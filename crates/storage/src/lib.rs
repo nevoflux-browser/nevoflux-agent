@@ -13,8 +13,9 @@ pub use error::{Result, StorageError};
 
 // Re-export model types for convenience
 pub use models::{
-    CreateSessionParams, ListSessionsParams, Session, SessionMode, UpdateSessionParams,
+    ContentType, CreateMessageParams, CreateSessionParams, ListMessagesParams, ListSessionsParams,
+    Message, MessageRole, Session, SessionMode, UpdateSessionParams,
 };
 
 // Re-export repository types for convenience
-pub use repositories::SessionRepository;
+pub use repositories::{MessageRepository, SessionRepository};
