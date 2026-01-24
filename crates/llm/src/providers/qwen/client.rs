@@ -2,6 +2,8 @@
 
 use reqwest::Client as HttpClient;
 
+use super::completion::QwenCompletionModel;
+
 /// DashScope API base URL (OpenAI-compatible endpoint)
 pub const QWEN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 
@@ -51,6 +53,19 @@ impl QwenClient {
     pub(crate) fn http_client(&self) -> &HttpClient {
         &self.http_client
     }
+
+    /// Create a completion model for the specified model name.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use nevoflux_llm::providers::qwen::QwenClient;
+    ///
+    /// let client = QwenClient::new("your-api-key");
+    /// let model = client.completion_model("qwen-turbo");
+    /// ```
+    pub fn completion_model(&self, model: impl Into<String>) -> QwenCompletionModel {
+        QwenCompletionModel::new(self.clone(), model)
+    }
 }
 
 impl std::fmt::Debug for QwenClient {
@@ -97,5 +112,20 @@ mod tests {
     fn test_api_key_accessible_internally() {
         let client = QwenClient::new("my-secret-key");
         assert_eq!(client.api_key(), "my-secret-key");
+    }
+
+    #[test]
+    fn test_completion_model_creation() {
+        let client = QwenClient::new("test-key");
+        let model = client.completion_model("qwen-turbo");
+        assert_eq!(model.model(), "qwen-turbo");
+    }
+
+    #[test]
+    fn test_completion_model_with_custom_base_url() {
+        let client = QwenClient::new("test-key")
+            .with_base_url("https://custom.example.com/v1");
+        let model = client.completion_model("qwen-plus");
+        assert_eq!(model.model(), "qwen-plus");
     }
 }
