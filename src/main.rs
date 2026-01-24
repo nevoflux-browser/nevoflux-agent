@@ -291,6 +291,80 @@ async fn run_proxy() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Run the MCP server mode.
+///
+/// This starts an MCP server that communicates via stdio, allowing
+/// Claude Code or other MCP clients to use browser automation tools.
+async fn run_mcp() -> Result<(), Box<dyn std::error::Error>> {
+    use nevoflux_mcp::{run_stdio_server, McpServer, McpServerConfig, ToolDefinition};
+
+    // Initialize logging to stderr (stdout is for MCP protocol)
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("nevoflux=info".parse().unwrap()),
+        )
+        .init();
+
+    tracing::info!("Starting MCP server mode");
+
+    // Create server with default configuration
+    let config = McpServerConfig::default();
+    let mut server = McpServer::with_config(config);
+
+    // Register browser automation tools
+    server.register_tool(ToolDefinition {
+        name: "browser_navigate".to_string(),
+        description: "Navigate the browser to a specified URL".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to navigate to"
+                }
+            },
+            "required": ["url"]
+        }),
+    });
+
+    server.register_tool(ToolDefinition {
+        name: "browser_click".to_string(),
+        description: "Click an element on the page identified by a CSS selector".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector for the element to click"
+                }
+            },
+            "required": ["selector"]
+        }),
+    });
+
+    server.register_tool(ToolDefinition {
+        name: "browser_screenshot".to_string(),
+        description: "Take a screenshot of the current page".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "full_page": {
+                    "type": "boolean",
+                    "description": "Whether to capture the full page or just the viewport",
+                    "default": false
+                }
+            }
+        }),
+    });
+
+    // Run the stdio server
+    run_stdio_server(server).await?;
+
+    Ok(())
+}
+
 /// Run the daemon.
 async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
@@ -371,8 +445,10 @@ async fn main() {
             std::process::exit(1);
         }
     } else if args.mcp {
-        println!("Starting MCP server mode...");
-        // TODO: Implement MCP mode
+        if let Err(e) = run_mcp().await {
+            eprintln!("MCP server error: {}", e);
+            std::process::exit(1);
+        }
     } else if args.status {
         run_status();
     } else if args.stop {

@@ -1787,6 +1787,7 @@ dependencies = [
  "fs2",
  "nevoflux-bridge",
  "nevoflux-daemon",
+ "nevoflux-mcp",
  "nevoflux-protocol",
  "nevoflux-storage",
  "predicates",
@@ -1796,6 +1797,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wat",
 ]
 
 [[package]]
@@ -1859,6 +1861,7 @@ dependencies = [
  "tracing",
  "wasmtime",
  "wasmtime-wasi",
+ "wat",
  "zeromq",
 ]
 
