@@ -356,7 +356,8 @@ impl completion::CompletionModel for QwenCompletionModel {
         messages.append(&mut completion_request.chat_history);
 
         // Add the user's prompt with context documents
-        let user_prompt = prompt_with_context(&completion_request.prompt, &completion_request.documents);
+        let user_prompt =
+            prompt_with_context(&completion_request.prompt, &completion_request.documents);
         messages.push(completion::Message {
             role: "user".into(),
             content: user_prompt,
@@ -505,10 +506,7 @@ mod tests {
         assert_eq!(resp.id, "chatcmpl-123");
         assert_eq!(resp.model, "qwen-turbo");
         assert_eq!(resp.choices.len(), 1);
-        assert_eq!(
-            resp.choices[0].message.content.as_deref(),
-            Some("Hello!")
-        );
+        assert_eq!(resp.choices[0].message.content.as_deref(), Some("Hello!"));
         assert_eq!(resp.usage.total_tokens, 15);
     }
 

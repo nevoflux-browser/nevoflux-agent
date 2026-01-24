@@ -56,7 +56,9 @@ mod tests {
 
     #[test]
     fn test_rate_limited_display() {
-        let err = LlmError::RateLimited { retry_after_ms: 1000 };
+        let err = LlmError::RateLimited {
+            retry_after_ms: 1000,
+        };
         assert_eq!(err.to_string(), "Rate limited: retry after 1000ms");
     }
 

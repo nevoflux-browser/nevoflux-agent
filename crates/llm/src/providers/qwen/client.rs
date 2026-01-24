@@ -89,8 +89,7 @@ mod tests {
 
     #[test]
     fn test_client_with_base_url() {
-        let client = QwenClient::new("test-api-key")
-            .with_base_url("https://custom.example.com/v1");
+        let client = QwenClient::new("test-api-key").with_base_url("https://custom.example.com/v1");
         assert_eq!(client.base_url(), "https://custom.example.com/v1");
     }
 
@@ -123,8 +122,7 @@ mod tests {
 
     #[test]
     fn test_completion_model_with_custom_base_url() {
-        let client = QwenClient::new("test-key")
-            .with_base_url("https://custom.example.com/v1");
+        let client = QwenClient::new("test-key").with_base_url("https://custom.example.com/v1");
         let model = client.completion_model("qwen-plus");
         assert_eq!(model.model(), "qwen-plus");
     }
