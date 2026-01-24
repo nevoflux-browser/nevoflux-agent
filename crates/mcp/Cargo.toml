@@ -1,0 +1,33 @@
+# crates/mcp/Cargo.toml
+
+[package]
+name = "nevoflux-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+description = "MCP (Model Context Protocol) client for NevoFlux Agent"
+
+[dependencies]
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Async runtime
+tokio = { workspace = true, features = ["process", "io-util", "io-std", "sync", "time"] }
+async-trait.workspace = true
+futures.workspace = true
+
+# HTTP client (for SSE transport)
+reqwest = { workspace = true, features = ["json", "stream"] }
+tokio-stream.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Logging
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
