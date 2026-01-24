@@ -8,6 +8,8 @@
 //! - `nevoflux --stop` - Stop daemon
 
 use clap::Parser;
+use fs2::FileExt;
+use std::fs::File;
 use std::path::PathBuf;
 
 /// Get the data directory for NevoFlux.
@@ -121,6 +123,152 @@ fn run_status() {
     }
 }
 
+/// Stop the running daemon.
+fn stop_daemon() -> std::io::Result<()> {
+    let data_dir = get_data_dir();
+    let port_file = data_dir.join("daemon.port");
+    let pid_file = data_dir.join("daemon.pid");
+    let lock_file = data_dir.join("daemon.lock");
+
+    // Try to read PID and send SIGTERM
+    if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            if is_process_running(pid) {
+                #[cfg(unix)]
+                {
+                    use std::process::Command;
+                    let _ = Command::new("kill")
+                        .args(["-TERM", &pid.to_string()])
+                        .output();
+
+                    // Wait briefly for graceful shutdown
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+
+                    // Force kill if still running
+                    if is_process_running(pid) {
+                        let _ = Command::new("kill")
+                            .args(["-KILL", &pid.to_string()])
+                            .output();
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    use std::process::Command;
+                    let _ = Command::new("taskkill")
+                        .args(["/F", "/PID", &pid.to_string()])
+                        .output();
+                }
+            }
+        }
+    }
+
+    // Clean up files
+    let _ = std::fs::remove_file(&port_file);
+    let _ = std::fs::remove_file(&pid_file);
+    let _ = std::fs::remove_file(&lock_file);
+
+    Ok(())
+}
+
+/// Run the stop command.
+fn run_stop() {
+    match check_daemon_status() {
+        DaemonStatus::Running { port: _, pid } => {
+            println!("Stopping daemon (PID {})...", pid);
+            if let Err(e) = stop_daemon() {
+                eprintln!("Error stopping daemon: {}", e);
+                std::process::exit(1);
+            }
+            println!("Daemon stopped.");
+        }
+        DaemonStatus::Stale { .. } => {
+            println!("Cleaning up stale daemon files...");
+            if let Err(e) = stop_daemon() {
+                eprintln!("Error cleaning up: {}", e);
+                std::process::exit(1);
+            }
+            println!("Cleanup complete.");
+        }
+        DaemonStatus::NotRunning => {
+            println!("Daemon is not running.");
+        }
+    }
+}
+
+/// Acquire the daemon lock file.
+fn acquire_daemon_lock() -> std::io::Result<File> {
+    let data_dir = ensure_data_dir()?;
+    let lock_path = data_dir.join("daemon.lock");
+
+    let file = File::create(&lock_path)?;
+    file.try_lock_exclusive().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "Daemon is already running",
+        )
+    })?;
+
+    Ok(file)
+}
+
+/// Write daemon port and PID files.
+fn write_daemon_files(port: u16) -> std::io::Result<()> {
+    let data_dir = get_data_dir();
+
+    std::fs::write(data_dir.join("daemon.port"), port.to_string())?;
+    std::fs::write(data_dir.join("daemon.pid"), std::process::id().to_string())?;
+
+    Ok(())
+}
+
+/// Run the daemon.
+async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logging
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("nevoflux=info".parse().unwrap()),
+        )
+        .init();
+
+    // Acquire lock
+    let _lock = match acquire_daemon_lock() {
+        Ok(lock) => lock,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            eprintln!("Error: Daemon is already running");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Error acquiring lock: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Start server
+    let config = nevoflux_daemon::ServerConfig::default();
+    let router = std::sync::Arc::new(nevoflux_daemon::Router::new());
+
+    let server = nevoflux_daemon::start_server(config, router).await?;
+    let port = server.port();
+
+    // Write port/pid files
+    write_daemon_files(port)?;
+
+    tracing::info!("Daemon started on port {}", port);
+
+    // Wait for shutdown signal
+    tokio::signal::ctrl_c().await?;
+
+    tracing::info!("Shutting down...");
+
+    // Cleanup
+    let data_dir = get_data_dir();
+    let _ = std::fs::remove_file(data_dir.join("daemon.port"));
+    let _ = std::fs::remove_file(data_dir.join("daemon.pid"));
+
+    Ok(())
+}
+
 /// NevoFlux Native Agent - AI-powered browser assistant
 #[derive(Parser, Debug)]
 #[command(name = "nevoflux")]
@@ -143,20 +291,25 @@ struct Args {
     stop: bool,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = Args::parse();
 
-    // For now, just print which mode was selected
     if args.daemon {
-        println!("Starting daemon mode...");
+        if let Err(e) = run_daemon().await {
+            eprintln!("Daemon error: {}", e);
+            std::process::exit(1);
+        }
     } else if args.mcp {
         println!("Starting MCP server mode...");
+        // TODO: Implement MCP mode
     } else if args.status {
         run_status();
     } else if args.stop {
-        println!("Stopping daemon...");
+        run_stop();
     } else {
         println!("Starting proxy mode...");
+        // TODO: Implement proxy mode
     }
 }
 
@@ -172,9 +325,18 @@ mod tests {
 
     #[test]
     fn test_port_file_path() {
+        // Use temp dir that contains "nevoflux" in path name for test
+        let temp = tempfile::Builder::new()
+            .prefix("nevoflux-test")
+            .tempdir()
+            .unwrap();
+        std::env::set_var("NEVOFLUX_DATA_DIR", temp.path());
+
         let dir = get_data_dir();
         let port_file = dir.join("daemon.port");
         assert!(port_file.to_string_lossy().contains("nevoflux"));
+
+        std::env::remove_var("NEVOFLUX_DATA_DIR");
     }
 
     #[test]
@@ -198,6 +360,46 @@ mod tests {
         let status = check_daemon_status();
         // Should be Stale since PID 12345 is not running
         assert!(matches!(status, DaemonStatus::Stale { .. }));
+
+        std::env::remove_var("NEVOFLUX_DATA_DIR");
+    }
+
+    #[test]
+    fn test_stop_daemon_no_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("NEVOFLUX_DATA_DIR", temp.path());
+
+        let result = stop_daemon();
+        assert!(result.is_ok());
+
+        std::env::remove_var("NEVOFLUX_DATA_DIR");
+    }
+
+    #[test]
+    fn test_stop_daemon_cleans_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let port_file = temp.path().join("daemon.port");
+        let pid_file = temp.path().join("daemon.pid");
+        std::fs::write(&port_file, "19500").unwrap();
+        std::fs::write(&pid_file, "99999").unwrap(); // Non-existent PID
+
+        std::env::set_var("NEVOFLUX_DATA_DIR", temp.path());
+
+        let result = stop_daemon();
+        assert!(result.is_ok());
+        assert!(!port_file.exists());
+        assert!(!pid_file.exists());
+
+        std::env::remove_var("NEVOFLUX_DATA_DIR");
+    }
+
+    #[test]
+    fn test_acquire_daemon_lock_succeeds() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::env::set_var("NEVOFLUX_DATA_DIR", temp.path());
+
+        let lock = acquire_daemon_lock();
+        assert!(lock.is_ok());
 
         std::env::remove_var("NEVOFLUX_DATA_DIR");
     }
