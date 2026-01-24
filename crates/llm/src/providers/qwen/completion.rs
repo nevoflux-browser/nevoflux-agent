@@ -1,7 +1,11 @@
 //! QwenCompletionModel implementation.
 //!
 //! Implements the rig-core CompletionModel trait for Qwen models via DashScope API.
+//! Also provides streaming support via Server-Sent Events (SSE).
 
+use std::pin::Pin;
+
+use futures::stream::{Stream, StreamExt};
 use rig::completion::{
     self, CompletionError, CompletionRequest, CompletionResponse, Document, ModelChoice,
 };
@@ -9,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{QwenClient, QwenUsage};
+use crate::error::LlmError;
 
 /// Completion model for Qwen via DashScope API.
 ///
@@ -46,6 +51,99 @@ impl QwenCompletionModel {
     /// Get the model name.
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// Stream a chat completion response.
+    ///
+    /// Returns a stream of content chunks as the model generates them.
+    /// Uses Server-Sent Events (SSE) format from the DashScope API.
+    ///
+    /// # Arguments
+    /// * `messages` - The chat messages to send to the model
+    ///
+    /// # Example
+    /// ```ignore
+    /// use futures::StreamExt;
+    /// use nevoflux_llm::providers::qwen::QwenClient;
+    /// use rig::completion::Message;
+    ///
+    /// let client = QwenClient::new("your-api-key");
+    /// let model = client.completion_model("qwen-turbo");
+    ///
+    /// let messages = vec![Message {
+    ///     role: "user".to_string(),
+    ///     content: "Hello!".to_string(),
+    /// }];
+    ///
+    /// let mut stream = model.stream_chat(messages).await?;
+    /// while let Some(chunk) = stream.next().await {
+    ///     match chunk {
+    ///         Ok(text) => print!("{}", text),
+    ///         Err(e) => eprintln!("Error: {}", e),
+    ///     }
+    /// }
+    /// ```
+    pub async fn stream_chat(
+        &self,
+        messages: Vec<completion::Message>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String, LlmError>> + Send>>, LlmError> {
+        let request = json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": true,
+        });
+
+        let response = self
+            .client
+            .http_client()
+            .post(format!("{}/chat/completions", self.client.base_url()))
+            .bearer_auth(self.client.api_key())
+            .json(&request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let message = response.text().await.unwrap_or_default();
+            return Err(LlmError::Api { status, message });
+        }
+
+        let byte_stream = response.bytes_stream();
+
+        let stream = byte_stream.filter_map(|result| async move {
+            match result {
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    // Parse SSE lines - may contain multiple data lines in one chunk
+                    let mut content_parts = Vec::new();
+                    for line in text.lines() {
+                        if let Some(data) = line.strip_prefix("data: ") {
+                            if data == "[DONE]" {
+                                // End of stream
+                                continue;
+                            }
+                            if let Ok(chunk) = serde_json::from_str::<QwenStreamChunk>(data) {
+                                if let Some(choice) = chunk.choices.first() {
+                                    if let Some(content) = &choice.delta.content {
+                                        if !content.is_empty() {
+                                            content_parts.push(content.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if content_parts.is_empty() {
+                        None
+                    } else {
+                        Some(Ok(content_parts.join("")))
+                    }
+                }
+                Err(e) => Some(Err(LlmError::Stream(e.to_string()))),
+            }
+        });
+
+        Ok(Box::pin(stream))
     }
 }
 
@@ -124,6 +222,56 @@ pub struct QwenCompletionResponse {
     pub model: String,
     pub choices: Vec<CompletionChoice>,
     pub usage: QwenUsage,
+}
+
+// ============================================================================
+// Streaming types
+// ============================================================================
+
+/// Streaming chunk from DashScope API.
+///
+/// Represents a single chunk in the Server-Sent Events (SSE) stream
+/// returned by the DashScope API when streaming is enabled.
+#[derive(Debug, Clone, Deserialize)]
+pub struct QwenStreamChunk {
+    /// Unique identifier for the completion
+    #[allow(dead_code)]
+    pub id: String,
+    /// Model that generated the completion
+    #[allow(dead_code)]
+    pub model: String,
+    /// Array of completion choices (usually just one for streaming)
+    pub choices: Vec<StreamChoice>,
+}
+
+/// Choice in a streaming chunk.
+///
+/// Contains the delta (incremental content) for this chunk.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamChoice {
+    /// Index of this choice (usually 0)
+    #[allow(dead_code)]
+    pub index: u32,
+    /// The incremental content
+    pub delta: StreamDelta,
+    /// Reason for finishing, if this is the last chunk
+    #[allow(dead_code)]
+    pub finish_reason: Option<String>,
+}
+
+/// Delta content in streaming.
+///
+/// Contains the incremental content added in this streaming chunk.
+/// Either role or content may be present, but not necessarily both.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct StreamDelta {
+    /// Role of the message (usually only in first chunk)
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub role: Option<String>,
+    /// Incremental text content
+    #[serde(default)]
+    pub content: Option<String>,
 }
 
 impl TryFrom<QwenCompletionResponse> for CompletionResponse<QwenCompletionResponse> {
@@ -504,5 +652,160 @@ mod tests {
         let resp: QwenCompletionResponse = serde_json::from_str(json).unwrap();
         let result: Result<CompletionResponse<QwenCompletionResponse>, _> = resp.try_into();
         assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // Streaming tests
+    // ========================================================================
+
+    #[test]
+    fn test_stream_chunk_deserialization() {
+        let json = r#"{
+            "id": "chatcmpl-123",
+            "model": "qwen-turbo",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "Hello"},
+                "finish_reason": null
+            }]
+        }"#;
+        let chunk: QwenStreamChunk = serde_json::from_str(json).unwrap();
+        assert_eq!(chunk.id, "chatcmpl-123");
+        assert_eq!(chunk.model, "qwen-turbo");
+        assert_eq!(chunk.choices.len(), 1);
+        assert_eq!(chunk.choices[0].index, 0);
+        assert_eq!(chunk.choices[0].delta.content, Some("Hello".to_string()));
+        assert!(chunk.choices[0].finish_reason.is_none());
+    }
+
+    #[test]
+    fn test_stream_chunk_with_finish_reason() {
+        let json = r#"{
+            "id": "chatcmpl-456",
+            "model": "qwen-plus",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "!"},
+                "finish_reason": "stop"
+            }]
+        }"#;
+        let chunk: QwenStreamChunk = serde_json::from_str(json).unwrap();
+        assert_eq!(chunk.choices[0].finish_reason, Some("stop".to_string()));
+    }
+
+    #[test]
+    fn test_stream_delta_with_role_only() {
+        let json = r#"{"role": "assistant"}"#;
+        let delta: StreamDelta = serde_json::from_str(json).unwrap();
+        assert_eq!(delta.role, Some("assistant".to_string()));
+        assert_eq!(delta.content, None);
+    }
+
+    #[test]
+    fn test_stream_delta_with_content_only() {
+        let json = r#"{"content": "Hello world"}"#;
+        let delta: StreamDelta = serde_json::from_str(json).unwrap();
+        assert_eq!(delta.role, None);
+        assert_eq!(delta.content, Some("Hello world".to_string()));
+    }
+
+    #[test]
+    fn test_stream_delta_empty() {
+        let json = r#"{}"#;
+        let delta: StreamDelta = serde_json::from_str(json).unwrap();
+        assert_eq!(delta.role, None);
+        assert_eq!(delta.content, None);
+    }
+
+    #[test]
+    fn test_stream_delta_with_both_role_and_content() {
+        let json = r#"{"role": "assistant", "content": "Hi"}"#;
+        let delta: StreamDelta = serde_json::from_str(json).unwrap();
+        assert_eq!(delta.role, Some("assistant".to_string()));
+        assert_eq!(delta.content, Some("Hi".to_string()));
+    }
+
+    #[test]
+    fn test_stream_choice_deserialization() {
+        let json = r#"{
+            "index": 0,
+            "delta": {"role": "assistant", "content": "Test"},
+            "finish_reason": null
+        }"#;
+        let choice: StreamChoice = serde_json::from_str(json).unwrap();
+        assert_eq!(choice.index, 0);
+        assert_eq!(choice.delta.role, Some("assistant".to_string()));
+        assert_eq!(choice.delta.content, Some("Test".to_string()));
+        assert!(choice.finish_reason.is_none());
+    }
+
+    #[test]
+    fn test_stream_chunk_clone() {
+        let chunk = QwenStreamChunk {
+            id: "test-id".to_string(),
+            model: "qwen-turbo".to_string(),
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: StreamDelta {
+                    role: Some("assistant".to_string()),
+                    content: Some("Hello".to_string()),
+                },
+                finish_reason: None,
+            }],
+        };
+        let cloned = chunk.clone();
+        assert_eq!(cloned.id, chunk.id);
+        assert_eq!(cloned.model, chunk.model);
+        assert_eq!(cloned.choices.len(), chunk.choices.len());
+    }
+
+    #[test]
+    fn test_stream_delta_default() {
+        let delta = StreamDelta::default();
+        assert!(delta.role.is_none());
+        assert!(delta.content.is_none());
+    }
+
+    #[test]
+    fn test_stream_chunk_multiple_choices() {
+        // Although unusual, the API could return multiple choices
+        let json = r#"{
+            "id": "chatcmpl-789",
+            "model": "qwen-max",
+            "choices": [
+                {"index": 0, "delta": {"content": "A"}, "finish_reason": null},
+                {"index": 1, "delta": {"content": "B"}, "finish_reason": null}
+            ]
+        }"#;
+        let chunk: QwenStreamChunk = serde_json::from_str(json).unwrap();
+        assert_eq!(chunk.choices.len(), 2);
+        assert_eq!(chunk.choices[0].index, 0);
+        assert_eq!(chunk.choices[0].delta.content, Some("A".to_string()));
+        assert_eq!(chunk.choices[1].index, 1);
+        assert_eq!(chunk.choices[1].delta.content, Some("B".to_string()));
+    }
+
+    #[test]
+    fn test_stream_types_are_debug() {
+        // Verify Debug trait is implemented
+        let chunk = QwenStreamChunk {
+            id: "id".to_string(),
+            model: "model".to_string(),
+            choices: vec![],
+        };
+        let debug_str = format!("{:?}", chunk);
+        assert!(debug_str.contains("QwenStreamChunk"));
+
+        let choice = StreamChoice {
+            index: 0,
+            delta: StreamDelta::default(),
+            finish_reason: None,
+        };
+        let debug_str = format!("{:?}", choice);
+        assert!(debug_str.contains("StreamChoice"));
+
+        let delta = StreamDelta::default();
+        let debug_str = format!("{:?}", delta);
+        assert!(debug_str.contains("StreamDelta"));
     }
 }
