@@ -6,6 +6,13 @@ members = [
     "crates/protocol",
     "crates/storage",
     "crates/llm",
+    "crates/testing",
+    "crates/mcp",
+    "crates/daemon",
+    "crates/bridge",
+    "crates/skills",
+    "crates/computer",
+    "crates/builtin-wasm",
 ]
 
 [workspace.package]
@@ -21,6 +28,7 @@ rig-core = "0.6"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 rmp-serde = "1"
 
 # Error handling
@@ -46,3 +54,25 @@ test-case = "3"
 
 # Mocking
 mockall = "0.13"
+
+# ZeroMQ
+zeromq = "0.4"
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# Platform directories
+directories = "5"
+
+# Glob patterns
+glob = "0.3"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# File locking
+fs2 = "0.4"
