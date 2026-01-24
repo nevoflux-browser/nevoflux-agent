@@ -7,6 +7,7 @@ pub mod chat;
 pub mod common;
 pub mod envelope;
 mod error;
+pub mod mcp;
 
 pub use channel::Channel;
 pub use envelope::{AuthInfo, DaemonEnvelope, ProxyEnvelope};
@@ -27,6 +28,10 @@ pub use chat::{
     SidebarMessage, AgentMessage,
 };
 pub use error::{ProtocolError, Result};
+pub use mcp::{
+    error_codes, JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpMessage,
+    McpRequest, McpResponse, McpSource,
+};
 
 /// Protocol version
 pub const PROTOCOL_VERSION: &str = "5.0.0";
