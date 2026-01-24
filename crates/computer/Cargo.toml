@@ -20,6 +20,9 @@ base64 = "0.22"
 # Cross-platform input simulation (optional, for real implementation)
 # enigo = { version = "0.2", optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["shm", "randr", "xtest"] }
+
 [dev-dependencies]
 tempfile = "3"
 tokio-test = "0.4"

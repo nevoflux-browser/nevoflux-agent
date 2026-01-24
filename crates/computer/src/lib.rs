@@ -34,11 +34,15 @@
 //! ```
 
 pub mod error;
+#[cfg(target_os = "linux")]
+pub mod linux;
 pub mod mock;
 pub mod traits;
 pub mod types;
 
 pub use error::{ComputerError, Result};
+#[cfg(target_os = "linux")]
+pub use linux::LinuxComputer;
 pub use mock::MockComputer;
 pub use traits::{ComputerController, KeyboardController, MouseController, ScreenshotProvider};
 pub use types::{
