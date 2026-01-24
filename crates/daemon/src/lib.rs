@@ -30,6 +30,7 @@ pub mod registry;
 pub mod router;
 pub mod server;
 pub mod session;
+pub mod skills;
 pub mod wasm;
 
 pub use config::DaemonConfig;
@@ -42,6 +43,7 @@ pub use session::SessionManager;
 pub use wasm::{create_linker, HostState, WasmConfig, WasmInstance, WasmRuntime};
 
 pub use agent::{AgentInput, AgentMode, AgentOutput, AgentRunner, AgentRunnerConfig};
+pub use skills::SkillsManager;
 
 #[cfg(test)]
 mod tests {
