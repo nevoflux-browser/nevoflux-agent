@@ -2,8 +2,10 @@
 
 //! NevoFlux Protocol - IPC message definitions for Agent communication.
 
+pub mod channel;
 mod error;
 
+pub use channel::Channel;
 pub use error::{ProtocolError, Result};
 
 /// Protocol version
