@@ -24,17 +24,21 @@
 pub mod config;
 pub mod context;
 pub mod error;
+pub mod permission;
 pub mod registry;
 pub mod router;
 pub mod server;
 pub mod session;
+pub mod wasm;
 
 pub use config::DaemonConfig;
 pub use error::{DaemonError, Result};
+pub use permission::{Action, PermissionEnforcer, PermissionResult, ResourceType};
 pub use registry::{ActiveRequest, ProxyInfo, ProxyRegistry, RequestRegistry};
 pub use router::Router;
 pub use server::{find_available_port, start_server, Server, ServerConfig};
 pub use session::SessionManager;
+pub use wasm::{create_linker, HostState, WasmConfig, WasmInstance, WasmRuntime};
 
 #[cfg(test)]
 mod tests {

@@ -40,3 +40,4 @@ wasmtime-wasi = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 nevoflux-testing = { path = "../testing" }
+wat = "1"
