@@ -3,6 +3,7 @@
 //! NevoFlux Protocol - IPC message definitions for Agent communication.
 
 pub mod channel;
+pub mod chat;
 pub mod common;
 pub mod envelope;
 mod error;
@@ -14,6 +15,16 @@ pub use common::{
     ErrorLevel, PermissionScope, PlanInfo, PlanType, PluginAction, QuotaInfo, Requester,
     RequesterType, ResourceAction, ResourceType, StepInfo, StreamFormat, StreamMetadata,
     SystemError, ToolInfo, ToolStatus, UsageQuota,
+};
+pub use chat::{
+    // Sidebar → Agent messages
+    ChatMessage, SkillCommand, StopGeneration, PermissionResponse, PluginCommand,
+    SystemCommand, BrowserToolResponse,
+    // Agent → Sidebar messages
+    StreamChunk, StreamEnd, ContentBlock, PermissionRequest, AgentStateMessage,
+    ErrorMessage, AccountStatus, SystemResponse, BrowserToolRequest,
+    // Tagged enums
+    SidebarMessage, AgentMessage,
 };
 pub use error::{ProtocolError, Result};
 
