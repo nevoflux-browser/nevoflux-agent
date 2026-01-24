@@ -8,6 +8,34 @@
 //! - `nevoflux --stop` - Stop daemon
 
 use clap::Parser;
+use std::path::PathBuf;
+
+/// Get the data directory for NevoFlux.
+///
+/// Platform-specific locations:
+/// - Linux: ~/.local/share/nevoflux/
+/// - macOS: ~/Library/Application Support/nevoflux/
+/// - Windows: %APPDATA%\nevoflux\
+fn get_data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("NEVOFLUX_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
+
+    directories::ProjectDirs::from("com", "nevoflux", "nevoflux")
+        .map(|dirs| dirs.data_dir().to_path_buf())
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".nevoflux")
+        })
+}
+
+/// Ensure the data directory exists.
+#[allow(dead_code)]
+fn ensure_data_dir() -> std::io::Result<PathBuf> {
+    let dir = get_data_dir();
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
 
 /// NevoFlux Native Agent - AI-powered browser assistant
 #[derive(Parser, Debug)]
@@ -45,5 +73,23 @@ fn main() {
         println!("Stopping daemon...");
     } else {
         println!("Starting proxy mode...");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_data_dir_returns_path() {
+        let dir = get_data_dir();
+        assert!(dir.exists() || dir.parent().map(|p| p.exists()).unwrap_or(false));
+    }
+
+    #[test]
+    fn test_port_file_path() {
+        let dir = get_data_dir();
+        let port_file = dir.join("daemon.port");
+        assert!(port_file.to_string_lossy().contains("nevoflux"));
     }
 }
