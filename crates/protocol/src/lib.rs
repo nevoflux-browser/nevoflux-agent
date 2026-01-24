@@ -4,9 +4,11 @@
 
 pub mod channel;
 pub mod common;
+pub mod envelope;
 mod error;
 
 pub use channel::Channel;
+pub use envelope::{AuthInfo, DaemonEnvelope, ProxyEnvelope};
 pub use common::{
     AccountInfo, AgentState, Attachment, BrowserToolAction, BrowserToolError, ContentType,
     ErrorLevel, PermissionScope, PlanInfo, PlanType, PluginAction, QuotaInfo, Requester,
