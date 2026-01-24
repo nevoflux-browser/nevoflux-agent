@@ -4,6 +4,7 @@
 resolver = "2"
 members = [
     "crates/protocol",
+    "crates/storage",
 ]
 
 [workspace.package]
@@ -20,6 +21,9 @@ rmp-serde = "1"
 
 # Error handling
 thiserror = "2"
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Testing
 proptest = "1"
