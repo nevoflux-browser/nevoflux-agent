@@ -41,6 +41,7 @@ mod migrations;
 pub mod models;
 pub mod repositories;
 mod storage;
+pub mod vector;
 
 pub use connection::Database;
 pub use error::{Result, StorageError};
@@ -57,3 +58,6 @@ pub use models::{
 pub use repositories::{
     ConfigRepository, MemoryRepository, MessageRepository, PermissionRepository, SessionRepository,
 };
+
+// Re-export vector types for convenience
+pub use vector::{cosine_similarity, euclidean_distance, SimpleVectorIndex, VectorSearchResult};
