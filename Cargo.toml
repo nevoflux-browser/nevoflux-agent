@@ -1,5 +1,13 @@
 # Cargo.toml (workspace root)
 
+[package]
+name = "nevoflux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NevoFlux Native Agent - AI-powered browser assistant"
+
 [workspace]
 resolver = "2"
 members = [
@@ -76,3 +84,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # File locking
 fs2 = "0.4"
+
+[[bin]]
+name = "nevoflux"
+path = "src/main.rs"
+
+[dependencies]
+nevoflux-daemon = { path = "crates/daemon" }
+nevoflux-bridge = { path = "crates/bridge" }
+nevoflux-protocol = { path = "crates/protocol" }
+nevoflux-storage = { path = "crates/storage" }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+directories = { workspace = true }
+fs2 = { workspace = true }
