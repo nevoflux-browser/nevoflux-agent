@@ -4,8 +4,8 @@
 //!
 //! These envelopes wrap all messages exchanged between Proxy/MCP bridges and Daemon.
 
-use serde::{Deserialize, Serialize};
 use crate::Channel;
+use serde::{Deserialize, Serialize};
 
 /// Authentication information (reserved for enterprise features)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,11 +77,7 @@ impl ProxyEnvelope {
 
 impl DaemonEnvelope {
     /// Create a new DaemonEnvelope with current timestamp
-    pub fn new(
-        proxy_id: impl Into<String>,
-        channel: Channel,
-        payload: serde_json::Value,
-    ) -> Self {
+    pub fn new(proxy_id: impl Into<String>, channel: Channel, payload: serde_json::Value) -> Self {
         Self {
             proxy_id: proxy_id.into(),
             request_id: None,
@@ -203,12 +199,8 @@ mod tests {
 
     #[test]
     fn test_proxy_envelope_builder() {
-        let envelope = ProxyEnvelope::new(
-            "proxy-001",
-            "req-001",
-            Channel::Chat,
-            serde_json::json!({}),
-        );
+        let envelope =
+            ProxyEnvelope::new("proxy-001", "req-001", Channel::Chat, serde_json::json!({}));
         assert_eq!(envelope.proxy_id, "proxy-001");
         assert!(envelope.auth.is_none());
         assert!(envelope.timestamp_ms > 0);

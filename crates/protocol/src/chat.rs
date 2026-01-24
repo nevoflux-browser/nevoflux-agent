@@ -4,8 +4,8 @@
 //!
 //! Messages exchanged between Chat Sidebar and Agent via the Chat channel.
 
-use serde::{Deserialize, Serialize};
 use crate::common::*;
+use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // Sidebar → Agent Messages

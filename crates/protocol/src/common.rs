@@ -249,29 +249,62 @@ mod tests {
 
     #[test]
     fn test_permission_scope_serialization() {
-        assert_eq!(serde_json::to_string(&PermissionScope::Once).unwrap(), "\"once\"");
-        assert_eq!(serde_json::to_string(&PermissionScope::Session).unwrap(), "\"session\"");
-        assert_eq!(serde_json::to_string(&PermissionScope::Always).unwrap(), "\"always\"");
+        assert_eq!(
+            serde_json::to_string(&PermissionScope::Once).unwrap(),
+            "\"once\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionScope::Session).unwrap(),
+            "\"session\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PermissionScope::Always).unwrap(),
+            "\"always\""
+        );
     }
 
     #[test]
     fn test_resource_type_serialization() {
-        assert_eq!(serde_json::to_string(&ResourceType::File).unwrap(), "\"file\"");
-        assert_eq!(serde_json::to_string(&ResourceType::Script).unwrap(), "\"script\"");
+        assert_eq!(
+            serde_json::to_string(&ResourceType::File).unwrap(),
+            "\"file\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ResourceType::Script).unwrap(),
+            "\"script\""
+        );
     }
 
     #[test]
     fn test_agent_state_serialization() {
-        assert_eq!(serde_json::to_string(&AgentState::Idle).unwrap(), "\"idle\"");
-        assert_eq!(serde_json::to_string(&AgentState::Thinking).unwrap(), "\"thinking\"");
-        assert_eq!(serde_json::to_string(&AgentState::ExecutingTool).unwrap(), "\"executing_tool\"");
+        assert_eq!(
+            serde_json::to_string(&AgentState::Idle).unwrap(),
+            "\"idle\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentState::Thinking).unwrap(),
+            "\"thinking\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentState::ExecutingTool).unwrap(),
+            "\"executing_tool\""
+        );
     }
 
     #[test]
     fn test_error_level_serialization() {
-        assert_eq!(serde_json::to_string(&ErrorLevel::Warning).unwrap(), "\"warning\"");
-        assert_eq!(serde_json::to_string(&ErrorLevel::Error).unwrap(), "\"error\"");
-        assert_eq!(serde_json::to_string(&ErrorLevel::Fatal).unwrap(), "\"fatal\"");
+        assert_eq!(
+            serde_json::to_string(&ErrorLevel::Warning).unwrap(),
+            "\"warning\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorLevel::Error).unwrap(),
+            "\"error\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorLevel::Fatal).unwrap(),
+            "\"fatal\""
+        );
     }
 
     #[test]

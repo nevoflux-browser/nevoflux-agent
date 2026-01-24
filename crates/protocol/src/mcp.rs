@@ -292,10 +292,8 @@ mod tests {
 
     #[test]
     fn test_jsonrpc_response_helpers() {
-        let success = JsonRpcResponse::success(
-            JsonRpcId::Number(1),
-            serde_json::json!({"ok": true}),
-        );
+        let success =
+            JsonRpcResponse::success(JsonRpcId::Number(1), serde_json::json!({"ok": true}));
         assert!(success.is_success());
 
         let error = JsonRpcResponse::error(
