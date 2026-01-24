@@ -1,0 +1,26 @@
+# Cargo.toml (workspace root)
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/protocol",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+repository = "https://github.com/user/nevoflux-agent"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1"
+
+# Error handling
+thiserror = "2"
+
+# Testing
+proptest = "1"
+test-case = "3"
