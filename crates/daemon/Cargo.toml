@@ -33,6 +33,10 @@ tracing = "0.1"
 # ZeroMQ
 zeromq = { workspace = true }
 
+# Wasmtime
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 nevoflux-testing = { path = "../testing" }
