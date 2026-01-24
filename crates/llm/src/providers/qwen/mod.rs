@@ -1,0 +1,15 @@
+//! Qwen/DashScope provider implementation.
+//!
+//! Provides access to Alibaba's Qwen models via the DashScope API.
+//!
+//! # Example
+//! ```ignore
+//! use nevoflux_llm::providers::qwen::QwenClient;
+//!
+//! let client = QwenClient::new("your-api-key");
+//! let model = client.completion_model("qwen-turbo");
+//! ```
+
+mod types;
+
+pub use types::*;

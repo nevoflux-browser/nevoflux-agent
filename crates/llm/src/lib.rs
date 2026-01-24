@@ -12,6 +12,7 @@
 //! - Qwen (DashScope): `nevoflux_llm::providers::qwen`
 
 pub mod error;
+pub mod providers;
 
 // Re-export rig for convenience
 pub use rig;
