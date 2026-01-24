@@ -4,7 +4,10 @@ use rusqlite::Connection;
 
 use crate::error::{Result, StorageError};
 
-const MIGRATIONS: &[(&str, &str)] = &[("001_initial", include_str!("migrations/001_initial.sql"))];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("001_initial", include_str!("migrations/001_initial.sql")),
+    ("002_memory", include_str!("migrations/002_memory.sql")),
+];
 
 /// Run all pending migrations on the given connection.
 pub fn run_all(conn: &mut Connection) -> Result<()> {
@@ -56,6 +59,6 @@ mod tests {
         let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
     }
 }
