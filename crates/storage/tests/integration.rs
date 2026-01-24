@@ -219,8 +219,8 @@ fn test_message_ordering() {
         .list(ListMessagesParams::new("sess-order"))
         .unwrap();
     assert_eq!(messages.len(), 5);
-    for i in 0..5 {
-        assert_eq!(messages[i].content, format!("Message {}", i));
+    for (i, message) in messages.iter().enumerate() {
+        assert_eq!(message.content, format!("Message {}", i));
     }
 }
 
@@ -366,7 +366,7 @@ fn test_config_typed_values() {
         .unwrap();
     storage
         .config()
-        .set("float", serde_json::json!(3.14))
+        .set("float", serde_json::json!(1.5))
         .unwrap();
     storage
         .config()
@@ -389,7 +389,7 @@ fn test_config_typed_values() {
     assert_eq!(n, 42);
 
     let f: f64 = storage.config().get_typed("float").unwrap().unwrap();
-    assert!((f - 3.14).abs() < 0.001);
+    assert!((f - 1.5).abs() < 0.001);
 
     let b: bool = storage.config().get_typed("bool").unwrap().unwrap();
     assert!(b);

@@ -499,8 +499,8 @@ mod tests {
         assert_eq!(repo.get("int").unwrap(), Some(serde_json::json!(42)));
 
         // Float
-        repo.set("float", serde_json::json!(3.14159)).unwrap();
-        assert_eq!(repo.get("float").unwrap(), Some(serde_json::json!(3.14159)));
+        repo.set("float", serde_json::json!(1.23456)).unwrap();
+        assert_eq!(repo.get("float").unwrap(), Some(serde_json::json!(1.23456)));
 
         // Negative number
         repo.set("negative", serde_json::json!(-100)).unwrap();
