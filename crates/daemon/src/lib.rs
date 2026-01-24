@@ -21,6 +21,7 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
+pub mod agent;
 pub mod config;
 pub mod context;
 pub mod error;
@@ -39,6 +40,8 @@ pub use router::Router;
 pub use server::{find_available_port, start_server, Server, ServerConfig};
 pub use session::SessionManager;
 pub use wasm::{create_linker, HostState, WasmConfig, WasmInstance, WasmRuntime};
+
+pub use agent::{AgentInput, AgentMode, AgentOutput, AgentRunner, AgentRunnerConfig};
 
 #[cfg(test)]
 mod tests {
