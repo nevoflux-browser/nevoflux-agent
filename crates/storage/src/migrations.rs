@@ -1,0 +1,61 @@
+//! Database migrations for the storage layer.
+
+use rusqlite::Connection;
+
+use crate::error::{Result, StorageError};
+
+const MIGRATIONS: &[(&str, &str)] = &[("001_initial", include_str!("migrations/001_initial.sql"))];
+
+/// Run all pending migrations on the given connection.
+pub fn run_all(conn: &mut Connection) -> Result<()> {
+    // Create migrations tracking table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS _migrations (
+            name TEXT PRIMARY KEY,
+            applied_at INTEGER NOT NULL
+        )",
+        [],
+    )?;
+
+    // Run each migration if not already applied
+    for (name, sql) in MIGRATIONS {
+        let already_applied: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM _migrations WHERE name = ?)",
+            [name],
+            |row| row.get(0),
+        )?;
+
+        if !already_applied {
+            conn.execute_batch(sql).map_err(|e| {
+                StorageError::Migration(format!("Migration {} failed: {}", name, e))
+            })?;
+
+            conn.execute(
+                "INSERT INTO _migrations (name, applied_at) VALUES (?, strftime('%s', 'now'))",
+                [name],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_migrations_idempotent() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // Run migrations twice
+        run_all(&mut conn).unwrap();
+        run_all(&mut conn).unwrap();
+
+        // Should still work
+        let count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+}
