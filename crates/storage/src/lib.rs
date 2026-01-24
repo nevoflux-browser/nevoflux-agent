@@ -5,6 +5,16 @@
 pub mod connection;
 pub mod error;
 mod migrations;
+pub mod models;
+pub mod repositories;
 
 pub use connection::Database;
 pub use error::{Result, StorageError};
+
+// Re-export model types for convenience
+pub use models::{
+    CreateSessionParams, ListSessionsParams, Session, SessionMode, UpdateSessionParams,
+};
+
+// Re-export repository types for convenience
+pub use repositories::SessionRepository;
