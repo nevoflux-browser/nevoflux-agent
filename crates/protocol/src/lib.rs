@@ -2,6 +2,10 @@
 
 //! NevoFlux Protocol - IPC message definitions for Agent communication.
 
+mod error;
+
+pub use error::{ProtocolError, Result};
+
 /// Protocol version
 pub const PROTOCOL_VERSION: &str = "5.0.0";
 
