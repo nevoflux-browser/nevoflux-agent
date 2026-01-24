@@ -14,6 +14,11 @@ description = "Core daemon for NevoFlux Agent"
 nevoflux-protocol = { path = "../protocol" }
 nevoflux-storage = { path = "../storage" }
 nevoflux-mcp = { path = "../mcp" }
+nevoflux-skills = { path = "../skills" }
+nevoflux-llm = { path = "../llm" }
+
+# LLM framework
+rig-core = { workspace = true }
 
 # Serialization
 serde.workspace = true
@@ -37,7 +42,14 @@ zeromq = { workspace = true }
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 
+# UUID generation
+uuid = { version = "1", features = ["v4"] }
+
+# File glob matching
+glob = "0.3"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 nevoflux-testing = { path = "../testing" }
 wat = "1"
+tempfile = "3"
