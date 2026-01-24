@@ -33,7 +33,7 @@ pub use config::DaemonConfig;
 pub use error::{DaemonError, Result};
 pub use registry::{ActiveRequest, ProxyInfo, ProxyRegistry, RequestRegistry};
 pub use router::Router;
-pub use server::{find_available_port, Server, ServerConfig};
+pub use server::{find_available_port, start_server, Server, ServerConfig};
 pub use session::SessionManager;
 
 #[cfg(test)]

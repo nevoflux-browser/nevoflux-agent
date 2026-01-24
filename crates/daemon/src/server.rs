@@ -1,7 +1,12 @@
 //! ZeroMQ ROUTER server for the daemon.
 
 use crate::error::{DaemonError, Result};
+use crate::router::Router;
+use nevoflux_protocol::ProxyEnvelope;
+use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing::{debug, error, info};
+use zeromq::Socket;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -59,6 +64,60 @@ pub async fn find_available_port(config: &ServerConfig) -> Result<u16> {
     Err(DaemonError::PortExhausted)
 }
 
+/// Start the ZeroMQ server.
+pub async fn start_server(config: ServerConfig, router: Arc<Router>) -> Result<Server> {
+    let port = find_available_port(&config).await?;
+    let addr = format!("tcp://{}:{}", config.bind_address, port);
+
+    info!("Starting daemon server on {}", addr);
+
+    let mut socket = zeromq::RouterSocket::new();
+    socket
+        .bind(&addr)
+        .await
+        .map_err(|e| DaemonError::InternalError(format!("Failed to bind: {}", e)))?;
+
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    let (msg_tx, mut _msg_rx) = mpsc::channel::<(Vec<u8>, ProxyEnvelope)>(100);
+
+    // Spawn receive loop
+    let recv_socket = socket;
+    let _router = router;
+    tokio::spawn(async move {
+        let mut socket = recv_socket;
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    info!("Server shutdown signal received");
+                    break;
+                }
+                msg = zeromq::SocketRecv::recv(&mut socket) => {
+                    match msg {
+                        Ok(zmq_msg) => {
+                            let frames = zmq_msg.into_vec();
+                            if frames.len() >= 2 {
+                                let identity = frames[0].to_vec();
+                                if let Ok(envelope) = serde_json::from_slice::<ProxyEnvelope>(&frames[1]) {
+                                    debug!("Received message from {}", envelope.proxy_id);
+                                    let _ = msg_tx.send((identity, envelope)).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Receive error: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(Server {
+        port,
+        shutdown_tx: Some(shutdown_tx),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +137,20 @@ mod tests {
         assert!(port.is_ok());
         let port = port.unwrap();
         assert!(port >= 19500 && port <= 19600);
+    }
+
+    #[tokio::test]
+    async fn test_server_start_and_shutdown() {
+        let config = ServerConfig::default();
+        let router = Arc::new(Router::new());
+
+        let server = start_server(config, router).await;
+        assert!(server.is_ok());
+
+        let mut server = server.unwrap();
+        assert!(server.port() >= 19500);
+
+        // Shutdown
+        server.shutdown().await;
     }
 }
