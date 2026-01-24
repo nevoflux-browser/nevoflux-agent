@@ -10,6 +10,8 @@
 //! let model = client.completion_model("qwen-turbo");
 //! ```
 
+mod client;
 mod types;
 
+pub use client::{QwenClient, QWEN_BASE_URL};
 pub use types::*;
