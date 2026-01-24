@@ -1,0 +1,38 @@
+# crates/daemon/Cargo.toml
+
+[package]
+name = "nevoflux-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+description = "Core daemon for NevoFlux Agent"
+
+[dependencies]
+# Internal crates
+nevoflux-protocol = { path = "../protocol" }
+nevoflux-storage = { path = "../storage" }
+nevoflux-mcp = { path = "../mcp" }
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Async runtime
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "signal", "fs"] }
+async-trait.workspace = true
+futures.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Logging
+tracing = "0.1"
+
+# ZeroMQ
+zeromq = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+nevoflux-testing = { path = "../testing" }
