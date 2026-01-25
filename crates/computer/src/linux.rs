@@ -78,16 +78,22 @@ impl LinuxComputer {
 
     /// Convert raw X11 image data (BGRA) to PNG and encode as base64.
     fn encode_to_png_base64(&self, data: &[u8], width: u32, height: u32) -> Result<String> {
+        // Validate data size - must be a multiple of 4 (BGRA = 4 bytes per pixel)
+        if data.len() % 4 != 0 {
+            return Err(ComputerError::ScreenshotFailed(format!(
+                "Invalid image data length: {} (not a multiple of 4)",
+                data.len()
+            )));
+        }
+
         // X11 returns BGRA format, we need to convert to RGBA
         let mut rgba_data = Vec::with_capacity(data.len());
-        for chunk in data.chunks(4) {
-            if chunk.len() >= 4 {
-                // BGRA -> RGBA
-                rgba_data.push(chunk[2]); // R
-                rgba_data.push(chunk[1]); // G
-                rgba_data.push(chunk[0]); // B
-                rgba_data.push(chunk[3]); // A
-            }
+        for chunk in data.chunks_exact(4) {
+            // BGRA -> RGBA
+            rgba_data.push(chunk[2]); // R
+            rgba_data.push(chunk[1]); // G
+            rgba_data.push(chunk[0]); // B
+            rgba_data.push(chunk[3]); // A
         }
 
         // Create image buffer
@@ -420,9 +426,9 @@ mod tests {
                 let result = computer.get_position().await;
                 // This should succeed if X11 is available
                 if let Ok(pos) = result {
-                    // Position should be within some reasonable bounds
-                    assert!(pos.x >= 0 || pos.x < 0); // Any valid coordinate
-                    assert!(pos.y >= 0 || pos.y < 0);
+                    // Mouse position should be within reasonable bounds
+                    assert!(pos.x >= 0);
+                    assert!(pos.y >= 0);
                 }
             }
         }
