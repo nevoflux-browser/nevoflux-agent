@@ -1,0 +1,9 @@
+{
+  "name": "com.nevoflux.agent",
+  "description": "NevoFlux Agent - AI-powered computer control",
+  "path": "{{BINARY_PATH}}",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://{{EXTENSION_ID}}/"
+  ]
+}
