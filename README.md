@@ -24,7 +24,7 @@ AI-powered browser assistant with native computer control capabilities.
 ### Build from Source
 
 ```bash
-git clone https://github.com/nevoflux/nevoflux-agent
+git clone https://github.com/dorisgyl/nevoflux-agent
 cd nevoflux-agent
 cargo build --release
 ```
@@ -33,18 +33,17 @@ The binary will be available at `target/release/nevoflux`.
 
 ### Install Native Messaging Host
 
-```bash
-# Linux (Chrome/Chromium)
-mkdir -p ~/.config/chromium/NativeMessagingHosts
-cp install/native-host/com.nevoflux.agent.json ~/.config/chromium/NativeMessagingHosts/
+Use the setup script to install the native messaging host:
 
-# macOS
-mkdir -p ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts
-cp install/native-host/com.nevoflux.agent.json ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts/
+```bash
+# Linux/macOS
+./install/native-host/setup.sh $(pwd)/target/release/nevoflux YOUR_EXTENSION_ID chrome
 
 # Windows (PowerShell as Administrator)
-# Registry key will be set automatically by setup script
+.\install\native-host\setup.ps1 -BinaryPath "$PWD\target\release\nevoflux.exe" -ExtensionId "YOUR_EXTENSION_ID" -Browser chrome
 ```
+
+The setup script configures the native messaging manifest with the correct binary path and extension ID.
 
 ## Usage
 
