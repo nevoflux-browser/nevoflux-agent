@@ -7,6 +7,7 @@ use wasmtime::{Caller, Engine, Linker};
 
 use crate::error::{DaemonError, Result};
 use crate::wasm::services::HostServices;
+use nevoflux_storage::{MemoryChunk, MemoryRepository};
 
 /// Initial capacity for the memory buffer (1MB).
 const MEMORY_BUFFER_CAPACITY: usize = 1024 * 1024;
@@ -319,8 +320,25 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
                     return -1;
                 }
 
-                // Generate a simple ID
+                let content = match String::from_utf8(content_buf) {
+                    Ok(s) => s,
+                    Err(_) => return -1,
+                };
+
+                // Generate UUID for ID
                 let id = format!("mem-{}", uuid::Uuid::new_v4());
+
+                // Store in database if services available
+                if let Some(services) = &caller.data().services {
+                    let chunk = MemoryChunk::new(&content).with_id(&id);
+                    let repo = MemoryRepository::new(&services.database);
+                    if repo.create(&chunk).is_err() {
+                        // Still return the ID even if storage fails
+                        tracing::warn!("Failed to store memory chunk in database");
+                    }
+                }
+
+                // Write ID to guest memory
                 let id_bytes = id.as_bytes();
                 let write_len = std::cmp::min(id_bytes.len(), result_len as usize);
 
@@ -339,7 +357,7 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
         })?;
 
     // Register memory_delete: deletes a memory chunk
-    // memory_delete: id_ptr, id_len -> 1 for success, -1 for error
+    // memory_delete: id_ptr, id_len -> 1 for success, 0 for failure
     linker
         .func_wrap(
             "nevoflux",
@@ -347,16 +365,32 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
             |mut caller: Caller<'_, HostState>, id_ptr: i32, id_len: i32| -> i32 {
                 let memory = match caller.get_export("memory") {
                     Some(wasmtime::Extern::Memory(mem)) => mem,
-                    _ => return -1,
+                    _ => return 0,
                 };
 
+                // Read ID from guest memory
                 let mut id_buf = vec![0u8; id_len as usize];
                 if memory.read(&caller, id_ptr as usize, &mut id_buf).is_err() {
-                    return -1;
+                    return 0;
                 }
 
-                // Return success (actual deletion would use services)
-                1
+                let id = match String::from_utf8(id_buf) {
+                    Ok(s) => s,
+                    Err(_) => return 0,
+                };
+
+                // Delete from database if services available
+                match &caller.data().services {
+                    Some(services) => {
+                        let repo = MemoryRepository::new(&services.database);
+                        match repo.delete(&id) {
+                            Ok(true) => 1,  // Successfully deleted
+                            Ok(false) => 0, // Not found
+                            Err(_) => 0,    // Error
+                        }
+                    }
+                    None => 1, // No services, return success (no-op)
+                }
             },
         )
         .map_err(|e| {
@@ -372,7 +406,7 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
             |mut caller: Caller<'_, HostState>,
              query_ptr: i32,
              query_len: i32,
-             _limit: i32,
+             limit: i32,
              results_ptr: i32,
              results_len: i32|
              -> i32 {
@@ -381,7 +415,7 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
                     _ => return -1,
                 };
 
-                // Read query (for logging/validation)
+                // Read query from guest memory
                 let mut query_buf = vec![0u8; query_len as usize];
                 if memory
                     .read(&caller, query_ptr as usize, &mut query_buf)
@@ -390,12 +424,47 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
                     return -1;
                 }
 
-                // Return empty JSON array for now
-                let result = b"[]";
-                let write_len = std::cmp::min(result.len(), results_len as usize);
+                let query = match String::from_utf8(query_buf) {
+                    Ok(s) => s,
+                    Err(_) => return -1,
+                };
+
+                // Get database from services and search
+                let result_json = match &caller.data().services {
+                    Some(services) => {
+                        let repo = MemoryRepository::new(&services.database);
+                        let limit = if limit <= 0 { 10 } else { limit as usize };
+
+                        match repo.search_fts(&query, limit) {
+                            Ok(chunks) => {
+                                // Serialize results to JSON with id, content, metadata fields
+                                let results: Vec<serde_json::Value> = chunks
+                                    .into_iter()
+                                    .map(|chunk| {
+                                        serde_json::json!({
+                                            "id": chunk.id,
+                                            "content": chunk.content,
+                                            "metadata": chunk.metadata
+                                        })
+                                    })
+                                    .collect();
+                                serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string())
+                            }
+                            Err(_) => "[]".to_string(),
+                        }
+                    }
+                    None => "[]".to_string(),
+                };
+
+                let result_bytes = result_json.as_bytes();
+                let write_len = std::cmp::min(result_bytes.len(), results_len as usize);
 
                 if memory
-                    .write(&mut caller, results_ptr as usize, &result[..write_len])
+                    .write(
+                        &mut caller,
+                        results_ptr as usize,
+                        &result_bytes[..write_len],
+                    )
                     .is_err()
                 {
                     return -1;
@@ -1395,5 +1464,215 @@ mod tests {
             "Expected glob to find file.rs, got {} bytes",
             result
         );
+    }
+
+    #[test]
+    fn test_memory_create_with_database() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "memory_create" (func $memory_create (param i32 i32 i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "test content for database")
+                (func (export "test") (result i32)
+                    i32.const 0    ;; content_ptr
+                    i32.const 25   ;; content_len
+                    i32.const 0    ;; metadata_ptr (unused)
+                    i32.const 0    ;; metadata_len (unused)
+                    i32.const 100  ;; result_ptr
+                    i32.const 256  ;; result_len
+                    call $memory_create
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let services = crate::wasm::services::HostServices::new(db.clone());
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert_eq!(result, 40); // ID format is "mem-{uuid}" which is 40 chars
+
+        // Read the ID from guest memory
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("Failed to get memory");
+        let mut id_buf = [0u8; 40];
+        memory
+            .read(&store, 100, &mut id_buf)
+            .expect("Failed to read ID");
+        let id = String::from_utf8(id_buf.to_vec()).expect("Invalid UTF-8");
+
+        // Verify the chunk was stored in the database
+        let repo = MemoryRepository::new(&db);
+        let chunk = repo.get(&id).expect("Failed to get chunk from database");
+        assert!(chunk.is_some());
+        let chunk = chunk.unwrap();
+        assert_eq!(chunk.content, "test content for database");
+    }
+
+    #[test]
+    fn test_memory_delete_with_database() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        // First create a memory chunk in the database
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let chunk = MemoryChunk::new("content to delete").with_id("test-delete-id");
+        let repo = MemoryRepository::new(&db);
+        repo.create(&chunk).expect("Failed to create chunk");
+
+        // Verify chunk exists
+        assert!(repo.get("test-delete-id").unwrap().is_some());
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "memory_delete" (func $memory_delete (param i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "test-delete-id")
+                (func (export "test") (result i32)
+                    i32.const 0   ;; id_ptr
+                    i32.const 14  ;; id_len
+                    call $memory_delete
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let services = crate::wasm::services::HostServices::new(db.clone());
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert_eq!(result, 1); // Success
+
+        // Verify chunk was deleted from the database
+        assert!(repo.get("test-delete-id").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_memory_search_with_database() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        // Create some memory chunks in the database
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let repo = MemoryRepository::new(&db);
+
+        let chunk1 = MemoryChunk::new("The quick brown fox jumps").with_id("search-1");
+        let chunk2 = MemoryChunk::new("A lazy dog sleeps").with_id("search-2");
+        let chunk3 = MemoryChunk::new("The brown bear runs").with_id("search-3");
+
+        repo.create(&chunk1).expect("Failed to create chunk1");
+        repo.create(&chunk2).expect("Failed to create chunk2");
+        repo.create(&chunk3).expect("Failed to create chunk3");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "memory_search" (func $memory_search (param i32 i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "brown")
+                (func (export "test") (result i32)
+                    i32.const 0    ;; query_ptr
+                    i32.const 5    ;; query_len ("brown")
+                    i32.const 10   ;; limit
+                    i32.const 100  ;; results_ptr
+                    i32.const 1024 ;; results_len
+                    call $memory_search
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let services = crate::wasm::services::HostServices::new(db.clone());
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert!(result > 2, "Expected search results, got {} bytes", result);
+
+        // Read and parse the results from guest memory
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("Failed to get memory");
+        let mut result_buf = vec![0u8; result as usize];
+        memory
+            .read(&store, 100, &mut result_buf)
+            .expect("Failed to read results");
+        let result_json = String::from_utf8(result_buf).expect("Invalid UTF-8");
+
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&result_json).expect("Failed to parse JSON");
+
+        // Should find 2 chunks with "brown"
+        assert_eq!(results.len(), 2);
+
+        // Verify the result structure has id, content, and metadata
+        for result in &results {
+            assert!(result.get("id").is_some());
+            assert!(result.get("content").is_some());
+            assert!(result.get("metadata").is_some());
+        }
+    }
+
+    #[test]
+    fn test_memory_delete_nonexistent() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "memory_delete" (func $memory_delete (param i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "nonexistent-id")
+                (func (export "test") (result i32)
+                    i32.const 0   ;; id_ptr
+                    i32.const 14  ;; id_len
+                    call $memory_delete
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let services = crate::wasm::services::HostServices::new(db);
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert_eq!(result, 0); // Not found
     }
 }
