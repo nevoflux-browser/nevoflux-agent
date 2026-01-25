@@ -83,27 +83,46 @@ function executeCommand(action, payload) {
       break;
 
     case 'get-element':
-      const element = document.querySelector(payload.selector);
-      if (element) {
-        const rect = element.getBoundingClientRect();
-        sendToBackground({
-          type: 'send',
-          payload: {
-            type: 'response',
-            data: {
-              found: true,
-              x: rect.x,
-              y: rect.y,
-              width: rect.width,
-              height: rect.height,
-              text: element.textContent?.slice(0, 1000)
+      try {
+        // Validate selector is provided
+        if (!payload.selector || typeof payload.selector !== 'string') {
+          sendToBackground({
+            type: 'send',
+            payload: { type: 'response', data: { found: false, error: 'Invalid selector' } }
+          });
+          break;
+        }
+
+        const element = document.querySelector(payload.selector);
+        if (element) {
+          const rect = element.getBoundingClientRect();
+          const text = element.textContent?.slice(0, 1000);
+          sendToBackground({
+            type: 'send',
+            payload: {
+              type: 'response',
+              data: {
+                found: true,
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+                text: text,
+                truncated: element.textContent && element.textContent.length > 1000
+              }
             }
-          }
-        });
-      } else {
+          });
+        } else {
+          sendToBackground({
+            type: 'send',
+            payload: { type: 'response', data: { found: false } }
+          });
+        }
+      } catch (e) {
+        console.error('[NevoFlux] Invalid selector:', e.message);
         sendToBackground({
           type: 'send',
-          payload: { type: 'response', data: { found: false } }
+          payload: { type: 'response', data: { found: false, error: 'Invalid CSS selector' } }
         });
       }
       break;
