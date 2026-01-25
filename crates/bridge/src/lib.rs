@@ -62,6 +62,7 @@ pub mod mcp_bridge;
 pub mod native_messaging;
 pub mod port_discovery;
 pub mod proxy;
+pub mod streaming;
 
 // Re-export main types
 pub use config::BridgeConfig;
@@ -74,6 +75,9 @@ pub use port_discovery::{
     read_pid_file, read_port_file, write_pid_file, write_port_file, DaemonInfo,
 };
 pub use proxy::{parse_native_message, Proxy, ProxyConfig, ProxyState};
+pub use streaming::{
+    extract_stream_message, ActiveStream, StreamAccumulator, StreamError, StreamMessageType,
+};
 
 #[cfg(test)]
 mod tests {
