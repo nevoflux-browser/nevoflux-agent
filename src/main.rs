@@ -10,6 +10,7 @@
 //! - `nevoflux setup` - Interactive setup wizard
 
 mod cli;
+mod logging;
 
 use clap::Parser;
 use cli::{Cli, Commands, ConfigAction};
@@ -232,18 +233,12 @@ fn write_daemon_files(port: u16) -> std::io::Result<()> {
 /// This bridges between the browser extension (via Native Messaging on stdin/stdout)
 /// and the daemon (via ZeroMQ). Messages from the browser are forwarded to the daemon,
 /// and responses from the daemon are forwarded back to the browser.
-async fn run_proxy() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_proxy(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     use nevoflux_bridge::{parse_native_message, BridgeConfig, Proxy, ProxyConfig};
     use tokio::io::{stdin, stdout};
 
     // Initialize logging to stderr (stdout is for Native Messaging)
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("nevoflux=debug".parse().unwrap()),
-        )
-        .init();
+    logging::init_stderr_logging(verbose, Some("nevoflux=debug"));
 
     tracing::debug!("Starting proxy mode");
 
@@ -301,18 +296,13 @@ async fn run_proxy() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// This starts an MCP server that communicates via stdio, allowing
 /// Claude Code or other MCP clients to use browser automation tools.
-async fn run_mcp() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_mcp(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     use nevoflux_mcp::{create_tools, run_stdio_server, McpServer, McpServerConfig};
 
     // Initialize logging to stderr (stdout is for MCP protocol)
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("nevoflux=info".parse().unwrap()),
-        )
-        .init();
+    logging::init_stderr_logging(verbose, Some("nevoflux=info"));
 
+    logging::log_startup(env!("CARGO_PKG_VERSION"));
     tracing::info!("Starting MCP server mode");
 
     // Create server with default configuration
@@ -331,14 +321,10 @@ async fn run_mcp() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Run the daemon.
-async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_daemon(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("nevoflux=info".parse().unwrap()),
-        )
-        .init();
+    logging::init_logging(verbose, None);
+    logging::log_startup(env!("CARGO_PKG_VERSION"));
 
     // Acquire lock
     let _lock = match acquire_daemon_lock() {
@@ -368,7 +354,7 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for shutdown signal
     tokio::signal::ctrl_c().await?;
 
-    tracing::info!("Shutting down...");
+    logging::log_shutdown();
 
     // Cleanup
     let data_dir = get_data_dir();
@@ -623,12 +609,12 @@ async fn main() {
 
     // Handle flags
     if cli.daemon {
-        if let Err(e) = run_daemon().await {
+        if let Err(e) = run_daemon(cli.verbose).await {
             eprintln!("Daemon error: {}", e);
             std::process::exit(1);
         }
     } else if cli.mcp {
-        if let Err(e) = run_mcp().await {
+        if let Err(e) = run_mcp(cli.verbose).await {
             eprintln!("MCP server error: {}", e);
             std::process::exit(1);
         }
@@ -636,7 +622,7 @@ async fn main() {
         run_status();
     } else if cli.stop {
         run_stop();
-    } else if let Err(e) = run_proxy().await {
+    } else if let Err(e) = run_proxy(cli.verbose).await {
         eprintln!("Proxy error: {}", e);
         std::process::exit(1);
     }
