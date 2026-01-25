@@ -31,9 +31,9 @@ impl SkillsManager {
     /// Load skills from configured directories.
     pub async fn load(&self) -> Result<usize> {
         let mut registry = self.registry.write().await;
-        registry.load().map_err(|e| {
-            DaemonError::InternalError(format!("Failed to load skills: {}", e))
-        })?;
+        registry
+            .load()
+            .map_err(|e| DaemonError::InternalError(format!("Failed to load skills: {}", e)))?;
         Ok(registry.len())
     }
 

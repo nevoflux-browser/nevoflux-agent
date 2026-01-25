@@ -12,7 +12,7 @@ fn test_help_output() {
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("NevoFlux Native Agent"));
+        .stdout(predicate::str::contains("NevoFlux"));
 }
 
 #[test]

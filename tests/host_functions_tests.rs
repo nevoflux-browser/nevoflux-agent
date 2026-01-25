@@ -84,7 +84,7 @@ fn create_full_host_test_wasm() -> Vec<u8> {
             (import "nevoflux" "memory_delete" (func $memory_delete (param i32 i32) (result i32)))
             (import "nevoflux" "skill_list" (func $skill_list (param i32 i32) (result i32)))
             (import "nevoflux" "skill_load" (func $skill_load (param i32 i32 i32 i32) (result i32)))
-            (import "nevoflux" "permission_check" (func $permission_check (param i32 i32) (result i32)))
+            (import "nevoflux" "permission_check" (func $permission_check (param i32 i32 i32 i32) (result i32)))
             (import "nevoflux" "tool_read" (func $tool_read (param i32 i32 i64 i64 i32 i32) (result i32)))
             (import "nevoflux" "tool_glob" (func $tool_glob (param i32 i32 i32 i32 i32 i32) (result i32)))
 
@@ -103,7 +103,11 @@ fn test_host_functions_available() {
     let wasm = create_full_host_test_wasm();
     let runtime = WasmRuntime::from_bytes(&wasm).unwrap();
     let instance = WasmInstance::new(&runtime);
-    assert!(instance.is_ok(), "Failed to instantiate module with all host functions: {:?}", instance.err());
+    assert!(
+        instance.is_ok(),
+        "Failed to instantiate module with all host functions: {:?}",
+        instance.err()
+    );
 }
 
 #[test]
@@ -158,7 +162,10 @@ fn test_memory_export_available() {
     let runtime = WasmRuntime::from_bytes(&wasm).unwrap();
     let mut instance = WasmInstance::new(&runtime).unwrap();
 
-    assert!(instance.has_export("memory"), "Memory export should be available");
+    assert!(
+        instance.has_export("memory"),
+        "Memory export should be available"
+    );
 }
 
 #[test]
@@ -177,7 +184,10 @@ fn test_llm_chat_import() {
 
     let runtime = WasmRuntime::from_bytes(&wasm).unwrap();
     let instance = WasmInstance::new(&runtime);
-    assert!(instance.is_ok(), "Module with llm_chat import should instantiate");
+    assert!(
+        instance.is_ok(),
+        "Module with llm_chat import should instantiate"
+    );
 }
 
 #[test]
@@ -186,7 +196,7 @@ fn test_permission_check_import() {
     let wasm = wat::parse_str(
         r#"
         (module
-            (import "nevoflux" "permission_check" (func $permission_check (param i32 i32) (result i32)))
+            (import "nevoflux" "permission_check" (func $permission_check (param i32 i32 i32 i32) (result i32)))
             (memory (export "memory") 1)
             (func (export "get_abi_version") (result i32) i32.const 1)
         )
@@ -196,7 +206,10 @@ fn test_permission_check_import() {
 
     let runtime = WasmRuntime::from_bytes(&wasm).unwrap();
     let instance = WasmInstance::new(&runtime);
-    assert!(instance.is_ok(), "Module with permission_check import should instantiate");
+    assert!(
+        instance.is_ok(),
+        "Module with permission_check import should instantiate"
+    );
 }
 
 #[test]
@@ -216,7 +229,10 @@ fn test_tool_functions_import() {
 
     let runtime = WasmRuntime::from_bytes(&wasm).unwrap();
     let instance = WasmInstance::new(&runtime);
-    assert!(instance.is_ok(), "Module with tool functions import should instantiate");
+    assert!(
+        instance.is_ok(),
+        "Module with tool functions import should instantiate"
+    );
 }
 
 #[test]
@@ -237,7 +253,10 @@ fn test_memory_functions_import() {
 
     let runtime = WasmRuntime::from_bytes(&wasm).unwrap();
     let instance = WasmInstance::new(&runtime);
-    assert!(instance.is_ok(), "Module with memory functions import should instantiate");
+    assert!(
+        instance.is_ok(),
+        "Module with memory functions import should instantiate"
+    );
 }
 
 #[test]
@@ -257,7 +276,10 @@ fn test_skill_functions_import() {
 
     let runtime = WasmRuntime::from_bytes(&wasm).unwrap();
     let instance = WasmInstance::new(&runtime);
-    assert!(instance.is_ok(), "Module with skill functions import should instantiate");
+    assert!(
+        instance.is_ok(),
+        "Module with skill functions import should instantiate"
+    );
 }
 
 #[test]

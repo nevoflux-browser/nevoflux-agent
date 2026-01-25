@@ -7,7 +7,9 @@ use wasmtime::{Caller, Engine, Linker};
 
 use crate::error::{DaemonError, Result};
 use crate::wasm::services::HostServices;
-use nevoflux_storage::{CheckPermissionParams, MemoryChunk, MemoryRepository, PermissionRepository};
+use nevoflux_storage::{
+    CheckPermissionParams, MemoryChunk, MemoryRepository, PermissionRepository,
+};
 
 /// Initial capacity for the memory buffer (1MB).
 const MEMORY_BUFFER_CAPACITY: usize = 1024 * 1024;
