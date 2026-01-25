@@ -6,9 +6,15 @@
 //! - `nevoflux --mcp` - MCP server mode
 //! - `nevoflux --status` - Show daemon status
 //! - `nevoflux --stop` - Stop daemon
+//! - `nevoflux config <action>` - Configuration management
+//! - `nevoflux setup` - Interactive setup wizard
+
+mod cli;
 
 use clap::Parser;
+use cli::{Cli, Commands, ConfigAction};
 use fs2::FileExt;
+use nevoflux_storage::Storage;
 use std::fs::File;
 use std::path::PathBuf;
 
@@ -372,45 +378,263 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// NevoFlux Native Agent - AI-powered browser assistant
-#[derive(Parser, Debug)]
-#[command(name = "nevoflux")]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    /// Run as daemon (core processing)
-    #[arg(long)]
-    daemon: bool,
+/// Get the database path for storage.
+fn get_db_path() -> PathBuf {
+    get_data_dir().join("nevoflux.db")
+}
 
-    /// Run as MCP server (stdio bridge)
-    #[arg(long)]
-    mcp: bool,
+/// Open storage, creating if necessary.
+fn open_storage() -> Result<Storage, Box<dyn std::error::Error>> {
+    let db_path = get_db_path();
+    ensure_data_dir()?;
+    Ok(Storage::open(&db_path)?)
+}
 
-    /// Show daemon status
-    #[arg(long)]
-    status: bool,
+/// Run the config show command.
+fn run_config_show() {
+    match open_storage() {
+        Ok(storage) => match storage.config().list() {
+            Ok(entries) => {
+                if entries.is_empty() {
+                    println!("No configuration entries found.");
+                    println!("Run 'nevoflux config init' to initialize default configuration.");
+                } else {
+                    println!("Configuration:");
+                    println!("{}", "-".repeat(60));
+                    for entry in entries {
+                        let value_str = serde_json::to_string_pretty(&entry.value)
+                            .unwrap_or_else(|_| entry.value.to_string());
+                        println!("{} = {}", entry.key, value_str);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Error listing configuration: {}", e);
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            eprintln!("Error opening storage: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
 
-    /// Stop running daemon
-    #[arg(long)]
-    stop: bool,
+/// Run the config init command.
+fn run_config_init() {
+    match open_storage() {
+        Ok(storage) => {
+            let defaults = [
+                ("app.name", serde_json::json!("NevoFlux")),
+                ("app.version", serde_json::json!(env!("CARGO_PKG_VERSION"))),
+                ("daemon.port", serde_json::json!(0)), // 0 means auto-assign
+                ("daemon.auto_start", serde_json::json!(true)),
+                ("logging.level", serde_json::json!("info")),
+                ("logging.file", serde_json::json!(null)),
+            ];
+
+            for (key, value) in defaults {
+                // Only set if not already exists
+                match storage.config().get(key) {
+                    Ok(Some(_)) => {
+                        println!("  {} (already set, skipping)", key);
+                    }
+                    Ok(None) => {
+                        if let Err(e) = storage.config().set(key, value.clone()) {
+                            eprintln!("Error setting {}: {}", key, e);
+                        } else {
+                            println!("  {} = {}", key, value);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error checking {}: {}", key, e);
+                    }
+                }
+            }
+            println!("\nConfiguration initialized.");
+        }
+        Err(e) => {
+            eprintln!("Error opening storage: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Run the config get command.
+fn run_config_get(key: &str) {
+    match open_storage() {
+        Ok(storage) => match storage.config().get(key) {
+            Ok(Some(value)) => {
+                let value_str =
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+                println!("{}", value_str);
+            }
+            Ok(None) => {
+                eprintln!("Key '{}' not found", key);
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error getting configuration: {}", e);
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            eprintln!("Error opening storage: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Run the config set command.
+fn run_config_set(key: &str, value: &str) {
+    match open_storage() {
+        Ok(storage) => {
+            // Try to parse as JSON, fall back to string
+            let json_value: serde_json::Value = serde_json::from_str(value)
+                .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+
+            match storage.config().set(key, json_value.clone()) {
+                Ok(()) => {
+                    println!("Set {} = {}", key, json_value);
+                }
+                Err(e) => {
+                    eprintln!("Error setting configuration: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Error opening storage: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Run the config delete command.
+fn run_config_delete(key: &str) {
+    match open_storage() {
+        Ok(storage) => match storage.config().delete(key) {
+            Ok(true) => {
+                println!("Deleted '{}'", key);
+            }
+            Ok(false) => {
+                eprintln!("Key '{}' not found", key);
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error deleting configuration: {}", e);
+                std::process::exit(1);
+            }
+        },
+        Err(e) => {
+            eprintln!("Error opening storage: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Run the config list command.
+fn run_config_list(prefix: &str) {
+    match open_storage() {
+        Ok(storage) => {
+            let result = if prefix.is_empty() {
+                storage.config().list()
+            } else {
+                storage.config().list_by_prefix(prefix)
+            };
+
+            match result {
+                Ok(entries) => {
+                    if entries.is_empty() {
+                        if prefix.is_empty() {
+                            println!("No configuration entries found.");
+                        } else {
+                            println!("No configuration entries found with prefix '{}'", prefix);
+                        }
+                    } else {
+                        for entry in entries {
+                            let value_str = serde_json::to_string(&entry.value)
+                                .unwrap_or_else(|_| entry.value.to_string());
+                            println!("{} = {}", entry.key, value_str);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error listing configuration: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Error opening storage: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Run the setup wizard.
+fn run_setup() {
+    println!("NevoFlux Setup Wizard");
+    println!("{}", "=".repeat(40));
+    println!();
+
+    // Initialize default configuration
+    println!("Initializing default configuration...");
+    run_config_init();
+
+    println!();
+    println!("Setup complete!");
+    println!();
+    println!("Next steps:");
+    println!("  1. Start the daemon: nevoflux --daemon");
+    println!("  2. Check status: nevoflux --status");
+    println!("  3. View configuration: nevoflux config show");
+}
+
+/// Handle config subcommands.
+fn handle_config_command(action: ConfigAction) {
+    match action {
+        ConfigAction::Show => run_config_show(),
+        ConfigAction::Init => run_config_init(),
+        ConfigAction::Get { key } => run_config_get(&key),
+        ConfigAction::Set { key, value } => run_config_set(&key, &value),
+        ConfigAction::Delete { key } => run_config_delete(&key),
+        ConfigAction::List { prefix } => run_config_list(&prefix),
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    if args.daemon {
+    // Handle subcommands first (they don't require async)
+    if let Some(command) = cli.command {
+        match command {
+            Commands::Config { action } => {
+                handle_config_command(action);
+                return;
+            }
+            Commands::Setup => {
+                run_setup();
+                return;
+            }
+        }
+    }
+
+    // Handle flags
+    if cli.daemon {
         if let Err(e) = run_daemon().await {
             eprintln!("Daemon error: {}", e);
             std::process::exit(1);
         }
-    } else if args.mcp {
+    } else if cli.mcp {
         if let Err(e) = run_mcp().await {
             eprintln!("MCP server error: {}", e);
             std::process::exit(1);
         }
-    } else if args.status {
+    } else if cli.status {
         run_status();
-    } else if args.stop {
+    } else if cli.stop {
         run_stop();
     } else if let Err(e) = run_proxy().await {
         eprintln!("Proxy error: {}", e);
