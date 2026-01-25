@@ -33,6 +33,7 @@ pub mod router;
 pub mod server;
 pub mod session;
 pub mod skills;
+pub mod validation;
 pub mod wasm;
 
 pub use config::{
@@ -68,6 +69,10 @@ pub use agent::computer_tools::create_computer;
 pub use health::{HealthMonitor, HealthStatus};
 pub use retry::{with_retry, RetryConfig, Retryable};
 pub use skills::SkillsManager;
+pub use validation::{
+    validate_extension_id, validate_length, validate_path, validate_port, validate_session_id,
+    ValidationError,
+};
 
 #[cfg(test)]
 mod tests {
