@@ -7,7 +7,7 @@ use wasmtime::{Caller, Engine, Linker};
 
 use crate::error::{DaemonError, Result};
 use crate::wasm::services::HostServices;
-use nevoflux_storage::{MemoryChunk, MemoryRepository};
+use nevoflux_storage::{CheckPermissionParams, MemoryChunk, MemoryRepository, PermissionRepository};
 
 /// Initial capacity for the memory buffer (1MB).
 const MEMORY_BUFFER_CAPACITY: usize = 1024 * 1024;
@@ -477,14 +477,89 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
             DaemonError::InternalError(format!("Failed to register memory_search: {}", e))
         })?;
 
-    // Register permission_check: placeholder that returns 1 (always allowed)
+    // Register permission_check: checks permission against database
+    // permission_check: resource_ptr, resource_len, action_ptr, action_len -> 1 (allowed), 0 (denied), -1 (error)
     linker
         .func_wrap(
             "nevoflux",
             "permission_check",
-            |_caller: Caller<'_, HostState>, _action_ptr: i32, _action_len: i32| -> i32 {
-                // Placeholder: always allowed
-                1
+            |mut caller: Caller<'_, HostState>,
+             resource_ptr: i32,
+             resource_len: i32,
+             action_ptr: i32,
+             action_len: i32|
+             -> i32 {
+                // If no services available, allow in development mode
+                let services = match &caller.data().services {
+                    Some(s) => s.clone(),
+                    None => return 1, // Allow in development mode
+                };
+
+                let memory = match caller.get_export("memory") {
+                    Some(wasmtime::Extern::Memory(mem)) => mem,
+                    _ => {
+                        tracing::error!("Guest module has no memory export");
+                        return -1;
+                    }
+                };
+
+                // Read resource string from guest memory
+                let mut resource_buf = vec![0u8; resource_len as usize];
+                if memory
+                    .read(&caller, resource_ptr as usize, &mut resource_buf)
+                    .is_err()
+                {
+                    caller
+                        .data_mut()
+                        .set_error("Failed to read resource from memory");
+                    return -1;
+                }
+
+                let resource = match String::from_utf8(resource_buf) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        caller.data_mut().set_error("Invalid UTF-8 in resource");
+                        return -1;
+                    }
+                };
+
+                // Read action string from guest memory
+                let mut action_buf = vec![0u8; action_len as usize];
+                if memory
+                    .read(&caller, action_ptr as usize, &mut action_buf)
+                    .is_err()
+                {
+                    caller
+                        .data_mut()
+                        .set_error("Failed to read action from memory");
+                    return -1;
+                }
+
+                let action = match String::from_utf8(action_buf) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        caller.data_mut().set_error("Invalid UTF-8 in action");
+                        return -1;
+                    }
+                };
+
+                // Check permission using database
+                // Use "default" as session_id for now
+                let repo = PermissionRepository::new(&services.database);
+                let params = CheckPermissionParams::new("resource", &action, &resource)
+                    .with_session_id("default");
+
+                match repo.check(params) {
+                    Ok(Some(true)) => 1,  // Permission granted
+                    Ok(Some(false)) => 0, // Permission denied
+                    Ok(None) => 1,        // No permission found, allow by default
+                    Err(e) => {
+                        caller
+                            .data_mut()
+                            .set_error(format!("Permission check failed: {}", e));
+                        -1
+                    }
+                }
             },
         )
         .map_err(|e| {
@@ -844,7 +919,7 @@ mod tests {
                 (import "nevoflux" "memory_create" (func $memory_create (param i32 i32 i32 i32 i32 i32) (result i32)))
                 (import "nevoflux" "memory_delete" (func $memory_delete (param i32 i32) (result i32)))
                 (import "nevoflux" "memory_search" (func $memory_search (param i32 i32 i32 i32 i32) (result i32)))
-                (import "nevoflux" "permission_check" (func $permission_check (param i32 i32) (result i32)))
+                (import "nevoflux" "permission_check" (func $permission_check (param i32 i32 i32 i32) (result i32)))
                 (import "nevoflux" "skill_list" (func $skill_list (param i32 i32) (result i32)))
                 (import "nevoflux" "skill_load" (func $skill_load (param i32 i32 i32 i32) (result i32)))
                 (import "nevoflux" "tool_read" (func $tool_read (param i32 i32 i64 i64 i32 i32) (result i32)))
@@ -1098,17 +1173,22 @@ mod tests {
     }
 
     #[test]
-    fn test_permission_check_allowed() {
+    fn test_permission_check_no_services() {
         let engine = Engine::default();
         let linker = create_linker(&engine).expect("Failed to create linker");
 
+        // Test with no services - should return 1 (allowed in development mode)
         let wat = r#"
             (module
-                (import "nevoflux" "permission_check" (func $permission_check (param i32 i32) (result i32)))
+                (import "nevoflux" "permission_check" (func $permission_check (param i32 i32 i32 i32) (result i32)))
                 (memory (export "memory") 1)
+                (data (i32.const 0) "/home/user/file.txt")
+                (data (i32.const 50) "read")
                 (func (export "test") (result i32)
-                    i32.const 0  ;; action_ptr
-                    i32.const 0  ;; action_len
+                    i32.const 0   ;; resource_ptr
+                    i32.const 19  ;; resource_len ("/home/user/file.txt")
+                    i32.const 50  ;; action_ptr
+                    i32.const 4   ;; action_len ("read")
                     call $permission_check
                 )
             )
@@ -1125,7 +1205,148 @@ mod tests {
             .expect("Failed to get test function");
 
         let result = test_func.call(&mut store, ()).expect("Failed to call test");
-        assert_eq!(result, 1); // Always allowed
+        assert_eq!(result, 1); // Allowed in development mode (no services)
+    }
+
+    #[test]
+    fn test_permission_check_with_database_no_permission() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        // Test with database but no permission set - should return 1 (allowed by default)
+        let wat = r#"
+            (module
+                (import "nevoflux" "permission_check" (func $permission_check (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "/home/user/file.txt")
+                (data (i32.const 50) "read")
+                (func (export "test") (result i32)
+                    i32.const 0   ;; resource_ptr
+                    i32.const 19  ;; resource_len
+                    i32.const 50  ;; action_ptr
+                    i32.const 4   ;; action_len
+                    call $permission_check
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open database"));
+        let services = crate::wasm::services::HostServices::new(db);
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert_eq!(result, 1); // Allowed by default when no permission is set
+    }
+
+    #[test]
+    fn test_permission_check_granted() {
+        use nevoflux_storage::{CreatePermissionParams, PermissionScope};
+
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "permission_check" (func $permission_check (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "/allowed/path")
+                (data (i32.const 50) "read")
+                (func (export "test") (result i32)
+                    i32.const 0   ;; resource_ptr
+                    i32.const 13  ;; resource_len ("/allowed/path")
+                    i32.const 50  ;; action_ptr
+                    i32.const 4   ;; action_len ("read")
+                    call $permission_check
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open database"));
+
+        // Create a permission that grants access
+        let repo = PermissionRepository::new(&db);
+        repo.create(
+            CreatePermissionParams::new("resource", "read", "/allowed/path")
+                .with_scope(PermissionScope::Session)
+                .with_session_id("default")
+                .with_granted(true),
+        )
+        .expect("Failed to create permission");
+
+        let services = crate::wasm::services::HostServices::new(db);
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert_eq!(result, 1); // Permission granted
+    }
+
+    #[test]
+    fn test_permission_check_denied() {
+        use nevoflux_storage::{CreatePermissionParams, PermissionScope};
+
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "permission_check" (func $permission_check (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "/denied/path")
+                (data (i32.const 50) "write")
+                (func (export "test") (result i32)
+                    i32.const 0   ;; resource_ptr
+                    i32.const 12  ;; resource_len ("/denied/path")
+                    i32.const 50  ;; action_ptr
+                    i32.const 5   ;; action_len ("write")
+                    call $permission_check
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open database"));
+
+        // Create a permission that denies access
+        let repo = PermissionRepository::new(&db);
+        repo.create(
+            CreatePermissionParams::new("resource", "write", "/denied/path")
+                .with_scope(PermissionScope::Session)
+                .with_session_id("default")
+                .with_granted(false),
+        )
+        .expect("Failed to create permission");
+
+        let services = crate::wasm::services::HostServices::new(db);
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert_eq!(result, 0); // Permission denied
     }
 
     #[test]
