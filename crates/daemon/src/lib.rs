@@ -27,6 +27,7 @@ pub mod context;
 pub mod error;
 pub mod permission;
 pub mod registry;
+pub mod retry;
 pub mod router;
 pub mod server;
 pub mod session;
@@ -49,6 +50,7 @@ pub use agent::{
     AgentContent, AgentInput, AgentMode, AgentOutput, AgentProcessInput, AgentProcessOutput,
     AgentRunner, AgentRunnerConfig, HistoryEntry,
 };
+pub use retry::{with_retry, RetryConfig, Retryable};
 pub use skills::SkillsManager;
 
 #[cfg(test)]

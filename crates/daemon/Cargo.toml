@@ -32,6 +32,9 @@ futures.workspace = true
 # Error handling
 thiserror.workspace = true
 
+# Random number generation (for retry jitter)
+rand = "0.8"
+
 # Logging
 tracing = "0.1"
 
