@@ -25,6 +25,7 @@ pub mod agent;
 pub mod config;
 pub mod context;
 pub mod error;
+pub mod health;
 pub mod permission;
 pub mod registry;
 pub mod retry;
@@ -64,6 +65,7 @@ pub use agent::computer_tools::create_computer;
 pub use agent::computer_tools::create_computer;
 #[cfg(target_os = "windows")]
 pub use agent::computer_tools::create_computer;
+pub use health::{HealthMonitor, HealthStatus};
 pub use retry::{with_retry, RetryConfig, Retryable};
 pub use skills::SkillsManager;
 
