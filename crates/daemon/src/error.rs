@@ -1,5 +1,6 @@
 //! Error types for the daemon.
 
+use crate::retry::Retryable;
 use thiserror::Error;
 
 /// Result type for daemon operations.
@@ -59,6 +60,55 @@ pub enum DaemonError {
     /// No available port in range.
     #[error("No available port in range")]
     PortExhausted,
+
+    /// Connection failed (transient).
+    #[error("Connection failed: {0}")]
+    ConnectionFailed(String),
+
+    /// Operation timed out (transient).
+    #[error("Timeout: {0}")]
+    Timeout(String),
+
+    /// Channel closed unexpectedly (transient).
+    #[error("Channel closed: {0}")]
+    ChannelClosed(String),
+
+    /// Invalid request (permanent).
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
+}
+
+impl Retryable for DaemonError {
+    /// Returns true if this error is transient and the operation should be retried.
+    ///
+    /// Transient errors (retryable):
+    /// - `ConnectionFailed` - Network connection issues may resolve
+    /// - `Timeout` - Temporary overload or network latency
+    /// - `ChannelClosed` - Communication channel can be re-established
+    ///
+    /// Permanent errors (not retryable):
+    /// - `SessionNotFound` - Resource doesn't exist
+    /// - `ProxyNotFound` - Resource doesn't exist
+    /// - `RequestNotFound` - Resource doesn't exist
+    /// - `SessionBusy` - State conflict
+    /// - `ConfigError` - Configuration issues require user intervention
+    /// - `RouterError` - Routing logic errors
+    /// - `ContextError` - Context building failures
+    /// - `PermissionDenied` - Authorization failures
+    /// - `SerializationError` - Data format issues
+    /// - `InternalError` - Implementation bugs
+    /// - `PortExhausted` - No ports available
+    /// - `InvalidRequest` - Client-side errors
+    /// - `StorageError` - Depends on underlying error (treated as non-retryable)
+    /// - `IoError` - Depends on kind (treated as non-retryable by default)
+    fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            DaemonError::ConnectionFailed(_)
+                | DaemonError::Timeout(_)
+                | DaemonError::ChannelClosed(_)
+        )
+    }
 }
 
 impl From<serde_json::Error> for DaemonError {
@@ -82,5 +132,98 @@ mod tests {
         let json_err = serde_json::from_str::<serde_json::Value>("invalid").unwrap_err();
         let daemon_err: DaemonError = json_err.into();
         assert!(matches!(daemon_err, DaemonError::SerializationError(_)));
+    }
+
+    #[test]
+    fn test_connection_failed_is_retryable() {
+        let err = DaemonError::ConnectionFailed("connection refused".to_string());
+        assert!(err.is_retryable());
+        assert!(err.to_string().contains("connection refused"));
+    }
+
+    #[test]
+    fn test_timeout_is_retryable() {
+        let err = DaemonError::Timeout("operation timed out".to_string());
+        assert!(err.is_retryable());
+        assert!(err.to_string().contains("operation timed out"));
+    }
+
+    #[test]
+    fn test_channel_closed_is_retryable() {
+        let err = DaemonError::ChannelClosed("receiver dropped".to_string());
+        assert!(err.is_retryable());
+        assert!(err.to_string().contains("receiver dropped"));
+    }
+
+    #[test]
+    fn test_session_not_found_is_not_retryable() {
+        let err = DaemonError::SessionNotFound("sess-001".to_string());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_permission_denied_is_not_retryable() {
+        let err = DaemonError::PermissionDenied("access denied".to_string());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_invalid_request_is_not_retryable() {
+        let err = DaemonError::InvalidRequest("malformed JSON".to_string());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_internal_error_is_not_retryable() {
+        let err = DaemonError::InternalError("unexpected state".to_string());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_config_error_is_not_retryable() {
+        let err = DaemonError::ConfigError("invalid config".to_string());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_serialization_error_is_not_retryable() {
+        let err = DaemonError::SerializationError("parse error".to_string());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_port_exhausted_is_not_retryable() {
+        let err = DaemonError::PortExhausted;
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_router_error_is_not_retryable() {
+        let err = DaemonError::RouterError("routing failed".to_string());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_context_error_is_not_retryable() {
+        let err = DaemonError::ContextError("context build failed".to_string());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_proxy_not_found_is_not_retryable() {
+        let err = DaemonError::ProxyNotFound("proxy-001".to_string());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_request_not_found_is_not_retryable() {
+        let err = DaemonError::RequestNotFound("req-001".to_string());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn test_session_busy_is_not_retryable() {
+        let err = DaemonError::SessionBusy("sess-001".to_string());
+        assert!(!err.is_retryable());
     }
 }
