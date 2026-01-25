@@ -21,6 +21,10 @@ pub enum ComputerError {
     #[error("Keyboard operation failed: {0}")]
     KeyboardFailed(String),
 
+    /// General input operation failed.
+    #[error("Input operation failed: {0}")]
+    InputFailed(String),
+
     /// Invalid coordinates.
     #[error("Invalid coordinates: ({0}, {1})")]
     InvalidCoordinates(i32, i32),

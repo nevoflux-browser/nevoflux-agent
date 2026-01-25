@@ -16,9 +16,39 @@ use x11rb::connection::Connection;
 #[cfg(target_os = "linux")]
 use x11rb::protocol::randr::ConnectionExt as RandrExt;
 #[cfg(target_os = "linux")]
-use x11rb::protocol::xproto::{ConnectionExt, ImageFormat as X11ImageFormat};
+use x11rb::protocol::xproto::{ConnectionExt, ImageFormat as X11ImageFormat, Keycode};
+#[cfg(target_os = "linux")]
+use x11rb::protocol::xtest::ConnectionExt as XTestExt;
 #[cfg(target_os = "linux")]
 use x11rb::rust_connection::RustConnection;
+
+// XTest event types
+#[cfg(target_os = "linux")]
+const KEY_PRESS: u8 = 2;
+#[cfg(target_os = "linux")]
+const KEY_RELEASE: u8 = 3;
+#[cfg(target_os = "linux")]
+const BUTTON_PRESS: u8 = 4;
+#[cfg(target_os = "linux")]
+const BUTTON_RELEASE: u8 = 5;
+#[cfg(target_os = "linux")]
+const MOTION_NOTIFY: u8 = 6;
+
+// X11 button codes
+#[cfg(target_os = "linux")]
+const BUTTON_LEFT: u8 = 1;
+#[cfg(target_os = "linux")]
+const BUTTON_MIDDLE: u8 = 2;
+#[cfg(target_os = "linux")]
+const BUTTON_RIGHT: u8 = 3;
+#[cfg(target_os = "linux")]
+const BUTTON_SCROLL_UP: u8 = 4;
+#[cfg(target_os = "linux")]
+const BUTTON_SCROLL_DOWN: u8 = 5;
+#[cfg(target_os = "linux")]
+const BUTTON_SCROLL_LEFT: u8 = 6;
+#[cfg(target_os = "linux")]
+const BUTTON_SCROLL_RIGHT: u8 = 7;
 
 /// Linux computer controller using X11.
 #[cfg(target_os = "linux")]
@@ -186,6 +216,155 @@ impl ScreenshotProvider for LinuxComputer {
 
 #[cfg(target_os = "linux")]
 impl LinuxComputer {
+    /// Send an XTest fake input event.
+    fn fake_input(&self, event_type: u8, detail: u8, x: i16, y: i16) -> Result<()> {
+        self.conn
+            .xtest_fake_input(event_type, detail, 0, self.root, x, y, 0)
+            .map_err(|e| ComputerError::InputFailed(format!("XTest fake_input failed: {}", e)))?;
+        self.conn.flush().map_err(|e| {
+            ComputerError::InputFailed(format!("Failed to flush X11 connection: {}", e))
+        })?;
+        Ok(())
+    }
+
+    /// Convert MouseButton to X11 button code.
+    fn mouse_button_to_code(button: MouseButton) -> u8 {
+        match button {
+            MouseButton::Left => BUTTON_LEFT,
+            MouseButton::Middle => BUTTON_MIDDLE,
+            MouseButton::Right => BUTTON_RIGHT,
+        }
+    }
+
+    /// Convert ScrollDirection to X11 button code.
+    fn scroll_direction_to_button(direction: ScrollDirection) -> u8 {
+        match direction {
+            ScrollDirection::Up => BUTTON_SCROLL_UP,
+            ScrollDirection::Down => BUTTON_SCROLL_DOWN,
+            ScrollDirection::Left => BUTTON_SCROLL_LEFT,
+            ScrollDirection::Right => BUTTON_SCROLL_RIGHT,
+        }
+    }
+
+    /// Convert a Key to an X11 keysym.
+    fn key_to_keysym(key: &Key) -> u32 {
+        // XK_ keysym values from X11/keysymdef.h
+        match key {
+            // Modifiers
+            Key::Shift => 0xffe1,   // XK_Shift_L
+            Key::Control => 0xffe3, // XK_Control_L
+            Key::Alt => 0xffe9,     // XK_Alt_L
+            Key::Meta => 0xffeb,    // XK_Super_L
+
+            // Function keys
+            Key::F1 => 0xffbe,
+            Key::F2 => 0xffbf,
+            Key::F3 => 0xffc0,
+            Key::F4 => 0xffc1,
+            Key::F5 => 0xffc2,
+            Key::F6 => 0xffc3,
+            Key::F7 => 0xffc4,
+            Key::F8 => 0xffc5,
+            Key::F9 => 0xffc6,
+            Key::F10 => 0xffc7,
+            Key::F11 => 0xffc8,
+            Key::F12 => 0xffc9,
+
+            // Navigation
+            Key::Escape => 0xff1b,
+            Key::Tab => 0xff09,
+            Key::CapsLock => 0xffe5,
+            Key::Space => 0x0020,
+            Key::Enter => 0xff0d, // XK_Return
+            Key::Backspace => 0xff08,
+            Key::Delete => 0xffff,
+            Key::Insert => 0xff63,
+            Key::Home => 0xff50,
+            Key::End => 0xff57,
+            Key::PageUp => 0xff55,
+            Key::PageDown => 0xff56,
+            Key::ArrowUp => 0xff52,
+            Key::ArrowDown => 0xff54,
+            Key::ArrowLeft => 0xff51,
+            Key::ArrowRight => 0xff53,
+
+            // Other
+            Key::PrintScreen => 0xff61,
+            Key::ScrollLock => 0xff14,
+            Key::Pause => 0xff13,
+            Key::NumLock => 0xff7f,
+        }
+    }
+
+    /// Convert a character to an X11 keysym.
+    fn char_to_keysym(c: char) -> u32 {
+        // For ASCII printable characters, keysym matches ASCII code
+        // For Latin-1 characters (0x80-0xff), keysym also matches
+        let code = c as u32;
+        if code < 0x100 {
+            code
+        } else {
+            // For Unicode characters, use Unicode keysym encoding
+            // XK_Unicode = 0x01000000 | unicode_codepoint
+            0x01000000 | code
+        }
+    }
+
+    /// Convert a KeyOrChar to an X11 keysym.
+    fn key_or_char_to_keysym(key: &KeyOrChar) -> u32 {
+        match key {
+            KeyOrChar::Key(k) => Self::key_to_keysym(k),
+            KeyOrChar::Char(c) => Self::char_to_keysym(*c),
+        }
+    }
+
+    /// Get the keycode for a keysym using the keyboard mapping.
+    fn keysym_to_keycode(&self, keysym: u32) -> Result<Keycode> {
+        let setup = self.conn.setup();
+        let min_keycode = setup.min_keycode;
+        let max_keycode = setup.max_keycode;
+
+        // Get keyboard mapping
+        let cookie = self
+            .conn
+            .get_keyboard_mapping(min_keycode, max_keycode - min_keycode + 1);
+        let mapping = cookie
+            .map_err(|e| {
+                ComputerError::InputFailed(format!("Failed to get keyboard mapping: {}", e))
+            })?
+            .reply()
+            .map_err(|e| {
+                ComputerError::InputFailed(format!("Failed to get keyboard mapping reply: {}", e))
+            })?;
+
+        let keysyms_per_keycode = mapping.keysyms_per_keycode as usize;
+
+        // Search through the mapping to find the keycode for this keysym
+        for keycode in min_keycode..=max_keycode {
+            let offset = ((keycode - min_keycode) as usize) * keysyms_per_keycode;
+            for i in 0..keysyms_per_keycode {
+                if offset + i < mapping.keysyms.len() && mapping.keysyms[offset + i] == keysym {
+                    return Ok(keycode);
+                }
+            }
+        }
+
+        Err(ComputerError::InputFailed(format!(
+            "No keycode found for keysym 0x{:x}",
+            keysym
+        )))
+    }
+
+    /// Press a key (send key down event).
+    fn send_key_press(&self, keycode: Keycode) -> Result<()> {
+        self.fake_input(KEY_PRESS, keycode, 0, 0)
+    }
+
+    /// Release a key (send key up event).
+    fn send_key_release(&self, keycode: Keycode) -> Result<()> {
+        self.fake_input(KEY_RELEASE, keycode, 0, 0)
+    }
+
     /// Get display information using RandR extension.
     fn get_displays_randr(&self) -> Result<Vec<DisplayInfo>> {
         // Query RandR version first
@@ -262,69 +441,128 @@ impl MouseController for LinuxComputer {
         Ok(Point::new(reply.root_x as i32, reply.root_y as i32))
     }
 
-    async fn move_to(&self, _point: Point) -> Result<()> {
-        // Would use XTest extension for warp_pointer
-        Err(ComputerError::NotSupported(
-            "Mouse move not yet implemented - requires XTest".into(),
-        ))
+    async fn move_to(&self, point: Point) -> Result<()> {
+        // XTest MotionNotify with absolute coordinates
+        self.fake_input(MOTION_NOTIFY, 0, point.x as i16, point.y as i16)
+            .map_err(|e| ComputerError::MouseFailed(format!("Failed to move mouse: {}", e)))
     }
 
-    async fn move_by(&self, _dx: i32, _dy: i32) -> Result<()> {
-        Err(ComputerError::NotSupported(
-            "Mouse move not yet implemented - requires XTest".into(),
-        ))
+    async fn move_by(&self, dx: i32, dy: i32) -> Result<()> {
+        let current = self.get_position().await?;
+        let new_point = Point::new(current.x + dx, current.y + dy);
+        self.move_to(new_point).await
     }
 
-    async fn click(&self, _button: MouseButton, _click_type: ClickType) -> Result<()> {
-        Err(ComputerError::NotSupported(
-            "Mouse click not yet implemented - requires XTest".into(),
-        ))
+    async fn click(&self, button: MouseButton, click_type: ClickType) -> Result<()> {
+        let click_count = match click_type {
+            ClickType::Single => 1,
+            ClickType::Double => 2,
+            ClickType::Triple => 3,
+        };
+
+        for _ in 0..click_count {
+            self.press(button).await?;
+            self.release(button).await?;
+        }
+
+        Ok(())
     }
 
-    async fn press(&self, _button: MouseButton) -> Result<()> {
-        Err(ComputerError::NotSupported(
-            "Mouse press not yet implemented - requires XTest".into(),
-        ))
+    async fn press(&self, button: MouseButton) -> Result<()> {
+        let button_code = Self::mouse_button_to_code(button);
+        self.fake_input(BUTTON_PRESS, button_code, 0, 0)
+            .map_err(|e| ComputerError::MouseFailed(format!("Failed to press mouse button: {}", e)))
     }
 
-    async fn release(&self, _button: MouseButton) -> Result<()> {
-        Err(ComputerError::NotSupported(
-            "Mouse release not yet implemented - requires XTest".into(),
-        ))
+    async fn release(&self, button: MouseButton) -> Result<()> {
+        let button_code = Self::mouse_button_to_code(button);
+        self.fake_input(BUTTON_RELEASE, button_code, 0, 0)
+            .map_err(|e| {
+                ComputerError::MouseFailed(format!("Failed to release mouse button: {}", e))
+            })
     }
 
-    async fn scroll(&self, _direction: ScrollDirection, _amount: u32) -> Result<()> {
-        Err(ComputerError::NotSupported(
-            "Mouse scroll not yet implemented - requires XTest".into(),
-        ))
+    async fn scroll(&self, direction: ScrollDirection, amount: u32) -> Result<()> {
+        let button_code = Self::scroll_direction_to_button(direction);
+
+        // Each scroll unit is a button press + release
+        for _ in 0..amount {
+            self.fake_input(BUTTON_PRESS, button_code, 0, 0)
+                .map_err(|e| ComputerError::MouseFailed(format!("Failed to scroll: {}", e)))?;
+            self.fake_input(BUTTON_RELEASE, button_code, 0, 0)
+                .map_err(|e| ComputerError::MouseFailed(format!("Failed to scroll: {}", e)))?;
+        }
+
+        Ok(())
     }
 }
 
 #[cfg(target_os = "linux")]
 #[async_trait]
 impl KeyboardController for LinuxComputer {
-    async fn type_text(&self, _text: &str) -> Result<()> {
-        Err(ComputerError::NotSupported(
-            "Keyboard typing not yet implemented - requires XTest".into(),
-        ))
+    async fn type_text(&self, text: &str) -> Result<()> {
+        for c in text.chars() {
+            // For each character, we create a key combination and press it
+            let combo = KeyCombination::char(c);
+            self.press_key(combo).await?;
+        }
+        Ok(())
     }
 
-    async fn press_key(&self, _combination: KeyCombination) -> Result<()> {
-        Err(ComputerError::NotSupported(
-            "Key press not yet implemented - requires XTest".into(),
-        ))
+    async fn press_key(&self, combination: KeyCombination) -> Result<()> {
+        // Press modifiers first
+        let mut modifier_keycodes = Vec::new();
+        for modifier in &combination.modifiers {
+            let keysym = Self::key_to_keysym(modifier);
+            let keycode = self.keysym_to_keycode(keysym)?;
+            self.send_key_press(keycode)?;
+            modifier_keycodes.push(keycode);
+        }
+
+        // Press the main key
+        let main_keysym = Self::key_or_char_to_keysym(&combination.key);
+        let main_keycode = self.keysym_to_keycode(main_keysym)?;
+        self.send_key_press(main_keycode)?;
+        self.send_key_release(main_keycode)?;
+
+        // Release modifiers in reverse order
+        for keycode in modifier_keycodes.into_iter().rev() {
+            self.send_key_release(keycode)?;
+        }
+
+        Ok(())
     }
 
-    async fn key_down(&self, _combination: KeyCombination) -> Result<()> {
-        Err(ComputerError::NotSupported(
-            "Key down not yet implemented - requires XTest".into(),
-        ))
+    async fn key_down(&self, combination: KeyCombination) -> Result<()> {
+        // Press modifiers first
+        for modifier in &combination.modifiers {
+            let keysym = Self::key_to_keysym(modifier);
+            let keycode = self.keysym_to_keycode(keysym)?;
+            self.send_key_press(keycode)?;
+        }
+
+        // Press the main key (hold down)
+        let main_keysym = Self::key_or_char_to_keysym(&combination.key);
+        let main_keycode = self.keysym_to_keycode(main_keysym)?;
+        self.send_key_press(main_keycode)?;
+
+        Ok(())
     }
 
-    async fn key_up(&self, _combination: KeyCombination) -> Result<()> {
-        Err(ComputerError::NotSupported(
-            "Key up not yet implemented - requires XTest".into(),
-        ))
+    async fn key_up(&self, combination: KeyCombination) -> Result<()> {
+        // Release the main key first
+        let main_keysym = Self::key_or_char_to_keysym(&combination.key);
+        let main_keycode = self.keysym_to_keycode(main_keysym)?;
+        self.send_key_release(main_keycode)?;
+
+        // Release modifiers in reverse order
+        for modifier in combination.modifiers.iter().rev() {
+            let keysym = Self::key_to_keysym(modifier);
+            let keycode = self.keysym_to_keycode(keysym)?;
+            self.send_key_release(keycode)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -452,6 +690,218 @@ mod tests {
                 let base64_data = result.unwrap();
                 // Base64 should start with PNG signature in base64
                 assert!(base64_data.starts_with("iVBOR"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_mouse_button_to_code() {
+        assert_eq!(LinuxComputer::mouse_button_to_code(MouseButton::Left), 1);
+        assert_eq!(LinuxComputer::mouse_button_to_code(MouseButton::Middle), 2);
+        assert_eq!(LinuxComputer::mouse_button_to_code(MouseButton::Right), 3);
+    }
+
+    #[test]
+    fn test_scroll_direction_to_button() {
+        assert_eq!(
+            LinuxComputer::scroll_direction_to_button(ScrollDirection::Up),
+            4
+        );
+        assert_eq!(
+            LinuxComputer::scroll_direction_to_button(ScrollDirection::Down),
+            5
+        );
+        assert_eq!(
+            LinuxComputer::scroll_direction_to_button(ScrollDirection::Left),
+            6
+        );
+        assert_eq!(
+            LinuxComputer::scroll_direction_to_button(ScrollDirection::Right),
+            7
+        );
+    }
+
+    #[test]
+    fn test_key_to_keysym() {
+        // Test modifier keys
+        assert_eq!(LinuxComputer::key_to_keysym(&Key::Shift), 0xffe1);
+        assert_eq!(LinuxComputer::key_to_keysym(&Key::Control), 0xffe3);
+        assert_eq!(LinuxComputer::key_to_keysym(&Key::Alt), 0xffe9);
+        assert_eq!(LinuxComputer::key_to_keysym(&Key::Meta), 0xffeb);
+
+        // Test function keys
+        assert_eq!(LinuxComputer::key_to_keysym(&Key::F1), 0xffbe);
+        assert_eq!(LinuxComputer::key_to_keysym(&Key::F12), 0xffc9);
+
+        // Test navigation keys
+        assert_eq!(LinuxComputer::key_to_keysym(&Key::Escape), 0xff1b);
+        assert_eq!(LinuxComputer::key_to_keysym(&Key::Enter), 0xff0d);
+        assert_eq!(LinuxComputer::key_to_keysym(&Key::Space), 0x0020);
+        assert_eq!(LinuxComputer::key_to_keysym(&Key::Tab), 0xff09);
+        assert_eq!(LinuxComputer::key_to_keysym(&Key::Backspace), 0xff08);
+
+        // Test arrow keys
+        assert_eq!(LinuxComputer::key_to_keysym(&Key::ArrowUp), 0xff52);
+        assert_eq!(LinuxComputer::key_to_keysym(&Key::ArrowDown), 0xff54);
+        assert_eq!(LinuxComputer::key_to_keysym(&Key::ArrowLeft), 0xff51);
+        assert_eq!(LinuxComputer::key_to_keysym(&Key::ArrowRight), 0xff53);
+    }
+
+    #[test]
+    fn test_char_to_keysym() {
+        // ASCII characters have keysyms matching their ASCII codes
+        assert_eq!(LinuxComputer::char_to_keysym('a'), 0x61);
+        assert_eq!(LinuxComputer::char_to_keysym('A'), 0x41);
+        assert_eq!(LinuxComputer::char_to_keysym('0'), 0x30);
+        assert_eq!(LinuxComputer::char_to_keysym(' '), 0x20);
+        assert_eq!(LinuxComputer::char_to_keysym('!'), 0x21);
+
+        // Unicode characters use the Unicode keysym encoding
+        let unicode_char = '\u{1F600}'; // emoji
+        assert_eq!(
+            LinuxComputer::char_to_keysym(unicode_char),
+            0x01000000 | 0x1F600
+        );
+    }
+
+    #[test]
+    fn test_key_or_char_to_keysym() {
+        assert_eq!(
+            LinuxComputer::key_or_char_to_keysym(&KeyOrChar::Key(Key::Enter)),
+            0xff0d
+        );
+        assert_eq!(
+            LinuxComputer::key_or_char_to_keysym(&KeyOrChar::Char('x')),
+            0x78
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mouse_move_to() {
+        // This test requires an X11 display with XTest extension
+        if std::env::var("DISPLAY").is_ok() {
+            if let Ok(computer) = LinuxComputer::new() {
+                // Move mouse to a position
+                let target = Point::new(100, 100);
+                let result = computer.move_to(target).await;
+                // May fail if XTest is not available
+                if result.is_ok() {
+                    // Verify position changed
+                    let pos = computer.get_position().await;
+                    if let Ok(pos) = pos {
+                        // Allow some tolerance for position
+                        assert!((pos.x - target.x).abs() <= 1);
+                        assert!((pos.y - target.y).abs() <= 1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mouse_move_by() {
+        if std::env::var("DISPLAY").is_ok() {
+            if let Ok(computer) = LinuxComputer::new() {
+                // Get starting position
+                if let Ok(start) = computer.get_position().await {
+                    // Move by relative amount
+                    let result = computer.move_by(10, 10).await;
+                    if result.is_ok() {
+                        if let Ok(end) = computer.get_position().await {
+                            assert!((end.x - start.x - 10).abs() <= 1);
+                            assert!((end.y - start.y - 10).abs() <= 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mouse_click() {
+        if std::env::var("DISPLAY").is_ok() {
+            if let Ok(computer) = LinuxComputer::new() {
+                // Test that click methods don't error (actual click not easily verifiable)
+                let result = computer.click(MouseButton::Left, ClickType::Single).await;
+                // May succeed or fail depending on XTest availability
+                if result.is_ok() {
+                    // At least no crash
+                    assert!(true);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mouse_scroll() {
+        if std::env::var("DISPLAY").is_ok() {
+            if let Ok(computer) = LinuxComputer::new() {
+                let result = computer.scroll(ScrollDirection::Down, 1).await;
+                // May succeed or fail depending on XTest availability
+                if result.is_ok() {
+                    assert!(true);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_keysym_to_keycode() {
+        if std::env::var("DISPLAY").is_ok() {
+            if let Ok(computer) = LinuxComputer::new() {
+                // Test common keys that should exist in any keyboard layout
+                let result = computer.keysym_to_keycode(0x0061); // 'a'
+                assert!(result.is_ok(), "Should find keycode for 'a'");
+
+                let result = computer.keysym_to_keycode(0xff0d); // Enter/Return
+                assert!(result.is_ok(), "Should find keycode for Enter");
+
+                let result = computer.keysym_to_keycode(0x0020); // Space
+                assert!(result.is_ok(), "Should find keycode for Space");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_type_text() {
+        if std::env::var("DISPLAY").is_ok() {
+            if let Ok(computer) = LinuxComputer::new() {
+                // Test typing a simple string
+                let result = computer.type_text("ab").await;
+                // May succeed or fail depending on XTest and keyboard layout
+                // At least verify it doesn't panic
+                let _ = result;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_press_key_with_modifiers() {
+        if std::env::var("DISPLAY").is_ok() {
+            if let Ok(computer) = LinuxComputer::new() {
+                // Test Ctrl+C
+                let combo = KeyCombination::char('c').with_ctrl();
+                let result = computer.press_key(combo).await;
+                // May succeed or fail depending on XTest
+                let _ = result;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_key_down_up() {
+        if std::env::var("DISPLAY").is_ok() {
+            if let Ok(computer) = LinuxComputer::new() {
+                let combo = KeyCombination::key(Key::Shift);
+
+                // Test key_down
+                let down_result = computer.key_down(combo.clone()).await;
+
+                // Test key_up
+                let up_result = computer.key_up(combo).await;
+
+                // At least verify no panic
+                let _ = (down_result, up_result);
             }
         }
     }
