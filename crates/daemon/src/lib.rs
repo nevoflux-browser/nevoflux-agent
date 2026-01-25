@@ -34,7 +34,10 @@ pub mod session;
 pub mod skills;
 pub mod wasm;
 
-pub use config::DaemonConfig;
+pub use config::{
+    AgentConfig, ConfigError, ContextConfig, DaemonConfig, LlmConfig, LoggingConfig, SessionConfig,
+    StorageConfig,
+};
 pub use error::{DaemonError, Result};
 pub use permission::{Action, PermissionEnforcer, PermissionResult, ResourceType};
 pub use registry::{ActiveRequest, ProxyInfo, ProxyRegistry, RequestRegistry};

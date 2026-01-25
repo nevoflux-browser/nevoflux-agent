@@ -16,6 +16,7 @@ nevoflux-storage = { path = "../storage" }
 nevoflux-mcp = { path = "../mcp" }
 nevoflux-skills = { path = "../skills" }
 nevoflux-llm = { path = "../llm" }
+nevoflux-computer = { path = "../computer" }
 
 # LLM framework
 rig-core = { workspace = true }
@@ -50,6 +51,10 @@ uuid = { version = "1", features = ["v4"] }
 
 # File glob matching
 glob = "0.3"
+
+# Configuration file support
+dirs = "5.0"
+toml = "0.8"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
