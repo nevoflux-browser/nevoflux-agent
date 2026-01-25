@@ -40,9 +40,15 @@ pub use registry::{ActiveRequest, ProxyInfo, ProxyRegistry, RequestRegistry};
 pub use router::Router;
 pub use server::{find_available_port, start_server, Server, ServerConfig};
 pub use session::SessionManager;
-pub use wasm::{create_linker, HostState, WasmConfig, WasmInstance, WasmRuntime};
+pub use wasm::{
+    create_linker, HostState, LlmChatRequest, LlmChatResponse, LlmMessage, LlmUsage, WasmConfig,
+    WasmInstance, WasmRuntime,
+};
 
-pub use agent::{AgentInput, AgentMode, AgentOutput, AgentRunner, AgentRunnerConfig};
+pub use agent::{
+    AgentContent, AgentInput, AgentMode, AgentOutput, AgentProcessInput, AgentProcessOutput,
+    AgentRunner, AgentRunnerConfig, HistoryEntry,
+};
 pub use skills::SkillsManager;
 
 #[cfg(test)]
