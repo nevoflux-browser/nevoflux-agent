@@ -251,7 +251,12 @@ impl ScreenshotProvider for MacOsComputer {
 
         let base64_data = self.encode_to_png_base64(&data, width, height)?;
 
-        Ok(Screenshot::new(width, height, ImageFormat::Png, base64_data))
+        Ok(Screenshot::new(
+            width,
+            height,
+            ImageFormat::Png,
+            base64_data,
+        ))
     }
 
     async fn capture_display(&self, display_id: u32) -> Result<Screenshot> {
@@ -272,7 +277,12 @@ impl ScreenshotProvider for MacOsComputer {
 
         let base64_data = self.encode_to_png_base64(&data, width, height)?;
 
-        Ok(Screenshot::new(width, height, ImageFormat::Png, base64_data))
+        Ok(Screenshot::new(
+            width,
+            height,
+            ImageFormat::Png,
+            base64_data,
+        ))
     }
 
     async fn capture_region(&self, region: Region) -> Result<Screenshot> {
@@ -306,8 +316,9 @@ impl ScreenshotProvider for MacOsComputer {
     }
 
     async fn get_displays(&self) -> Result<Vec<DisplayInfo>> {
-        let display_ids = CGDisplay::active_displays()
-            .map_err(|e| ComputerError::ScreenshotFailed(format!("Failed to get displays: {}", e)))?;
+        let display_ids = CGDisplay::active_displays().map_err(|e| {
+            ComputerError::ScreenshotFailed(format!("Failed to get displays: {}", e))
+        })?;
 
         let main_id = Self::main_display_id();
         let mut displays = Vec::new();
@@ -401,8 +412,11 @@ impl MouseController for MacOsComputer {
             MouseButton::Middle => (CGEventType::OtherMouseDown, CGMouseButton::Center),
         };
 
-        let event = CGEvent::new_mouse_event(self.event_source.clone(), event_type, position, cg_button)
-            .map_err(|_| ComputerError::MouseFailed("Failed to create mouse press event".into()))?;
+        let event =
+            CGEvent::new_mouse_event(self.event_source.clone(), event_type, position, cg_button)
+                .map_err(|_| {
+                    ComputerError::MouseFailed("Failed to create mouse press event".into())
+                })?;
 
         event.post(CGEventTapLocation::HID);
         Ok(())
@@ -418,8 +432,11 @@ impl MouseController for MacOsComputer {
             MouseButton::Middle => (CGEventType::OtherMouseUp, CGMouseButton::Center),
         };
 
-        let event = CGEvent::new_mouse_event(self.event_source.clone(), event_type, position, cg_button)
-            .map_err(|_| ComputerError::MouseFailed("Failed to create mouse release event".into()))?;
+        let event =
+            CGEvent::new_mouse_event(self.event_source.clone(), event_type, position, cg_button)
+                .map_err(|_| {
+                    ComputerError::MouseFailed("Failed to create mouse release event".into())
+                })?;
 
         event.post(CGEventTapLocation::HID);
         Ok(())
@@ -549,9 +566,9 @@ impl KeyboardController for MacOsComputer {
         // Press the main key (hold down)
         let keycode = match &combination.key {
             KeyOrChar::Key(k) => Self::key_to_keycode(k),
-            KeyOrChar::Char(c) => Self::char_to_keycode(*c)
-                .map(|(kc, _)| kc)
-                .ok_or_else(|| ComputerError::InvalidKey(format!("Unsupported character: {}", c)))?,
+            KeyOrChar::Char(c) => Self::char_to_keycode(*c).map(|(kc, _)| kc).ok_or_else(|| {
+                ComputerError::InvalidKey(format!("Unsupported character: {}", c))
+            })?,
         };
 
         let event = CGEvent::new_keyboard_event(self.event_source.clone(), keycode, true)
@@ -565,9 +582,9 @@ impl KeyboardController for MacOsComputer {
         // Release the main key first
         let keycode = match &combination.key {
             KeyOrChar::Key(k) => Self::key_to_keycode(k),
-            KeyOrChar::Char(c) => Self::char_to_keycode(*c)
-                .map(|(kc, _)| kc)
-                .ok_or_else(|| ComputerError::InvalidKey(format!("Unsupported character: {}", c)))?,
+            KeyOrChar::Char(c) => Self::char_to_keycode(*c).map(|(kc, _)| kc).ok_or_else(|| {
+                ComputerError::InvalidKey(format!("Unsupported character: {}", c))
+            })?,
         };
 
         let event = CGEvent::new_keyboard_event(self.event_source.clone(), keycode, false)

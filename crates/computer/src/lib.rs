@@ -41,6 +41,7 @@ pub mod macos;
 pub mod mock;
 pub mod traits;
 pub mod types;
+pub mod windows;
 
 pub use error::{ComputerError, Result};
 #[cfg(target_os = "linux")]
@@ -53,6 +54,7 @@ pub use types::{
     ClickType, DisplayInfo, ImageFormat, Key, KeyCombination, KeyOrChar, MouseButton, Point,
     Region, Screenshot, ScrollDirection,
 };
+pub use windows::WindowsComputer;
 
 #[cfg(test)]
 mod tests {
