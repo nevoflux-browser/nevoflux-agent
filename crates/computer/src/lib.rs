@@ -36,6 +36,8 @@
 pub mod error;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod mock;
 pub mod traits;
 pub mod types;
@@ -43,6 +45,8 @@ pub mod types;
 pub use error::{ComputerError, Result};
 #[cfg(target_os = "linux")]
 pub use linux::LinuxComputer;
+#[cfg(target_os = "macos")]
+pub use macos::MacOsComputer;
 pub use mock::MockComputer;
 pub use traits::{ComputerController, KeyboardController, MouseController, ScreenshotProvider};
 pub use types::{
