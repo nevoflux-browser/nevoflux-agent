@@ -13,7 +13,9 @@ Wayland's security model restricts global input access:
 - Mouse: No global control (security restriction)
 - Keyboard: No global control (security restriction)
 
-**Workaround**: Run with XWayland for full functionality.
+**Detection**: NevoFlux detects Wayland via `WAYLAND_DISPLAY` and `XDG_SESSION_TYPE` environment variables.
+
+**Workaround**: Run with XWayland for full functionality. Most Wayland compositors include XWayland support.
 
 ## macOS
 

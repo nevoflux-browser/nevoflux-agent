@@ -1,4 +1,7 @@
-//! Linux computer backend using X11.
+//! Linux computer backend with X11 support and Wayland detection.
+//!
+//! Note: Full functionality requires X11. Wayland detection is provided but
+//! input control requires XWayland compatibility layer.
 
 use crate::error::{ComputerError, Result};
 use crate::traits::{ComputerController, KeyboardController, MouseController, ScreenshotProvider};
@@ -17,13 +20,18 @@ pub enum DisplayServer {
 }
 
 /// Check if running under Wayland.
+///
+/// Checks both WAYLAND_DISPLAY and XDG_SESSION_TYPE for reliable detection.
 pub fn is_wayland() -> bool {
     std::env::var("WAYLAND_DISPLAY").is_ok()
+        || std::env::var("XDG_SESSION_TYPE")
+            .map(|v| v == "wayland")
+            .unwrap_or(false)
 }
 
 /// Get display server type.
 pub fn display_server() -> DisplayServer {
-    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+    if is_wayland() {
         DisplayServer::Wayland
     } else if std::env::var("DISPLAY").is_ok() {
         DisplayServer::X11
