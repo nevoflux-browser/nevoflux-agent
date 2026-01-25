@@ -10,6 +10,7 @@ use crate::agent::abi::{
     AgentContent, AgentProcessInput, AgentProcessOutput, HistoryEntry, PendingToolCall, ToolResult,
     ABI_VERSION,
 };
+use crate::agent::tools::ToolRegistry;
 use crate::error::{DaemonError, Result};
 use crate::wasm::{HostServices, WasmInstance, WasmRuntime};
 use nevoflux_protocol::ChatMessage;
@@ -91,6 +92,7 @@ pub struct ToolCall {
 pub struct AgentRunner {
     runtime: WasmRuntime,
     config: AgentRunnerConfig,
+    tools: ToolRegistry,
     #[allow(dead_code)]
     services: Option<HostServices>,
 }
@@ -102,6 +104,7 @@ impl AgentRunner {
         Ok(Self {
             runtime,
             config: AgentRunnerConfig::default(),
+            tools: ToolRegistry::new(),
             services: None,
         })
     }
@@ -112,6 +115,7 @@ impl AgentRunner {
         Ok(Self {
             runtime,
             config,
+            tools: ToolRegistry::new(),
             services: None,
         })
     }
@@ -120,6 +124,16 @@ impl AgentRunner {
     pub fn with_services(mut self, services: HostServices) -> Self {
         self.services = Some(services);
         self
+    }
+
+    /// Get a mutable reference to the tool registry.
+    pub fn tools_mut(&mut self) -> &mut ToolRegistry {
+        &mut self.tools
+    }
+
+    /// Get a reference to the tool registry.
+    pub fn tools(&self) -> &ToolRegistry {
+        &self.tools
     }
 
     /// Run the agent with the given input.
@@ -303,19 +317,12 @@ impl AgentRunner {
         }
     }
 
-    /// Execute a tool call.
+    /// Execute a tool call using the tool registry.
     ///
-    /// This is a simulated implementation that returns mock results.
-    /// A full implementation would dispatch to actual tool implementations.
+    /// This method dispatches the tool call to the appropriate executor
+    /// in the tool registry and returns the result.
     async fn execute_tool(&self, tool_call: &PendingToolCall) -> ToolResult {
-        // Simulated tool execution for testing
-        // In production, this would dispatch to actual tool implementations
-        ToolResult {
-            call_id: tool_call.id.clone(),
-            name: tool_call.name.clone(),
-            content: Some(format!("Executed {} successfully", tool_call.name)),
-            error: None,
-        }
+        self.tools.execute(tool_call).await
     }
 
     /// Get the configuration.

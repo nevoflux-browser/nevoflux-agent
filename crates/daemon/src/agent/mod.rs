@@ -2,6 +2,7 @@
 
 pub mod abi;
 pub mod runner;
+pub mod tools;
 
 pub use abi::{
     AgentContent, AgentProcessInput, AgentProcessOutput, AgentResult, HistoryEntry,
@@ -9,3 +10,4 @@ pub use abi::{
     MEMORY_EXPORT,
 };
 pub use runner::{AgentInput, AgentMode, AgentOutput, AgentRunner, AgentRunnerConfig, ToolCall};
+pub use tools::{ToolExecutor, ToolRegistry};
