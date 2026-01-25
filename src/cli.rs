@@ -54,6 +54,12 @@ pub enum Commands {
     },
     /// Run interactive setup wizard
     Setup,
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 /// Configuration subcommand actions.

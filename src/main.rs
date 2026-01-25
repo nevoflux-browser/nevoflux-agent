@@ -10,6 +10,7 @@
 //! - `nevoflux setup` - Interactive setup wizard
 
 mod cli;
+mod completions;
 mod logging;
 
 use clap::Parser;
@@ -602,6 +603,10 @@ async fn main() {
             }
             Commands::Setup => {
                 run_setup();
+                return;
+            }
+            Commands::Completions { shell } => {
+                completions::generate_completions(shell);
                 return;
             }
         }

@@ -100,6 +100,7 @@ nevoflux-mcp = { path = "crates/mcp" }
 nevoflux-protocol = { path = "crates/protocol" }
 nevoflux-storage = { path = "crates/storage" }
 clap = { workspace = true }
+clap_complete = "4"
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 tracing = { workspace = true }
