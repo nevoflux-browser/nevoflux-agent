@@ -503,12 +503,49 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
                     _ => return -1,
                 };
 
-                // Return empty JSON array for now (actual implementation would use services.skills)
-                let result = b"[]";
-                let write_len = std::cmp::min(result.len(), result_len as usize);
+                // Get skill summaries from registry
+                let result_json = match &caller.data().services {
+                    Some(services) => {
+                        let skills = services.skills.clone();
+
+                        // Use tokio runtime to access the async RwLock
+                        match tokio::runtime::Handle::try_current() {
+                            Ok(handle) => std::thread::scope(|s| {
+                                s.spawn(|| {
+                                    handle.block_on(async {
+                                        let registry = skills.read().await;
+                                        let summaries = registry.list();
+
+                                        // Serialize to JSON array with name, description, tags
+                                        let json_summaries: Vec<serde_json::Value> = summaries
+                                            .into_iter()
+                                            .map(|s| {
+                                                serde_json::json!({
+                                                    "name": s.name,
+                                                    "description": s.description,
+                                                    "tags": s.tags
+                                                })
+                                            })
+                                            .collect();
+
+                                        serde_json::to_string(&json_summaries)
+                                            .unwrap_or_else(|_| "[]".to_string())
+                                    })
+                                })
+                                .join()
+                                .expect("Thread panicked")
+                            }),
+                            Err(_) => "[]".to_string(),
+                        }
+                    }
+                    None => "[]".to_string(),
+                };
+
+                let result_bytes = result_json.as_bytes();
+                let write_len = std::cmp::min(result_bytes.len(), result_len as usize);
 
                 if memory
-                    .write(&mut caller, result_ptr as usize, &result[..write_len])
+                    .write(&mut caller, result_ptr as usize, &result_bytes[..write_len])
                     .is_err()
                 {
                     return -1;
@@ -528,8 +565,8 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
             |mut caller: Caller<'_, HostState>,
              name_ptr: i32,
              name_len: i32,
-             _result_ptr: i32,
-             _result_len: i32|
+             result_ptr: i32,
+             result_len: i32|
              -> i32 {
                 let memory = match caller.get_export("memory") {
                     Some(wasmtime::Extern::Memory(mem)) => mem,
@@ -544,13 +581,66 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
                 {
                     return -2;
                 }
-                let _name = match String::from_utf8(name_buf) {
+                let name = match String::from_utf8(name_buf) {
                     Ok(s) => s,
                     Err(_) => return -2,
                 };
 
-                // Return -1 for "not found" (actual implementation would load from registry)
-                -1
+                // Get skill from registry
+                let skill_json = match &caller.data().services {
+                    Some(services) => {
+                        let skills = services.skills.clone();
+
+                        // Use tokio runtime to access the async RwLock
+                        match tokio::runtime::Handle::try_current() {
+                            Ok(handle) => std::thread::scope(|s| {
+                                s.spawn(|| {
+                                    handle.block_on(async {
+                                        let registry = skills.read().await;
+                                        match registry.get(&name) {
+                                            Some(skill) => {
+                                                // Serialize skill to JSON with name, description, content, tags
+                                                let json = serde_json::json!({
+                                                    "name": skill.name(),
+                                                    "description": skill.description(),
+                                                    "content": skill.content,
+                                                    "tags": skill.metadata.tags
+                                                });
+                                                Some(
+                                                    serde_json::to_string(&json)
+                                                        .unwrap_or_else(|_| "{}".to_string()),
+                                                )
+                                            }
+                                            None => None,
+                                        }
+                                    })
+                                })
+                                .join()
+                                .expect("Thread panicked")
+                            }),
+                            Err(_) => None,
+                        }
+                    }
+                    None => None,
+                };
+
+                // Return -1 if skill not found
+                let skill_json = match skill_json {
+                    Some(json) => json,
+                    None => return -1,
+                };
+
+                let result_bytes = skill_json.as_bytes();
+                let write_len = std::cmp::min(result_bytes.len(), result_len as usize);
+
+                if memory
+                    .write(&mut caller, result_ptr as usize, &result_bytes[..write_len])
+                    .is_err()
+                {
+                    return -2;
+                }
+
+                write_len as i32
             },
         )
         .map_err(|e| DaemonError::InternalError(format!("Failed to register skill_load: {}", e)))?;
@@ -706,8 +796,10 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nevoflux_skills::{Skill, SkillMetadata, SkillRegistry};
     use nevoflux_storage::Database;
     use std::sync::Arc;
+    use tokio::sync::RwLock;
     use wasmtime::{Module, Store};
 
     #[test]
@@ -1674,5 +1766,217 @@ mod tests {
 
         let result = test_func.call(&mut store, ()).expect("Failed to call test");
         assert_eq!(result, 0); // Not found
+    }
+
+    #[tokio::test]
+    async fn test_skill_list_with_registry() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "skill_list" (func $skill_list (param i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (func (export "test") (result i32)
+                    i32.const 100  ;; result_ptr
+                    i32.const 1024 ;; result_len
+                    call $skill_list
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+
+        // Create a registry with some skills
+        let mut registry = SkillRegistry::new();
+        let skill1 = Skill::new(
+            SkillMetadata::new("code-review")
+                .with_description("Review code for best practices")
+                .with_tag("code")
+                .with_tag("review"),
+            "# Code Review\n\nReview guidelines...",
+        );
+        let skill2 = Skill::new(
+            SkillMetadata::new("testing")
+                .with_description("Write and run tests")
+                .with_tag("testing"),
+            "# Testing\n\nTesting best practices...",
+        );
+        registry
+            .register(skill1)
+            .expect("Failed to register skill1");
+        registry
+            .register(skill2)
+            .expect("Failed to register skill2");
+
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let services =
+            crate::wasm::services::HostServices::with_skills(db, Arc::new(RwLock::new(registry)));
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert!(result > 2, "Expected skill list JSON, got {} bytes", result);
+
+        // Read and parse the results from guest memory
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("Failed to get memory");
+        let mut result_buf = vec![0u8; result as usize];
+        memory
+            .read(&store, 100, &mut result_buf)
+            .expect("Failed to read results");
+        let result_json = String::from_utf8(result_buf).expect("Invalid UTF-8");
+
+        let summaries: Vec<serde_json::Value> =
+            serde_json::from_str(&result_json).expect("Failed to parse JSON");
+
+        // Should have 2 skills
+        assert_eq!(summaries.len(), 2);
+
+        // Verify structure has name, description, tags
+        for summary in &summaries {
+            assert!(summary.get("name").is_some());
+            assert!(summary.get("description").is_some());
+            assert!(summary.get("tags").is_some());
+        }
+
+        // Verify specific skills are present
+        let names: Vec<&str> = summaries
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"code-review"));
+        assert!(names.contains(&"testing"));
+    }
+
+    #[tokio::test]
+    async fn test_skill_load_with_registry() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "skill_load" (func $skill_load (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "code-review")
+                (func (export "test") (result i32)
+                    i32.const 0    ;; name_ptr
+                    i32.const 11   ;; name_len ("code-review")
+                    i32.const 100  ;; result_ptr
+                    i32.const 1024 ;; result_len
+                    call $skill_load
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+
+        // Create a registry with a skill
+        let mut registry = SkillRegistry::new();
+        let skill = Skill::new(
+            SkillMetadata::new("code-review")
+                .with_description("Review code for best practices")
+                .with_tag("code")
+                .with_tag("review"),
+            "# Code Review\n\nWhen reviewing code, check for:\n1. Logic errors\n2. Style issues",
+        );
+        registry.register(skill).expect("Failed to register skill");
+
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let services =
+            crate::wasm::services::HostServices::with_skills(db, Arc::new(RwLock::new(registry)));
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert!(result > 0, "Expected skill JSON, got {} bytes", result);
+
+        // Read and parse the result from guest memory
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("Failed to get memory");
+        let mut result_buf = vec![0u8; result as usize];
+        memory
+            .read(&store, 100, &mut result_buf)
+            .expect("Failed to read result");
+        let result_json = String::from_utf8(result_buf).expect("Invalid UTF-8");
+
+        let skill: serde_json::Value =
+            serde_json::from_str(&result_json).expect("Failed to parse JSON");
+
+        // Verify structure has name, description, content, tags
+        assert_eq!(skill["name"].as_str().unwrap(), "code-review");
+        assert_eq!(
+            skill["description"].as_str().unwrap(),
+            "Review code for best practices"
+        );
+        assert!(skill["content"]
+            .as_str()
+            .unwrap()
+            .contains("When reviewing code"));
+        let tags: Vec<&str> = skill["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap())
+            .collect();
+        assert!(tags.contains(&"code"));
+        assert!(tags.contains(&"review"));
+    }
+
+    #[tokio::test]
+    async fn test_skill_load_not_found_with_registry() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "skill_load" (func $skill_load (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "nonexistent-skill")
+                (func (export "test") (result i32)
+                    i32.const 0    ;; name_ptr
+                    i32.const 17   ;; name_len ("nonexistent-skill")
+                    i32.const 100  ;; result_ptr
+                    i32.const 256  ;; result_len
+                    call $skill_load
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+
+        // Create an empty registry
+        let registry = SkillRegistry::new();
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let services =
+            crate::wasm::services::HostServices::with_skills(db, Arc::new(RwLock::new(registry)));
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert_eq!(result, -1); // Not found
     }
 }
