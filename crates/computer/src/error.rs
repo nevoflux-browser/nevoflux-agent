@@ -9,6 +9,10 @@ pub enum ComputerError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// Connection to display server failed.
+    #[error("Connection failed: {0}")]
+    ConnectionFailed(String),
+
     /// Screenshot capture failed.
     #[error("Screenshot failed: {0}")]
     ScreenshotFailed(String),

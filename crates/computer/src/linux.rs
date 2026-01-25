@@ -18,6 +18,8 @@ use x11rb::protocol::randr::ConnectionExt as RandrExt;
 #[cfg(target_os = "linux")]
 use x11rb::protocol::xproto::{ConnectionExt, ImageFormat as X11ImageFormat, Keycode};
 #[cfg(target_os = "linux")]
+use x11rb::protocol::xtest;
+#[cfg(target_os = "linux")]
 use x11rb::protocol::xtest::ConnectionExt as XTestExt;
 #[cfg(target_os = "linux")]
 use x11rb::rust_connection::RustConnection;
@@ -66,8 +68,18 @@ impl LinuxComputer {
     /// Create a new Linux computer controller.
     pub fn new() -> Result<Self> {
         let (conn, screen_num) = RustConnection::connect(None).map_err(|e| {
-            ComputerError::ScreenshotFailed(format!("Failed to connect to X11 display: {}", e))
+            ComputerError::ConnectionFailed(format!("Failed to connect to X11 display: {}", e))
         })?;
+
+        // Query XTest extension version to verify availability
+        xtest::get_version(&conn, 2, 0)
+            .map_err(|e| {
+                ComputerError::ConnectionFailed(format!("XTest extension unavailable: {}", e))
+            })?
+            .reply()
+            .map_err(|e| {
+                ComputerError::ConnectionFailed(format!("XTest extension check failed: {}", e))
+            })?;
 
         let root = conn.setup().roots[screen_num].root;
 
@@ -247,6 +259,9 @@ impl LinuxComputer {
     }
 
     /// Convert a Key to an X11 keysym.
+    ///
+    /// Keysym values are defined in X11/keysymdef.h from the X11 headers.
+    /// These are standard X11 keysym constants (XK_* macros).
     fn key_to_keysym(key: &Key) -> u32 {
         // XK_ keysym values from X11/keysymdef.h
         match key {
@@ -341,9 +356,17 @@ impl LinuxComputer {
 
         // Search through the mapping to find the keycode for this keysym
         for keycode in min_keycode..=max_keycode {
-            let offset = ((keycode - min_keycode) as usize) * keysyms_per_keycode;
+            // Use checked arithmetic to prevent potential overflow
+            let keycode_offset = (keycode - min_keycode) as usize;
+            let offset = keycode_offset
+                .checked_mul(keysyms_per_keycode)
+                .ok_or_else(|| ComputerError::InputFailed("Keyboard mapping overflow".into()))?;
+
             for i in 0..keysyms_per_keycode {
-                if offset + i < mapping.keysyms.len() && mapping.keysyms[offset + i] == keysym {
+                let idx = offset.checked_add(i).ok_or_else(|| {
+                    ComputerError::InputFailed("Keyboard mapping index overflow".into())
+                })?;
+                if idx < mapping.keysyms.len() && mapping.keysyms[idx] == keysym {
                     return Ok(keycode);
                 }
             }
