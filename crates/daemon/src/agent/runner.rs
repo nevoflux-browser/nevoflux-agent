@@ -5,15 +5,17 @@
 //! - Iteration loop with timeout handling
 //! - Tool call execution and result passing
 //! - Response accumulation and completion detection
+//! - Streaming responses in real-time
 
 use crate::agent::abi::{
     AgentContent, AgentProcessInput, AgentProcessOutput, HistoryEntry, PendingToolCall, ToolResult,
     ABI_VERSION,
 };
+use crate::agent::streaming::StreamHandle;
 use crate::agent::tools::ToolRegistry;
 use crate::error::{DaemonError, Result};
 use crate::wasm::{HostServices, WasmInstance, WasmRuntime};
-use nevoflux_protocol::ChatMessage;
+use nevoflux_protocol::{ChatMessage, StreamFormat, StreamMetadata};
 use serde::{Deserialize, Serialize};
 
 /// Agent execution mode.
@@ -329,11 +331,176 @@ impl AgentRunner {
     pub fn config(&self) -> &AgentRunnerConfig {
         &self.config
     }
+
+    /// Run the agent with streaming output.
+    ///
+    /// This method is similar to `run`, but streams response chunks back
+    /// through the provided `StreamHandle` as they are generated.
+    ///
+    /// # Arguments
+    ///
+    /// * `input` - The agent input containing session, mode, and user message
+    /// * `stream_handle` - Handle for sending streaming chunks back to the client
+    ///
+    /// # Returns
+    ///
+    /// Returns `AgentOutput` containing the complete response and execution metadata.
+    /// Note that the response text in the output will contain the complete accumulated
+    /// text, even though it was already streamed.
+    pub async fn run_streaming(
+        &self,
+        input: AgentInput,
+        stream_handle: StreamHandle,
+    ) -> Result<AgentOutput> {
+        // Create instance
+        let mut instance = WasmInstance::new(&self.runtime)?;
+
+        // Check ABI version
+        let abi_version = instance.get_abi_version()?;
+        if abi_version as i32 != ABI_VERSION {
+            return Err(DaemonError::InternalError(format!(
+                "Unsupported ABI version: {}, expected: {}",
+                abi_version, ABI_VERSION
+            )));
+        }
+
+        // Convert history from ChatMessage to HistoryEntry
+        let history: Vec<HistoryEntry> = input
+            .history
+            .iter()
+            .map(|msg| HistoryEntry {
+                role: "user".to_string(),
+                content: msg.text.clone(),
+            })
+            .collect();
+
+        // Initialize loop state
+        let mut iteration: u32 = 0;
+        let mut accumulated_text = String::new();
+        let mut all_tool_calls: Vec<ToolCall> = Vec::new();
+        let mut current_content = AgentContent::UserMessage {
+            text: input.user_message.clone(),
+        };
+
+        // Track timing for metadata
+        let start_time = std::time::Instant::now();
+
+        // Main execution loop
+        loop {
+            // Check if we've exceeded max iterations
+            if iteration >= self.config.max_iterations {
+                // End stream with metadata
+                let metadata = StreamMetadata {
+                    total_tokens: None,
+                    duration_ms: Some(start_time.elapsed().as_millis() as u64),
+                    model: None,
+                };
+                let _ = stream_handle.end(Some(metadata)).await;
+
+                return Ok(AgentOutput {
+                    text: accumulated_text,
+                    continue_loop: true,
+                    tool_calls: all_tool_calls,
+                    iterations: iteration,
+                });
+            }
+
+            // Build the process input for this iteration
+            let process_input = AgentProcessInput {
+                session_id: input.session_id.clone(),
+                iteration,
+                content: current_content.clone(),
+                history: history.clone(),
+            };
+
+            // Call the Wasm agent
+            let output = self.call_agent(&mut instance, &process_input).await?;
+
+            // Stream the response text as it comes
+            if !output.text.is_empty() {
+                // Send the chunk via the stream handle
+                if let Err(e) = stream_handle
+                    .send_chunk(output.text.clone(), StreamFormat::Markdown)
+                    .await
+                {
+                    tracing::warn!("Failed to send stream chunk: {}", e);
+                    // Continue processing even if streaming fails
+                }
+
+                // Accumulate the text
+                if !accumulated_text.is_empty() {
+                    accumulated_text.push('\n');
+                }
+                accumulated_text.push_str(&output.text);
+            }
+
+            // Convert pending tool calls to ToolCall structs
+            let tool_calls: Vec<ToolCall> = output
+                .tool_calls
+                .iter()
+                .map(|tc| ToolCall {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                    result: None,
+                })
+                .collect();
+
+            // Check if complete
+            if output.complete {
+                // Add any final tool calls
+                all_tool_calls.extend(tool_calls);
+
+                // End the stream with metadata
+                let metadata = StreamMetadata {
+                    total_tokens: None,
+                    duration_ms: Some(start_time.elapsed().as_millis() as u64),
+                    model: None,
+                };
+                let _ = stream_handle.end(Some(metadata)).await;
+
+                return Ok(AgentOutput {
+                    text: accumulated_text,
+                    continue_loop: false,
+                    tool_calls: all_tool_calls,
+                    iterations: iteration + 1,
+                });
+            }
+
+            // If there are pending tool calls, execute them
+            if !output.tool_calls.is_empty() {
+                let mut tool_results: Vec<ToolResult> = Vec::new();
+
+                for pending in &output.tool_calls {
+                    // Execute the tool
+                    let result = self.execute_tool(pending).await;
+
+                    // Track the tool call with its result
+                    all_tool_calls.push(ToolCall {
+                        id: pending.id.clone(),
+                        name: pending.name.clone(),
+                        arguments: pending.arguments.clone(),
+                        result: result.content.clone(),
+                    });
+
+                    tool_results.push(result);
+                }
+
+                // Set up next iteration with tool results
+                current_content = AgentContent::ToolResults {
+                    results: tool_results,
+                };
+            }
+
+            iteration += 1;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::streaming::{create_stream_channel, StreamEvent};
 
     fn create_test_wasm() -> Vec<u8> {
         wat::parse_str(
@@ -504,5 +671,151 @@ mod tests {
         assert!(!output.continue_loop);
         assert_eq!(output.tool_calls.len(), 1);
         assert_eq!(output.iterations, 3);
+    }
+
+    // Streaming tests
+
+    #[tokio::test]
+    async fn test_agent_runner_run_streaming() {
+        let wasm = create_test_wasm();
+        let runner = AgentRunner::new(&wasm).unwrap();
+
+        let (tx, mut rx) = create_stream_channel(16);
+        let stream_handle = StreamHandle::new("sess-001".to_string(), tx);
+
+        let input = AgentInput {
+            session_id: "sess-001".to_string(),
+            mode: AgentMode::Chat,
+            user_message: "Hello".to_string(),
+            history: vec![],
+        };
+
+        // Run in a separate task so we can receive events
+        let runner_task =
+            tokio::spawn(async move { runner.run_streaming(input, stream_handle).await });
+
+        // Collect stream events
+        let mut chunks = Vec::new();
+        let mut end_event = None;
+
+        while let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::Chunk(chunk) => chunks.push(chunk),
+                StreamEvent::End(end) => {
+                    end_event = Some(end);
+                    break;
+                }
+            }
+        }
+
+        // Wait for the runner to complete
+        let result = runner_task.await.unwrap();
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert!(output.text.contains("Hello"));
+        assert!(!output.continue_loop);
+        assert_eq!(output.iterations, 1);
+
+        // Verify we received stream events
+        assert!(!chunks.is_empty());
+        assert!(end_event.is_some());
+
+        // Verify the end event has metadata with duration
+        let end = end_event.unwrap();
+        assert!(end.metadata.is_some());
+        let metadata = end.metadata.unwrap();
+        assert!(metadata.duration_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_agent_runner_streaming_returns_same_as_run() {
+        let wasm = create_test_wasm();
+
+        // Run without streaming
+        let runner1 = AgentRunner::new(&wasm).unwrap();
+        let input1 = AgentInput {
+            session_id: "sess-001".to_string(),
+            mode: AgentMode::Chat,
+            user_message: "Test message".to_string(),
+            history: vec![],
+        };
+        let output1 = runner1.run(input1).await.unwrap();
+
+        // Run with streaming
+        let runner2 = AgentRunner::new(&wasm).unwrap();
+        let (tx, mut rx) = create_stream_channel(16);
+        let stream_handle = StreamHandle::new("sess-002".to_string(), tx);
+
+        let input2 = AgentInput {
+            session_id: "sess-002".to_string(),
+            mode: AgentMode::Chat,
+            user_message: "Test message".to_string(),
+            history: vec![],
+        };
+
+        let runner_task =
+            tokio::spawn(async move { runner2.run_streaming(input2, stream_handle).await });
+
+        // Drain the stream
+        while let Some(event) = rx.recv().await {
+            if event.is_end() {
+                break;
+            }
+        }
+
+        let output2 = runner_task.await.unwrap().unwrap();
+
+        // Both should produce the same text and iterations
+        assert_eq!(output1.text, output2.text);
+        assert_eq!(output1.iterations, output2.iterations);
+        assert_eq!(output1.continue_loop, output2.continue_loop);
+    }
+
+    #[tokio::test]
+    async fn test_agent_runner_streaming_wrong_abi() {
+        let wasm = create_wrong_abi_wasm();
+        let runner = AgentRunner::new(&wasm).unwrap();
+
+        let (tx, _rx) = create_stream_channel(16);
+        let stream_handle = StreamHandle::new("sess-001".to_string(), tx);
+
+        let input = AgentInput {
+            session_id: "sess-001".to_string(),
+            mode: AgentMode::Chat,
+            user_message: "Hello".to_string(),
+            history: vec![],
+        };
+
+        let result = runner.run_streaming(input, stream_handle).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Unsupported ABI version"));
+    }
+
+    #[tokio::test]
+    async fn test_agent_runner_streaming_continues_after_channel_close() {
+        let wasm = create_test_wasm();
+        let runner = AgentRunner::new(&wasm).unwrap();
+
+        let (tx, rx) = create_stream_channel(16);
+        let stream_handle = StreamHandle::new("sess-001".to_string(), tx);
+
+        // Drop the receiver immediately to simulate channel close
+        drop(rx);
+
+        let input = AgentInput {
+            session_id: "sess-001".to_string(),
+            mode: AgentMode::Chat,
+            user_message: "Hello".to_string(),
+            history: vec![],
+        };
+
+        // The runner should still complete even if streaming fails
+        let result = runner.run_streaming(input, stream_handle).await;
+        assert!(result.is_ok());
+
+        let output = result.unwrap();
+        assert!(output.text.contains("Hello"));
     }
 }
