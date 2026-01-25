@@ -47,9 +47,20 @@ pub use wasm::{
 };
 
 pub use agent::{
-    AgentContent, AgentInput, AgentMode, AgentOutput, AgentProcessInput, AgentProcessOutput,
-    AgentRunner, AgentRunnerConfig, HistoryEntry,
+    create_mock_computer, create_stream_channel, register_computer_tools, AgentContent, AgentInput,
+    AgentMode, AgentOutput, AgentProcessInput, AgentProcessOutput, AgentRunner, AgentRunnerConfig,
+    GetDisplaysTool, GetMousePositionTool, HistoryEntry, MouseClickTool, MouseDragTool,
+    MouseMoveTool, MouseScrollTool, PressKeyTool, ScreenshotTool, StreamEvent, StreamHandle,
+    StreamSendError, ToolExecutor, ToolRegistry, TypeTextTool, DEFAULT_STREAM_BUFFER_SIZE,
 };
+
+// Platform-specific computer creation
+#[cfg(target_os = "linux")]
+pub use agent::computer_tools::create_computer;
+#[cfg(target_os = "macos")]
+pub use agent::computer_tools::create_computer;
+#[cfg(target_os = "windows")]
+pub use agent::computer_tools::create_computer;
 pub use retry::{with_retry, RetryConfig, Retryable};
 pub use skills::SkillsManager;
 

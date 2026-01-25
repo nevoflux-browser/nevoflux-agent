@@ -115,6 +115,7 @@ assert_cmd = "2"
 predicates = "3"
 wat = "1"
 nevoflux-bridge = { path = "crates/bridge" }
+nevoflux-computer = { path = "crates/computer" }
 nevoflux-daemon = { path = "crates/daemon" }
 nevoflux-mcp = { path = "crates/mcp" }
 nevoflux-protocol = { path = "crates/protocol" }
