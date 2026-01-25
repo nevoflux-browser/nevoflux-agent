@@ -35,6 +35,7 @@ pub mod client;
 pub mod error;
 pub mod registry;
 pub mod server;
+pub mod tools;
 pub mod transport;
 pub mod types;
 
@@ -42,6 +43,7 @@ pub use client::McpClient;
 pub use error::{McpError, Result};
 pub use registry::{McpRegistry, ServerConfig, ServerResource, ServerTool};
 pub use server::{run_stdio_server, McpServer, McpServerConfig, PROTOCOL_VERSION};
+pub use tools::create_tools;
 pub use transport::{McpTransport, StdioTransport};
 pub use types::{
     JsonRpcError, JsonRpcRequest, JsonRpcResponse, Resource, ResourceContent, ServerCapabilities,

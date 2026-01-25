@@ -296,7 +296,7 @@ async fn run_proxy() -> Result<(), Box<dyn std::error::Error>> {
 /// This starts an MCP server that communicates via stdio, allowing
 /// Claude Code or other MCP clients to use browser automation tools.
 async fn run_mcp() -> Result<(), Box<dyn std::error::Error>> {
-    use nevoflux_mcp::{run_stdio_server, McpServer, McpServerConfig, ToolDefinition};
+    use nevoflux_mcp::{create_tools, run_stdio_server, McpServer, McpServerConfig};
 
     // Initialize logging to stderr (stdout is for MCP protocol)
     tracing_subscriber::fmt()
@@ -313,51 +313,10 @@ async fn run_mcp() -> Result<(), Box<dyn std::error::Error>> {
     let config = McpServerConfig::default();
     let mut server = McpServer::with_config(config);
 
-    // Register browser automation tools
-    server.register_tool(ToolDefinition {
-        name: "browser_navigate".to_string(),
-        description: "Navigate the browser to a specified URL".to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "The URL to navigate to"
-                }
-            },
-            "required": ["url"]
-        }),
-    });
-
-    server.register_tool(ToolDefinition {
-        name: "browser_click".to_string(),
-        description: "Click an element on the page identified by a CSS selector".to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "selector": {
-                    "type": "string",
-                    "description": "CSS selector for the element to click"
-                }
-            },
-            "required": ["selector"]
-        }),
-    });
-
-    server.register_tool(ToolDefinition {
-        name: "browser_screenshot".to_string(),
-        description: "Take a screenshot of the current page".to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "full_page": {
-                    "type": "boolean",
-                    "description": "Whether to capture the full page or just the viewport",
-                    "default": false
-                }
-            }
-        }),
-    });
+    // Register all tools from the tools module
+    for tool in create_tools() {
+        server.register_tool(tool);
+    }
 
     // Run the stdio server
     run_stdio_server(server).await?;
