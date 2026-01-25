@@ -5,6 +5,33 @@ use crate::traits::{ComputerController, KeyboardController, MouseController, Scr
 use crate::types::*;
 use async_trait::async_trait;
 
+/// Display server type on Linux.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DisplayServer {
+    /// X11 display server.
+    X11,
+    /// Wayland compositor.
+    Wayland,
+    /// No display server detected.
+    None,
+}
+
+/// Check if running under Wayland.
+pub fn is_wayland() -> bool {
+    std::env::var("WAYLAND_DISPLAY").is_ok()
+}
+
+/// Get display server type.
+pub fn display_server() -> DisplayServer {
+    if std::env::var("WAYLAND_DISPLAY").is_ok() {
+        DisplayServer::Wayland
+    } else if std::env::var("DISPLAY").is_ok() {
+        DisplayServer::X11
+    } else {
+        DisplayServer::None
+    }
+}
+
 #[cfg(target_os = "linux")]
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 #[cfg(target_os = "linux")]
@@ -927,5 +954,43 @@ mod tests {
                 let _ = (down_result, up_result);
             }
         }
+    }
+
+    #[test]
+    fn test_display_server_enum() {
+        // Test that DisplayServer enum variants exist and are comparable
+        assert_ne!(DisplayServer::X11, DisplayServer::Wayland);
+        assert_ne!(DisplayServer::X11, DisplayServer::None);
+        assert_ne!(DisplayServer::Wayland, DisplayServer::None);
+
+        // Test Clone and Copy
+        let ds = DisplayServer::X11;
+        let ds_clone = ds.clone();
+        let ds_copy = ds;
+        assert_eq!(ds, ds_clone);
+        assert_eq!(ds, ds_copy);
+
+        // Test Debug
+        let debug_str = format!("{:?}", DisplayServer::X11);
+        assert!(debug_str.contains("X11"));
+    }
+
+    #[test]
+    fn test_is_wayland() {
+        // Test that the function runs without panicking
+        // The result depends on environment variables
+        let _is_wayland = is_wayland();
+    }
+
+    #[test]
+    fn test_display_server() {
+        // Test that the function runs and returns a valid variant
+        let server = display_server();
+        // Should be one of the three valid variants
+        assert!(
+            server == DisplayServer::X11
+                || server == DisplayServer::Wayland
+                || server == DisplayServer::None
+        );
     }
 }
