@@ -8,6 +8,7 @@ use crate::types::{
     InitializeParams, InitializeResult, JsonRpcNotification, JsonRpcRequest, Resource,
     ResourceContent, ServerCapabilities, ServerInfo, ToolDefinition, ToolResult,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -40,7 +41,33 @@ impl McpClient {
     /// let client = McpClient::connect_stdio("npx", &["-y", "@anthropic/mcp-server-filesystem", "~"]).await?;
     /// ```
     pub async fn connect_stdio(command: &str, args: &[&str]) -> Result<Self> {
-        let transport = StdioTransport::spawn(command, args).await?;
+        Self::connect_stdio_with_env(command, args, &HashMap::new()).await
+    }
+
+    /// Connect to an MCP server via stdio transport with environment variables.
+    ///
+    /// This spawns the specified command as a child process with custom environment
+    /// variables and communicates with it via stdin/stdout.
+    ///
+    /// # Arguments
+    ///
+    /// * `command` - The command to execute
+    /// * `args` - Arguments to pass to the command
+    /// * `env` - Environment variables to set for the process
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut env = HashMap::new();
+    /// env.insert("API_KEY".to_string(), "secret".to_string());
+    /// let client = McpClient::connect_stdio_with_env("node", &["server.js"], &env).await?;
+    /// ```
+    pub async fn connect_stdio_with_env(
+        command: &str,
+        args: &[&str],
+        env: &HashMap<String, String>,
+    ) -> Result<Self> {
+        let transport = StdioTransport::spawn_with_env(command, args, env).await?;
         let client = Self::from_transport(Arc::new(transport));
         client.initialize().await?;
         Ok(client)

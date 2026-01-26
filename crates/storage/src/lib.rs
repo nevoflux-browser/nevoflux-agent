@@ -49,9 +49,10 @@ pub use storage::Storage;
 
 // Re-export model types for convenience
 pub use models::{
-    CheckPermissionParams, ConfigEntry, ContentType, CreateMessageParams, CreatePermissionParams,
-    CreateSessionParams, ListMessagesParams, ListSessionsParams, MemoryChunk, Message, MessageRole,
-    Permission, PermissionScope, Session, SessionMode, UpdateSessionParams,
+    CheckPermissionParams, CleanupPolicy, CleanupResult, ConfigEntry, ContentType,
+    CreateMessageParams, CreatePermissionParams, CreateSessionParams, ListMessagesParams,
+    ListSessionsParams, MemoryChunk, Message, MessageRole, Permission, PermissionScope, Session,
+    SessionMode, UpdateSessionParams,
 };
 
 // Re-export repository types for convenience

@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use crate::connection::Database;
 use crate::error::{Result, StorageError};
 use crate::models::{
-    current_timestamp, uuid_v4, CreateSessionParams, ListSessionsParams, Session,
-    UpdateSessionParams,
+    current_timestamp, uuid_v4, CleanupPolicy, CleanupResult, CreateSessionParams,
+    ListSessionsParams, Session, UpdateSessionParams,
 };
 
 /// Repository for session CRUD operations.
@@ -259,6 +259,246 @@ impl<'a> SessionRepository<'a> {
             Ok(())
         })
     }
+
+    /// Run cleanup based on the provided policy.
+    ///
+    /// Returns a `CleanupResult` with details about what was deleted.
+    pub fn cleanup(&self, policy: &CleanupPolicy) -> Result<CleanupResult> {
+        let mut result = CleanupResult::default();
+
+        if !policy.has_rules() {
+            return Ok(result);
+        }
+
+        // Step 1: Delete inactive sessions
+        if let Some(inactive_days) = policy.inactive_days {
+            result.inactive_deleted = self.cleanup_inactive(
+                inactive_days,
+                policy.preserve_pinned,
+                policy.preserve_archived,
+            )?;
+        }
+
+        // Step 2: Enforce max sessions limit
+        if let Some(max_sessions) = policy.max_sessions {
+            result.count_deleted =
+                self.cleanup_excess_sessions(max_sessions, policy.preserve_pinned)?;
+        }
+
+        // Step 3: Enforce storage limit (if applicable)
+        if let Some(max_storage_mb) = policy.max_storage_mb {
+            let (deleted, bytes) =
+                self.cleanup_by_storage(max_storage_mb, policy.preserve_pinned)?;
+            result.storage_deleted = deleted;
+            result.bytes_freed = bytes;
+        }
+
+        Ok(result)
+    }
+
+    /// Delete sessions that haven't been updated for more than `inactive_days`.
+    pub fn cleanup_inactive(
+        &self,
+        inactive_days: u32,
+        preserve_pinned: bool,
+        preserve_archived: bool,
+    ) -> Result<u32> {
+        let now = current_timestamp();
+        let cutoff = now - (inactive_days as i64 * 24 * 60 * 60);
+
+        self.db.with_connection(|conn| {
+            let mut conditions = vec!["updated_at < ?1"];
+
+            if preserve_pinned {
+                conditions.push("pinned = 0");
+            }
+
+            if preserve_archived {
+                conditions.push("archived = 0");
+            }
+
+            let sql = format!("DELETE FROM sessions WHERE {}", conditions.join(" AND "));
+
+            let rows_affected = conn.execute(&sql, params![cutoff])?;
+            Ok(rows_affected as u32)
+        })
+    }
+
+    /// Delete the oldest sessions to keep the count under `max_sessions`.
+    pub fn cleanup_excess_sessions(&self, max_sessions: u32, preserve_pinned: bool) -> Result<u32> {
+        let current_count = self.count(true)?;
+
+        if current_count <= max_sessions {
+            return Ok(0);
+        }
+
+        let to_delete = current_count - max_sessions;
+
+        self.db.with_connection(|conn| {
+            // Get IDs of oldest sessions to delete
+            let pinned_filter = if preserve_pinned {
+                "WHERE pinned = 0"
+            } else {
+                ""
+            };
+
+            let sql = format!(
+                "SELECT id FROM sessions {} ORDER BY updated_at ASC LIMIT ?1",
+                pinned_filter
+            );
+
+            let ids: Vec<String> = conn
+                .prepare(&sql)?
+                .query_map(params![to_delete], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            if ids.is_empty() {
+                return Ok(0);
+            }
+
+            // Delete the selected sessions
+            let placeholders: Vec<String> = ids
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect();
+            let delete_sql = format!(
+                "DELETE FROM sessions WHERE id IN ({})",
+                placeholders.join(", ")
+            );
+
+            let params: Vec<&dyn rusqlite::ToSql> =
+                ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let rows_affected = conn.execute(&delete_sql, params.as_slice())?;
+
+            Ok(rows_affected as u32)
+        })
+    }
+
+    /// Delete oldest sessions to get storage under `max_storage_mb`.
+    ///
+    /// Returns (sessions_deleted, bytes_freed).
+    pub fn cleanup_by_storage(
+        &self,
+        max_storage_mb: u32,
+        preserve_pinned: bool,
+    ) -> Result<(u32, u64)> {
+        let max_bytes = max_storage_mb as u64 * 1024 * 1024;
+
+        self.db.with_connection(|conn| {
+            // Get current storage size
+            let current_size: u64 = conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(title) + LENGTH(metadata) + 100), 0) FROM sessions",
+                [],
+                |row| row.get(0),
+            )?;
+
+            if current_size <= max_bytes {
+                return Ok((0, 0));
+            }
+
+            let bytes_to_free = current_size - max_bytes;
+            let mut bytes_freed: u64 = 0;
+            let mut deleted: u32 = 0;
+
+            // Get sessions ordered by updated_at (oldest first)
+            let pinned_filter = if preserve_pinned {
+                "WHERE pinned = 0"
+            } else {
+                ""
+            };
+
+            let sql = format!(
+                "SELECT id, COALESCE(LENGTH(title), 0) + COALESCE(LENGTH(metadata), 0) + 100 as size
+                 FROM sessions {} ORDER BY updated_at ASC",
+                pinned_filter
+            );
+
+            let sessions: Vec<(String, u64)> = conn
+                .prepare(&sql)?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            for (id, size) in sessions {
+                if bytes_freed >= bytes_to_free {
+                    break;
+                }
+
+                conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+                bytes_freed += size;
+                deleted += 1;
+            }
+
+            Ok((deleted, bytes_freed))
+        })
+    }
+
+    /// Get all session IDs that would be affected by a cleanup policy (dry run).
+    pub fn preview_cleanup(&self, policy: &CleanupPolicy) -> Result<Vec<String>> {
+        let mut ids = Vec::new();
+
+        if !policy.has_rules() {
+            return Ok(ids);
+        }
+
+        self.db.with_connection(|conn| {
+            // Preview inactive sessions
+            if let Some(inactive_days) = policy.inactive_days {
+                let now = current_timestamp();
+                let cutoff = now - (inactive_days as i64 * 24 * 60 * 60);
+
+                let mut conditions = vec!["updated_at < ?1"];
+                if policy.preserve_pinned {
+                    conditions.push("pinned = 0");
+                }
+                if policy.preserve_archived {
+                    conditions.push("archived = 0");
+                }
+
+                let sql = format!("SELECT id FROM sessions WHERE {}", conditions.join(" AND "));
+
+                let inactive_ids: Vec<String> = conn
+                    .prepare(&sql)?
+                    .query_map(params![cutoff], |row| row.get(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+
+                ids.extend(inactive_ids);
+            }
+
+            // Preview excess sessions
+            if let Some(max_sessions) = policy.max_sessions {
+                let current_count = self.count(true)?;
+                if current_count > max_sessions {
+                    let to_delete = current_count - max_sessions;
+                    let pinned_filter = if policy.preserve_pinned {
+                        "WHERE pinned = 0"
+                    } else {
+                        ""
+                    };
+
+                    let sql = format!(
+                        "SELECT id FROM sessions {} ORDER BY updated_at ASC LIMIT ?1",
+                        pinned_filter
+                    );
+
+                    let excess_ids: Vec<String> = conn
+                        .prepare(&sql)?
+                        .query_map(params![to_delete], |row| row.get(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+                    for id in excess_ids {
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                        }
+                    }
+                }
+            }
+
+            Ok(ids)
+        })
+    }
 }
 
 /// Convert a database row to a Session.
@@ -297,7 +537,7 @@ fn row_to_session(row: &Row<'_>) -> rusqlite::Result<Result<Session>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::SessionMode;
+    use crate::models::{CleanupPolicy, SessionMode};
 
     fn setup_db() -> Database {
         Database::open_in_memory().unwrap()
@@ -737,5 +977,185 @@ mod tests {
 
         let result = repo.touch("nonexistent");
         assert!(matches!(result, Err(StorageError::NotFound { .. })));
+    }
+
+    #[test]
+    fn test_cleanup_no_rules() {
+        let db = setup_db();
+        let repo = SessionRepository::new(&db);
+
+        repo.create(CreateSessionParams::new().with_id("test"))
+            .unwrap();
+
+        let policy = CleanupPolicy::new();
+        let result = repo.cleanup(&policy).unwrap();
+
+        assert_eq!(result.total_deleted(), 0);
+        assert!(!result.has_deletions());
+    }
+
+    #[test]
+    fn test_cleanup_inactive() {
+        let db = setup_db();
+        let repo = SessionRepository::new(&db);
+
+        // Create an old session by manually setting updated_at
+        repo.create(CreateSessionParams::new().with_id("old"))
+            .unwrap();
+        repo.create(CreateSessionParams::new().with_id("new"))
+            .unwrap();
+
+        // Manually update the 'old' session to be 100 days old
+        let old_timestamp = current_timestamp() - (100 * 24 * 60 * 60);
+        db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE sessions SET updated_at = ?1 WHERE id = 'old'",
+                params![old_timestamp],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        // Cleanup sessions inactive for more than 30 days
+        let policy = CleanupPolicy::new().with_inactive_days(30);
+        let result = repo.cleanup(&policy).unwrap();
+
+        assert_eq!(result.inactive_deleted, 1);
+        assert!(repo.get("old").unwrap().is_none());
+        assert!(repo.get("new").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_cleanup_preserve_pinned() {
+        let db = setup_db();
+        let repo = SessionRepository::new(&db);
+
+        // Create an old pinned session
+        repo.create(
+            CreateSessionParams::new()
+                .with_id("old-pinned")
+                .with_pinned(true),
+        )
+        .unwrap();
+
+        // Make it old
+        let old_timestamp = current_timestamp() - (100 * 24 * 60 * 60);
+        db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE sessions SET updated_at = ?1 WHERE id = 'old-pinned'",
+                params![old_timestamp],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        // Cleanup with preserve_pinned = true (default)
+        let policy = CleanupPolicy::new().with_inactive_days(30);
+        let result = repo.cleanup(&policy).unwrap();
+
+        assert_eq!(result.inactive_deleted, 0);
+        assert!(repo.get("old-pinned").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_cleanup_max_sessions() {
+        let db = setup_db();
+        let repo = SessionRepository::new(&db);
+
+        // Create 5 sessions
+        for i in 0..5 {
+            repo.create(CreateSessionParams::new().with_id(format!("session-{}", i)))
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Keep only 3 sessions
+        let policy = CleanupPolicy::new().with_max_sessions(3);
+        let result = repo.cleanup(&policy).unwrap();
+
+        assert_eq!(result.count_deleted, 2);
+        assert_eq!(repo.count(true).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_preview_cleanup() {
+        let db = setup_db();
+        let repo = SessionRepository::new(&db);
+
+        // Create sessions
+        repo.create(CreateSessionParams::new().with_id("old"))
+            .unwrap();
+        repo.create(CreateSessionParams::new().with_id("new"))
+            .unwrap();
+
+        // Make 'old' session old
+        let old_timestamp = current_timestamp() - (100 * 24 * 60 * 60);
+        db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE sessions SET updated_at = ?1 WHERE id = 'old'",
+                params![old_timestamp],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        let policy = CleanupPolicy::new().with_inactive_days(30);
+        let preview_ids = repo.preview_cleanup(&policy).unwrap();
+
+        assert_eq!(preview_ids.len(), 1);
+        assert!(preview_ids.contains(&"old".to_string()));
+
+        // Verify sessions still exist (preview doesn't delete)
+        assert!(repo.get("old").unwrap().is_some());
+        assert!(repo.get("new").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_cleanup_result() {
+        let result = CleanupResult {
+            inactive_deleted: 5,
+            count_deleted: 3,
+            storage_deleted: 2,
+            bytes_freed: 1024,
+        };
+
+        assert_eq!(result.total_deleted(), 10);
+        assert!(result.has_deletions());
+
+        let empty_result = CleanupResult::default();
+        assert_eq!(empty_result.total_deleted(), 0);
+        assert!(!empty_result.has_deletions());
+    }
+
+    #[test]
+    fn test_cleanup_policy_builder() {
+        let policy = CleanupPolicy::new()
+            .with_inactive_days(30)
+            .with_max_sessions(100)
+            .with_max_storage_mb(500)
+            .preserve_pinned(true)
+            .preserve_archived(false);
+
+        assert_eq!(policy.inactive_days, Some(30));
+        assert_eq!(policy.max_sessions, Some(100));
+        assert_eq!(policy.max_storage_mb, Some(500));
+        assert!(policy.preserve_pinned);
+        assert!(!policy.preserve_archived);
+        assert!(policy.has_rules());
+    }
+
+    #[test]
+    fn test_cleanup_policy_default() {
+        let policy = CleanupPolicy::default();
+
+        assert!(policy.inactive_days.is_none());
+        assert!(policy.max_sessions.is_none());
+        assert!(policy.max_storage_mb.is_none());
+        assert!(policy.preserve_pinned);
+        assert!(!policy.preserve_archived);
+        assert!(!policy.has_rules());
     }
 }

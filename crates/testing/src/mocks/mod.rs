@@ -21,8 +21,10 @@
 
 mod browser;
 mod llm;
+mod mcp_client;
 mod permission;
 
 pub use browser::{BrowserActionRecord, MockBrowserActions, MockBrowserResponse};
-pub use llm::MockLlmProvider;
+pub use llm::{CompletionRecord, MockLlmProvider, MockMessage, MockResponse, MockToolCall};
+pub use mcp_client::{MockMcpClient, MockMcpError, MockResource, ToolCallRecord};
 pub use permission::MockPermissionChecker;

@@ -3,6 +3,8 @@
 //! This module provides the host functions that Wasm guest modules can call
 //! to interact with the NevoFlux daemon.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use wasmtime::{Caller, Engine, Linker};
 
 use crate::error::{DaemonError, Result};
@@ -13,6 +15,149 @@ use nevoflux_storage::{
 
 /// Initial capacity for the memory buffer (1MB).
 const MEMORY_BUFFER_CAPACITY: usize = 1024 * 1024;
+
+/// Status of a subagent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubagentStatus {
+    /// Subagent is currently running.
+    Running,
+    /// Subagent completed successfully.
+    Completed,
+    /// Subagent failed with an error.
+    Failed(String),
+    /// Subagent was killed.
+    Killed,
+}
+
+/// Information about a spawned subagent.
+#[derive(Debug, Clone)]
+pub struct SubagentInfo {
+    /// Unique identifier for this subagent.
+    pub id: u64,
+    /// The task description given to the subagent.
+    pub task: String,
+    /// The mode the subagent is running in.
+    pub mode: String,
+    /// Current status.
+    pub status: SubagentStatus,
+    /// Result if completed.
+    pub result: Option<String>,
+}
+
+/// Registry for managing subagents.
+#[derive(Debug, Clone, Default)]
+pub struct SubagentRegistry {
+    /// Next subagent ID.
+    next_id: Arc<Mutex<u64>>,
+    /// Active subagents by ID.
+    subagents: Arc<Mutex<HashMap<u64, SubagentInfo>>>,
+}
+
+impl SubagentRegistry {
+    /// Create a new empty registry.
+    pub fn new() -> Self {
+        Self {
+            next_id: Arc::new(Mutex::new(1)),
+            subagents: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Spawn a new subagent and return its ID.
+    pub fn spawn(&self, task: String, mode: String) -> u64 {
+        let mut next_id = self.next_id.lock().unwrap();
+        let id = *next_id;
+        *next_id += 1;
+
+        let info = SubagentInfo {
+            id,
+            task,
+            mode,
+            status: SubagentStatus::Running,
+            result: None,
+        };
+
+        self.subagents.lock().unwrap().insert(id, info);
+        id
+    }
+
+    /// Get the status of a subagent.
+    pub fn get_status(&self, id: u64) -> Option<SubagentStatus> {
+        self.subagents
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|s| s.status.clone())
+    }
+
+    /// Get a subagent's info.
+    pub fn get(&self, id: u64) -> Option<SubagentInfo> {
+        self.subagents.lock().unwrap().get(&id).cloned()
+    }
+
+    /// Complete a subagent with a result.
+    pub fn complete(&self, id: u64, result: String) -> bool {
+        if let Some(info) = self.subagents.lock().unwrap().get_mut(&id) {
+            info.status = SubagentStatus::Completed;
+            info.result = Some(result);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark a subagent as failed.
+    pub fn fail(&self, id: u64, error: String) -> bool {
+        if let Some(info) = self.subagents.lock().unwrap().get_mut(&id) {
+            info.status = SubagentStatus::Failed(error);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Kill a subagent.
+    pub fn kill(&self, id: u64) -> bool {
+        if let Some(info) = self.subagents.lock().unwrap().get_mut(&id) {
+            if info.status == SubagentStatus::Running {
+                info.status = SubagentStatus::Killed;
+                true
+            } else {
+                false // Already finished
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Check if a subagent is still running.
+    pub fn is_running(&self, id: u64) -> bool {
+        self.subagents
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|s| s.status == SubagentStatus::Running)
+            .unwrap_or(false)
+    }
+
+    /// Get the result of a completed subagent.
+    pub fn get_result(&self, id: u64) -> Option<String> {
+        self.subagents
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(|s| s.result.clone())
+    }
+
+    /// Remove a subagent from the registry.
+    pub fn remove(&self, id: u64) -> Option<SubagentInfo> {
+        self.subagents.lock().unwrap().remove(&id)
+    }
+
+    /// List all subagent IDs.
+    pub fn list_ids(&self) -> Vec<u64> {
+        self.subagents.lock().unwrap().keys().cloned().collect()
+    }
+}
 
 /// Host state for Wasm guest modules.
 ///
@@ -30,6 +175,9 @@ pub struct HostState {
     /// When set, host functions can access the database, skills registry,
     /// and other services provided by the daemon.
     pub services: Option<HostServices>,
+
+    /// Subagent registry for managing spawned subagents.
+    pub subagents: SubagentRegistry,
 }
 
 impl Default for HostState {
@@ -45,6 +193,7 @@ impl HostState {
             memory_buffer: Vec::with_capacity(MEMORY_BUFFER_CAPACITY),
             last_error: None,
             services: None,
+            subagents: SubagentRegistry::new(),
         }
     }
 
@@ -479,6 +628,139 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
             DaemonError::InternalError(format!("Failed to register memory_search: {}", e))
         })?;
 
+    // Register memory_update: updates an existing memory chunk
+    // memory_update: id_ptr, id_len, content_ptr, content_len -> 1 for success, 0 for not found, -1 for error
+    linker
+        .func_wrap(
+            "nevoflux",
+            "memory_update",
+            |mut caller: Caller<'_, HostState>,
+             id_ptr: i32,
+             id_len: i32,
+             content_ptr: i32,
+             content_len: i32|
+             -> i32 {
+                let memory = match caller.get_export("memory") {
+                    Some(wasmtime::Extern::Memory(mem)) => mem,
+                    _ => return -1,
+                };
+
+                // Read ID from guest memory
+                let mut id_buf = vec![0u8; id_len as usize];
+                if memory.read(&caller, id_ptr as usize, &mut id_buf).is_err() {
+                    return -1;
+                }
+                let id = match String::from_utf8(id_buf) {
+                    Ok(s) => s,
+                    Err(_) => return -1,
+                };
+
+                // Read content from guest memory
+                let mut content_buf = vec![0u8; content_len as usize];
+                if memory
+                    .read(&caller, content_ptr as usize, &mut content_buf)
+                    .is_err()
+                {
+                    return -1;
+                }
+                let content = match String::from_utf8(content_buf) {
+                    Ok(s) => s,
+                    Err(_) => return -1,
+                };
+
+                // Get the database and update
+                match caller.data().services.as_ref() {
+                    Some(services) => {
+                        let repo = MemoryRepository::new(&services.database);
+                        match repo.update(&id, &content) {
+                            Ok(true) => 1,  // Updated successfully
+                            Ok(false) => 0, // Not found
+                            Err(e) => {
+                                caller.data_mut().set_error(e.to_string());
+                                -1
+                            }
+                        }
+                    }
+                    None => -1,
+                }
+            },
+        )
+        .map_err(|e| {
+            DaemonError::InternalError(format!("Failed to register memory_update: {}", e))
+        })?;
+
+    // Register memory_get: retrieves a memory chunk by ID
+    // memory_get: id_ptr, id_len, result_ptr, result_len -> bytes written or 0 (not found) or -1 (error)
+    linker
+        .func_wrap(
+            "nevoflux",
+            "memory_get",
+            |mut caller: Caller<'_, HostState>,
+             id_ptr: i32,
+             id_len: i32,
+             result_ptr: i32,
+             result_len: i32|
+             -> i32 {
+                let memory = match caller.get_export("memory") {
+                    Some(wasmtime::Extern::Memory(mem)) => mem,
+                    _ => return -1,
+                };
+
+                // Read ID from guest memory
+                let mut id_buf = vec![0u8; id_len as usize];
+                if memory.read(&caller, id_ptr as usize, &mut id_buf).is_err() {
+                    return -1;
+                }
+                let id = match String::from_utf8(id_buf) {
+                    Ok(s) => s,
+                    Err(_) => return -1,
+                };
+
+                // Get the database and fetch the memory chunk
+                match caller.data().services.as_ref() {
+                    Some(services) => {
+                        let repo = MemoryRepository::new(&services.database);
+                        match repo.get(&id) {
+                            Ok(Some(chunk)) => {
+                                // Serialize to JSON
+                                let json = match serde_json::to_string(&chunk) {
+                                    Ok(j) => j,
+                                    Err(e) => {
+                                        caller.data_mut().set_error(e.to_string());
+                                        return -1;
+                                    }
+                                };
+
+                                let result_bytes = json.as_bytes();
+                                let write_len =
+                                    std::cmp::min(result_bytes.len(), result_len as usize);
+
+                                if memory
+                                    .write(
+                                        &mut caller,
+                                        result_ptr as usize,
+                                        &result_bytes[..write_len],
+                                    )
+                                    .is_err()
+                                {
+                                    return -1;
+                                }
+
+                                write_len as i32
+                            }
+                            Ok(None) => 0, // Not found
+                            Err(e) => {
+                                caller.data_mut().set_error(e.to_string());
+                                -1
+                            }
+                        }
+                    }
+                    None => -1,
+                }
+            },
+        )
+        .map_err(|e| DaemonError::InternalError(format!("Failed to register memory_get: {}", e)))?;
+
     // Register permission_check: checks permission against database
     // permission_check: resource_ptr, resource_len, action_ptr, action_len -> 1 (allowed), 0 (denied), -1 (error)
     linker
@@ -722,6 +1004,357 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
         )
         .map_err(|e| DaemonError::InternalError(format!("Failed to register skill_load: {}", e)))?;
 
+    // Register skill_read: reads an auxiliary file from a skill's directory (Level 3 loading)
+    // skill_read: name_ptr, name_len, path_ptr, path_len, result_ptr, result_len -> bytes written or -1 (not found) or -2 (error)
+    linker
+        .func_wrap(
+            "nevoflux",
+            "skill_read",
+            |mut caller: Caller<'_, HostState>,
+             name_ptr: i32,
+             name_len: i32,
+             path_ptr: i32,
+             path_len: i32,
+             result_ptr: i32,
+             result_len: i32|
+             -> i32 {
+                let memory = match caller.get_export("memory") {
+                    Some(wasmtime::Extern::Memory(mem)) => mem,
+                    _ => return -2,
+                };
+
+                // Read skill name from guest memory
+                let mut name_buf = vec![0u8; name_len as usize];
+                if memory
+                    .read(&caller, name_ptr as usize, &mut name_buf)
+                    .is_err()
+                {
+                    return -2;
+                }
+                let skill_name = match String::from_utf8(name_buf) {
+                    Ok(s) => s,
+                    Err(_) => return -2,
+                };
+
+                // Read path from guest memory
+                let mut path_buf = vec![0u8; path_len as usize];
+                if memory
+                    .read(&caller, path_ptr as usize, &mut path_buf)
+                    .is_err()
+                {
+                    return -2;
+                }
+                let relative_path = match String::from_utf8(path_buf) {
+                    Ok(s) => s,
+                    Err(_) => return -2,
+                };
+
+                // Try to read the auxiliary file
+                let content = match caller.data().services.as_ref() {
+                    Some(services) => {
+                        let registry = services.skills.blocking_read();
+                        match registry.read_auxiliary_file(&skill_name, &relative_path) {
+                            Ok(content) => content,
+                            Err(_) => return -1, // Not found or read error
+                        }
+                    }
+                    None => return -1,
+                };
+
+                let result_bytes = content.as_bytes();
+                let write_len = std::cmp::min(result_bytes.len(), result_len as usize);
+
+                if memory
+                    .write(&mut caller, result_ptr as usize, &result_bytes[..write_len])
+                    .is_err()
+                {
+                    return -2;
+                }
+
+                write_len as i32
+            },
+        )
+        .map_err(|e| DaemonError::InternalError(format!("Failed to register skill_read: {}", e)))?;
+
+    // Register skill_execute: executes a script from a skill's directory (Level 3 loading)
+    // skill_execute: name_ptr, name_len, script_ptr, script_len, args_ptr, args_len, result_ptr, result_len -> bytes written or -1 (not found) or -2 (error)
+    linker
+        .func_wrap(
+            "nevoflux",
+            "skill_execute",
+            |mut caller: Caller<'_, HostState>,
+             name_ptr: i32,
+             name_len: i32,
+             script_ptr: i32,
+             script_len: i32,
+             args_ptr: i32,
+             args_len: i32,
+             result_ptr: i32,
+             result_len: i32|
+             -> i32 {
+                let memory = match caller.get_export("memory") {
+                    Some(wasmtime::Extern::Memory(mem)) => mem,
+                    _ => return -2,
+                };
+
+                // Read skill name from guest memory
+                let mut name_buf = vec![0u8; name_len as usize];
+                if memory
+                    .read(&caller, name_ptr as usize, &mut name_buf)
+                    .is_err()
+                {
+                    return -2;
+                }
+                let skill_name = match String::from_utf8(name_buf) {
+                    Ok(s) => s,
+                    Err(_) => return -2,
+                };
+
+                // Read script path from guest memory
+                let mut script_buf = vec![0u8; script_len as usize];
+                if memory
+                    .read(&caller, script_ptr as usize, &mut script_buf)
+                    .is_err()
+                {
+                    return -2;
+                }
+                let script_path = match String::from_utf8(script_buf) {
+                    Ok(s) => s,
+                    Err(_) => return -2,
+                };
+
+                // Read args JSON from guest memory
+                let mut args_buf = vec![0u8; args_len as usize];
+                if memory
+                    .read(&caller, args_ptr as usize, &mut args_buf)
+                    .is_err()
+                {
+                    return -2;
+                }
+                let args_str = match String::from_utf8(args_buf) {
+                    Ok(s) => s,
+                    Err(_) => return -2,
+                };
+                let args: serde_json::Value = match serde_json::from_str(&args_str) {
+                    Ok(v) => v,
+                    Err(_) => return -2,
+                };
+
+                // Try to execute the script
+                // Clone the skills Arc to avoid borrow issues
+                let skills = match caller.data().services.as_ref() {
+                    Some(services) => services.skills.clone(),
+                    None => return -1,
+                };
+
+                let output = {
+                    let registry = skills.blocking_read();
+                    match registry.execute_script(&skill_name, &script_path, &args) {
+                        Ok(output) => output,
+                        Err(e) => {
+                            drop(registry); // Explicitly drop before mutable borrow
+                            caller.data_mut().set_error(e.to_string());
+                            return -1;
+                        }
+                    }
+                };
+
+                let result_bytes = output.as_bytes();
+                let write_len = std::cmp::min(result_bytes.len(), result_len as usize);
+
+                if memory
+                    .write(&mut caller, result_ptr as usize, &result_bytes[..write_len])
+                    .is_err()
+                {
+                    return -2;
+                }
+
+                write_len as i32
+            },
+        )
+        .map_err(|e| {
+            DaemonError::InternalError(format!("Failed to register skill_execute: {}", e))
+        })?;
+
+    // Register subagent_spawn: spawns a new subagent
+    // subagent_spawn: task_ptr, task_len, mode_ptr, mode_len -> subagent_id (u64 as i64) or -1 on error
+    linker
+        .func_wrap(
+            "nevoflux",
+            "subagent_spawn",
+            |mut caller: Caller<'_, HostState>,
+             task_ptr: i32,
+             task_len: i32,
+             mode_ptr: i32,
+             mode_len: i32|
+             -> i64 {
+                let memory = match caller.get_export("memory") {
+                    Some(wasmtime::Extern::Memory(mem)) => mem,
+                    _ => return -1,
+                };
+
+                // Read task from guest memory
+                let mut task_buf = vec![0u8; task_len as usize];
+                if memory
+                    .read(&caller, task_ptr as usize, &mut task_buf)
+                    .is_err()
+                {
+                    return -1;
+                }
+                let task = match String::from_utf8(task_buf) {
+                    Ok(s) => s,
+                    Err(_) => return -1,
+                };
+
+                // Read mode from guest memory
+                let mut mode_buf = vec![0u8; mode_len as usize];
+                if memory
+                    .read(&caller, mode_ptr as usize, &mut mode_buf)
+                    .is_err()
+                {
+                    return -1;
+                }
+                let mode = match String::from_utf8(mode_buf) {
+                    Ok(s) => s,
+                    Err(_) => return -1,
+                };
+
+                // Spawn the subagent
+                let id = caller.data().subagents.spawn(task, mode);
+                id as i64
+            },
+        )
+        .map_err(|e| {
+            DaemonError::InternalError(format!("Failed to register subagent_spawn: {}", e))
+        })?;
+
+    // Register subagent_status: gets the status of a subagent
+    // subagent_status: subagent_id -> status (0=running, 1=completed, 2=failed, 3=killed, -1=not found)
+    linker
+        .func_wrap(
+            "nevoflux",
+            "subagent_status",
+            |caller: Caller<'_, HostState>, subagent_id: i64| -> i32 {
+                match caller.data().subagents.get_status(subagent_id as u64) {
+                    Some(SubagentStatus::Running) => 0,
+                    Some(SubagentStatus::Completed) => 1,
+                    Some(SubagentStatus::Failed(_)) => 2,
+                    Some(SubagentStatus::Killed) => 3,
+                    None => -1,
+                }
+            },
+        )
+        .map_err(|e| {
+            DaemonError::InternalError(format!("Failed to register subagent_status: {}", e))
+        })?;
+
+    // Register subagent_wait: waits for a subagent and gets its result
+    // subagent_wait: subagent_id, result_ptr, result_len -> bytes written or -1 (not found) or -2 (still running) or -3 (failed/killed)
+    linker
+        .func_wrap(
+            "nevoflux",
+            "subagent_wait",
+            |mut caller: Caller<'_, HostState>,
+             subagent_id: i64,
+             result_ptr: i32,
+             result_len: i32|
+             -> i32 {
+                let memory = match caller.get_export("memory") {
+                    Some(wasmtime::Extern::Memory(mem)) => mem,
+                    _ => return -1,
+                };
+
+                let info = match caller.data().subagents.get(subagent_id as u64) {
+                    Some(info) => info,
+                    None => return -1, // Not found
+                };
+
+                match info.status {
+                    SubagentStatus::Running => -2, // Still running
+                    SubagentStatus::Completed => {
+                        // Return the result
+                        if let Some(result) = info.result {
+                            let result_bytes = result.as_bytes();
+                            let write_len = std::cmp::min(result_bytes.len(), result_len as usize);
+
+                            if memory
+                                .write(&mut caller, result_ptr as usize, &result_bytes[..write_len])
+                                .is_err()
+                            {
+                                return -1;
+                            }
+
+                            write_len as i32
+                        } else {
+                            0 // Completed with no result
+                        }
+                    }
+                    SubagentStatus::Failed(_) | SubagentStatus::Killed => -3, // Failed or killed
+                }
+            },
+        )
+        .map_err(|e| {
+            DaemonError::InternalError(format!("Failed to register subagent_wait: {}", e))
+        })?;
+
+    // Register subagent_kill: kills a running subagent
+    // subagent_kill: subagent_id -> 1 (success), 0 (already finished), -1 (not found)
+    linker
+        .func_wrap(
+            "nevoflux",
+            "subagent_kill",
+            |caller: Caller<'_, HostState>, subagent_id: i64| -> i32 {
+                match caller.data().subagents.get(subagent_id as u64) {
+                    Some(_) => {
+                        if caller.data().subagents.kill(subagent_id as u64) {
+                            1 // Successfully killed
+                        } else {
+                            0 // Already finished
+                        }
+                    }
+                    None => -1, // Not found
+                }
+            },
+        )
+        .map_err(|e| {
+            DaemonError::InternalError(format!("Failed to register subagent_kill: {}", e))
+        })?;
+
+    // Register subagent_list: lists all subagent IDs
+    // subagent_list: result_ptr, result_len -> bytes written (JSON array of IDs) or -1 on error
+    linker
+        .func_wrap(
+            "nevoflux",
+            "subagent_list",
+            |mut caller: Caller<'_, HostState>, result_ptr: i32, result_len: i32| -> i32 {
+                let memory = match caller.get_export("memory") {
+                    Some(wasmtime::Extern::Memory(mem)) => mem,
+                    _ => return -1,
+                };
+
+                let ids = caller.data().subagents.list_ids();
+                let json = match serde_json::to_string(&ids) {
+                    Ok(j) => j,
+                    Err(_) => return -1,
+                };
+
+                let result_bytes = json.as_bytes();
+                let write_len = std::cmp::min(result_bytes.len(), result_len as usize);
+
+                if memory
+                    .write(&mut caller, result_ptr as usize, &result_bytes[..write_len])
+                    .is_err()
+                {
+                    return -1;
+                }
+
+                write_len as i32
+            },
+        )
+        .map_err(|e| {
+            DaemonError::InternalError(format!("Failed to register subagent_list: {}", e))
+        })?;
+
     // Register tool_read: reads file contents
     // tool_read: path_ptr, path_len, offset, limit, result_ptr, result_len -> bytes written or -1
     linker
@@ -867,6 +1500,106 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
         )
         .map_err(|e| DaemonError::InternalError(format!("Failed to register tool_glob: {}", e)))?;
 
+    // Register tool_search: search tools by keyword using BM25 ranking
+    // tool_search: query_ptr, query_len, max_results, result_ptr, result_len -> bytes written or -1 (no services) or -2 (error)
+    linker
+        .func_wrap(
+            "nevoflux",
+            "tool_search",
+            |mut caller: Caller<'_, HostState>,
+             query_ptr: i32,
+             query_len: i32,
+             max_results: i32,
+             result_ptr: i32,
+             result_len: i32|
+             -> i32 {
+                let memory = match caller.get_export("memory") {
+                    Some(wasmtime::Extern::Memory(mem)) => mem,
+                    _ => return -1,
+                };
+
+                // Read query from guest memory
+                let mut query_buf = vec![0u8; query_len as usize];
+                if memory
+                    .read(&caller, query_ptr as usize, &mut query_buf)
+                    .is_err()
+                {
+                    return -1;
+                }
+                let query = match String::from_utf8(query_buf) {
+                    Ok(s) => s,
+                    Err(_) => return -1,
+                };
+
+                // Get tool search index from services
+                let services = match &caller.data().services {
+                    Some(s) => s.clone(),
+                    None => return -1, // No services configured
+                };
+
+                let tool_search = match &services.tool_search {
+                    Some(ts) => ts.clone(),
+                    None => {
+                        // Return empty array if no tool search configured
+                        let empty = "[]";
+                        let empty_bytes = empty.as_bytes();
+                        let write_len = std::cmp::min(empty_bytes.len(), result_len as usize);
+                        if memory
+                            .write(&mut caller, result_ptr as usize, &empty_bytes[..write_len])
+                            .is_err()
+                        {
+                            return -2;
+                        }
+                        return write_len as i32;
+                    }
+                };
+
+                // Perform the search
+                let results = {
+                    let index = tool_search.blocking_read();
+                    if max_results > 0 {
+                        index.search_limit(&query, max_results as usize)
+                    } else {
+                        index.search(&query)
+                    }
+                };
+
+                // Convert results to JSON
+                let json_results: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "name": r.tool.name,
+                            "description": r.tool.description,
+                            "score": r.score,
+                            "input_schema": r.tool.input_schema
+                        })
+                    })
+                    .collect();
+
+                let json = match serde_json::to_string(&json_results) {
+                    Ok(j) => j,
+                    Err(_) => return -2,
+                };
+
+                // Write result to guest memory
+                let result_bytes = json.as_bytes();
+                let write_len = std::cmp::min(result_bytes.len(), result_len as usize);
+
+                if memory
+                    .write(&mut caller, result_ptr as usize, &result_bytes[..write_len])
+                    .is_err()
+                {
+                    return -2;
+                }
+
+                write_len as i32
+            },
+        )
+        .map_err(|e| {
+            DaemonError::InternalError(format!("Failed to register tool_search: {}", e))
+        })?;
+
     Ok(linker)
 }
 
@@ -921,11 +1654,21 @@ mod tests {
                 (import "nevoflux" "memory_create" (func $memory_create (param i32 i32 i32 i32 i32 i32) (result i32)))
                 (import "nevoflux" "memory_delete" (func $memory_delete (param i32 i32) (result i32)))
                 (import "nevoflux" "memory_search" (func $memory_search (param i32 i32 i32 i32 i32) (result i32)))
+                (import "nevoflux" "memory_update" (func $memory_update (param i32 i32 i32 i32) (result i32)))
+                (import "nevoflux" "memory_get" (func $memory_get (param i32 i32 i32 i32) (result i32)))
                 (import "nevoflux" "permission_check" (func $permission_check (param i32 i32 i32 i32) (result i32)))
                 (import "nevoflux" "skill_list" (func $skill_list (param i32 i32) (result i32)))
                 (import "nevoflux" "skill_load" (func $skill_load (param i32 i32 i32 i32) (result i32)))
+                (import "nevoflux" "skill_read" (func $skill_read (param i32 i32 i32 i32 i32 i32) (result i32)))
+                (import "nevoflux" "skill_execute" (func $skill_execute (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+                (import "nevoflux" "subagent_spawn" (func $subagent_spawn (param i32 i32 i32 i32) (result i64)))
+                (import "nevoflux" "subagent_status" (func $subagent_status (param i64) (result i32)))
+                (import "nevoflux" "subagent_wait" (func $subagent_wait (param i64 i32 i32) (result i32)))
+                (import "nevoflux" "subagent_kill" (func $subagent_kill (param i64) (result i32)))
+                (import "nevoflux" "subagent_list" (func $subagent_list (param i32 i32) (result i32)))
                 (import "nevoflux" "tool_read" (func $tool_read (param i32 i32 i64 i64 i32 i32) (result i32)))
                 (import "nevoflux" "tool_glob" (func $tool_glob (param i32 i32 i32 i32 i32 i32) (result i32)))
+                (import "nevoflux" "tool_search" (func $tool_search (param i32 i32 i32 i32 i32) (result i32)))
                 (memory (export "memory") 1)
             )
         "#;
@@ -1991,6 +2734,193 @@ mod tests {
         assert_eq!(result, 0); // Not found
     }
 
+    #[test]
+    fn test_memory_update_not_found() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "memory_update" (func $memory_update (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "nonexistent-id")
+                (data (i32.const 20) "new content")
+                (func (export "test") (result i32)
+                    i32.const 0   ;; id_ptr
+                    i32.const 14  ;; id_len
+                    i32.const 20  ;; content_ptr
+                    i32.const 11  ;; content_len
+                    call $memory_update
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let services = crate::wasm::services::HostServices::new(db);
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert_eq!(result, 0); // Not found
+    }
+
+    #[test]
+    fn test_memory_update_success() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+
+        // Create a memory chunk first
+        let chunk = MemoryChunk::new("original content").with_id("test-update-id");
+        MemoryRepository::new(&db)
+            .create(&chunk)
+            .expect("Failed to create chunk");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "memory_update" (func $memory_update (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "test-update-id")
+                (data (i32.const 20) "updated content")
+                (func (export "test") (result i32)
+                    i32.const 0   ;; id_ptr
+                    i32.const 14  ;; id_len
+                    i32.const 20  ;; content_ptr
+                    i32.const 15  ;; content_len
+                    call $memory_update
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let services = crate::wasm::services::HostServices::new(db.clone());
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert_eq!(result, 1); // Success
+
+        // Verify the content was updated
+        let updated = MemoryRepository::new(&db)
+            .get("test-update-id")
+            .expect("Failed to get chunk")
+            .expect("Chunk should exist");
+        assert_eq!(updated.content, "updated content");
+    }
+
+    #[test]
+    fn test_memory_get_not_found() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "memory_get" (func $memory_get (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "nonexistent-id")
+                (func (export "test") (result i32)
+                    i32.const 0   ;; id_ptr
+                    i32.const 14  ;; id_len
+                    i32.const 100 ;; result_ptr
+                    i32.const 256 ;; result_len
+                    call $memory_get
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let services = crate::wasm::services::HostServices::new(db);
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert_eq!(result, 0); // Not found
+    }
+
+    #[test]
+    fn test_memory_get_success() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+
+        // Create a memory chunk first
+        let chunk = MemoryChunk::new("test content for get").with_id("test-get-id");
+        MemoryRepository::new(&db)
+            .create(&chunk)
+            .expect("Failed to create chunk");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "memory_get" (func $memory_get (param i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "test-get-id")
+                (func (export "test") (result i32)
+                    i32.const 0   ;; id_ptr
+                    i32.const 11  ;; id_len
+                    i32.const 100 ;; result_ptr
+                    i32.const 512 ;; result_len
+                    call $memory_get
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let services = crate::wasm::services::HostServices::new(db);
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert!(result > 0, "Expected JSON bytes, got {}", result);
+
+        // Read and verify the JSON
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("Failed to get memory");
+        let mut result_buf = vec![0u8; result as usize];
+        memory
+            .read(&store, 100, &mut result_buf)
+            .expect("Failed to read result");
+        let json_str = String::from_utf8(result_buf).expect("Invalid UTF-8");
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).expect("Invalid JSON");
+
+        assert_eq!(parsed["id"].as_str().unwrap(), "test-get-id");
+        assert_eq!(parsed["content"].as_str().unwrap(), "test content for get");
+    }
+
     #[tokio::test]
     async fn test_skill_list_with_registry() {
         let engine = Engine::default();
@@ -2201,5 +3131,538 @@ mod tests {
 
         let result = test_func.call(&mut store, ()).expect("Failed to call test");
         assert_eq!(result, -1); // Not found
+    }
+
+    #[test]
+    fn test_skill_read_not_found() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "skill_read" (func $skill_read (param i32 i32 i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "nonexistent-skill")
+                (data (i32.const 20) "file.txt")
+                (func (export "test") (result i32)
+                    i32.const 0    ;; name_ptr
+                    i32.const 17   ;; name_len ("nonexistent-skill")
+                    i32.const 20   ;; path_ptr
+                    i32.const 8    ;; path_len ("file.txt")
+                    i32.const 100  ;; result_ptr
+                    i32.const 256  ;; result_len
+                    call $skill_read
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let registry = SkillRegistry::new();
+        let services =
+            crate::wasm::services::HostServices::with_skills(db, Arc::new(RwLock::new(registry)));
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert_eq!(result, -1); // Skill not found
+    }
+
+    #[test]
+    fn test_skill_execute_not_found() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "skill_execute" (func $skill_execute (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "nonexistent-skill")
+                (data (i32.const 20) "script.sh")
+                (data (i32.const 30) "{}")
+                (func (export "test") (result i32)
+                    i32.const 0    ;; name_ptr
+                    i32.const 17   ;; name_len ("nonexistent-skill")
+                    i32.const 20   ;; script_ptr
+                    i32.const 9    ;; script_len ("script.sh")
+                    i32.const 30   ;; args_ptr
+                    i32.const 2    ;; args_len ("{}")
+                    i32.const 100  ;; result_ptr
+                    i32.const 256  ;; result_len
+                    call $skill_execute
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let registry = SkillRegistry::new();
+        let services =
+            crate::wasm::services::HostServices::with_skills(db, Arc::new(RwLock::new(registry)));
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert_eq!(result, -1); // Skill not found
+    }
+
+    #[test]
+    fn test_subagent_registry_spawn() {
+        let registry = SubagentRegistry::new();
+
+        let id1 = registry.spawn("task1".to_string(), "chat".to_string());
+        let id2 = registry.spawn("task2".to_string(), "agent".to_string());
+
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+
+        let info1 = registry.get(id1).expect("Subagent 1 not found");
+        assert_eq!(info1.task, "task1");
+        assert_eq!(info1.mode, "chat");
+        assert_eq!(info1.status, SubagentStatus::Running);
+
+        let info2 = registry.get(id2).expect("Subagent 2 not found");
+        assert_eq!(info2.task, "task2");
+        assert_eq!(info2.mode, "agent");
+    }
+
+    #[test]
+    fn test_subagent_registry_complete() {
+        let registry = SubagentRegistry::new();
+        let id = registry.spawn("task".to_string(), "chat".to_string());
+
+        registry.complete(id, "result".to_string());
+
+        let info = registry.get(id).expect("Subagent not found");
+        assert_eq!(info.status, SubagentStatus::Completed);
+        assert_eq!(info.result, Some("result".to_string()));
+    }
+
+    #[test]
+    fn test_subagent_registry_fail() {
+        let registry = SubagentRegistry::new();
+        let id = registry.spawn("task".to_string(), "chat".to_string());
+
+        registry.fail(id, "error message".to_string());
+
+        let info = registry.get(id).expect("Subagent not found");
+        assert_eq!(
+            info.status,
+            SubagentStatus::Failed("error message".to_string())
+        );
+    }
+
+    #[test]
+    fn test_subagent_registry_kill() {
+        let registry = SubagentRegistry::new();
+        let id = registry.spawn("task".to_string(), "chat".to_string());
+
+        // Kill running subagent
+        assert!(registry.kill(id));
+
+        let info = registry.get(id).expect("Subagent not found");
+        assert_eq!(info.status, SubagentStatus::Killed);
+
+        // Cannot kill already killed subagent
+        assert!(!registry.kill(id));
+    }
+
+    #[test]
+    fn test_subagent_registry_list_ids() {
+        let registry = SubagentRegistry::new();
+        registry.spawn("task1".to_string(), "chat".to_string());
+        registry.spawn("task2".to_string(), "agent".to_string());
+        registry.spawn("task3".to_string(), "browser".to_string());
+
+        let ids = registry.list_ids();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
+        assert!(ids.contains(&3));
+    }
+
+    #[test]
+    fn test_subagent_spawn_wasm() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "subagent_spawn" (func $subagent_spawn (param i32 i32 i32 i32) (result i64)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "test task")
+                (data (i32.const 20) "chat")
+                (func (export "test") (result i64)
+                    i32.const 0    ;; task_ptr
+                    i32.const 9    ;; task_len ("test task")
+                    i32.const 20   ;; mode_ptr
+                    i32.const 4    ;; mode_len ("chat")
+                    call $subagent_spawn
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let mut store = Store::new(&engine, HostState::new());
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i64>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert_eq!(result, 1); // First subagent gets ID 1
+    }
+
+    #[test]
+    fn test_subagent_status_wasm() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "subagent_spawn" (func $subagent_spawn (param i32 i32 i32 i32) (result i64)))
+                (import "nevoflux" "subagent_status" (func $subagent_status (param i64) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "task")
+                (data (i32.const 10) "chat")
+                (func (export "spawn") (result i64)
+                    i32.const 0  i32.const 4  i32.const 10  i32.const 4  call $subagent_spawn
+                )
+                (func (export "status") (param i64) (result i32)
+                    local.get 0  call $subagent_status
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let mut store = Store::new(&engine, HostState::new());
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        // Spawn a subagent
+        let spawn_func = instance
+            .get_typed_func::<(), i64>(&mut store, "spawn")
+            .expect("Failed to get spawn function");
+        let id = spawn_func.call(&mut store, ()).expect("Failed to spawn");
+        assert_eq!(id, 1);
+
+        // Check status (should be running = 0)
+        let status_func = instance
+            .get_typed_func::<i64, i32>(&mut store, "status")
+            .expect("Failed to get status function");
+        let status = status_func
+            .call(&mut store, id)
+            .expect("Failed to get status");
+        assert_eq!(status, 0); // 0 = Running
+
+        // Check status for non-existent subagent
+        let status = status_func
+            .call(&mut store, 999)
+            .expect("Failed to get status");
+        assert_eq!(status, -1); // -1 = Not found
+    }
+
+    #[test]
+    fn test_subagent_kill_wasm() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "subagent_spawn" (func $subagent_spawn (param i32 i32 i32 i32) (result i64)))
+                (import "nevoflux" "subagent_status" (func $subagent_status (param i64) (result i32)))
+                (import "nevoflux" "subagent_kill" (func $subagent_kill (param i64) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "task")
+                (data (i32.const 10) "chat")
+                (func (export "spawn") (result i64)
+                    i32.const 0  i32.const 4  i32.const 10  i32.const 4  call $subagent_spawn
+                )
+                (func (export "status") (param i64) (result i32)
+                    local.get 0  call $subagent_status
+                )
+                (func (export "kill") (param i64) (result i32)
+                    local.get 0  call $subagent_kill
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let mut store = Store::new(&engine, HostState::new());
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        // Spawn a subagent
+        let spawn_func = instance
+            .get_typed_func::<(), i64>(&mut store, "spawn")
+            .expect("Failed to get spawn function");
+        let id = spawn_func.call(&mut store, ()).expect("Failed to spawn");
+
+        // Kill the subagent
+        let kill_func = instance
+            .get_typed_func::<i64, i32>(&mut store, "kill")
+            .expect("Failed to get kill function");
+        let result = kill_func.call(&mut store, id).expect("Failed to kill");
+        assert_eq!(result, 1); // 1 = Successfully killed
+
+        // Check status (should be killed = 3)
+        let status_func = instance
+            .get_typed_func::<i64, i32>(&mut store, "status")
+            .expect("Failed to get status function");
+        let status = status_func
+            .call(&mut store, id)
+            .expect("Failed to get status");
+        assert_eq!(status, 3); // 3 = Killed
+
+        // Try to kill again (should fail)
+        let result = kill_func.call(&mut store, id).expect("Failed to kill");
+        assert_eq!(result, 0); // 0 = Already finished
+    }
+
+    #[test]
+    fn test_subagent_list_wasm() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "subagent_spawn" (func $subagent_spawn (param i32 i32 i32 i32) (result i64)))
+                (import "nevoflux" "subagent_list" (func $subagent_list (param i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "task1")
+                (data (i32.const 10) "chat")
+                (data (i32.const 20) "task2")
+                (func (export "spawn1") (result i64)
+                    i32.const 0  i32.const 5  i32.const 10  i32.const 4  call $subagent_spawn
+                )
+                (func (export "spawn2") (result i64)
+                    i32.const 20  i32.const 5  i32.const 10  i32.const 4  call $subagent_spawn
+                )
+                (func (export "list") (result i32)
+                    i32.const 100  ;; result_ptr
+                    i32.const 256  ;; result_len
+                    call $subagent_list
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let mut store = Store::new(&engine, HostState::new());
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        // Spawn two subagents
+        let spawn1_func = instance
+            .get_typed_func::<(), i64>(&mut store, "spawn1")
+            .expect("Failed to get spawn1 function");
+        spawn1_func.call(&mut store, ()).expect("Failed to spawn1");
+
+        let spawn2_func = instance
+            .get_typed_func::<(), i64>(&mut store, "spawn2")
+            .expect("Failed to get spawn2 function");
+        spawn2_func.call(&mut store, ()).expect("Failed to spawn2");
+
+        // List subagents
+        let list_func = instance
+            .get_typed_func::<(), i32>(&mut store, "list")
+            .expect("Failed to get list function");
+        let result = list_func.call(&mut store, ()).expect("Failed to list");
+
+        // Should return JSON array "[1,2]" which is 5 bytes
+        assert!(result > 0, "Expected positive bytes, got {}", result);
+
+        // Read and verify the JSON
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("Failed to get memory");
+        let mut result_buf = vec![0u8; result as usize];
+        memory
+            .read(&store, 100, &mut result_buf)
+            .expect("Failed to read result");
+        let json_str = String::from_utf8(result_buf).expect("Invalid UTF-8");
+        let ids: Vec<u64> = serde_json::from_str(&json_str).expect("Invalid JSON");
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&1));
+        assert!(ids.contains(&2));
+    }
+
+    #[test]
+    fn test_tool_search_no_services() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "tool_search" (func $tool_search (param i32 i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "file")
+                (func (export "test") (result i32)
+                    i32.const 0    ;; query_ptr
+                    i32.const 4    ;; query_len ("file")
+                    i32.const 10   ;; max_results
+                    i32.const 100  ;; result_ptr
+                    i32.const 1024 ;; result_len
+                    call $tool_search
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+        let mut store = Store::new(&engine, HostState::new());
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        // No services configured, returns -1
+        assert_eq!(result, -1);
+    }
+
+    #[test]
+    fn test_tool_search_no_index() {
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "tool_search" (func $tool_search (param i32 i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "file")
+                (func (export "test") (result i32)
+                    i32.const 0    ;; query_ptr
+                    i32.const 4    ;; query_len ("file")
+                    i32.const 10   ;; max_results
+                    i32.const 100  ;; result_ptr
+                    i32.const 1024 ;; result_len
+                    call $tool_search
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+
+        // Create services without tool search index
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let services = crate::wasm::services::HostServices::new(db);
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        // No tool search index, returns empty array "[]" = 2 bytes
+        assert_eq!(result, 2);
+    }
+
+    #[test]
+    fn test_tool_search_with_results() {
+        use nevoflux_mcp::{ToolDefinition, ToolSearchIndex};
+
+        let engine = Engine::default();
+        let linker = create_linker(&engine).expect("Failed to create linker");
+
+        let wat = r#"
+            (module
+                (import "nevoflux" "tool_search" (func $tool_search (param i32 i32 i32 i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "file")
+                (func (export "test") (result i32)
+                    i32.const 0    ;; query_ptr
+                    i32.const 4    ;; query_len ("file")
+                    i32.const 10   ;; max_results
+                    i32.const 100  ;; result_ptr
+                    i32.const 4096 ;; result_len
+                    call $tool_search
+                )
+            )
+        "#;
+
+        let module = Module::new(&engine, wat).expect("Failed to compile test module");
+
+        // Create tool search index with some tools
+        let mut index = ToolSearchIndex::new();
+        index.add(&ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read the contents of a file".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        });
+        index.add(&ToolDefinition {
+            name: "write_file".to_string(),
+            description: "Write content to a file".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}}),
+        });
+        index.add(&ToolDefinition {
+            name: "browser_navigate".to_string(),
+            description: "Navigate to a URL".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {"url": {"type": "string"}}}),
+        });
+
+        // Create services with tool search index
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let services = crate::wasm::services::HostServices::new(db).with_tool_search(index);
+        let state = HostState::new().with_services(services);
+        let mut store = Store::new(&engine, state);
+
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("Failed to instantiate");
+
+        let test_func = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .expect("Failed to get test function");
+
+        let result = test_func.call(&mut store, ()).expect("Failed to call test");
+        assert!(result > 2, "Expected results, got {} bytes", result);
+
+        // Read and verify the JSON
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("Failed to get memory");
+        let mut result_buf = vec![0u8; result as usize];
+        memory
+            .read(&store, 100, &mut result_buf)
+            .expect("Failed to read result");
+        let json_str = String::from_utf8(result_buf).expect("Invalid UTF-8");
+        let results: Vec<serde_json::Value> =
+            serde_json::from_str(&json_str).expect("Invalid JSON");
+
+        // Should find 2 file-related tools (read_file, write_file)
+        assert_eq!(results.len(), 2);
+
+        // Verify result structure
+        let names: Vec<&str> = results.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"write_file"));
+        assert!(!names.contains(&"browser_navigate")); // Should not match "file"
     }
 }

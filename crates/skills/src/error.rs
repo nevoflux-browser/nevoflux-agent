@@ -41,6 +41,14 @@ pub enum SkillsError {
     #[error("Script execution error: {0}")]
     ScriptError(String),
 
+    /// Execution error (for skill script execution).
+    #[error("Execution error: {0}")]
+    ExecutionError(String),
+
+    /// Load error (for auxiliary file loading).
+    #[error("Load error: {0}")]
+    LoadError(String),
+
     /// Glob pattern error.
     #[error("Glob pattern error: {0}")]
     GlobError(String),

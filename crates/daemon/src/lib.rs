@@ -23,6 +23,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod config_watcher;
 pub mod context;
 pub mod error;
 pub mod health;
@@ -30,6 +31,7 @@ pub mod permission;
 pub mod registry;
 pub mod retry;
 pub mod router;
+pub mod secrets;
 pub mod server;
 pub mod session;
 pub mod skills;
@@ -40,6 +42,7 @@ pub use config::{
     AgentConfig, ConfigError, ContextConfig, DaemonConfig, LlmConfig, LoggingConfig, SessionConfig,
     StorageConfig,
 };
+pub use config_watcher::{create_config_watcher, ConfigReceiver, ConfigWatcher, WatcherError};
 pub use error::{DaemonError, Result};
 pub use permission::{Action, PermissionEnforcer, PermissionResult, ResourceType};
 pub use registry::{ActiveRequest, ProxyInfo, ProxyRegistry, RequestRegistry};
@@ -68,6 +71,7 @@ pub use agent::computer_tools::create_computer;
 pub use agent::computer_tools::create_computer;
 pub use health::{HealthMonitor, HealthStatus};
 pub use retry::{with_retry, RetryConfig, Retryable};
+pub use secrets::{ApiKey, ApiKeyManager, KeySource, SecretError};
 pub use skills::SkillsManager;
 pub use validation::{
     validate_extension_id, validate_length, validate_path, validate_port, validate_session_id,

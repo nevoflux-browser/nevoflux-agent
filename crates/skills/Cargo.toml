@@ -9,7 +9,7 @@ description = "Skills system for NevoFlux Agent"
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
-tokio = { workspace = true, features = ["fs", "sync", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["fs", "sync", "rt-multi-thread", "process"] }
 async-trait.workspace = true
 thiserror.workspace = true
 tracing = "0.1"

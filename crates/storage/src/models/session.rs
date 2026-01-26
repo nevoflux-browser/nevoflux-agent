@@ -248,6 +248,103 @@ impl UpdateSessionParams {
     }
 }
 
+/// Session cleanup policy configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanupPolicy {
+    /// Delete sessions inactive for more than this many days.
+    /// `None` means no time-based cleanup.
+    pub inactive_days: Option<u32>,
+    /// Maximum number of sessions to keep.
+    /// `None` means no limit on session count.
+    pub max_sessions: Option<u32>,
+    /// Maximum total storage size in MB.
+    /// `None` means no limit on storage size.
+    pub max_storage_mb: Option<u32>,
+    /// Whether to skip pinned sessions during cleanup.
+    pub preserve_pinned: bool,
+    /// Whether to skip archived sessions during cleanup.
+    pub preserve_archived: bool,
+}
+
+impl Default for CleanupPolicy {
+    fn default() -> Self {
+        Self {
+            inactive_days: None,
+            max_sessions: None,
+            max_storage_mb: None,
+            preserve_pinned: true,
+            preserve_archived: false,
+        }
+    }
+}
+
+impl CleanupPolicy {
+    /// Create a new cleanup policy with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the inactive days threshold.
+    pub fn with_inactive_days(mut self, days: u32) -> Self {
+        self.inactive_days = Some(days);
+        self
+    }
+
+    /// Set the maximum number of sessions.
+    pub fn with_max_sessions(mut self, max: u32) -> Self {
+        self.max_sessions = Some(max);
+        self
+    }
+
+    /// Set the maximum storage size in MB.
+    pub fn with_max_storage_mb(mut self, mb: u32) -> Self {
+        self.max_storage_mb = Some(mb);
+        self
+    }
+
+    /// Set whether to preserve pinned sessions.
+    pub fn preserve_pinned(mut self, preserve: bool) -> Self {
+        self.preserve_pinned = preserve;
+        self
+    }
+
+    /// Set whether to preserve archived sessions.
+    pub fn preserve_archived(mut self, preserve: bool) -> Self {
+        self.preserve_archived = preserve;
+        self
+    }
+
+    /// Check if any cleanup rules are configured.
+    pub fn has_rules(&self) -> bool {
+        self.inactive_days.is_some() || self.max_sessions.is_some() || self.max_storage_mb.is_some()
+    }
+}
+
+/// Result of a cleanup operation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CleanupResult {
+    /// Number of sessions deleted due to inactivity.
+    pub inactive_deleted: u32,
+    /// Number of sessions deleted due to session count limit.
+    pub count_deleted: u32,
+    /// Number of sessions deleted due to storage limit.
+    pub storage_deleted: u32,
+    /// Total bytes freed.
+    pub bytes_freed: u64,
+}
+
+impl CleanupResult {
+    /// Get the total number of sessions deleted.
+    pub fn total_deleted(&self) -> u32 {
+        self.inactive_deleted + self.count_deleted + self.storage_deleted
+    }
+
+    /// Check if any sessions were deleted.
+    pub fn has_deletions(&self) -> bool {
+        self.total_deleted() > 0
+    }
+}
+
 /// Parameters for listing sessions.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListSessionsParams {

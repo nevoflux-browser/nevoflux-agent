@@ -13,6 +13,7 @@ description = "Shared testing infrastructure for NevoFlux Agent"
 # Internal crates
 nevoflux-protocol = { path = "../protocol" }
 nevoflux-storage = { path = "../storage" }
+nevoflux-daemon = { path = "../daemon" }
 
 # Serialization
 serde.workspace = true

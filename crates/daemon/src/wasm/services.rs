@@ -5,6 +5,7 @@
 //! the NevoFlux system.
 
 use nevoflux_llm::ProviderType;
+use nevoflux_mcp::ToolSearchIndex;
 use nevoflux_skills::SkillRegistry;
 use nevoflux_storage::Database;
 use std::sync::Arc;
@@ -71,6 +72,8 @@ pub struct HostServices {
     pub skills: Arc<RwLock<SkillRegistry>>,
     /// LLM configuration for AI-powered features.
     pub llm_config: Option<LlmConfig>,
+    /// Tool search index for keyword-based tool discovery.
+    pub tool_search: Option<Arc<RwLock<ToolSearchIndex>>>,
 }
 
 impl HostServices {
@@ -98,6 +101,7 @@ impl HostServices {
             database,
             skills,
             llm_config: None,
+            tool_search: None,
         }
     }
 
@@ -112,7 +116,24 @@ impl HostServices {
             database,
             skills,
             llm_config: None,
+            tool_search: None,
         }
+    }
+
+    /// Add tool search index to the services.
+    ///
+    /// This enables the `tool_search` host function for keyword-based tool discovery.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The tool search index to use.
+    ///
+    /// # Returns
+    ///
+    /// Returns self for method chaining.
+    pub fn with_tool_search(mut self, index: ToolSearchIndex) -> Self {
+        self.tool_search = Some(Arc::new(RwLock::new(index)));
+        self
     }
 
     /// Add LLM configuration to the services.
@@ -151,6 +172,10 @@ impl std::fmt::Debug for HostServices {
             .field("database", &"Arc<Database>")
             .field("skills", &"Arc<RwLock<SkillRegistry>>")
             .field("llm_config", &self.llm_config.as_ref().map(|_| "Some(...)"))
+            .field(
+                "tool_search",
+                &self.tool_search.as_ref().map(|_| "Some(...)"),
+            )
             .finish()
     }
 }

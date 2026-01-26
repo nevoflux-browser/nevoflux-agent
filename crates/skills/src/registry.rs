@@ -189,6 +189,130 @@ impl SkillRegistry {
     pub fn total_estimated_tokens(&self) -> u32 {
         self.skills.values().map(|s| s.estimated_tokens()).sum()
     }
+
+    /// Read an auxiliary file from a skill's directory (Level 3 loading).
+    ///
+    /// # Arguments
+    /// * `skill_name` - Name of the skill
+    /// * `relative_path` - Path relative to the skill's directory
+    ///
+    /// # Returns
+    /// The file contents, or an error if the skill doesn't exist or the file can't be read.
+    pub fn read_auxiliary_file(&self, skill_name: &str, relative_path: &str) -> Result<String> {
+        let skill = self
+            .skills
+            .get(skill_name)
+            .ok_or_else(|| SkillsError::NotFound(skill_name.to_string()))?;
+
+        skill
+            .read_auxiliary_file(relative_path)
+            .map_err(|e| SkillsError::LoadError(format!("Failed to read auxiliary file: {}", e)))
+    }
+
+    /// Execute a script from a skill's directory (Level 3 loading).
+    ///
+    /// # Arguments
+    /// * `skill_name` - Name of the skill
+    /// * `script_path` - Path to the script relative to the skill's directory
+    /// * `args` - JSON arguments to pass to the script
+    ///
+    /// # Returns
+    /// The script's stdout output, or an error if execution fails.
+    pub fn execute_script(
+        &self,
+        skill_name: &str,
+        script_path: &str,
+        args: &serde_json::Value,
+    ) -> Result<String> {
+        let skill = self
+            .skills
+            .get(skill_name)
+            .ok_or_else(|| SkillsError::NotFound(skill_name.to_string()))?;
+
+        let base_dir = skill.base_dir().ok_or_else(|| {
+            SkillsError::ExecutionError("Skill has no base directory".to_string())
+        })?;
+
+        // Security: prevent path traversal
+        let normalized = std::path::PathBuf::from(script_path);
+        if normalized
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(SkillsError::ExecutionError(
+                "Path traversal not allowed".to_string(),
+            ));
+        }
+
+        let script_full_path = base_dir.join(&normalized);
+        if !script_full_path.exists() {
+            return Err(SkillsError::NotFound(format!(
+                "Script not found: {}",
+                script_path
+            )));
+        }
+
+        // Determine interpreter based on extension
+        let extension = script_full_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        let interpreter = match extension {
+            "sh" | "bash" => "bash",
+            "py" => "python3",
+            "js" => "node",
+            "rb" => "ruby",
+            "lua" => "lua",
+            "" => {
+                // Check shebang
+                if let Ok(content) = std::fs::read_to_string(&script_full_path) {
+                    if content.starts_with("#!") {
+                        "bash" // Let the shebang handle it
+                    } else {
+                        return Err(SkillsError::ExecutionError(
+                            "Cannot determine script interpreter".to_string(),
+                        ));
+                    }
+                } else {
+                    return Err(SkillsError::ExecutionError(
+                        "Cannot read script file".to_string(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(SkillsError::ExecutionError(format!(
+                    "Unsupported script extension: {}",
+                    extension
+                )))
+            }
+        };
+
+        // Serialize args to pass to the script
+        let args_json = serde_json::to_string(args)
+            .map_err(|e| SkillsError::ExecutionError(format!("Failed to serialize args: {}", e)))?;
+
+        // Execute the script
+        let output = std::process::Command::new(interpreter)
+            .arg(script_full_path)
+            .arg(&args_json)
+            .current_dir(base_dir)
+            .output()
+            .map_err(|e| SkillsError::ExecutionError(format!("Failed to execute script: {}", e)))?;
+
+        if output.status.success() {
+            String::from_utf8(output.stdout).map_err(|e| {
+                SkillsError::ExecutionError(format!("Invalid UTF-8 in script output: {}", e))
+            })
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(SkillsError::ExecutionError(format!(
+                "Script failed with exit code {:?}: {}",
+                output.status.code(),
+                stderr
+            )))
+        }
+    }
 }
 
 /// Thread-safe async skill registry.
@@ -264,6 +388,122 @@ impl AsyncSkillRegistry {
     pub async fn is_empty(&self) -> bool {
         let registry = self.inner.read().await;
         registry.is_empty()
+    }
+
+    /// Read an auxiliary file from a skill's directory (Level 3 loading).
+    pub async fn read_auxiliary_file(
+        &self,
+        skill_name: &str,
+        relative_path: &str,
+    ) -> Result<String> {
+        let registry = self.inner.read().await;
+        registry.read_auxiliary_file(skill_name, relative_path)
+    }
+
+    /// Execute a script from a skill's directory (Level 3 loading).
+    pub async fn execute_script(
+        &self,
+        skill_name: &str,
+        script_path: &str,
+        args: &serde_json::Value,
+    ) -> Result<String> {
+        // Clone necessary data while holding the lock briefly
+        let (base_dir, script_full_path) = {
+            let registry = self.inner.read().await;
+            let skill = registry
+                .skills
+                .get(skill_name)
+                .ok_or_else(|| SkillsError::NotFound(skill_name.to_string()))?;
+
+            let base = skill
+                .base_dir()
+                .ok_or_else(|| {
+                    SkillsError::ExecutionError("Skill has no base directory".to_string())
+                })?
+                .to_path_buf();
+
+            // Security: prevent path traversal
+            let normalized = std::path::PathBuf::from(script_path);
+            if normalized
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(SkillsError::ExecutionError(
+                    "Path traversal not allowed".to_string(),
+                ));
+            }
+
+            let full_path = base.join(&normalized);
+            (base, full_path)
+        };
+
+        if !script_full_path.exists() {
+            return Err(SkillsError::NotFound(format!(
+                "Script not found: {}",
+                script_path
+            )));
+        }
+
+        // Determine interpreter based on extension
+        let extension = script_full_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        let interpreter = match extension {
+            "sh" | "bash" => "bash",
+            "py" => "python3",
+            "js" => "node",
+            "rb" => "ruby",
+            "lua" => "lua",
+            "" => {
+                // Check shebang
+                let content = tokio::fs::read_to_string(&script_full_path)
+                    .await
+                    .map_err(|e| {
+                        SkillsError::ExecutionError(format!("Cannot read script file: {}", e))
+                    })?;
+                if content.starts_with("#!") {
+                    "bash" // Let the shebang handle it
+                } else {
+                    return Err(SkillsError::ExecutionError(
+                        "Cannot determine script interpreter".to_string(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(SkillsError::ExecutionError(format!(
+                    "Unsupported script extension: {}",
+                    extension
+                )))
+            }
+        };
+
+        // Serialize args to pass to the script
+        let args_json = serde_json::to_string(args)
+            .map_err(|e| SkillsError::ExecutionError(format!("Failed to serialize args: {}", e)))?;
+
+        // Execute the script asynchronously
+        let output = tokio::process::Command::new(interpreter)
+            .arg(&script_full_path)
+            .arg(&args_json)
+            .current_dir(&base_dir)
+            .output()
+            .await
+            .map_err(|e| SkillsError::ExecutionError(format!("Failed to execute script: {}", e)))?;
+
+        if output.status.success() {
+            String::from_utf8(output.stdout).map_err(|e| {
+                SkillsError::ExecutionError(format!("Invalid UTF-8 in script output: {}", e))
+            })
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(SkillsError::ExecutionError(format!(
+                "Script failed with exit code {:?}: {}",
+                output.status.code(),
+                stderr
+            )))
+        }
     }
 }
 

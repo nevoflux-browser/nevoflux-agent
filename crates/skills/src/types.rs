@@ -193,6 +193,47 @@ impl Skill {
         let chars = self.content.len() + self.metadata.description.len();
         (chars / 4) as u32
     }
+
+    /// Read an auxiliary file relative to the skill's directory (Level 3 loading).
+    ///
+    /// This allows skills to reference additional files (templates, data, scripts)
+    /// that are stored alongside the main skill file.
+    pub fn read_auxiliary_file(&self, relative_path: &str) -> std::io::Result<String> {
+        let base_dir = match &self.file_path {
+            Some(path) => path.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Skill has no parent directory",
+                )
+            })?,
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Skill has no file path (not loaded from disk)",
+                ))
+            }
+        };
+
+        // Security: prevent path traversal attacks
+        let normalized = PathBuf::from(relative_path);
+        if normalized
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Path traversal not allowed",
+            ));
+        }
+
+        let full_path = base_dir.join(normalized);
+        std::fs::read_to_string(full_path)
+    }
+
+    /// Get the skill's base directory path.
+    pub fn base_dir(&self) -> Option<&std::path::Path> {
+        self.file_path.as_ref().and_then(|p| p.parent())
+    }
 }
 
 /// Brief skill info for listing (Level 1 loading).

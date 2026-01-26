@@ -2,6 +2,8 @@
 //!
 //! These tests verify the command-line interface behavior of the nevoflux binary.
 
+#![allow(deprecated)]
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 

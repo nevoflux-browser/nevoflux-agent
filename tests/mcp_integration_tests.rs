@@ -13,12 +13,12 @@ use nevoflux_mcp::{create_tools, JsonRpcRequest, McpServer, McpServerConfig, PRO
 fn test_mcp_tools_complete() {
     let tools = create_tools();
 
-    // Should have 8 tools
-    assert_eq!(tools.len(), 8, "Expected 8 tools, got {}", tools.len());
+    // Should have 23 tools (16 browser + 1 agent + 6 computer)
+    assert_eq!(tools.len(), 23, "Expected 23 tools, got {}", tools.len());
 
     let names: Vec<_> = tools.iter().map(|t| t.name.as_str()).collect();
 
-    // Browser tools
+    // Browser tools (16)
     assert!(
         names.contains(&"browser_navigate"),
         "Missing browser_navigate"
@@ -29,11 +29,53 @@ fn test_mcp_tools_complete() {
         "Missing browser_screenshot"
     );
     assert!(names.contains(&"browser_type"), "Missing browser_type");
+    assert!(names.contains(&"browser_fill"), "Missing browser_fill");
+    assert!(
+        names.contains(&"browser_get_content"),
+        "Missing browser_get_content"
+    );
+    assert!(
+        names.contains(&"browser_eval_js"),
+        "Missing browser_eval_js"
+    );
+    assert!(
+        names.contains(&"browser_wait_for"),
+        "Missing browser_wait_for"
+    );
+    assert!(names.contains(&"browser_scroll"), "Missing browser_scroll");
+    assert!(
+        names.contains(&"browser_get_element"),
+        "Missing browser_get_element"
+    );
+    assert!(
+        names.contains(&"browser_query_all"),
+        "Missing browser_query_all"
+    );
+    assert!(
+        names.contains(&"browser_snapshot"),
+        "Missing browser_snapshot"
+    );
+    assert!(
+        names.contains(&"browser_click_by_id"),
+        "Missing browser_click_by_id"
+    );
+    assert!(
+        names.contains(&"browser_fill_by_id"),
+        "Missing browser_fill_by_id"
+    );
+    assert!(
+        names.contains(&"browser_type_by_id"),
+        "Missing browser_type_by_id"
+    );
+    assert!(
+        names.contains(&"browser_get_markdown"),
+        "Missing browser_get_markdown"
+    );
 
-    // Agent tools
+    // Agent tools (1)
     assert!(names.contains(&"agent_chat"), "Missing agent_chat");
 
-    // Computer tools
+    // Computer tools (6)
     assert!(
         names.contains(&"computer_screenshot"),
         "Missing computer_screenshot"
@@ -45,6 +87,12 @@ fn test_mcp_tools_complete() {
     assert!(
         names.contains(&"computer_type_text"),
         "Missing computer_type_text"
+    );
+    assert!(names.contains(&"computer_click"), "Missing computer_click");
+    assert!(names.contains(&"computer_key"), "Missing computer_key");
+    assert!(
+        names.contains(&"computer_scroll"),
+        "Missing computer_scroll"
     );
 }
 
@@ -265,8 +313,8 @@ fn test_mcp_server_with_all_tools() {
         server.register_tool(tool);
     }
 
-    // Verify all tools are registered
-    assert_eq!(server.tools().len(), 8);
+    // Verify all tools are registered (23 total: 16 browser + 1 agent + 6 computer)
+    assert_eq!(server.tools().len(), 23);
 
     // List tools via JSON-RPC
     let request = JsonRpcRequest::with_id(1, "tools/list", None);
@@ -275,7 +323,7 @@ fn test_mcp_server_with_all_tools() {
     assert!(response.is_success());
     let result = response.result.unwrap();
     let listed_tools = result["tools"].as_array().unwrap();
-    assert_eq!(listed_tools.len(), 8);
+    assert_eq!(listed_tools.len(), 23);
 }
 
 #[test]
@@ -295,9 +343,9 @@ fn test_mcp_server_tool_categories() {
         .filter(|t| t.name.starts_with("computer_"))
         .collect();
 
-    assert_eq!(browser_tools.len(), 4, "Expected 4 browser tools");
+    assert_eq!(browser_tools.len(), 16, "Expected 16 browser tools");
     assert_eq!(agent_tools.len(), 1, "Expected 1 agent tool");
-    assert_eq!(computer_tools.len(), 3, "Expected 3 computer tools");
+    assert_eq!(computer_tools.len(), 6, "Expected 6 computer tools");
 }
 
 #[test]
@@ -487,18 +535,36 @@ fn test_full_mcp_workflow() {
 
     let result = list_response.result.unwrap();
     let tools = result["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 8);
+    assert_eq!(tools.len(), 23);
 
     // Step 3: Verify each tool is callable (though not implemented)
     let tool_names = [
+        // Browser tools (16)
         "browser_navigate",
         "browser_click",
         "browser_screenshot",
         "browser_type",
+        "browser_fill",
+        "browser_get_content",
+        "browser_eval_js",
+        "browser_wait_for",
+        "browser_scroll",
+        "browser_get_element",
+        "browser_query_all",
+        "browser_snapshot",
+        "browser_click_by_id",
+        "browser_fill_by_id",
+        "browser_type_by_id",
+        "browser_get_markdown",
+        // Agent tools (1)
         "agent_chat",
+        // Computer tools (6)
         "computer_screenshot",
         "computer_mouse_move",
         "computer_type_text",
+        "computer_click",
+        "computer_key",
+        "computer_scroll",
     ];
 
     for (id, name) in tool_names.iter().enumerate() {

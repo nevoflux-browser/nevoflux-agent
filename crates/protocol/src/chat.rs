@@ -406,4 +406,123 @@ mod tests {
         let decoded: BrowserToolRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, decoded);
     }
+
+    #[test]
+    fn test_content_block_a2ui_serialization() {
+        // Test A2UI content block for structured UI components
+        let block = ContentBlock {
+            session_id: "sess-001".into(),
+            block_id: "block-001".into(),
+            content_type: ContentType::A2ui,
+            content: serde_json::json!({
+                "component": "file_tree",
+                "props": {
+                    "root": "/home/user/project",
+                    "files": [
+                        {"name": "src", "type": "directory"},
+                        {"name": "Cargo.toml", "type": "file"}
+                    ]
+                }
+            }),
+            metadata: Some(serde_json::json!({
+                "interactive": true,
+                "expandable": true
+            })),
+        };
+
+        let json = serde_json::to_string(&block).unwrap();
+        assert!(json.contains("\"content_type\":\"a2ui\""));
+        assert!(json.contains("\"component\":\"file_tree\""));
+
+        let decoded: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(block, decoded);
+    }
+
+    #[test]
+    fn test_content_block_a2ui_button_component() {
+        // Test A2UI button component
+        let block = ContentBlock {
+            session_id: "sess-001".into(),
+            block_id: "block-002".into(),
+            content_type: ContentType::A2ui,
+            content: serde_json::json!({
+                "component": "action_buttons",
+                "props": {
+                    "buttons": [
+                        {"label": "Approve", "action": "approve", "style": "primary"},
+                        {"label": "Reject", "action": "reject", "style": "danger"}
+                    ]
+                }
+            }),
+            metadata: None,
+        };
+
+        let json = serde_json::to_string(&block).unwrap();
+        let decoded: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(block, decoded);
+        assert_eq!(decoded.content_type, ContentType::A2ui);
+    }
+
+    #[test]
+    fn test_content_block_a2ui_progress_component() {
+        // Test A2UI progress component
+        let block = ContentBlock {
+            session_id: "sess-001".into(),
+            block_id: "block-003".into(),
+            content_type: ContentType::A2ui,
+            content: serde_json::json!({
+                "component": "progress_indicator",
+                "props": {
+                    "current": 3,
+                    "total": 10,
+                    "label": "Processing files...",
+                    "items": [
+                        {"name": "file1.rs", "status": "complete"},
+                        {"name": "file2.rs", "status": "complete"},
+                        {"name": "file3.rs", "status": "in_progress"},
+                        {"name": "file4.rs", "status": "pending"}
+                    ]
+                }
+            }),
+            metadata: Some(serde_json::json!({
+                "auto_update": true,
+                "update_interval_ms": 500
+            })),
+        };
+
+        let json = serde_json::to_string(&block).unwrap();
+        let decoded: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(block.block_id, decoded.block_id);
+        assert!(json.contains("\"progress_indicator\""));
+    }
+
+    #[test]
+    fn test_agent_message_content_block_a2ui() {
+        // Test A2UI content in AgentMessage envelope
+        let msg = AgentMessage::ContentBlock(ContentBlock {
+            session_id: "sess-001".into(),
+            block_id: "block-004".into(),
+            content_type: ContentType::A2ui,
+            content: serde_json::json!({
+                "component": "code_diff",
+                "props": {
+                    "language": "rust",
+                    "original": "fn old() {}",
+                    "modified": "fn new() {}"
+                }
+            }),
+            metadata: None,
+        });
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"content_block\""));
+        assert!(json.contains("\"content_type\":\"a2ui\""));
+
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        if let AgentMessage::ContentBlock(block) = decoded {
+            assert_eq!(block.content_type, ContentType::A2ui);
+        } else {
+            panic!("Expected ContentBlock variant");
+        }
+    }
 }

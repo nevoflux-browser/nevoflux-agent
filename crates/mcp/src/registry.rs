@@ -142,7 +142,7 @@ impl McpRegistry {
         }
 
         let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
-        let client = McpClient::connect_stdio(&config.command, &args).await?;
+        let client = McpClient::connect_stdio_with_env(&config.command, &args, &config.env).await?;
 
         self.clients
             .write()
@@ -382,5 +382,18 @@ mod tests {
 
         let results = registry.health_check_all().await;
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_server_config_with_multiple_env_vars() {
+        let config = ServerConfig::new("test", "node")
+            .with_env("API_KEY", "secret123")
+            .with_env("DEBUG", "true")
+            .with_env("NODE_ENV", "production");
+
+        assert_eq!(config.env.len(), 3);
+        assert_eq!(config.env.get("API_KEY"), Some(&"secret123".to_string()));
+        assert_eq!(config.env.get("DEBUG"), Some(&"true".to_string()));
+        assert_eq!(config.env.get("NODE_ENV"), Some(&"production".to_string()));
     }
 }
