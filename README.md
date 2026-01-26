@@ -4,13 +4,17 @@ AI-powered browser assistant with native computer control capabilities.
 
 ## Features
 
-- **Browser Automation**: Control browser tabs via extension with navigate, click, type, and screenshot capabilities
+- **Browser Automation**: Full browser control via extension - navigate, click, type, fill, screenshot, JavaScript execution, accessibility tree snapshots
 - **Computer Control**: Screenshots, mouse, keyboard support for Linux (X11), macOS, and Windows
 - **MCP Integration**: Works with Claude Code via Model Context Protocol (stdio transport)
+- **MCP Manager**: Connect to external MCP servers with auto-reconnection and health monitoring
 - **Native Messaging**: Secure bridge between browser extension and daemon via ZeroMQ
-- **LLM Integration**: Supports Qwen provider with extensible provider system via rig-core
-- **WASM Skills**: Extensible skill system using WebAssembly modules
-- **Session Management**: Persistent session storage with SQLite backend
+- **LLM Integration**: Supports Anthropic, OpenAI, Qwen, DeepSeek, OpenRouter via rig-core
+- **WASM Skills**: Extensible skill system using WebAssembly modules with host functions
+- **Session Management**: Persistent session storage with SQLite, automatic cleanup policies
+- **Hot Config Reload**: Configuration file watching with automatic updates
+- **Tool Search**: BM25 text search for discovering tools across registries
+- **API Key Management**: Layered lookup (environment, keyring, config file)
 
 ## Installation
 
@@ -31,9 +35,26 @@ cargo build --release
 
 The binary will be available at `target/release/nevoflux`.
 
-### Install Native Messaging Host
+### Using justfile
 
-Use the setup script to install the native messaging host:
+Development tasks are automated via `just`:
+
+```bash
+just build          # Build all crates
+just build-release  # Build release version
+just test           # Run all tests
+just ci             # Full CI (fmt check + clippy + tests)
+just daemon         # Run daemon with verbose logging
+just mcp            # Run MCP server
+just status         # Check daemon status
+just stop           # Stop running daemon
+just fmt            # Format code
+just lint           # Run clippy
+just doc            # Generate documentation
+just clean          # Clean build artifacts
+```
+
+### Install Native Messaging Host
 
 ```bash
 # Linux/macOS
@@ -43,22 +64,13 @@ Use the setup script to install the native messaging host:
 .\install\native-host\setup.ps1 -BinaryPath "$PWD\target\release\nevoflux.exe" -ExtensionId "YOUR_EXTENSION_ID" -Browser chrome
 ```
 
-The setup script configures the native messaging manifest with the correct binary path and extension ID.
-
 ## Usage
 
 ### Start Daemon
 
-The daemon is the core processing server that handles requests from the MCP bridge and browser extension.
-
 ```bash
-nevoflux --daemon
-```
-
-With verbose logging:
-
-```bash
-nevoflux --daemon --verbose
+nevoflux --daemon           # Start daemon
+nevoflux --daemon --verbose # With verbose logging
 ```
 
 ### Check Status
@@ -74,8 +86,6 @@ nevoflux --stop
 ```
 
 ### MCP Mode (for Claude Code)
-
-Run as an MCP server for integration with Claude Code:
 
 ```bash
 nevoflux --mcp
@@ -96,46 +106,16 @@ Add to your Claude Code MCP configuration:
 
 ### Configuration Management
 
-Initialize default configuration:
-
 ```bash
-nevoflux config init
-```
-
-Show current configuration:
-
-```bash
-nevoflux config show
-```
-
-Get a specific value:
-
-```bash
-nevoflux config get llm.default_provider
-```
-
-Set a configuration value:
-
-```bash
-nevoflux config set llm.default_provider qwen
-nevoflux config set llm.max_tokens 8192
-```
-
-List configuration values by prefix:
-
-```bash
-nevoflux config list daemon.
-```
-
-Delete a configuration value:
-
-```bash
-nevoflux config delete llm.default_model
+nevoflux config init              # Create default config
+nevoflux config show              # Show current config
+nevoflux config get llm.provider  # Get specific value
+nevoflux config set llm.provider qwen  # Set value
+nevoflux config list daemon.      # List by prefix
+nevoflux config delete key        # Delete value
 ```
 
 ### Interactive Setup
-
-Run the setup wizard for guided configuration:
 
 ```bash
 nevoflux setup
@@ -183,43 +163,56 @@ nevoflux setup
 | Crate | Description |
 |-------|-------------|
 | `nevoflux` | Main binary with CLI interface |
-| `nevoflux-daemon` | Core daemon with session management, WASM runtime, and agent execution |
-| `nevoflux-mcp` | MCP server/client implementation with stdio transport |
+| `nevoflux-daemon` | Core daemon: sessions, WASM runtime, agent runner, permissions |
+| `nevoflux-mcp` | MCP server/client, tools, external server manager |
 | `nevoflux-bridge` | Native messaging bridge between browser and daemon |
-| `nevoflux-protocol` | Shared message types and serialization |
+| `nevoflux-protocol` | Shared message types and serialization (JSON/MessagePack) |
 | `nevoflux-storage` | SQLite-based persistent storage |
-| `nevoflux-llm` | LLM provider abstraction (Qwen, extensible) |
+| `nevoflux-llm` | LLM provider abstraction (Anthropic, OpenAI, Qwen, DeepSeek, OpenRouter) |
 | `nevoflux-computer` | Cross-platform computer control (screenshot, mouse, keyboard) |
 | `nevoflux-skills` | WASM skill loading and management |
 | `nevoflux-builtin-wasm` | Built-in WASM skill modules |
-| `nevoflux-testing` | Testing utilities and mocks |
+| `nevoflux-testing` | Testing utilities, mocks, and fixtures |
 
 ## MCP Tools
-
-The following tools are exposed via the MCP protocol:
 
 ### Browser Tools
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `browser_navigate` | Navigate to URL | `url` (required) |
-| `browser_click` | Click element by CSS selector | `selector` (required) |
-| `browser_screenshot` | Capture page screenshot | `full_page` (optional, default: false) |
-| `browser_type` | Type text into element | `selector`, `text` (required), `clear` (optional) |
-
-### Agent Tools
-
-| Tool | Description | Parameters |
-|------|-------------|------------|
-| `agent_chat` | Send message to AI agent | `message` (required), `context` (optional) |
+| `browser_navigate` | Navigate to URL | `url` |
+| `browser_click` | Click element by selector | `selector` |
+| `browser_type` | Type text into element | `selector`, `text`, `clear?` |
+| `browser_fill` | Fill form field (clears first) | `selector`, `value` |
+| `browser_screenshot` | Capture page screenshot | `full_page?` |
+| `browser_get_content` | Get page/element text | `selector?` |
+| `browser_eval_js` | Execute JavaScript | `script` |
+| `browser_wait_for` | Wait for element | `selector`, `timeout_ms?` |
+| `browser_scroll` | Scroll page | `direction`, `amount?` |
+| `browser_get_element` | Get element info | `selector` |
+| `browser_query_all` | Query all matching elements | `selector` |
+| `browser_snapshot` | Accessibility tree snapshot | - |
+| `browser_click_by_id` | Click by snapshot ID | `element_id` |
+| `browser_fill_by_id` | Fill by snapshot ID | `element_id`, `value` |
+| `browser_type_by_id` | Type by snapshot ID | `element_id`, `text` |
+| `browser_get_markdown` | Extract page as Markdown | - |
 
 ### Computer Tools
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `computer_screenshot` | Capture screen | `monitor` (optional, 0-based index) |
-| `computer_mouse_move` | Move cursor and optionally click | `x`, `y` (required), `click` (optional: left/right/middle/double) |
-| `computer_type_text` | Type text at cursor | `text` (required), `delay_ms` (optional) |
+| `computer_screenshot` | Capture screen | `monitor?` |
+| `computer_mouse_move` | Move cursor | `x`, `y`, `click?` |
+| `computer_click` | Click at position | `x`, `y`, `button?` |
+| `computer_type_text` | Type text | `text`, `delay_ms?` |
+| `computer_key` | Press keyboard keys | `keys` |
+| `computer_scroll` | Scroll at position | `x`, `y`, `direction`, `amount?` |
+
+### Agent Tools
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| `agent_chat` | Send message to AI | `message`, `context?` |
 
 ### Built-in Agent Tools
 
@@ -231,7 +224,7 @@ The following tools are exposed via the MCP protocol:
 
 ## Configuration
 
-Configuration file location: `~/.config/nevoflux/config.toml`
+Configuration file: `~/.config/nevoflux/config.toml`
 
 ### Example Configuration
 
@@ -259,8 +252,8 @@ include_memory = true
 include_current_page = true
 
 [llm]
-default_provider = "qwen"
-default_model = "qwen-max"
+default_provider = "anthropic"
+default_model = "claude-sonnet-4-20250514"
 max_tokens = 4096
 temperature = 0.7
 timeout_secs = 120
@@ -279,11 +272,17 @@ json_format = false
 
 ### Environment Variables
 
-LLM providers may require API keys via environment variables:
-
 ```bash
-export QWEN_API_KEY="your-api-key"
-export DASHSCOPE_API_KEY="your-api-key"  # Alternative for Qwen
+# LLM Provider API Keys
+ANTHROPIC_API_KEY     # Anthropic Claude
+OPENAI_API_KEY        # OpenAI GPT
+DASHSCOPE_API_KEY     # Qwen (Alibaba)
+DEEPSEEK_API_KEY      # DeepSeek
+OPENROUTER_API_KEY    # OpenRouter
+
+# NevoFlux Settings
+NEVOFLUX_DATA_DIR     # Override data directory
+NEVOFLUX_LOG_LEVEL    # Override log level (trace, debug, info, warn, error)
 ```
 
 ## Development
@@ -291,61 +290,79 @@ export DASHSCOPE_API_KEY="your-api-key"  # Alternative for Qwen
 ### Run Tests
 
 ```bash
-# Run all tests
-cargo test --workspace
-
-# Run tests for a specific crate
-cargo test -p nevoflux-daemon
-
-# Run with verbose output
-cargo test --workspace -- --nocapture
+just test                        # All tests
+cargo test -p nevoflux-daemon    # Single crate
+cargo test test_name -- --nocapture  # Specific test
 ```
 
-### Linting
+### Test Infrastructure
+
+The `nevoflux-testing` crate provides:
+
+- `MockLlmProvider` - Fake LLM responses for testing
+- `MockMcpClient` - Fake MCP server for testing
+- `MockPermissionChecker` - Configurable permission responses
+- `TestDaemonBuilder` - Build test daemon instances
+- Property-based tests with `proptest` for protocol layer
+
+### Linting & Formatting
 
 ```bash
-cargo clippy --workspace
-```
-
-### Formatting
-
-```bash
-# Check formatting
-cargo fmt --check
-
-# Apply formatting
-cargo fmt
+just lint    # Run clippy
+just fmt     # Format code
+just ci      # Full CI check
 ```
 
 ### Generate Documentation
 
 ```bash
-cargo doc --workspace --open
+just doc     # Generate and open docs
 ```
 
 ### Build for Release
 
 ```bash
-cargo build --release --workspace
+just build-release
 ```
 
 ## Platform Notes
 
 ### Linux
 
-- Requires X11 display server for computer control features
+- Requires X11 display server for computer control
 - Wayland support is not yet implemented
 - Install `xdotool` for enhanced input simulation (optional)
 
 ### macOS
 
 - Requires Accessibility permissions for mouse/keyboard control
-- Grant permissions via System Preferences > Security & Privacy > Privacy > Accessibility
+- Grant via System Preferences > Security & Privacy > Privacy > Accessibility
 
 ### Windows
 
 - Administrator privileges required for native messaging host registration
 - Uses Windows API for screen capture and input simulation
+
+## Troubleshooting
+
+### Daemon Issues
+
+```bash
+nevoflux --status    # Check current status
+nevoflux --stop      # Clean up stale files
+```
+
+### WASM Errors
+
+Ensure wasmtime compatibility (version 27 required).
+
+### Linux Display Issues
+
+Computer control requires X11. Check with:
+
+```bash
+echo $XDG_SESSION_TYPE  # Should be "x11"
+```
 
 ## License
 
