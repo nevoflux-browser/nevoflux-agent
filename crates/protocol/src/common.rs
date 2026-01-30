@@ -321,6 +321,10 @@ pub struct FileInfo {
     pub modified: Option<u64>,
 }
 
+/// Type alias for local file references in messages.
+/// Uses FileInfo which contains path, is_directory, size, and modified.
+pub type LocalFileRef = FileInfo;
+
 /// Response from file picker
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PickFilesResponse {
