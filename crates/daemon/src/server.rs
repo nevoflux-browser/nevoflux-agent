@@ -246,8 +246,8 @@ async fn handle_chat_message_streaming(
     // For non-chat_message types, handle synchronously
     if msg_type != "chat_message" {
         let response_payload = handle_chat_message(payload, config, session_manager, runtime).await;
-        let response = DaemonEnvelope::new(&proxy_id, channel, response_payload)
-            .with_request_id(&request_id);
+        let response =
+            DaemonEnvelope::new(&proxy_id, channel, response_payload).with_request_id(&request_id);
         if let Err(e) = response_tx.send((identity, response)).await {
             error!("Failed to queue response: {}", e);
         }
@@ -269,8 +269,8 @@ async fn handle_chat_message_streaming(
                 "message": "Message content is empty"
             }
         });
-        let response = DaemonEnvelope::new(&proxy_id, channel, response_payload)
-            .with_request_id(&request_id);
+        let response =
+            DaemonEnvelope::new(&proxy_id, channel, response_payload).with_request_id(&request_id);
         if let Err(e) = response_tx.send((identity, response)).await {
             error!("Failed to queue response: {}", e);
         }
@@ -367,12 +367,11 @@ async fn handle_chat_message_streaming(
     }
 
     // Create unbounded channel for streaming chunks
-    let (stream_tx, mut stream_rx) =
-        tokio::sync::mpsc::unbounded_channel::<SidebarStreamChunk>();
+    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<SidebarStreamChunk>();
 
     // Create host functions with streaming support
-    let host = DaemonHostFunctions::new(config.clone(), runtime.clone())
-        .with_sidebar_stream(stream_tx);
+    let host =
+        DaemonHostFunctions::new(config.clone(), runtime.clone()).with_sidebar_stream(stream_tx);
 
     // Create agent with host functions
     let agent = Agent::new(host);
@@ -430,7 +429,10 @@ async fn handle_chat_message_streaming(
             }
 
             if chunk.done {
-                debug!("Stream completed, total accumulated: {} bytes", accumulated_text.len());
+                debug!(
+                    "Stream completed, total accumulated: {} bytes",
+                    accumulated_text.len()
+                );
                 break;
             }
         }
@@ -507,8 +509,8 @@ async fn handle_chat_message_streaming(
                 final_payload["payload"]["session_title"] = serde_json::Value::String(title);
             }
 
-            let response = DaemonEnvelope::new(&proxy_id, channel, final_payload)
-                .with_request_id(&request_id);
+            let response =
+                DaemonEnvelope::new(&proxy_id, channel, final_payload).with_request_id(&request_id);
             if let Err(e) = response_tx.send((identity, response)).await {
                 error!("Failed to send final response: {}", e);
             }
@@ -522,8 +524,8 @@ async fn handle_chat_message_streaming(
                     "message": format!("Agent error: {}", e)
                 }
             });
-            let response = DaemonEnvelope::new(&proxy_id, channel, error_payload)
-                .with_request_id(&request_id);
+            let response =
+                DaemonEnvelope::new(&proxy_id, channel, error_payload).with_request_id(&request_id);
             if let Err(e) = response_tx.send((identity, response)).await {
                 error!("Failed to send error response: {}", e);
             }
@@ -537,8 +539,8 @@ async fn handle_chat_message_streaming(
                     "message": format!("Agent task failed: {}", e)
                 }
             });
-            let response = DaemonEnvelope::new(&proxy_id, channel, error_payload)
-                .with_request_id(&request_id);
+            let response =
+                DaemonEnvelope::new(&proxy_id, channel, error_payload).with_request_id(&request_id);
             if let Err(e) = response_tx.send((identity, response)).await {
                 error!("Failed to send error response: {}", e);
             }

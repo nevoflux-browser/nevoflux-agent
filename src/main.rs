@@ -660,6 +660,11 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Mutex to serialize tests that modify NEVOFLUX_DATA_DIR environment variable.
+    // This prevents race conditions when tests run in parallel.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_get_data_dir_returns_path() {
@@ -669,6 +674,8 @@ mod tests {
 
     #[test]
     fn test_port_file_path() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
         // Use temp dir that contains "nevoflux" in path name for test
         let temp = tempfile::Builder::new()
             .prefix("nevoflux-test")
@@ -685,6 +692,8 @@ mod tests {
 
     #[test]
     fn test_check_daemon_status_not_running() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
         let temp = tempfile::TempDir::new().unwrap();
         std::env::set_var("NEVOFLUX_DATA_DIR", temp.path());
 
@@ -696,6 +705,8 @@ mod tests {
 
     #[test]
     fn test_check_daemon_status_with_port_file() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
         let temp = tempfile::TempDir::new().unwrap();
         std::fs::write(temp.path().join("daemon.port"), "19500").unwrap();
         std::fs::write(temp.path().join("daemon.pid"), "12345").unwrap();
@@ -710,6 +721,8 @@ mod tests {
 
     #[test]
     fn test_stop_daemon_no_files() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
         let temp = tempfile::TempDir::new().unwrap();
         std::env::set_var("NEVOFLUX_DATA_DIR", temp.path());
 
@@ -721,6 +734,8 @@ mod tests {
 
     #[test]
     fn test_stop_daemon_cleans_files() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
         let temp = tempfile::TempDir::new().unwrap();
         let port_file = temp.path().join("daemon.port");
         let pid_file = temp.path().join("daemon.pid");
