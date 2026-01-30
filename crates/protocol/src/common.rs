@@ -283,6 +283,65 @@ pub struct SystemError {
     pub message: String,
 }
 
+/// File picker mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickerMode {
+    /// Select files only
+    Files,
+    /// Select directories only
+    Directories,
+    /// Select both files and directories
+    Both,
+}
+
+/// Request to pick files/directories via native dialog
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickFilesRequest {
+    /// What type of items can be selected
+    pub mode: PickerMode,
+    /// Allow multiple selection
+    pub multiple: bool,
+    /// Dialog title
+    pub title: Option<String>,
+    /// Default directory to open
+    pub default_path: Option<String>,
+}
+
+/// Information about a selected file or directory
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileInfo {
+    /// Absolute path
+    pub path: String,
+    /// Whether this is a directory
+    pub is_directory: bool,
+    /// File size in bytes (None for directories)
+    pub size: Option<u64>,
+    /// Modification timestamp (Unix seconds)
+    pub modified: Option<u64>,
+}
+
+/// Response from file picker
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickFilesResponse {
+    /// Selected files/directories (empty if cancelled)
+    pub files: Vec<FileInfo>,
+    /// Whether the user cancelled the dialog
+    pub cancelled: bool,
+}
+
+/// Error from file picker
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickFilesError {
+    /// Dialog failed to open
+    DialogFailed(String),
+    /// No display available (Linux headless)
+    NoDisplay,
+    /// Another dialog is already open
+    AlreadyPicking,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +428,70 @@ mod tests {
         let json = serde_json::to_string(&requester).unwrap();
         let decoded: Requester = serde_json::from_str(&json).unwrap();
         assert_eq!(requester, decoded);
+    }
+
+    #[test]
+    fn test_picker_mode_serialization() {
+        assert_eq!(
+            serde_json::to_string(&PickerMode::Files).unwrap(),
+            "\"files\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PickerMode::Directories).unwrap(),
+            "\"directories\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PickerMode::Both).unwrap(),
+            "\"both\""
+        );
+    }
+
+    #[test]
+    fn test_pick_files_request_roundtrip() {
+        let req = PickFilesRequest {
+            mode: PickerMode::Both,
+            multiple: true,
+            title: Some("Select files".into()),
+            default_path: Some("/home/user".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: PickFilesRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, decoded);
+    }
+
+    #[test]
+    fn test_file_info_roundtrip() {
+        let info = FileInfo {
+            path: "/home/user/test.txt".into(),
+            is_directory: false,
+            size: Some(1024),
+            modified: Some(1706600000),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let decoded: FileInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(info, decoded);
+    }
+
+    #[test]
+    fn test_pick_files_response_roundtrip() {
+        let resp = PickFilesResponse {
+            files: vec![FileInfo {
+                path: "/home/user/test.txt".into(),
+                is_directory: false,
+                size: Some(1024),
+                modified: Some(1706600000),
+            }],
+            cancelled: false,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: PickFilesResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, decoded);
+    }
+
+    #[test]
+    fn test_pick_files_error_serialization() {
+        let err = PickFilesError::NoDisplay;
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("no_display"));
     }
 }

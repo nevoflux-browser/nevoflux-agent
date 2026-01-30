@@ -52,9 +52,10 @@ pub use mcp::{
 // Re-export common types
 pub use common::{
     AccountInfo, AgentState, Attachment, BrowserToolAction, BrowserToolError, ContentType,
-    ErrorLevel, PermissionScope, PlanInfo, PlanType, PluginAction, QuotaInfo, Requester,
-    RequesterType, ResourceAction, ResourceType, StepInfo, StreamFormat, StreamMetadata,
-    SystemError, ToolInfo, ToolStatus, UsageQuota,
+    ErrorLevel, FileInfo, PermissionScope, PickFilesError, PickFilesRequest, PickFilesResponse,
+    PickerMode, PlanInfo, PlanType, PluginAction, QuotaInfo, Requester, RequesterType,
+    ResourceAction, ResourceType, StepInfo, StreamFormat, StreamMetadata, SystemError, ToolInfo,
+    ToolStatus, UsageQuota,
 };
 
 /// Protocol version
