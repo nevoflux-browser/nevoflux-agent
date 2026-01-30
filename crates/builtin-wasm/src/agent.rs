@@ -11,7 +11,6 @@ use crate::types::*;
 use nevoflux_protocol::LocalFileRef;
 
 /// Format local file references for injection into user message.
-#[allow(dead_code)]
 fn format_local_files(files: &[LocalFileRef]) -> String {
     if files.is_empty() {
         return String::new();
@@ -38,7 +37,6 @@ fn format_local_files(files: &[LocalFileRef]) -> String {
 }
 
 /// Format file size in human-readable form.
-#[allow(dead_code)]
 fn format_file_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -161,12 +159,20 @@ impl<H: HostFunctions> Agent<H> {
         let mut messages = vec![Message::system(system_prompt)];
         messages.extend(input.history.clone());
 
-        // Create user message with attachments if present
+        // Build user message content with local files prefix
+        let local_files_prefix = format_local_files(&input.local_files);
+        let user_content = if local_files_prefix.is_empty() {
+            input.user_message.clone()
+        } else {
+            format!("{}{}", local_files_prefix, input.user_message)
+        };
+
+        // Create user message with optional attachments
         if input.attachments.is_empty() {
-            messages.push(Message::user(&input.user_message));
+            messages.push(Message::user(&user_content));
         } else {
             messages.push(Message::user_with_attachments(
-                &input.user_message,
+                &user_content,
                 input.attachments.clone(),
             ));
         }
