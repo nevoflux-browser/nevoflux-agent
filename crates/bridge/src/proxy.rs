@@ -7,9 +7,10 @@ use crate::config::BridgeConfig;
 use crate::daemon_client::{generate_proxy_id, DaemonClient};
 use crate::error::{BridgeError, Result};
 use crate::native_messaging::{read_message, write_message};
+use crate::port_discovery::launch_daemon;
 use nevoflux_protocol::{Channel, DaemonEnvelope, ProxyEnvelope};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 /// Proxy bridge state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +131,9 @@ where
     }
 
     /// Connect to the daemon.
+    ///
+    /// If the daemon is not running and `auto_launch_daemon` is enabled,
+    /// this will attempt to start the daemon first.
     pub async fn connect(&mut self) -> Result<()> {
         if self.state != ProxyState::Disconnected {
             return Ok(());
@@ -140,14 +144,59 @@ where
 
         let mut client = DaemonClient::new(&self.proxy_id, self.config.bridge.clone());
 
+        // First attempt to connect
         match client.connect().await {
             Ok(()) => {
                 self.daemon_client = Some(client);
                 self.state = ProxyState::Connected;
                 info!("Proxy {} connected to daemon", self.proxy_id);
-                Ok(())
+                return Ok(());
             }
             Err(e) => {
+                debug!("Initial connection failed: {}", e);
+
+                // If auto_launch is enabled, try to start daemon
+                if self.config.bridge.auto_launch_daemon {
+                    info!("Attempting to auto-launch daemon");
+
+                    // Get current executable path
+                    let exe_path = std::env::current_exe().map_err(|e| {
+                        BridgeError::DaemonLaunchFailed(format!(
+                            "Failed to get executable path: {}",
+                            e
+                        ))
+                    })?;
+
+                    // Launch daemon
+                    match launch_daemon(&exe_path, &self.config.bridge).await {
+                        Ok(pid) => {
+                            info!("Daemon launched with PID {}", pid);
+
+                            // Retry connection
+                            let mut retry_client =
+                                DaemonClient::new(&self.proxy_id, self.config.bridge.clone());
+
+                            match retry_client.connect().await {
+                                Ok(()) => {
+                                    self.daemon_client = Some(retry_client);
+                                    self.state = ProxyState::Connected;
+                                    info!("Proxy {} connected to daemon after auto-launch", self.proxy_id);
+                                    return Ok(());
+                                }
+                                Err(e) => {
+                                    self.state = ProxyState::Disconnected;
+                                    error!("Failed to connect after daemon launch: {}", e);
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to auto-launch daemon: {}", e);
+                            // Fall through to return original error
+                        }
+                    }
+                }
+
                 self.state = ProxyState::Disconnected;
                 error!("Proxy {} failed to connect: {}", self.proxy_id, e);
                 Err(e)
