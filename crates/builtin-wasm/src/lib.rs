@@ -36,7 +36,11 @@ pub mod types;
 
 pub use agent::{Agent, AgentConfig};
 pub use host::{HostError, HostFunctions, HostResult};
-pub use types::*;
+pub use types::{
+    AgentInput, AgentMode, AgentOutput, Attachment, BrowserToolResult, LlmChunk, LlmRequest,
+    LlmResponse, MemoryChunk, Message, MessageRole, SkillSummary, SubagentInfo, ToolCall,
+    ToolDefinition, ToolResult, ToolSearchResult,
+};
 
 /// Version of the builtin-wasm module.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -116,6 +120,8 @@ mod tests {
             mode: AgentMode::Chat,
             user_message: "Hello".into(),
             history: vec![],
+            attachments: vec![],
+            custom_system_prompt: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -135,6 +141,8 @@ mod tests {
                 mode,
                 user_message: "Test".into(),
                 history: vec![],
+                attachments: vec![],
+                custom_system_prompt: None,
             };
 
             let output = agent.run(&input);
@@ -152,6 +160,8 @@ mod tests {
             mode: AgentMode::Chat,
             user_message: "Continue our conversation".into(),
             history: vec![Message::user("Hello"), Message::assistant("Hi there!")],
+            attachments: vec![],
+            custom_system_prompt: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -164,6 +174,7 @@ mod tests {
         let config = AgentConfig {
             max_iterations: 10,
             use_streaming: false,
+            suppress_streaming: false,
         };
         let agent = Agent::with_config(mock, config);
 
@@ -172,6 +183,8 @@ mod tests {
             mode: AgentMode::Chat,
             user_message: "Test".into(),
             history: vec![],
+            attachments: vec![],
+            custom_system_prompt: None,
         };
 
         let output = agent.run(&input);

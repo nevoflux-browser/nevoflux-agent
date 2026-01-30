@@ -19,6 +19,19 @@ pub struct WasmConfig {
     /// Enable WASI Preview 2 support.
     /// Default: false.
     pub wasi_preview2: bool,
+
+    /// Fuel limit for execution (None = unlimited).
+    ///
+    /// Fuel is consumed by WASM instructions and provides a way to limit
+    /// CPU usage. Each instruction consumes some amount of fuel.
+    /// When fuel runs out, execution is trapped.
+    pub fuel_limit: Option<u64>,
+
+    /// Enable epoch-based interruption for timeout support.
+    ///
+    /// When enabled, the engine will check for epoch deadlines,
+    /// allowing execution to be interrupted after a timeout.
+    pub epoch_interruption: bool,
 }
 
 impl Default for WasmConfig {
@@ -26,6 +39,8 @@ impl Default for WasmConfig {
         Self {
             max_memory_pages: 1024,
             wasi_preview2: false,
+            fuel_limit: None,
+            epoch_interruption: false,
         }
     }
 }
@@ -46,6 +61,37 @@ impl WasmConfig {
     pub fn with_wasi_preview2(mut self, enabled: bool) -> Self {
         self.wasi_preview2 = enabled;
         self
+    }
+
+    /// Set the fuel limit for execution.
+    ///
+    /// Fuel provides CPU limiting for WASM execution.
+    pub fn with_fuel_limit(mut self, fuel: u64) -> Self {
+        self.fuel_limit = Some(fuel);
+        self
+    }
+
+    /// Enable or disable epoch-based interruption.
+    ///
+    /// This is required for timeout support in subagent execution.
+    pub fn with_epoch_interruption(mut self, enabled: bool) -> Self {
+        self.epoch_interruption = enabled;
+        self
+    }
+
+    /// Create a config suitable for subagent execution with resource limits.
+    ///
+    /// # Arguments
+    ///
+    /// * `memory_pages` - Maximum memory in WASM pages (64KB each)
+    /// * `fuel_limit` - Optional fuel limit for CPU limiting
+    pub fn for_subagent(memory_pages: u32, fuel_limit: Option<u64>) -> Self {
+        Self {
+            max_memory_pages: memory_pages,
+            wasi_preview2: false,
+            fuel_limit,
+            epoch_interruption: true, // Enable for timeout support
+        }
     }
 }
 
@@ -73,6 +119,23 @@ impl std::fmt::Debug for WasmRuntime {
 }
 
 impl WasmRuntime {
+    /// Create a Wasmtime engine configuration based on WasmConfig.
+    fn create_engine_config(config: &WasmConfig) -> wasmtime::Config {
+        let mut engine_config = wasmtime::Config::new();
+
+        // Enable fuel consumption if a limit is set
+        if config.fuel_limit.is_some() {
+            engine_config.consume_fuel(true);
+        }
+
+        // Enable epoch interruption for timeout support
+        if config.epoch_interruption {
+            engine_config.epoch_interruption(true);
+        }
+
+        engine_config
+    }
+
     /// Load a Wasm module from a file path using default configuration.
     ///
     /// # Arguments
@@ -97,7 +160,10 @@ impl WasmRuntime {
     ///
     /// Returns an error if the file cannot be read or the module is invalid.
     pub fn from_file_with_config<P: AsRef<Path>>(path: P, config: WasmConfig) -> Result<Self> {
-        let engine = Engine::default();
+        let engine_config = Self::create_engine_config(&config);
+        let engine = Engine::new(&engine_config).map_err(|e| {
+            DaemonError::InternalError(format!("Failed to create Wasm engine: {}", e))
+        })?;
         let module = Module::from_file(&engine, path).map_err(|e| {
             DaemonError::InternalError(format!("Failed to load Wasm module from file: {}", e))
         })?;
@@ -133,7 +199,10 @@ impl WasmRuntime {
     ///
     /// Returns an error if the bytes are not valid Wasm.
     pub fn from_bytes_with_config(bytes: &[u8], config: WasmConfig) -> Result<Self> {
-        let engine = Engine::default();
+        let engine_config = Self::create_engine_config(&config);
+        let engine = Engine::new(&engine_config).map_err(|e| {
+            DaemonError::InternalError(format!("Failed to create Wasm engine: {}", e))
+        })?;
         let module = Module::new(&engine, bytes).map_err(|e| {
             DaemonError::InternalError(format!("Failed to load Wasm module from bytes: {}", e))
         })?;
@@ -159,6 +228,21 @@ impl WasmRuntime {
     pub fn config(&self) -> &WasmConfig {
         &self.config
     }
+
+    /// Check if fuel consumption is enabled.
+    pub fn has_fuel_limit(&self) -> bool {
+        self.config.fuel_limit.is_some()
+    }
+
+    /// Get the fuel limit if configured.
+    pub fn fuel_limit(&self) -> Option<u64> {
+        self.config.fuel_limit
+    }
+
+    /// Check if epoch interruption is enabled.
+    pub fn has_epoch_interruption(&self) -> bool {
+        self.config.epoch_interruption
+    }
 }
 
 #[cfg(test)]
@@ -175,16 +259,41 @@ mod tests {
 
         assert_eq!(config.max_memory_pages, 1024);
         assert!(!config.wasi_preview2);
+        assert!(config.fuel_limit.is_none());
+        assert!(!config.epoch_interruption);
     }
 
     #[test]
     fn test_wasm_config_builder() {
         let config = WasmConfig::new()
             .with_max_memory_pages(2048)
-            .with_wasi_preview2(true);
+            .with_wasi_preview2(true)
+            .with_fuel_limit(1_000_000)
+            .with_epoch_interruption(true);
 
         assert_eq!(config.max_memory_pages, 2048);
         assert!(config.wasi_preview2);
+        assert_eq!(config.fuel_limit, Some(1_000_000));
+        assert!(config.epoch_interruption);
+    }
+
+    #[test]
+    fn test_wasm_config_for_subagent() {
+        let config = WasmConfig::for_subagent(4096, Some(500_000));
+
+        assert_eq!(config.max_memory_pages, 4096);
+        assert!(!config.wasi_preview2);
+        assert_eq!(config.fuel_limit, Some(500_000));
+        assert!(config.epoch_interruption);
+    }
+
+    #[test]
+    fn test_wasm_config_for_subagent_no_fuel() {
+        let config = WasmConfig::for_subagent(2048, None);
+
+        assert_eq!(config.max_memory_pages, 2048);
+        assert!(config.fuel_limit.is_none());
+        assert!(config.epoch_interruption);
     }
 
     #[test]
@@ -227,5 +336,45 @@ mod tests {
         let config = runtime.config();
 
         assert_eq!(config.max_memory_pages, 1024);
+        assert!(!runtime.has_fuel_limit());
+        assert!(runtime.fuel_limit().is_none());
+        assert!(!runtime.has_epoch_interruption());
+    }
+
+    #[test]
+    fn test_wasm_runtime_with_fuel_limit() {
+        let wasm_bytes = minimal_wasm();
+        let config = WasmConfig::new().with_fuel_limit(100_000);
+
+        let runtime = WasmRuntime::from_bytes_with_config(&wasm_bytes, config)
+            .expect("Failed to create runtime");
+
+        assert!(runtime.has_fuel_limit());
+        assert_eq!(runtime.fuel_limit(), Some(100_000));
+    }
+
+    #[test]
+    fn test_wasm_runtime_with_epoch_interruption() {
+        let wasm_bytes = minimal_wasm();
+        let config = WasmConfig::new().with_epoch_interruption(true);
+
+        let runtime = WasmRuntime::from_bytes_with_config(&wasm_bytes, config)
+            .expect("Failed to create runtime");
+
+        assert!(runtime.has_epoch_interruption());
+    }
+
+    #[test]
+    fn test_wasm_runtime_for_subagent() {
+        let wasm_bytes = minimal_wasm();
+        let config = WasmConfig::for_subagent(2048, Some(50_000));
+
+        let runtime = WasmRuntime::from_bytes_with_config(&wasm_bytes, config)
+            .expect("Failed to create runtime");
+
+        assert_eq!(runtime.config().max_memory_pages, 2048);
+        assert!(runtime.has_fuel_limit());
+        assert_eq!(runtime.fuel_limit(), Some(50_000));
+        assert!(runtime.has_epoch_interruption());
     }
 }

@@ -4,12 +4,15 @@
 //! dependencies needed by Wasm host functions to interact with
 //! the NevoFlux system.
 
+use crate::wasm::subagent::SubagentExecutor;
 use nevoflux_llm::ProviderType;
-use nevoflux_mcp::ToolSearchIndex;
+use nevoflux_mcp::{McpManager, ToolSearchIndex};
+use nevoflux_protocol::{BrowserToolAction, BrowserToolError};
 use nevoflux_skills::SkillRegistry;
 use nevoflux_storage::Database;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, oneshot, RwLock};
 
 /// LLM configuration for host functions.
 ///
@@ -59,6 +62,39 @@ impl LlmConfig {
     }
 }
 
+/// Browser tool request for the browser sender channel.
+#[derive(Debug, Clone)]
+pub struct BrowserRequest {
+    /// Unique request ID.
+    pub request_id: String,
+    /// Session ID.
+    pub session_id: String,
+    /// Tab ID (None for active tab).
+    pub tab_id: Option<i64>,
+    /// Browser action to perform.
+    pub action: BrowserToolAction,
+    /// Action parameters.
+    pub params: serde_json::Value,
+    /// Timeout in milliseconds.
+    pub timeout_ms: u64,
+}
+
+/// Browser tool response.
+#[derive(Debug, Clone)]
+pub struct BrowserResponse {
+    /// Request ID this is responding to.
+    pub request_id: String,
+    /// Whether the operation succeeded.
+    pub success: bool,
+    /// Result data.
+    pub result: Option<serde_json::Value>,
+    /// Error information.
+    pub error: Option<BrowserToolError>,
+}
+
+/// Type alias for browser request sender.
+pub type BrowserSender = mpsc::Sender<(BrowserRequest, oneshot::Sender<BrowserResponse>)>;
+
 /// Services container for host functions.
 ///
 /// This struct holds shared references to services that Wasm guest modules
@@ -74,6 +110,20 @@ pub struct HostServices {
     pub llm_config: Option<LlmConfig>,
     /// Tool search index for keyword-based tool discovery.
     pub tool_search: Option<Arc<RwLock<ToolSearchIndex>>>,
+    /// MCP Manager for calling dynamic tools.
+    pub mcp_manager: Option<Arc<McpManager>>,
+    /// Browser tool request sender.
+    pub browser_sender: Option<BrowserSender>,
+    /// Interrupt flag for stopping agent execution.
+    ///
+    /// Set to `true` when the user requests to stop the agent (e.g., clicks stop button).
+    /// The agent loop checks this flag and gracefully exits when set.
+    pub interrupt_flag: Arc<AtomicBool>,
+    /// Subagent executor for spawning sandboxed sub-agents.
+    ///
+    /// When set, enables the subagent_spawn host function to create
+    /// isolated WASM instances for sub-agent execution.
+    pub subagent_executor: Option<Arc<SubagentExecutor>>,
 }
 
 impl HostServices {
@@ -102,6 +152,10 @@ impl HostServices {
             skills,
             llm_config: None,
             tool_search: None,
+            mcp_manager: None,
+            browser_sender: None,
+            interrupt_flag: Arc::new(AtomicBool::new(false)),
+            subagent_executor: None,
         }
     }
 
@@ -117,6 +171,10 @@ impl HostServices {
             skills,
             llm_config: None,
             tool_search: None,
+            mcp_manager: None,
+            browser_sender: None,
+            interrupt_flag: Arc::new(AtomicBool::new(false)),
+            subagent_executor: None,
         }
     }
 
@@ -164,6 +222,102 @@ impl HostServices {
         self.llm_config = Some(config);
         self
     }
+
+    /// Add MCP manager to the services.
+    ///
+    /// This enables the `tool_call_dynamic` host function to call tools
+    /// discovered via tool search.
+    ///
+    /// # Arguments
+    ///
+    /// * `manager` - The MCP manager to use.
+    ///
+    /// # Returns
+    ///
+    /// Returns self for method chaining.
+    pub fn with_mcp_manager(mut self, manager: Arc<McpManager>) -> Self {
+        self.mcp_manager = Some(manager);
+        self
+    }
+
+    /// Add browser sender to the services.
+    ///
+    /// This enables browser tool host functions to send requests to the
+    /// browser extension via the proxy/bridge.
+    ///
+    /// # Arguments
+    ///
+    /// * `sender` - The browser request sender channel.
+    ///
+    /// # Returns
+    ///
+    /// Returns self for method chaining.
+    pub fn with_browser_sender(mut self, sender: BrowserSender) -> Self {
+        self.browser_sender = Some(sender);
+        self
+    }
+
+    /// Add subagent executor to the services.
+    ///
+    /// This enables the `subagent_spawn` host function to create
+    /// isolated WASM instances for sub-agent execution.
+    ///
+    /// # Arguments
+    ///
+    /// * `executor` - The subagent executor to use.
+    ///
+    /// # Returns
+    ///
+    /// Returns self for method chaining.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use nevoflux_daemon::wasm::{HostServices, SubagentExecutor};
+    /// use nevoflux_daemon::config::SubagentConfig;
+    /// use nevoflux_storage::Database;
+    /// use std::sync::Arc;
+    ///
+    /// let db = Arc::new(Database::open_in_memory().unwrap());
+    /// let rt = tokio::runtime::Handle::current();
+    /// let executor = Arc::new(SubagentExecutor::new(SubagentConfig::default(), rt));
+    /// let services = HostServices::new(db).with_subagent_executor(executor);
+    /// ```
+    pub fn with_subagent_executor(mut self, executor: Arc<SubagentExecutor>) -> Self {
+        self.subagent_executor = Some(executor);
+        self
+    }
+
+    /// Check if subagent execution is available.
+    pub fn has_subagent_executor(&self) -> bool {
+        self.subagent_executor.is_some()
+    }
+
+    /// Set the interrupt flag.
+    ///
+    /// When set to `true`, the agent loop will check this flag and
+    /// gracefully stop execution at the next opportunity.
+    ///
+    /// # Arguments
+    ///
+    /// * `interrupted` - Whether to mark the session as interrupted.
+    pub fn set_interrupted(&self, interrupted: bool) {
+        self.interrupt_flag.store(interrupted, Ordering::Relaxed);
+    }
+
+    /// Check if the session has been interrupted.
+    ///
+    /// Returns `true` if the interrupt flag has been set.
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupt_flag.load(Ordering::Relaxed)
+    }
+
+    /// Reset the interrupt flag.
+    ///
+    /// Call this at the start of a new agent run to clear any previous interrupt state.
+    pub fn reset_interrupt(&self) {
+        self.interrupt_flag.store(false, Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Debug for HostServices {
@@ -175,6 +329,19 @@ impl std::fmt::Debug for HostServices {
             .field(
                 "tool_search",
                 &self.tool_search.as_ref().map(|_| "Some(...)"),
+            )
+            .field(
+                "mcp_manager",
+                &self.mcp_manager.as_ref().map(|_| "Some(...)"),
+            )
+            .field(
+                "browser_sender",
+                &self.browser_sender.as_ref().map(|_| "Some(...)"),
+            )
+            .field("interrupt_flag", &self.is_interrupted())
+            .field(
+                "subagent_executor",
+                &self.subagent_executor.as_ref().map(|_| "Some(...)"),
             )
             .finish()
     }
@@ -278,6 +445,25 @@ mod tests {
     }
 
     #[test]
+    fn test_host_services_with_mcp_manager() {
+        use nevoflux_mcp::ManagerConfig;
+
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let manager = Arc::new(McpManager::new(ManagerConfig::default()));
+        let services = HostServices::new(db).with_mcp_manager(manager);
+
+        assert!(services.mcp_manager.is_some());
+    }
+
+    #[test]
+    fn test_host_services_without_mcp_manager() {
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let services = HostServices::new(db);
+
+        assert!(services.mcp_manager.is_none());
+    }
+
+    #[test]
     fn test_host_services_with_llm_debug() {
         let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
         let config = LlmConfig::new(ProviderType::Qwen, "key", "model");
@@ -285,6 +471,178 @@ mod tests {
         let debug_str = format!("{:?}", services);
 
         assert!(debug_str.contains("llm_config"));
+        assert!(debug_str.contains("Some(...)"));
+    }
+
+    #[test]
+    fn test_host_services_with_browser_sender() {
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let (tx, _rx) = mpsc::channel(10);
+        let services = HostServices::new(db).with_browser_sender(tx);
+
+        assert!(services.browser_sender.is_some());
+    }
+
+    #[test]
+    fn test_host_services_without_browser_sender() {
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let services = HostServices::new(db);
+
+        assert!(services.browser_sender.is_none());
+    }
+
+    #[test]
+    fn test_browser_request_creation() {
+        let request = BrowserRequest {
+            request_id: "req-001".into(),
+            session_id: "sess-001".into(),
+            tab_id: Some(123),
+            action: BrowserToolAction::Navigate,
+            params: serde_json::json!({"url": "https://example.com"}),
+            timeout_ms: 30000,
+        };
+
+        assert_eq!(request.request_id, "req-001");
+        assert_eq!(request.action, BrowserToolAction::Navigate);
+    }
+
+    #[test]
+    fn test_browser_response_success() {
+        let response = BrowserResponse {
+            request_id: "req-001".into(),
+            success: true,
+            result: Some(serde_json::json!({"url": "https://example.com"})),
+            error: None,
+        };
+
+        assert!(response.success);
+        assert!(response.result.is_some());
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn test_browser_response_error() {
+        let response = BrowserResponse {
+            request_id: "req-001".into(),
+            success: false,
+            result: None,
+            error: Some(BrowserToolError {
+                code: 404,
+                message: "Element not found".into(),
+                recoverable: true,
+            }),
+        };
+
+        assert!(!response.success);
+        assert!(response.error.is_some());
+    }
+
+    #[test]
+    fn test_host_services_interrupt_flag_default() {
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let services = HostServices::new(db);
+
+        // Default should be not interrupted
+        assert!(!services.is_interrupted());
+    }
+
+    #[test]
+    fn test_host_services_set_interrupted() {
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let services = HostServices::new(db);
+
+        // Set interrupted
+        services.set_interrupted(true);
+        assert!(services.is_interrupted());
+
+        // Reset
+        services.set_interrupted(false);
+        assert!(!services.is_interrupted());
+    }
+
+    #[test]
+    fn test_host_services_reset_interrupt() {
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let services = HostServices::new(db);
+
+        // Set interrupted and then reset
+        services.set_interrupted(true);
+        assert!(services.is_interrupted());
+
+        services.reset_interrupt();
+        assert!(!services.is_interrupted());
+    }
+
+    #[test]
+    fn test_host_services_interrupt_flag_shared() {
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let services = HostServices::new(db);
+        let cloned = services.clone();
+
+        // Set on one, should be visible on the other
+        services.set_interrupted(true);
+        assert!(cloned.is_interrupted());
+
+        // Reset on clone, should be visible on original
+        cloned.reset_interrupt();
+        assert!(!services.is_interrupted());
+    }
+
+    #[test]
+    fn test_host_services_debug_shows_interrupt_flag() {
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let services = HostServices::new(db);
+        let debug_str = format!("{:?}", services);
+
+        assert!(debug_str.contains("interrupt_flag"));
+        assert!(debug_str.contains("false"));
+    }
+
+    #[test]
+    fn test_host_services_without_subagent_executor() {
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let services = HostServices::new(db);
+
+        assert!(!services.has_subagent_executor());
+        assert!(services.subagent_executor.is_none());
+    }
+
+    #[test]
+    fn test_host_services_with_subagent_executor() {
+        use crate::config::SubagentConfig;
+        use crate::wasm::subagent::SubagentExecutor;
+
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+
+        // Create a runtime for the executor
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+        let executor = Arc::new(SubagentExecutor::new(
+            SubagentConfig::default(),
+            rt.handle().clone(),
+        ));
+
+        let services = HostServices::new(db).with_subagent_executor(executor);
+
+        assert!(services.has_subagent_executor());
+        assert!(services.subagent_executor.is_some());
+    }
+
+    #[test]
+    fn test_host_services_subagent_executor_debug() {
+        use crate::config::SubagentConfig;
+        use crate::wasm::subagent::SubagentExecutor;
+
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+        let executor = Arc::new(SubagentExecutor::new(
+            SubagentConfig::default(),
+            rt.handle().clone(),
+        ));
+
+        let services = HostServices::new(db).with_subagent_executor(executor);
+        let debug_str = format!("{:?}", services);
+
+        assert!(debug_str.contains("subagent_executor"));
         assert!(debug_str.contains("Some(...)"));
     }
 }

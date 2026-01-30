@@ -116,6 +116,9 @@ impl AgentConfig {
         }
 
         // Merge LLM config
+        if other.llm.provider.is_some() {
+            self.llm.provider = other.llm.provider.clone();
+        }
         if other.llm.default_provider.is_some() {
             self.llm.default_provider = other.llm.default_provider.clone();
         }
@@ -124,6 +127,19 @@ impl AgentConfig {
         }
         if other.llm.max_tokens != LlmConfig::default().max_tokens {
             self.llm.max_tokens = other.llm.max_tokens;
+        }
+        // Merge provider-specific configs
+        if other.llm.anthropic.api_key.is_some() {
+            self.llm.anthropic.api_key = other.llm.anthropic.api_key.clone();
+        }
+        if other.llm.anthropic.model.is_some() {
+            self.llm.anthropic.model = other.llm.anthropic.model.clone();
+        }
+        if other.llm.openai.api_key.is_some() {
+            self.llm.openai.api_key = other.llm.openai.api_key.clone();
+        }
+        if other.llm.openai.model.is_some() {
+            self.llm.openai.model = other.llm.openai.model.clone();
         }
 
         // Merge storage config
@@ -147,13 +163,33 @@ impl AgentConfig {
 /// LLM provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
-    /// Default LLM provider (e.g., "anthropic", "openai", "qwen").
+    /// Active LLM provider (e.g., "anthropic", "openai", "qwen").
+    #[serde(default)]
+    pub provider: Option<String>,
+
+    /// Default LLM provider (legacy, use `provider` instead).
     #[serde(default)]
     pub default_provider: Option<String>,
 
-    /// Default model name.
+    /// Default model name (legacy).
     #[serde(default)]
     pub default_model: Option<String>,
+
+    /// Anthropic-specific configuration.
+    #[serde(default)]
+    pub anthropic: ProviderConfig,
+
+    /// OpenAI-specific configuration.
+    #[serde(default)]
+    pub openai: ProviderConfig,
+
+    /// Qwen-specific configuration.
+    #[serde(default)]
+    pub qwen: ProviderConfig,
+
+    /// DeepSeek-specific configuration.
+    #[serde(default)]
+    pub deepseek: ProviderConfig,
 
     /// Maximum tokens for responses.
     #[serde(default = "default_max_tokens")]
@@ -172,11 +208,59 @@ pub struct LlmConfig {
     pub max_retries: u32,
 }
 
+/// Provider-specific configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderConfig {
+    /// API key for this provider.
+    #[serde(default)]
+    pub api_key: Option<String>,
+
+    /// Model name for this provider.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+impl LlmConfig {
+    /// Get the active provider name.
+    pub fn active_provider(&self) -> Option<&str> {
+        self.provider
+            .as_deref()
+            .or(self.default_provider.as_deref())
+    }
+
+    /// Get the API key for the active provider.
+    pub fn active_api_key(&self) -> Option<&str> {
+        match self.active_provider()? {
+            "anthropic" => self.anthropic.api_key.as_deref(),
+            "openai" => self.openai.api_key.as_deref(),
+            "qwen" => self.qwen.api_key.as_deref(),
+            "deepseek" => self.deepseek.api_key.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Get the model for the active provider.
+    pub fn active_model(&self) -> Option<&str> {
+        match self.active_provider()? {
+            "anthropic" => self.anthropic.model.as_deref(),
+            "openai" => self.openai.model.as_deref(),
+            "qwen" => self.qwen.model.as_deref(),
+            "deepseek" => self.deepseek.model.as_deref(),
+            _ => self.default_model.as_deref(),
+        }
+    }
+}
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
+            provider: None,
             default_provider: None,
             default_model: None,
+            anthropic: ProviderConfig::default(),
+            openai: ProviderConfig::default(),
+            qwen: ProviderConfig::default(),
+            deepseek: ProviderConfig::default(),
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
             timeout_secs: default_timeout_secs(),
@@ -296,6 +380,9 @@ pub struct DaemonConfig {
     pub session: SessionConfig,
     /// Context configuration.
     pub context: ContextConfig,
+    /// Subagent configuration for WASM sandboxed sub-agents.
+    #[serde(default)]
+    pub subagent: SubagentConfig,
 }
 
 impl Default for DaemonConfig {
@@ -310,6 +397,7 @@ impl Default for DaemonConfig {
             keep_alive_for_mcp: true,
             session: SessionConfig::default(),
             context: ContextConfig::default(),
+            subagent: SubagentConfig::default(),
         }
     }
 }
@@ -376,6 +464,21 @@ pub struct ContextConfig {
     pub include_memory: bool,
     /// Whether to include current page info.
     pub include_current_page: bool,
+    /// Enable automatic context compression.
+    #[serde(default = "default_enable_compression")]
+    pub enable_compression: bool,
+    /// Token threshold to trigger compression (% of history budget).
+    #[serde(default = "default_compression_threshold")]
+    pub compression_threshold_percent: u32,
+    /// Number of recent messages to keep uncompressed.
+    #[serde(default = "default_keep_recent")]
+    pub keep_recent_messages: u32,
+    /// Model for summarization (default: gpt-4o-mini).
+    #[serde(default)]
+    pub summarization_model: Option<String>,
+    /// Max tokens for summary output.
+    #[serde(default = "default_summary_max_tokens")]
+    pub summary_max_tokens: u32,
 }
 
 impl Default for ContextConfig {
@@ -386,7 +489,114 @@ impl Default for ContextConfig {
             max_history_messages: 50,
             include_memory: true,
             include_current_page: true,
+            enable_compression: default_enable_compression(),
+            compression_threshold_percent: default_compression_threshold(),
+            keep_recent_messages: default_keep_recent(),
+            summarization_model: None,
+            summary_max_tokens: default_summary_max_tokens(),
         }
+    }
+}
+
+fn default_enable_compression() -> bool {
+    true
+}
+
+fn default_compression_threshold() -> u32 {
+    80
+}
+
+fn default_keep_recent() -> u32 {
+    6
+}
+
+fn default_summary_max_tokens() -> u32 {
+    500
+}
+
+// ==================== Subagent Configuration ====================
+
+/// Subagent resource limits and configuration.
+///
+/// This configuration controls how sub-agents are executed in isolated
+/// WASM instances with resource constraints for security and stability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentConfig {
+    /// Maximum concurrent subagents per session.
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: usize,
+
+    /// Execution timeout in seconds.
+    #[serde(default = "default_subagent_timeout_secs")]
+    pub timeout_secs: u64,
+
+    /// Memory limit in WASM pages (64KB each).
+    /// Default: 4096 pages = 256MB.
+    #[serde(default = "default_memory_pages")]
+    pub memory_pages: u32,
+
+    /// Fuel limit for execution (None = unlimited).
+    /// Fuel is consumed by WASM instructions and provides CPU limiting.
+    #[serde(default)]
+    pub fuel_limit: Option<u64>,
+}
+
+fn default_max_concurrent() -> usize {
+    5
+}
+
+fn default_subagent_timeout_secs() -> u64 {
+    300
+}
+
+fn default_memory_pages() -> u32 {
+    4096
+}
+
+impl Default for SubagentConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: default_max_concurrent(),
+            timeout_secs: default_subagent_timeout_secs(),
+            memory_pages: default_memory_pages(),
+            fuel_limit: None,
+        }
+    }
+}
+
+impl SubagentConfig {
+    /// Create a new SubagentConfig with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the maximum concurrent subagents.
+    pub fn with_max_concurrent(mut self, max: usize) -> Self {
+        self.max_concurrent = max;
+        self
+    }
+
+    /// Set the execution timeout in seconds.
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout_secs = secs;
+        self
+    }
+
+    /// Set the memory limit in WASM pages.
+    pub fn with_memory_pages(mut self, pages: u32) -> Self {
+        self.memory_pages = pages;
+        self
+    }
+
+    /// Set the fuel limit for execution.
+    pub fn with_fuel_limit(mut self, fuel: u64) -> Self {
+        self.fuel_limit = Some(fuel);
+        self
+    }
+
+    /// Get memory limit in bytes.
+    pub fn memory_bytes(&self) -> u64 {
+        self.memory_pages as u64 * 65536 // 64KB per page
     }
 }
 
@@ -432,6 +642,11 @@ mod tests {
 
         assert_eq!(config.system_prompt_reserve, 2000);
         assert!(config.include_memory);
+        assert!(config.enable_compression);
+        assert_eq!(config.compression_threshold_percent, 80);
+        assert_eq!(config.keep_recent_messages, 6);
+        assert!(config.summarization_model.is_none());
+        assert_eq!(config.summary_max_tokens, 500);
     }
 
     #[test]
@@ -456,6 +671,7 @@ mod tests {
         // Check LLM defaults
         assert_eq!(config.llm.max_tokens, 4096);
         assert_eq!(config.llm.temperature, 0.7);
+        assert!(config.llm.provider.is_none());
         assert!(config.llm.default_provider.is_none());
 
         // Check storage defaults
@@ -579,7 +795,7 @@ level = "warn"
 
         // Set some non-default values in other
         other.daemon.port_range_start = 21000;
-        other.llm.default_provider = Some("anthropic".to_string());
+        other.llm.provider = Some("anthropic".to_string());
         other.storage.data_dir = Some(PathBuf::from("/merged/path"));
         other.logging.level = "trace".to_string();
 
@@ -587,7 +803,7 @@ level = "warn"
 
         // Merged values should be applied
         assert_eq!(base.daemon.port_range_start, 21000);
-        assert_eq!(base.llm.default_provider, Some("anthropic".to_string()));
+        assert_eq!(base.llm.provider, Some("anthropic".to_string()));
         assert_eq!(base.storage.data_dir, Some(PathBuf::from("/merged/path")));
         assert_eq!(base.logging.level, "trace");
 
@@ -600,12 +816,35 @@ level = "warn"
     fn test_llm_config_defaults() {
         let config = LlmConfig::default();
 
+        assert!(config.provider.is_none());
         assert!(config.default_provider.is_none());
         assert!(config.default_model.is_none());
         assert_eq!(config.max_tokens, 4096);
         assert_eq!(config.temperature, 0.7);
         assert_eq!(config.timeout_secs, 120);
         assert_eq!(config.max_retries, 3);
+    }
+
+    #[test]
+    fn test_llm_config_active_provider() {
+        let mut config = LlmConfig::default();
+        config.provider = Some("openai".to_string());
+        config.openai.api_key = Some("test-key".to_string());
+        config.openai.model = Some("gpt-4o".to_string());
+
+        assert_eq!(config.active_provider(), Some("openai"));
+        assert_eq!(config.active_api_key(), Some("test-key"));
+        assert_eq!(config.active_model(), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn test_llm_config_fallback_to_default_provider() {
+        let mut config = LlmConfig::default();
+        config.default_provider = Some("anthropic".to_string());
+        config.anthropic.api_key = Some("sk-ant-xxx".to_string());
+
+        assert_eq!(config.active_provider(), Some("anthropic"));
+        assert_eq!(config.active_api_key(), Some("sk-ant-xxx"));
     }
 
     #[test]
@@ -656,5 +895,89 @@ level = "warn"
             Err(ConfigError::ParseError(_)) => (),
             _ => panic!("Expected ParseError"),
         }
+    }
+
+    // ==================== SubagentConfig Tests ====================
+
+    #[test]
+    fn test_subagent_config_defaults() {
+        let config = SubagentConfig::default();
+
+        assert_eq!(config.max_concurrent, 5);
+        assert_eq!(config.timeout_secs, 300);
+        assert_eq!(config.memory_pages, 4096);
+        assert!(config.fuel_limit.is_none());
+    }
+
+    #[test]
+    fn test_subagent_config_builder() {
+        let config = SubagentConfig::new()
+            .with_max_concurrent(10)
+            .with_timeout_secs(600)
+            .with_memory_pages(8192)
+            .with_fuel_limit(1_000_000);
+
+        assert_eq!(config.max_concurrent, 10);
+        assert_eq!(config.timeout_secs, 600);
+        assert_eq!(config.memory_pages, 8192);
+        assert_eq!(config.fuel_limit, Some(1_000_000));
+    }
+
+    #[test]
+    fn test_subagent_config_memory_bytes() {
+        let config = SubagentConfig::default();
+        // 4096 pages * 64KB = 256MB
+        assert_eq!(config.memory_bytes(), 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_daemon_config_includes_subagent() {
+        let config = DaemonConfig::default();
+        assert_eq!(config.subagent.max_concurrent, 5);
+        assert_eq!(config.subagent.timeout_secs, 300);
+    }
+
+    #[test]
+    fn test_subagent_config_serialization() {
+        let config = SubagentConfig::new()
+            .with_max_concurrent(3)
+            .with_fuel_limit(500_000);
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"max_concurrent\":3"));
+        assert!(json.contains("\"fuel_limit\":500000"));
+
+        let decoded: SubagentConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.max_concurrent, 3);
+        assert_eq!(decoded.fuel_limit, Some(500_000));
+    }
+
+    #[test]
+    fn test_subagent_config_toml_parsing() {
+        // Parse just the subagent config section
+        let toml_str = r#"
+max_concurrent = 8
+timeout_secs = 120
+memory_pages = 2048
+fuel_limit = 10000000
+"#;
+        let config: SubagentConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.max_concurrent, 8);
+        assert_eq!(config.timeout_secs, 120);
+        assert_eq!(config.memory_pages, 2048);
+        assert_eq!(config.fuel_limit, Some(10_000_000));
+    }
+
+    #[test]
+    fn test_subagent_config_partial_toml() {
+        // Only specify some fields, others should use defaults
+        let toml_str = r#"
+max_concurrent = 2
+"#;
+        let config: SubagentConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.max_concurrent, 2);
+        assert_eq!(config.timeout_secs, 300); // default
+        assert_eq!(config.memory_pages, 4096); // default
+        assert!(config.fuel_limit.is_none()); // default
     }
 }

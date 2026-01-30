@@ -8,9 +8,11 @@ pub mod linker;
 pub mod llm;
 pub mod runtime;
 pub mod services;
+pub mod subagent;
 
 pub use instance::WasmInstance;
 pub use linker::{create_linker, HostState};
-pub use llm::{LlmChatRequest, LlmChatResponse, LlmMessage, LlmUsage};
+pub use llm::{LlmAttachment, LlmChatRequest, LlmChatResponse, LlmMessage, LlmUsage};
 pub use runtime::{WasmConfig, WasmRuntime};
 pub use services::{HostServices, LlmConfig};
+pub use subagent::{SubagentExecutor, SubagentHandle, SubagentStatus};

@@ -46,6 +46,9 @@ pub struct Message {
     /// Optional tool call ID (for tool responses).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Attachments for multimodal messages (images, files).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
 }
 
 impl Message {
@@ -55,6 +58,7 @@ impl Message {
             role: MessageRole::System,
             content: content.into(),
             tool_call_id: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -64,6 +68,17 @@ impl Message {
             role: MessageRole::User,
             content: content.into(),
             tool_call_id: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// Create a user message with attachments.
+    pub fn user_with_attachments(content: impl Into<String>, attachments: Vec<Attachment>) -> Self {
+        Self {
+            role: MessageRole::User,
+            content: content.into(),
+            tool_call_id: None,
+            attachments,
         }
     }
 
@@ -73,6 +88,7 @@ impl Message {
             role: MessageRole::Assistant,
             content: content.into(),
             tool_call_id: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -82,6 +98,7 @@ impl Message {
             role: MessageRole::Tool,
             content: content.into(),
             tool_call_id: Some(tool_call_id.into()),
+            attachments: Vec::new(),
         }
     }
 }
@@ -168,6 +185,15 @@ pub struct AgentInput {
     /// Conversation history.
     #[serde(default)]
     pub history: Vec<Message>,
+    /// Attachments for multimodal input (images, files).
+    #[serde(default)]
+    pub attachments: Vec<Attachment>,
+    /// Custom system prompt (overrides default mode-based prompt).
+    ///
+    /// When set, this replaces the built-in system prompt for the agent mode.
+    /// This is primarily used for sub-agents that need specialized instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_system_prompt: Option<String>,
 }
 
 /// Agent output to host.
@@ -206,6 +232,104 @@ pub struct MemoryChunk {
     pub session_id: Option<String>,
     /// Relevance score.
     pub score: f32,
+}
+
+/// Attachment for multimodal messages (images, files, etc.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    /// Attachment name/filename.
+    pub name: String,
+    /// MIME type (e.g., "image/png", "image/jpeg", "application/pdf").
+    pub mime_type: String,
+    /// Base64 encoded data.
+    pub data: String,
+}
+
+/// Result from browser tool execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserToolResult {
+    /// Whether the operation succeeded.
+    pub success: bool,
+    /// Result data (action-specific).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    /// Error message if the operation failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Base64 encoded screenshot (for screenshot action).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot: Option<String>,
+}
+
+impl BrowserToolResult {
+    /// Create a successful result with data.
+    pub fn success(data: serde_json::Value) -> Self {
+        Self {
+            success: true,
+            data: Some(data),
+            error: None,
+            screenshot: None,
+        }
+    }
+
+    /// Create a successful result with no data.
+    pub fn ok() -> Self {
+        Self {
+            success: true,
+            data: None,
+            error: None,
+            screenshot: None,
+        }
+    }
+
+    /// Create an error result.
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(message.into()),
+            screenshot: None,
+        }
+    }
+
+    /// Create a screenshot result.
+    pub fn screenshot(base64_data: impl Into<String>) -> Self {
+        Self {
+            success: true,
+            data: None,
+            error: None,
+            screenshot: Some(base64_data.into()),
+        }
+    }
+}
+
+/// Information about a sub-agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentInfo {
+    /// Sub-agent ID.
+    pub id: u64,
+    /// Task description.
+    pub task: String,
+    /// Execution mode (chat, browser, agent).
+    pub mode: String,
+    /// Current status (running, completed, failed).
+    pub status: String,
+}
+
+/// Result from tool search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSearchResult {
+    /// Tool name.
+    pub name: String,
+    /// Tool description.
+    pub description: String,
+    /// BM25 relevance score.
+    pub score: f64,
+    /// JSON Schema for tool input parameters.
+    pub input_schema: serde_json::Value,
+    /// Source of the tool (e.g., "mcp:filesystem", "builtin").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[cfg(test)]
@@ -286,9 +410,57 @@ mod tests {
             mode: AgentMode::Agent,
             user_message: "Help me".into(),
             history: vec![Message::system("You are helpful")],
+            attachments: vec![],
+            custom_system_prompt: None,
         };
         assert_eq!(input.mode, AgentMode::Agent);
         assert_eq!(input.history.len(), 1);
+        assert!(input.custom_system_prompt.is_none());
+    }
+
+    #[test]
+    fn test_agent_input_with_custom_prompt() {
+        let input = AgentInput {
+            session_id: "sess-001".into(),
+            mode: AgentMode::Agent,
+            user_message: "Search for files".into(),
+            history: vec![],
+            attachments: vec![],
+            custom_system_prompt: Some("You are a sub-agent focused on file search.".into()),
+        };
+        assert!(input.custom_system_prompt.is_some());
+        assert!(input
+            .custom_system_prompt
+            .as_ref()
+            .unwrap()
+            .contains("sub-agent"));
+    }
+
+    #[test]
+    fn test_agent_input_custom_prompt_serialization() {
+        let input = AgentInput {
+            session_id: "sess-001".into(),
+            mode: AgentMode::Chat,
+            user_message: "Hello".into(),
+            history: vec![],
+            attachments: vec![],
+            custom_system_prompt: Some("Custom prompt".into()),
+        };
+        let json = serde_json::to_string(&input).unwrap();
+        assert!(json.contains("custom_system_prompt"));
+        assert!(json.contains("Custom prompt"));
+
+        // Verify None is not serialized
+        let input_no_prompt = AgentInput {
+            session_id: "sess-001".into(),
+            mode: AgentMode::Chat,
+            user_message: "Hello".into(),
+            history: vec![],
+            attachments: vec![],
+            custom_system_prompt: None,
+        };
+        let json2 = serde_json::to_string(&input_no_prompt).unwrap();
+        assert!(!json2.contains("custom_system_prompt"));
     }
 
     #[test]
@@ -349,5 +521,123 @@ mod tests {
             score: 0.95,
         };
         assert!(chunk.score > 0.9);
+    }
+
+    #[test]
+    fn test_tool_search_result() {
+        let result = ToolSearchResult {
+            name: "read_file".into(),
+            description: "Read a file from disk".into(),
+            score: 1.5,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"}
+                }
+            }),
+            source: Some("mcp:filesystem".into()),
+        };
+        assert_eq!(result.name, "read_file");
+        assert!(result.score > 0.0);
+        assert!(result.source.is_some());
+    }
+
+    #[test]
+    fn test_tool_search_result_serialization() {
+        let result = ToolSearchResult {
+            name: "test_tool".into(),
+            description: "A test tool".into(),
+            score: 2.0,
+            input_schema: serde_json::json!({"type": "object"}),
+            source: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("test_tool"));
+        // source should be omitted when None
+        assert!(!json.contains("source"));
+
+        let decoded: ToolSearchResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.name, "test_tool");
+        assert!(decoded.source.is_none());
+    }
+
+    #[test]
+    fn test_browser_tool_result_success() {
+        let result = BrowserToolResult::success(serde_json::json!({"url": "https://example.com"}));
+        assert!(result.success);
+        assert!(result.data.is_some());
+        assert!(result.error.is_none());
+        assert!(result.screenshot.is_none());
+    }
+
+    #[test]
+    fn test_browser_tool_result_ok() {
+        let result = BrowserToolResult::ok();
+        assert!(result.success);
+        assert!(result.data.is_none());
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn test_browser_tool_result_error() {
+        let result = BrowserToolResult::error("Element not found");
+        assert!(!result.success);
+        assert!(result.data.is_none());
+        assert_eq!(result.error, Some("Element not found".into()));
+    }
+
+    #[test]
+    fn test_browser_tool_result_screenshot() {
+        let result = BrowserToolResult::screenshot("iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB");
+        assert!(result.success);
+        assert!(result.screenshot.is_some());
+    }
+
+    #[test]
+    fn test_browser_tool_result_serialization() {
+        let result = BrowserToolResult::success(serde_json::json!({"content": "Hello"}));
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"content\":\"Hello\""));
+        // error and screenshot should be omitted when None
+        assert!(!json.contains("error"));
+        assert!(!json.contains("screenshot"));
+
+        let decoded: BrowserToolResult = serde_json::from_str(&json).unwrap();
+        assert!(decoded.success);
+        assert!(decoded.data.is_some());
+    }
+
+    #[test]
+    fn test_subagent_info() {
+        let info = SubagentInfo {
+            id: 42,
+            task: "Search for information".into(),
+            mode: "agent".into(),
+            status: "running".into(),
+        };
+        assert_eq!(info.id, 42);
+        assert_eq!(info.task, "Search for information");
+        assert_eq!(info.mode, "agent");
+        assert_eq!(info.status, "running");
+    }
+
+    #[test]
+    fn test_subagent_info_serialization() {
+        let info = SubagentInfo {
+            id: 1,
+            task: "Test task".into(),
+            mode: "chat".into(),
+            status: "completed".into(),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"id\":1"));
+        assert!(json.contains("\"task\":\"Test task\""));
+        assert!(json.contains("\"mode\":\"chat\""));
+        assert!(json.contains("\"status\":\"completed\""));
+
+        let decoded: SubagentInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.id, 1);
+        assert_eq!(decoded.task, "Test task");
     }
 }

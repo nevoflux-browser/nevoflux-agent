@@ -147,6 +147,20 @@ pub trait HostFunctions {
     ) -> HostResult<bool>;
 
     // =========================================================================
+    // Dynamic Tool Functions
+    // =========================================================================
+
+    /// Search available tools by keyword using BM25 ranking.
+    fn tool_search(&self, query: &str, max_results: usize) -> HostResult<Vec<ToolSearchResult>>;
+
+    /// Call a dynamically discovered tool by name.
+    fn tool_call_dynamic(
+        &self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> HostResult<String>;
+
+    // =========================================================================
     // Built-in Proxy (for plugins to inherit built-in capabilities)
     // =========================================================================
 
@@ -158,6 +172,144 @@ pub trait HostFunctions {
 
     /// Invoke built-in agent mode.
     fn builtin_agent(&self, input: &AgentInput) -> HostResult<AgentOutput>;
+
+    // =========================================================================
+    // Browser Tools
+    // =========================================================================
+
+    /// Navigate to a URL.
+    fn browser_navigate(&self, url: &str, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
+
+    /// Click on an element by CSS selector.
+    fn browser_click(&self, selector: &str, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
+
+    /// Click on an element by element ID attribute.
+    fn browser_click_by_id(
+        &self,
+        element_id: &str,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
+
+    /// Type text into an element (simulates keystrokes).
+    fn browser_type(
+        &self,
+        selector: &str,
+        text: &str,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
+
+    /// Type text into an element by ID (simulates keystrokes).
+    fn browser_type_by_id(
+        &self,
+        element_id: &str,
+        text: &str,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
+
+    /// Fill an input element with a value (sets value directly).
+    fn browser_fill(
+        &self,
+        selector: &str,
+        value: &str,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
+
+    /// Fill an input element by ID with a value.
+    fn browser_fill_by_id(
+        &self,
+        element_id: &str,
+        value: &str,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
+
+    /// Get page content as text/HTML.
+    fn browser_get_content(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
+
+    /// Get page content as markdown.
+    fn browser_get_markdown(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
+
+    /// Take a screenshot of the page.
+    fn browser_screenshot(
+        &self,
+        full_page: bool,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
+
+    /// Execute JavaScript in the page context.
+    fn browser_eval_js(&self, script: &str, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
+
+    /// Scroll the page.
+    fn browser_scroll(
+        &self,
+        direction: &str,
+        amount: i32,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
+
+    /// Wait for an element to appear.
+    fn browser_wait_for(
+        &self,
+        selector: &str,
+        timeout_ms: u64,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
+
+    // =========================================================================
+    // Session Control Functions
+    // =========================================================================
+
+    /// Check if the current session has been interrupted (e.g., user clicked stop).
+    ///
+    /// This is used by the agent loop to check for user-requested interrupts
+    /// and gracefully stop execution.
+    fn is_interrupted(&self) -> HostResult<bool>;
+
+    // =========================================================================
+    // Subagent Functions
+    // =========================================================================
+
+    /// Spawn a sub-agent to execute a task.
+    ///
+    /// # Arguments
+    /// * `task` - The task description for the sub-agent
+    /// * `mode` - Execution mode: "chat", "browser", or "agent"
+    ///
+    /// # Returns
+    /// The sub-agent ID on success.
+    fn subagent_spawn(&self, task: &str, mode: &str) -> HostResult<u64>;
+
+    /// Check the status of a sub-agent.
+    ///
+    /// # Arguments
+    /// * `id` - The sub-agent ID
+    ///
+    /// # Returns
+    /// The status string: "running", "completed", or "failed".
+    fn subagent_status(&self, id: u64) -> HostResult<String>;
+
+    /// Wait for a sub-agent to complete and get its result.
+    ///
+    /// # Arguments
+    /// * `id` - The sub-agent ID
+    ///
+    /// # Returns
+    /// The sub-agent's result text on completion.
+    fn subagent_wait(&self, id: u64) -> HostResult<String>;
+
+    /// Terminate a sub-agent.
+    ///
+    /// # Arguments
+    /// * `id` - The sub-agent ID
+    ///
+    /// # Returns
+    /// `true` if the sub-agent was terminated, `false` if it was already completed.
+    fn subagent_kill(&self, id: u64) -> HostResult<bool>;
+
+    /// List all sub-agents.
+    ///
+    /// # Returns
+    /// A list of sub-agent information.
+    fn subagent_list(&self) -> HostResult<Vec<SubagentInfo>>;
 }
 
 /// Mock host functions for testing.
@@ -167,6 +319,12 @@ pub struct MockHostFunctions {
     pub llm_responses: std::cell::RefCell<Vec<LlmResponse>>,
     /// Simulated skills.
     pub skills: std::cell::RefCell<Vec<SkillSummary>>,
+    /// Interrupt flag for testing.
+    pub interrupted: std::cell::Cell<bool>,
+    /// Next subagent ID counter.
+    next_subagent_id: std::cell::Cell<u64>,
+    /// Subagent registry for tracking spawned subagents.
+    subagents: std::cell::RefCell<Vec<SubagentInfo>>,
 }
 
 #[cfg(test)]
@@ -183,6 +341,9 @@ impl MockHostFunctions {
         Self {
             llm_responses: std::cell::RefCell::new(vec![]),
             skills: std::cell::RefCell::new(vec![]),
+            interrupted: std::cell::Cell::new(false),
+            next_subagent_id: std::cell::Cell::new(1),
+            subagents: std::cell::RefCell::new(vec![]),
         }
     }
 
@@ -194,6 +355,11 @@ impl MockHostFunctions {
     /// Add a skill.
     pub fn add_skill(&self, skill: SkillSummary) {
         self.skills.borrow_mut().push(skill);
+    }
+
+    /// Set the interrupt flag.
+    pub fn set_interrupted(&self, interrupted: bool) {
+        self.interrupted.set(interrupted);
     }
 }
 
@@ -334,6 +500,18 @@ impl HostFunctions for MockHostFunctions {
         Ok(true) // Always granted in mock
     }
 
+    fn tool_search(&self, _query: &str, _max_results: usize) -> HostResult<Vec<ToolSearchResult>> {
+        Ok(vec![])
+    }
+
+    fn tool_call_dynamic(
+        &self,
+        tool_name: &str,
+        _arguments: &serde_json::Value,
+    ) -> HostResult<String> {
+        Ok(format!("Mock result for tool: {}", tool_name))
+    }
+
     fn builtin_chat(&self, input: &AgentInput) -> HostResult<AgentOutput> {
         Ok(AgentOutput {
             text: format!("Chat response to: {}", input.user_message),
@@ -356,6 +534,186 @@ impl HostFunctions for MockHostFunctions {
             tool_calls: vec![],
             continue_loop: false,
         })
+    }
+
+    fn browser_navigate(&self, url: &str, _tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(
+            serde_json::json!({"url": url, "title": "Mock Page"}),
+        ))
+    }
+
+    fn browser_click(&self, selector: &str, _tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(
+            serde_json::json!({"clicked": selector}),
+        ))
+    }
+
+    fn browser_click_by_id(
+        &self,
+        element_id: &str,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(
+            serde_json::json!({"clicked_id": element_id}),
+        ))
+    }
+
+    fn browser_type(
+        &self,
+        selector: &str,
+        text: &str,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(
+            serde_json::json!({"typed": text, "into": selector}),
+        ))
+    }
+
+    fn browser_type_by_id(
+        &self,
+        element_id: &str,
+        text: &str,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(
+            serde_json::json!({"typed": text, "into_id": element_id}),
+        ))
+    }
+
+    fn browser_fill(
+        &self,
+        selector: &str,
+        value: &str,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(
+            serde_json::json!({"filled": selector, "value": value}),
+        ))
+    }
+
+    fn browser_fill_by_id(
+        &self,
+        element_id: &str,
+        value: &str,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(
+            serde_json::json!({"filled_id": element_id, "value": value}),
+        ))
+    }
+
+    fn browser_get_content(&self, _tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(serde_json::json!({
+            "content": "<html><body>Mock page content</body></html>",
+            "text": "Mock page content"
+        })))
+    }
+
+    fn browser_get_markdown(&self, _tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(serde_json::json!({
+            "markdown": "# Mock Page\n\nThis is mock content."
+        })))
+    }
+
+    fn browser_screenshot(
+        &self,
+        _full_page: bool,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::screenshot("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="))
+    }
+
+    fn browser_eval_js(&self, script: &str, _tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(serde_json::json!({
+            "result": format!("Executed: {}", script)
+        })))
+    }
+
+    fn browser_scroll(
+        &self,
+        direction: &str,
+        amount: i32,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(serde_json::json!({
+            "scrolled": direction,
+            "amount": amount
+        })))
+    }
+
+    fn browser_wait_for(
+        &self,
+        selector: &str,
+        _timeout_ms: u64,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(serde_json::json!({
+            "found": selector
+        })))
+    }
+
+    fn is_interrupted(&self) -> HostResult<bool> {
+        Ok(self.interrupted.get())
+    }
+
+    fn subagent_spawn(&self, task: &str, mode: &str) -> HostResult<u64> {
+        let id = self.next_subagent_id.get();
+        self.next_subagent_id.set(id + 1);
+
+        let info = SubagentInfo {
+            id,
+            task: task.to_string(),
+            mode: mode.to_string(),
+            status: "completed".to_string(), // Mock: immediately complete
+        };
+        self.subagents.borrow_mut().push(info);
+
+        Ok(id)
+    }
+
+    fn subagent_status(&self, id: u64) -> HostResult<String> {
+        let subagents = self.subagents.borrow();
+        subagents
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.status.clone())
+            .ok_or_else(|| HostError {
+                code: 404,
+                message: format!("Subagent not found: {}", id),
+            })
+    }
+
+    fn subagent_wait(&self, id: u64) -> HostResult<String> {
+        let subagents = self.subagents.borrow();
+        subagents
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| format!("Result from subagent {}: {}", id, s.task))
+            .ok_or_else(|| HostError {
+                code: 404,
+                message: format!("Subagent not found: {}", id),
+            })
+    }
+
+    fn subagent_kill(&self, id: u64) -> HostResult<bool> {
+        let mut subagents = self.subagents.borrow_mut();
+        if let Some(info) = subagents.iter_mut().find(|s| s.id == id) {
+            if info.status == "running" {
+                info.status = "killed".to_string();
+                Ok(true)
+            } else {
+                Ok(false) // Already completed
+            }
+        } else {
+            Err(HostError {
+                code: 404,
+                message: format!("Subagent not found: {}", id),
+            })
+        }
+    }
+
+    fn subagent_list(&self) -> HostResult<Vec<SubagentInfo>> {
+        Ok(self.subagents.borrow().clone())
     }
 }
 
@@ -486,6 +844,8 @@ mod tests {
             mode: AgentMode::Chat,
             user_message: "Hello".into(),
             history: vec![],
+            attachments: vec![],
+            custom_system_prompt: None,
         };
 
         let chat_output = mock.builtin_chat(&input).unwrap();
@@ -496,5 +856,209 @@ mod tests {
 
         let agent_output = mock.builtin_agent(&input).unwrap();
         assert!(agent_output.text.contains("Hello"));
+    }
+
+    #[test]
+    fn test_mock_host_functions_tool_search() {
+        let mock = MockHostFunctions::new();
+        let results = mock.tool_search("file", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_mock_host_functions_tool_call_dynamic() {
+        let mock = MockHostFunctions::new();
+        let result = mock
+            .tool_call_dynamic("read_file", &serde_json::json!({"path": "/test.txt"}))
+            .unwrap();
+        assert!(result.contains("read_file"));
+    }
+
+    #[test]
+    fn test_mock_host_functions_browser_navigate() {
+        let mock = MockHostFunctions::new();
+        let result = mock.browser_navigate("https://example.com", None).unwrap();
+        assert!(result.success);
+        assert!(result.data.is_some());
+    }
+
+    #[test]
+    fn test_mock_host_functions_browser_click() {
+        let mock = MockHostFunctions::new();
+        let result = mock.browser_click("#submit-btn", None).unwrap();
+        assert!(result.success);
+    }
+
+    #[test]
+    fn test_mock_host_functions_browser_click_by_id() {
+        let mock = MockHostFunctions::new();
+        let result = mock.browser_click_by_id("submit-btn", None).unwrap();
+        assert!(result.success);
+    }
+
+    #[test]
+    fn test_mock_host_functions_browser_type() {
+        let mock = MockHostFunctions::new();
+        let result = mock.browser_type("#input", "Hello", None).unwrap();
+        assert!(result.success);
+    }
+
+    #[test]
+    fn test_mock_host_functions_browser_fill() {
+        let mock = MockHostFunctions::new();
+        let result = mock
+            .browser_fill("#email", "test@example.com", None)
+            .unwrap();
+        assert!(result.success);
+    }
+
+    #[test]
+    fn test_mock_host_functions_browser_get_content() {
+        let mock = MockHostFunctions::new();
+        let result = mock.browser_get_content(None).unwrap();
+        assert!(result.success);
+        assert!(result.data.is_some());
+    }
+
+    #[test]
+    fn test_mock_host_functions_browser_get_markdown() {
+        let mock = MockHostFunctions::new();
+        let result = mock.browser_get_markdown(None).unwrap();
+        assert!(result.success);
+    }
+
+    #[test]
+    fn test_mock_host_functions_browser_screenshot() {
+        let mock = MockHostFunctions::new();
+        let result = mock.browser_screenshot(false, None).unwrap();
+        assert!(result.success);
+        assert!(result.screenshot.is_some());
+    }
+
+    #[test]
+    fn test_mock_host_functions_browser_eval_js() {
+        let mock = MockHostFunctions::new();
+        let result = mock.browser_eval_js("document.title", None).unwrap();
+        assert!(result.success);
+    }
+
+    #[test]
+    fn test_mock_host_functions_browser_scroll() {
+        let mock = MockHostFunctions::new();
+        let result = mock.browser_scroll("down", 500, None).unwrap();
+        assert!(result.success);
+    }
+
+    #[test]
+    fn test_mock_host_functions_browser_wait_for() {
+        let mock = MockHostFunctions::new();
+        let result = mock.browser_wait_for("#element", 5000, None).unwrap();
+        assert!(result.success);
+    }
+
+    #[test]
+    fn test_mock_host_functions_is_interrupted_default() {
+        let mock = MockHostFunctions::new();
+        let result = mock.is_interrupted().unwrap();
+        assert!(!result); // Default is not interrupted
+    }
+
+    #[test]
+    fn test_mock_host_functions_is_interrupted_set() {
+        let mock = MockHostFunctions::new();
+
+        // Set interrupted
+        mock.set_interrupted(true);
+        assert!(mock.is_interrupted().unwrap());
+
+        // Reset
+        mock.set_interrupted(false);
+        assert!(!mock.is_interrupted().unwrap());
+    }
+
+    #[test]
+    fn test_mock_host_functions_subagent_spawn() {
+        let mock = MockHostFunctions::new();
+
+        let id1 = mock.subagent_spawn("Search for files", "agent").unwrap();
+        assert_eq!(id1, 1);
+
+        let id2 = mock.subagent_spawn("Chat with user", "chat").unwrap();
+        assert_eq!(id2, 2);
+    }
+
+    #[test]
+    fn test_mock_host_functions_subagent_status() {
+        let mock = MockHostFunctions::new();
+
+        let id = mock.subagent_spawn("Test task", "agent").unwrap();
+        let status = mock.subagent_status(id).unwrap();
+        assert_eq!(status, "completed");
+    }
+
+    #[test]
+    fn test_mock_host_functions_subagent_status_not_found() {
+        let mock = MockHostFunctions::new();
+
+        let result = mock.subagent_status(999);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, 404);
+    }
+
+    #[test]
+    fn test_mock_host_functions_subagent_wait() {
+        let mock = MockHostFunctions::new();
+
+        let id = mock.subagent_spawn("Find documents", "agent").unwrap();
+        let result = mock.subagent_wait(id).unwrap();
+        assert!(result.contains("Find documents"));
+    }
+
+    #[test]
+    fn test_mock_host_functions_subagent_wait_not_found() {
+        let mock = MockHostFunctions::new();
+
+        let result = mock.subagent_wait(999);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, 404);
+    }
+
+    #[test]
+    fn test_mock_host_functions_subagent_kill() {
+        let mock = MockHostFunctions::new();
+
+        let id = mock.subagent_spawn("Long task", "agent").unwrap();
+        // Mock sets status to "completed" immediately, so kill returns false
+        let killed = mock.subagent_kill(id).unwrap();
+        assert!(!killed);
+    }
+
+    #[test]
+    fn test_mock_host_functions_subagent_kill_not_found() {
+        let mock = MockHostFunctions::new();
+
+        let result = mock.subagent_kill(999);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, 404);
+    }
+
+    #[test]
+    fn test_mock_host_functions_subagent_list() {
+        let mock = MockHostFunctions::new();
+
+        // Initially empty
+        let list = mock.subagent_list().unwrap();
+        assert!(list.is_empty());
+
+        // Spawn some subagents
+        mock.subagent_spawn("Task 1", "agent").unwrap();
+        mock.subagent_spawn("Task 2", "browser").unwrap();
+
+        let list = mock.subagent_list().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].task, "Task 1");
+        assert_eq!(list[0].mode, "agent");
+        assert_eq!(list[1].task, "Task 2");
+        assert_eq!(list[1].mode, "browser");
     }
 }
