@@ -328,11 +328,35 @@ async fn handle_chat_message_streaming(
         })
         .unwrap_or_default();
 
+    // Extract local file references (from file picker)
+    let local_files: Vec<nevoflux_protocol::FileInfo> = payload
+        .get("payload")
+        .and_then(|p| p.get("local_files"))
+        .and_then(|f| f.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    let path = v.get("path")?.as_str()?.to_string();
+                    let is_directory = v.get("is_directory")?.as_bool()?;
+                    let size = v.get("size").and_then(|s| s.as_u64());
+                    let modified = v.get("modified").and_then(|m| m.as_u64());
+                    Some(nevoflux_protocol::FileInfo {
+                        path,
+                        is_directory,
+                        size,
+                        modified,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     debug!(
-        "Processing streaming chat message with mode={:?}, session={}, attachments={}",
+        "Processing streaming chat message with mode={:?}, session={}, attachments={}, local_files={}",
         mode,
         session_id,
-        attachments.len()
+        attachments.len(),
+        local_files.len()
     );
 
     // Ensure session exists and save user message
@@ -394,6 +418,7 @@ async fn handle_chat_message_streaming(
         user_message: message_content.to_string(),
         history: vec![], // TODO: Load history from session
         attachments,
+        local_files,
         custom_system_prompt: None, // Use default mode-based prompt
     };
 
@@ -641,11 +666,35 @@ async fn handle_chat_message(
                 })
                 .unwrap_or_default();
 
+            // Extract local file references (from file picker)
+            let local_files: Vec<nevoflux_protocol::FileInfo> = payload
+                .get("payload")
+                .and_then(|p| p.get("local_files"))
+                .and_then(|f| f.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| {
+                            let path = v.get("path")?.as_str()?.to_string();
+                            let is_directory = v.get("is_directory")?.as_bool()?;
+                            let size = v.get("size").and_then(|s| s.as_u64());
+                            let modified = v.get("modified").and_then(|m| m.as_u64());
+                            Some(nevoflux_protocol::FileInfo {
+                                path,
+                                is_directory,
+                                size,
+                                modified,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
             debug!(
-                "Processing chat message with mode={:?}, session={}, attachments={}",
+                "Processing chat message with mode={:?}, session={}, attachments={}, local_files={}",
                 mode,
                 session_id,
-                attachments.len()
+                attachments.len(),
+                local_files.len()
             );
 
             // Ensure session exists and save user message
@@ -703,6 +752,7 @@ async fn handle_chat_message(
                 user_message: message_content.to_string(),
                 history: vec![], // TODO: Load history from session
                 attachments,
+                local_files,
                 custom_system_prompt: None, // Use default mode-based prompt
             };
 

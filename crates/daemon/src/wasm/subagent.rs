@@ -434,6 +434,7 @@ impl SubagentExecutor {
             user_message: task,
             history: vec![],
             attachments: vec![],
+            local_files: vec![],
             custom_system_prompt: custom_prompt,
         };
 

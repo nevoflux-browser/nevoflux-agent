@@ -1876,6 +1876,7 @@ impl DaemonHostFunctions {
                 user_message: task_str.clone(),
                 history: vec![],
                 attachments: vec![],
+                local_files: vec![],
                 custom_system_prompt: Some(format!(
                     "You are a sub-agent executing a specific task.\n\
                      Task: {}\n\n\
