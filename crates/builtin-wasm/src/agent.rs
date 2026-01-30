@@ -8,6 +8,52 @@
 
 use crate::host::{HostFunctions, HostResult};
 use crate::types::*;
+use nevoflux_protocol::LocalFileRef;
+
+/// Format local file references for injection into user message.
+#[allow(dead_code)]
+fn format_local_files(files: &[LocalFileRef]) -> String {
+    if files.is_empty() {
+        return String::new();
+    }
+
+    let mut result = String::from("用户附加了以下本地文件/目录：\n");
+
+    for file in files {
+        let type_str = if file.is_directory { "目录" } else { "文件" };
+        let size_str = file
+            .size
+            .map(format_file_size)
+            .unwrap_or_default();
+
+        if file.is_directory {
+            result.push_str(&format!("- {} ({})\n", file.path, type_str));
+        } else {
+            result.push_str(&format!("- {} ({}, {})\n", file.path, type_str, size_str));
+        }
+    }
+
+    result.push_str("\n如需查看内容，请使用 read_file 或 list_directory 工具。\n\n");
+    result
+}
+
+/// Format file size in human-readable form.
+#[allow(dead_code)]
+fn format_file_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
 
 /// Maximum iterations in the agent loop to prevent infinite loops.
 const MAX_ITERATIONS: usize = 100;
@@ -1902,5 +1948,73 @@ mod tests {
         assert!(result.success);
         assert!(result.content.contains("Task 1"));
         assert!(result.content.contains("Task 2"));
+    }
+
+    #[test]
+    fn test_format_file_size() {
+        assert_eq!(format_file_size(500), "500 B");
+        assert_eq!(format_file_size(1024), "1.0 KB");
+        assert_eq!(format_file_size(1536), "1.5 KB");
+        assert_eq!(format_file_size(1048576), "1.0 MB");
+        assert_eq!(format_file_size(1073741824), "1.0 GB");
+    }
+
+    #[test]
+    fn test_format_local_files_empty() {
+        let result = format_local_files(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_local_files_single_file() {
+        use nevoflux_protocol::LocalFileRef;
+        let files = vec![LocalFileRef {
+            path: "/home/user/test.rs".into(),
+            is_directory: false,
+            size: Some(2048),
+            modified: None,
+        }];
+        let result = format_local_files(&files);
+        assert!(result.contains("/home/user/test.rs"));
+        assert!(result.contains("文件"));
+        assert!(result.contains("2.0 KB"));
+        assert!(result.contains("read_file"));
+    }
+
+    #[test]
+    fn test_format_local_files_directory() {
+        use nevoflux_protocol::LocalFileRef;
+        let files = vec![LocalFileRef {
+            path: "/home/user/project".into(),
+            is_directory: true,
+            size: None,
+            modified: None,
+        }];
+        let result = format_local_files(&files);
+        assert!(result.contains("/home/user/project"));
+        assert!(result.contains("目录"));
+        assert!(result.contains("list_directory"));
+    }
+
+    #[test]
+    fn test_format_local_files_mixed() {
+        use nevoflux_protocol::LocalFileRef;
+        let files = vec![
+            LocalFileRef {
+                path: "/home/user/main.rs".into(),
+                is_directory: false,
+                size: Some(1024),
+                modified: None,
+            },
+            LocalFileRef {
+                path: "/home/user/src".into(),
+                is_directory: true,
+                size: None,
+                modified: None,
+            },
+        ];
+        let result = format_local_files(&files);
+        assert!(result.contains("main.rs"));
+        assert!(result.contains("/home/user/src"));
     }
 }
