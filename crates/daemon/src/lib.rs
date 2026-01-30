@@ -27,6 +27,7 @@ pub mod config;
 pub mod config_watcher;
 pub mod context;
 pub mod error;
+pub mod file_picker;
 pub mod health;
 pub mod mcp_config;
 pub mod permission;
