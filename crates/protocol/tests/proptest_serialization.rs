@@ -3,8 +3,9 @@
 //! These tests verify that serialization round-trips work correctly for all protocol types.
 
 use nevoflux_protocol::{
-    AgentState, Channel, DaemonEnvelope, ErrorLevel, JsonRpcId, JsonRpcRequest, JsonRpcResponse,
-    PermissionScope, ProxyEnvelope,
+    AgentState, Channel, DaemonEnvelope, ErrorLevel, FileInfo, JsonRpcId, JsonRpcRequest,
+    JsonRpcResponse, PermissionScope, PickFilesError, PickFilesRequest, PickFilesResponse,
+    PickerMode, ProxyEnvelope,
 };
 use proptest::prelude::*;
 
@@ -116,6 +117,60 @@ fn arb_json_rpc_request() -> impl Strategy<Value = JsonRpcRequest> {
 fn arb_json_rpc_response_success() -> impl Strategy<Value = JsonRpcResponse> {
     (arb_json_rpc_id(), arb_non_null_json_value())
         .prop_map(|(id, result)| JsonRpcResponse::success(id, result))
+}
+
+fn arb_picker_mode() -> impl Strategy<Value = PickerMode> {
+    prop_oneof![
+        Just(PickerMode::Files),
+        Just(PickerMode::Directories),
+        Just(PickerMode::Both),
+    ]
+}
+
+fn arb_file_info() -> impl Strategy<Value = FileInfo> {
+    (
+        "/[a-z]{1,10}/[a-z]{1,10}\\.[a-z]{2,4}", // path
+        any::<bool>(),                            // is_directory
+        proptest::option::of(0u64..1000000u64),   // size
+        proptest::option::of(1700000000u64..1800000000u64), // modified
+    )
+        .prop_map(|(path, is_directory, size, modified)| FileInfo {
+            path,
+            is_directory,
+            size,
+            modified,
+        })
+}
+
+fn arb_pick_files_request() -> impl Strategy<Value = PickFilesRequest> {
+    (
+        arb_picker_mode(),
+        any::<bool>(),
+        proptest::option::of("[A-Za-z ]{1,20}"),
+        proptest::option::of("/[a-z]{1,10}"),
+    )
+        .prop_map(|(mode, multiple, title, default_path)| PickFilesRequest {
+            mode,
+            multiple,
+            title,
+            default_path,
+        })
+}
+
+fn arb_pick_files_response() -> impl Strategy<Value = PickFilesResponse> {
+    (
+        proptest::collection::vec(arb_file_info(), 0..5),
+        any::<bool>(),
+    )
+        .prop_map(|(files, cancelled)| PickFilesResponse { files, cancelled })
+}
+
+fn arb_pick_files_error() -> impl Strategy<Value = PickFilesError> {
+    prop_oneof![
+        "[a-z ]{1,20}".prop_map(PickFilesError::DialogFailed),
+        Just(PickFilesError::NoDisplay),
+        Just(PickFilesError::AlreadyPicking),
+    ]
 }
 
 proptest! {
@@ -242,6 +297,42 @@ proptest! {
         let json = serde_json::to_string(&from_msgpack).unwrap();
         let from_json: DaemonEnvelope = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(envelope, from_json);
+    }
+
+    // File picker serialization tests
+    #[test]
+    fn test_picker_mode_roundtrip(mode in arb_picker_mode()) {
+        let json = serde_json::to_string(&mode).unwrap();
+        let decoded: PickerMode = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(mode, decoded);
+    }
+
+    #[test]
+    fn test_file_info_roundtrip(info in arb_file_info()) {
+        let json = serde_json::to_string(&info).unwrap();
+        let decoded: FileInfo = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(info, decoded);
+    }
+
+    #[test]
+    fn test_pick_files_request_roundtrip(req in arb_pick_files_request()) {
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: PickFilesRequest = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(req, decoded);
+    }
+
+    #[test]
+    fn test_pick_files_response_roundtrip(resp in arb_pick_files_response()) {
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: PickFilesResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(resp, decoded);
+    }
+
+    #[test]
+    fn test_pick_files_error_roundtrip(err in arb_pick_files_error()) {
+        let json = serde_json::to_string(&err).unwrap();
+        let decoded: PickFilesError = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(err, decoded);
     }
 }
 
