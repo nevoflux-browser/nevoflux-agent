@@ -238,8 +238,9 @@ async fn run_proxy(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     use nevoflux_bridge::{parse_native_message, BridgeConfig, Proxy, ProxyConfig};
     use tokio::io::{stdin, stdout};
 
-    // Initialize logging to stderr (stdout is for Native Messaging)
-    logging::init_stderr_logging(verbose, Some("nevoflux=debug"));
+    // Initialize logging to file only (stdout/stderr must be silent for Native Messaging)
+    let log_file = get_data_dir().join("proxy.log");
+    logging::init_file_only_logging(log_file, verbose);
 
     tracing::debug!("Starting proxy mode");
 
@@ -252,6 +253,18 @@ async fn run_proxy(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     proxy.connect().await?;
 
     tracing::info!("Proxy connected to daemon");
+
+    // Send initial "connected" message to browser
+    let init_msg = serde_json::json!({
+        "type": "connected",
+        "payload": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "proxy_id": proxy.proxy_id()
+        }
+    });
+    if let Err(e) = proxy.write_native_message(&init_msg).await {
+        tracing::error!("Failed to send init message: {}", e);
+    }
 
     // Main event loop
     // Process messages from Native Messaging (browser) and forward to daemon.
@@ -340,11 +353,18 @@ async fn run_daemon(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Create session manager with database
+    let db_path = get_db_path();
+    let session_manager = std::sync::Arc::new(
+        nevoflux_daemon::SessionManager::new(db_path.to_str().unwrap_or("nevoflux.db"))
+            .expect("Failed to create session manager"),
+    );
+
     // Start server
     let config = nevoflux_daemon::ServerConfig::default();
     let router = std::sync::Arc::new(nevoflux_daemon::Router::new());
 
-    let server = nevoflux_daemon::start_server(config, router).await?;
+    let server = nevoflux_daemon::start_server(config, router, session_manager).await?;
     let port = server.port();
 
     // Write port/pid files
@@ -608,6 +628,10 @@ async fn main() {
             Commands::Completions { shell } => {
                 completions::generate_completions(shell);
                 return;
+            }
+            Commands::External(_) => {
+                // Firefox passes manifest path and extension ID as arguments
+                // Ignore them and continue to proxy mode (default behavior)
             }
         }
     }

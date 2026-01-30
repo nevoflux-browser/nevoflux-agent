@@ -1,7 +1,7 @@
 //! NevoFlux MCP - Model Context Protocol client
 //!
 //! This crate provides an MCP client implementation for connecting to MCP servers
-//! via stdio or SSE transport.
+//! via stdio or SSE transport. By default, it uses the official rmcp SDK.
 //!
 //! # Features
 //!
@@ -10,16 +10,21 @@
 //! - SSE transport for HTTP-based servers
 //! - Tool discovery and invocation
 //! - Resource listing and reading
+//! - Official rmcp SDK as default backend
+//!
+//! # Feature Flags
+//!
+//! - `legacy-backend`: Use the custom McpClient instead of the official rmcp SDK
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use nevoflux_mcp::{McpClient, StdioTransport};
+//! use nevoflux_mcp::{RmcpClient};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Connect to an MCP server
-//!     let client = McpClient::connect_stdio("npx", &["-y", "@anthropic/mcp-server-filesystem", "~"]).await?;
+//!     // Connect to an MCP server using official rmcp SDK
+//!     let client = RmcpClient::connect_stdio("npx", &["-y", "@anthropic/mcp-server-filesystem", "~"]).await?;
 //!
 //!     // List available tools
 //!     let tools = client.list_tools().await?;
@@ -31,27 +36,31 @@
 //! }
 //! ```
 
+pub mod backend;
 pub mod client;
 pub mod error;
 pub mod manager;
 pub mod registry;
+pub mod rmcp_adapter;
 pub mod search;
 pub mod server;
 pub mod tools;
 pub mod transport;
 pub mod types;
 
+pub use backend::McpClientBackend;
 pub use client::McpClient;
 pub use error::{McpError, Result};
 pub use manager::{ManagerConfig, McpManager, ServerStatus};
 pub use registry::{McpRegistry, ServerConfig, ServerResource, ServerTool};
+pub use rmcp_adapter::RmcpClient;
 pub use search::{Bm25Config, SearchResult, ToolSearchIndex};
 pub use server::{run_stdio_server, McpServer, McpServerConfig, PROTOCOL_VERSION};
 pub use tools::create_tools;
 pub use transport::{McpTransport, StdioTransport};
 pub use types::{
     JsonRpcError, JsonRpcRequest, JsonRpcResponse, Resource, ResourceContent, ServerCapabilities,
-    ServerInfo, ToolDefinition, ToolResult,
+    ServerInfo, ToolDefinition, ToolResult, ToolResultContent,
 };
 
 #[cfg(test)]

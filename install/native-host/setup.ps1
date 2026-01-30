@@ -1,6 +1,6 @@
 # Native Messaging Host Setup for NevoFlux Agent (Windows)
 param(
-    [string]$BinaryPath = "C:\Program Files\NevoFlux\nevoflux.exe",
+    [string]$BinaryPath = "C:\Program Files\NevoFlux\nevoflux-agent.exe",
     [string]$ExtensionId = "placeholder_extension_id"
 )
 

@@ -84,6 +84,39 @@ pub fn init_stderr_logging(verbose: bool, module_filter: Option<&str>) {
         .init();
 }
 
+/// Initialize logging to file only (no console/stderr output).
+///
+/// This is used for proxy mode where both stdout and stderr should be silent.
+/// Logs are written to the specified file path.
+///
+/// # Arguments
+///
+/// * `log_file` - Path to write logs to
+/// * `verbose` - If true, sets log level to debug; otherwise defaults to info
+pub fn init_file_only_logging(log_file: PathBuf, verbose: bool) {
+    let filter = if verbose {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+    };
+
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)
+    {
+        let file_layer = fmt::layer()
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false);
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(file_layer)
+            .init();
+    }
+    // If file creation fails, logging is silently disabled
+}
+
 /// Log a startup message with version information.
 ///
 /// # Arguments

@@ -5,9 +5,14 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARY_PATH="${1:-$(which nevoflux 2>/dev/null || echo "$SCRIPT_DIR/../../target/release/nevoflux")}"
-EXTENSION_ID="${2:-placeholder_extension_id}"
-BROWSER="${3:-chrome}"
+BINARY_PATH="${1:-$(which nevoflux-agent 2>/dev/null || echo "$SCRIPT_DIR/../../target/release/nevoflux-agent")}"
+EXTENSION_ID="${2:-agent@nevoflux.com}"
+BROWSER="${3:-firefox}"
+
+# Convert to absolute path
+if [[ "$BINARY_PATH" != /* ]]; then
+    BINARY_PATH="$(cd "$(dirname "$BINARY_PATH")" && pwd)/$(basename "$BINARY_PATH")"
+fi
 
 echo "NevoFlux Native Messaging Host Setup"
 echo "====================================="
@@ -46,11 +51,34 @@ fi
 
 mkdir -p "$HOST_DIR"
 
-# Generate manifest
+# Generate manifest based on browser type
 MANIFEST_FILE="$HOST_DIR/com.nevoflux.agent.json"
-sed -e "s|{{BINARY_PATH}}|$BINARY_PATH|g" \
-    -e "s|{{EXTENSION_ID}}|$EXTENSION_ID|g" \
-    "$SCRIPT_DIR/com.nevoflux.agent.json.template" > "$MANIFEST_FILE"
+
+if [[ "$BROWSER" == "firefox" ]]; then
+    # Firefox uses allowed_extensions
+    cat > "$MANIFEST_FILE" <<EOF
+{
+  "name": "com.nevoflux.agent",
+  "description": "NevoFlux Agent - AI-powered computer control",
+  "path": "$BINARY_PATH",
+  "type": "stdio",
+  "allowed_extensions": ["$EXTENSION_ID"]
+}
+EOF
+else
+    # Chrome/Chromium uses allowed_origins
+    cat > "$MANIFEST_FILE" <<EOF
+{
+  "name": "com.nevoflux.agent",
+  "description": "NevoFlux Agent - AI-powered computer control",
+  "path": "$BINARY_PATH",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://$EXTENSION_ID/"]
+}
+EOF
+fi
 
 echo "Installed: $MANIFEST_FILE"
+cat "$MANIFEST_FILE"
+echo ""
 echo "Done!"

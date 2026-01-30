@@ -19,4 +19,6 @@ pub mod providers;
 pub use rig;
 
 pub use error::{LlmError, Result};
-pub use factory::{default_model_for, ProviderConfig, ProviderType};
+pub use factory::{
+    api_key_env_var, default_model_for, gemini_models, ProviderConfig, ProviderType,
+};

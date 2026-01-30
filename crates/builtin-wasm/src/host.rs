@@ -310,6 +310,32 @@ pub trait HostFunctions {
     /// # Returns
     /// A list of sub-agent information.
     fn subagent_list(&self) -> HostResult<Vec<SubagentInfo>>;
+
+    // =========================================================================
+    // Streaming Functions
+    // =========================================================================
+
+    /// Emit a streaming chunk to the sidebar.
+    ///
+    /// This function sends incremental text content to the sidebar in real-time
+    /// as the LLM generates it. Use this within the agent loop when processing
+    /// streaming LLM responses.
+    ///
+    /// # Arguments
+    /// * `text` - The incremental text content to send
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    fn stream_emit(&self, text: &str) -> HostResult<()>;
+
+    /// Signal end of streaming.
+    ///
+    /// This function signals the sidebar that streaming has completed.
+    /// Call this after all chunks have been sent.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    fn stream_end(&self) -> HostResult<()>;
 }
 
 /// Mock host functions for testing.
@@ -714,6 +740,16 @@ impl HostFunctions for MockHostFunctions {
 
     fn subagent_list(&self) -> HostResult<Vec<SubagentInfo>> {
         Ok(self.subagents.borrow().clone())
+    }
+
+    fn stream_emit(&self, _text: &str) -> HostResult<()> {
+        // Mock: just accept the chunk
+        Ok(())
+    }
+
+    fn stream_end(&self) -> HostResult<()> {
+        // Mock: just accept the end signal
+        Ok(())
     }
 }
 

@@ -22,6 +22,14 @@ fn has_api_key(provider: ProviderType) -> Option<String> {
         ProviderType::Qwen => "DASHSCOPE_API_KEY",
         ProviderType::DeepSeek => "DEEPSEEK_API_KEY",
         ProviderType::OpenRouter => "OPENROUTER_API_KEY",
+        ProviderType::Gemini => "GEMINI_API_KEY",
+        ProviderType::Groq => "GROQ_API_KEY",
+        ProviderType::Ollama => "OLLAMA_API_KEY",
+        ProviderType::Mistral => "MISTRAL_API_KEY",
+        ProviderType::XAi => "XAI_API_KEY",
+        ProviderType::Cohere => "COHERE_API_KEY",
+        ProviderType::Perplexity => "PERPLEXITY_API_KEY",
+        ProviderType::Together => "TOGETHER_API_KEY",
     };
 
     std::env::var(env_var).ok().filter(|k| !k.is_empty())
@@ -38,6 +46,14 @@ mod provider_config_tests {
             ProviderType::Qwen,
             ProviderType::DeepSeek,
             ProviderType::OpenRouter,
+            ProviderType::Gemini,
+            ProviderType::Groq,
+            ProviderType::Ollama,
+            ProviderType::Mistral,
+            ProviderType::XAi,
+            ProviderType::Cohere,
+            ProviderType::Perplexity,
+            ProviderType::Together,
         ];
 
         for provider in providers {
@@ -76,6 +92,14 @@ mod provider_config_tests {
         let _ = ProviderType::Qwen;
         let _ = ProviderType::DeepSeek;
         let _ = ProviderType::OpenRouter;
+        let _ = ProviderType::Gemini;
+        let _ = ProviderType::Groq;
+        let _ = ProviderType::Ollama;
+        let _ = ProviderType::Mistral;
+        let _ = ProviderType::XAi;
+        let _ = ProviderType::Cohere;
+        let _ = ProviderType::Perplexity;
+        let _ = ProviderType::Together;
     }
 
     #[test]
@@ -179,6 +203,14 @@ mod api_key_availability_tests {
             (ProviderType::Qwen, "DASHSCOPE_API_KEY"),
             (ProviderType::DeepSeek, "DEEPSEEK_API_KEY"),
             (ProviderType::OpenRouter, "OPENROUTER_API_KEY"),
+            (ProviderType::Gemini, "GEMINI_API_KEY"),
+            (ProviderType::Groq, "GROQ_API_KEY"),
+            (ProviderType::Ollama, "OLLAMA_API_KEY"),
+            (ProviderType::Mistral, "MISTRAL_API_KEY"),
+            (ProviderType::XAi, "XAI_API_KEY"),
+            (ProviderType::Cohere, "COHERE_API_KEY"),
+            (ProviderType::Perplexity, "PERPLEXITY_API_KEY"),
+            (ProviderType::Together, "TOGETHER_API_KEY"),
         ];
 
         println!("Available LLM providers:");
@@ -273,6 +305,14 @@ mod multi_provider_tests {
             ProviderType::Anthropic,
             ProviderType::OpenAi,
             ProviderType::Qwen,
+            ProviderType::Gemini,
+            ProviderType::Groq,
+            ProviderType::Ollama,
+            ProviderType::Mistral,
+            ProviderType::XAi,
+            ProviderType::Cohere,
+            ProviderType::Perplexity,
+            ProviderType::Together,
         ];
 
         for provider in providers {

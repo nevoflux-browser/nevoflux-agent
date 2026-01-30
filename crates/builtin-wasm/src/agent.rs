@@ -140,14 +140,18 @@ impl<H: HostFunctions> Agent<H> {
                 break;
             }
 
-            // Call LLM
-            let request = LlmRequest {
-                messages: messages.clone(),
-                tools: tools.to_vec(),
-                stream: false,
+            // Use streaming or non-streaming LLM based on config
+            let response = if self.config.use_streaming && !self.config.suppress_streaming {
+                self.call_llm_streaming(&messages, tools)?
+            } else {
+                // Call LLM non-streaming
+                let request = LlmRequest {
+                    messages: messages.clone(),
+                    tools: tools.to_vec(),
+                    stream: false,
+                };
+                self.host.llm_chat(&request)?
             };
-
-            let response = self.host.llm_chat(&request)?;
 
             // If no tool calls, we're done
             if response.tool_calls.is_empty() {
@@ -175,10 +179,80 @@ impl<H: HostFunctions> Agent<H> {
             }
         }
 
+        // Signal end of stream if streaming was enabled
+        if self.config.use_streaming && !self.config.suppress_streaming {
+            let _ = self.host.stream_end();
+        }
+
         Ok(AgentOutput {
             text: final_text,
             tool_calls: all_tool_calls,
             continue_loop: false,
+        })
+    }
+
+    /// Call LLM with streaming support.
+    ///
+    /// This method starts a stream, emits chunks to the sidebar, and returns
+    /// the accumulated response.
+    fn call_llm_streaming(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+    ) -> HostResult<LlmResponse> {
+        let request = LlmRequest {
+            messages: messages.to_vec(),
+            tools: tools.to_vec(),
+            stream: true,
+        };
+
+        // Start the stream
+        let stream_id = self.host.llm_stream_start(&request)?;
+
+        let mut accumulated_text = String::new();
+        let mut accumulated_tool_calls: Vec<ToolCall> = Vec::new();
+
+        // Read chunks until done
+        loop {
+            // Check for interrupt
+            if self.host.is_interrupted()? {
+                self.host.llm_stream_close(stream_id)?;
+                break;
+            }
+
+            match self.host.llm_stream_next(stream_id)? {
+                Some(chunk) => {
+                    // Accumulate text
+                    if let Some(ref text) = chunk.text {
+                        if !text.is_empty() {
+                            accumulated_text.push_str(text);
+
+                            // Emit to sidebar
+                            self.host.stream_emit(text)?;
+                        }
+                    }
+
+                    // Accumulate tool calls
+                    accumulated_tool_calls.extend(chunk.tool_calls);
+
+                    if chunk.done {
+                        break;
+                    }
+                }
+                None => {
+                    // No more chunks available, wait a bit and try again
+                    // In WASM context, we might need to yield
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+
+        // Close the stream
+        self.host.llm_stream_close(stream_id)?;
+
+        Ok(LlmResponse {
+            text: accumulated_text,
+            tool_calls: accumulated_tool_calls,
         })
     }
 
@@ -1293,7 +1367,13 @@ mod tests {
             tool_calls: vec![],
         });
 
-        let agent = Agent::new(mock);
+        // Use non-streaming config since mock doesn't support streaming responses
+        let config = AgentConfig {
+            max_iterations: 100,
+            use_streaming: false,
+            suppress_streaming: false,
+        };
+        let agent = Agent::with_config(mock, config);
         let input = AgentInput {
             session_id: "sess-001".into(),
             mode: AgentMode::Chat,

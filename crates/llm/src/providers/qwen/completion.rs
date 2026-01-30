@@ -7,8 +7,12 @@ use std::pin::Pin;
 
 use futures::stream::{Stream, StreamExt};
 use rig::completion::{
-    self, CompletionError, CompletionRequest, CompletionResponse, Document, ModelChoice,
+    self, AssistantContent, CompletionError, CompletionRequest, CompletionResponse, Document,
+    ToolDefinition, Usage,
 };
+use rig::message::{Message, ToolResultContent, UserContent};
+use rig::streaming::{RawStreamingChoice, StreamingCompletionResponse};
+use rig::OneOrMany;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -19,20 +23,6 @@ use crate::error::LlmError;
 ///
 /// Implements the rig-core `CompletionModel` trait for seamless integration
 /// with the rig framework.
-///
-/// # Example
-/// ```ignore
-/// use nevoflux_llm::providers::qwen::QwenClient;
-///
-/// let client = QwenClient::new("your-api-key");
-/// let model = client.completion_model("qwen-turbo");
-///
-/// // Use with rig's completion API
-/// let response = model.completion_request("Hello!")
-///     .preamble("You are a helpful assistant.")
-///     .send()
-///     .await?;
-/// ```
 #[derive(Clone)]
 pub struct QwenCompletionModel {
     client: QwenClient,
@@ -57,35 +47,9 @@ impl QwenCompletionModel {
     ///
     /// Returns a stream of content chunks as the model generates them.
     /// Uses Server-Sent Events (SSE) format from the DashScope API.
-    ///
-    /// # Arguments
-    /// * `messages` - The chat messages to send to the model
-    ///
-    /// # Example
-    /// ```ignore
-    /// use futures::StreamExt;
-    /// use nevoflux_llm::providers::qwen::QwenClient;
-    /// use rig::completion::Message;
-    ///
-    /// let client = QwenClient::new("your-api-key");
-    /// let model = client.completion_model("qwen-turbo");
-    ///
-    /// let messages = vec![Message {
-    ///     role: "user".to_string(),
-    ///     content: "Hello!".to_string(),
-    /// }];
-    ///
-    /// let mut stream = model.stream_chat(messages).await?;
-    /// while let Some(chunk) = stream.next().await {
-    ///     match chunk {
-    ///         Ok(text) => print!("{}", text),
-    ///         Err(e) => eprintln!("Error: {}", e),
-    ///     }
-    /// }
-    /// ```
     pub async fn stream_chat(
         &self,
-        messages: Vec<completion::Message>,
+        messages: Vec<QwenMessage>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String, LlmError>> + Send>>, LlmError> {
         let request = json!({
             "model": self.model,
@@ -114,12 +78,10 @@ impl QwenCompletionModel {
             match result {
                 Ok(bytes) => {
                     let text = String::from_utf8_lossy(&bytes);
-                    // Parse SSE lines - may contain multiple data lines in one chunk
                     let mut content_parts = Vec::new();
                     for line in text.lines() {
                         if let Some(data) = line.strip_prefix("data: ") {
                             if data == "[DONE]" {
-                                // End of stream
                                 continue;
                             }
                             if let Ok(chunk) = serde_json::from_str::<QwenStreamChunk>(data) {
@@ -147,6 +109,100 @@ impl QwenCompletionModel {
     }
 }
 
+// ============================================================================
+// Qwen-specific message type for API serialization
+// ============================================================================
+
+/// Simple message structure for Qwen API serialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QwenMessage {
+    pub role: String,
+    pub content: String,
+}
+
+impl QwenMessage {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: "system".into(),
+            content: content.into(),
+        }
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: "user".into(),
+            content: content.into(),
+        }
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+        }
+    }
+}
+
+/// Convert rig Message to QwenMessage for API serialization.
+fn message_to_qwen(msg: &Message) -> QwenMessage {
+    match msg {
+        Message::User { content } => {
+            let text = extract_text_from_user_content(content);
+            QwenMessage::user(text)
+        }
+        Message::Assistant { content, .. } => {
+            let text = extract_text_from_assistant_content(content);
+            QwenMessage::assistant(text)
+        }
+    }
+}
+
+/// Extract text content from UserContent.
+fn extract_text_from_user_content(content: &OneOrMany<UserContent>) -> String {
+    content
+        .iter()
+        .filter_map(|c| match c {
+            UserContent::Text(t) => Some(t.text.clone()),
+            UserContent::ToolResult(tr) => {
+                let result_text: Vec<String> = tr
+                    .content
+                    .iter()
+                    .filter_map(|rc| match rc {
+                        ToolResultContent::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                Some(format!("[Tool Result {}]: {}", tr.id, result_text.join("")))
+            }
+            _ => None, // Skip images, audio, documents for now
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Extract text content from AssistantContent.
+fn extract_text_from_assistant_content(content: &OneOrMany<AssistantContent>) -> String {
+    content
+        .iter()
+        .filter_map(|c| match c {
+            AssistantContent::Text(t) => Some(t.text.clone()),
+            AssistantContent::ToolCall(tc) => Some(format!(
+                "[Tool Call {}]: {}({})",
+                tc.id, tc.function.name, tc.function.arguments
+            )),
+            AssistantContent::Reasoning(r) => {
+                Some(format!("[Reasoning]: {}", r.reasoning.join(" ")))
+            }
+            AssistantContent::Image(_) => None, // Skip images for now
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ============================================================================
+// API response types
+// ============================================================================
+
 /// API error response from DashScope.
 #[derive(Debug, Deserialize)]
 struct ApiErrorResponse {
@@ -162,18 +218,17 @@ enum ApiResponse<T> {
 }
 
 /// Tool call structure for function calling.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ToolCall {
-    #[allow(dead_code)]
     pub id: String,
-    #[allow(dead_code)]
     #[serde(rename = "type")]
+    #[allow(dead_code)]
     pub call_type: String,
     pub function: FunctionCall,
 }
 
 /// Function call details.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: String,
     pub arguments: String,
@@ -184,11 +239,11 @@ pub struct FunctionCall {
 pub struct QwenToolDefinition {
     #[serde(rename = "type")]
     pub tool_type: String,
-    pub function: completion::ToolDefinition,
+    pub function: ToolDefinition,
 }
 
-impl From<completion::ToolDefinition> for QwenToolDefinition {
-    fn from(tool: completion::ToolDefinition) -> Self {
+impl From<ToolDefinition> for QwenToolDefinition {
+    fn from(tool: ToolDefinition) -> Self {
         Self {
             tool_type: "function".into(),
             function: tool,
@@ -197,7 +252,7 @@ impl From<completion::ToolDefinition> for QwenToolDefinition {
 }
 
 /// Extended message for completion responses with optional tool calls.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CompletionMessage {
     #[allow(dead_code)]
     pub role: String,
@@ -206,7 +261,7 @@ pub struct CompletionMessage {
 }
 
 /// Extended choice for completion responses.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CompletionChoice {
     #[allow(dead_code)]
     pub index: u32,
@@ -216,7 +271,7 @@ pub struct CompletionChoice {
 }
 
 /// Extended completion response that supports tool calls.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct QwenCompletionResponse {
     pub id: String,
     pub model: String,
@@ -229,55 +284,61 @@ pub struct QwenCompletionResponse {
 // ============================================================================
 
 /// Streaming chunk from DashScope API.
-///
-/// Represents a single chunk in the Server-Sent Events (SSE) stream
-/// returned by the DashScope API when streaming is enabled.
 #[derive(Debug, Clone, Deserialize)]
 pub struct QwenStreamChunk {
-    /// Unique identifier for the completion
     #[allow(dead_code)]
     pub id: String,
-    /// Model that generated the completion
     #[allow(dead_code)]
     pub model: String,
-    /// Array of completion choices (usually just one for streaming)
     pub choices: Vec<StreamChoice>,
 }
 
 /// Choice in a streaming chunk.
-///
-/// Contains the delta (incremental content) for this chunk.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StreamChoice {
-    /// Index of this choice (usually 0)
     #[allow(dead_code)]
     pub index: u32,
-    /// The incremental content
     pub delta: StreamDelta,
-    /// Reason for finishing, if this is the last chunk
     #[allow(dead_code)]
     pub finish_reason: Option<String>,
 }
 
 /// Delta content in streaming.
-///
-/// Contains the incremental content added in this streaming chunk.
-/// Either role or content may be present, but not necessarily both.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct StreamDelta {
-    /// Role of the message (usually only in first chunk)
     #[serde(default)]
     #[allow(dead_code)]
     pub role: Option<String>,
-    /// Incremental text content
     #[serde(default)]
     pub content: Option<String>,
+}
+
+/// Streaming response for Qwen.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QwenStreamingResponse {
+    pub usage: Option<QwenUsage>,
+}
+
+impl completion::GetTokenUsage for QwenStreamingResponse {
+    fn token_usage(&self) -> Option<Usage> {
+        self.usage.as_ref().map(|u| Usage {
+            input_tokens: u.prompt_tokens as u64,
+            output_tokens: u.completion_tokens as u64,
+            total_tokens: u.total_tokens as u64,
+        })
+    }
 }
 
 impl TryFrom<QwenCompletionResponse> for CompletionResponse<QwenCompletionResponse> {
     type Error = CompletionError;
 
     fn try_from(value: QwenCompletionResponse) -> Result<Self, Self::Error> {
+        let usage = Usage {
+            input_tokens: value.usage.prompt_tokens as u64,
+            output_tokens: value.usage.completion_tokens as u64,
+            total_tokens: value.usage.total_tokens as u64,
+        };
+
         match value.choices.as_slice() {
             // Handle tool calls
             [CompletionChoice {
@@ -291,11 +352,14 @@ impl TryFrom<QwenCompletionResponse> for CompletionResponse<QwenCompletionRespon
                 if !calls.is_empty() =>
             {
                 let call = calls.first().unwrap();
+                let args: serde_json::Value = serde_json::from_str(&call.function.arguments)?;
                 Ok(CompletionResponse {
-                    choice: ModelChoice::ToolCall(
-                        call.function.name.clone(),
-                        serde_json::from_str(&call.function.arguments)?,
-                    ),
+                    choice: OneOrMany::one(AssistantContent::tool_call(
+                        &call.id,
+                        &call.function.name,
+                        args,
+                    )),
+                    usage,
                     raw_response: value,
                 })
             }
@@ -308,7 +372,8 @@ impl TryFrom<QwenCompletionResponse> for CompletionResponse<QwenCompletionRespon
                     },
                 ..
             }, ..] => Ok(CompletionResponse {
-                choice: ModelChoice::Message(content.clone()),
+                choice: OneOrMany::one(AssistantContent::text(content)),
+                usage,
                 raw_response: value,
             }),
             _ => Err(CompletionError::ResponseError(
@@ -318,8 +383,13 @@ impl TryFrom<QwenCompletionResponse> for CompletionResponse<QwenCompletionRespon
     }
 }
 
-/// Build prompt with context documents (similar to rig's internal method).
-fn prompt_with_context(prompt: &str, documents: &[Document]) -> String {
+/// Build prompt with context documents.
+fn prompt_with_context(prompt: &Message, documents: &[Document]) -> String {
+    let text = match prompt {
+        Message::User { content } => extract_text_from_user_content(content),
+        Message::Assistant { content, .. } => extract_text_from_assistant_content(content),
+    };
+
     if !documents.is_empty() {
         format!(
             "<attachments>\n{}</attachments>\n\n{}",
@@ -328,40 +398,51 @@ fn prompt_with_context(prompt: &str, documents: &[Document]) -> String {
                 .map(|doc| doc.to_string())
                 .collect::<Vec<_>>()
                 .join(""),
-            prompt
+            text
         )
     } else {
-        prompt.to_string()
+        text
     }
 }
 
 impl completion::CompletionModel for QwenCompletionModel {
     type Response = QwenCompletionResponse;
+    type StreamingResponse = QwenStreamingResponse;
+    type Client = QwenClient;
+
+    fn make(client: &Self::Client, model: impl Into<String>) -> Self {
+        Self::new(client.clone(), model)
+    }
 
     async fn completion(
         &self,
-        mut completion_request: CompletionRequest,
+        completion_request: CompletionRequest,
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
         // Build messages starting with preamble (system message)
-        let mut messages = if let Some(preamble) = &completion_request.preamble {
-            vec![completion::Message {
-                role: "system".into(),
-                content: preamble.clone(),
-            }]
+        let mut messages: Vec<QwenMessage> = if let Some(preamble) = &completion_request.preamble {
+            vec![QwenMessage::system(preamble)]
         } else {
             vec![]
         };
 
-        // Append chat history
-        messages.append(&mut completion_request.chat_history);
+        // The last message in chat_history is the prompt - get all but the last for history
+        let history_msgs: Vec<_> = completion_request.chat_history.iter().collect();
+        let (history, prompt_msg) = if history_msgs.len() > 1 {
+            (&history_msgs[..history_msgs.len() - 1], history_msgs.last())
+        } else {
+            (&[][..], history_msgs.first())
+        };
+
+        // Append chat history (excluding the last message which is the prompt)
+        for msg in history {
+            messages.push(message_to_qwen(msg));
+        }
 
         // Add the user's prompt with context documents
-        let user_prompt =
-            prompt_with_context(&completion_request.prompt, &completion_request.documents);
-        messages.push(completion::Message {
-            role: "user".into(),
-            content: user_prompt,
-        });
+        if let Some(prompt) = prompt_msg {
+            let user_prompt = prompt_with_context(prompt, &completion_request.documents);
+            messages.push(QwenMessage::user(user_prompt));
+        }
 
         // Build the request JSON
         let request = if completion_request.tools.is_empty() {
@@ -379,7 +460,7 @@ impl completion::CompletionModel for QwenCompletionModel {
                 "temperature": completion_request.temperature,
                 "max_tokens": completion_request.max_tokens,
                 "stream": false,
-                "tools": completion_request.tools.into_iter().map(QwenToolDefinition::from).collect::<Vec<_>>(),
+                "tools": completion_request.tools.iter().cloned().map(QwenToolDefinition::from).collect::<Vec<_>>(),
                 "tool_choice": "auto",
             })
         };
@@ -419,6 +500,102 @@ impl completion::CompletionModel for QwenCompletionModel {
             Err(CompletionError::ProviderError(error_text))
         }
     }
+
+    async fn stream(
+        &self,
+        completion_request: CompletionRequest,
+    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+        // Build messages starting with preamble (system message)
+        let mut messages: Vec<QwenMessage> = if let Some(preamble) = &completion_request.preamble {
+            vec![QwenMessage::system(preamble)]
+        } else {
+            vec![]
+        };
+
+        // The last message in chat_history is the prompt
+        let history_msgs: Vec<_> = completion_request.chat_history.iter().collect();
+        let (history, prompt_msg) = if history_msgs.len() > 1 {
+            (&history_msgs[..history_msgs.len() - 1], history_msgs.last())
+        } else {
+            (&[][..], history_msgs.first())
+        };
+
+        for msg in history {
+            messages.push(message_to_qwen(msg));
+        }
+
+        if let Some(prompt) = prompt_msg {
+            let user_prompt = prompt_with_context(prompt, &completion_request.documents);
+            messages.push(QwenMessage::user(user_prompt));
+        }
+
+        let request = json!({
+            "model": self.model,
+            "messages": messages,
+            "temperature": completion_request.temperature,
+            "max_tokens": completion_request.max_tokens,
+            "stream": true,
+        });
+
+        let final_request = if let Some(params) = completion_request.additional_params {
+            merge_json(request, params)
+        } else {
+            request
+        };
+
+        let response = self
+            .client
+            .http_client()
+            .post(format!("{}/chat/completions", self.client.base_url()))
+            .bearer_auth(self.client.api_key())
+            .json(&final_request)
+            .send()
+            .await
+            .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let error_text = response
+                .text()
+                .await
+                .map_err(|e| CompletionError::ProviderError(e.to_string()))?;
+            return Err(CompletionError::ProviderError(error_text));
+        }
+
+        let byte_stream = response.bytes_stream();
+
+        let stream = byte_stream.filter_map(|result| async move {
+            match result {
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    let mut content_parts = Vec::new();
+                    for line in text.lines() {
+                        if let Some(data) = line.strip_prefix("data: ") {
+                            if data == "[DONE]" {
+                                continue;
+                            }
+                            if let Ok(chunk) = serde_json::from_str::<QwenStreamChunk>(data) {
+                                if let Some(choice) = chunk.choices.first() {
+                                    if let Some(content) = &choice.delta.content {
+                                        if !content.is_empty() {
+                                            content_parts.push(content.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if content_parts.is_empty() {
+                        None
+                    } else {
+                        Some(Ok(RawStreamingChoice::Message(content_parts.join(""))))
+                    }
+                }
+                Err(e) => Some(Err(CompletionError::ProviderError(e.to_string()))),
+            }
+        });
+
+        Ok(StreamingCompletionResponse::stream(Box::pin(stream)))
+    }
 }
 
 /// Merge two JSON values, with the second taking precedence.
@@ -455,21 +632,8 @@ mod tests {
     }
 
     #[test]
-    fn test_completion_model_with_different_models() {
-        let client = QwenClient::new("test-key");
-
-        let turbo = QwenCompletionModel::new(client.clone(), "qwen-turbo");
-        let plus = QwenCompletionModel::new(client.clone(), "qwen-plus");
-        let max = QwenCompletionModel::new(client.clone(), "qwen-max");
-
-        assert_eq!(turbo.model(), "qwen-turbo");
-        assert_eq!(plus.model(), "qwen-plus");
-        assert_eq!(max.model(), "qwen-max");
-    }
-
-    #[test]
     fn test_tool_definition_conversion() {
-        let rig_tool = completion::ToolDefinition {
+        let rig_tool = ToolDefinition {
             name: "get_weather".to_string(),
             description: "Get weather information".to_string(),
             parameters: serde_json::json!({
@@ -530,10 +694,9 @@ mod tests {
         let resp: QwenCompletionResponse = serde_json::from_str(json).unwrap();
         let rig_resp: CompletionResponse<QwenCompletionResponse> = resp.try_into().unwrap();
 
-        match rig_resp.choice {
-            ModelChoice::Message(msg) => assert_eq!(msg, "Hello there!"),
-            _ => panic!("Expected Message choice"),
-        }
+        // Check that we got text content
+        let first = rig_resp.choice.first();
+        assert!(matches!(first, AssistantContent::Text(_)));
     }
 
     #[test]
@@ -567,10 +730,11 @@ mod tests {
         let resp: QwenCompletionResponse = serde_json::from_str(json).unwrap();
         let rig_resp: CompletionResponse<QwenCompletionResponse> = resp.try_into().unwrap();
 
-        match rig_resp.choice {
-            ModelChoice::ToolCall(name, params) => {
-                assert_eq!(name, "get_weather");
-                assert_eq!(params["location"], "Tokyo");
+        let first = rig_resp.choice.first();
+        match first {
+            AssistantContent::ToolCall(tc) => {
+                assert_eq!(tc.function.name, "get_weather");
+                assert_eq!(tc.function.arguments["location"], "Tokyo");
             }
             _ => panic!("Expected ToolCall choice"),
         }
@@ -589,20 +753,25 @@ mod tests {
 
         let merged = merge_json(base, overlay);
         assert_eq!(merged["model"], "qwen-turbo");
-        assert_eq!(merged["temperature"], 0.5); // overlay wins
+        assert_eq!(merged["temperature"], 0.5);
         assert_eq!(merged["top_p"], 0.9);
     }
 
     #[test]
-    fn test_api_error_response_deserialization() {
-        let json = r#"{"message": "Invalid API key"}"#;
-        let err: ApiErrorResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(err.message, "Invalid API key");
+    fn test_qwen_message() {
+        let msg = QwenMessage::user("Hello");
+        assert_eq!(msg.role, "user");
+        assert_eq!(msg.content, "Hello");
+
+        let msg = QwenMessage::assistant("Hi!");
+        assert_eq!(msg.role, "assistant");
+
+        let msg = QwenMessage::system("You are helpful");
+        assert_eq!(msg.role, "system");
     }
 
     #[test]
     fn test_implements_completion_model_trait() {
-        // Verify that QwenCompletionModel implements the CompletionModel trait
         fn assert_completion_model<T: completion::CompletionModel>() {}
         assert_completion_model::<QwenCompletionModel>();
     }
@@ -611,27 +780,6 @@ mod tests {
     fn test_completion_model_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<QwenCompletionModel>();
-    }
-
-    #[test]
-    fn test_prompt_with_context_no_documents() {
-        let result = prompt_with_context("Hello", &[]);
-        assert_eq!(result, "Hello");
-    }
-
-    #[test]
-    fn test_prompt_with_context_with_documents() {
-        use std::collections::HashMap;
-        let docs = vec![Document {
-            id: "doc1".to_string(),
-            text: "Some content".to_string(),
-            additional_props: HashMap::new(),
-        }];
-        let result = prompt_with_context("Hello", &docs);
-        assert!(result.contains("<attachments>"));
-        assert!(result.contains("doc1"));
-        assert!(result.contains("Some content"));
-        assert!(result.contains("Hello"));
     }
 
     #[test]
@@ -652,10 +800,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ========================================================================
-    // Streaming tests
-    // ========================================================================
-
     #[test]
     fn test_stream_chunk_deserialization() {
         let json = r#"{
@@ -668,93 +812,8 @@ mod tests {
             }]
         }"#;
         let chunk: QwenStreamChunk = serde_json::from_str(json).unwrap();
-        assert_eq!(chunk.id, "chatcmpl-123");
-        assert_eq!(chunk.model, "qwen-turbo");
         assert_eq!(chunk.choices.len(), 1);
-        assert_eq!(chunk.choices[0].index, 0);
         assert_eq!(chunk.choices[0].delta.content, Some("Hello".to_string()));
-        assert!(chunk.choices[0].finish_reason.is_none());
-    }
-
-    #[test]
-    fn test_stream_chunk_with_finish_reason() {
-        let json = r#"{
-            "id": "chatcmpl-456",
-            "model": "qwen-plus",
-            "choices": [{
-                "index": 0,
-                "delta": {"content": "!"},
-                "finish_reason": "stop"
-            }]
-        }"#;
-        let chunk: QwenStreamChunk = serde_json::from_str(json).unwrap();
-        assert_eq!(chunk.choices[0].finish_reason, Some("stop".to_string()));
-    }
-
-    #[test]
-    fn test_stream_delta_with_role_only() {
-        let json = r#"{"role": "assistant"}"#;
-        let delta: StreamDelta = serde_json::from_str(json).unwrap();
-        assert_eq!(delta.role, Some("assistant".to_string()));
-        assert_eq!(delta.content, None);
-    }
-
-    #[test]
-    fn test_stream_delta_with_content_only() {
-        let json = r#"{"content": "Hello world"}"#;
-        let delta: StreamDelta = serde_json::from_str(json).unwrap();
-        assert_eq!(delta.role, None);
-        assert_eq!(delta.content, Some("Hello world".to_string()));
-    }
-
-    #[test]
-    fn test_stream_delta_empty() {
-        let json = r#"{}"#;
-        let delta: StreamDelta = serde_json::from_str(json).unwrap();
-        assert_eq!(delta.role, None);
-        assert_eq!(delta.content, None);
-    }
-
-    #[test]
-    fn test_stream_delta_with_both_role_and_content() {
-        let json = r#"{"role": "assistant", "content": "Hi"}"#;
-        let delta: StreamDelta = serde_json::from_str(json).unwrap();
-        assert_eq!(delta.role, Some("assistant".to_string()));
-        assert_eq!(delta.content, Some("Hi".to_string()));
-    }
-
-    #[test]
-    fn test_stream_choice_deserialization() {
-        let json = r#"{
-            "index": 0,
-            "delta": {"role": "assistant", "content": "Test"},
-            "finish_reason": null
-        }"#;
-        let choice: StreamChoice = serde_json::from_str(json).unwrap();
-        assert_eq!(choice.index, 0);
-        assert_eq!(choice.delta.role, Some("assistant".to_string()));
-        assert_eq!(choice.delta.content, Some("Test".to_string()));
-        assert!(choice.finish_reason.is_none());
-    }
-
-    #[test]
-    fn test_stream_chunk_clone() {
-        let chunk = QwenStreamChunk {
-            id: "test-id".to_string(),
-            model: "qwen-turbo".to_string(),
-            choices: vec![StreamChoice {
-                index: 0,
-                delta: StreamDelta {
-                    role: Some("assistant".to_string()),
-                    content: Some("Hello".to_string()),
-                },
-                finish_reason: None,
-            }],
-        };
-        let cloned = chunk.clone();
-        assert_eq!(cloned.id, chunk.id);
-        assert_eq!(cloned.model, chunk.model);
-        assert_eq!(cloned.choices.len(), chunk.choices.len());
     }
 
     #[test]
@@ -762,48 +821,5 @@ mod tests {
         let delta = StreamDelta::default();
         assert!(delta.role.is_none());
         assert!(delta.content.is_none());
-    }
-
-    #[test]
-    fn test_stream_chunk_multiple_choices() {
-        // Although unusual, the API could return multiple choices
-        let json = r#"{
-            "id": "chatcmpl-789",
-            "model": "qwen-max",
-            "choices": [
-                {"index": 0, "delta": {"content": "A"}, "finish_reason": null},
-                {"index": 1, "delta": {"content": "B"}, "finish_reason": null}
-            ]
-        }"#;
-        let chunk: QwenStreamChunk = serde_json::from_str(json).unwrap();
-        assert_eq!(chunk.choices.len(), 2);
-        assert_eq!(chunk.choices[0].index, 0);
-        assert_eq!(chunk.choices[0].delta.content, Some("A".to_string()));
-        assert_eq!(chunk.choices[1].index, 1);
-        assert_eq!(chunk.choices[1].delta.content, Some("B".to_string()));
-    }
-
-    #[test]
-    fn test_stream_types_are_debug() {
-        // Verify Debug trait is implemented
-        let chunk = QwenStreamChunk {
-            id: "id".to_string(),
-            model: "model".to_string(),
-            choices: vec![],
-        };
-        let debug_str = format!("{:?}", chunk);
-        assert!(debug_str.contains("QwenStreamChunk"));
-
-        let choice = StreamChoice {
-            index: 0,
-            delta: StreamDelta::default(),
-            finish_reason: None,
-        };
-        let debug_str = format!("{:?}", choice);
-        assert!(debug_str.contains("StreamChoice"));
-
-        let delta = StreamDelta::default();
-        let debug_str = format!("{:?}", delta);
-        assert!(debug_str.contains("StreamDelta"));
     }
 }

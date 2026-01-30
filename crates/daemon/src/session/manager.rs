@@ -3,8 +3,8 @@
 use crate::config::SessionConfig;
 use crate::error::{DaemonError, Result};
 use nevoflux_storage::{
-    CreateMessageParams, CreateSessionParams, ListMessagesParams, ListSessionsParams, Message,
-    MessageRole, Session, SessionMode, Storage, UpdateSessionParams,
+    ContentType, CreateMessageParams, CreateSessionParams, ListMessagesParams, ListSessionsParams,
+    Message, MessageRole, Session, SessionMode, Storage, UpdateSessionParams,
 };
 use std::sync::Arc;
 
@@ -161,6 +161,42 @@ impl SessionManager {
         Ok(message)
     }
 
+    /// Add a tool use message to a session.
+    ///
+    /// Stores tool call details (id, name, arguments, result) in metadata.
+    pub async fn add_tool_use_message(
+        &self,
+        session_id: &str,
+        tool_id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        result: Option<&str>,
+    ) -> Result<Message> {
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("tool_id".to_string(), serde_json::json!(tool_id));
+        metadata.insert("tool_name".to_string(), serde_json::json!(tool_name));
+        metadata.insert("arguments".to_string(), arguments.clone());
+
+        if let Some(r) = result {
+            metadata.insert("result".to_string(), serde_json::json!(r));
+        }
+
+        // Content is a summary for display
+        let content = format!(
+            "{}({})",
+            tool_name,
+            serde_json::to_string(arguments).unwrap_or_default()
+        );
+
+        let params = CreateMessageParams::new(session_id, MessageRole::Assistant, &content)
+            .with_content_type(ContentType::ToolUse)
+            .with_metadata(metadata);
+
+        let message = self.storage.messages().create(params)?;
+        self.touch_session(session_id).await.ok();
+        Ok(message)
+    }
+
     /// Get messages for a session.
     pub async fn get_messages(&self, session_id: &str) -> Result<Vec<Message>> {
         let params = ListMessagesParams::new(session_id);
@@ -209,7 +245,15 @@ impl SessionManager {
     }
 
     /// Generate a title from the first message.
+    /// Returns None if session already has a title or if there are no messages.
     pub async fn generate_title(&self, session_id: &str) -> Result<Option<String>> {
+        // Check if session already has a title
+        if let Ok(Some(session)) = self.get_session(session_id).await {
+            if session.title.is_some() {
+                return Ok(None);
+            }
+        }
+
         let messages = self.get_recent_messages(session_id, 1).await?;
 
         if let Some(first_message) = messages.first() {
@@ -396,5 +440,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(manager.get_message_count(&session.id).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_session_manager_add_tool_use_message() {
+        let manager = SessionManager::in_memory().unwrap();
+        let session = manager.create_session(None, None).await.unwrap();
+
+        let msg = manager
+            .add_tool_use_message(
+                &session.id,
+                "call-001",
+                "read_file",
+                &serde_json::json!({"path": "/tmp/test.txt"}),
+                Some("file contents"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(msg.session_id, session.id);
+        assert_eq!(msg.role, MessageRole::Assistant);
+        assert_eq!(msg.content_type, ContentType::ToolUse);
+
+        let metadata = msg.metadata.unwrap();
+        assert_eq!(metadata["tool_id"], "call-001");
+        assert_eq!(metadata["tool_name"], "read_file");
+        assert_eq!(metadata["result"], "file contents");
     }
 }

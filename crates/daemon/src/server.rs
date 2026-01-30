@@ -1,13 +1,13 @@
 //! ZeroMQ ROUTER server for the daemon.
 
-use crate::agent_host::DaemonHostFunctions;
+use crate::agent_host::{DaemonHostFunctions, SidebarStreamChunk};
 use crate::config::AgentConfig;
 use crate::error::{DaemonError, Result};
 use crate::router::{RouteDecision, Router};
 use crate::session::SessionManager;
 use bytes::Bytes;
 use nevoflux_builtin_wasm::{Agent, AgentInput, AgentMode, Attachment};
-use nevoflux_protocol::{DaemonEnvelope, ProxyEnvelope};
+use nevoflux_protocol::{Channel, DaemonEnvelope, ProxyEnvelope};
 use nevoflux_storage::{ListSessionsParams, MessageRole};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -177,38 +177,45 @@ pub async fn start_server(
             debug!("Route decision for {}: {:?}", proxy_id, decision);
 
             // Process based on route decision
-            let response_payload = match decision {
+            match decision {
                 RouteDecision::RejectUnregistered => {
-                    serde_json::json!({
+                    let response_payload = serde_json::json!({
                         "type": "error",
                         "payload": {
                             "code": "UNREGISTERED",
                             "message": "Proxy not registered"
                         }
-                    })
+                    });
+                    let response = DaemonEnvelope::new(&proxy_id, channel, response_payload)
+                        .with_request_id(&request_id);
+                    if let Err(e) = process_response_tx.send((identity, response)).await {
+                        error!("Failed to queue response: {}", e);
+                    }
                 }
                 RouteDecision::ProcessChat { .. } => {
-                    // Handle chat messages via Agent
-                    handle_chat_message(
+                    // Handle chat messages via Agent with streaming support
+                    handle_chat_message_streaming(
                         &envelope.payload,
                         &process_config,
                         &process_session_manager,
                         process_runtime.clone(),
+                        identity,
+                        proxy_id,
+                        request_id,
+                        channel,
+                        process_response_tx.clone(),
                     )
-                    .await
+                    .await;
                 }
                 RouteDecision::ProcessMcp { .. } => {
                     // Handle MCP messages
-                    handle_mcp_message(&envelope.payload).await
+                    let response_payload = handle_mcp_message(&envelope.payload).await;
+                    let response = DaemonEnvelope::new(&proxy_id, channel, response_payload)
+                        .with_request_id(&request_id);
+                    if let Err(e) = process_response_tx.send((identity, response)).await {
+                        error!("Failed to queue response: {}", e);
+                    }
                 }
-            };
-
-            // Send response
-            let response = DaemonEnvelope::new(&proxy_id, channel, response_payload)
-                .with_request_id(&request_id);
-
-            if let Err(e) = process_response_tx.send((identity, response)).await {
-                error!("Failed to queue response: {}", e);
             }
         }
     });
@@ -219,7 +226,327 @@ pub async fn start_server(
     })
 }
 
-/// Handle chat channel messages using the Agent.
+/// Handle chat channel messages with streaming support.
+///
+/// This function processes chat messages and streams the response back to the sidebar
+/// in real-time as the LLM generates output.
+async fn handle_chat_message_streaming(
+    payload: &serde_json::Value,
+    config: &Arc<AgentConfig>,
+    session_manager: &Arc<SessionManager>,
+    runtime: tokio::runtime::Handle,
+    identity: Vec<u8>,
+    proxy_id: String,
+    request_id: String,
+    channel: Channel,
+    response_tx: mpsc::Sender<(Vec<u8>, DaemonEnvelope)>,
+) {
+    let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    // For non-chat_message types, handle synchronously
+    if msg_type != "chat_message" {
+        let response_payload = handle_chat_message(payload, config, session_manager, runtime).await;
+        let response = DaemonEnvelope::new(&proxy_id, channel, response_payload)
+            .with_request_id(&request_id);
+        if let Err(e) = response_tx.send((identity, response)).await {
+            error!("Failed to queue response: {}", e);
+        }
+        return;
+    }
+
+    // Extract message content from payload
+    let message_content = payload
+        .get("payload")
+        .and_then(|p| p.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+
+    if message_content.is_empty() {
+        let response_payload = serde_json::json!({
+            "type": "error",
+            "payload": {
+                "code": "EMPTY_MESSAGE",
+                "message": "Message content is empty"
+            }
+        });
+        let response = DaemonEnvelope::new(&proxy_id, channel, response_payload)
+            .with_request_id(&request_id);
+        if let Err(e) = response_tx.send((identity, response)).await {
+            error!("Failed to queue response: {}", e);
+        }
+        return;
+    }
+
+    // Extract session_id if provided
+    let session_id = payload
+        .get("payload")
+        .and_then(|p| p.get("session_id"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("default")
+        .to_string();
+
+    // Extract mode if provided (default to Chat)
+    let mode = payload
+        .get("payload")
+        .and_then(|p| p.get("mode"))
+        .and_then(|m| m.as_str())
+        .map(|m| match m {
+            "browser" => AgentMode::Browser,
+            "agent" => AgentMode::Agent,
+            _ => AgentMode::Chat,
+        })
+        .unwrap_or(AgentMode::Chat);
+
+    // Extract attachments (multimodal: images, files)
+    let attachments: Vec<Attachment> = payload
+        .get("payload")
+        .and_then(|p| p.get("attachments"))
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    let name = v.get("name")?.as_str()?.to_string();
+                    let mime_type = v.get("mime_type")?.as_str()?.to_string();
+                    let data = v.get("data")?.as_str()?.to_string();
+                    Some(Attachment {
+                        name,
+                        mime_type,
+                        data,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    debug!(
+        "Processing streaming chat message with mode={:?}, session={}, attachments={}",
+        mode,
+        session_id,
+        attachments.len()
+    );
+
+    // Ensure session exists and save user message
+    match session_manager.get_or_create_session(&session_id).await {
+        Ok(session) => {
+            info!(
+                "Session ready: id={}, created_at={}",
+                session.id, session.created_at
+            );
+        }
+        Err(e) => {
+            error!("Failed to get/create session {}: {}", session_id, e);
+        }
+    }
+
+    // Save user message to database
+    let mut generated_title: Option<String> = None;
+    match session_manager
+        .add_message(&session_id, MessageRole::User, message_content)
+        .await
+    {
+        Ok(msg) => {
+            info!("Saved user message: id={}, session={}", msg.id, session_id);
+
+            // Generate title from first message if session has no title yet
+            match session_manager.generate_title(&session_id).await {
+                Ok(Some(title)) => {
+                    info!("Generated session title: {}", title);
+                    generated_title = Some(title);
+                }
+                Ok(None) => {
+                    // Session already has a title or no messages
+                }
+                Err(e) => {
+                    error!("Failed to generate title: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            error!("Failed to save user message to {}: {}", session_id, e);
+        }
+    }
+
+    // Create unbounded channel for streaming chunks
+    let (stream_tx, mut stream_rx) =
+        tokio::sync::mpsc::unbounded_channel::<SidebarStreamChunk>();
+
+    // Create host functions with streaming support
+    let host = DaemonHostFunctions::new(config.clone(), runtime.clone())
+        .with_sidebar_stream(stream_tx);
+
+    // Create agent with host functions
+    let agent = Agent::new(host);
+
+    // Build agent input
+    let input = AgentInput {
+        session_id: session_id.clone(),
+        mode,
+        user_message: message_content.to_string(),
+        history: vec![], // TODO: Load history from session
+        attachments,
+        custom_system_prompt: None, // Use default mode-based prompt
+    };
+
+    // Clone variables for the streaming forwarder task
+    let stream_proxy_id = proxy_id.clone();
+    let stream_channel = channel.clone();
+    let stream_request_id = request_id.clone();
+    let stream_identity = identity.clone();
+    let stream_response_tx = response_tx.clone();
+    let stream_title = generated_title.clone();
+
+    // Spawn task to forward stream chunks to the sidebar
+    let forwarder_handle = tokio::spawn(async move {
+        let mut accumulated_text = String::new();
+
+        while let Some(chunk) = stream_rx.recv().await {
+            accumulated_text.push_str(&chunk.text);
+
+            let mut chunk_payload = serde_json::json!({
+                "type": "stream_chunk",
+                "payload": {
+                    "content": chunk.text,
+                    "done": chunk.done
+                }
+            });
+
+            // Include session title on first chunk if available
+            if !accumulated_text.is_empty() && accumulated_text == chunk.text {
+                if let Some(ref title) = stream_title {
+                    chunk_payload["payload"]["session_title"] =
+                        serde_json::Value::String(title.clone());
+                }
+            }
+
+            let response = DaemonEnvelope::new(&stream_proxy_id, stream_channel, chunk_payload)
+                .with_request_id(&stream_request_id);
+
+            if let Err(e) = stream_response_tx
+                .send((stream_identity.clone(), response))
+                .await
+            {
+                error!("Failed to send stream chunk: {}", e);
+                break;
+            }
+
+            if chunk.done {
+                debug!("Stream completed, total accumulated: {} bytes", accumulated_text.len());
+                break;
+            }
+        }
+
+        accumulated_text
+    });
+
+    // Run agent (this will call stream_emit() for each chunk)
+    let agent_result = tokio::task::spawn_blocking(move || agent.run(&input)).await;
+
+    // Wait for the forwarder to complete
+    let accumulated_text = match forwarder_handle.await {
+        Ok(text) => text,
+        Err(e) => {
+            error!("Stream forwarder task failed: {}", e);
+            String::new()
+        }
+    };
+
+    // Handle agent result
+    match agent_result {
+        Ok(Ok(output)) => {
+            // Save assistant response to database
+            let final_text = if output.text.is_empty() {
+                accumulated_text
+            } else {
+                output.text.clone()
+            };
+
+            if !final_text.is_empty() {
+                match session_manager
+                    .add_message(&session_id, MessageRole::Assistant, &final_text)
+                    .await
+                {
+                    Ok(msg) => {
+                        info!(
+                            "Saved assistant message: id={}, session={}",
+                            msg.id, session_id
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to save assistant message to {}: {}", session_id, e);
+                    }
+                }
+            }
+
+            // Save tool calls to session history
+            for tool_call in &output.tool_calls {
+                if let Err(e) = session_manager
+                    .add_tool_use_message(
+                        &session_id,
+                        &tool_call.id,
+                        &tool_call.name,
+                        &tool_call.arguments,
+                        None,
+                    )
+                    .await
+                {
+                    error!("Failed to save tool call {}: {}", tool_call.name, e);
+                }
+            }
+
+            // Send final completion message
+            let mut final_payload = serde_json::json!({
+                "type": "stream_chunk",
+                "payload": {
+                    "content": "",
+                    "tool_calls": output.tool_calls,
+                    "done": true
+                }
+            });
+
+            if let Some(title) = generated_title {
+                final_payload["payload"]["session_title"] = serde_json::Value::String(title);
+            }
+
+            let response = DaemonEnvelope::new(&proxy_id, channel, final_payload)
+                .with_request_id(&request_id);
+            if let Err(e) = response_tx.send((identity, response)).await {
+                error!("Failed to send final response: {}", e);
+            }
+        }
+        Ok(Err(e)) => {
+            error!("Agent run failed: {}", e);
+            let error_payload = serde_json::json!({
+                "type": "error",
+                "payload": {
+                    "code": "AGENT_ERROR",
+                    "message": format!("Agent error: {}", e)
+                }
+            });
+            let response = DaemonEnvelope::new(&proxy_id, channel, error_payload)
+                .with_request_id(&request_id);
+            if let Err(e) = response_tx.send((identity, response)).await {
+                error!("Failed to send error response: {}", e);
+            }
+        }
+        Err(e) => {
+            error!("Agent task panicked: {}", e);
+            let error_payload = serde_json::json!({
+                "type": "error",
+                "payload": {
+                    "code": "AGENT_PANIC",
+                    "message": format!("Agent task failed: {}", e)
+                }
+            });
+            let response = DaemonEnvelope::new(&proxy_id, channel, error_payload)
+                .with_request_id(&request_id);
+            if let Err(e) = response_tx.send((identity, response)).await {
+                error!("Failed to send error response: {}", e);
+            }
+        }
+    }
+}
+
+/// Handle chat channel messages using the Agent (non-streaming).
 async fn handle_chat_message(
     payload: &serde_json::Value,
     config: &Arc<AgentConfig>,

@@ -7,11 +7,20 @@
 //! multiple tests concurrently.
 
 use nevoflux_bridge::{generate_proxy_id, BridgeConfig, DaemonClient};
-use nevoflux_daemon::{start_server, Router, ServerConfig};
+use nevoflux_daemon::{start_server, Router, ServerConfig, SessionManager};
 use nevoflux_protocol::Channel;
 use serial_test::serial;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Helper to create a test session manager with a temp database.
+fn create_test_session_manager() -> Arc<SessionManager> {
+    let temp_dir = std::env::temp_dir();
+    let db_path = temp_dir.join(format!("nevoflux_test_{}.db", std::process::id()));
+    Arc::new(
+        SessionManager::new(db_path.to_str().unwrap()).expect("Failed to create session manager"),
+    )
+}
 
 /// Test that a proxy can successfully connect to the daemon.
 #[tokio::test]
@@ -20,7 +29,8 @@ async fn test_proxy_connects_to_daemon() {
     // Start daemon server
     let config = ServerConfig::default();
     let router = Arc::new(Router::new());
-    let server = start_server(config, router).await.unwrap();
+    let session_manager = create_test_session_manager();
+    let server = start_server(config, router, session_manager).await.unwrap();
     let port = server.port();
 
     // Give server time to bind and start receiving
@@ -46,7 +56,10 @@ async fn test_proxy_sends_chat_message_to_daemon() {
     // Start daemon server
     let config = ServerConfig::default();
     let router = Arc::new(Router::new());
-    let server = start_server(config, router.clone()).await.unwrap();
+    let session_manager = create_test_session_manager();
+    let server = start_server(config, router.clone(), session_manager)
+        .await
+        .unwrap();
     let port = server.port();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -85,7 +98,10 @@ async fn test_proxy_sends_mcp_message_to_daemon() {
     // Start daemon server
     let config = ServerConfig::default();
     let router = Arc::new(Router::new());
-    let server = start_server(config, router.clone()).await.unwrap();
+    let session_manager = create_test_session_manager();
+    let server = start_server(config, router.clone(), session_manager)
+        .await
+        .unwrap();
     let port = server.port();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -122,7 +138,10 @@ async fn test_multiple_proxies_connect() {
     // Start daemon server
     let config = ServerConfig::default();
     let router = Arc::new(Router::new());
-    let server = start_server(config, router.clone()).await.unwrap();
+    let session_manager = create_test_session_manager();
+    let server = start_server(config, router.clone(), session_manager)
+        .await
+        .unwrap();
     let port = server.port();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -159,7 +178,10 @@ async fn test_router_tracks_proxy_requests() {
     // Start daemon server
     let config = ServerConfig::default();
     let router = Arc::new(Router::new());
-    let server = start_server(config, router.clone()).await.unwrap();
+    let session_manager = create_test_session_manager();
+    let server = start_server(config, router.clone(), session_manager)
+        .await
+        .unwrap();
     let port = server.port();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -193,7 +215,8 @@ async fn test_port_file_discovery() {
     // Start daemon server
     let config = ServerConfig::default();
     let router = Arc::new(Router::new());
-    let server = start_server(config, router).await.unwrap();
+    let session_manager = create_test_session_manager();
+    let server = start_server(config, router, session_manager).await.unwrap();
     let port = server.port();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -229,7 +252,8 @@ async fn test_port_file_discovery() {
 async fn test_server_shutdown() {
     let config = ServerConfig::default();
     let router = Arc::new(Router::new());
-    let mut server = start_server(config, router).await.unwrap();
+    let session_manager = create_test_session_manager();
+    let mut server = start_server(config, router, session_manager).await.unwrap();
 
     let port = server.port();
     assert!((19500..=19600).contains(&port));
@@ -245,7 +269,10 @@ async fn test_proxy_close_connection() {
     // Start daemon server
     let config = ServerConfig::default();
     let router = Arc::new(Router::new());
-    let server = start_server(config, router.clone()).await.unwrap();
+    let session_manager = create_test_session_manager();
+    let server = start_server(config, router.clone(), session_manager)
+        .await
+        .unwrap();
     let port = server.port();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -278,7 +305,10 @@ async fn test_channel_types() {
     // Start daemon server
     let config = ServerConfig::default();
     let router = Arc::new(Router::new());
-    let server = start_server(config, router.clone()).await.unwrap();
+    let session_manager = create_test_session_manager();
+    let server = start_server(config, router.clone(), session_manager)
+        .await
+        .unwrap();
     let port = server.port();
 
     tokio::time::sleep(Duration::from_millis(100)).await;

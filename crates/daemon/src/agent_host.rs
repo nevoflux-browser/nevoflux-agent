@@ -21,7 +21,10 @@
 
 use crate::config::AgentConfig;
 use crate::context::{CompressionResult, ContextCompressor, ContextMessage, TokenBudget};
-use crate::wasm::llm::{execute_llm_chat, LlmChatRequest, LlmMessage as DaemonLlmMessage};
+use crate::wasm::llm::{
+    execute_llm_chat, start_llm_stream, LlmChatRequest, LlmMessage as DaemonLlmMessage,
+    LlmStreamRegistry,
+};
 use crate::wasm::HostServices;
 use nevoflux_builtin_wasm::{
     AgentInput, AgentMode, AgentOutput, BrowserToolResult, HostError, HostFunctions, HostResult,
@@ -99,6 +102,15 @@ impl Default for SubagentRegistry {
     }
 }
 
+/// A streaming chunk to send to the sidebar.
+#[derive(Debug, Clone)]
+pub struct SidebarStreamChunk {
+    /// The incremental text content.
+    pub text: String,
+    /// Whether this is the final chunk.
+    pub done: bool,
+}
+
 /// Daemon's implementation of HostFunctions for the Agent.
 ///
 /// This bridges the WASM agent's host function calls to the actual daemon services.
@@ -111,6 +123,10 @@ pub struct DaemonHostFunctions {
     services: Option<HostServices>,
     /// Registry for tracking sub-agents.
     subagent_registry: Arc<SubagentRegistry>,
+    /// Registry for tracking LLM streams.
+    stream_registry: Arc<LlmStreamRegistry>,
+    /// Optional sender for streaming chunks to the sidebar.
+    sidebar_stream_tx: Option<tokio::sync::mpsc::UnboundedSender<SidebarStreamChunk>>,
 }
 
 impl DaemonHostFunctions {
@@ -121,12 +137,23 @@ impl DaemonHostFunctions {
             runtime,
             services: None,
             subagent_registry: Arc::new(SubagentRegistry::new()),
+            stream_registry: Arc::new(LlmStreamRegistry::new()),
+            sidebar_stream_tx: None,
         }
     }
 
     /// Add services to enable tool search and dynamic tool calls.
     pub fn with_services(mut self, services: HostServices) -> Self {
         self.services = Some(services);
+        self
+    }
+
+    /// Add a sidebar stream sender for streaming chunks.
+    pub fn with_sidebar_stream(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<SidebarStreamChunk>,
+    ) -> Self {
+        self.sidebar_stream_tx = Some(tx);
         self
     }
 
@@ -157,6 +184,62 @@ impl DaemonHostFunctions {
             .map(|m| m.content.clone());
 
         // Convert tools from original request
+        let tools = if request.tools.is_empty() {
+            None
+        } else {
+            Some(
+                request
+                    .tools
+                    .iter()
+                    .map(|t| crate::wasm::llm::LlmToolDefinition {
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        parameters: t.input_schema.clone(),
+                    })
+                    .collect(),
+            )
+        };
+
+        LlmChatRequest {
+            messages,
+            system,
+            temperature: Some(self.config.llm.temperature),
+            max_tokens: Some(self.config.llm.max_tokens),
+            tools,
+        }
+    }
+
+    /// Convert agent LlmRequest to daemon LlmChatRequest.
+    fn convert_request_to_daemon(&self, request: &LlmRequest) -> LlmChatRequest {
+        // Convert messages to daemon format
+        let messages: Vec<DaemonLlmMessage> = request
+            .messages
+            .iter()
+            .map(|m| {
+                let role = match m.role {
+                    nevoflux_builtin_wasm::MessageRole::System => "system",
+                    nevoflux_builtin_wasm::MessageRole::User => "user",
+                    nevoflux_builtin_wasm::MessageRole::Assistant => "assistant",
+                    nevoflux_builtin_wasm::MessageRole::Tool => "tool",
+                };
+                DaemonLlmMessage {
+                    role: role.to_string(),
+                    content: m.content.clone(),
+                    tool_calls: None,
+                    tool_call_id: m.tool_call_id.clone(),
+                    attachments: Vec::new(),
+                }
+            })
+            .collect();
+
+        // Extract system message
+        let system = request
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, nevoflux_builtin_wasm::MessageRole::System))
+            .map(|m| m.content.clone());
+
+        // Convert tools
         let tools = if request.tools.is_empty() {
             None
         } else {
@@ -310,26 +393,99 @@ impl HostFunctions for DaemonHostFunctions {
         }
     }
 
-    fn llm_stream_start(&self, _request: &LlmRequest) -> HostResult<u64> {
-        // Streaming not yet implemented
-        warn!("llm_stream_start not yet implemented");
-        Err(HostError {
-            code: 501,
-            message: "Streaming not yet implemented".into(),
-        })
+    fn llm_stream_start(&self, request: &LlmRequest) -> HostResult<u64> {
+        // Get provider configuration
+        let provider_name = self.config.llm.active_provider().ok_or_else(|| HostError {
+            code: 1,
+            message: "No LLM provider configured".into(),
+        })?;
+
+        let api_key = self
+            .config
+            .llm
+            .active_api_key()
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| HostError {
+                code: 2,
+                message: "No API key configured".into(),
+            })?;
+
+        let model = self.config.llm.active_model().unwrap_or("gpt-4o-mini");
+
+        let provider = ProviderType::from_str(provider_name).map_err(|_| HostError {
+            code: 3,
+            message: format!("Invalid provider: {}", provider_name),
+        })?;
+
+        debug!(
+            "llm_stream_start: provider={}, model={}, messages={}",
+            provider_name,
+            model,
+            request.messages.len()
+        );
+
+        // Convert request to daemon format
+        let daemon_request = self.convert_request_to_daemon(request);
+
+        // Start the stream
+        let registry = Arc::clone(&self.stream_registry);
+        let api_key_owned = api_key.to_string();
+        let model_owned = model.to_string();
+
+        let stream_id = self
+            .runtime
+            .block_on(async {
+                start_llm_stream(
+                    provider,
+                    &api_key_owned,
+                    &model_owned,
+                    daemon_request,
+                    registry,
+                )
+                .await
+            })
+            .map_err(|e| HostError {
+                code: 100,
+                message: format!("Failed to start stream: {}", e),
+            })?;
+
+        debug!("llm_stream_start: stream_id={}", stream_id);
+        Ok(stream_id)
     }
 
     fn llm_stream_next(
         &self,
-        _stream_id: u64,
+        stream_id: u64,
     ) -> HostResult<Option<nevoflux_builtin_wasm::LlmChunk>> {
-        Err(HostError {
-            code: 501,
-            message: "Streaming not yet implemented".into(),
-        })
+        match self.stream_registry.next_chunk(stream_id) {
+            Ok(Some(chunk)) => {
+                // Convert daemon chunk to builtin-wasm chunk
+                let wasm_chunk = nevoflux_builtin_wasm::LlmChunk {
+                    text: chunk.text,
+                    tool_calls: chunk
+                        .tool_calls
+                        .into_iter()
+                        .map(|tc| nevoflux_builtin_wasm::ToolCall {
+                            id: tc.id,
+                            name: tc.name,
+                            arguments: tc.arguments,
+                        })
+                        .collect(),
+                    done: chunk.done,
+                };
+                Ok(Some(wasm_chunk))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: format!("Stream error: {}", e),
+            }),
+        }
     }
 
-    fn llm_stream_close(&self, _stream_id: u64) -> HostResult<()> {
+    fn llm_stream_close(&self, stream_id: u64) -> HostResult<()> {
+        debug!("llm_stream_close: stream_id={}", stream_id);
+        self.stream_registry.close(stream_id);
         Ok(())
     }
 
@@ -1279,6 +1435,41 @@ impl HostFunctions for DaemonHostFunctions {
 
         Ok(all_subagents)
     }
+
+    fn stream_emit(&self, text: &str) -> HostResult<()> {
+        if let Some(tx) = &self.sidebar_stream_tx {
+            let chunk = SidebarStreamChunk {
+                text: text.to_string(),
+                done: false,
+            };
+            tx.send(chunk).map_err(|_| HostError {
+                code: 500,
+                message: "Failed to send stream chunk: channel closed".into(),
+            })?;
+            debug!("stream_emit: sent {} bytes", text.len());
+        } else {
+            // If no stream sender is configured, just log and continue
+            debug!("stream_emit: no sidebar stream configured, ignoring chunk");
+        }
+        Ok(())
+    }
+
+    fn stream_end(&self) -> HostResult<()> {
+        if let Some(tx) = &self.sidebar_stream_tx {
+            let chunk = SidebarStreamChunk {
+                text: String::new(),
+                done: true,
+            };
+            tx.send(chunk).map_err(|_| HostError {
+                code: 500,
+                message: "Failed to send stream end: channel closed".into(),
+            })?;
+            debug!("stream_end: sent end signal");
+        } else {
+            debug!("stream_end: no sidebar stream configured, ignoring");
+        }
+        Ok(())
+    }
 }
 
 impl DaemonHostFunctions {
@@ -1289,6 +1480,8 @@ impl DaemonHostFunctions {
             runtime: self.runtime.clone(),
             services: self.services.clone(),
             subagent_registry: self.subagent_registry.clone(),
+            stream_registry: self.stream_registry.clone(),
+            sidebar_stream_tx: self.sidebar_stream_tx.clone(),
         }
     }
 

@@ -217,6 +217,30 @@ impl ContextBuilder {
         self
     }
 
+    /// Get current messages for inspection.
+    pub fn messages(&self) -> &[ContextMessage] {
+        &self.messages
+    }
+
+    /// Get estimated token count.
+    pub fn current_estimated_tokens(&self) -> u32 {
+        self.estimate_tokens()
+    }
+
+    /// Replace messages with compressed set (summary + recent).
+    pub fn with_compressed_messages(
+        mut self,
+        summary: String,
+        recent: Vec<ContextMessage>,
+    ) -> Self {
+        self.messages = vec![ContextMessage {
+            role: "system".to_string(),
+            content: format!("[Conversation summary]\n{}", summary),
+        }];
+        self.messages.extend(recent);
+        self
+    }
+
     /// Build the context.
     pub fn build(self) -> Context {
         let estimated_tokens = self.estimate_tokens();
@@ -428,5 +452,58 @@ mod tests {
 
         assert_eq!(context.system_prompt, decoded.system_prompt);
         assert_eq!(context.messages.len(), decoded.messages.len());
+    }
+
+    #[test]
+    fn test_context_builder_messages() {
+        let builder = ContextBuilder::new()
+            .add_message("user", "Hello")
+            .add_message("assistant", "Hi there");
+
+        let messages = builder.messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+    }
+
+    #[test]
+    fn test_context_builder_current_estimated_tokens() {
+        let builder = ContextBuilder::new()
+            .system_prompt("System prompt") // 13 chars
+            .add_message("user", "Hello"); // 4 + 5 = 9 chars
+
+        // Total chars = 22, estimated tokens = 22 / 4 = 5
+        assert_eq!(builder.current_estimated_tokens(), 5);
+    }
+
+    #[test]
+    fn test_context_builder_with_compressed_messages() {
+        let summary = "User asked about weather, assistant provided forecast.".to_string();
+        let recent = vec![
+            ContextMessage {
+                role: "user".to_string(),
+                content: "What's the temperature?".to_string(),
+            },
+            ContextMessage {
+                role: "assistant".to_string(),
+                content: "It's 72°F.".to_string(),
+            },
+        ];
+
+        let context = ContextBuilder::new()
+            .add_message("user", "Old message 1")
+            .add_message("assistant", "Old response 1")
+            .with_compressed_messages(summary.clone(), recent)
+            .build();
+
+        // Should have 3 messages: summary + 2 recent
+        assert_eq!(context.messages.len(), 3);
+        assert_eq!(context.messages[0].role, "system");
+        assert!(context.messages[0]
+            .content
+            .contains("[Conversation summary]"));
+        assert!(context.messages[0].content.contains(&summary));
+        assert_eq!(context.messages[1].role, "user");
+        assert_eq!(context.messages[2].role, "assistant");
     }
 }

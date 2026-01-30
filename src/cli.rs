@@ -14,6 +14,8 @@ use std::path::PathBuf;
     long_about = "NevoFlux is an AI-powered browser assistant that provides \
     intelligent automation and assistance through browser extensions and MCP integration."
 )]
+// Allow external subcommands (Firefox passes manifest path and extension ID)
+#[command(allow_external_subcommands = true)]
 pub struct Cli {
     /// Run as MCP server (stdio bridge for Claude Code integration)
     #[arg(long)]
@@ -60,6 +62,9 @@ pub enum Commands {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
+    /// External subcommand (catches Firefox native messaging args)
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 /// Configuration subcommand actions.
@@ -272,5 +277,26 @@ mod tests {
         let cli = Cli::try_parse_from(["nevoflux", "--verbose", "--daemon"]).unwrap();
         assert!(cli.verbose);
         assert!(cli.daemon);
+    }
+
+    #[test]
+    fn test_cli_parse_firefox_native_messaging_args() {
+        // Firefox passes manifest path and extension ID as arguments
+        let cli = Cli::try_parse_from([
+            "nevoflux",
+            "/home/user/.mozilla/native-messaging-hosts/com.nevoflux.agent.json",
+            "agent@nevoflux.com",
+        ])
+        .unwrap();
+
+        // These should be captured as external subcommand, not cause an error
+        match cli.command {
+            Some(Commands::External(args)) => {
+                assert_eq!(args.len(), 2);
+                assert!(args[0].contains("native-messaging-hosts"));
+                assert_eq!(args[1], "agent@nevoflux.com");
+            }
+            _ => panic!("Expected External command for Firefox args"),
+        }
     }
 }

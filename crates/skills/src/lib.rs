@@ -64,7 +64,9 @@ pub mod types;
 
 // Re-export main types
 pub use error::{Result, SkillsError};
-pub use loader::{default_user_skills_dir, AsyncSkillLoader, LoaderConfig, SkillLoader};
+#[allow(deprecated)]
+pub use loader::default_user_skills_dir;
+pub use loader::{default_user_skills_dirs, AsyncSkillLoader, LoaderConfig, SkillLoader};
 pub use parser::{parse_skill, parse_skill_file, serialize_skill};
 pub use registry::{AsyncSkillRegistry, SkillRegistry};
 pub use types::{Skill, SkillMetadata, SkillSource, SkillSummary};

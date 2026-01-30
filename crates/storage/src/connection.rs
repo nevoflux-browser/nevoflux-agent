@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{Result, StorageError};
 use crate::migrations;
+use crate::repositories::{MemoryRepository, PermissionRepository};
 
 /// Thread-safe database connection wrapper.
 #[derive(Clone)]
@@ -60,6 +61,16 @@ impl Database {
 
     fn run_migrations(&self) -> Result<()> {
         self.with_connection_mut(migrations::run_all)
+    }
+
+    /// Get a memory repository for this database.
+    pub fn memory(&self) -> MemoryRepository<'_> {
+        MemoryRepository::new(self)
+    }
+
+    /// Get a permission repository for this database.
+    pub fn permissions(&self) -> PermissionRepository<'_> {
+        PermissionRepository::new(self)
     }
 }
 

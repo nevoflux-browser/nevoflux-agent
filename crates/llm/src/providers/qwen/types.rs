@@ -54,7 +54,7 @@ pub struct QwenChoice {
 }
 
 /// Token usage statistics.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QwenUsage {
     /// Tokens used for the prompt
     pub prompt_tokens: u32,

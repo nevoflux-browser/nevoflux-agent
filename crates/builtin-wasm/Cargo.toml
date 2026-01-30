@@ -9,7 +9,8 @@ description = "Built-in Wasm Agent for NevoFlux - Chat/Browser/Agent modes"
 # Build with: cargo build --release --target wasm32-wasi
 
 [lib]
-crate-type = ["cdylib"]
+# cdylib for WASM compilation, rlib for native usage as library
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 serde = { workspace = true }

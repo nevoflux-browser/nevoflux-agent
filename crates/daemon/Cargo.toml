@@ -17,6 +17,7 @@ nevoflux-mcp = { path = "../mcp" }
 nevoflux-skills = { path = "../skills" }
 nevoflux-llm = { path = "../llm" }
 nevoflux-computer = { path = "../computer" }
+nevoflux-builtin-wasm = { path = "../builtin-wasm" }
 
 # LLM framework
 rig-core = { workspace = true }
@@ -41,6 +42,7 @@ tracing = "0.1"
 
 # ZeroMQ
 zeromq = { workspace = true }
+bytes = "1"
 
 # Wasmtime
 wasmtime = { workspace = true }

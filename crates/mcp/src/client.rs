@@ -2,12 +2,14 @@
 //!
 //! Provides a high-level API for interacting with MCP servers.
 
+use crate::backend::McpClientBackend;
 use crate::error::{McpError, Result};
 use crate::transport::{McpTransport, StdioTransport};
 use crate::types::{
     InitializeParams, InitializeResult, JsonRpcNotification, JsonRpcRequest, Resource,
     ResourceContent, ServerCapabilities, ServerInfo, ToolDefinition, ToolResult,
 };
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -334,6 +336,29 @@ impl McpClient {
             ));
         }
         Ok(())
+    }
+}
+
+#[async_trait]
+impl McpClientBackend for McpClient {
+    async fn list_tools(&self) -> Result<Vec<ToolDefinition>> {
+        McpClient::list_tools(self).await
+    }
+
+    async fn list_resources(&self) -> Result<Vec<Resource>> {
+        McpClient::list_resources(self).await
+    }
+
+    async fn call_tool(&self, name: &str, arguments: serde_json::Value) -> Result<ToolResult> {
+        McpClient::call_tool(self, name, arguments).await
+    }
+
+    async fn health_check(&self) -> Result<bool> {
+        McpClient::health_check(self).await
+    }
+
+    async fn close(&self) -> Result<()> {
+        McpClient::close(self).await
     }
 }
 

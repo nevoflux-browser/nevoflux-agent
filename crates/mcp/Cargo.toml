@@ -9,6 +9,11 @@ repository.workspace = true
 
 description = "MCP (Model Context Protocol) client for NevoFlux Agent"
 
+[features]
+default = []
+# Use custom McpClient instead of official rmcp SDK (legacy mode)
+legacy-backend = []
+
 [dependencies]
 # Serialization
 serde.workspace = true
@@ -28,6 +33,9 @@ thiserror.workspace = true
 
 # Logging
 tracing = "0.1"
+
+# Official MCP SDK (default backend)
+rmcp = { version = "0.14", features = ["client", "transport-child-process", "transport-io"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }

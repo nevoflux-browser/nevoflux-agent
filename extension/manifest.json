@@ -4,6 +4,12 @@
   "version": "0.1.0",
   "description": "AI-powered browser assistant with native computer control",
 
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "agent@nevoflux.com"
+    }
+  },
+
   "permissions": [
     "nativeMessaging",
     "activeTab",

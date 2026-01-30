@@ -3,12 +3,18 @@
 //! The registry allows managing multiple MCP server connections,
 //! aggregating their tools and resources.
 
-use crate::client::McpClient;
+use crate::backend::McpClientBackend;
 use crate::error::{McpError, Result};
 use crate::types::{Resource, ToolDefinition, ToolResult};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+#[cfg(not(feature = "legacy-backend"))]
+use crate::rmcp_adapter::RmcpClient;
+
+#[cfg(feature = "legacy-backend")]
+use crate::client::McpClient;
 
 /// Configuration for an MCP server.
 #[derive(Debug, Clone)]
@@ -77,7 +83,7 @@ pub struct ServerResource {
 /// Registry for managing multiple MCP server connections.
 pub struct McpRegistry {
     /// Connected clients by server name.
-    clients: RwLock<HashMap<String, Arc<McpClient>>>,
+    clients: RwLock<HashMap<String, Arc<dyn McpClientBackend>>>,
     /// Server configurations.
     configs: RwLock<HashMap<String, ServerConfig>>,
 }
@@ -123,6 +129,9 @@ impl McpRegistry {
     }
 
     /// Connect to a configured server by name.
+    ///
+    /// Uses the official rmcp SDK when the `rmcp-backend` feature is enabled,
+    /// otherwise uses the custom McpClient implementation.
     pub async fn connect(&self, name: &str) -> Result<()> {
         let config = self
             .configs
@@ -142,12 +151,18 @@ impl McpRegistry {
         }
 
         let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
-        let client = McpClient::connect_stdio_with_env(&config.command, &args, &config.env).await?;
 
-        self.clients
-            .write()
-            .await
-            .insert(name.to_string(), Arc::new(client));
+        // Use official rmcp SDK by default, custom McpClient with legacy-backend feature
+        #[cfg(not(feature = "legacy-backend"))]
+        let client: Arc<dyn McpClientBackend> = Arc::new(
+            RmcpClient::connect_stdio_with_env(&config.command, &args, &config.env).await?,
+        );
+
+        #[cfg(feature = "legacy-backend")]
+        let client: Arc<dyn McpClientBackend> =
+            Arc::new(McpClient::connect_stdio_with_env(&config.command, &args, &config.env).await?);
+
+        self.clients.write().await.insert(name.to_string(), client);
 
         Ok(())
     }
@@ -181,7 +196,7 @@ impl McpRegistry {
 
     /// Disconnect from all servers.
     pub async fn disconnect_all(&self) -> Result<()> {
-        let clients: Vec<Arc<McpClient>> =
+        let clients: Vec<Arc<dyn McpClientBackend>> =
             self.clients.write().await.drain().map(|(_, c)| c).collect();
 
         for client in clients {
@@ -191,7 +206,7 @@ impl McpRegistry {
     }
 
     /// Get a specific client by name.
-    pub async fn get_client(&self, name: &str) -> Option<Arc<McpClient>> {
+    pub async fn get_client(&self, name: &str) -> Option<Arc<dyn McpClientBackend>> {
         self.clients.read().await.get(name).cloned()
     }
 

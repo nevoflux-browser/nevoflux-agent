@@ -8,13 +8,11 @@ use nevoflux_daemon::{LlmChatRequest, LlmChatResponse, LlmMessage, LlmUsage};
 #[test]
 fn test_llm_request_structure() {
     let request = LlmChatRequest {
-        messages: vec![LlmMessage {
-            role: "user".into(),
-            content: "Hello!".into(),
-        }],
+        messages: vec![LlmMessage::user("Hello!")],
         system: Some("You are helpful.".into()),
         temperature: Some(0.7),
         max_tokens: Some(1000),
+        tools: None,
     };
 
     let json = serde_json::to_string(&request).unwrap();
@@ -60,10 +58,7 @@ fn test_llm_usage_structure() {
 
 #[test]
 fn test_llm_message_serialization() {
-    let message = LlmMessage {
-        role: "assistant".into(),
-        content: "How can I help you?".into(),
-    };
+    let message = LlmMessage::assistant("How can I help you?");
 
     let json = serde_json::to_string(&message).unwrap();
     assert!(json.contains("assistant"));
@@ -78,13 +73,8 @@ fn test_llm_message_serialization() {
 fn test_llm_request_minimal() {
     // Test with only required fields
     let request = LlmChatRequest {
-        messages: vec![LlmMessage {
-            role: "user".into(),
-            content: "Hi".into(),
-        }],
-        system: None,
-        temperature: None,
-        max_tokens: None,
+        messages: vec![LlmMessage::user("Hi")],
+        ..Default::default()
     };
 
     let json = serde_json::to_string(&request).unwrap();
@@ -100,22 +90,14 @@ fn test_llm_request_minimal() {
 fn test_llm_request_multiple_messages() {
     let request = LlmChatRequest {
         messages: vec![
-            LlmMessage {
-                role: "user".into(),
-                content: "Hello".into(),
-            },
-            LlmMessage {
-                role: "assistant".into(),
-                content: "Hi there!".into(),
-            },
-            LlmMessage {
-                role: "user".into(),
-                content: "How are you?".into(),
-            },
+            LlmMessage::user("Hello"),
+            LlmMessage::assistant("Hi there!"),
+            LlmMessage::user("How are you?"),
         ],
         system: Some("Be friendly".into()),
         temperature: Some(0.5),
         max_tokens: Some(500),
+        tools: None,
     };
 
     let json = serde_json::to_string(&request).unwrap();
@@ -163,6 +145,7 @@ fn test_llm_response_to_json_string() {
     let response = LlmChatResponse {
         content: "The answer is 4.".into(),
         finish_reason: "stop".into(),
+        tool_calls: None,
         usage: Some(LlmUsage {
             prompt_tokens: 20,
             completion_tokens: 10,
@@ -177,10 +160,7 @@ fn test_llm_response_to_json_string() {
 
 #[test]
 fn test_llm_types_clone() {
-    let message = LlmMessage {
-        role: "user".into(),
-        content: "Test".into(),
-    };
+    let message = LlmMessage::user("Test");
     let cloned_message = message.clone();
     assert_eq!(cloned_message.role, message.role);
     assert_eq!(cloned_message.content, message.content);
@@ -198,6 +178,7 @@ fn test_llm_types_clone() {
         system: Some("System".into()),
         temperature: Some(0.5),
         max_tokens: Some(100),
+        tools: None,
     };
     let cloned_request = request.clone();
     assert_eq!(cloned_request.messages.len(), 1);
@@ -205,6 +186,7 @@ fn test_llm_types_clone() {
     let response = LlmChatResponse {
         content: "Response".into(),
         finish_reason: "stop".into(),
+        tool_calls: None,
         usage: Some(usage),
     };
     let cloned_response = response.clone();
@@ -213,10 +195,7 @@ fn test_llm_types_clone() {
 
 #[test]
 fn test_llm_types_debug() {
-    let message = LlmMessage {
-        role: "user".into(),
-        content: "Debug test".into(),
-    };
+    let message = LlmMessage::user("Debug test");
     let debug = format!("{:?}", message);
     assert!(debug.contains("LlmMessage"));
 
@@ -230,9 +209,7 @@ fn test_llm_types_debug() {
 
     let request = LlmChatRequest {
         messages: vec![],
-        system: None,
-        temperature: None,
-        max_tokens: None,
+        ..Default::default()
     };
     let debug = format!("{:?}", request);
     assert!(debug.contains("LlmChatRequest"));
@@ -240,7 +217,7 @@ fn test_llm_types_debug() {
     let response = LlmChatResponse {
         content: "Test".into(),
         finish_reason: "stop".into(),
-        usage: None,
+        ..Default::default()
     };
     let debug = format!("{:?}", response);
     assert!(debug.contains("LlmChatResponse"));

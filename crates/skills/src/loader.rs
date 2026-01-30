@@ -9,8 +9,8 @@ use tracing::{debug, warn};
 /// Configuration for the skill loader.
 #[derive(Debug, Clone)]
 pub struct LoaderConfig {
-    /// User skills directory.
-    pub user_dir: Option<PathBuf>,
+    /// User skills directories (multiple sources supported).
+    pub user_dirs: Vec<PathBuf>,
     /// Builtin skills directory.
     pub builtin_dir: Option<PathBuf>,
     /// File extension for skill files.
@@ -22,7 +22,7 @@ pub struct LoaderConfig {
 impl Default for LoaderConfig {
     fn default() -> Self {
         Self {
-            user_dir: default_user_skills_dir(),
+            user_dirs: default_user_skills_dirs(),
             builtin_dir: None,
             extension: "md".to_string(),
             load_disabled: false,
@@ -36,9 +36,21 @@ impl LoaderConfig {
         Self::default()
     }
 
-    /// Set the user skills directory.
+    /// Set a single user skills directory (replaces all existing).
     pub fn with_user_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.user_dir = Some(dir.into());
+        self.user_dirs = vec![dir.into()];
+        self
+    }
+
+    /// Add a user skills directory.
+    pub fn with_additional_user_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.user_dirs.push(dir.into());
+        self
+    }
+
+    /// Set multiple user skills directories (replaces all existing).
+    pub fn with_user_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.user_dirs = dirs;
         self
     }
 
@@ -59,12 +71,52 @@ impl LoaderConfig {
         self.load_disabled = load;
         self
     }
+
+    /// For backward compatibility: get the first user directory.
+    #[deprecated(note = "Use user_dirs instead")]
+    pub fn user_dir(&self) -> Option<&PathBuf> {
+        self.user_dirs.first()
+    }
 }
 
-/// Get the default user skills directory.
+/// Get all default user skills directories.
+///
+/// Searches multiple common locations for skills:
+/// - `~/.config/nevoflux/skills/` (NevoFlux native)
+/// - `~/.claude/skills/` (Claude Code compatible)
+/// - `~/.gemini/skills/` (Gemini compatible)
+/// - `~/.config/opencode/skills/` (OpenCode compatible)
+/// - `~/.config/goose/skills/` (Goose compatible)
+pub fn default_user_skills_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    // NevoFlux native directory
+    if let Some(project_dirs) = directories::ProjectDirs::from("com", "nevoflux", "nevoflux") {
+        dirs.push(project_dirs.config_dir().join("skills"));
+    }
+
+    // Home directory based paths
+    if let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
+        // Claude Code compatible
+        dirs.push(home.join(".claude").join("skills"));
+
+        // Gemini compatible
+        dirs.push(home.join(".gemini").join("skills"));
+
+        // OpenCode compatible
+        dirs.push(home.join(".config").join("opencode").join("skills"));
+
+        // Goose compatible
+        dirs.push(home.join(".config").join("goose").join("skills"));
+    }
+
+    dirs
+}
+
+/// Get the default user skills directory (legacy, returns first directory).
+#[deprecated(note = "Use default_user_skills_dirs() instead")]
 pub fn default_user_skills_dir() -> Option<PathBuf> {
-    directories::ProjectDirs::from("com", "nevoflux", "nevoflux")
-        .map(|dirs| dirs.config_dir().join("skills"))
+    default_user_skills_dirs().into_iter().next()
 }
 
 /// Skill loader.
@@ -90,26 +142,34 @@ impl SkillLoader {
     }
 
     /// Load all skills from configured directories.
+    ///
+    /// Skills are loaded in order: builtin first, then user directories.
+    /// Later directories override earlier ones (same name = replace).
     pub fn load_all(&self) -> Result<Vec<Skill>> {
-        let mut skills = Vec::new();
+        use std::collections::HashMap;
+
+        let mut skills_map: HashMap<String, Skill> = HashMap::new();
 
         // Load builtin skills first
         if let Some(ref dir) = self.config.builtin_dir {
             if dir.exists() {
-                let builtin = self.load_from_directory(dir, SkillSource::Builtin)?;
-                skills.extend(builtin);
+                for skill in self.load_from_directory(dir, SkillSource::Builtin)? {
+                    skills_map.insert(skill.name().to_string(), skill);
+                }
             }
         }
 
-        // Load user skills (can override builtin)
-        if let Some(ref dir) = self.config.user_dir {
+        // Load user skills from all configured directories (can override builtin)
+        // Later directories take precedence over earlier ones
+        for dir in &self.config.user_dirs {
             if dir.exists() {
-                let user = self.load_from_directory(dir, SkillSource::User)?;
-                skills.extend(user);
+                for skill in self.load_from_directory(dir, SkillSource::User)? {
+                    skills_map.insert(skill.name().to_string(), skill);
+                }
             }
         }
 
-        Ok(skills)
+        Ok(skills_map.into_values().collect())
     }
 
     /// Load skills from a specific directory.
@@ -162,9 +222,12 @@ impl SkillLoader {
     }
 
     /// Load a single skill by name.
+    ///
+    /// Searches user directories first (in reverse order, so later directories
+    /// take precedence), then falls back to builtin directory.
     pub fn load_skill(&self, name: &str) -> Result<Skill> {
-        // Try user directory first
-        if let Some(ref dir) = self.config.user_dir {
+        // Try user directories in reverse order (later dirs have higher priority)
+        for dir in self.config.user_dirs.iter().rev() {
             let path = dir.join(format!("{}.{}", name, self.config.extension));
             if path.exists() {
                 return parse_skill_file(&path, SkillSource::User);
@@ -184,13 +247,15 @@ impl SkillLoader {
 
     /// Check if a skill exists.
     pub fn skill_exists(&self, name: &str) -> bool {
-        if let Some(ref dir) = self.config.user_dir {
+        // Check user directories
+        for dir in &self.config.user_dirs {
             let path = dir.join(format!("{}.{}", name, self.config.extension));
             if path.exists() {
                 return true;
             }
         }
 
+        // Check builtin directory
         if let Some(ref dir) = self.config.builtin_dir {
             let path = dir.join(format!("{}.{}", name, self.config.extension));
             if path.exists() {
@@ -205,10 +270,12 @@ impl SkillLoader {
     pub fn list_skill_names(&self) -> Result<Vec<String>> {
         let mut names = Vec::new();
 
-        let dirs: Vec<&PathBuf> = [&self.config.builtin_dir, &self.config.user_dir]
-            .into_iter()
-            .flatten()
-            .collect();
+        // Collect all directories to search
+        let mut dirs: Vec<&PathBuf> = Vec::new();
+        if let Some(ref builtin) = self.config.builtin_dir {
+            dirs.push(builtin);
+        }
+        dirs.extend(self.config.user_dirs.iter());
 
         for dir in dirs {
             if !dir.exists() {
@@ -302,7 +369,7 @@ Content for {}.
     #[test]
     fn test_loader_config_default() {
         let config = LoaderConfig::default();
-        assert!(config.user_dir.is_some());
+        assert!(!config.user_dirs.is_empty());
         assert!(config.builtin_dir.is_none());
         assert_eq!(config.extension, "md");
         assert!(!config.load_disabled);
@@ -316,17 +383,29 @@ Content for {}.
             .with_extension("skill")
             .with_load_disabled(true);
 
-        assert_eq!(config.user_dir, Some(PathBuf::from("/custom/user")));
+        assert_eq!(config.user_dirs, vec![PathBuf::from("/custom/user")]);
         assert_eq!(config.builtin_dir, Some(PathBuf::from("/custom/builtin")));
         assert_eq!(config.extension, "skill");
         assert!(config.load_disabled);
     }
 
     #[test]
+    fn test_loader_config_multiple_user_dirs() {
+        let config = LoaderConfig::new()
+            .with_user_dirs(vec![PathBuf::from("/dir1"), PathBuf::from("/dir2")])
+            .with_additional_user_dir("/dir3");
+
+        assert_eq!(config.user_dirs.len(), 3);
+        assert_eq!(config.user_dirs[0], PathBuf::from("/dir1"));
+        assert_eq!(config.user_dirs[1], PathBuf::from("/dir2"));
+        assert_eq!(config.user_dirs[2], PathBuf::from("/dir3"));
+    }
+
+    #[test]
     fn test_skill_loader_new() {
         let config = LoaderConfig::new().with_user_dir("/test");
         let loader = SkillLoader::new(config);
-        assert_eq!(loader.config().user_dir, Some(PathBuf::from("/test")));
+        assert_eq!(loader.config().user_dirs, vec![PathBuf::from("/test")]);
     }
 
     #[test]
@@ -577,11 +656,64 @@ Disabled content."#,
     }
 
     #[test]
-    fn test_default_user_skills_dir() {
-        let dir = default_user_skills_dir();
-        // Should return Some on most systems
-        if let Some(path) = dir {
-            assert!(path.to_string_lossy().contains("skills"));
+    fn test_default_user_skills_dirs() {
+        let dirs = default_user_skills_dirs();
+        // Should return multiple directories on most systems
+        assert!(!dirs.is_empty());
+
+        // All paths should contain "skills"
+        for dir in &dirs {
+            assert!(dir.to_string_lossy().contains("skills"));
         }
+
+        // At least check that we have multiple directories (claude, gemini, opencode, goose)
+        assert!(
+            dirs.len() >= 4,
+            "Expected at least 4 directories, got {}",
+            dirs.len()
+        );
+    }
+
+    #[test]
+    fn test_load_from_multiple_user_dirs() {
+        let temp1 = TempDir::new().unwrap();
+        let temp2 = TempDir::new().unwrap();
+
+        // Create skill in first directory
+        create_skill_file(
+            temp1.path(),
+            "skill-from-dir1",
+            &sample_skill_content("skill-from-dir1", "From directory 1"),
+        );
+
+        // Create skill in second directory
+        create_skill_file(
+            temp2.path(),
+            "skill-from-dir2",
+            &sample_skill_content("skill-from-dir2", "From directory 2"),
+        );
+
+        // Create skill with same name in both (dir2 should win)
+        create_skill_file(
+            temp1.path(),
+            "shared-skill",
+            &sample_skill_content("shared-skill", "Version from dir1"),
+        );
+        create_skill_file(
+            temp2.path(),
+            "shared-skill",
+            &sample_skill_content("shared-skill", "Version from dir2"),
+        );
+
+        let config = LoaderConfig::new()
+            .with_user_dirs(vec![temp1.path().to_path_buf(), temp2.path().to_path_buf()]);
+        let loader = SkillLoader::new(config);
+
+        let skills = loader.load_all().unwrap();
+        assert_eq!(skills.len(), 3); // skill-from-dir1, skill-from-dir2, shared-skill
+
+        // shared-skill should be from dir2 (later directory wins)
+        let shared = skills.iter().find(|s| s.name() == "shared-skill").unwrap();
+        assert!(shared.description().contains("dir2"));
     }
 }

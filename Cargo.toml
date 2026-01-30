@@ -31,7 +31,7 @@ repository = "https://github.com/user/nevoflux-agent"
 
 [workspace.dependencies]
 # LLM Framework
-rig-core = "0.6"
+rig-core = "0.29"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -90,7 +90,7 @@ wasmtime = "27"
 wasmtime-wasi = "27"
 
 [[bin]]
-name = "nevoflux"
+name = "nevoflux-agent"
 path = "src/main.rs"
 
 [dependencies]

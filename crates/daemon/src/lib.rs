@@ -22,11 +22,13 @@
 //! ```
 
 pub mod agent;
+pub mod agent_host;
 pub mod config;
 pub mod config_watcher;
 pub mod context;
 pub mod error;
 pub mod health;
+pub mod mcp_config;
 pub mod permission;
 pub mod registry;
 pub mod retry;
@@ -44,6 +46,7 @@ pub use config::{
 };
 pub use config_watcher::{create_config_watcher, ConfigReceiver, ConfigWatcher, WatcherError};
 pub use error::{DaemonError, Result};
+pub use mcp_config::{McpConfigError, McpServerConfigFile, McpServersConfig};
 pub use permission::{Action, PermissionEnforcer, PermissionResult, ResourceType};
 pub use registry::{ActiveRequest, ProxyInfo, ProxyRegistry, RequestRegistry};
 pub use router::Router;
