@@ -154,6 +154,18 @@ pub enum BrowserToolAction {
     /// - `content_length`: Content size in bytes
     /// - `cached`: Whether result was from cache
     WebFetch,
+    /// Perform web search and return results.
+    ///
+    /// Params:
+    /// - `query`: Search query string
+    /// - `max_results`: Optional, max number of results (default 10)
+    /// - `timeout_ms`: Optional timeout (default 30000)
+    ///
+    /// Returns:
+    /// - `results`: Array of {title, url, snippet}
+    /// - `query`: Original query
+    /// - `total_results`: Total number of results found
+    WebSearch,
 }
 
 /// File attachment

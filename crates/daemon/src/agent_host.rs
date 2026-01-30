@@ -834,9 +834,68 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn tool_web_search(&self, query: &str) -> HostResult<String> {
-        // TODO: Integrate with web search API
-        debug!("tool_web_search not yet implemented for query: {}", query);
-        Ok(format!("Web search for '{}' not yet implemented", query))
+        debug!("tool_web_search: query={}", query);
+
+        // Request sidebar to perform web search
+        let browser_result = self.execute_browser_action(
+            BrowserToolAction::WebSearch,
+            serde_json::json!({
+                "query": query,
+                "max_results": 10,
+                "timeout_ms": 30000
+            }),
+            None, // WebSearch doesn't need tab_id
+        )?;
+
+        if !browser_result.success {
+            let error_msg = browser_result
+                .error
+                .unwrap_or_else(|| "Failed to perform web search".into());
+            return Err(HostError {
+                code: 7001,
+                message: error_msg,
+            });
+        }
+
+        // Extract search results from response
+        let result_data = browser_result.data.ok_or_else(|| HostError {
+            code: 7001,
+            message: "No result data from web search".into(),
+        })?;
+
+        let results = result_data["results"].as_array().ok_or_else(|| HostError {
+            code: 7001,
+            message: "No results array in response".into(),
+        })?;
+
+        // Format results as markdown
+        let mut output = format!("# Search Results for: {}\n\n", query);
+
+        if results.is_empty() {
+            output.push_str("No results found.\n");
+        } else {
+            for (i, result) in results.iter().enumerate() {
+                let title = result["title"].as_str().unwrap_or("Untitled");
+                let url = result["url"].as_str().unwrap_or("");
+                let snippet = result["snippet"].as_str().unwrap_or("");
+
+                output.push_str(&format!(
+                    "{}. **[{}]({})**\n   {}\n\n",
+                    i + 1,
+                    title,
+                    url,
+                    snippet
+                ));
+            }
+
+            // Add total count if available
+            if let Some(total) = result_data["total_results"].as_u64() {
+                output.push_str(&format!("---\n*Total results: {}*\n", total));
+            }
+        }
+
+        debug!("tool_web_search: found {} results", results.len());
+        Ok(output)
     }
 
     fn tool_web_fetch(&self, url: &str, prompt: &str) -> HostResult<String> {
