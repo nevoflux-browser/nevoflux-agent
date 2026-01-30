@@ -881,6 +881,7 @@ mod tests {
             user_message: "Hello".into(),
             history: vec![],
             attachments: vec![],
+            local_files: vec![],
             custom_system_prompt: None,
         };
 

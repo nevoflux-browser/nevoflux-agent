@@ -1255,6 +1255,7 @@ mod tests {
             user_message: "Search for files".into(),
             history: vec![],
             attachments: vec![],
+            local_files: vec![],
             custom_system_prompt: Some(
                 "You are a specialized file search sub-agent. Focus only on finding files.".into(),
             ),
@@ -1308,6 +1309,7 @@ mod tests {
             user_message: "Hello".into(),
             history: vec![],
             attachments: vec![],
+            local_files: vec![],
             custom_system_prompt: None,
         };
 
@@ -1326,6 +1328,7 @@ mod tests {
             user_message: "Click the button".into(),
             history: vec![],
             attachments: vec![],
+            local_files: vec![],
             custom_system_prompt: None,
         };
 
@@ -1344,6 +1347,7 @@ mod tests {
             user_message: "List files".into(),
             history: vec![],
             attachments: vec![],
+            local_files: vec![],
             custom_system_prompt: None,
         };
 
@@ -1380,6 +1384,7 @@ mod tests {
             user_message: "Tell me about Rust".into(),
             history: vec![],
             attachments: vec![],
+            local_files: vec![],
             custom_system_prompt: None,
         };
 
@@ -1711,6 +1716,7 @@ mod tests {
             user_message: "Hello".into(),
             history: vec![],
             attachments: vec![],
+            local_files: vec![],
             custom_system_prompt: None,
         };
 
@@ -1733,6 +1739,7 @@ mod tests {
             user_message: "Hello".into(),
             history: vec![],
             attachments: vec![],
+            local_files: vec![],
             custom_system_prompt: None,
         };
 

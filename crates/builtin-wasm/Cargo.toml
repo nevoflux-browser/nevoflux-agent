@@ -19,6 +19,9 @@ serde_json = { workspace = true }
 # MessagePack for host-guest communication
 rmp-serde = { workspace = true }
 
+# Protocol types (for LocalFileRef)
+nevoflux-protocol = { path = "../protocol" }
+
 [dev-dependencies]
 # Tests run on native target, not wasm
 

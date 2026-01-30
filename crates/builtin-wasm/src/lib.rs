@@ -36,6 +36,7 @@ pub mod types;
 
 pub use agent::{Agent, AgentConfig};
 pub use host::{HostError, HostFunctions, HostResult};
+pub use nevoflux_protocol::LocalFileRef;
 pub use types::{
     AgentInput, AgentMode, AgentOutput, Attachment, BrowserToolResult, LlmChunk, LlmRequest,
     LlmResponse, MemoryChunk, Message, MessageRole, SkillSummary, SubagentInfo, ToolCall,
@@ -121,6 +122,7 @@ mod tests {
             user_message: "Hello".into(),
             history: vec![],
             attachments: vec![],
+            local_files: vec![],
             custom_system_prompt: None,
         };
 
@@ -142,6 +144,7 @@ mod tests {
                 user_message: "Test".into(),
                 history: vec![],
                 attachments: vec![],
+                local_files: vec![],
                 custom_system_prompt: None,
             };
 
@@ -161,6 +164,7 @@ mod tests {
             user_message: "Continue our conversation".into(),
             history: vec![Message::user("Hello"), Message::assistant("Hi there!")],
             attachments: vec![],
+            local_files: vec![],
             custom_system_prompt: None,
         };
 
@@ -184,6 +188,7 @@ mod tests {
             user_message: "Test".into(),
             history: vec![],
             attachments: vec![],
+            local_files: vec![],
             custom_system_prompt: None,
         };
 

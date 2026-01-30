@@ -2330,6 +2330,7 @@ dependencies = [
 name = "nevoflux-builtin-wasm"
 version = "0.1.0"
 dependencies = [
+ "nevoflux-protocol",
  "rmp-serde",
  "serde",
  "serde_json",

@@ -2,6 +2,7 @@
 //!
 //! These types are serialized via MessagePack for efficient transfer.
 
+use nevoflux_protocol::LocalFileRef;
 use serde::{Deserialize, Serialize};
 
 /// Agent execution mode.
@@ -183,6 +184,10 @@ pub struct AgentInput {
     /// Attachments for multimodal input (images, files).
     #[serde(default)]
     pub attachments: Vec<Attachment>,
+    /// Local file references attached by user (paths only, not content).
+    /// These are displayed in the prompt so LLM can decide to read them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_files: Vec<LocalFileRef>,
     /// Custom system prompt (overrides default mode-based prompt).
     ///
     /// When set, this replaces the built-in system prompt for the agent mode.
@@ -406,6 +411,7 @@ mod tests {
             user_message: "Help me".into(),
             history: vec![Message::system("You are helpful")],
             attachments: vec![],
+            local_files: vec![],
             custom_system_prompt: None,
         };
         assert_eq!(input.mode, AgentMode::Agent);
@@ -421,6 +427,7 @@ mod tests {
             user_message: "Search for files".into(),
             history: vec![],
             attachments: vec![],
+            local_files: vec![],
             custom_system_prompt: Some("You are a sub-agent focused on file search.".into()),
         };
         assert!(input.custom_system_prompt.is_some());
@@ -439,6 +446,7 @@ mod tests {
             user_message: "Hello".into(),
             history: vec![],
             attachments: vec![],
+            local_files: vec![],
             custom_system_prompt: Some("Custom prompt".into()),
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -452,6 +460,7 @@ mod tests {
             user_message: "Hello".into(),
             history: vec![],
             attachments: vec![],
+            local_files: vec![],
             custom_system_prompt: None,
         };
         let json2 = serde_json::to_string(&input_no_prompt).unwrap();
@@ -634,5 +643,46 @@ mod tests {
         let decoded: SubagentInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.id, 1);
         assert_eq!(decoded.task, "Test task");
+    }
+
+    #[test]
+    fn test_agent_input_with_local_files() {
+        let input = AgentInput {
+            session_id: "sess-001".into(),
+            mode: AgentMode::Chat,
+            user_message: "Analyze this file".into(),
+            history: vec![],
+            attachments: vec![],
+            local_files: vec![LocalFileRef {
+                path: "/home/user/test.rs".into(),
+                is_directory: false,
+                size: Some(1024),
+                modified: Some(1706600000),
+            }],
+            custom_system_prompt: None,
+        };
+        let json = serde_json::to_string(&input).unwrap();
+        assert!(json.contains("local_files"));
+        assert!(json.contains("/home/user/test.rs"));
+
+        let decoded: AgentInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.local_files.len(), 1);
+        assert_eq!(decoded.local_files[0].path, "/home/user/test.rs");
+    }
+
+    #[test]
+    fn test_agent_input_local_files_empty_not_serialized() {
+        let input = AgentInput {
+            session_id: "sess-001".into(),
+            mode: AgentMode::Chat,
+            user_message: "Hello".into(),
+            history: vec![],
+            attachments: vec![],
+            local_files: vec![],
+            custom_system_prompt: None,
+        };
+        let json = serde_json::to_string(&input).unwrap();
+        // Empty vec should not be serialized
+        assert!(!json.contains("local_files"));
     }
 }
