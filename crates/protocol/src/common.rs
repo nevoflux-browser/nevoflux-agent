@@ -166,6 +166,19 @@ pub enum BrowserToolAction {
     /// - `query`: Original query
     /// - `total_results`: Total number of results found
     WebSearch,
+    /// Ask the user a question and wait for response.
+    ///
+    /// Params:
+    /// - `question`: Question text to display
+    /// - `options`: Array of option strings (can be empty for free text)
+    /// - `allow_custom`: Optional, allow custom text input (default true)
+    /// - `timeout_ms`: Optional timeout for user response (default 60000)
+    ///
+    /// Returns:
+    /// - `answer`: User's response text
+    /// - `is_custom`: Whether the answer was custom input
+    /// - `selected_index`: Index of selected option (-1 if custom)
+    AskUser,
 }
 
 /// File attachment

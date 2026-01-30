@@ -962,16 +962,47 @@ impl HostFunctions for DaemonHostFunctions {
         Ok(processed_result)
     }
 
-    fn tool_ask_user(&self, question: &str, _options: &[String]) -> HostResult<String> {
-        // TODO: Integrate with browser extension for user interaction
+    fn tool_ask_user(&self, question: &str, options: &[String]) -> HostResult<String> {
         debug!(
-            "tool_ask_user not yet implemented for question: {}",
-            question
+            "tool_ask_user: question='{}', options={:?}",
+            question, options
         );
-        Err(HostError {
-            code: 501,
-            message: "User interaction not yet implemented".into(),
-        })
+
+        // Request sidebar to show user prompt and wait for response
+        let browser_result = self.execute_browser_action(
+            BrowserToolAction::AskUser,
+            serde_json::json!({
+                "question": question,
+                "options": options,
+                "allow_custom": true,
+                "timeout_ms": 60000  // 60 second timeout for user response
+            }),
+            None, // AskUser doesn't need tab_id
+        )?;
+
+        if !browser_result.success {
+            let error_msg = browser_result
+                .error
+                .unwrap_or_else(|| "Failed to get user response".into());
+            return Err(HostError {
+                code: 8001,
+                message: error_msg,
+            });
+        }
+
+        // Extract answer from response
+        let result_data = browser_result.data.ok_or_else(|| HostError {
+            code: 8001,
+            message: "No result data from ask user".into(),
+        })?;
+
+        let answer = result_data["answer"].as_str().ok_or_else(|| HostError {
+            code: 8001,
+            message: "No answer in response".into(),
+        })?;
+
+        debug!("tool_ask_user: received answer='{}'", answer);
+        Ok(answer.to_string())
     }
 
     fn permission_request(
