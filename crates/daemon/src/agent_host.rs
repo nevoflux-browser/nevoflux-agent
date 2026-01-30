@@ -840,12 +840,67 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn tool_web_fetch(&self, url: &str, prompt: &str) -> HostResult<String> {
-        // TODO: Integrate with web fetch
-        debug!("tool_web_fetch not yet implemented for url: {}", url);
-        Ok(format!(
-            "Web fetch for '{}' with prompt '{}' not yet implemented",
-            url, prompt
-        ))
+        debug!("tool_web_fetch: url={}, prompt={}", url, prompt);
+
+        // Step 1: Request sidebar to fetch URL and save to cache file
+        let browser_result = self.execute_browser_action(
+            BrowserToolAction::WebFetch,
+            serde_json::json!({
+                "url": url,
+                "timeout_ms": 30000,
+                "include_images": false,
+                "max_length": 100000
+            }),
+            None, // WebFetch doesn't need tab_id
+        )?;
+
+        if !browser_result.success {
+            let error_msg = browser_result
+                .error
+                .unwrap_or_else(|| "Failed to fetch URL".into());
+            return Err(HostError {
+                code: 6001,
+                message: error_msg,
+            });
+        }
+
+        // Step 2: Extract file path from response
+        let result_data = browser_result.data.ok_or_else(|| HostError {
+            code: 6001,
+            message: "No result data from web fetch".into(),
+        })?;
+
+        let file_path = result_data["file_path"].as_str().ok_or_else(|| HostError {
+            code: 6001,
+            message: "No file_path in response".into(),
+        })?;
+
+        let page_title = result_data["title"].as_str().unwrap_or("Untitled");
+
+        debug!(
+            "tool_web_fetch: fetched to file={}, title={}",
+            file_path, page_title
+        );
+
+        // Step 3: Read markdown content from cache file
+        let markdown_content = std::fs::read_to_string(file_path).map_err(|e| HostError {
+            code: 6005,
+            message: format!("Failed to read cache file: {}", e),
+        })?;
+
+        // Step 4: If prompt is empty, return raw content
+        if prompt.trim().is_empty() {
+            return Ok(format!(
+                "# {}\n\nSource: {}\n\n{}",
+                page_title, url, markdown_content
+            ));
+        }
+
+        // Step 5: Process content with LLM using the prompt
+        let processed_result =
+            Self::process_web_content_with_llm(self, &markdown_content, prompt, url, page_title)?;
+
+        Ok(processed_result)
     }
 
     fn tool_ask_user(&self, question: &str, _options: &[String]) -> HostResult<String> {
@@ -1494,6 +1549,56 @@ impl DaemonHostFunctions {
                 warn!("Failed to load skills from filesystem: {}", e);
             }
         }
+    }
+
+    /// Process web content with LLM using a small model.
+    ///
+    /// This takes the fetched web page content and uses the prompt to extract
+    /// or summarize the relevant information.
+    fn process_web_content_with_llm(
+        &self,
+        content: &str,
+        prompt: &str,
+        url: &str,
+        title: &str,
+    ) -> HostResult<String> {
+        use nevoflux_builtin_wasm::{LlmRequest, Message};
+
+        // Build system message for content extraction
+        let system_message = format!(
+            "You are a content extraction assistant. \
+             Extract and summarize information from the provided web page content \
+             based on the user's request.\n\n\
+             Page URL: {}\n\
+             Page Title: {}",
+            url, title
+        );
+
+        // Truncate content if too long (keep first 50000 chars to leave room for response)
+        let truncated_content = if content.len() > 50000 {
+            format!("{}...\n\n[Content truncated]", &content[..50000])
+        } else {
+            content.to_string()
+        };
+
+        let user_message = format!(
+            "Web page content:\n\n{}\n\n---\n\nUser request: {}",
+            truncated_content, prompt
+        );
+
+        let request = LlmRequest {
+            messages: vec![
+                Message::system(&system_message),
+                Message::user(&user_message),
+            ],
+            tools: vec![],
+            stream: false,
+        };
+
+        // Call LLM (non-streaming)
+        let response = self.llm_chat(&request)?;
+
+        Ok(response.text)
     }
 
     /// Execute a browser action via the browser sender channel.

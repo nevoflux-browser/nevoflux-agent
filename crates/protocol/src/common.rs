@@ -139,6 +139,21 @@ pub enum BrowserToolAction {
     FillById,
     TypeById,
     GetMarkdown,
+    /// Fetch URL content and save to cache file.
+    ///
+    /// Params:
+    /// - `url`: URL to fetch
+    /// - `timeout_ms`: Optional timeout (default 30000)
+    /// - `include_images`: Optional, include images (default false)
+    /// - `max_length`: Optional, max content length
+    ///
+    /// Returns:
+    /// - `file_path`: Path to cached markdown file
+    /// - `url`: Original URL
+    /// - `title`: Page title
+    /// - `content_length`: Content size in bytes
+    /// - `cached`: Whether result was from cache
+    WebFetch,
 }
 
 /// File attachment
