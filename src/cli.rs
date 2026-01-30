@@ -48,6 +48,7 @@ pub struct Cli {
 
 /// Available subcommands.
 #[derive(Subcommand, Debug)]
+#[allow(dead_code)] // External variant's Vec<String> is used in tests but not in main binary
 pub enum Commands {
     /// Configuration management
     Config {

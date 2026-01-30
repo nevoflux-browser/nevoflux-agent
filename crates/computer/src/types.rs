@@ -103,10 +103,11 @@ impl Region {
 }
 
 /// Mouse button.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MouseButton {
     /// Left mouse button.
+    #[default]
     Left,
     /// Right mouse button.
     Right,
@@ -114,28 +115,17 @@ pub enum MouseButton {
     Middle,
 }
 
-impl Default for MouseButton {
-    fn default() -> Self {
-        Self::Left
-    }
-}
-
 /// Click action type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClickType {
     /// Single click.
+    #[default]
     Single,
     /// Double click.
     Double,
     /// Triple click.
     Triple,
-}
-
-impl Default for ClickType {
-    fn default() -> Self {
-        Self::Single
-    }
 }
 
 /// Scroll direction.
@@ -317,19 +307,14 @@ pub enum KeyOrChar {
 }
 
 /// Screenshot format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageFormat {
     /// PNG format.
+    #[default]
     Png,
     /// JPEG format.
     Jpeg,
-}
-
-impl Default for ImageFormat {
-    fn default() -> Self {
-        Self::Png
-    }
 }
 
 /// Screenshot result.

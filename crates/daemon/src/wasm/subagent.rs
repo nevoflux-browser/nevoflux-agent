@@ -366,6 +366,7 @@ impl SubagentExecutor {
     }
 
     /// Run a subagent with timeout.
+    #[allow(clippy::too_many_arguments)]
     async fn run_subagent_with_timeout(
         id: u64,
         task: String,

@@ -156,7 +156,7 @@ impl LinuxComputer {
     /// Convert raw X11 image data (BGRA) to PNG and encode as base64.
     fn encode_to_png_base64(&self, data: &[u8], width: u32, height: u32) -> Result<String> {
         // Validate data size - must be a multiple of 4 (BGRA = 4 bytes per pixel)
-        if data.len() % 4 != 0 {
+        if !data.len().is_multiple_of(4) {
             return Err(ComputerError::ScreenshotFailed(format!(
                 "Invalid image data length: {} (not a multiple of 4)",
                 data.len()

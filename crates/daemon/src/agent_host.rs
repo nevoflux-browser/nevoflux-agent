@@ -782,7 +782,7 @@ impl HostFunctions for DaemonHostFunctions {
         let timeout = Duration::from_millis(timeout_ms.unwrap_or(120_000));
 
         // Spawn the command
-        let mut child = Command::new("bash")
+        let child = Command::new("bash")
             .arg("-c")
             .arg(command)
             .stdout(Stdio::piped())

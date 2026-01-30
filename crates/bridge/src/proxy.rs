@@ -150,7 +150,7 @@ where
                 self.daemon_client = Some(client);
                 self.state = ProxyState::Connected;
                 info!("Proxy {} connected to daemon", self.proxy_id);
-                return Ok(());
+                Ok(())
             }
             Err(e) => {
                 debug!("Initial connection failed: {}", e);
@@ -180,7 +180,10 @@ where
                                 Ok(()) => {
                                     self.daemon_client = Some(retry_client);
                                     self.state = ProxyState::Connected;
-                                    info!("Proxy {} connected to daemon after auto-launch", self.proxy_id);
+                                    info!(
+                                        "Proxy {} connected to daemon after auto-launch",
+                                        self.proxy_id
+                                    );
                                     return Ok(());
                                 }
                                 Err(e) => {

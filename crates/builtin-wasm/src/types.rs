@@ -5,21 +5,16 @@
 use serde::{Deserialize, Serialize};
 
 /// Agent execution mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentMode {
     /// Chat mode - dialogue + current page understanding.
+    #[default]
     Chat,
     /// Browser mode - active browser control.
     Browser,
     /// Agent mode - full capabilities including file/bash/computer use.
     Agent,
-}
-
-impl Default for AgentMode {
-    fn default() -> Self {
-        Self::Chat
-    }
 }
 
 /// Message role in conversation.

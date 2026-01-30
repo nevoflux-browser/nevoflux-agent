@@ -170,7 +170,7 @@ pub async fn start_server(
         while let Some((identity, envelope)) = msg_rx.recv().await {
             let proxy_id = envelope.proxy_id.clone();
             let request_id = envelope.request_id.clone();
-            let channel = envelope.channel.clone();
+            let channel = envelope.channel;
 
             // Register proxy if not already registered (pid 0 for native messaging)
             if !process_router.proxy_registry().is_registered(&proxy_id) {
@@ -237,6 +237,7 @@ pub async fn start_server(
 ///
 /// This function processes chat messages and streams the response back to the sidebar
 /// in real-time as the LLM generates output.
+#[allow(clippy::too_many_arguments)]
 async fn handle_chat_message_streaming(
     payload: &serde_json::Value,
     config: &Arc<AgentConfig>,
@@ -398,7 +399,7 @@ async fn handle_chat_message_streaming(
 
     // Clone variables for the streaming forwarder task
     let stream_proxy_id = proxy_id.clone();
-    let stream_channel = channel.clone();
+    let stream_channel = channel;
     let stream_request_id = request_id.clone();
     let stream_identity = identity.clone();
     let stream_response_tx = response_tx.clone();
@@ -1134,7 +1135,7 @@ async fn handle_session_clone(
     let mut cloned_messages = Vec::new();
     for msg in &source_messages {
         match session_manager
-            .add_message(target_id, msg.role.clone(), &msg.content)
+            .add_message(target_id, msg.role, &msg.content)
             .await
         {
             Ok(new_msg) => {
@@ -1982,12 +1983,11 @@ async fn handle_file_pick(params: &serde_json::Value) -> serde_json::Value {
                 nevoflux_protocol::PickFilesError::NoDisplay => {
                     ("NO_DISPLAY", "No graphical display available".to_string())
                 }
-                nevoflux_protocol::PickFilesError::AlreadyPicking => {
-                    ("ALREADY_PICKING", "A file picker dialog is already open".to_string())
-                }
-                nevoflux_protocol::PickFilesError::DialogFailed(msg) => {
-                    ("DIALOG_FAILED", msg)
-                }
+                nevoflux_protocol::PickFilesError::AlreadyPicking => (
+                    "ALREADY_PICKING",
+                    "A file picker dialog is already open".to_string(),
+                ),
+                nevoflux_protocol::PickFilesError::DialogFailed(msg) => ("DIALOG_FAILED", msg),
             };
 
             serde_json::json!({

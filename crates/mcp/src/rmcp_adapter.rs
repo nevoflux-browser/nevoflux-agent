@@ -229,27 +229,24 @@ impl RmcpClient {
         });
 
         // Extract capabilities from InitializeResult
-        let capabilities =
-            service.peer_info().and_then(|result| {
-                Some(ServerCapabilities {
-                    tools: result.capabilities.tools.as_ref().map(|_| {
-                        crate::types::ToolsCapability {
-                            list_changed: false,
-                        }
-                    }),
-                    resources: result.capabilities.resources.as_ref().map(|r| {
-                        crate::types::ResourcesCapability {
-                            list_changed: false,
-                            subscribe: r.subscribe.unwrap_or(false),
-                        }
-                    }),
-                    prompts: result.capabilities.prompts.as_ref().map(|_| {
-                        crate::types::PromptsCapability {
-                            list_changed: false,
-                        }
-                    }),
-                })
-            });
+        let capabilities = service.peer_info().map(|result| ServerCapabilities {
+            tools: result.capabilities.tools.as_ref().map(|_| {
+                crate::types::ToolsCapability {
+                    list_changed: false,
+                }
+            }),
+            resources: result.capabilities.resources.as_ref().map(|r| {
+                crate::types::ResourcesCapability {
+                    list_changed: false,
+                    subscribe: r.subscribe.unwrap_or(false),
+                }
+            }),
+            prompts: result.capabilities.prompts.as_ref().map(|_| {
+                crate::types::PromptsCapability {
+                    list_changed: false,
+                }
+            }),
+        });
 
         Ok(Self {
             service: Arc::new(RwLock::new(Some(service))),
@@ -353,7 +350,7 @@ impl RmcpClient {
         let service = service_guard.as_ref().ok_or(McpError::NotInitialized)?;
 
         let params = rmcp::model::ReadResourceRequestParams {
-            uri: uri.to_string().into(),
+            uri: uri.to_string(),
             meta: None,
         };
 

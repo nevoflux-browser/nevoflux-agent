@@ -4,23 +4,18 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Source of a skill.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillSource {
     /// Built-in skill bundled with the agent.
     Builtin,
     /// User-defined skill from the user's skills directory.
+    #[default]
     User,
     /// Plugin-provided skill.
     Plugin { plugin_id: String },
     /// Remote skill loaded from a URL.
     Remote { url: String },
-}
-
-impl Default for SkillSource {
-    fn default() -> Self {
-        Self::User
-    }
 }
 
 /// Skill metadata from frontmatter.
