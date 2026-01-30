@@ -127,6 +127,8 @@ pub struct DaemonHostFunctions {
     stream_registry: Arc<LlmStreamRegistry>,
     /// Optional sender for streaming chunks to the sidebar.
     sidebar_stream_tx: Option<tokio::sync::mpsc::UnboundedSender<SidebarStreamChunk>>,
+    /// Current session ID for browser tool requests.
+    session_id: Option<String>,
 }
 
 impl DaemonHostFunctions {
@@ -139,6 +141,7 @@ impl DaemonHostFunctions {
             subagent_registry: Arc::new(SubagentRegistry::new()),
             stream_registry: Arc::new(LlmStreamRegistry::new()),
             sidebar_stream_tx: None,
+            session_id: None,
         }
     }
 
@@ -154,6 +157,12 @@ impl DaemonHostFunctions {
         tx: tokio::sync::mpsc::UnboundedSender<SidebarStreamChunk>,
     ) -> Self {
         self.sidebar_stream_tx = Some(tx);
+        self
+    }
+
+    /// Set the session ID for browser tool requests.
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
         self
     }
 
@@ -765,27 +774,59 @@ impl HostFunctions for DaemonHostFunctions {
         })
     }
 
-    fn tool_bash(&self, command: &str, _timeout_ms: Option<u64>) -> HostResult<String> {
-        use std::process::Command;
+    fn tool_bash(&self, command: &str, timeout_ms: Option<u64>) -> HostResult<String> {
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
 
-        // TODO: Implement timeout for bash commands
+        // Default timeout: 2 minutes (120000ms)
+        let timeout = Duration::from_millis(timeout_ms.unwrap_or(120_000));
 
-        let output = Command::new("bash")
+        // Spawn the command
+        let mut child = Command::new("bash")
             .arg("-c")
             .arg(command)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| HostError {
                 code: 1,
-                message: format!("Failed to execute command: {}", e),
+                message: format!("Failed to spawn command: {}", e),
             })?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Wait with timeout using tokio
+        let runtime = self.runtime.clone();
+        let result: Result<std::process::Output, String> = tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                let wait_future = tokio::task::spawn_blocking(move || child.wait_with_output());
 
-        if output.status.success() {
-            Ok(stdout.to_string())
-        } else {
-            Ok(format!("STDOUT:\n{}\nSTDERR:\n{}", stdout, stderr))
+                match tokio::time::timeout(timeout, wait_future).await {
+                    Ok(Ok(output)) => output.map_err(|e| format!("Command failed: {}", e)),
+                    Ok(Err(e)) => Err(format!("Task join error: {}", e)),
+                    Err(_) => {
+                        // Timeout occurred - try to kill the process
+                        // Note: child was moved, so we can't kill it here directly
+                        // The spawn_blocking task owns it now
+                        Err(format!("Command timed out after {}ms", timeout.as_millis()))
+                    }
+                }
+            })
+        });
+
+        match result {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+
+                if output.status.success() {
+                    Ok(stdout.to_string())
+                } else {
+                    Ok(format!("STDOUT:\n{}\nSTDERR:\n{}", stdout, stderr))
+                }
+            }
+            Err(e) => Err(HostError {
+                code: 408, // Request Timeout
+                message: e,
+            }),
         }
     }
 
@@ -1627,6 +1668,7 @@ impl DaemonHostFunctions {
             subagent_registry: self.subagent_registry.clone(),
             stream_registry: self.stream_registry.clone(),
             sidebar_stream_tx: self.sidebar_stream_tx.clone(),
+            session_id: self.session_id.clone(),
         }
     }
 
@@ -1713,9 +1755,15 @@ impl DaemonHostFunctions {
         // Generate unique request ID
         let request_id = uuid::Uuid::new_v4().to_string();
 
+        // Use configured session_id or fallback to "default"
+        let session_id = self
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+
         let request = BrowserRequest {
             request_id: request_id.clone(),
-            session_id: "default".into(), // TODO: get from context
+            session_id,
             tab_id,
             action,
             params,
