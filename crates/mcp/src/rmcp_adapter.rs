@@ -230,11 +230,13 @@ impl RmcpClient {
 
         // Extract capabilities from InitializeResult
         let capabilities = service.peer_info().map(|result| ServerCapabilities {
-            tools: result.capabilities.tools.as_ref().map(|_| {
-                crate::types::ToolsCapability {
+            tools: result
+                .capabilities
+                .tools
+                .as_ref()
+                .map(|_| crate::types::ToolsCapability {
                     list_changed: false,
-                }
-            }),
+                }),
             resources: result.capabilities.resources.as_ref().map(|r| {
                 crate::types::ResourcesCapability {
                     list_changed: false,

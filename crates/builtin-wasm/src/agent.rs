@@ -19,11 +19,12 @@ fn format_local_files(files: &[LocalFileRef]) -> String {
     let mut result = String::from("用户附加了以下本地文件/目录：\n");
 
     for file in files {
-        let type_str = if file.is_directory { "目录" } else { "文件" };
-        let size_str = file
-            .size
-            .map(format_file_size)
-            .unwrap_or_default();
+        let type_str = if file.is_directory {
+            "目录"
+        } else {
+            "文件"
+        };
+        let size_str = file.size.map(format_file_size).unwrap_or_default();
 
         if file.is_directory {
             result.push_str(&format!("- {} ({})\n", file.path, type_str));

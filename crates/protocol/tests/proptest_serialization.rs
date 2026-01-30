@@ -129,9 +129,9 @@ fn arb_picker_mode() -> impl Strategy<Value = PickerMode> {
 
 fn arb_file_info() -> impl Strategy<Value = FileInfo> {
     (
-        "/[a-z]{1,10}/[a-z]{1,10}\\.[a-z]{2,4}", // path
-        any::<bool>(),                            // is_directory
-        proptest::option::of(0u64..1000000u64),   // size
+        "/[a-z]{1,10}/[a-z]{1,10}\\.[a-z]{2,4}",            // path
+        any::<bool>(),                                      // is_directory
+        proptest::option::of(0u64..1000000u64),             // size
         proptest::option::of(1700000000u64..1800000000u64), // modified
     )
         .prop_map(|(path, is_directory, size, modified)| FileInfo {
