@@ -5,6 +5,7 @@ use crate::config::AgentConfig;
 use crate::error::{DaemonError, Result};
 use crate::router::{RouteDecision, Router};
 use crate::session::SessionManager;
+use crate::wasm::HostServices;
 use bytes::Bytes;
 use nevoflux_builtin_wasm::{Agent, AgentInput, AgentMode, Attachment};
 use nevoflux_protocol::{Channel, DaemonEnvelope, ProxyEnvelope};
@@ -85,6 +86,10 @@ pub async fn start_server(
     let agent_config = AgentConfig::load().unwrap_or_default();
     let agent_config = Arc::new(agent_config);
 
+    // Create host services with database from session manager
+    let db = session_manager.storage().database().clone();
+    let services = HostServices::new(Arc::new(db));
+
     let mut socket = zeromq::RouterSocket::new();
     socket
         .bind(&addr)
@@ -159,6 +164,7 @@ pub async fn start_server(
     let process_response_tx = response_tx.clone();
     let process_config = agent_config.clone();
     let process_session_manager = session_manager.clone();
+    let process_services = services.clone();
     let process_runtime = tokio::runtime::Handle::current();
     tokio::spawn(async move {
         while let Some((identity, envelope)) = msg_rx.recv().await {
@@ -198,6 +204,7 @@ pub async fn start_server(
                         &envelope.payload,
                         &process_config,
                         &process_session_manager,
+                        &process_services,
                         process_runtime.clone(),
                         identity,
                         proxy_id,
@@ -234,6 +241,7 @@ async fn handle_chat_message_streaming(
     payload: &serde_json::Value,
     config: &Arc<AgentConfig>,
     session_manager: &Arc<SessionManager>,
+    services: &HostServices,
     runtime: tokio::runtime::Handle,
     identity: Vec<u8>,
     proxy_id: String,
@@ -245,7 +253,8 @@ async fn handle_chat_message_streaming(
 
     // For non-chat_message types, handle synchronously
     if msg_type != "chat_message" {
-        let response_payload = handle_chat_message(payload, config, session_manager, runtime).await;
+        let response_payload =
+            handle_chat_message(payload, config, session_manager, services, runtime).await;
         let response =
             DaemonEnvelope::new(&proxy_id, channel, response_payload).with_request_id(&request_id);
         if let Err(e) = response_tx.send((identity, response)).await {
@@ -370,8 +379,9 @@ async fn handle_chat_message_streaming(
     let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<SidebarStreamChunk>();
 
     // Create host functions with streaming support
-    let host =
-        DaemonHostFunctions::new(config.clone(), runtime.clone()).with_sidebar_stream(stream_tx);
+    let host = DaemonHostFunctions::new(config.clone(), runtime.clone())
+        .with_services(services.clone())
+        .with_sidebar_stream(stream_tx);
 
     // Create agent with host functions
     let agent = Agent::new(host);
@@ -553,6 +563,7 @@ async fn handle_chat_message(
     payload: &serde_json::Value,
     config: &Arc<AgentConfig>,
     session_manager: &Arc<SessionManager>,
+    services: &HostServices,
     runtime: tokio::runtime::Handle,
 ) -> serde_json::Value {
     let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -678,7 +689,8 @@ async fn handle_chat_message(
             }
 
             // Create host functions with config and runtime
-            let host = DaemonHostFunctions::new(config.clone(), runtime);
+            let host =
+                DaemonHostFunctions::new(config.clone(), runtime).with_services(services.clone());
 
             // Create agent with host functions
             let agent = Agent::new(host);
@@ -817,6 +829,7 @@ async fn handle_chat_message(
                 "mcp.test" => handle_mcp_test(&params).await,
                 "mcp.connect" => handle_mcp_connect(&params).await,
                 "mcp.disconnect" => handle_mcp_disconnect(&params).await,
+                "file.pick" => handle_file_pick(&params).await,
                 _ => {
                     serde_json::json!({
                         "type": "system_response",
@@ -1875,6 +1888,122 @@ async fn handle_mcp_disconnect(params: &serde_json::Value) -> serde_json::Value 
             }
         }
     })
+}
+
+/// Handle file.pick command.
+///
+/// Opens a native file picker dialog and returns selected files.
+async fn handle_file_pick(params: &serde_json::Value) -> serde_json::Value {
+    use crate::file_picker::pick_files;
+    use nevoflux_protocol::{PickFilesRequest, PickerMode};
+
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Parse picker mode
+    let mode = params
+        .get("mode")
+        .and_then(|m| m.as_str())
+        .map(|m| match m {
+            "files" => PickerMode::Files,
+            "directories" => PickerMode::Directories,
+            _ => PickerMode::Both,
+        })
+        .unwrap_or(PickerMode::Both);
+
+    let multiple = params
+        .get("multiple")
+        .and_then(|m| m.as_bool())
+        .unwrap_or(false);
+
+    let title = params
+        .get("title")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string());
+
+    let default_path = params
+        .get("default_path")
+        .and_then(|p| p.as_str())
+        .map(|s| s.to_string());
+
+    let req = PickFilesRequest {
+        mode,
+        multiple,
+        title,
+        default_path,
+    };
+
+    info!(
+        "File picker requested: mode={:?}, multiple={}",
+        req.mode, req.multiple
+    );
+
+    match pick_files(req).await {
+        Ok(response) => {
+            let files: Vec<serde_json::Value> = response
+                .files
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "path": f.path,
+                        "is_directory": f.is_directory,
+                        "size": f.size,
+                        "modified": f.modified
+                    })
+                })
+                .collect();
+
+            info!(
+                "File picker completed: {} files selected, cancelled={}",
+                files.len(),
+                response.cancelled
+            );
+
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "file.pick",
+                    "success": true,
+                    "data": {
+                        "files": files,
+                        "cancelled": response.cancelled
+                    }
+                }
+            })
+        }
+        Err(e) => {
+            error!("File picker failed: {:?}", e);
+
+            let (code, message) = match e {
+                nevoflux_protocol::PickFilesError::NoDisplay => {
+                    ("NO_DISPLAY", "No graphical display available".to_string())
+                }
+                nevoflux_protocol::PickFilesError::AlreadyPicking => {
+                    ("ALREADY_PICKING", "A file picker dialog is already open".to_string())
+                }
+                nevoflux_protocol::PickFilesError::DialogFailed(msg) => {
+                    ("DIALOG_FAILED", msg)
+                }
+            };
+
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "file.pick",
+                    "success": false,
+                    "error": {
+                        "code": code,
+                        "message": message
+                    }
+                }
+            })
+        }
+    }
 }
 
 #[cfg(test)]
