@@ -657,3 +657,214 @@ async fn test_openai_streaming_tool_calling_full_streaming() {
 
     println!("\n✅ Full streaming tool call test passed!");
 }
+
+/// Helper struct to track tool calls and build messages for multi-round tests
+struct ToolCallTracker {
+    messages: Vec<LlmMessage>,
+    tools: Vec<LlmToolDefinition>,
+}
+
+impl ToolCallTracker {
+    fn new(initial_user_message: &str, system: Option<&str>, tools: Vec<LlmToolDefinition>) -> Self {
+        let mut messages = Vec::new();
+        if let Some(sys) = system {
+            messages.push(LlmMessage {
+                role: "system".into(),
+                content: sys.into(),
+                tool_calls: None,
+                tool_call_id: None,
+                attachments: vec![],
+            });
+        }
+        messages.push(LlmMessage::user(initial_user_message));
+        Self { messages, tools }
+    }
+
+    fn add_assistant_with_tool_calls(&mut self, tool_calls: Vec<LlmToolCall>) {
+        self.messages
+            .push(LlmMessage::assistant_with_tool_calls(tool_calls));
+    }
+
+    fn add_tool_result(&mut self, tool_call_id: &str, content: &str) {
+        self.messages
+            .push(LlmMessage::tool_result(tool_call_id, content));
+    }
+
+    fn build_request(&self) -> LlmChatRequest {
+        LlmChatRequest {
+            messages: self.messages.clone(),
+            system: None, // System is included in messages
+            temperature: Some(0.0),
+            max_tokens: Some(300),
+            tools: Some(self.tools.clone()),
+        }
+    }
+
+    fn build_request_no_tools(&self) -> LlmChatRequest {
+        LlmChatRequest {
+            messages: self.messages.clone(),
+            system: None,
+            temperature: Some(0.0),
+            max_tokens: Some(300),
+            tools: None,
+        }
+    }
+}
+
+/// Collect all chunks from a stream until done, returning (text, tool_calls)
+async fn collect_stream(
+    registry: &LlmStreamRegistry,
+    stream_id: u64,
+) -> (String, Vec<LlmToolCall>) {
+    let mut combined_text = String::new();
+    let mut all_tool_calls = Vec::new();
+
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        match registry.next_chunk(stream_id) {
+            Ok(Some(chunk)) => {
+                if let Some(text) = &chunk.text {
+                    combined_text.push_str(text);
+                }
+                all_tool_calls.extend(chunk.tool_calls);
+                if chunk.done {
+                    break;
+                }
+            }
+            Ok(None) => continue,
+            Err(e) => panic!("Stream error: {:?}", e),
+        }
+    }
+    registry.close(stream_id);
+
+    (combined_text, all_tool_calls)
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_multi_round_tool_calling() {
+    // This test simulates the real agent loop:
+    // User question → Tool Call 1 → Result 1 → Tool Call 2 → Result 2 → Final Response
+    //
+    // Scenario: User asks about weather in two cities
+    // Round 1: LLM calls get_weather for first city
+    // Round 2: LLM calls get_weather for second city
+    // Round 3: LLM synthesizes both results into final answer
+
+    let api_key = match get_env_key("OPENAI_API_KEY") {
+        Some(key) => key,
+        None => {
+            eprintln!("Skipping: OPENAI_API_KEY not set");
+            return;
+        }
+    };
+
+    let registry = Arc::new(LlmStreamRegistry::new());
+
+    let tools = vec![LlmToolDefinition {
+        name: "get_weather".into(),
+        description: "Get the current weather in a given location. Call this once per city."
+            .into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": "The city name"
+                }
+            },
+            "required": ["location"]
+        }),
+    }];
+
+    let mut tracker = ToolCallTracker::new(
+        "What's the weather in Tokyo and Paris? Use the get_weather tool for each city separately.",
+        Some("You are a helpful assistant. When asked about weather in multiple cities, call the get_weather tool once for each city. Do not try to get weather for multiple cities in a single call."),
+        tools,
+    );
+
+    let mut round = 0;
+    const MAX_ROUNDS: usize = 5;
+
+    loop {
+        round += 1;
+        if round > MAX_ROUNDS {
+            panic!("Too many rounds, possible infinite loop");
+        }
+
+        println!("\n=== Round {} (messages: {}) ===", round, tracker.messages.len());
+
+        // Build request (include tools unless we've done multiple rounds)
+        let request = if round <= 3 {
+            tracker.build_request()
+        } else {
+            tracker.build_request_no_tools()
+        };
+
+        // Start streaming request
+        let stream_id = start_llm_stream(
+            ProviderType::OpenAi,
+            &api_key,
+            "gpt-4o-mini",
+            request,
+            registry.clone(),
+        )
+        .await
+        .expect("Failed to start stream");
+
+        let (text, tool_calls) = collect_stream(&registry, stream_id).await;
+
+        println!("Response text: {}", if text.is_empty() { "(empty)" } else { &text });
+        println!("Tool calls: {}", tool_calls.len());
+
+        if tool_calls.is_empty() {
+            // No more tool calls, we have the final response
+            println!("\n=== Final Response ===");
+            println!("{}", text);
+
+            // Verify the response mentions both cities
+            let text_lower = text.to_lowercase();
+            assert!(
+                text_lower.contains("tokyo") || text_lower.contains("東京"),
+                "Response should mention Tokyo"
+            );
+            assert!(
+                text_lower.contains("paris") || text_lower.contains("巴黎"),
+                "Response should mention Paris"
+            );
+
+            println!("\n✅ Multi-round tool calling test passed! (completed in {} rounds)", round);
+            return;
+        }
+
+        // When model returns multiple tool calls, we need to:
+        // 1. Add ONE assistant message with ALL tool calls
+        // 2. Add ONE tool result for EACH tool call
+        tracker.add_assistant_with_tool_calls(tool_calls.clone());
+
+        // Process each tool call and add results
+        for tc in &tool_calls {
+            println!(
+                "  Tool call: {} (id={}, call_id={:?})",
+                tc.name, tc.id, tc.call_id
+            );
+
+            let call_id = tc.call_id.as_ref().unwrap_or(&tc.id);
+            let location = tc.arguments["location"].as_str().unwrap_or("unknown");
+
+            // Simulate tool execution with fake weather data
+            let weather_result = match location.to_lowercase().as_str() {
+                l if l.contains("tokyo") => {
+                    r#"{"temperature": "18°C", "condition": "Cloudy", "humidity": "60%"}"#
+                }
+                l if l.contains("paris") => {
+                    r#"{"temperature": "12°C", "condition": "Rainy", "humidity": "80%"}"#
+                }
+                _ => r#"{"temperature": "20°C", "condition": "Unknown", "humidity": "50%"}"#,
+            };
+
+            println!("  -> Result for {}: {}", location, weather_result);
+            tracker.add_tool_result(call_id, weather_result);
+        }
+    }
+}
