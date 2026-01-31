@@ -577,14 +577,27 @@ where
         }
     }
 
-    // Get the last user message with text content as the prompt.
-    // Tool result messages are also User messages but should not be used as the prompt.
-    let (prompt, chat_history) = if chat_history.is_empty() {
+    // Check if we have any messages
+    if chat_history.is_empty() {
         return Err(DaemonError::InternalError(
             "LLM chat requires at least one user message".into(),
         ));
+    }
+
+    // Check if this is a continuation after tool calls (has tool result messages)
+    let has_tool_results = chat_history
+        .iter()
+        .any(|m| matches!(m, Message::User { content } if content.iter().any(|c| matches!(c, UserContent::ToolResult(_)))));
+
+    // Build the completion request
+    // IMPORTANT: rig's builder appends prompt to the END of chat_history.
+    // For multi-turn with tool results, we must keep all messages in their original order,
+    // so we use empty prompt and put everything in chat_history.
+    let (prompt, chat_history) = if has_tool_results {
+        // Continuation after tool calls: keep all messages in order, use empty prompt
+        (String::new(), chat_history)
     } else {
-        // Find the last user message that contains text content (not just tool results)
+        // First request or no tool results: extract last user message as prompt
         let last_text_user_idx = chat_history.iter().rposition(|m| match m {
             Message::User { content } => content.iter().any(|c| matches!(c, UserContent::Text(_))),
             _ => false,
@@ -596,8 +609,6 @@ where
             history.remove(idx);
             (prompt, history)
         } else {
-            // No text user message found - this can happen when all user messages are tool results.
-            // In this case, use an empty prompt and keep all messages in history.
             (String::new(), chat_history)
         }
     };
@@ -1176,14 +1187,27 @@ where
         }
     }
 
-    // Get the last user message with text content as the prompt.
-    // Tool result messages are also User messages but should not be used as the prompt.
-    let (prompt, chat_history) = if chat_history.is_empty() {
+    // Check if we have any messages
+    if chat_history.is_empty() {
         return Err(DaemonError::InternalError(
             "LLM stream requires at least one user message".into(),
         ));
+    }
+
+    // Check if this is a continuation after tool calls (has tool result messages)
+    let has_tool_results = chat_history
+        .iter()
+        .any(|m| matches!(m, Message::User { content } if content.iter().any(|c| matches!(c, UserContent::ToolResult(_)))));
+
+    // Build the completion request
+    // IMPORTANT: rig's builder appends prompt to the END of chat_history.
+    // For multi-turn with tool results, we must keep all messages in their original order,
+    // so we use empty prompt and put everything in chat_history.
+    let (prompt, chat_history) = if has_tool_results {
+        // Continuation after tool calls: keep all messages in order, use empty prompt
+        (String::new(), chat_history)
     } else {
-        // Find the last user message that contains text content (not just tool results)
+        // First request or no tool results: extract last user message as prompt
         let last_text_user_idx = chat_history.iter().rposition(|m| match m {
             Message::User { content } => content.iter().any(|c| matches!(c, UserContent::Text(_))),
             _ => false,
@@ -1195,13 +1219,10 @@ where
             history.remove(idx);
             (prompt, history)
         } else {
-            // No text user message found - this can happen when all user messages are tool results.
-            // In this case, use an empty prompt and keep all messages in history.
             (String::new(), chat_history)
         }
     };
 
-    // Build the completion request
     let mut builder = completion_model.completion_request(&prompt);
 
     if let Some(preamble) = system_prompt {

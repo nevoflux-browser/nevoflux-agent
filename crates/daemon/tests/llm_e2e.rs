@@ -863,7 +863,6 @@ async fn test_multi_round_tool_calling() {
                 _ => r#"{"temperature": "20°C", "condition": "Unknown", "humidity": "50%"}"#,
             };
 
-            println!("  -> Result for {}: {}", location, weather_result);
             tracker.add_tool_result(call_id, weather_result);
         }
     }
