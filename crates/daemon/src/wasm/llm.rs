@@ -11,7 +11,8 @@ use rig::client::CompletionClient;
 use rig::client::Nothing;
 use rig::completion::{CompletionModel, ToolDefinition};
 use rig::message::{
-    AssistantContent, DocumentSourceKind, Image, ImageMediaType, Message, UserContent,
+    AssistantContent, DocumentSourceKind, Image, ImageMediaType, Message, Text,
+    ToolCall as RigToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
 };
 use rig::providers::{
     anthropic, cohere, deepseek, gemini, groq, mistral, ollama, openai, openrouter, perplexity,
@@ -54,8 +55,13 @@ impl From<LlmToolDefinition> for ToolDefinition {
 /// Represents a request from the LLM to invoke a specific tool with given arguments.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmToolCall {
-    /// Unique identifier for this tool call (used to match with tool results).
+    /// Unique identifier for this tool call.
     pub id: String,
+    /// The call ID used to match tool results with tool calls.
+    /// For OpenAI Responses API, this is different from `id` and MUST be used
+    /// when sending tool results back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     /// The name of the tool to invoke.
     pub name: String,
     /// The arguments to pass to the tool (JSON object).
@@ -477,36 +483,68 @@ where
                 system_prompt = Some(msg.content.clone());
             }
             "tool" => {
-                // Tool results are included as user messages with tool_result content
-                let tool_content = if let Some(ref id) = msg.tool_call_id {
-                    format!("[Tool Result for {}]: {}", id, msg.content)
-                } else {
-                    msg.content.clone()
+                // Tool results must be sent as ToolResult content, not plain text
+                let tool_call_id = msg.tool_call_id.clone().unwrap_or_default();
+                tracing::info!(
+                    "Converting tool result: tool_call_id={}, content_len={}, starts_with_call={}, starts_with_fc={}",
+                    tool_call_id,
+                    msg.content.len(),
+                    tool_call_id.starts_with("call_"),
+                    tool_call_id.starts_with("fc_")
+                );
+                let tool_result = ToolResult {
+                    id: tool_call_id.clone(),
+                    call_id: Some(tool_call_id),
+                    content: OneOrMany::one(ToolResultContent::Text(Text {
+                        text: msg.content.clone(),
+                    })),
                 };
                 chat_history.push(Message::User {
-                    content: OneOrMany::one(UserContent::text(tool_content)),
+                    content: OneOrMany::one(UserContent::ToolResult(tool_result)),
                 });
             }
             "assistant" => {
-                // For assistant messages with tool_calls, format them for context
-                let content = if let Some(ref tool_calls) = msg.tool_calls {
-                    if msg.content.is_empty() {
-                        // Format tool calls for context
-                        let calls: Vec<String> = tool_calls
-                            .iter()
-                            .map(|tc| format!("{}({})", tc.name, tc.arguments))
-                            .collect();
-                        format!("[Tool Calls]: {}", calls.join(", "))
-                    } else {
-                        msg.content.clone()
+                // Build assistant content - may include text and/or tool calls
+                let mut assistant_contents: Vec<AssistantContent> = Vec::new();
+
+                // Add text content if present
+                if !msg.content.is_empty() {
+                    assistant_contents.push(AssistantContent::text(&msg.content));
+                }
+
+                // Add tool calls if present - these must be properly structured
+                if let Some(ref tool_calls) = msg.tool_calls {
+                    tracing::debug!(
+                        "Converting assistant tool_calls: count={}, ids={:?}, call_ids={:?}",
+                        tool_calls.len(),
+                        tool_calls.iter().map(|tc| &tc.id).collect::<Vec<_>>(),
+                        tool_calls.iter().map(|tc| &tc.call_id).collect::<Vec<_>>()
+                    );
+                    for tc in tool_calls {
+                        let mut rig_tool_call = RigToolCall::new(
+                            tc.id.clone(),
+                            ToolFunction::new(tc.name.clone(), tc.arguments.clone()),
+                        );
+                        // OpenAI Responses API requires call_id to be set
+                        if let Some(ref call_id) = tc.call_id {
+                            rig_tool_call = rig_tool_call.with_call_id(call_id.clone());
+                        }
+                        assistant_contents.push(AssistantContent::ToolCall(rig_tool_call));
                     }
+                }
+
+                // If no content at all, add empty text
+                if assistant_contents.is_empty() {
+                    assistant_contents.push(AssistantContent::text(""));
+                }
+
+                let content = if assistant_contents.len() == 1 {
+                    OneOrMany::one(assistant_contents.remove(0))
                 } else {
-                    msg.content.clone()
+                    OneOrMany::many(assistant_contents)
+                        .unwrap_or_else(|_| OneOrMany::one(AssistantContent::text("")))
                 };
-                chat_history.push(Message::Assistant {
-                    id: None,
-                    content: OneOrMany::one(AssistantContent::text(content)),
-                });
+                chat_history.push(Message::Assistant { id: None, content });
             }
             _ => {
                 // Treat as user message, with optional attachments
@@ -539,22 +577,29 @@ where
         }
     }
 
-    // Get the last user message as the prompt
+    // Get the last user message with text content as the prompt.
+    // Tool result messages are also User messages but should not be used as the prompt.
     let (prompt, chat_history) = if chat_history.is_empty() {
         return Err(DaemonError::InternalError(
             "LLM chat requires at least one user message".into(),
         ));
     } else {
-        // Find the last user message to use as the prompt
-        let last_user_idx = chat_history
-            .iter()
-            .rposition(|m| matches!(m, Message::User { .. }))
-            .unwrap_or(chat_history.len() - 1);
+        // Find the last user message that contains text content (not just tool results)
+        let last_text_user_idx = chat_history.iter().rposition(|m| match m {
+            Message::User { content } => content.iter().any(|c| matches!(c, UserContent::Text(_))),
+            _ => false,
+        });
 
-        let prompt = extract_text_from_message(&chat_history[last_user_idx]);
-        let mut history = chat_history;
-        history.remove(last_user_idx);
-        (prompt, history)
+        if let Some(idx) = last_text_user_idx {
+            let prompt = extract_text_from_message(&chat_history[idx]);
+            let mut history = chat_history;
+            history.remove(idx);
+            (prompt, history)
+        } else {
+            // No text user message found - this can happen when all user messages are tool results.
+            // In this case, use an empty prompt and keep all messages in history.
+            (String::new(), chat_history)
+        }
     };
 
     // Build the completion request using the builder pattern
@@ -630,6 +675,7 @@ fn process_completion_response(choice: OneOrMany<AssistantContent>) -> Result<Ll
             AssistantContent::ToolCall(tc) => {
                 tool_calls.push(LlmToolCall {
                     id: tc.id.clone(),
+                    call_id: tc.call_id.clone(),
                     name: tc.function.name.clone(),
                     arguments: tc.function.arguments.clone(),
                 });
@@ -1042,33 +1088,68 @@ where
                 system_prompt = Some(msg.content.clone());
             }
             "tool" => {
-                let tool_content = if let Some(ref id) = msg.tool_call_id {
-                    format!("[Tool Result for {}]: {}", id, msg.content)
-                } else {
-                    msg.content.clone()
+                // Tool results must be sent as ToolResult content, not plain text
+                let tool_call_id = msg.tool_call_id.clone().unwrap_or_default();
+                tracing::info!(
+                    "Converting tool result: tool_call_id={}, content_len={}, starts_with_call={}, starts_with_fc={}",
+                    tool_call_id,
+                    msg.content.len(),
+                    tool_call_id.starts_with("call_"),
+                    tool_call_id.starts_with("fc_")
+                );
+                let tool_result = ToolResult {
+                    id: tool_call_id.clone(),
+                    call_id: Some(tool_call_id),
+                    content: OneOrMany::one(ToolResultContent::Text(Text {
+                        text: msg.content.clone(),
+                    })),
                 };
                 chat_history.push(Message::User {
-                    content: OneOrMany::one(UserContent::text(tool_content)),
+                    content: OneOrMany::one(UserContent::ToolResult(tool_result)),
                 });
             }
             "assistant" => {
-                let content = if let Some(ref tool_calls) = msg.tool_calls {
-                    if msg.content.is_empty() {
-                        let calls: Vec<String> = tool_calls
-                            .iter()
-                            .map(|tc| format!("{}({})", tc.name, tc.arguments))
-                            .collect();
-                        format!("[Tool Calls]: {}", calls.join(", "))
-                    } else {
-                        msg.content.clone()
+                // Build assistant content - may include text and/or tool calls
+                let mut assistant_contents: Vec<AssistantContent> = Vec::new();
+
+                // Add text content if present
+                if !msg.content.is_empty() {
+                    assistant_contents.push(AssistantContent::text(&msg.content));
+                }
+
+                // Add tool calls if present - these must be properly structured
+                if let Some(ref tool_calls) = msg.tool_calls {
+                    tracing::debug!(
+                        "Converting assistant tool_calls: count={}, ids={:?}, call_ids={:?}",
+                        tool_calls.len(),
+                        tool_calls.iter().map(|tc| &tc.id).collect::<Vec<_>>(),
+                        tool_calls.iter().map(|tc| &tc.call_id).collect::<Vec<_>>()
+                    );
+                    for tc in tool_calls {
+                        let mut rig_tool_call = RigToolCall::new(
+                            tc.id.clone(),
+                            ToolFunction::new(tc.name.clone(), tc.arguments.clone()),
+                        );
+                        // OpenAI Responses API requires call_id to be set
+                        if let Some(ref call_id) = tc.call_id {
+                            rig_tool_call = rig_tool_call.with_call_id(call_id.clone());
+                        }
+                        assistant_contents.push(AssistantContent::ToolCall(rig_tool_call));
                     }
+                }
+
+                // If no content at all, add empty text
+                if assistant_contents.is_empty() {
+                    assistant_contents.push(AssistantContent::text(""));
+                }
+
+                let content = if assistant_contents.len() == 1 {
+                    OneOrMany::one(assistant_contents.remove(0))
                 } else {
-                    msg.content.clone()
+                    OneOrMany::many(assistant_contents)
+                        .unwrap_or_else(|_| OneOrMany::one(AssistantContent::text("")))
                 };
-                chat_history.push(Message::Assistant {
-                    id: None,
-                    content: OneOrMany::one(rig::message::AssistantContent::text(content)),
-                });
+                chat_history.push(Message::Assistant { id: None, content });
             }
             _ => {
                 let mut user_content: Vec<UserContent> = Vec::new();
@@ -1095,21 +1176,29 @@ where
         }
     }
 
-    // Get the last user message as the prompt
+    // Get the last user message with text content as the prompt.
+    // Tool result messages are also User messages but should not be used as the prompt.
     let (prompt, chat_history) = if chat_history.is_empty() {
         return Err(DaemonError::InternalError(
             "LLM stream requires at least one user message".into(),
         ));
     } else {
-        let last_user_idx = chat_history
-            .iter()
-            .rposition(|m| matches!(m, Message::User { .. }))
-            .unwrap_or(chat_history.len() - 1);
+        // Find the last user message that contains text content (not just tool results)
+        let last_text_user_idx = chat_history.iter().rposition(|m| match m {
+            Message::User { content } => content.iter().any(|c| matches!(c, UserContent::Text(_))),
+            _ => false,
+        });
 
-        let prompt = extract_text_from_message(&chat_history[last_user_idx]);
-        let mut history = chat_history;
-        history.remove(last_user_idx);
-        (prompt, history)
+        if let Some(idx) = last_text_user_idx {
+            let prompt = extract_text_from_message(&chat_history[idx]);
+            let mut history = chat_history;
+            history.remove(idx);
+            (prompt, history)
+        } else {
+            // No text user message found - this can happen when all user messages are tool results.
+            // In this case, use an empty prompt and keep all messages in history.
+            (String::new(), chat_history)
+        }
     };
 
     // Build the completion request
@@ -1133,24 +1222,48 @@ where
         .map_err(|e| DaemonError::InternalError(format!("LLM stream failed: {}", e)))?;
 
     // Process stream chunks
+    // Track tool calls that were already sent (complete tool calls)
+    let mut sent_tool_call_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // Track tool calls being built from deltas (not yet sent)
     let mut accumulated_tool_calls: HashMap<String, LlmToolCall> = HashMap::new();
 
     while let Some(chunk_result) = stream_response.next().await {
         match chunk_result {
             Ok(choice) => {
                 let chunk = match choice {
-                    StreamedAssistantContent::Text(text) => LlmStreamChunk {
-                        text: Some(text.text),
-                        tool_calls: vec![],
-                        done: false,
-                    },
+                    StreamedAssistantContent::Text(text) => {
+                        tracing::debug!("Stream chunk: Text({})", text.text);
+                        LlmStreamChunk {
+                            text: Some(text.text),
+                            tool_calls: vec![],
+                            done: false,
+                        }
+                    }
                     StreamedAssistantContent::ToolCall(tc) => {
+                        tracing::info!(
+                            "Stream chunk: COMPLETE ToolCall received - id={}, call_id={:?}, name={}",
+                            tc.id,
+                            tc.call_id,
+                            tc.function.name
+                        );
                         let tool_call = LlmToolCall {
                             id: tc.id.clone(),
+                            call_id: tc.call_id.clone(),
                             name: tc.function.name.clone(),
                             arguments: tc.function.arguments.clone(),
                         };
-                        accumulated_tool_calls.insert(tc.id.clone(), tool_call.clone());
+                        // Mark this tool call as already sent
+                        sent_tool_call_ids.insert(tc.id.clone());
+                        // Also update accumulated_tool_calls with call_id if it was being built from deltas
+                        if let Some(accumulated_tc) = accumulated_tool_calls.get_mut(&tc.id) {
+                            tracing::info!(
+                                "Updating accumulated tool call {} with call_id={:?}",
+                                tc.id,
+                                tc.call_id
+                            );
+                            accumulated_tc.call_id = tc.call_id.clone();
+                        }
                         LlmStreamChunk {
                             text: None,
                             tool_calls: vec![tool_call],
@@ -1158,34 +1271,48 @@ where
                         }
                     }
                     StreamedAssistantContent::ToolCallDelta { id, content } => {
-                        // Handle tool call deltas (accumulate)
-                        if let Some(tc) = accumulated_tool_calls.get_mut(&id) {
-                            match content {
-                                ToolCallDeltaContent::Name(name) => {
-                                    tc.name = name;
-                                }
-                                ToolCallDeltaContent::Delta(delta) => {
-                                    // Append to arguments string representation
-                                    if let Some(s) = tc.arguments.as_str() {
-                                        tc.arguments =
-                                            serde_json::Value::String(format!("{}{}", s, delta));
-                                    }
+                        tracing::debug!("Stream chunk: ToolCallDelta(id={})", id);
+                        // Handle tool call deltas (accumulate for later sending)
+                        let tc = accumulated_tool_calls.entry(id.clone()).or_insert_with(|| {
+                            LlmToolCall {
+                                id: id.clone(),
+                                call_id: None,
+                                name: String::new(),
+                                arguments: serde_json::Value::String(String::new()),
+                            }
+                        });
+                        match content {
+                            ToolCallDeltaContent::Name(name) => {
+                                tc.name = name;
+                            }
+                            ToolCallDeltaContent::Delta(delta) => {
+                                // Append to arguments string representation
+                                if let Some(s) = tc.arguments.as_str() {
+                                    tc.arguments =
+                                        serde_json::Value::String(format!("{}{}", s, delta));
                                 }
                             }
                         }
                         continue; // Don't send delta chunks
                     }
-                    StreamedAssistantContent::Reasoning(reasoning) => LlmStreamChunk {
-                        text: Some(format!("[Reasoning]: {}", reasoning.reasoning.join(" "))),
-                        tool_calls: vec![],
-                        done: false,
-                    },
-                    StreamedAssistantContent::ReasoningDelta { reasoning, .. } => LlmStreamChunk {
-                        text: Some(reasoning),
-                        tool_calls: vec![],
-                        done: false,
-                    },
+                    StreamedAssistantContent::Reasoning(reasoning) => {
+                        tracing::debug!("Stream chunk: Reasoning");
+                        LlmStreamChunk {
+                            text: Some(format!("[Reasoning]: {}", reasoning.reasoning.join(" "))),
+                            tool_calls: vec![],
+                            done: false,
+                        }
+                    }
+                    StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+                        tracing::debug!("Stream chunk: ReasoningDelta({})", reasoning);
+                        LlmStreamChunk {
+                            text: Some(reasoning),
+                            tool_calls: vec![],
+                            done: false,
+                        }
+                    }
                     StreamedAssistantContent::Final(_) => {
+                        tracing::debug!("Stream chunk: Final");
                         continue; // Skip final response, we'll send done chunk below
                     }
                 };
@@ -1202,8 +1329,28 @@ where
         }
     }
 
-    // Send final chunk with accumulated tool calls
-    let final_tool_calls: Vec<LlmToolCall> = accumulated_tool_calls.into_values().collect();
+    // Send final chunk with only tool calls that were built from deltas (not already sent)
+    let final_tool_calls: Vec<LlmToolCall> = accumulated_tool_calls
+        .into_values()
+        .filter(|tc| !sent_tool_call_ids.contains(&tc.id))
+        .collect();
+
+    if !final_tool_calls.is_empty() {
+        tracing::info!(
+            "Sending {} accumulated tool calls in final chunk: {:?}",
+            final_tool_calls.len(),
+            final_tool_calls
+                .iter()
+                .map(|tc| (&tc.id, &tc.call_id, &tc.name))
+                .collect::<Vec<_>>()
+        );
+    }
+    tracing::info!(
+        "Stream complete. sent_tool_call_ids={:?}, final_tool_calls_count={}",
+        sent_tool_call_ids,
+        final_tool_calls.len()
+    );
+
     let _ = tx
         .send(LlmStreamChunk {
             text: None,
@@ -1491,6 +1638,7 @@ mod tests {
     fn test_llm_tool_call() {
         let tool_call = LlmToolCall {
             id: "call_123".into(),
+            call_id: Some("call_123".into()),
             name: "get_weather".into(),
             arguments: serde_json::json!({"location": "Tokyo"}),
         };
@@ -1505,6 +1653,7 @@ mod tests {
     fn test_llm_message_with_tool_calls() {
         let tool_call = LlmToolCall {
             id: "call_abc".into(),
+            call_id: Some("call_abc".into()),
             name: "search".into(),
             arguments: serde_json::json!({"query": "rust"}),
         };
@@ -1533,6 +1682,7 @@ mod tests {
             finish_reason: "tool_calls".into(),
             tool_calls: Some(vec![LlmToolCall {
                 id: "call_xyz".into(),
+                call_id: Some("call_xyz".into()),
                 name: "calculator".into(),
                 arguments: serde_json::json!({"expression": "2+2"}),
             }]),
@@ -1590,6 +1740,7 @@ mod tests {
             text: None,
             tool_calls: vec![LlmToolCall {
                 id: "call_123".into(),
+                call_id: Some("call_123".into()),
                 name: "search".into(),
                 arguments: serde_json::json!({"query": "rust"}),
             }],
