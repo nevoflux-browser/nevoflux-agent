@@ -5,15 +5,25 @@ use crate::config::AgentConfig;
 use crate::error::{DaemonError, Result};
 use crate::router::{RouteDecision, Router};
 use crate::session::SessionManager;
-use crate::wasm::HostServices;
+use crate::wasm::{BrowserRequest, BrowserResponse, HostServices};
 use bytes::Bytes;
 use nevoflux_builtin_wasm::{Agent, AgentInput, AgentMode, Attachment};
 use nevoflux_protocol::{Channel, DaemonEnvelope, ProxyEnvelope};
+use nevoflux_skills::{check_tool_availability, format_missing_tools_message, ToolCheckResult};
 use nevoflux_storage::{ListSessionsParams, MessageRole};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, warn};
 use zeromq::{Socket, SocketSend, ZmqMessage};
+
+/// Registry for pending browser tool requests.
+/// Maps request_id to the response sender.
+type BrowserRequestRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<BrowserResponse>>>>;
+
+/// Registry for active streaming sessions that can be cancelled.
+/// Maps session_id to the cancellation token.
+type CancellationRegistry = Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -88,7 +98,16 @@ pub async fn start_server(
 
     // Create host services with database from session manager
     let db = session_manager.storage().database().clone();
-    let services = HostServices::new(Arc::new(db));
+
+    // Create browser request channel and registry
+    let (browser_tx, mut browser_rx) =
+        mpsc::channel::<(BrowserRequest, oneshot::Sender<BrowserResponse>)>(100);
+    let browser_registry: BrowserRequestRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+    // Create cancellation registry for active streaming sessions
+    let cancellation_registry: CancellationRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+    let services = HostServices::new(Arc::new(db)).with_browser_sender(browser_tx);
 
     let mut socket = zeromq::RouterSocket::new();
     socket
@@ -100,61 +119,138 @@ pub async fn start_server(
     let (msg_tx, mut msg_rx) = mpsc::channel::<(Vec<u8>, ProxyEnvelope)>(100);
     let (response_tx, mut response_rx) = mpsc::channel::<(Vec<u8>, DaemonEnvelope)>(100);
 
-    // Spawn receive loop
-    let mut recv_socket = socket;
+    // Use internal channel for socket operations to avoid send blocking receive
+    // The socket task processes send/receive in round-robin fashion
+    let (socket_send_tx, mut socket_send_rx) = mpsc::channel::<(Vec<u8>, Vec<u8>, String)>(1000);
+
+    // Task to forward responses to socket send channel
+    let forward_response_tx = socket_send_tx.clone();
+    tokio::spawn(async move {
+        while let Some((identity, response)) = response_rx.recv().await {
+            let msg_type = response
+                .payload
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            if let Ok(data) = serde_json::to_vec(&response) {
+                let _ = forward_response_tx.send((identity, data, msg_type)).await;
+            }
+        }
+    });
+
+    // Main socket I/O task - alternates between send and receive
+    let mut socket = socket;
     tokio::spawn(async move {
         loop {
-            tokio::select! {
-                _ = shutdown_rx.recv() => {
+            // Try to send one message if available (non-blocking check)
+            match socket_send_rx.try_recv() {
+                Ok((identity, data, msg_type)) => {
+                    let frames: Vec<Bytes> = vec![Bytes::from(identity), Bytes::from(data)];
+                    if let Ok(zmq_msg) = ZmqMessage::try_from(frames) {
+                        if let Err(e) = socket.send(zmq_msg).await {
+                            error!("Failed to send: {}", e);
+                        } else {
+                            debug!("Socket sent: type={}", msg_type);
+                        }
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+
+            // Try to receive one message with short timeout
+            match tokio::time::timeout(
+                tokio::time::Duration::from_millis(5),
+                zeromq::SocketRecv::recv(&mut socket),
+            )
+            .await
+            {
+                Ok(Ok(zmq_msg)) => {
+                    let frames = zmq_msg.into_vec();
+                    if frames.len() >= 2 {
+                        let identity = frames[0].to_vec();
+                        if let Ok(envelope) = serde_json::from_slice::<ProxyEnvelope>(&frames[1]) {
+                            let msg_type = envelope
+                                .payload
+                                .get("type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            info!(
+                                "Socket received: type={}, proxy_id={}",
+                                msg_type, envelope.proxy_id
+                            );
+                            let _ = msg_tx.send((identity, envelope)).await;
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    error!("Receive error: {}", e);
+                }
+                Err(_) => {
+                    // Timeout - no message, continue loop
+                }
+            }
+
+            // Check shutdown
+            match shutdown_rx.try_recv() {
+                Ok(_) => {
                     info!("Server shutdown signal received");
                     break;
                 }
-                // Send responses back to proxies
-                Some((identity, response)) = response_rx.recv() => {
-                    match serde_json::to_vec(&response) {
-                        Ok(data) => {
-                            let frames: Vec<Bytes> = vec![
-                                Bytes::from(identity),
-                                Bytes::from(data),
-                            ];
-                            match ZmqMessage::try_from(frames) {
-                                Ok(zmq_msg) => {
-                                    if let Err(e) = recv_socket.send(zmq_msg).await {
-                                        error!("Failed to send response: {}", e);
-                                    } else {
-                                        debug!("Sent response to {}", response.proxy_id);
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to create ZMQ message: {:?}", e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to serialize response: {}", e);
-                        }
-                    }
-                }
-                // Receive messages from proxies
-                msg = zeromq::SocketRecv::recv(&mut recv_socket) => {
-                    match msg {
-                        Ok(zmq_msg) => {
-                            let frames = zmq_msg.into_vec();
-                            if frames.len() >= 2 {
-                                let identity = frames[0].to_vec();
-                                if let Ok(envelope) = serde_json::from_slice::<ProxyEnvelope>(&frames[1]) {
-                                    debug!("Received message from {}: type={:?}", envelope.proxy_id, envelope.payload.get("type"));
-                                    let _ = msg_tx.send((identity, envelope)).await;
-                                } else {
-                                    warn!("Failed to parse ProxyEnvelope from frame");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Receive error: {}", e);
-                        }
-                    }
-                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+    });
+
+    // Spawn browser request handler task
+    // This task receives browser tool requests from the agent and sends them to the sidebar
+    let browser_response_tx = response_tx.clone();
+    let browser_registry_clone = browser_registry.clone();
+    tokio::spawn(async move {
+        while let Some((request, response_sender)) = browser_rx.recv().await {
+            let request_id = request.request_id.clone();
+            info!(
+                "Browser request sending to sidebar: id={}, action={:?}, proxy_id={}, identity_len={}",
+                request_id, request.action, request.proxy_id, request.client_identity.len()
+            );
+
+            // Store the response sender in the registry
+            {
+                let mut registry = browser_registry_clone.lock().await;
+                registry.insert(request_id.clone(), response_sender);
+                info!(
+                    "Browser request registered: id={}, registry_size={}",
+                    request_id,
+                    registry.len()
+                );
+            }
+
+            // Create BrowserToolRequest message to send to sidebar
+            let browser_request = nevoflux_protocol::BrowserToolRequest {
+                request_id: request.request_id,
+                session_id: request.session_id,
+                tab_id: request.tab_id,
+                action: request.action,
+                params: request.params,
+                timeout_ms: request.timeout_ms,
+            };
+
+            // Wrap in AgentMessage and send
+            let agent_message =
+                nevoflux_protocol::AgentMessage::BrowserToolRequest(browser_request);
+            let response_payload = serde_json::to_value(&agent_message).unwrap_or_default();
+
+            // Send to the sidebar using the client identity from the request
+            let response = DaemonEnvelope::new(&request.proxy_id, Channel::Chat, response_payload);
+            if let Err(e) = browser_response_tx
+                .send((request.client_identity, response))
+                .await
+            {
+                error!("Failed to send browser request: {}", e);
+            } else {
+                info!("Browser request sent to response queue: id={}", request_id);
             }
         }
     });
@@ -166,11 +262,107 @@ pub async fn start_server(
     let process_session_manager = session_manager.clone();
     let process_services = services.clone();
     let process_runtime = tokio::runtime::Handle::current();
+    let process_browser_registry = browser_registry.clone();
+    let process_cancellation_registry = cancellation_registry.clone();
     tokio::spawn(async move {
         while let Some((identity, envelope)) = msg_rx.recv().await {
             let proxy_id = envelope.proxy_id.clone();
             let request_id = envelope.request_id.clone();
             let channel = envelope.channel;
+
+            // Log all incoming messages
+            let msg_type = envelope
+                .payload
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            info!(
+                "Message loop received: type={}, proxy_id={}, channel={:?}, identity_len={}",
+                msg_type,
+                proxy_id,
+                channel,
+                identity.len()
+            );
+
+            // Check for stop_generation messages - handle cancellation
+            if msg_type == "stop_generation" {
+                // Extract session_id from payload
+                let session_id = envelope
+                    .payload
+                    .get("payload")
+                    .and_then(|p| p.get("session_id"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default();
+
+                info!("Received stop_generation for session: {}", session_id);
+
+                // Cancel the active streaming session
+                let cancelled = {
+                    let mut registry = process_cancellation_registry.lock().await;
+                    if let Some(token) = registry.remove(session_id) {
+                        token.cancel();
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                // Send acknowledgment
+                let response_payload = serde_json::json!({
+                    "type": "agent_state",
+                    "payload": {
+                        "state": "idle",
+                        "message": if cancelled { "Generation stopped" } else { "No active generation" },
+                        "done": true
+                    }
+                });
+                let response = DaemonEnvelope::new(&proxy_id, channel, response_payload)
+                    .with_request_id(&request_id);
+                if let Err(e) = process_response_tx.send((identity, response)).await {
+                    error!("Failed to send stop_generation response: {}", e);
+                }
+                continue;
+            }
+
+            // Check for BrowserToolResponse messages
+            if msg_type == "browser_tool_response" {
+                info!("Processing browser_tool_response message");
+                if let Some(payload) = envelope.payload.get("payload") {
+                    if let Ok(response) = serde_json::from_value::<
+                        nevoflux_protocol::BrowserToolResponse,
+                    >(payload.clone())
+                    {
+                        let request_id = response.request_id.clone();
+                        info!(
+                            "Received browser tool response: id={}, success={}",
+                            request_id, response.success
+                        );
+
+                        // Find the pending request and send the response
+                        let sender = {
+                            let mut registry = process_browser_registry.lock().await;
+                            registry.remove(&request_id)
+                        };
+
+                        if let Some(sender) = sender {
+                            let browser_response = BrowserResponse {
+                                request_id: response.request_id,
+                                success: response.success,
+                                result: response.result,
+                                error: response.error,
+                            };
+                            if sender.send(browser_response).is_err() {
+                                warn!("Failed to send browser response - receiver dropped");
+                            } else {
+                                info!("Browser response forwarded to agent");
+                            }
+                        } else {
+                            warn!("No pending request for browser response: {}", request_id);
+                        }
+                        continue; // Don't process further
+                    }
+                }
+            }
 
             // Register proxy if not already registered (pid 0 for native messaging)
             if !process_router.proxy_registry().is_registered(&proxy_id) {
@@ -200,19 +392,32 @@ pub async fn start_server(
                 }
                 RouteDecision::ProcessChat { .. } => {
                     // Handle chat messages via Agent with streaming support
-                    handle_chat_message_streaming(
-                        &envelope.payload,
-                        &process_config,
-                        &process_session_manager,
-                        &process_services,
-                        process_runtime.clone(),
-                        identity,
-                        proxy_id,
-                        request_id,
-                        channel,
-                        process_response_tx.clone(),
-                    )
-                    .await;
+                    // IMPORTANT: Spawn as a separate task to avoid blocking the message loop
+                    // This allows browser_tool_response messages to be processed while
+                    // the agent is waiting for browser tool results.
+                    let payload = envelope.payload.clone();
+                    let config = process_config.clone();
+                    let session_manager = process_session_manager.clone();
+                    let services = process_services.clone();
+                    let runtime = process_runtime.clone();
+                    let response_tx = process_response_tx.clone();
+                    let cancellation_registry = process_cancellation_registry.clone();
+                    tokio::spawn(async move {
+                        handle_chat_message_streaming(
+                            &payload,
+                            &config,
+                            &session_manager,
+                            &services,
+                            runtime,
+                            identity,
+                            proxy_id,
+                            request_id,
+                            channel,
+                            response_tx,
+                            cancellation_registry,
+                        )
+                        .await;
+                    });
                 }
                 RouteDecision::ProcessMcp { .. } => {
                     // Handle MCP messages
@@ -249,13 +454,31 @@ async fn handle_chat_message_streaming(
     request_id: String,
     channel: Channel,
     response_tx: mpsc::Sender<(Vec<u8>, DaemonEnvelope)>,
+    cancellation_registry: CancellationRegistry,
 ) {
     let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
+    // Debug: log raw attachments from payload
+    let raw_attachments = payload.get("payload").and_then(|p| p.get("attachments"));
+    info!(
+        "handle_chat_message_streaming: raw_attachments present={}, is_array={}, len={:?}",
+        raw_attachments.is_some(),
+        raw_attachments.map(|a| a.is_array()).unwrap_or(false),
+        raw_attachments
+            .and_then(|a| a.as_array())
+            .map(|arr| arr.len())
+    );
+
     // For non-chat_message types, handle synchronously
     if msg_type != "chat_message" {
-        let response_payload =
+        let mut response_payload =
             handle_chat_message(payload, config, session_manager, services, runtime).await;
+        // Add done: true to signal this is a complete response (not streaming)
+        if let Some(obj) = response_payload.as_object_mut() {
+            if let Some(payload_obj) = obj.get_mut("payload").and_then(|p| p.as_object_mut()) {
+                payload_obj.insert("done".to_string(), serde_json::json!(true));
+            }
+        }
         let response =
             DaemonEnvelope::new(&proxy_id, channel, response_payload).with_request_id(&request_id);
         if let Err(e) = response_tx.send((identity, response)).await {
@@ -351,12 +574,49 @@ async fn handle_chat_message_streaming(
         })
         .unwrap_or_default();
 
-    debug!(
-        "Processing streaming chat message with mode={:?}, session={}, attachments={}, local_files={}",
+    // Extract tab_id if provided (from browser sidebar)
+    let tab_id = payload
+        .get("payload")
+        .and_then(|p| p.get("tab_id"))
+        .and_then(|t| t.as_i64());
+
+    // Extract tab_ids list if provided (all available tabs)
+    let tab_ids: Vec<nevoflux_builtin_wasm::TabInfo> = payload
+        .get("payload")
+        .and_then(|p| p.get("tab_ids"))
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    let space = v
+                        .get("space")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let tab_id = v.get("tab_id").and_then(|t| t.as_i64())?;
+                    let tab_title = v
+                        .get("tab_title")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Some(nevoflux_builtin_wasm::TabInfo {
+                        space,
+                        tab_id,
+                        tab_title,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    info!(
+        "Processing streaming chat message with mode={:?}, session={}, attachments={}, local_files={}, tab_id={:?}, tab_ids={}",
         mode,
         session_id,
         attachments.len(),
-        local_files.len()
+        local_files.len(),
+        tab_id,
+        tab_ids.len()
     );
 
     // Ensure session exists and save user message
@@ -404,9 +664,14 @@ async fn handle_chat_message_streaming(
     let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<SidebarStreamChunk>();
 
     // Create host functions with streaming support
+    // Set client context on services so browser tool requests can be routed back
+    let services_with_context = services
+        .clone()
+        .with_client_context(identity.clone(), proxy_id.clone());
     let host = DaemonHostFunctions::new(config.clone(), runtime.clone())
-        .with_services(services.clone())
-        .with_sidebar_stream(stream_tx);
+        .with_services(services_with_context)
+        .with_sidebar_stream(stream_tx)
+        .with_session_id(session_id.clone());
 
     // Create agent with host functions
     let agent = Agent::new(host);
@@ -420,7 +685,18 @@ async fn handle_chat_message_streaming(
         attachments,
         local_files,
         custom_system_prompt: None, // Use default mode-based prompt
+        tab_id,
+        tab_ids,
+        skill_context: None,
     };
+
+    // Create cancellation token for this streaming session
+    let cancellation_token = tokio_util::sync::CancellationToken::new();
+    {
+        let mut registry = cancellation_registry.lock().await;
+        registry.insert(session_id.clone(), cancellation_token.clone());
+        debug!("Registered cancellation token for session: {}", session_id);
+    }
 
     // Clone variables for the streaming forwarder task
     let stream_proxy_id = proxy_id.clone();
@@ -429,64 +705,104 @@ async fn handle_chat_message_streaming(
     let stream_identity = identity.clone();
     let stream_response_tx = response_tx.clone();
     let stream_title = generated_title.clone();
+    let forwarder_cancellation = cancellation_token.clone();
 
     // Spawn task to forward stream chunks to the sidebar
     let forwarder_handle = tokio::spawn(async move {
         let mut accumulated_text = String::new();
+        let mut cancelled = false;
 
-        while let Some(chunk) = stream_rx.recv().await {
-            accumulated_text.push_str(&chunk.text);
+        loop {
+            tokio::select! {
+                biased;
 
-            let mut chunk_payload = serde_json::json!({
-                "type": "stream_chunk",
-                "payload": {
-                    "content": chunk.text,
-                    "done": chunk.done
+                // Check cancellation first
+                _ = forwarder_cancellation.cancelled() => {
+                    info!("Stream forwarder cancelled");
+                    cancelled = true;
+                    break;
                 }
-            });
 
-            // Include session title on first chunk if available
-            if !accumulated_text.is_empty() && accumulated_text == chunk.text {
-                if let Some(ref title) = stream_title {
-                    chunk_payload["payload"]["session_title"] =
-                        serde_json::Value::String(title.clone());
+                // Receive stream chunks
+                chunk = stream_rx.recv() => {
+                    match chunk {
+                        Some(chunk) => {
+                            accumulated_text.push_str(&chunk.text);
+
+                            let mut chunk_payload = serde_json::json!({
+                                "type": "stream_chunk",
+                                "payload": {
+                                    "content": chunk.text,
+                                    "done": chunk.done
+                                }
+                            });
+
+                            // Include session title on first chunk if available
+                            if !accumulated_text.is_empty() && accumulated_text == chunk.text {
+                                if let Some(ref title) = stream_title {
+                                    chunk_payload["payload"]["session_title"] =
+                                        serde_json::Value::String(title.clone());
+                                }
+                            }
+
+                            let response = DaemonEnvelope::new(&stream_proxy_id, stream_channel, chunk_payload)
+                                .with_request_id(&stream_request_id);
+
+                            if let Err(e) = stream_response_tx
+                                .send((stream_identity.clone(), response))
+                                .await
+                            {
+                                error!("Failed to send stream chunk: {}", e);
+                                break;
+                            }
+
+                            if chunk.done {
+                                debug!(
+                                    "Stream completed, total accumulated: {} bytes",
+                                    accumulated_text.len()
+                                );
+                                break;
+                            }
+                        }
+                        None => {
+                            debug!("Stream channel closed");
+                            break;
+                        }
+                    }
                 }
-            }
-
-            let response = DaemonEnvelope::new(&stream_proxy_id, stream_channel, chunk_payload)
-                .with_request_id(&stream_request_id);
-
-            if let Err(e) = stream_response_tx
-                .send((stream_identity.clone(), response))
-                .await
-            {
-                error!("Failed to send stream chunk: {}", e);
-                break;
-            }
-
-            if chunk.done {
-                debug!(
-                    "Stream completed, total accumulated: {} bytes",
-                    accumulated_text.len()
-                );
-                break;
             }
         }
 
-        accumulated_text
+        (accumulated_text, cancelled)
     });
 
     // Run agent (this will call stream_emit() for each chunk)
     let agent_result = tokio::task::spawn_blocking(move || agent.run(&input)).await;
 
     // Wait for the forwarder to complete
-    let accumulated_text = match forwarder_handle.await {
-        Ok(text) => text,
+    let (accumulated_text, was_cancelled) = match forwarder_handle.await {
+        Ok(result) => result,
         Err(e) => {
             error!("Stream forwarder task failed: {}", e);
-            String::new()
+            (String::new(), false)
         }
     };
+
+    // Cleanup cancellation token from registry
+    {
+        let mut registry = cancellation_registry.lock().await;
+        registry.remove(&session_id);
+        debug!("Removed cancellation token for session: {}", session_id);
+    }
+
+    // If cancelled, don't send final response (stop_generation handler already did)
+    if was_cancelled {
+        info!(
+            "Streaming session {} was cancelled, skipping final response",
+            session_id
+        );
+        return;
+    }
 
     // Handle agent result
     match agent_result {
@@ -625,6 +941,84 @@ async fn handle_chat_message(
                 });
             }
 
+            // Detect and process /skillname commands
+            // Returns (user_message, skill_context)
+            let (user_message, skill_context) = if message_content.starts_with('/') {
+                // Parse: "/skillname args" -> ("skillname", "args")
+                let trimmed = &message_content[1..];
+                let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
+                let skill_name = parts[0].trim();
+                let args = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
+
+                if skill_name.is_empty() {
+                    // Just "/" with no skill name - treat as regular message
+                    (message_content.to_string(), None)
+                } else {
+                    // Look up skill in registry
+                    let registry = services.skills.read().await;
+                    if let Some(skill) = registry.get(skill_name) {
+                        // Check if required tools are available
+                        let available_tools = gather_available_tools(&services).await;
+                        match check_tool_availability(&skill.metadata, &available_tools) {
+                            ToolCheckResult::Satisfied => {
+                                // All tools available, proceed with skill injection
+                            }
+                            ToolCheckResult::Missing(missing) => {
+                                // Required tools are not available
+                                let message = format_missing_tools_message(skill_name, &missing);
+                                warn!(
+                                    "Skill '{}' requires unavailable tools: {:?}",
+                                    skill_name, missing
+                                );
+                                return serde_json::json!({
+                                    "type": "error",
+                                    "payload": {
+                                        "code": "SKILL_TOOLS_UNAVAILABLE",
+                                        "message": message,
+                                        "recoverable": true,
+                                        "missing_tools": missing
+                                    }
+                                });
+                            }
+                        }
+
+                        // Get skill's base directory path for auxiliary file access
+                        let base_path = skill
+                            .file_path
+                            .as_ref()
+                            .and_then(|p| p.parent())
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_default();
+
+                        info!(
+                            "Injecting skill '{}' into system prompt (base_path={})",
+                            skill_name, base_path
+                        );
+
+                        // Return user args as message, skill content as context
+                        let ctx = nevoflux_builtin_wasm::SkillContext {
+                            name: skill.metadata.name.clone(),
+                            base_path,
+                            content: skill.content.clone(),
+                        };
+                        (args, Some(ctx))
+                    } else {
+                        // Skill not found - return error
+                        return serde_json::json!({
+                            "type": "error",
+                            "payload": {
+                                "code": "SKILL_NOT_FOUND",
+                                "message": format!("Skill '{}' not found. Type / to see available skills.", skill_name),
+                                "recoverable": true
+                            }
+                        });
+                    }
+                }
+            } else {
+                // Regular message without skill
+                (message_content.to_string(), None)
+            };
+
             // Extract session_id if provided
             let session_id = payload
                 .get("payload")
@@ -689,12 +1083,49 @@ async fn handle_chat_message(
                 })
                 .unwrap_or_default();
 
+            // Extract tab_id if provided (from browser sidebar)
+            let tab_id = payload
+                .get("payload")
+                .and_then(|p| p.get("tab_id"))
+                .and_then(|t| t.as_i64());
+
+            // Extract tab_ids list if provided (all available tabs)
+            let tab_ids: Vec<nevoflux_builtin_wasm::TabInfo> = payload
+                .get("payload")
+                .and_then(|p| p.get("tab_ids"))
+                .and_then(|t| t.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| {
+                            let space = v
+                                .get("space")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let tab_id = v.get("tab_id").and_then(|t| t.as_i64())?;
+                            let tab_title = v
+                                .get("tab_title")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            Some(nevoflux_builtin_wasm::TabInfo {
+                                space,
+                                tab_id,
+                                tab_title,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
             debug!(
-                "Processing chat message with mode={:?}, session={}, attachments={}, local_files={}",
+                "Processing chat message with mode={:?}, session={}, attachments={}, local_files={}, tab_id={:?}, tab_ids={}",
                 mode,
                 session_id,
                 attachments.len(),
-                local_files.len()
+                local_files.len(),
+                tab_id,
+                tab_ids.len()
             );
 
             // Ensure session exists and save user message
@@ -739,21 +1170,25 @@ async fn handle_chat_message(
             }
 
             // Create host functions with config and runtime
-            let host =
-                DaemonHostFunctions::new(config.clone(), runtime).with_services(services.clone());
+            let host = DaemonHostFunctions::new(config.clone(), runtime)
+                .with_services(services.clone())
+                .with_session_id(session_id.clone());
 
             // Create agent with host functions
             let agent = Agent::new(host);
 
-            // Build agent input
+            // Build agent input with skill context injected into system prompt
             let input = AgentInput {
                 session_id: session_id.clone(),
                 mode,
-                user_message: message_content.to_string(),
+                user_message,
                 history: vec![], // TODO: Load history from session
                 attachments,
                 local_files,
                 custom_system_prompt: None, // Use default mode-based prompt
+                tab_id,
+                tab_ids,
+                skill_context,
             };
 
             // Run agent
@@ -881,6 +1316,7 @@ async fn handle_chat_message(
                 "mcp.connect" => handle_mcp_connect(&params).await,
                 "mcp.disconnect" => handle_mcp_disconnect(&params).await,
                 "file.pick" => handle_file_pick(&params).await,
+                "skill.list" => handle_skill_list(services, &params).await,
                 _ => {
                     serde_json::json!({
                         "type": "system_response",
@@ -1258,7 +1694,6 @@ async fn handle_mcp_message(payload: &serde_json::Value) -> serde_json::Value {
 // ============================================
 
 use crate::mcp_config::{McpServerConfigFile, McpServersConfig};
-use std::collections::HashMap;
 
 /// Handle mcp.list command.
 ///
@@ -2054,6 +2489,101 @@ async fn handle_file_pick(params: &serde_json::Value) -> serde_json::Value {
             })
         }
     }
+}
+
+/// Handle skill.list system command.
+///
+/// Lists all available skills from the skill registry.
+async fn handle_skill_list(
+    services: &HostServices,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let registry = services.skills.read().await;
+    let summaries = registry.list();
+
+    let skills: Vec<_> = summaries
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "description": s.description,
+                "tags": s.tags,
+                "source": s.source,
+                "enabled": s.enabled
+            })
+        })
+        .collect();
+
+    info!("skill.list: returning {} skills", skills.len());
+
+    serde_json::json!({
+        "type": "system_response",
+        "payload": {
+            "request_id": request_id,
+            "command": "skill.list",
+            "success": true,
+            "data": { "skills": skills }
+        }
+    })
+}
+
+// ============================================
+// Tool Availability Helpers
+// ============================================
+
+/// Built-in tools that are always available.
+/// These correspond to the core tools provided by the agent runtime.
+const BUILTIN_TOOLS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Glob",
+    "Grep",
+    "browser_navigate",
+    "browser_click",
+    "browser_type",
+    "browser_screenshot",
+    "browser_scroll",
+    "browser_get_content",
+    "computer_screenshot",
+    "computer_click",
+    "computer_type",
+    "computer_key",
+    "computer_scroll",
+];
+
+/// Gather all available tools from MCP servers and built-in tools.
+///
+/// Returns a list of tool names in the format:
+/// - Built-in tools: just the tool name (e.g., "Read", "Write")
+/// - MCP tools: "server_name:tool_name" format (e.g., "notion:search")
+async fn gather_available_tools(services: &HostServices) -> Vec<String> {
+    let mut tools = Vec::new();
+
+    // Add built-in tools
+    tools.extend(BUILTIN_TOOLS.iter().map(|s| s.to_string()));
+
+    // Add MCP tools from connected servers
+    if let Some(ref mcp_manager) = services.mcp_manager {
+        if let Ok(mcp_tools) = mcp_manager.list_all_tools().await {
+            for server_tool in mcp_tools {
+                // Format: "server_name:tool_name"
+                tools.push(format!(
+                    "{}:{}",
+                    server_tool.server_name, server_tool.tool.name
+                ));
+            }
+        }
+    }
+
+    tools
 }
 
 #[cfg(test)]
