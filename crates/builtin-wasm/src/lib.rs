@@ -39,8 +39,8 @@ pub use host::{HostError, HostFunctions, HostResult};
 pub use nevoflux_protocol::LocalFileRef;
 pub use types::{
     AgentInput, AgentMode, AgentOutput, Attachment, BrowserToolResult, LlmChunk, LlmRequest,
-    LlmResponse, MemoryChunk, Message, MessageRole, SkillSummary, SubagentInfo, ToolCall,
-    ToolDefinition, ToolResult, ToolSearchResult,
+    LlmResponse, MemoryChunk, Message, MessageRole, SkillContext, SkillSummary, SubagentInfo,
+    TabInfo, ToolCall, ToolDefinition, ToolResult, ToolSearchResult,
 };
 
 /// Version of the builtin-wasm module.
@@ -124,6 +124,9 @@ mod tests {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -146,6 +149,9 @@ mod tests {
                 attachments: vec![],
                 local_files: vec![],
                 custom_system_prompt: None,
+                tab_id: None,
+                tab_ids: vec![],
+                skill_context: None,
             };
 
             let output = agent.run(&input);
@@ -166,6 +172,9 @@ mod tests {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -190,6 +199,9 @@ mod tests {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
 
         let output = agent.run(&input);

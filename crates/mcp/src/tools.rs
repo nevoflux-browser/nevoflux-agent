@@ -72,7 +72,7 @@ fn create_browser_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "browser_screenshot".to_string(),
-            description: "Take a screenshot of the current page".to_string(),
+            description: "Take a visual IMAGE of the page. For viewing only, NOT for interaction. To interact with elements (click/type/fill), use browser_get_elements instead to get element IDs.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -130,7 +130,7 @@ fn create_browser_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "browser_get_content".to_string(),
-            description: "Get the text content of the page or a specific element".to_string(),
+            description: "Get text/HTML content for READING only. NOT for interaction - use browser_get_elements to get element IDs for clicking/typing.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -262,8 +262,8 @@ fn create_browser_tools() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
-            name: "browser_snapshot".to_string(),
-            description: "Take an accessibility tree snapshot of the current page".to_string(),
+            name: "browser_get_elements".to_string(),
+            description: "REQUIRED before any page interaction (click, type, fill). Takes an accessibility tree snapshot with element IDs needed for browser_click_by_id, browser_fill_by_id, browser_type_by_id. Use this FIRST when you need to click buttons, fill forms, or interact with page elements.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -284,7 +284,7 @@ fn create_browser_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "browser_click_by_id".to_string(),
-            description: "Click an element by its accessibility tree snapshot element ID"
+            description: "Click an element by its element ID. REQUIRES browser_get_elements first to get element IDs."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -305,7 +305,7 @@ fn create_browser_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "browser_fill_by_id".to_string(),
-            description: "Fill a form field by its accessibility tree snapshot element ID"
+            description: "Fill a form field by its element ID. REQUIRES browser_get_elements first to get element IDs."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -324,7 +324,7 @@ fn create_browser_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "browser_type_by_id".to_string(),
-            description: "Type text into an element by its accessibility tree snapshot element ID"
+            description: "Type text into an element by its element ID. REQUIRES browser_get_elements first to get element IDs."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -348,7 +348,7 @@ fn create_browser_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "browser_get_markdown".to_string(),
-            description: "Extract the page content as Markdown for easier reading".to_string(),
+            description: "Extract page content as Markdown for READING/UNDERSTANDING only. Use for: summarizing articles, extracting text, getting page information. DO NOT use for page interactions - use browser_get_elements instead when you need to click, type, or fill.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -583,7 +583,7 @@ mod tests {
         assert!(tool_names.contains(&"browser_scroll"));
         assert!(tool_names.contains(&"browser_get_element"));
         assert!(tool_names.contains(&"browser_query_all"));
-        assert!(tool_names.contains(&"browser_snapshot"));
+        assert!(tool_names.contains(&"browser_get_elements"));
         assert!(tool_names.contains(&"browser_click_by_id"));
         assert!(tool_names.contains(&"browser_fill_by_id"));
         assert!(tool_names.contains(&"browser_type_by_id"));
@@ -851,9 +851,9 @@ mod tests {
     }
 
     #[test]
-    fn test_browser_snapshot_tool_schema() {
+    fn test_browser_get_elements_tool_schema() {
         let tools = create_browser_tools();
-        let tool = tools.iter().find(|t| t.name == "browser_snapshot").unwrap();
+        let tool = tools.iter().find(|t| t.name == "browser_get_elements").unwrap();
 
         assert!(tool.description.contains("accessibility tree"));
 

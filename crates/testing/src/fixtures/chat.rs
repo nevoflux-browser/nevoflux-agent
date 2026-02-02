@@ -14,6 +14,7 @@ pub fn sample_chat_message(session_id: &str, text: &str) -> ChatMessage {
         text: text.to_string(),
         attachments: vec![],
         tab_id: None,
+        tab_ids: vec![],
     }
 }
 

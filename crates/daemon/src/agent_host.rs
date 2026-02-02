@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Status of a sub-agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,12 +231,40 @@ impl DaemonHostFunctions {
                     nevoflux_builtin_wasm::MessageRole::Assistant => "assistant",
                     nevoflux_builtin_wasm::MessageRole::Tool => "tool",
                 };
+                // Convert tool_calls from builtin-wasm format to daemon format
+                let tool_calls = if m.tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(
+                        m.tool_calls
+                            .iter()
+                            .map(|tc| crate::wasm::llm::LlmToolCall {
+                                id: tc.id.clone(),
+                                call_id: tc.call_id.clone(),
+                                name: tc.name.clone(),
+                                arguments: tc.arguments.clone(),
+                                signature: tc.signature.clone(),
+                            })
+                            .collect(),
+                    )
+                };
+                // Convert attachments from builtin-wasm format to daemon format
+                let attachments = m
+                    .attachments
+                    .iter()
+                    .map(|a| crate::wasm::llm::LlmAttachment {
+                        name: a.name.clone(),
+                        mime_type: a.mime_type.clone(),
+                        data: a.data.clone(),
+                    })
+                    .collect();
+
                 DaemonLlmMessage {
                     role: role.to_string(),
                     content: m.content.clone(),
-                    tool_calls: None,
+                    tool_calls,
                     tool_call_id: m.tool_call_id.clone(),
-                    attachments: Vec::new(),
+                    attachments,
                 }
             })
             .collect();
@@ -335,11 +363,17 @@ impl HostFunctions for DaemonHostFunctions {
 
         // Attempt compression if needed
         let compressor = ContextCompressor::new(self.config.clone(), self.runtime.clone());
-        let final_messages = match compressor.compress_if_needed(
+        let compression_result = compressor.compress_if_needed(
             &context_messages,
             estimated_tokens,
             token_budget.for_history,
-        ) {
+        );
+
+        // Convert to daemon request
+        // IMPORTANT: When no compression happens, use convert_request_to_daemon() to preserve
+        // tool_calls and tool_call_id fields. Only use convert_request_with_messages() when
+        // compression actually modified the messages.
+        let daemon_request = match compression_result {
             CompressionResult::Compressed {
                 summary,
                 recent,
@@ -347,22 +381,21 @@ impl HostFunctions for DaemonHostFunctions {
             } => {
                 debug!("Compressed context, saved {} tokens", saved);
                 // Prepend summary to recent messages
-                let mut result = vec![ContextMessage {
+                let mut final_messages = vec![ContextMessage {
                     role: "system".into(),
                     content: format!("[Conversation summary]\n{}", summary),
                 }];
-                result.extend(recent);
-                result
+                final_messages.extend(recent);
+                // Use convert_request_with_messages for compressed messages
+                // Note: This will lose tool_calls - compression and tool calling are incompatible
+                self.convert_request_with_messages(request, &final_messages)
             }
-            CompressionResult::NotNeeded => context_messages,
-            CompressionResult::Skipped { reason } => {
-                debug!("Context compression skipped: {}", reason);
-                context_messages
+            CompressionResult::NotNeeded | CompressionResult::Skipped { .. } => {
+                // No compression - use direct conversion to preserve tool_calls and tool_call_id
+                debug!("No compression needed, preserving tool_calls");
+                self.convert_request_to_daemon(request)
             }
         };
-
-        // Convert to daemon request with potentially compressed messages
-        let daemon_request = self.convert_request_with_messages(request, &final_messages);
 
         // Execute LLM call synchronously using block_in_place
         // (allows blocking in async context by moving to blocking thread pool)
@@ -375,15 +408,17 @@ impl HostFunctions for DaemonHostFunctions {
 
         match result {
             Ok(response) => {
-                // Convert tool calls
+                // Convert tool calls, preserving call_id for OpenAI Responses API compatibility
                 let tool_calls = response
                     .tool_calls
                     .unwrap_or_default()
                     .into_iter()
                     .map(|tc| nevoflux_builtin_wasm::ToolCall {
                         id: tc.id,
+                        call_id: tc.call_id,
                         name: tc.name,
                         arguments: tc.arguments,
+                        signature: tc.signature,
                     })
                     .collect();
 
@@ -468,7 +503,7 @@ impl HostFunctions for DaemonHostFunctions {
     ) -> HostResult<Option<nevoflux_builtin_wasm::LlmChunk>> {
         match self.stream_registry.next_chunk(stream_id) {
             Ok(Some(chunk)) => {
-                // Convert daemon chunk to builtin-wasm chunk
+                // Convert daemon chunk to builtin-wasm chunk, preserving call_id
                 let wasm_chunk = nevoflux_builtin_wasm::LlmChunk {
                     text: chunk.text,
                     tool_calls: chunk
@@ -476,8 +511,10 @@ impl HostFunctions for DaemonHostFunctions {
                         .into_iter()
                         .map(|tc| nevoflux_builtin_wasm::ToolCall {
                             id: tc.id,
+                            call_id: tc.call_id,
                             name: tc.name,
                             arguments: tc.arguments,
+                            signature: tc.signature,
                         })
                         .collect(),
                     done: chunk.done,
@@ -616,14 +653,24 @@ impl HostFunctions for DaemonHostFunctions {
             message: "Services not available".into(),
         })?;
 
-        debug!("skill_list");
-
         // Load skills from filesystem if registry is empty (lazy loading)
         self.ensure_skills_loaded(services);
 
         // Now read the summaries
         let registry = services.skills.blocking_read();
         let summaries = registry.list();
+
+        // Log skills found for injection into system prompt
+        if summaries.is_empty() {
+            info!("skill_list: no skills found, system prompt will not include skills section");
+        } else {
+            let skill_names: Vec<&str> = summaries.iter().map(|s| s.name.as_str()).collect();
+            info!(
+                "skill_list: found {} skills for system prompt injection: {:?}",
+                summaries.len(),
+                skill_names
+            );
+        }
 
         // Convert skills::SkillSummary to builtin_wasm::SkillSummary
         Ok(summaries
@@ -720,6 +767,11 @@ impl HostFunctions for DaemonHostFunctions {
         use std::fs;
         use std::io::{BufRead, BufReader};
 
+        debug!(
+            "tool_read: path={}, offset={:?}, limit={:?}",
+            path, offset, limit
+        );
+
         let file = fs::File::open(path).map_err(|e| HostError {
             code: 1,
             message: format!("Failed to open file: {}", e),
@@ -736,7 +788,14 @@ impl HostFunctions for DaemonHostFunctions {
             .filter_map(|l| l.ok())
             .collect();
 
-        Ok(lines.join("\n"))
+        let result = lines.join("\n");
+        debug!(
+            "tool_read: read {} lines, content_len={}",
+            lines.len(),
+            result.len()
+        );
+        debug!("tool_read: content={:?}", result);
+        Ok(result)
     }
 
     fn tool_write(&self, path: &str, content: &str) -> HostResult<()> {
@@ -1425,6 +1484,11 @@ impl HostFunctions for DaemonHostFunctions {
         )
     }
 
+    fn browser_get_elements(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+        debug!("browser_get_elements: getting accessibility tree");
+        self.execute_browser_action(BrowserToolAction::Snapshot, serde_json::json!({}), tab_id)
+    }
+
     fn is_interrupted(&self) -> HostResult<bool> {
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
@@ -1676,9 +1740,19 @@ impl DaemonHostFunctions {
     fn ensure_skills_loaded(&self, services: &HostServices) {
         let mut registry = services.skills.blocking_write();
         if registry.is_empty() {
-            debug!("ensure_skills_loaded: loading skills from filesystem");
-            if let Err(e) = registry.load() {
-                warn!("Failed to load skills from filesystem: {}", e);
+            info!("Loading skills from filesystem");
+            match registry.load() {
+                Ok(count) => {
+                    if count > 0 {
+                        let names = registry.names();
+                        info!("Loaded {} skills from filesystem: {:?}", count, names);
+                    } else {
+                        info!("No skills found in configured directories");
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to load skills from filesystem: {}", e);
+                }
             }
         }
     }
@@ -1768,6 +1842,16 @@ impl DaemonHostFunctions {
             action,
             params,
             timeout_ms: 30000, // 30 second default timeout
+            client_identity: self
+                .services
+                .as_ref()
+                .map(|s| s.client_identity.clone())
+                .unwrap_or_default(),
+            proxy_id: self
+                .services
+                .as_ref()
+                .map(|s| s.proxy_id.clone())
+                .unwrap_or_default(),
         };
 
         // Create oneshot channel for response
@@ -1884,6 +1968,9 @@ impl DaemonHostFunctions {
                      Return your findings when complete.",
                     task_str
                 )),
+                tab_id: None,    // Sub-agents don't inherit browser tab context
+                tab_ids: vec![], // Sub-agents don't inherit tab list
+                skill_context: None,
             };
 
             // Run the appropriate builtin mode
@@ -1983,7 +2070,7 @@ impl DaemonHostFunctions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nevoflux_skills::{Skill, SkillMetadata};
+    use nevoflux_skills::{LoaderConfig, Skill, SkillMetadata, SkillRegistry};
     use nevoflux_storage::Database;
 
     fn setup_host_with_services() -> (DaemonHostFunctions, tokio::runtime::Runtime) {
@@ -1991,6 +2078,23 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = Arc::new(Database::open_in_memory().unwrap());
         let services = HostServices::new(db);
+        let host = DaemonHostFunctions::new(config, rt.handle().clone()).with_services(services);
+        (host, rt)
+    }
+
+    /// Setup host with an empty skills registry (no default directories).
+    fn setup_host_with_empty_skills() -> (DaemonHostFunctions, tokio::runtime::Runtime) {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
+
+        // Use LoaderConfig with empty user_dirs to avoid loading from real filesystem
+        let loader_config = LoaderConfig::new().with_user_dirs(vec![]);
+        let skills = Arc::new(tokio::sync::RwLock::new(SkillRegistry::with_config(
+            loader_config,
+        )));
+        let services = HostServices::with_skills(db, skills);
+
         let host = DaemonHostFunctions::new(config, rt.handle().clone()).with_services(services);
         (host, rt)
     }
@@ -2110,7 +2214,8 @@ mod tests {
 
     #[test]
     fn test_skill_list_empty() {
-        let (host, _rt) = setup_host_with_services();
+        // Use setup with empty skills registry to avoid loading from real filesystem
+        let (host, _rt) = setup_host_with_empty_skills();
 
         let result = host.skill_list();
         assert!(result.is_ok());
@@ -2123,8 +2228,14 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = Arc::new(Database::open_in_memory().unwrap());
 
-        // Create services and register a skill
-        let services = HostServices::new(db);
+        // Use empty skills registry to avoid loading from real filesystem
+        let loader_config = LoaderConfig::new().with_user_dirs(vec![]);
+        let skills = Arc::new(tokio::sync::RwLock::new(SkillRegistry::with_config(
+            loader_config,
+        )));
+        let services = HostServices::with_skills(db, skills);
+
+        // Register a test skill
         {
             let mut registry = services.skills.blocking_write();
             let skill = Skill::new(

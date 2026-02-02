@@ -55,6 +55,7 @@
 //! bridge.connect().await?;
 //! ```
 
+pub mod async_proxy;
 pub mod config;
 pub mod daemon_client;
 pub mod error;
@@ -78,6 +79,7 @@ pub use proxy::{parse_native_message, Proxy, ProxyConfig, ProxyState};
 pub use streaming::{
     extract_stream_message, ActiveStream, StreamAccumulator, StreamError, StreamMessageType,
 };
+pub use async_proxy::{run_async_proxy, AsyncProxyConfig, StdinMessage, StdoutMessage};
 
 #[cfg(test)]
 mod tests {

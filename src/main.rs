@@ -232,77 +232,23 @@ fn write_daemon_files(port: u16) -> std::io::Result<()> {
 /// Run in proxy mode (Native Messaging bridge).
 ///
 /// This bridges between the browser extension (via Native Messaging on stdin/stdout)
-/// and the daemon (via ZeroMQ). Messages from the browser are forwarded to the daemon,
-/// and responses from the daemon are forwarded back to the browser.
+/// and the daemon (via ZeroMQ). Uses full-duplex communication to allow receiving
+/// messages (like cancel requests or browser tool responses) while streaming.
 async fn run_proxy(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    use nevoflux_bridge::{parse_native_message, BridgeConfig, Proxy, ProxyConfig};
+    use nevoflux_bridge::{run_async_proxy, AsyncProxyConfig, BridgeConfig};
     use tokio::io::{stdin, stdout};
 
     // Initialize logging to file only (stdout/stderr must be silent for Native Messaging)
     let log_file = get_data_dir().join("proxy.log");
     logging::init_file_only_logging(log_file, verbose);
 
-    tracing::debug!("Starting proxy mode");
+    tracing::debug!("Starting async proxy mode (full-duplex)");
 
     let bridge_config = BridgeConfig::new().with_data_dir(get_data_dir());
-    let proxy_config = ProxyConfig::new().with_bridge(bridge_config);
+    let config = AsyncProxyConfig::new().with_bridge(bridge_config);
 
-    let mut proxy = Proxy::new(stdin(), stdout(), proxy_config);
+    run_async_proxy(stdin(), stdout(), config).await?;
 
-    // Connect to daemon (will auto-start if not running)
-    proxy.connect().await?;
-
-    tracing::info!("Proxy connected to daemon");
-
-    // Send initial "connected" message to browser
-    let init_msg = serde_json::json!({
-        "type": "connected",
-        "payload": {
-            "version": env!("CARGO_PKG_VERSION"),
-            "proxy_id": proxy.proxy_id()
-        }
-    });
-    if let Err(e) = proxy.write_native_message(&init_msg).await {
-        tracing::error!("Failed to send init message: {}", e);
-    }
-
-    // Main event loop
-    // Process messages from Native Messaging (browser) and forward to daemon.
-    // After forwarding, wait for and forward the daemon's response back.
-    loop {
-        // Read from Native Messaging (browser)
-        let message = match proxy.read_native_message().await {
-            Ok(msg) => msg,
-            Err(e) => {
-                tracing::debug!("Native messaging read error: {}", e);
-                break; // Browser closed connection
-            }
-        };
-
-        // Parse and forward to daemon
-        if let Some((request_id, channel, payload)) = parse_native_message(&message) {
-            if let Err(e) = proxy.forward_to_daemon(request_id, channel, payload).await {
-                tracing::error!("Failed to forward to daemon: {}", e);
-                proxy.send_error("DAEMON_ERROR", &e.to_string()).await.ok();
-                continue;
-            }
-
-            // Wait for daemon response and forward to sidebar
-            match proxy.receive_from_daemon().await {
-                Ok(env) => {
-                    if let Err(e) = proxy.forward_to_sidebar(env).await {
-                        tracing::error!("Failed to forward to sidebar: {}", e);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Daemon receive error: {}", e);
-                    proxy.send_error("DAEMON_ERROR", &e.to_string()).await.ok();
-                }
-            }
-        }
-    }
-
-    proxy.shutdown().await?;
     Ok(())
 }
 

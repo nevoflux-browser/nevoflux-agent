@@ -436,6 +436,9 @@ impl SubagentExecutor {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: custom_prompt,
+            tab_id: None,    // Sub-agents don't inherit browser tab context
+            tab_ids: vec![], // Sub-agents don't inherit tab list
+            skill_context: None,
         };
 
         // Check for kill before running

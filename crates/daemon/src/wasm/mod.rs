@@ -14,5 +14,5 @@ pub use instance::WasmInstance;
 pub use linker::{create_linker, HostState};
 pub use llm::{LlmAttachment, LlmChatRequest, LlmChatResponse, LlmMessage, LlmUsage};
 pub use runtime::{WasmConfig, WasmRuntime};
-pub use services::{HostServices, LlmConfig};
+pub use services::{BrowserRequest, BrowserResponse, BrowserSender, HostServices, LlmConfig};
 pub use subagent::{SubagentExecutor, SubagentHandle, SubagentStatus};

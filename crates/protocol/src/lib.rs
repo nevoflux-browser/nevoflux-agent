@@ -40,7 +40,7 @@ pub use chat::{
     AccountStatus, AgentMessage, AgentStateMessage, BrowserToolRequest, BrowserToolResponse,
     ChatMessage, ContentBlock, ErrorMessage, PermissionRequest, PermissionResponse, PluginCommand,
     SidebarMessage, SkillCommand, StopGeneration, StreamChunk, StreamEnd, SystemCommand,
-    SystemResponse,
+    SystemResponse, TabInfo,
 };
 
 // Re-export MCP messages

@@ -11,6 +11,19 @@ use serde::{Deserialize, Serialize};
 // Sidebar → Agent Messages
 // ============================================================================
 
+/// Information about a browser tab.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabInfo {
+    /// The space/group the tab belongs to (e.g., workspace name).
+    #[serde(default)]
+    pub space: String,
+    /// The tab's unique ID.
+    pub tab_id: i64,
+    /// The tab's title.
+    #[serde(default)]
+    pub tab_title: String,
+}
+
 /// User chat message
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -23,8 +36,11 @@ pub struct ChatMessage {
     /// Attachments
     #[serde(default)]
     pub attachments: Vec<Attachment>,
-    /// Current tab ID
+    /// Current active tab ID.
     pub tab_id: Option<i64>,
+    /// List of all available tabs with their metadata.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tab_ids: Vec<TabInfo>,
 }
 
 /// Skill command

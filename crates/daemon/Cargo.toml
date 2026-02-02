@@ -28,6 +28,7 @@ serde_json.workspace = true
 
 # Async runtime
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "signal", "fs"] }
+tokio-util = "0.7"
 async-trait.workspace = true
 futures.workspace = true
 

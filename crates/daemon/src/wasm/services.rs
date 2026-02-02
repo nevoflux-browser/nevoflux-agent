@@ -77,6 +77,10 @@ pub struct BrowserRequest {
     pub params: serde_json::Value,
     /// Timeout in milliseconds.
     pub timeout_ms: u64,
+    /// Client identity for routing response back.
+    pub client_identity: Vec<u8>,
+    /// Proxy ID for the response envelope.
+    pub proxy_id: String,
 }
 
 /// Browser tool response.
@@ -124,6 +128,10 @@ pub struct HostServices {
     /// When set, enables the subagent_spawn host function to create
     /// isolated WASM instances for sub-agent execution.
     pub subagent_executor: Option<Arc<SubagentExecutor>>,
+    /// Current client identity for routing browser tool responses.
+    pub client_identity: Vec<u8>,
+    /// Current proxy ID for the response envelope.
+    pub proxy_id: String,
 }
 
 impl HostServices {
@@ -146,7 +154,15 @@ impl HostServices {
     /// let services = HostServices::new(db);
     /// ```
     pub fn new(database: Arc<Database>) -> Self {
-        let skills = Arc::new(RwLock::new(SkillRegistry::new()));
+        // Create skill registry and load skills from default directories
+        let mut registry = SkillRegistry::new();
+        if let Err(e) = registry.load() {
+            tracing::warn!("Failed to load skills: {}", e);
+        } else {
+            tracing::info!("Loaded {} skills into registry", registry.len());
+        }
+        let skills = Arc::new(RwLock::new(registry));
+
         Self {
             database,
             skills,
@@ -156,6 +172,8 @@ impl HostServices {
             browser_sender: None,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             subagent_executor: None,
+            client_identity: Vec::new(),
+            proxy_id: String::new(),
         }
     }
 
@@ -175,6 +193,8 @@ impl HostServices {
             browser_sender: None,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             subagent_executor: None,
+            client_identity: Vec::new(),
+            proxy_id: String::new(),
         }
     }
 
@@ -285,6 +305,25 @@ impl HostServices {
     /// ```
     pub fn with_subagent_executor(mut self, executor: Arc<SubagentExecutor>) -> Self {
         self.subagent_executor = Some(executor);
+        self
+    }
+
+    /// Set the client context for routing browser tool responses.
+    ///
+    /// This stores the client identity and proxy ID so browser tool requests
+    /// can be routed back to the correct client.
+    ///
+    /// # Arguments
+    ///
+    /// * `identity` - The ZeroMQ identity of the client connection.
+    /// * `proxy_id` - The proxy ID for the response envelope.
+    ///
+    /// # Returns
+    ///
+    /// Returns self for method chaining.
+    pub fn with_client_context(mut self, identity: Vec<u8>, proxy_id: String) -> Self {
+        self.client_identity = identity;
+        self.proxy_id = proxy_id;
         self
     }
 
@@ -500,10 +539,14 @@ mod tests {
             action: BrowserToolAction::Navigate,
             params: serde_json::json!({"url": "https://example.com"}),
             timeout_ms: 30000,
+            client_identity: vec![1, 2, 3],
+            proxy_id: "proxy-001".into(),
         };
 
         assert_eq!(request.request_id, "req-001");
         assert_eq!(request.action, BrowserToolAction::Navigate);
+        assert_eq!(request.client_identity, vec![1, 2, 3]);
+        assert_eq!(request.proxy_id, "proxy-001");
     }
 
     #[test]

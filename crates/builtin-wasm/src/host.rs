@@ -254,6 +254,9 @@ pub trait HostFunctions {
         tab_id: Option<i64>,
     ) -> HostResult<BrowserToolResult>;
 
+    /// Get accessibility tree with element IDs for interaction.
+    fn browser_get_elements(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
+
     // =========================================================================
     // Session Control Functions
     // =========================================================================
@@ -678,6 +681,15 @@ impl HostFunctions for MockHostFunctions {
         })))
     }
 
+    fn browser_get_elements(&self, _tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(serde_json::json!({
+            "elements": [
+                {"id": "e1", "role": "button", "name": "Submit"},
+                {"id": "e2", "role": "textbox", "name": "Email"}
+            ]
+        })))
+    }
+
     fn is_interrupted(&self) -> HostResult<bool> {
         Ok(self.interrupted.get())
     }
@@ -883,6 +895,9 @@ mod tests {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
 
         let chat_output = mock.builtin_chat(&input).unwrap();

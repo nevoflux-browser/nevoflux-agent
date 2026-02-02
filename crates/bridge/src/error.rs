@@ -48,6 +48,14 @@ pub enum BridgeError {
     /// Failed to launch daemon.
     #[error("Failed to launch daemon: {0}")]
     DaemonLaunchFailed(String),
+
+    /// Disconnected from daemon.
+    #[error("Disconnected from daemon")]
+    Disconnected,
+
+    /// Reconnection failed after max retries.
+    #[error("Reconnection failed after {0} attempts")]
+    ReconnectionFailed(u32),
 }
 
 /// Result type for bridge operations.

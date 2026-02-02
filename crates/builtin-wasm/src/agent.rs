@@ -123,9 +123,28 @@ impl<H: HostFunctions> Agent<H> {
     /// Run the agent for a single turn.
     pub fn run(&self, input: &AgentInput) -> HostResult<AgentOutput> {
         // Use custom system prompt if provided, otherwise use mode-based prompt
-        let system_prompt = match &input.custom_system_prompt {
+        let base_prompt = match &input.custom_system_prompt {
             Some(custom) => custom.clone(),
             None => self.build_system_prompt_for_mode(input.mode),
+        };
+
+        // Prepend skill context with high priority if present
+        let system_prompt = match &input.skill_context {
+            Some(skill) => {
+                format!(
+                    r#"<CRITICAL_INSTRUCTIONS priority="highest">
+The following skill instructions MUST be followed exactly. These instructions take absolute priority over all other guidance.
+
+<skill name="{}" base_path="{}">
+{}
+</skill>
+</CRITICAL_INSTRUCTIONS>
+
+{}"#,
+                    skill.name, skill.base_path, skill.content, base_prompt
+                )
+            }
+            None => base_prompt,
         };
 
         let tools = self.get_tools_for_mode(input.mode);
@@ -133,6 +152,7 @@ impl<H: HostFunctions> Agent<H> {
     }
 
     /// Build system prompt for a specific mode.
+    /// Note: Tab context is injected into user message to preserve API cache.
     fn build_system_prompt_for_mode(&self, mode: AgentMode) -> String {
         match mode {
             AgentMode::Chat => self.build_chat_system_prompt(),
@@ -160,12 +180,19 @@ impl<H: HostFunctions> Agent<H> {
         let mut messages = vec![Message::system(system_prompt)];
         messages.extend(input.history.clone());
 
-        // Build user message content with local files prefix
+        // Build context prefixes for user message
         let local_files_prefix = format_local_files(&input.local_files);
-        let user_content = if local_files_prefix.is_empty() {
-            input.user_message.clone()
-        } else {
-            format!("{}{}", local_files_prefix, input.user_message)
+        let tab_context_prefix = self.format_tab_context(input.tab_id, &input.tab_ids);
+
+        // Combine prefixes with user message
+        let user_content = match (local_files_prefix.is_empty(), tab_context_prefix.is_empty()) {
+            (true, true) => input.user_message.clone(),
+            (false, true) => format!("{}{}", local_files_prefix, input.user_message),
+            (true, false) => format!("{}\n\n{}", tab_context_prefix, input.user_message),
+            (false, false) => format!(
+                "{}{}\n\n{}",
+                local_files_prefix, tab_context_prefix, input.user_message
+            ),
         };
 
         // Create user message with optional attachments
@@ -212,13 +239,38 @@ impl<H: HostFunctions> Agent<H> {
                 break;
             }
 
-            // Execute tool calls
-            messages.push(Message::assistant(&response.text));
+            // Execute tool calls - must include tool_calls in the assistant message
+            messages.push(Message::assistant_with_tool_calls(
+                &response.text,
+                response.tool_calls.clone(),
+            ));
             all_tool_calls.extend(response.tool_calls.clone());
 
             for tool_call in &response.tool_calls {
+                eprintln!(
+                    "[AGENT] Executing tool: name={}, id={}, call_id={:?}, args={}",
+                    tool_call.name, tool_call.id, tool_call.call_id, tool_call.arguments
+                );
                 let result = self.execute_tool(tool_call)?;
-                messages.push(Message::tool(&tool_call.id, &result.content));
+                eprintln!(
+                    "[AGENT] Tool result will use tool_call_id={}",
+                    result.tool_call_id
+                );
+                // Find safe UTF-8 boundary for preview (handles multi-byte chars like Chinese)
+                let preview = truncate_string_safe(&result.content, 200);
+                eprintln!(
+                    "[AGENT] Tool result: success={}, content_len={}, content={:?}",
+                    result.success,
+                    result.content.len(),
+                    preview
+                );
+
+                // Dynamic truncation based on current message size
+                let content = truncate_tool_result_if_needed(&messages, &result.content);
+
+                // Use call_id (from result.tool_call_id) for the tool message
+                // This was set in execute_tool to use call_id when available
+                messages.push(Message::tool(&result.tool_call_id, &content));
 
                 // Check interrupt after each tool execution
                 if self.host.is_interrupted()? {
@@ -263,7 +315,9 @@ impl<H: HostFunctions> Agent<H> {
         let stream_id = self.host.llm_stream_start(&request)?;
 
         let mut accumulated_text = String::new();
-        let mut accumulated_tool_calls: Vec<ToolCall> = Vec::new();
+        // Use a HashMap to deduplicate tool calls by id, preferring those with call_id set
+        let mut tool_calls_map: std::collections::HashMap<String, ToolCall> =
+            std::collections::HashMap::new();
 
         // Read chunks until done
         loop {
@@ -285,8 +339,22 @@ impl<H: HostFunctions> Agent<H> {
                         }
                     }
 
-                    // Accumulate tool calls
-                    accumulated_tool_calls.extend(chunk.tool_calls);
+                    // Accumulate tool calls, preferring those with call_id set
+                    // This handles the case where OpenAI Responses API sends both
+                    // delta-accumulated tool calls (without call_id) and complete
+                    // tool calls (with call_id) for the same id
+                    for tc in chunk.tool_calls {
+                        let should_insert = match tool_calls_map.get(&tc.id) {
+                            None => true,
+                            Some(existing) => {
+                                // Prefer the one with call_id, or the newer one if both have it
+                                tc.call_id.is_some() || existing.call_id.is_none()
+                            }
+                        };
+                        if should_insert {
+                            tool_calls_map.insert(tc.id.clone(), tc);
+                        }
+                    }
 
                     if chunk.done {
                         break;
@@ -305,7 +373,7 @@ impl<H: HostFunctions> Agent<H> {
 
         Ok(LlmResponse {
             text: accumulated_text,
-            tool_calls: accumulated_tool_calls,
+            tool_calls: tool_calls_map.into_values().collect(),
         })
     }
 
@@ -395,11 +463,9 @@ impl<H: HostFunctions> Agent<H> {
             }
             "tool_call_dynamic" => {
                 let tool_name = tool_call.arguments["tool_name"].as_str().unwrap_or("");
-                let arguments = tool_call
-                    .arguments
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or(serde_json::json!({}));
+                let arguments_str = tool_call.arguments["arguments"].as_str().unwrap_or("{}");
+                let arguments: serde_json::Value =
+                    serde_json::from_str(arguments_str).unwrap_or(serde_json::json!({}));
                 self.host.tool_call_dynamic(tool_name, &arguments)?
             }
             // Browser tools
@@ -485,6 +551,11 @@ impl<H: HostFunctions> Agent<H> {
                 let result = self.host.browser_wait_for(selector, timeout_ms, tab_id)?;
                 serde_json::to_string(&result).unwrap_or_default()
             }
+            "browser_get_elements" => {
+                let tab_id = tool_call.arguments["tab_id"].as_i64();
+                let result = self.host.browser_get_elements(tab_id)?;
+                serde_json::to_string(&result).unwrap_or_default()
+            }
             // Subagent tools
             "subagent_spawn" => {
                 let task = tool_call.arguments["task"].as_str().unwrap_or("");
@@ -519,8 +590,14 @@ impl<H: HostFunctions> Agent<H> {
             }
         };
 
+        // Use call_id if available, otherwise fall back to id
+        // OpenAI Responses API requires call_id to match tool results
+        let tool_call_id = tool_call
+            .call_id
+            .clone()
+            .unwrap_or_else(|| tool_call.id.clone());
         Ok(ToolResult {
-            tool_call_id: tool_call.id.clone(),
+            tool_call_id,
             content,
             success: true,
         })
@@ -533,44 +610,63 @@ impl<H: HostFunctions> Agent<H> {
 You can:
 - Answer questions and have conversations
 - Search the web for current information
-- Read and understand the current page content
+- Get page content using browser_get_content or browser_get_markdown (pass tab_id from context)
+- Take screenshots using browser_screenshot
 - Ask the user clarifying questions
 
 You cannot:
-- Interact with the page (click, type, etc.)
+- Interact with the page (click, type, navigate, etc.)
 - Access local files
 - Execute commands
 
+When the user asks to summarize or analyze a page, use browser_get_markdown with the tab_id from the context.
 Be helpful, accurate, and concise."#;
 
         self.append_skills_section(base_prompt)
     }
 
     /// Build system prompt for browser mode.
+    /// Note: Tab context is injected into user message to preserve API cache.
     fn build_browser_system_prompt(&self) -> String {
         let base_prompt = r#"You are a helpful AI assistant with browser automation capabilities.
 
-You can:
-- Everything from chat mode
-- Navigate to URLs using browser_navigate
-- Click on elements using browser_click or browser_click_by_id
-- Type text into inputs using browser_type or browser_type_by_id (simulates keystrokes)
-- Fill form fields using browser_fill or browser_fill_by_id (sets value directly)
-- Get page content as text/HTML using browser_get_content
-- Get page content as markdown using browser_get_markdown
-- Take screenshots using browser_screenshot
-- Execute JavaScript using browser_eval_js
-- Scroll the page using browser_scroll
-- Wait for elements to appear using browser_wait_for
+## MOST IMPORTANT RULE - READ THIS FIRST
 
-Use browser automation to help users accomplish tasks on web pages.
-Always confirm before taking actions that might have side effects.
-Prefer using *_by_id variants when element IDs are available for more reliable targeting."#;
+When user asks to CLICK, TYPE, FILL, LOGIN, SIGNUP, or interact with ANY page element:
+
+**STEP 1: Call browser_get_elements** - This returns element IDs you need
+**STEP 2: Call browser_click_by_id / browser_fill_by_id / browser_type_by_id** with the element ID
+
+NEVER use these tools for interaction tasks:
+- browser_get_content ❌ (only returns HTML, no element IDs)
+- browser_get_markdown ❌ (only returns text, no element IDs)
+- browser_screenshot ❌ (only returns image, no element IDs)
+
+ONLY browser_get_elements provides element IDs needed for clicking!
+
+## Tool Reference
+
+### For Reading Page Content (NOT for clicking)
+- browser_get_markdown: Get page text (for reading/summarizing)
+- browser_get_content: Get raw HTML
+- browser_screenshot: Get visual image
+
+### For Interacting with Page Elements
+- browser_get_elements: **MUST call first** - returns accessibility tree with element IDs
+- browser_click_by_id: Click using element ID from snapshot
+- browser_fill_by_id: Fill form using element ID from snapshot
+- browser_type_by_id: Type text using element ID from snapshot
+
+### For Navigation
+- browser_navigate, browser_scroll, browser_wait_for
+
+Always confirm before taking actions that might have side effects."#;
 
         self.append_skills_section(base_prompt)
     }
 
     /// Build system prompt for agent mode.
+    /// Note: Tab context is injected into user message to preserve API cache.
     fn build_agent_system_prompt(&self) -> String {
         let base_prompt = r#"You are a powerful AI agent with full system access.
 
@@ -587,6 +683,56 @@ Always verify your work after making modifications.
 Ask for permission before destructive operations."#;
 
         self.append_skills_section(base_prompt)
+    }
+
+    /// Format tab context for system prompt.
+    ///
+    /// When `tab_ids` is provided, it means the user has attached specific tabs for processing.
+    /// The user's action should be performed on ALL tabs in `tab_ids`, not on `tab_id`.
+    /// `tab_id` is just the current active tab (for reference only when `tab_ids` is present).
+    fn format_tab_context(&self, tab_id: Option<i64>, tab_ids: &[TabInfo]) -> String {
+        let mut context = String::new();
+
+        // When tab_ids is provided, those are the target tabs for the user's action
+        if !tab_ids.is_empty() {
+            context.push_str("\n\n## Browser Tab Context\n\n");
+            context.push_str("**IMPORTANT:** The user has attached the following tabs for processing.\n");
+            context.push_str("When the user asks to summarize, analyze, or process content, you should process ALL of these attached tabs:\n\n");
+
+            // Group tabs by space
+            let mut tabs_by_space: std::collections::BTreeMap<&str, Vec<&TabInfo>> = std::collections::BTreeMap::new();
+            for tab in tab_ids {
+                let space = if tab.space.is_empty() { "Default" } else { &tab.space };
+                tabs_by_space.entry(space).or_default().push(tab);
+            }
+
+            for (space, tabs) in tabs_by_space {
+                context.push_str(&format!("[{}]\n", space));
+                for tab in tabs {
+                    context.push_str(&format!("- tab_id={}: {}\n", tab.tab_id, tab.tab_title));
+                }
+            }
+
+            context.push_str("\nTo get content from each tab, use `browser_get_markdown(tab_id=<id>)` for each tab listed above.");
+
+            // Add active tab info as secondary context
+            if let Some(id) = tab_id {
+                context.push_str(&format!("\n\n(Current active tab ID: {} - for reference only)", id));
+            }
+        } else if let Some(id) = tab_id {
+            // Only show active tab info when no specific tabs are attached
+            // Emphasize using the current page for actions
+            context.push_str(&format!(
+                "\n\n## Browser Tab Context\n\n\
+                **IMPORTANT:** The user is viewing a webpage and wants you to work with it.\n\
+                **Current Page Tab ID:** {}\n\n\
+                When the user asks to summarize, analyze, or process content, use this current page.\n\
+                To get the page content, use `browser_get_markdown(tab_id={})`.",
+                id, id
+            ));
+        }
+
+        context
     }
 
     /// Append available skills section to a base prompt.
@@ -687,6 +833,51 @@ Ask for permission before destructive operations."#;
                         }
                     },
                     "required": ["name"]
+                }),
+            },
+            // Browser content tools (also available in chat mode for tab context)
+            ToolDefinition {
+                name: "browser_get_content".into(),
+                description: "Get the current page content as text/HTML".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "tab_id": {
+                            "type": "integer",
+                            "description": "Optional tab ID (uses active tab if not specified)"
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "browser_get_markdown".into(),
+                description: "Get the current page content as markdown (better for summarization)".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "tab_id": {
+                            "type": "integer",
+                            "description": "Optional tab ID (uses active tab if not specified)"
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "browser_screenshot".into(),
+                description: "Take a screenshot of the current page".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "full_page": {
+                            "type": "boolean",
+                            "description": "Whether to capture the full page (default: false)",
+                            "default": false
+                        },
+                        "tab_id": {
+                            "type": "integer",
+                            "description": "Optional tab ID (uses active tab if not specified)"
+                        }
+                    }
                 }),
             },
         ]
@@ -974,6 +1165,21 @@ Ask for permission before destructive operations."#;
             }),
         });
 
+        // Get elements - REQUIRED before any page interaction
+        tools.push(ToolDefinition {
+            name: "browser_get_elements".into(),
+            description: "REQUIRED before clicking/typing/filling. Returns accessibility tree with element IDs for browser_click_by_id, browser_fill_by_id, browser_type_by_id.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "Optional tab ID"
+                    }
+                }
+            }),
+        });
+
         tools
     }
 
@@ -1138,7 +1344,7 @@ Ask for permission before destructive operations."#;
         tools.push(ToolDefinition {
             name: "tool_call_dynamic".into(),
             description: "Call a tool discovered via tool_search. Provide the exact tool name \
-                          and arguments matching the tool's input_schema."
+                          and arguments as a JSON string matching the tool's input_schema."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -1148,11 +1354,12 @@ Ask for permission before destructive operations."#;
                         "description": "The exact name of the tool to call"
                     },
                     "arguments": {
-                        "type": "object",
-                        "description": "Arguments to pass to the tool"
+                        "type": "string",
+                        "description": "JSON string of arguments to pass to the tool (e.g., '{\"key\": \"value\"}')"
                     }
                 },
-                "required": ["tool_name", "arguments"]
+                "required": ["tool_name", "arguments"],
+                "additionalProperties": false
             }),
         });
 
@@ -1251,6 +1458,86 @@ fn format_skill_summaries(skills: &[SkillSummary]) -> String {
         .join("\n")
 }
 
+/// Safely truncate a string to at most `max_bytes` bytes at a valid UTF-8 char boundary.
+fn truncate_string_safe(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // Find the last char boundary at or before max_bytes
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Calculate the total size of all messages in bytes.
+fn calculate_messages_size(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|m| {
+            let mut size = m.content.len();
+            // Add tool calls size for assistant messages
+            for tc in &m.tool_calls {
+                size += tc.id.len() + tc.name.len();
+                // arguments is a serde_json::Value, estimate its string size
+                size += tc.arguments.to_string().len();
+                if let Some(ref call_id) = tc.call_id {
+                    size += call_id.len();
+                }
+            }
+            size
+        })
+        .sum()
+}
+
+/// Truncate tool result content if it would exceed the total message size limit.
+///
+/// This function dynamically calculates how much space is available based on:
+/// - Current total message size
+/// - Maximum allowed total size (300KB, ~75K tokens)
+/// - Reserved space for LLM output (50KB)
+/// - Minimum tool result size (10KB)
+fn truncate_tool_result_if_needed(messages: &[Message], content: &str) -> String {
+    // Total message size limit (~75K tokens for most models)
+    const MAX_TOTAL_MESSAGE_SIZE: usize = 300 * 1024; // 300KB
+    // Reserved space for LLM output
+    const RESERVED_OUTPUT_SIZE: usize = 50 * 1024; // 50KB
+    // Minimum tool result size (don't truncate below this)
+    const MIN_TOOL_RESULT_SIZE: usize = 10 * 1024; // 10KB
+
+    let current_size = calculate_messages_size(messages);
+    let available_space = MAX_TOTAL_MESSAGE_SIZE
+        .saturating_sub(current_size)
+        .saturating_sub(RESERVED_OUTPUT_SIZE);
+
+    // Calculate max size for this tool result
+    let max_result_size = available_space.max(MIN_TOOL_RESULT_SIZE);
+
+    if content.len() <= max_result_size {
+        return content.to_string();
+    }
+
+    // Need to truncate
+    eprintln!(
+        "[AGENT] Tool result truncated: {} -> {} bytes (current_msgs={}, available={})",
+        content.len(),
+        max_result_size,
+        current_size,
+        available_space
+    );
+
+    // Use safe UTF-8 truncation
+    let truncated = truncate_string_safe(content, max_result_size);
+
+    format!(
+        "{}...\n\n[Content truncated: {} bytes total, showing first {} bytes]",
+        truncated,
+        content.len(),
+        truncated.len()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1312,6 +1599,9 @@ mod tests {
             custom_system_prompt: Some(
                 "You are a specialized file search sub-agent. Focus only on finding files.".into(),
             ),
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
 
         // Should run successfully with custom prompt
@@ -1324,6 +1614,7 @@ mod tests {
         let mock = MockHostFunctions::new();
         let agent = Agent::new(mock);
 
+        // System prompts are now static (no tab context) for API cache preservation
         let chat_prompt = agent.build_system_prompt_for_mode(AgentMode::Chat);
         assert!(chat_prompt.contains("helpful AI assistant"));
 
@@ -1332,6 +1623,36 @@ mod tests {
 
         let agent_prompt = agent.build_system_prompt_for_mode(AgentMode::Agent);
         assert!(agent_prompt.contains("full system access"));
+    }
+
+    #[test]
+    fn test_format_tab_context() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        // Test with only tab_id (no attached tabs) - emphasize current page
+        let context_with_tab = agent.format_tab_context(Some(42), &[]);
+        assert!(context_with_tab.contains("Current Page Tab ID:** 42"));
+        assert!(context_with_tab.contains("browser_get_markdown(tab_id=42)"));
+        assert!(context_with_tab.contains("use this current page"));
+
+        // Test with tab_ids list (attached tabs for processing)
+        let tab_ids = vec![
+            TabInfo { space: "Work".into(), tab_id: 1, tab_title: "GitHub".into() },
+            TabInfo { space: "Work".into(), tab_id: 2, tab_title: "Docs".into() },
+            TabInfo { space: "Personal".into(), tab_id: 3, tab_title: "Email".into() },
+        ];
+        let context_with_tabs = agent.format_tab_context(Some(99), &tab_ids);
+        assert!(context_with_tabs.contains("attached the following tabs"));
+        assert!(context_with_tabs.contains("[Work]"));
+        assert!(context_with_tabs.contains("[Personal]"));
+        assert!(context_with_tabs.contains("tab_id=1: GitHub"));
+        assert!(context_with_tabs.contains("tab_id=2: Docs"));
+        assert!(context_with_tabs.contains("active tab ID: 99"));
+
+        // Test with no tab context
+        let empty_context = agent.format_tab_context(None, &[]);
+        assert!(empty_context.is_empty());
     }
 
     #[test]
@@ -1364,6 +1685,9 @@ mod tests {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -1383,6 +1707,9 @@ mod tests {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -1402,6 +1729,9 @@ mod tests {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -1415,6 +1745,7 @@ mod tests {
             text: "Let me search for that.".into(),
             tool_calls: vec![ToolCall {
                 id: "call-001".into(),
+                call_id: None,
                 name: "web_search".into(),
                 arguments: serde_json::json!({"query": "rust programming"}),
             }],
@@ -1439,6 +1770,9 @@ mod tests {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -1584,6 +1918,7 @@ mod tests {
 
         let tool_call = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "web_search".into(),
             arguments: serde_json::json!({"query": "test"}),
         };
@@ -1600,6 +1935,7 @@ mod tests {
 
         let tool_call = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "unknown_tool".into(),
             arguments: serde_json::json!({}),
         };
@@ -1615,6 +1951,7 @@ mod tests {
 
         let tool_call = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "tool_search".into(),
             arguments: serde_json::json!({"query": "file", "max_results": 5}),
         };
@@ -1632,10 +1969,11 @@ mod tests {
 
         let tool_call = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "tool_call_dynamic".into(),
             arguments: serde_json::json!({
                 "tool_name": "read_file",
-                "arguments": {"path": "/test.txt"}
+                "arguments": r#"{"path": "/test.txt"}"#
             }),
         };
 
@@ -1661,6 +1999,7 @@ mod tests {
 
         let tool_call = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "browser_navigate".into(),
             arguments: serde_json::json!({"url": "https://example.com"}),
         };
@@ -1677,6 +2016,7 @@ mod tests {
 
         let tool_call = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "browser_click".into(),
             arguments: serde_json::json!({"selector": "#submit-btn"}),
         };
@@ -1692,6 +2032,7 @@ mod tests {
 
         let tool_call = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "browser_type".into(),
             arguments: serde_json::json!({"selector": "#input", "text": "Hello World"}),
         };
@@ -1707,6 +2048,7 @@ mod tests {
 
         let tool_call = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "browser_screenshot".into(),
             arguments: serde_json::json!({"full_page": true}),
         };
@@ -1723,6 +2065,7 @@ mod tests {
 
         let tool_call = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "browser_scroll".into(),
             arguments: serde_json::json!({"direction": "down", "amount": 500}),
         };
@@ -1738,6 +2081,7 @@ mod tests {
 
         let tool_call = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "browser_wait_for".into(),
             arguments: serde_json::json!({"selector": "#loading", "timeout_ms": 5000}),
         };
@@ -1771,6 +2115,9 @@ mod tests {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
 
         // Should complete normally
@@ -1794,6 +2141,9 @@ mod tests {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
 
         // Should exit early due to interrupt
@@ -1823,6 +2173,7 @@ mod tests {
 
         let tool_call = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "subagent_spawn".into(),
             arguments: serde_json::json!({"task": "Search for files", "mode": "agent"}),
         };
@@ -1839,6 +2190,7 @@ mod tests {
 
         let tool_call = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "subagent_spawn".into(),
             arguments: serde_json::json!({"task": "Do something"}),
         };
@@ -1856,6 +2208,7 @@ mod tests {
         // First spawn a subagent
         let spawn_call = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "subagent_spawn".into(),
             arguments: serde_json::json!({"task": "Test task"}),
         };
@@ -1864,6 +2217,7 @@ mod tests {
         // Then check its status
         let status_call = ToolCall {
             id: "call-002".into(),
+            call_id: None,
             name: "subagent_status".into(),
             arguments: serde_json::json!({"id": 1}),
         };
@@ -1881,6 +2235,7 @@ mod tests {
         // First spawn a subagent
         let spawn_call = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "subagent_spawn".into(),
             arguments: serde_json::json!({"task": "Test task"}),
         };
@@ -1889,6 +2244,7 @@ mod tests {
         // Then wait for it
         let wait_call = ToolCall {
             id: "call-002".into(),
+            call_id: None,
             name: "subagent_wait".into(),
             arguments: serde_json::json!({"id": 1}),
         };
@@ -1906,6 +2262,7 @@ mod tests {
         // First spawn a subagent
         let spawn_call = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "subagent_spawn".into(),
             arguments: serde_json::json!({"task": "Long running task"}),
         };
@@ -1914,6 +2271,7 @@ mod tests {
         // Then kill it
         let kill_call = ToolCall {
             id: "call-002".into(),
+            call_id: None,
             name: "subagent_kill".into(),
             arguments: serde_json::json!({"id": 1}),
         };
@@ -1932,6 +2290,7 @@ mod tests {
         // First spawn some subagents
         let spawn_call1 = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "subagent_spawn".into(),
             arguments: serde_json::json!({"task": "Task 1", "mode": "agent"}),
         };
@@ -1939,6 +2298,7 @@ mod tests {
 
         let spawn_call2 = ToolCall {
             id: "call-002".into(),
+            call_id: None,
             name: "subagent_spawn".into(),
             arguments: serde_json::json!({"task": "Task 2", "mode": "browser"}),
         };
@@ -1947,6 +2307,7 @@ mod tests {
         // Then list them
         let list_call = ToolCall {
             id: "call-003".into(),
+            call_id: None,
             name: "subagent_list".into(),
             arguments: serde_json::json!({}),
         };
@@ -2023,5 +2384,66 @@ mod tests {
         let result = format_local_files(&files);
         assert!(result.contains("main.rs"));
         assert!(result.contains("/home/user/src"));
+    }
+
+    // ==================== Truncation Tests ====================
+
+    #[test]
+    fn test_calculate_messages_size() {
+        let messages = vec![
+            Message::system("System prompt"),
+            Message::user("User message"),
+        ];
+        let size = calculate_messages_size(&messages);
+        assert_eq!(size, "System prompt".len() + "User message".len());
+    }
+
+    #[test]
+    fn test_truncate_tool_result_small_content() {
+        // Small content should not be truncated
+        let messages = vec![Message::system("System prompt")];
+        let content = "Small content";
+        let result = truncate_tool_result_if_needed(&messages, content);
+        assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_truncate_tool_result_large_content() {
+        // Large content should be truncated
+        let messages = vec![Message::system("System prompt")];
+        // Create content larger than MAX_TOTAL_MESSAGE_SIZE
+        let large_content = "x".repeat(400 * 1024); // 400KB
+        let result = truncate_tool_result_if_needed(&messages, &large_content);
+
+        // Should be truncated
+        assert!(result.len() < large_content.len());
+        assert!(result.contains("[Content truncated:"));
+    }
+
+    #[test]
+    fn test_truncate_tool_result_respects_existing_messages() {
+        // When messages already take up space, less space is available for tool result
+        let large_system = "x".repeat(200 * 1024); // 200KB system message
+        let messages = vec![Message::system(&large_system)];
+
+        let content = "y".repeat(150 * 1024); // 150KB content
+        let result = truncate_tool_result_if_needed(&messages, &content);
+
+        // Should be truncated because total would exceed 300KB limit
+        assert!(result.len() < content.len());
+        assert!(result.contains("[Content truncated:"));
+    }
+
+    #[test]
+    fn test_truncate_tool_result_minimum_size() {
+        // Even when messages are very large, tool result should have minimum 10KB
+        let huge_system = "x".repeat(290 * 1024); // 290KB - almost at limit
+        let messages = vec![Message::system(&huge_system)];
+
+        let content = "y".repeat(50 * 1024); // 50KB content
+        let result = truncate_tool_result_if_needed(&messages, &content);
+
+        // Should have at least 10KB (MIN_TOOL_RESULT_SIZE)
+        assert!(result.len() >= 10 * 1024);
     }
 }

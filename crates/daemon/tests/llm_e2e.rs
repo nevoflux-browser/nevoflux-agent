@@ -11,8 +11,8 @@
 //! - DASHSCOPE_API_KEY: For Qwen tests
 
 use nevoflux_daemon::wasm::llm::{
-    execute_llm_chat, start_llm_stream, LlmChatRequest, LlmMessage, LlmStreamRegistry,
-    LlmToolCall, LlmToolDefinition,
+    execute_llm_chat, start_llm_stream, LlmAttachment, LlmChatRequest, LlmMessage,
+    LlmStreamRegistry, LlmToolCall, LlmToolDefinition,
 };
 use nevoflux_llm::ProviderType;
 use serde_json::json;
@@ -262,6 +262,7 @@ async fn test_openai_tool_calling() {
                         call_id: tool_call.call_id.clone(),
                         name: tool_call.name.clone(),
                         arguments: tool_call.arguments.clone(),
+                        signature: tool_call.signature.clone(),
                     }]),
                     LlmMessage::tool_result(
                         tool_result_id,
@@ -445,7 +446,10 @@ async fn test_openai_streaming_tool_calling() {
     println!("Total tool calls: {}", all_tool_calls.len());
 
     // Verify we got tool calls
-    assert!(!all_tool_calls.is_empty(), "Should have received tool calls");
+    assert!(
+        !all_tool_calls.is_empty(),
+        "Should have received tool calls"
+    );
 
     // Find the get_weather tool call
     let weather_call = all_tool_calls
@@ -483,6 +487,7 @@ async fn test_openai_streaming_tool_calling() {
                 call_id: weather_call.call_id.clone(),
                 name: weather_call.name.clone(),
                 arguments: weather_call.arguments.clone(),
+                signature: weather_call.signature.clone(),
             }]),
             LlmMessage::tool_result(
                 call_id, // Use call_id, not id!
@@ -591,7 +596,10 @@ async fn test_openai_streaming_tool_calling_full_streaming() {
         .as_ref()
         .expect("call_id must be present");
 
-    println!("First stream got tool call: id={}, call_id={}", weather_call.id, call_id);
+    println!(
+        "First stream got tool call: id={}, call_id={}",
+        weather_call.id, call_id
+    );
 
     // Step 2: Send tool result back using STREAMING (this is the key difference!)
     let request2 = LlmChatRequest {
@@ -602,6 +610,7 @@ async fn test_openai_streaming_tool_calling_full_streaming() {
                 call_id: weather_call.call_id.clone(),
                 name: weather_call.name.clone(),
                 arguments: weather_call.arguments.clone(),
+                signature: weather_call.signature.clone(),
             }]),
             LlmMessage::tool_result(
                 call_id,
@@ -665,7 +674,11 @@ struct ToolCallTracker {
 }
 
 impl ToolCallTracker {
-    fn new(initial_user_message: &str, system: Option<&str>, tools: Vec<LlmToolDefinition>) -> Self {
+    fn new(
+        initial_user_message: &str,
+        system: Option<&str>,
+        tools: Vec<LlmToolDefinition>,
+    ) -> Self {
         let mut messages = Vec::new();
         if let Some(sys) = system {
             messages.push(LlmMessage {
@@ -763,8 +776,7 @@ async fn test_multi_round_tool_calling() {
 
     let tools = vec![LlmToolDefinition {
         name: "get_weather".into(),
-        description: "Get the current weather in a given location. Call this once per city."
-            .into(),
+        description: "Get the current weather in a given location. Call this once per city.".into(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -792,7 +804,11 @@ async fn test_multi_round_tool_calling() {
             panic!("Too many rounds, possible infinite loop");
         }
 
-        println!("\n=== Round {} (messages: {}) ===", round, tracker.messages.len());
+        println!(
+            "\n=== Round {} (messages: {}) ===",
+            round,
+            tracker.messages.len()
+        );
 
         // Build request (include tools unless we've done multiple rounds)
         let request = if round <= 3 {
@@ -814,7 +830,10 @@ async fn test_multi_round_tool_calling() {
 
         let (text, tool_calls) = collect_stream(&registry, stream_id).await;
 
-        println!("Response text: {}", if text.is_empty() { "(empty)" } else { &text });
+        println!(
+            "Response text: {}",
+            if text.is_empty() { "(empty)" } else { &text }
+        );
         println!("Tool calls: {}", tool_calls.len());
 
         if tool_calls.is_empty() {
@@ -833,7 +852,10 @@ async fn test_multi_round_tool_calling() {
                 "Response should mention Paris"
             );
 
-            println!("\n✅ Multi-round tool calling test passed! (completed in {} rounds)", round);
+            println!(
+                "\n✅ Multi-round tool calling test passed! (completed in {} rounds)",
+                round
+            );
             return;
         }
 
@@ -865,5 +887,582 @@ async fn test_multi_round_tool_calling() {
 
             tracker.add_tool_result(call_id, weather_result);
         }
+    }
+}
+
+/// A minimal 8x8 red PNG image encoded as base64.
+/// This is a valid PNG that shows a solid red square.
+const TEST_RED_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC";
+
+/// A minimal 8x8 blue PNG image encoded as base64.
+const TEST_BLUE_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEElEQVR4nGNgYPiPAw0pCQCpcD/BFMrqcwAAAABJRU5ErkJggg==";
+
+#[tokio::test]
+#[ignore]
+async fn test_openai_image_attachment() {
+    // This test verifies that image attachments (base64 encoded) are correctly
+    // sent to the LLM and processed.
+    let api_key = match get_env_key("OPENAI_API_KEY") {
+        Some(key) => key,
+        None => {
+            eprintln!("Skipping: OPENAI_API_KEY not set");
+            return;
+        }
+    };
+
+    // Create a request with an image attachment
+    let request = LlmChatRequest {
+        messages: vec![LlmMessage::user_with_attachments(
+            "What color is this image? Reply with just the color name.",
+            vec![LlmAttachment {
+                name: "red_square.png".into(),
+                mime_type: "image/png".into(),
+                data: TEST_RED_PNG_BASE64.into(),
+            }],
+        )],
+        system: Some(
+            "You are a helpful assistant. Be very concise, reply with just a single word.".into(),
+        ),
+        temperature: Some(0.0),
+        max_tokens: Some(50),
+        tools: None,
+    };
+
+    let response = execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request).await;
+
+    match response {
+        Ok(resp) => {
+            println!("OpenAI image response: {:?}", resp);
+            assert!(!resp.content.is_empty(), "Response should not be empty");
+            // The response should mention red (the color of the test image)
+            let content_lower = resp.content.to_lowercase();
+            assert!(
+                content_lower.contains("red")
+                    || content_lower.contains("pink")
+                    || content_lower.contains("maroon"),
+                "Response should describe the red image, got: {}",
+                resp.content
+            );
+            println!("✅ OpenAI image attachment test passed!");
+        }
+        Err(e) => panic!("OpenAI image chat failed: {:?}", e),
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_openai_image_attachment_streaming() {
+    // This test verifies that image attachments work correctly with streaming.
+    // This matches the real scenario where the sidebar sends an image via streaming API.
+    let api_key = match get_env_key("OPENAI_API_KEY") {
+        Some(key) => key,
+        None => {
+            eprintln!("Skipping: OPENAI_API_KEY not set");
+            return;
+        }
+    };
+
+    let registry = Arc::new(LlmStreamRegistry::new());
+
+    // Create a request that mirrors the agent flow:
+    // - System message (like agent mode prompt)
+    // - User message with image attachment
+    let request = LlmChatRequest {
+        messages: vec![
+            LlmMessage {
+                role: "system".into(),
+                content: "You are a powerful AI agent with full system access.".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                attachments: vec![],
+            },
+            LlmMessage::user_with_attachments(
+                "描述一下这个图片", // Same as sidebar test
+                vec![LlmAttachment {
+                    name: "red_square.png".into(),
+                    mime_type: "image/png".into(),
+                    data: TEST_RED_PNG_BASE64.into(),
+                }],
+            ),
+        ],
+        system: None, // System is in messages, not separate
+        temperature: Some(0.0),
+        max_tokens: Some(50),
+        tools: None,
+    };
+
+    println!("Request messages count: {}", request.messages.len());
+    for (i, msg) in request.messages.iter().enumerate() {
+        println!(
+            "Message[{}]: role={}, content_len={}, attachments={}",
+            i,
+            msg.role,
+            msg.content.len(),
+            msg.attachments.len()
+        );
+    }
+
+    let stream_id = start_llm_stream(
+        ProviderType::OpenAi,
+        &api_key,
+        "gpt-4o-mini",
+        request,
+        registry.clone(),
+    )
+    .await
+    .expect("Failed to start stream");
+
+    println!("Stream started with ID: {}", stream_id);
+
+    // Collect response
+    let mut combined_text = String::new();
+    let mut chunk_count = 0;
+
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        match registry.next_chunk(stream_id) {
+            Ok(Some(chunk)) => {
+                chunk_count += 1;
+                if let Some(text) = &chunk.text {
+                    combined_text.push_str(text);
+                }
+                if chunk.done {
+                    break;
+                }
+            }
+            Ok(None) => continue,
+            Err(e) => panic!("Stream error: {:?}", e),
+        }
+    }
+    registry.close(stream_id);
+
+    println!("Received {} chunks", chunk_count);
+    println!("Combined response: {}", combined_text);
+
+    assert!(!combined_text.is_empty(), "Response should not be empty");
+    let content_lower = combined_text.to_lowercase();
+    // Accept English or Chinese for "red"
+    assert!(
+        content_lower.contains("red")
+            || content_lower.contains("pink")
+            || content_lower.contains("maroon")
+            || combined_text.contains("红"), // Chinese for red
+        "Response should describe the red image, got: {}",
+        combined_text
+    );
+
+    println!("✅ OpenAI streaming image attachment test passed!");
+}
+
+/// A larger 200x200 red PNG image for testing size limits.
+const TEST_LARGE_RED_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAMgAAADICAIAAAAiOjnJAAACcklEQVR4nO3OAQkAMBDEsPNvejPxUCiFCMjelpzjB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1HiB1H60Yes1qIoPaoAAAAASUVORK5CYII=";
+
+#[tokio::test]
+#[ignore]
+async fn test_openai_image_attachment_with_agent_prompt() {
+    // This test mirrors the exact sidebar agent flow:
+    // - Full agent system prompt
+    // - Image attachment
+    // - Tools available
+    let api_key = match get_env_key("OPENAI_API_KEY") {
+        Some(key) => key,
+        None => {
+            eprintln!("Skipping: OPENAI_API_KEY not set");
+            return;
+        }
+    };
+
+    let registry = Arc::new(LlmStreamRegistry::new());
+
+    // Use the exact agent system prompt
+    let agent_system_prompt = r#"You are a powerful AI agent with full system access.
+
+You can:
+- Everything from browser mode
+- Read, write, and edit local files
+- Execute bash commands
+- Use computer control (mouse, keyboard)
+- Call MCP servers
+- Spawn sub-agents for parallel work
+
+Think step by step. Use tools to gather information before making changes.
+Always verify your work after making modifications.
+Ask for permission before destructive operations."#;
+
+    let request = LlmChatRequest {
+        messages: vec![
+            LlmMessage {
+                role: "system".into(),
+                content: agent_system_prompt.into(),
+                tool_calls: None,
+                tool_call_id: None,
+                attachments: vec![],
+            },
+            LlmMessage::user_with_attachments(
+                "描述一下这个图片",
+                vec![LlmAttachment {
+                    name: "screenshot.png".into(),
+                    mime_type: "image/png".into(),
+                    data: TEST_LARGE_RED_PNG_BASE64.into(),
+                }],
+            ),
+        ],
+        system: None,
+        temperature: Some(0.0),
+        max_tokens: Some(200),
+        // Add tools like the agent mode does
+        tools: Some(vec![LlmToolDefinition {
+            name: "read_file".into(),
+            description: "Read a file from the filesystem".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to read"}
+                },
+                "required": ["path"]
+            }),
+        }]),
+    };
+
+    println!("Request messages count: {}", request.messages.len());
+    println!("System prompt length: {}", agent_system_prompt.len());
+    println!("Image data length: {}", TEST_LARGE_RED_PNG_BASE64.len());
+
+    let stream_id = start_llm_stream(
+        ProviderType::OpenAi,
+        &api_key,
+        "gpt-4o-mini",
+        request,
+        registry.clone(),
+    )
+    .await
+    .expect("Failed to start stream");
+
+    let mut combined_text = String::new();
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        match registry.next_chunk(stream_id) {
+            Ok(Some(chunk)) => {
+                if let Some(text) = &chunk.text {
+                    combined_text.push_str(text);
+                }
+                if chunk.done {
+                    break;
+                }
+            }
+            Ok(None) => continue,
+            Err(e) => panic!("Stream error: {:?}", e),
+        }
+    }
+    registry.close(stream_id);
+
+    println!("Response: {}", combined_text);
+    assert!(!combined_text.is_empty(), "Response should not be empty");
+
+    // Should describe the image, not say "I cannot view"
+    assert!(
+        !combined_text.contains("无法查看")
+            && !combined_text.contains("cannot view")
+            && !combined_text.contains("can't see"),
+        "Model should be able to see the image! Got: {}",
+        combined_text
+    );
+
+    // Should mention red color
+    assert!(
+        combined_text.contains("红") || combined_text.to_lowercase().contains("red"),
+        "Response should describe the red image, got: {}",
+        combined_text
+    );
+
+    println!("✅ OpenAI image with agent prompt test passed!");
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_anthropic_image_attachment() {
+    // Test image attachments with Anthropic Claude
+    let api_key = match get_env_key("ANTHROPIC_API_KEY") {
+        Some(key) => key,
+        None => {
+            eprintln!("Skipping: ANTHROPIC_API_KEY not set");
+            return;
+        }
+    };
+
+    let request = LlmChatRequest {
+        messages: vec![LlmMessage::user_with_attachments(
+            "What color is this image? Reply with just the color name.",
+            vec![LlmAttachment {
+                name: "red_square.png".into(),
+                mime_type: "image/png".into(),
+                data: TEST_RED_PNG_BASE64.into(),
+            }],
+        )],
+        system: Some(
+            "You are a helpful assistant. Be very concise, reply with just a single word.".into(),
+        ),
+        temperature: Some(0.0),
+        max_tokens: Some(50),
+        tools: None,
+    };
+
+    let response = execute_llm_chat(
+        ProviderType::Anthropic,
+        &api_key,
+        "claude-3-haiku-20240307",
+        request,
+    )
+    .await;
+
+    match response {
+        Ok(resp) => {
+            println!("Anthropic image response: {:?}", resp);
+            assert!(!resp.content.is_empty(), "Response should not be empty");
+            let content_lower = resp.content.to_lowercase();
+            assert!(
+                content_lower.contains("red")
+                    || content_lower.contains("pink")
+                    || content_lower.contains("maroon"),
+                "Response should describe the red image, got: {}",
+                resp.content
+            );
+            println!("✅ Anthropic image attachment test passed!");
+        }
+        Err(e) => panic!("Anthropic image chat failed: {:?}", e),
+    }
+}
+
+/// Test with a large screenshot-like image (400x300, ~160KB base64)
+/// This test aims to reproduce the sidebar issue where large screenshots
+/// were not being described by gpt-4o-mini.
+#[tokio::test]
+#[ignore]
+async fn test_openai_large_screenshot_image() {
+    let api_key = match get_env_key("OPENAI_API_KEY") {
+        Some(key) => key,
+        None => {
+            eprintln!("Skipping: OPENAI_API_KEY not set");
+            return;
+        }
+    };
+
+    // Try larger image first (800x600, ~937KB), fallback to 400x300
+    let screenshot_base64 = match std::fs::read_to_string("/tmp/test_screenshot_800x600.txt") {
+        Ok(data) => {
+            println!("Using 800x600 screenshot (~937KB base64)");
+            data
+        }
+        Err(_) => match std::fs::read_to_string("/tmp/test_screenshot_400x300.txt") {
+            Ok(data) => {
+                println!("Using 400x300 screenshot (~160KB base64)");
+                data
+            }
+            Err(_) => {
+                eprintln!("Skipping: No test screenshot files found");
+                return;
+            }
+        },
+    };
+
+    println!(
+        "Testing with large screenshot image: {} bytes base64",
+        screenshot_base64.len()
+    );
+
+    let registry = Arc::new(LlmStreamRegistry::new());
+
+    // Test with gpt-4o-mini (same as sidebar)
+    let request = LlmChatRequest {
+        messages: vec![
+            LlmMessage {
+                role: "system".into(),
+                content: "You are a helpful assistant.".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                attachments: vec![],
+            },
+            LlmMessage::user_with_attachments(
+                "描述一下这个图片",
+                vec![LlmAttachment {
+                    name: "screenshot.png".into(),
+                    mime_type: "image/png".into(),
+                    data: screenshot_base64.clone(),
+                }],
+            ),
+        ],
+        system: None,
+        temperature: Some(0.0),
+        max_tokens: Some(200),
+        tools: None,
+    };
+
+    let stream_id = start_llm_stream(
+        ProviderType::OpenAi,
+        &api_key,
+        "gpt-4o-mini",
+        request,
+        registry.clone(),
+    )
+    .await
+    .expect("Failed to start stream");
+
+    let mut combined_text = String::new();
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        match registry.next_chunk(stream_id) {
+            Ok(Some(chunk)) => {
+                if let Some(text) = &chunk.text {
+                    combined_text.push_str(text);
+                }
+                if chunk.done {
+                    break;
+                }
+            }
+            Ok(None) => continue,
+            Err(e) => panic!("Stream error: {:?}", e),
+        }
+    }
+    registry.close(stream_id);
+
+    println!(
+        "gpt-4o-mini response for large screenshot: {}",
+        combined_text
+    );
+
+    // The response should NOT say "cannot view" or similar
+    let has_error_response = combined_text.contains("无法查看")
+        || combined_text.contains("cannot view")
+        || combined_text.contains("can't see")
+        || combined_text.contains("unable to")
+        || combined_text.contains("请上传"); // "please upload"
+
+    if has_error_response {
+        println!("⚠️ gpt-4o-mini failed to process large screenshot!");
+        println!("Response: {}", combined_text);
+
+        // Try with gpt-4o
+        println!("\nRetrying with gpt-4o...");
+        let request_gpt4o = LlmChatRequest {
+            messages: vec![
+                LlmMessage {
+                    role: "system".into(),
+                    content: "You are a helpful assistant.".into(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    attachments: vec![],
+                },
+                LlmMessage::user_with_attachments(
+                    "描述一下这个图片",
+                    vec![LlmAttachment {
+                        name: "screenshot.png".into(),
+                        mime_type: "image/png".into(),
+                        data: screenshot_base64,
+                    }],
+                ),
+            ],
+            system: None,
+            temperature: Some(0.0),
+            max_tokens: Some(200),
+            tools: None,
+        };
+
+        let stream_id2 = start_llm_stream(
+            ProviderType::OpenAi,
+            &api_key,
+            "gpt-4o",
+            request_gpt4o,
+            registry.clone(),
+        )
+        .await
+        .expect("Failed to start stream with gpt-4o");
+
+        let mut gpt4o_response = String::new();
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            match registry.next_chunk(stream_id2) {
+                Ok(Some(chunk)) => {
+                    if let Some(text) = &chunk.text {
+                        gpt4o_response.push_str(text);
+                    }
+                    if chunk.done {
+                        break;
+                    }
+                }
+                Ok(None) => continue,
+                Err(e) => panic!("Stream error: {:?}", e),
+            }
+        }
+        registry.close(stream_id2);
+
+        println!("gpt-4o response: {}", gpt4o_response);
+
+        // gpt-4o should work
+        assert!(
+            !gpt4o_response.contains("无法查看") && !gpt4o_response.contains("cannot view"),
+            "Even gpt-4o failed to view the image!"
+        );
+    }
+
+    assert!(!combined_text.is_empty(), "Response should not be empty");
+
+    println!("✅ Large screenshot image test completed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_multiple_image_attachments() {
+    // Test sending multiple images in a single message
+    let api_key = match get_env_key("OPENAI_API_KEY") {
+        Some(key) => key,
+        None => {
+            eprintln!("Skipping: OPENAI_API_KEY not set");
+            return;
+        }
+    };
+
+    let request = LlmChatRequest {
+        messages: vec![LlmMessage::user_with_attachments(
+            "I'm showing you two images. What colors do you see? List both colors.",
+            vec![
+                LlmAttachment {
+                    name: "red_square.png".into(),
+                    mime_type: "image/png".into(),
+                    data: TEST_RED_PNG_BASE64.into(),
+                },
+                LlmAttachment {
+                    name: "blue_square.png".into(),
+                    mime_type: "image/png".into(),
+                    data: TEST_BLUE_PNG_BASE64.into(),
+                },
+            ],
+        )],
+        system: Some("You are a helpful assistant. Be concise.".into()),
+        temperature: Some(0.0),
+        max_tokens: Some(100),
+        tools: None,
+    };
+
+    let response = execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request).await;
+
+    match response {
+        Ok(resp) => {
+            println!("Multiple images response: {:?}", resp);
+            assert!(!resp.content.is_empty(), "Response should not be empty");
+            let content_lower = resp.content.to_lowercase();
+            // Should mention both colors
+            assert!(
+                content_lower.contains("red") || content_lower.contains("pink"),
+                "Response should mention red, got: {}",
+                resp.content
+            );
+            assert!(
+                content_lower.contains("blue"),
+                "Response should mention blue, got: {}",
+                resp.content
+            );
+            println!("✅ Multiple image attachments test passed!");
+        }
+        Err(e) => panic!("Multiple images chat failed: {:?}", e),
     }
 }

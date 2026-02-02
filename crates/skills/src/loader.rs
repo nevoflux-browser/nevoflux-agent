@@ -173,6 +173,10 @@ impl SkillLoader {
     }
 
     /// Load skills from a specific directory.
+    ///
+    /// Supports two directory structures:
+    /// 1. Direct files: `skills/*.md` (e.g., `skills/code-review.md`)
+    /// 2. Subdirectory with SKILL.md: `skills/*/SKILL.md` (e.g., `skills/code-review/SKILL.md`)
     pub fn load_from_directory(&self, dir: &Path, source: SkillSource) -> Result<Vec<Skill>> {
         if !dir.exists() {
             return Ok(Vec::new());
@@ -185,80 +189,115 @@ impl SkillLoader {
             )));
         }
 
-        let pattern = dir.join(format!("*.{}", self.config.extension));
-        let pattern_str = pattern.to_string_lossy();
-
-        let entries =
-            glob::glob(&pattern_str).map_err(|e| SkillsError::GlobError(e.to_string()))?;
-
         let mut skills = Vec::new();
 
-        for entry in entries {
-            match entry {
-                Ok(path) => {
-                    match parse_skill_file(&path, source.clone()) {
-                        Ok(skill) => {
-                            // Skip disabled skills unless configured to load them
-                            if !skill.is_enabled() && !self.config.load_disabled {
-                                debug!("Skipping disabled skill: {}", skill.name());
-                                continue;
-                            }
+        // Pattern 1: Direct files (*.md)
+        let direct_pattern = dir.join(format!("*.{}", self.config.extension));
+        let direct_pattern_str = direct_pattern.to_string_lossy();
 
-                            debug!("Loaded skill: {} from {}", skill.name(), path.display());
-                            skills.push(skill);
-                        }
-                        Err(e) => {
-                            warn!("Failed to parse skill file {}: {}", path.display(), e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to read skill file: {}", e);
-                }
+        if let Ok(entries) = glob::glob(&direct_pattern_str) {
+            for entry in entries.flatten() {
+                self.try_load_skill_file(&entry, source.clone(), &mut skills);
+            }
+        }
+
+        // Pattern 2: Subdirectory with SKILL.md (*/SKILL.md)
+        let subdir_pattern = dir.join(format!("*/SKILL.{}", self.config.extension));
+        let subdir_pattern_str = subdir_pattern.to_string_lossy();
+
+        if let Ok(entries) = glob::glob(&subdir_pattern_str) {
+            for entry in entries.flatten() {
+                self.try_load_skill_file(&entry, source.clone(), &mut skills);
             }
         }
 
         Ok(skills)
     }
 
+    /// Try to load a skill file and add it to the skills vector.
+    fn try_load_skill_file(&self, path: &Path, source: SkillSource, skills: &mut Vec<Skill>) {
+        match parse_skill_file(path, source) {
+            Ok(skill) => {
+                // Skip disabled skills unless configured to load them
+                if !skill.is_enabled() && !self.config.load_disabled {
+                    debug!("Skipping disabled skill: {}", skill.name());
+                    return;
+                }
+
+                debug!("Loaded skill: {} from {}", skill.name(), path.display());
+                skills.push(skill);
+            }
+            Err(e) => {
+                warn!("Failed to parse skill file {}: {}", path.display(), e);
+            }
+        }
+    }
+
     /// Load a single skill by name.
     ///
     /// Searches user directories first (in reverse order, so later directories
     /// take precedence), then falls back to builtin directory.
+    ///
+    /// Supports two file structures:
+    /// 1. Direct file: `name.md`
+    /// 2. Subdirectory: `name/SKILL.md`
     pub fn load_skill(&self, name: &str) -> Result<Skill> {
         // Try user directories in reverse order (later dirs have higher priority)
         for dir in self.config.user_dirs.iter().rev() {
-            let path = dir.join(format!("{}.{}", name, self.config.extension));
-            if path.exists() {
-                return parse_skill_file(&path, SkillSource::User);
+            if let Some(skill) = self.try_load_skill_from_dir(dir, name, SkillSource::User) {
+                return Ok(skill);
             }
         }
 
         // Try builtin directory
         if let Some(ref dir) = self.config.builtin_dir {
-            let path = dir.join(format!("{}.{}", name, self.config.extension));
-            if path.exists() {
-                return parse_skill_file(&path, SkillSource::Builtin);
+            if let Some(skill) = self.try_load_skill_from_dir(dir, name, SkillSource::Builtin) {
+                return Ok(skill);
             }
         }
 
         Err(SkillsError::NotFound(name.to_string()))
     }
 
+    /// Try to load a skill from a directory by name.
+    /// Checks both direct file (name.md) and subdirectory (name/SKILL.md).
+    fn try_load_skill_from_dir(
+        &self,
+        dir: &Path,
+        name: &str,
+        source: SkillSource,
+    ) -> Option<Skill> {
+        // Pattern 1: Direct file (name.md)
+        let direct_path = dir.join(format!("{}.{}", name, self.config.extension));
+        if direct_path.exists() {
+            return parse_skill_file(&direct_path, source).ok();
+        }
+
+        // Pattern 2: Subdirectory (name/SKILL.md)
+        let subdir_path = dir
+            .join(name)
+            .join(format!("SKILL.{}", self.config.extension));
+        if subdir_path.exists() {
+            return parse_skill_file(&subdir_path, source).ok();
+        }
+
+        None
+    }
+
     /// Check if a skill exists.
+    ///
+    /// Checks both direct file (name.md) and subdirectory (name/SKILL.md).
     pub fn skill_exists(&self, name: &str) -> bool {
         // Check user directories
         for dir in &self.config.user_dirs {
-            let path = dir.join(format!("{}.{}", name, self.config.extension));
-            if path.exists() {
+            if self.skill_exists_in_dir(dir, name) {
                 return true;
             }
         }
 
         // Check builtin directory
         if let Some(ref dir) = self.config.builtin_dir {
-            let path = dir.join(format!("{}.{}", name, self.config.extension));
-            if path.exists() {
+            if self.skill_exists_in_dir(dir, name) {
                 return true;
             }
         }
@@ -266,7 +305,24 @@ impl SkillLoader {
         false
     }
 
+    /// Check if a skill exists in a specific directory.
+    fn skill_exists_in_dir(&self, dir: &Path, name: &str) -> bool {
+        // Pattern 1: Direct file (name.md)
+        let direct_path = dir.join(format!("{}.{}", name, self.config.extension));
+        if direct_path.exists() {
+            return true;
+        }
+
+        // Pattern 2: Subdirectory (name/SKILL.md)
+        let subdir_path = dir
+            .join(name)
+            .join(format!("SKILL.{}", self.config.extension));
+        subdir_path.exists()
+    }
+
     /// List skill names from configured directories.
+    ///
+    /// Finds skills from both direct files (*.md) and subdirectories (*/SKILL.md).
     pub fn list_skill_names(&self) -> Result<Vec<String>> {
         let mut names = Vec::new();
 
@@ -282,17 +338,35 @@ impl SkillLoader {
                 continue;
             }
 
-            let pattern = dir.join(format!("*.{}", self.config.extension));
-            let pattern_str = pattern.to_string_lossy();
+            // Pattern 1: Direct files (*.md)
+            let direct_pattern = dir.join(format!("*.{}", self.config.extension));
+            let direct_pattern_str = direct_pattern.to_string_lossy();
 
-            let entries =
-                glob::glob(&pattern_str).map_err(|e| SkillsError::GlobError(e.to_string()))?;
+            if let Ok(entries) = glob::glob(&direct_pattern_str) {
+                for entry in entries.flatten() {
+                    if let Some(stem) = entry.file_stem() {
+                        let name = stem.to_string_lossy().to_string();
+                        if !names.contains(&name) {
+                            names.push(name);
+                        }
+                    }
+                }
+            }
 
-            for entry in entries.flatten() {
-                if let Some(stem) = entry.file_stem() {
-                    let name = stem.to_string_lossy().to_string();
-                    if !names.contains(&name) {
-                        names.push(name);
+            // Pattern 2: Subdirectories with SKILL.md (*/SKILL.md)
+            let subdir_pattern = dir.join(format!("*/SKILL.{}", self.config.extension));
+            let subdir_pattern_str = subdir_pattern.to_string_lossy();
+
+            if let Ok(entries) = glob::glob(&subdir_pattern_str) {
+                for entry in entries.flatten() {
+                    // Get the parent directory name as the skill name
+                    if let Some(parent) = entry.parent() {
+                        if let Some(dir_name) = parent.file_name() {
+                            let name = dir_name.to_string_lossy().to_string();
+                            if !names.contains(&name) {
+                                names.push(name);
+                            }
+                        }
                     }
                 }
             }
@@ -715,5 +789,153 @@ Disabled content."#,
         // shared-skill should be from dir2 (later directory wins)
         let shared = skills.iter().find(|s| s.name() == "shared-skill").unwrap();
         assert!(shared.description().contains("dir2"));
+    }
+
+    // ========================================
+    // Tests for subdirectory structure support
+    // ========================================
+
+    /// Create a skill subdirectory with SKILL.md file.
+    fn create_skill_subdir(parent: &Path, name: &str, content: &str) {
+        let skill_dir = parent.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_file = skill_dir.join("SKILL.md");
+        std::fs::write(skill_file, content).unwrap();
+    }
+
+    #[test]
+    fn test_load_skills_from_subdirectories() {
+        let temp = TempDir::new().unwrap();
+
+        // Create skills using subdirectory structure (*/SKILL.md)
+        create_skill_subdir(
+            temp.path(),
+            "code-review",
+            &sample_skill_content("code-review", "Review code for issues"),
+        );
+        create_skill_subdir(
+            temp.path(),
+            "commit",
+            &sample_skill_content("commit", "Create git commit"),
+        );
+
+        let config = LoaderConfig::new().with_user_dir(temp.path());
+        let loader = SkillLoader::new(config);
+
+        let skills = loader.load_all().unwrap();
+        assert_eq!(skills.len(), 2, "Should load 2 skills from subdirectories");
+
+        let names: Vec<_> = skills.iter().map(|s| s.name()).collect();
+        assert!(names.contains(&"code-review"));
+        assert!(names.contains(&"commit"));
+    }
+
+    #[test]
+    fn test_load_skills_mixed_structures() {
+        let temp = TempDir::new().unwrap();
+
+        // Create a direct skill file
+        create_skill_file(
+            temp.path(),
+            "direct-skill",
+            &sample_skill_content("direct-skill", "Direct file skill"),
+        );
+
+        // Create a skill using subdirectory structure
+        create_skill_subdir(
+            temp.path(),
+            "subdir-skill",
+            &sample_skill_content("subdir-skill", "Subdirectory skill"),
+        );
+
+        let config = LoaderConfig::new().with_user_dir(temp.path());
+        let loader = SkillLoader::new(config);
+
+        let skills = loader.load_all().unwrap();
+        assert_eq!(
+            skills.len(),
+            2,
+            "Should load both direct and subdirectory skills"
+        );
+
+        let names: Vec<_> = skills.iter().map(|s| s.name()).collect();
+        assert!(names.contains(&"direct-skill"));
+        assert!(names.contains(&"subdir-skill"));
+    }
+
+    #[test]
+    fn test_load_skill_by_name_from_subdirectory() {
+        let temp = TempDir::new().unwrap();
+
+        create_skill_subdir(
+            temp.path(),
+            "my-skill",
+            &sample_skill_content("my-skill", "Skill in subdirectory"),
+        );
+
+        let config = LoaderConfig::new().with_user_dir(temp.path());
+        let loader = SkillLoader::new(config);
+
+        // Should find skill by name from subdirectory
+        let skill = loader.load_skill("my-skill").unwrap();
+        assert_eq!(skill.name(), "my-skill");
+        assert_eq!(skill.description(), "Skill in subdirectory");
+    }
+
+    #[test]
+    fn test_skill_exists_in_subdirectory() {
+        let temp = TempDir::new().unwrap();
+
+        create_skill_subdir(
+            temp.path(),
+            "existing-skill",
+            &sample_skill_content("existing-skill", "Exists"),
+        );
+
+        let config = LoaderConfig::new().with_user_dir(temp.path());
+        let loader = SkillLoader::new(config);
+
+        assert!(loader.skill_exists("existing-skill"));
+        assert!(!loader.skill_exists("nonexistent-skill"));
+    }
+
+    #[test]
+    fn test_list_skill_names_from_subdirectories() {
+        let temp = TempDir::new().unwrap();
+
+        // Mix of direct and subdirectory skills
+        create_skill_file(temp.path(), "alpha", "---\nname: alpha\n---\n");
+        create_skill_subdir(temp.path(), "beta", "---\nname: beta\n---\n");
+        create_skill_subdir(temp.path(), "gamma", "---\nname: gamma\n---\n");
+
+        let config = LoaderConfig::new().with_user_dir(temp.path());
+        let loader = SkillLoader::new(config);
+
+        let names = loader.list_skill_names().unwrap();
+        assert_eq!(names, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn test_direct_file_takes_precedence_over_subdirectory() {
+        let temp = TempDir::new().unwrap();
+
+        // Create same skill as both direct file and subdirectory
+        create_skill_file(
+            temp.path(),
+            "shared",
+            &sample_skill_content("shared", "Direct version"),
+        );
+        create_skill_subdir(
+            temp.path(),
+            "shared",
+            &sample_skill_content("shared", "Subdirectory version"),
+        );
+
+        let config = LoaderConfig::new().with_user_dir(temp.path());
+        let loader = SkillLoader::new(config);
+
+        // Direct file should be preferred when loading by name
+        let skill = loader.load_skill("shared").unwrap();
+        assert_eq!(skill.description(), "Direct version");
     }
 }

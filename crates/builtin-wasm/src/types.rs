@@ -5,6 +5,19 @@
 use nevoflux_protocol::LocalFileRef;
 use serde::{Deserialize, Serialize};
 
+/// Information about a browser tab.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabInfo {
+    /// The space/group the tab belongs to (e.g., workspace name).
+    #[serde(default)]
+    pub space: String,
+    /// The tab's unique ID.
+    pub tab_id: i64,
+    /// The tab's title.
+    #[serde(default)]
+    pub tab_title: String,
+}
+
 /// Agent execution mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,6 +55,9 @@ pub struct Message {
     /// Optional tool call ID (for tool responses).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Tool calls made by assistant (only for assistant role).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
     /// Attachments for multimodal messages (images, files).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
@@ -54,6 +70,7 @@ impl Message {
             role: MessageRole::System,
             content: content.into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
             attachments: Vec::new(),
         }
     }
@@ -64,6 +81,7 @@ impl Message {
             role: MessageRole::User,
             content: content.into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
             attachments: Vec::new(),
         }
     }
@@ -74,6 +92,7 @@ impl Message {
             role: MessageRole::User,
             content: content.into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
             attachments,
         }
     }
@@ -84,6 +103,21 @@ impl Message {
             role: MessageRole::Assistant,
             content: content.into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
+            attachments: Vec::new(),
+        }
+    }
+
+    /// Create an assistant message with tool calls.
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+    ) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls,
             attachments: Vec::new(),
         }
     }
@@ -94,6 +128,7 @@ impl Message {
             role: MessageRole::Tool,
             content: content.into(),
             tool_call_id: Some(tool_call_id.into()),
+            tool_calls: Vec::new(),
             attachments: Vec::new(),
         }
     }
@@ -115,10 +150,20 @@ pub struct ToolDefinition {
 pub struct ToolCall {
     /// Unique ID for this tool call.
     pub id: String,
+    /// Call ID used to match tool results with tool calls.
+    /// For OpenAI Responses API, this is different from `id` and MUST be used
+    /// when sending tool results back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     /// Tool name to invoke.
     pub name: String,
     /// Tool arguments as JSON.
     pub arguments: serde_json::Value,
+    /// Optional cryptographic signature for the tool call.
+    /// Used by Gemini 3 (thought_signature) to verify the tool call was generated
+    /// by the model. MUST be preserved and sent back with tool results for multi-turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 /// Tool execution result.
@@ -194,6 +239,36 @@ pub struct AgentInput {
     /// This is primarily used for sub-agents that need specialized instructions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_system_prompt: Option<String>,
+    /// Current active browser tab ID.
+    ///
+    /// When set, the agent knows which tab to interact with using browser tools.
+    /// This is passed from the browser sidebar when the user sends a message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<i64>,
+    /// List of all available browser tabs with their metadata.
+    ///
+    /// This provides the agent with context about all open tabs,
+    /// allowing it to navigate between tabs or reference content from multiple tabs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tab_ids: Vec<TabInfo>,
+    /// Skill context to prepend to system prompt.
+    ///
+    /// When a user invokes a skill (e.g., `/design-md`), the skill's instructions
+    /// are stored here instead of in user_message. This gives skill instructions
+    /// higher priority by placing them at the beginning of the system prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_context: Option<SkillContext>,
+}
+
+/// Skill context for injection into system prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillContext {
+    /// Skill name.
+    pub name: String,
+    /// Base path for skill's auxiliary files.
+    pub base_path: String,
+    /// Skill content/instructions.
+    pub content: String,
 }
 
 /// Agent output to host.
@@ -387,6 +462,7 @@ mod tests {
     fn test_tool_call() {
         let call = ToolCall {
             id: "call-001".into(),
+            call_id: None,
             name: "bash".into(),
             arguments: serde_json::json!({"command": "ls -la"}),
         };
@@ -413,6 +489,9 @@ mod tests {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
         assert_eq!(input.mode, AgentMode::Agent);
         assert_eq!(input.history.len(), 1);
@@ -429,6 +508,9 @@ mod tests {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: Some("You are a sub-agent focused on file search.".into()),
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
         assert!(input.custom_system_prompt.is_some());
         assert!(input
@@ -448,6 +530,9 @@ mod tests {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: Some("Custom prompt".into()),
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         assert!(json.contains("custom_system_prompt"));
@@ -462,6 +547,9 @@ mod tests {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
         let json2 = serde_json::to_string(&input_no_prompt).unwrap();
         assert!(!json2.contains("custom_system_prompt"));
@@ -660,6 +748,9 @@ mod tests {
                 modified: Some(1706600000),
             }],
             custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         assert!(json.contains("local_files"));
@@ -680,9 +771,98 @@ mod tests {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         // Empty vec should not be serialized
         assert!(!json.contains("local_files"));
+    }
+
+    #[test]
+    fn test_agent_input_with_tab_id() {
+        let input = AgentInput {
+            session_id: "sess-001".into(),
+            mode: AgentMode::Browser,
+            user_message: "Summarize this page".into(),
+            history: vec![],
+            attachments: vec![],
+            local_files: vec![],
+            custom_system_prompt: None,
+            tab_id: Some(42),
+            tab_ids: vec![],
+            skill_context: None,
+        };
+        assert_eq!(input.tab_id, Some(42));
+
+        let json = serde_json::to_string(&input).unwrap();
+        assert!(json.contains("tab_id"));
+        assert!(json.contains("42"));
+
+        // Verify None is not serialized
+        let input_no_tab = AgentInput {
+            session_id: "sess-001".into(),
+            mode: AgentMode::Chat,
+            user_message: "Hello".into(),
+            history: vec![],
+            attachments: vec![],
+            local_files: vec![],
+            custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
+        };
+        let json2 = serde_json::to_string(&input_no_tab).unwrap();
+        assert!(!json2.contains("tab_id"));
+    }
+
+    #[test]
+    fn test_agent_input_with_tab_ids() {
+        let input = AgentInput {
+            session_id: "sess-001".into(),
+            mode: AgentMode::Browser,
+            user_message: "Compare these tabs".into(),
+            history: vec![],
+            attachments: vec![],
+            local_files: vec![],
+            custom_system_prompt: None,
+            tab_id: Some(1),
+            tab_ids: vec![
+                TabInfo { space: "Work".into(), tab_id: 1, tab_title: "GitHub".into() },
+                TabInfo { space: "Work".into(), tab_id: 2, tab_title: "Docs".into() },
+                TabInfo { space: "Personal".into(), tab_id: 3, tab_title: "Email".into() },
+            ],
+            skill_context: None,
+        };
+        assert_eq!(input.tab_ids.len(), 3);
+        assert_eq!(input.tab_ids[0].space, "Work");
+        assert_eq!(input.tab_ids[0].tab_id, 1);
+        assert_eq!(input.tab_ids[0].tab_title, "GitHub");
+
+        let json = serde_json::to_string(&input).unwrap();
+        assert!(json.contains("tab_ids"));
+        assert!(json.contains("GitHub"));
+        assert!(json.contains("Work"));
+
+        let decoded: AgentInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.tab_ids.len(), 3);
+        assert_eq!(decoded.tab_ids[2].space, "Personal");
+
+        // Verify empty vec is not serialized
+        let input_no_tabs = AgentInput {
+            session_id: "sess-001".into(),
+            mode: AgentMode::Chat,
+            user_message: "Hello".into(),
+            history: vec![],
+            attachments: vec![],
+            local_files: vec![],
+            custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
+        };
+        let json2 = serde_json::to_string(&input_no_tabs).unwrap();
+        assert!(!json2.contains("tab_ids"));
     }
 }

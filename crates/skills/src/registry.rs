@@ -817,4 +817,222 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "code-review");
     }
+
+    // ========================================
+    // Integration tests for filesystem loading
+    // ========================================
+
+    /// Helper to create a skill file in a directory.
+    fn create_skill_file(dir: &std::path::Path, filename: &str, content: &str) {
+        let path = dir.join(filename);
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// Format skill summaries the same way as builtin-wasm/agent.rs does.
+    fn format_skill_summaries_for_prompt(skills: &[SkillSummary]) -> String {
+        skills
+            .iter()
+            .map(|s| format!("- **{}**: {}", s.name, s.description))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn test_registry_load_from_filesystem() {
+        // Create a temporary directory with skill files
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        // Create skill files in the proper format (YAML frontmatter + markdown)
+        create_skill_file(
+            temp_dir.path(),
+            "code-review.md",
+            r#"---
+name: code-review
+description: Review code for issues
+tags:
+  - code
+  - review
+---
+
+# Code Review
+
+When reviewing code, follow these guidelines...
+"#,
+        );
+
+        create_skill_file(
+            temp_dir.path(),
+            "commit.md",
+            r#"---
+name: commit
+description: Create git commit
+tags:
+  - git
+---
+
+# Commit
+
+Guidelines for creating commits...
+"#,
+        );
+
+        // Configure loader to use the temp directory
+        let config = LoaderConfig::new().with_user_dir(temp_dir.path());
+        let mut registry = SkillRegistry::with_config(config);
+
+        // Load skills from filesystem
+        let count = registry.load().unwrap();
+        assert_eq!(count, 2, "Should load 2 skills from filesystem");
+
+        // Verify list() returns correct summaries
+        let summaries = registry.list();
+        assert_eq!(summaries.len(), 2);
+
+        let names: Vec<&str> = summaries.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"code-review"));
+        assert!(names.contains(&"commit"));
+
+        // Verify descriptions are correct
+        let code_review = summaries.iter().find(|s| s.name == "code-review").unwrap();
+        assert_eq!(code_review.description, "Review code for issues");
+
+        let commit = summaries.iter().find(|s| s.name == "commit").unwrap();
+        assert_eq!(commit.description, "Create git commit");
+    }
+
+    #[test]
+    fn test_skills_format_for_prompt_injection() {
+        // Create a temporary directory with skill files
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        create_skill_file(
+            temp_dir.path(),
+            "code-review.md",
+            r#"---
+name: code-review
+description: Review code for issues
+---
+
+Content here.
+"#,
+        );
+
+        create_skill_file(
+            temp_dir.path(),
+            "commit.md",
+            r#"---
+name: commit
+description: Create git commit
+---
+
+Content here.
+"#,
+        );
+
+        // Load skills
+        let config = LoaderConfig::new().with_user_dir(temp_dir.path());
+        let mut registry = SkillRegistry::with_config(config);
+        registry.load().unwrap();
+
+        // Get summaries and format for prompt
+        let mut summaries = registry.list();
+        // Sort for deterministic output
+        summaries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let formatted = format_skill_summaries_for_prompt(&summaries);
+
+        // Verify the format matches what's expected in the system prompt
+        assert!(
+            formatted.contains("- **code-review**: Review code for issues"),
+            "Should contain code-review skill in correct format. Got: {}",
+            formatted
+        );
+        assert!(
+            formatted.contains("- **commit**: Create git commit"),
+            "Should contain commit skill in correct format. Got: {}",
+            formatted
+        );
+
+        // Verify the full format
+        let expected = "- **code-review**: Review code for issues\n- **commit**: Create git commit";
+        assert_eq!(formatted, expected);
+
+        // Simulate how it would appear in the system prompt
+        let base_prompt = "You are a helpful AI assistant.";
+        let full_prompt = format!(
+            "{}\n\n## Available Skills\n\n{}\n\nUse skill_load(name) to load a skill's full content.",
+            base_prompt, formatted
+        );
+
+        assert!(full_prompt.contains("## Available Skills"));
+        assert!(full_prompt.contains("**code-review**"));
+        assert!(full_prompt.contains("**commit**"));
+        assert!(full_prompt.contains("Use skill_load(name)"));
+    }
+
+    #[test]
+    fn test_empty_skills_directory() {
+        // Create an empty temporary directory
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        let config = LoaderConfig::new().with_user_dir(temp_dir.path());
+        let mut registry = SkillRegistry::with_config(config);
+
+        // Load from empty directory
+        let count = registry.load().unwrap();
+        assert_eq!(count, 0, "Should load 0 skills from empty directory");
+
+        let summaries = registry.list();
+        assert!(summaries.is_empty());
+
+        // Format should be empty
+        let formatted = format_skill_summaries_for_prompt(&summaries);
+        assert!(formatted.is_empty());
+    }
+
+    #[test]
+    fn test_nonexistent_skills_directory() {
+        // Use a path that doesn't exist
+        let config = LoaderConfig::new().with_user_dir("/nonexistent/skills/path");
+        let mut registry = SkillRegistry::with_config(config);
+
+        // Load should succeed but return 0 skills
+        let count = registry.load().unwrap();
+        assert_eq!(count, 0);
+
+        let summaries = registry.list();
+        assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn test_default_user_dirs_skills_loading() {
+        // This test checks if skills can be loaded from the actual default directories
+        // It may or may not find skills depending on the system state
+        let config = LoaderConfig::default();
+        let mut registry = SkillRegistry::with_config(config);
+
+        // This should not panic regardless of whether skills exist
+        let result = registry.load();
+        assert!(result.is_ok(), "Loading from default dirs should not error");
+
+        let count = result.unwrap();
+        let summaries = registry.list();
+        assert_eq!(summaries.len(), count);
+
+        // If skills were found, verify they have valid names and descriptions
+        for summary in &summaries {
+            assert!(!summary.name.is_empty(), "Skill name should not be empty");
+            // Description can be empty but name cannot
+        }
+
+        // Print what we found (for debugging)
+        if count > 0 {
+            println!("Found {} skills in default directories:", count);
+            for s in &summaries {
+                println!("  - {}: {}", s.name, s.description);
+            }
+        } else {
+            println!("No skills found in default directories (this is expected if no .md files exist directly in skills dirs)");
+        }
+    }
 }

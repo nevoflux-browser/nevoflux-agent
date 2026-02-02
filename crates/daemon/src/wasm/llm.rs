@@ -66,6 +66,11 @@ pub struct LlmToolCall {
     pub name: String,
     /// The arguments to pass to the tool (JSON object).
     pub arguments: Value,
+    /// Optional cryptographic signature for the tool call.
+    /// Used by Gemini 3 (thought_signature) to verify the tool call was generated
+    /// by the model. MUST be preserved and sent back with tool results for multi-turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 /// Request structure for LLM chat operations.
@@ -476,7 +481,15 @@ where
     let mut chat_history: Vec<Message> = Vec::new();
     let mut system_prompt: Option<String> = request.system.clone();
 
-    for msg in &request.messages {
+    for (idx, msg) in request.messages.iter().enumerate() {
+        tracing::info!(
+            "Processing message[{}]: role={}, content_len={}, tool_calls_count={:?}, tool_call_id={:?}",
+            idx,
+            msg.role,
+            msg.content.len(),
+            msg.tool_calls.as_ref().map(|tc| tc.len()),
+            msg.tool_call_id
+        );
         match msg.role.as_str() {
             "system" => {
                 // Use the last system message if multiple are provided
@@ -507,6 +520,13 @@ where
                 // Build assistant content - may include text and/or tool calls
                 let mut assistant_contents: Vec<AssistantContent> = Vec::new();
 
+                tracing::info!(
+                    "Converting assistant message: content_len={}, tool_calls_present={}, tool_calls_count={:?}",
+                    msg.content.len(),
+                    msg.tool_calls.is_some(),
+                    msg.tool_calls.as_ref().map(|tc| tc.len())
+                );
+
                 // Add text content if present
                 if !msg.content.is_empty() {
                     assistant_contents.push(AssistantContent::text(&msg.content));
@@ -514,7 +534,7 @@ where
 
                 // Add tool calls if present - these must be properly structured
                 if let Some(ref tool_calls) = msg.tool_calls {
-                    tracing::debug!(
+                    tracing::info!(
                         "Converting assistant tool_calls: count={}, ids={:?}, call_ids={:?}",
                         tool_calls.len(),
                         tool_calls.iter().map(|tc| &tc.id).collect::<Vec<_>>(),
@@ -557,9 +577,47 @@ where
 
                 // Add image attachments
                 for attachment in &msg.attachments {
+                    tracing::info!(
+                        "Processing attachment: name={}, mime_type={}, data_len={}",
+                        attachment.name,
+                        attachment.mime_type,
+                        attachment.data.len()
+                    );
+
+                    // Warn about large images that may cause intermittent failures with some models
+                    // Known issue: gpt-4o-mini can intermittently fail to process images larger than ~200KB base64
+                    // Recommendation: Use gpt-4o for large image processing, or resize images before sending
+                    const LARGE_IMAGE_THRESHOLD: usize = 200_000; // ~200KB base64
+                    if attachment.data.len() > LARGE_IMAGE_THRESHOLD {
+                        tracing::warn!(
+                            "Large image attachment detected: {} ({} bytes). Some models (e.g., gpt-4o-mini) may have \
+                            intermittent issues with large images. Consider using gpt-4o for better reliability.",
+                            attachment.name,
+                            attachment.data.len()
+                        );
+                    }
+
                     if let Some(media_type) = mime_to_image_media_type(&attachment.mime_type) {
+                        // Strip data URL prefix if present (e.g., "data:image/png;base64,")
+                        let base64_data = if attachment.data.starts_with("data:") {
+                            attachment
+                                .data
+                                .find(",")
+                                .map(|i| &attachment.data[i + 1..])
+                                .unwrap_or(&attachment.data)
+                        } else {
+                            &attachment.data
+                        };
+                        // Remove any whitespace/newlines from base64 (some encoders add line breaks)
+                        let clean_base64: String =
+                            base64_data.chars().filter(|c| !c.is_whitespace()).collect();
+                        tracing::info!(
+                            "Using cleaned base64 data: original_len={}, clean_len={}",
+                            base64_data.len(),
+                            clean_base64.len()
+                        );
                         user_content.push(UserContent::Image(Image {
-                            data: DocumentSourceKind::Base64(attachment.data.clone()),
+                            data: DocumentSourceKind::Base64(clean_base64),
                             media_type: Some(media_type),
                             detail: None,
                             additional_params: None,
@@ -589,15 +647,24 @@ where
         .iter()
         .any(|m| matches!(m, Message::User { content } if content.iter().any(|c| matches!(c, UserContent::ToolResult(_)))));
 
+    // Check if any user message has multimodal content (images, documents)
+    let has_multimodal = chat_history.iter().any(|m| match m {
+        Message::User { content } => content
+            .iter()
+            .any(|c| matches!(c, UserContent::Image(_) | UserContent::Document(_))),
+        _ => false,
+    });
+
     // Build the completion request
     // IMPORTANT: rig's builder appends prompt to the END of chat_history.
-    // For multi-turn with tool results, we must keep all messages in their original order,
-    // so we use empty prompt and put everything in chat_history.
-    let (prompt, chat_history) = if has_tool_results {
-        // Continuation after tool calls: keep all messages in order, use empty prompt
+    // For multi-turn with tool results OR multimodal content, we must keep all messages
+    // in their original order, so we use empty prompt and put everything in chat_history.
+    let (prompt, chat_history) = if has_tool_results || has_multimodal {
+        // Continuation after tool calls OR multimodal content: keep all messages in order, use empty prompt
+        // We can't extract multimodal content as a simple string prompt
         (String::new(), chat_history)
     } else {
-        // First request or no tool results: extract last user message as prompt
+        // First request with text only: extract last user message as prompt
         let last_text_user_idx = chat_history.iter().rposition(|m| match m {
             Message::User { content } => content.iter().any(|c| matches!(c, UserContent::Text(_))),
             _ => false,
@@ -689,6 +756,7 @@ fn process_completion_response(choice: OneOrMany<AssistantContent>) -> Result<Ll
                     call_id: tc.call_id.clone(),
                     name: tc.function.name.clone(),
                     arguments: tc.function.arguments.clone(),
+                    signature: tc.signature.clone(),
                 });
             }
             AssistantContent::Reasoning(r) => {
@@ -1089,11 +1157,25 @@ where
     M: CompletionModel,
     M::StreamingResponse: Clone + Unpin + rig::completion::GetTokenUsage,
 {
+    tracing::info!(
+        "=== stream_rig_completion ENTRY === message_count={}",
+        request.messages.len()
+    );
+
     // Convert request messages to rig messages (same as non-streaming)
     let mut chat_history: Vec<Message> = Vec::new();
     let mut system_prompt: Option<String> = request.system.clone();
 
-    for msg in &request.messages {
+    for (idx, msg) in request.messages.iter().enumerate() {
+        tracing::info!(
+            "Processing message[{}]: role={}, content_len={}, attachments_count={}, tool_calls_count={:?}, tool_call_id={:?}",
+            idx,
+            msg.role,
+            msg.content.len(),
+            msg.attachments.len(),
+            msg.tool_calls.as_ref().map(|tc| tc.len()),
+            msg.tool_call_id
+        );
         match msg.role.as_str() {
             "system" => {
                 system_prompt = Some(msg.content.clone());
@@ -1123,6 +1205,13 @@ where
                 // Build assistant content - may include text and/or tool calls
                 let mut assistant_contents: Vec<AssistantContent> = Vec::new();
 
+                tracing::info!(
+                    "Converting assistant message: content_len={}, tool_calls_present={}, tool_calls_count={:?}",
+                    msg.content.len(),
+                    msg.tool_calls.is_some(),
+                    msg.tool_calls.as_ref().map(|tc| tc.len())
+                );
+
                 // Add text content if present
                 if !msg.content.is_empty() {
                     assistant_contents.push(AssistantContent::text(&msg.content));
@@ -1130,7 +1219,7 @@ where
 
                 // Add tool calls if present - these must be properly structured
                 if let Some(ref tool_calls) = msg.tool_calls {
-                    tracing::debug!(
+                    tracing::info!(
                         "Converting assistant tool_calls: count={}, ids={:?}, call_ids={:?}",
                         tool_calls.len(),
                         tool_calls.iter().map(|tc| &tc.id).collect::<Vec<_>>(),
@@ -1168,13 +1257,54 @@ where
                     user_content.push(UserContent::text(&msg.content));
                 }
                 for attachment in &msg.attachments {
+                    tracing::info!(
+                        "Processing attachment (stream): name={}, mime_type={}, data_len={}",
+                        attachment.name,
+                        attachment.mime_type,
+                        attachment.data.len()
+                    );
+
+                    // Warn about large images that may cause intermittent failures with some models
+                    const LARGE_IMAGE_THRESHOLD: usize = 200_000; // ~200KB base64
+                    if attachment.data.len() > LARGE_IMAGE_THRESHOLD {
+                        tracing::warn!(
+                            "Large image attachment detected (stream): {} ({} bytes). Some models (e.g., gpt-4o-mini) \
+                            may have intermittent issues with large images. Consider using gpt-4o for better reliability.",
+                            attachment.name,
+                            attachment.data.len()
+                        );
+                    }
+
                     if let Some(media_type) = mime_to_image_media_type(&attachment.mime_type) {
+                        // Strip data URL prefix if present (e.g., "data:image/png;base64,")
+                        let base64_data = if attachment.data.starts_with("data:") {
+                            attachment
+                                .data
+                                .find(",")
+                                .map(|i| &attachment.data[i + 1..])
+                                .unwrap_or(&attachment.data)
+                        } else {
+                            &attachment.data
+                        };
+                        // Remove any whitespace/newlines from base64 (some encoders add line breaks)
+                        let clean_base64: String =
+                            base64_data.chars().filter(|c| !c.is_whitespace()).collect();
+                        tracing::info!(
+                            "Using cleaned base64 data (stream): original_len={}, clean_len={}",
+                            base64_data.len(),
+                            clean_base64.len()
+                        );
                         user_content.push(UserContent::Image(Image {
-                            data: DocumentSourceKind::Base64(attachment.data.clone()),
+                            data: DocumentSourceKind::Base64(clean_base64),
                             media_type: Some(media_type),
                             detail: None,
                             additional_params: None,
                         }));
+                    } else {
+                        tracing::warn!(
+                            "Unsupported attachment mime_type: {}",
+                            attachment.mime_type
+                        );
                     }
                 }
                 if !user_content.is_empty() {
@@ -1194,6 +1324,57 @@ where
         ));
     }
 
+    // Debug: Log message structure before processing
+    tracing::info!("=== LLM STREAM MESSAGE STRUCTURE (before prompt extraction) ===");
+    for (i, msg) in chat_history.iter().enumerate() {
+        match msg {
+            Message::User { content } => {
+                let content_types: Vec<&str> = content
+                    .iter()
+                    .map(|c| match c {
+                        UserContent::Text(_) => "Text",
+                        UserContent::Image(_) => "Image",
+                        UserContent::Document(_) => "Document",
+                        UserContent::Audio(_) => "Audio",
+                        UserContent::Video(_) => "Video",
+                        UserContent::ToolResult(tr) => {
+                            tracing::info!(
+                                "  Message[{}] User/ToolResult: id={}, call_id={:?}",
+                                i,
+                                tr.id,
+                                tr.call_id
+                            );
+                            "ToolResult"
+                        }
+                    })
+                    .collect();
+                tracing::info!("Message[{}]: User({:?})", i, content_types);
+            }
+            Message::Assistant { content, .. } => {
+                let content_types: Vec<String> = content
+                    .iter()
+                    .map(|c| match c {
+                        AssistantContent::Text(_) => "Text".to_string(),
+                        AssistantContent::ToolCall(tc) => {
+                            tracing::info!(
+                                "  Message[{}] Assistant/ToolCall: id={}, call_id={:?}, name={}",
+                                i,
+                                tc.id,
+                                tc.call_id,
+                                tc.function.name
+                            );
+                            format!("ToolCall(id={},call_id={:?})", tc.id, tc.call_id)
+                        }
+                        AssistantContent::Reasoning(_) => "Reasoning".to_string(),
+                        AssistantContent::Image(_) => "Image".to_string(),
+                    })
+                    .collect();
+                tracing::info!("Message[{}]: Assistant({:?})", i, content_types);
+            }
+        }
+    }
+    tracing::info!("=== END MESSAGE STRUCTURE ===");
+
     // Check if this is a continuation after tool calls (has tool result messages)
     let has_tool_results = chat_history
         .iter()
@@ -1203,11 +1384,31 @@ where
     // IMPORTANT: rig's builder appends prompt to the END of chat_history.
     // For multi-turn with tool results, we must keep all messages in their original order,
     // so we use empty prompt and put everything in chat_history.
-    let (prompt, chat_history) = if has_tool_results {
-        // Continuation after tool calls: keep all messages in order, use empty prompt
+    tracing::info!(
+        "has_tool_results={}, message_count={}",
+        has_tool_results,
+        chat_history.len()
+    );
+
+    // Check if last user message has multimodal content (images, etc.)
+    let has_multimodal = chat_history.iter().any(|m| match m {
+        Message::User { content } => content
+            .iter()
+            .any(|c| matches!(c, UserContent::Image(_) | UserContent::Document(_))),
+        _ => false,
+    });
+
+    let (prompt, chat_history) = if has_tool_results || has_multimodal {
+        // Continuation after tool calls OR multimodal content: keep all messages in order, use empty prompt
+        // We can't extract multimodal content as a simple string prompt
+        tracing::info!(
+            "Using empty prompt (has_tool_results={}, has_multimodal={})",
+            has_tool_results,
+            has_multimodal
+        );
         (String::new(), chat_history)
     } else {
-        // First request or no tool results: extract last user message as prompt
+        // First request with text only: extract last user message as prompt
         let last_text_user_idx = chat_history.iter().rposition(|m| match m {
             Message::User { content } => content.iter().any(|c| matches!(c, UserContent::Text(_))),
             _ => false,
@@ -1215,13 +1416,25 @@ where
 
         if let Some(idx) = last_text_user_idx {
             let prompt = extract_text_from_message(&chat_history[idx]);
+            tracing::info!(
+                "Extracted prompt from message[{}]: len={}",
+                idx,
+                prompt.len()
+            );
             let mut history = chat_history;
             history.remove(idx);
             (prompt, history)
         } else {
+            tracing::info!("No user text message found, using empty prompt");
             (String::new(), chat_history)
         }
     };
+
+    tracing::info!(
+        "Final: prompt_len={}, chat_history_len={}",
+        prompt.len(),
+        chat_history.len()
+    );
 
     let mut builder = completion_model.completion_request(&prompt);
 
@@ -1273,17 +1486,20 @@ where
                             call_id: tc.call_id.clone(),
                             name: tc.function.name.clone(),
                             arguments: tc.function.arguments.clone(),
+                            signature: tc.signature.clone(),
                         };
                         // Mark this tool call as already sent
                         sent_tool_call_ids.insert(tc.id.clone());
-                        // Also update accumulated_tool_calls with call_id if it was being built from deltas
+                        // Also update accumulated_tool_calls with call_id and signature if it was being built from deltas
                         if let Some(accumulated_tc) = accumulated_tool_calls.get_mut(&tc.id) {
                             tracing::info!(
-                                "Updating accumulated tool call {} with call_id={:?}",
+                                "Updating accumulated tool call {} with call_id={:?}, signature={:?}",
                                 tc.id,
-                                tc.call_id
+                                tc.call_id,
+                                tc.signature.as_ref().map(|s| &s[..s.len().min(20)])
                             );
                             accumulated_tc.call_id = tc.call_id.clone();
+                            accumulated_tc.signature = tc.signature.clone();
                         }
                         LlmStreamChunk {
                             text: None,
@@ -1300,6 +1516,7 @@ where
                                 call_id: None,
                                 name: String::new(),
                                 arguments: serde_json::Value::String(String::new()),
+                                signature: None,
                             }
                         });
                         match content {
@@ -1662,6 +1879,7 @@ mod tests {
             call_id: Some("call_123".into()),
             name: "get_weather".into(),
             arguments: serde_json::json!({"location": "Tokyo"}),
+            signature: None,
         };
 
         let json = serde_json::to_string(&tool_call).unwrap();
@@ -1677,6 +1895,7 @@ mod tests {
             call_id: Some("call_abc".into()),
             name: "search".into(),
             arguments: serde_json::json!({"query": "rust"}),
+            signature: None,
         };
         let message = LlmMessage::assistant_with_tool_calls(vec![tool_call]);
 
@@ -1706,6 +1925,7 @@ mod tests {
                 call_id: Some("call_xyz".into()),
                 name: "calculator".into(),
                 arguments: serde_json::json!({"expression": "2+2"}),
+                signature: None,
             }]),
             usage: None,
         };
@@ -1764,6 +1984,7 @@ mod tests {
                 call_id: Some("call_123".into()),
                 name: "search".into(),
                 arguments: serde_json::json!({"query": "rust"}),
+                signature: None,
             }],
             done: false,
         };
