@@ -60,6 +60,7 @@ pub mod error;
 pub mod loader;
 pub mod parser;
 pub mod registry;
+pub mod tool_check;
 pub mod types;
 
 // Re-export main types
@@ -69,6 +70,7 @@ pub use loader::default_user_skills_dir;
 pub use loader::{default_user_skills_dirs, AsyncSkillLoader, LoaderConfig, SkillLoader};
 pub use parser::{parse_skill, parse_skill_file, serialize_skill};
 pub use registry::{AsyncSkillRegistry, SkillRegistry};
+pub use tool_check::{check_tool_availability, format_missing_tools_message, ToolCheckResult};
 pub use types::{Skill, SkillMetadata, SkillSource, SkillSummary};
 
 #[cfg(test)]

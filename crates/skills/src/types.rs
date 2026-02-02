@@ -47,6 +47,10 @@ pub struct SkillMetadata {
     /// Custom data.
     #[serde(default)]
     pub extra: serde_json::Value,
+    /// Tools this skill depends on. Supports glob patterns (e.g., "stitch*:*", "Read").
+    /// If specified, the skill will only be injected if these tools are available.
+    #[serde(default, alias = "allowed-tools")]
+    pub allowed_tools: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -65,6 +69,7 @@ impl Default for SkillMetadata {
             dependencies: Vec::new(),
             triggers: Vec::new(),
             extra: serde_json::Value::Null,
+            allowed_tools: Vec::new(),
         }
     }
 }
@@ -117,6 +122,12 @@ impl SkillMetadata {
     /// Add a trigger pattern.
     pub fn with_trigger(mut self, trigger: impl Into<String>) -> Self {
         self.triggers.push(trigger.into());
+        self
+    }
+
+    /// Add a required tool pattern.
+    pub fn with_allowed_tool(mut self, tool: impl Into<String>) -> Self {
+        self.allowed_tools.push(tool.into());
         self
     }
 }
@@ -296,6 +307,7 @@ mod tests {
         assert!(meta.name.is_empty());
         assert!(meta.enabled);
         assert!(meta.tags.is_empty());
+        assert!(meta.allowed_tools.is_empty());
     }
 
     #[test]
@@ -308,7 +320,8 @@ mod tests {
             .with_tag("example")
             .with_enabled(true)
             .with_dependency("base-skill")
-            .with_trigger("when testing");
+            .with_trigger("when testing")
+            .with_allowed_tool("stitch*:*");
 
         assert_eq!(meta.name, "test-skill");
         assert_eq!(meta.description, "A test skill");
@@ -318,6 +331,7 @@ mod tests {
         assert!(meta.enabled);
         assert_eq!(meta.dependencies, vec!["base-skill"]);
         assert_eq!(meta.triggers, vec!["when testing"]);
+        assert_eq!(meta.allowed_tools, vec!["stitch*:*"]);
     }
 
     #[test]

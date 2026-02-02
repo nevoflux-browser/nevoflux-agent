@@ -431,4 +431,54 @@ name: whitespace-test
         // Content should be trimmed
         assert!(skill.content.starts_with("Content"));
     }
+
+    #[test]
+    fn test_parse_skill_with_allowed_tools() {
+        let content = r#"---
+name: stitch-skill
+description: A skill that requires Stitch tools
+allowed-tools:
+  - stitch*:*
+  - Read
+---
+
+# Stitch Skill
+
+This skill uses Stitch MCP tools.
+"#;
+
+        let skill = parse_skill(content, SkillSource::User).unwrap();
+        assert_eq!(skill.metadata.name, "stitch-skill");
+        assert_eq!(skill.metadata.allowed_tools, vec!["stitch*:*", "Read"]);
+    }
+
+    #[test]
+    fn test_parse_skill_with_allowed_tools_snake_case() {
+        // Test with snake_case variant (allowed_tools)
+        let content = r#"---
+name: notion-skill
+allowed_tools:
+  - notion:*
+---
+
+Content.
+"#;
+
+        let skill = parse_skill(content, SkillSource::User).unwrap();
+        assert_eq!(skill.metadata.allowed_tools, vec!["notion:*"]);
+    }
+
+    #[test]
+    fn test_parse_skill_without_allowed_tools() {
+        // Skills without allowed-tools should have empty vec
+        let content = r#"---
+name: basic-skill
+---
+
+Content.
+"#;
+
+        let skill = parse_skill(content, SkillSource::User).unwrap();
+        assert!(skill.metadata.allowed_tools.is_empty());
+    }
 }
