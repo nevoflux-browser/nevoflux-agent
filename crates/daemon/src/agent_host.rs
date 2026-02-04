@@ -1871,6 +1871,37 @@ impl DaemonHostFunctions {
     }
 
     /// Execute a browser action via the browser sender channel.
+    /// Extract base64 screenshot data from a browser response result.
+    ///
+    /// Handles multiple response formats from the sidebar:
+    /// - Plain base64 string: `"iVBORw0KGgo..."`
+    /// - Data URL string: `"data:image/png;base64,iVBORw0KGgo..."`
+    /// - Object with "screenshot" key: `{"screenshot": "..."}`
+    /// - Object with "data" key: `{"data": "..."}`
+    fn extract_screenshot_base64(result: &Option<serde_json::Value>) -> Option<String> {
+        let value = result.as_ref()?;
+
+        // Case 1: plain string (base64 or data URL)
+        if let Some(s) = value.as_str() {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+
+        // Case 2: JSON object with known keys
+        if let Some(obj) = value.as_object() {
+            for key in &["screenshot", "data", "image", "base64"] {
+                if let Some(serde_json::Value::String(s)) = obj.get(*key) {
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     fn execute_browser_action(
         &self,
         action: BrowserToolAction,
@@ -1946,11 +1977,21 @@ impl DaemonHostFunctions {
                     // For Screenshot actions, put the base64 data in the screenshot field
                     // so that downstream extract_screenshot_from_tool_result can find it
                     if action == BrowserToolAction::Screenshot {
-                        let screenshot_base64 = response
-                            .result
-                            .as_ref()
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
+                        let screenshot_base64 =
+                            Self::extract_screenshot_base64(&response.result);
+                        if screenshot_base64.is_none() {
+                            warn!(
+                                "browser_screenshot returned success but no screenshot data. result={:?}",
+                                response.result.as_ref().map(|v| {
+                                    let s = v.to_string();
+                                    if s.len() > 200 {
+                                        format!("{}...({}B)", &s[..200], s.len())
+                                    } else {
+                                        s
+                                    }
+                                })
+                            );
+                        }
                         Ok(BrowserToolResult {
                             success: true,
                             data: None,
@@ -2838,5 +2879,110 @@ mod tests {
         let result = host.subagent_wait(999);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, 404);
+    }
+
+    // ==================== Screenshot Extraction Tests ====================
+
+    #[test]
+    fn test_extract_screenshot_base64_none() {
+        assert_eq!(DaemonHostFunctions::extract_screenshot_base64(&None), None);
+    }
+
+    #[test]
+    fn test_extract_screenshot_base64_plain_string() {
+        let result = Some(serde_json::Value::String("iVBORw0KGgo".into()));
+        assert_eq!(
+            DaemonHostFunctions::extract_screenshot_base64(&result),
+            Some("iVBORw0KGgo".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_screenshot_base64_data_url() {
+        let data_url = "data:image/png;base64,iVBORw0KGgo";
+        let result = Some(serde_json::Value::String(data_url.into()));
+        assert_eq!(
+            DaemonHostFunctions::extract_screenshot_base64(&result),
+            Some(data_url.into())
+        );
+    }
+
+    #[test]
+    fn test_extract_screenshot_base64_empty_string() {
+        let result = Some(serde_json::Value::String("".into()));
+        assert_eq!(DaemonHostFunctions::extract_screenshot_base64(&result), None);
+    }
+
+    #[test]
+    fn test_extract_screenshot_base64_object_screenshot_key() {
+        let result = Some(serde_json::json!({"screenshot": "iVBORw0KGgo"}));
+        assert_eq!(
+            DaemonHostFunctions::extract_screenshot_base64(&result),
+            Some("iVBORw0KGgo".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_screenshot_base64_object_data_key() {
+        let result = Some(serde_json::json!({"data": "iVBORw0KGgo"}));
+        assert_eq!(
+            DaemonHostFunctions::extract_screenshot_base64(&result),
+            Some("iVBORw0KGgo".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_screenshot_base64_object_image_key() {
+        let result = Some(serde_json::json!({"image": "iVBORw0KGgo"}));
+        assert_eq!(
+            DaemonHostFunctions::extract_screenshot_base64(&result),
+            Some("iVBORw0KGgo".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_screenshot_base64_object_base64_key() {
+        let result = Some(serde_json::json!({"base64": "iVBORw0KGgo"}));
+        assert_eq!(
+            DaemonHostFunctions::extract_screenshot_base64(&result),
+            Some("iVBORw0KGgo".into())
+        );
+    }
+
+    #[test]
+    fn test_extract_screenshot_base64_object_unknown_keys() {
+        let result = Some(serde_json::json!({"success": true, "url": "http://example.com"}));
+        assert_eq!(DaemonHostFunctions::extract_screenshot_base64(&result), None);
+    }
+
+    #[test]
+    fn test_extract_screenshot_base64_object_empty_value() {
+        let result = Some(serde_json::json!({"screenshot": ""}));
+        assert_eq!(DaemonHostFunctions::extract_screenshot_base64(&result), None);
+    }
+
+    #[test]
+    fn test_extract_screenshot_base64_number() {
+        let result = Some(serde_json::json!(42));
+        assert_eq!(DaemonHostFunctions::extract_screenshot_base64(&result), None);
+    }
+
+    #[test]
+    fn test_extract_screenshot_base64_bool() {
+        let result = Some(serde_json::json!(true));
+        assert_eq!(DaemonHostFunctions::extract_screenshot_base64(&result), None);
+    }
+
+    #[test]
+    fn test_extract_screenshot_base64_object_priority() {
+        // "screenshot" key should be found first due to iteration order
+        let result = Some(serde_json::json!({
+            "screenshot": "from_screenshot",
+            "data": "from_data"
+        }));
+        assert_eq!(
+            DaemonHostFunctions::extract_screenshot_base64(&result),
+            Some("from_screenshot".into())
+        );
     }
 }
