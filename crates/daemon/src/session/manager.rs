@@ -54,6 +54,11 @@ impl SessionManager {
         &self.storage
     }
 
+    /// Get a shared reference to the underlying storage.
+    pub fn shared_storage(&self) -> Arc<Storage> {
+        self.storage.clone()
+    }
+
     /// Create a new session.
     ///
     /// If `session_id` is None, a new ID will be generated.

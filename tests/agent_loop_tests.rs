@@ -52,6 +52,7 @@ async fn test_agent_loop_with_history() {
                 text: "Hello there!".to_string(),
                 attachments: vec![],
                 tab_id: None,
+                tab_ids: vec![],
             },
             nevoflux_protocol::ChatMessage {
                 session_id: "test-with-history".into(),
@@ -59,6 +60,7 @@ async fn test_agent_loop_with_history() {
                 text: "Hi! How can I help?".to_string(),
                 attachments: vec![],
                 tab_id: None,
+                tab_ids: vec![],
             },
         ],
     };

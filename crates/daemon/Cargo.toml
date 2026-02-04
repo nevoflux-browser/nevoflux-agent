@@ -57,6 +57,7 @@ glob = "0.3"
 
 # Configuration file support
 dirs = "5.0"
+directories = { workspace = true }
 toml = "0.8"
 
 # Date/time utilities

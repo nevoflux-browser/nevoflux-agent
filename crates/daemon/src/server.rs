@@ -5,6 +5,8 @@ use crate::config::AgentConfig;
 use crate::error::{DaemonError, Result};
 use crate::router::{RouteDecision, Router};
 use crate::session::SessionManager;
+use crate::trace::collector::TraceCollector;
+use crate::trace::file_writer::TraceFileWriter;
 use crate::wasm::{BrowserRequest, BrowserResponse, HostServices};
 use bytes::Bytes;
 use nevoflux_builtin_wasm::{Agent, AgentInput, AgentMode, Attachment};
@@ -34,6 +36,8 @@ pub struct ServerConfig {
     pub port_end: u16,
     /// Bind address (default: 127.0.0.1).
     pub bind_address: String,
+    /// Whether trace collection is enabled.
+    pub trace_enabled: bool,
 }
 
 impl Default for ServerConfig {
@@ -42,6 +46,7 @@ impl Default for ServerConfig {
             port_start: 19500,
             port_end: 19600,
             bind_address: "127.0.0.1".into(),
+            trace_enabled: false,
         }
     }
 }
@@ -264,6 +269,7 @@ pub async fn start_server(
     let process_runtime = tokio::runtime::Handle::current();
     let process_browser_registry = browser_registry.clone();
     let process_cancellation_registry = cancellation_registry.clone();
+    let process_trace_enabled = config.trace_enabled;
     tokio::spawn(async move {
         while let Some((identity, envelope)) = msg_rx.recv().await {
             let proxy_id = envelope.proxy_id.clone();
@@ -402,6 +408,7 @@ pub async fn start_server(
                     let runtime = process_runtime.clone();
                     let response_tx = process_response_tx.clone();
                     let cancellation_registry = process_cancellation_registry.clone();
+                    let trace_enabled = process_trace_enabled;
                     tokio::spawn(async move {
                         handle_chat_message_streaming(
                             &payload,
@@ -415,6 +422,7 @@ pub async fn start_server(
                             channel,
                             response_tx,
                             cancellation_registry,
+                            trace_enabled,
                         )
                         .await;
                     });
@@ -455,6 +463,7 @@ async fn handle_chat_message_streaming(
     channel: Channel,
     response_tx: mpsc::Sender<(Vec<u8>, DaemonEnvelope)>,
     cancellation_registry: CancellationRegistry,
+    trace_enabled: bool,
 ) {
     let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -660,6 +669,30 @@ async fn handle_chat_message_streaming(
         }
     }
 
+    // Create trace collector for this session
+    let trace_collector = {
+        let file_writer = if trace_enabled {
+            let data_dir = std::env::var("NEVOFLUX_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    directories::ProjectDirs::from("com", "nevoflux", "nevoflux")
+                        .map(|dirs| dirs.data_dir().to_path_buf())
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                });
+            let traces_dir = data_dir.join("traces");
+            TraceFileWriter::new(&traces_dir, &session_id).ok()
+        } else {
+            None
+        };
+        match file_writer {
+            Some(writer) => Arc::new(TraceCollector::with_file_writer(
+                session_manager.shared_storage(),
+                writer,
+            )),
+            None => Arc::new(TraceCollector::new(session_manager.shared_storage())),
+        }
+    };
+
     // Create unbounded channel for streaming chunks
     let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel::<SidebarStreamChunk>();
 
@@ -671,7 +704,8 @@ async fn handle_chat_message_streaming(
     let host = DaemonHostFunctions::new(config.clone(), runtime.clone())
         .with_services(services_with_context)
         .with_sidebar_stream(stream_tx)
-        .with_session_id(session_id.clone());
+        .with_session_id(session_id.clone())
+        .with_trace_collector(trace_collector.clone());
 
     // Create agent with host functions
     let agent = Agent::new(host);
@@ -794,6 +828,9 @@ async fn handle_chat_message_streaming(
         registry.remove(&session_id);
         debug!("Removed cancellation token for session: {}", session_id);
     }
+
+    // Cleanup trace collector session data
+    trace_collector.cleanup_session(&session_id);
 
     // If cancelled, don't send final response (stop_generation handler already did)
     if was_cancelled {

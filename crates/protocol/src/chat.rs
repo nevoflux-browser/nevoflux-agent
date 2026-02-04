@@ -300,6 +300,7 @@ mod tests {
             text: "Hello, Agent!".into(),
             attachments: vec![],
             tab_id: Some(123),
+            tab_ids: vec![],
         };
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -343,6 +344,7 @@ mod tests {
             text: "Hello".into(),
             attachments: vec![],
             tab_id: None,
+            tab_ids: vec![],
         });
 
         let json = serde_json::to_string(&msg).unwrap();

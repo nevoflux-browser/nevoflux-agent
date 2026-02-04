@@ -285,9 +285,15 @@ async fn run_daemon(verbose: bool, trace: bool) -> Result<(), Box<dyn std::error
     // Initialize logging
     logging::init_logging(verbose, None);
 
-    let trace_enabled = trace || std::env::var("NEVOFLUX_TRACE").map(|v| v == "1").unwrap_or(false);
+    let trace_enabled = trace
+        || std::env::var("NEVOFLUX_TRACE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
     if trace_enabled {
-        tracing::info!("Trace enabled: writing to {}/traces/", get_data_dir().display());
+        tracing::info!(
+            "Trace enabled: writing to {}/traces/",
+            get_data_dir().display()
+        );
     }
 
     logging::log_startup(env!("CARGO_PKG_VERSION"));
@@ -313,7 +319,10 @@ async fn run_daemon(verbose: bool, trace: bool) -> Result<(), Box<dyn std::error
     );
 
     // Start server
-    let config = nevoflux_daemon::ServerConfig::default();
+    let config = nevoflux_daemon::ServerConfig {
+        trace_enabled,
+        ..Default::default()
+    };
     let router = std::sync::Arc::new(nevoflux_daemon::Router::new());
 
     let server = nevoflux_daemon::start_server(config, router, session_manager).await?;
