@@ -80,6 +80,7 @@ fn test_agent_process_input_serialization() {
             role: "user".into(),
             content: "Previous message".into(),
         }],
+        trace_summary: None,
     };
 
     let json = serde_json::to_string(&input).unwrap();
@@ -311,6 +312,7 @@ fn test_agent_process_input_with_tool_results() {
             ],
         },
         history: vec![],
+        trace_summary: None,
     };
 
     let json = serde_json::to_string(&input).unwrap();

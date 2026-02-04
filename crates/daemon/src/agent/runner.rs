@@ -14,9 +14,12 @@ use crate::agent::abi::{
 use crate::agent::streaming::StreamHandle;
 use crate::agent::tools::ToolRegistry;
 use crate::error::{DaemonError, Result};
+use crate::trace::collector::TraceCollector;
+use crate::trace::detection::{DetectionContext, PatternEngine};
 use crate::wasm::{HostServices, WasmInstance, WasmRuntime};
 use nevoflux_protocol::{ChatMessage, StreamFormat, StreamMetadata};
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 
 /// Agent execution mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -97,6 +100,8 @@ pub struct AgentRunner {
     tools: ToolRegistry,
     #[allow(dead_code)]
     services: Option<HostServices>,
+    trace_collector: Option<Arc<TraceCollector>>,
+    pattern_engine: Option<Mutex<PatternEngine>>,
 }
 
 impl AgentRunner {
@@ -108,6 +113,8 @@ impl AgentRunner {
             config: AgentRunnerConfig::default(),
             tools: ToolRegistry::new(),
             services: None,
+            trace_collector: None,
+            pattern_engine: None,
         })
     }
 
@@ -119,12 +126,21 @@ impl AgentRunner {
             config,
             tools: ToolRegistry::new(),
             services: None,
+            trace_collector: None,
+            pattern_engine: None,
         })
     }
 
     /// Set services for host functions.
     pub fn with_services(mut self, services: HostServices) -> Self {
         self.services = Some(services);
+        self
+    }
+
+    /// Enable trace collection and pattern detection.
+    pub fn with_trace(mut self, collector: Arc<TraceCollector>) -> Self {
+        self.trace_collector = Some(collector);
+        self.pattern_engine = Some(Mutex::new(PatternEngine::default_engine()));
         self
     }
 
@@ -181,6 +197,7 @@ impl AgentRunner {
         let mut current_content = AgentContent::UserMessage {
             text: input.user_message.clone(),
         };
+        let mut trace_summary: Option<String> = None;
 
         // Main execution loop
         loop {
@@ -200,6 +217,7 @@ impl AgentRunner {
                 iteration,
                 content: current_content.clone(),
                 history: history.clone(),
+                trace_summary: trace_summary.take(),
             };
 
             // Call the Wasm agent (simulated for now since we don't have a real agent_process export)
@@ -251,6 +269,30 @@ impl AgentRunner {
                     // Execute the tool (simulated for now)
                     let result = self.execute_tool(pending).await;
 
+                    // Record tool execution in trace
+                    if let Some(tc) = &self.trace_collector {
+                        let params_summary =
+                            extract_tool_params_summary(&pending.name, &pending.arguments);
+                        let (success, err_code, err_msg) = match &result.error {
+                            Some(err) => {
+                                (false, Some("TOOL_ERROR".to_string()), Some(err.clone()))
+                            }
+                            None => (true, None, None),
+                        };
+                        tc.record_tool_exec(
+                            &input.session_id,
+                            iteration,
+                            &pending.name,
+                            params_summary,
+                            success,
+                            err_code,
+                            err_msg,
+                            0, // duration_ms - not tracked at this level currently
+                            None,
+                            None,
+                        );
+                    }
+
                     // Track the tool call with its result
                     all_tool_calls.push(ToolCall {
                         id: pending.id.clone(),
@@ -260,6 +302,20 @@ impl AgentRunner {
                     });
 
                     tool_results.push(result);
+                }
+
+                // Pattern detection - check for anomalous patterns
+                if let (Some(tc), Some(engine)) =
+                    (&self.trace_collector, &self.pattern_engine)
+                {
+                    let recent = tc.recent_tool_spans(&input.session_id, 10);
+                    let ctx = DetectionContext {
+                        session_id: &input.session_id,
+                        iteration,
+                        max_iterations: self.config.max_iterations,
+                        recent_tool_spans: &recent,
+                    };
+                    trace_summary = engine.lock().unwrap().check(&ctx);
                 }
 
                 // Set up next iteration with tool results
@@ -381,6 +437,7 @@ impl AgentRunner {
         let mut current_content = AgentContent::UserMessage {
             text: input.user_message.clone(),
         };
+        let mut trace_summary: Option<String> = None;
 
         // Track timing for metadata
         let start_time = std::time::Instant::now();
@@ -411,6 +468,7 @@ impl AgentRunner {
                 iteration,
                 content: current_content.clone(),
                 history: history.clone(),
+                trace_summary: trace_summary.take(),
             };
 
             // Call the Wasm agent
@@ -475,6 +533,30 @@ impl AgentRunner {
                     // Execute the tool
                     let result = self.execute_tool(pending).await;
 
+                    // Record tool execution in trace
+                    if let Some(tc) = &self.trace_collector {
+                        let params_summary =
+                            extract_tool_params_summary(&pending.name, &pending.arguments);
+                        let (success, err_code, err_msg) = match &result.error {
+                            Some(err) => {
+                                (false, Some("TOOL_ERROR".to_string()), Some(err.clone()))
+                            }
+                            None => (true, None, None),
+                        };
+                        tc.record_tool_exec(
+                            &input.session_id,
+                            iteration,
+                            &pending.name,
+                            params_summary,
+                            success,
+                            err_code,
+                            err_msg,
+                            0, // duration_ms - not tracked at this level currently
+                            None,
+                            None,
+                        );
+                    }
+
                     // Track the tool call with its result
                     all_tool_calls.push(ToolCall {
                         id: pending.id.clone(),
@@ -486,6 +568,20 @@ impl AgentRunner {
                     tool_results.push(result);
                 }
 
+                // Pattern detection - check for anomalous patterns
+                if let (Some(tc), Some(engine)) =
+                    (&self.trace_collector, &self.pattern_engine)
+                {
+                    let recent = tc.recent_tool_spans(&input.session_id, 10);
+                    let ctx = DetectionContext {
+                        session_id: &input.session_id,
+                        iteration,
+                        max_iterations: self.config.max_iterations,
+                        recent_tool_spans: &recent,
+                    };
+                    trace_summary = engine.lock().unwrap().check(&ctx);
+                }
+
                 // Set up next iteration with tool results
                 current_content = AgentContent::ToolResults {
                     results: tool_results,
@@ -495,6 +591,20 @@ impl AgentRunner {
             iteration += 1;
         }
     }
+}
+
+/// Extract key identifying fields from tool arguments for pattern detection.
+fn extract_tool_params_summary(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+    let key = match tool_name {
+        "write_file" | "read_file" | "tool_read" | "tool_write" => "path",
+        "web_fetch" | "tool_web_fetch" => "url",
+        "web_search" | "tool_web_search" => "query",
+        "tool_glob" => "pattern",
+        "tool_bash" => "command",
+        _ => return Some(tool_name.to_string()),
+    };
+    args.get(key)
+        .map(|v| serde_json::json!({ key: v }).to_string())
 }
 
 #[cfg(test)]

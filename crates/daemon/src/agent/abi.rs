@@ -79,6 +79,9 @@ pub struct AgentProcessInput {
     pub content: AgentContent,
     /// Conversation history.
     pub history: Vec<HistoryEntry>,
+    /// Optional trace summary injected by pattern detection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_summary: Option<String>,
 }
 
 /// Content types that can be passed to the agent.
@@ -184,6 +187,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "Previous message".to_string(),
             }],
+            trace_summary: None,
         };
 
         let json = serde_json::to_string(&input).unwrap();

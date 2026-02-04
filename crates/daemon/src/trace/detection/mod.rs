@@ -17,20 +17,20 @@ pub struct DetectionContext<'a> {
 }
 
 /// Trait for pattern detectors.
-pub trait PatternDetector {
+pub trait PatternDetector: Send {
     fn check(&self, ctx: &DetectionContext) -> Option<String>;
 }
 
 /// Engine that runs all detectors and tracks firing state.
 pub struct PatternEngine {
-    detectors: Vec<Box<dyn PatternDetector>>,
+    detectors: Vec<Box<dyn PatternDetector + Send>>,
     max_injections: u32,
     fired: Vec<bool>,
     injection_count: u32,
 }
 
 impl PatternEngine {
-    pub fn new(detectors: Vec<Box<dyn PatternDetector>>, max_injections: u32) -> Self {
+    pub fn new(detectors: Vec<Box<dyn PatternDetector + Send>>, max_injections: u32) -> Self {
         let fired = vec![false; detectors.len()];
         Self { detectors, max_injections, fired, injection_count: 0 }
     }
