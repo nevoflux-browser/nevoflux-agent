@@ -41,6 +41,10 @@ pub struct Cli {
     #[arg(long, short)]
     pub verbose: bool,
 
+    /// Enable trace output for debugging (writes JSONL to data dir)
+    #[arg(long)]
+    pub trace: bool,
+
     /// Subcommand to execute
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -277,6 +281,13 @@ mod tests {
     fn test_cli_parse_combined_flags() {
         let cli = Cli::try_parse_from(["nevoflux", "--verbose", "--daemon"]).unwrap();
         assert!(cli.verbose);
+        assert!(cli.daemon);
+    }
+
+    #[test]
+    fn test_cli_parse_trace_flag() {
+        let cli = Cli::try_parse_from(["nevoflux", "--trace", "--daemon"]).unwrap();
+        assert!(cli.trace);
         assert!(cli.daemon);
     }
 

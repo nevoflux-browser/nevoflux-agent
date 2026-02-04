@@ -281,9 +281,15 @@ async fn run_mcp(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Run the daemon.
-async fn run_daemon(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_daemon(verbose: bool, trace: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     logging::init_logging(verbose, None);
+
+    let trace_enabled = trace || std::env::var("NEVOFLUX_TRACE").map(|v| v == "1").unwrap_or(false);
+    if trace_enabled {
+        tracing::info!("Trace enabled: writing to {}/traces/", get_data_dir().display());
+    }
+
     logging::log_startup(env!("CARGO_PKG_VERSION"));
 
     // Acquire lock
@@ -584,7 +590,7 @@ async fn main() {
 
     // Handle flags
     if cli.daemon {
-        if let Err(e) = run_daemon(cli.verbose).await {
+        if let Err(e) = run_daemon(cli.verbose, cli.trace).await {
             eprintln!("Daemon error: {}", e);
             std::process::exit(1);
         }
