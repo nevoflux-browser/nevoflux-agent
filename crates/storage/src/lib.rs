@@ -58,7 +58,10 @@ pub use models::{
 // Re-export repository types for convenience
 pub use repositories::{
     ConfigRepository, MemoryRepository, MessageRepository, PermissionRepository, SessionRepository,
+    TraceRepository,
 };
+
+pub use repositories::traces::{CreateTraceSpanParams, TraceSpanRecord};
 
 // Re-export vector types for convenience
 pub use vector::{cosine_similarity, euclidean_distance, SimpleVectorIndex, VectorSearchResult};

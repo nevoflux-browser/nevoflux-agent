@@ -7,6 +7,7 @@ use crate::error::Result;
 use crate::repositories::{
     ConfigRepository, MessageRepository, PermissionRepository, SessionRepository,
 };
+use crate::repositories::traces::TraceRepository;
 
 /// Main storage facade providing access to all repositories.
 ///
@@ -60,6 +61,13 @@ impl Storage {
     /// Use this to store and retrieve configuration key-value pairs.
     pub fn config(&self) -> ConfigRepository<'_> {
         ConfigRepository::new(&self.db)
+    }
+
+    /// Get a trace repository.
+    ///
+    /// Use this to create, read, and delete trace span records.
+    pub fn traces(&self) -> TraceRepository<'_> {
+        TraceRepository::new(&self.db)
     }
 
     /// Get the underlying database (for advanced operations).
