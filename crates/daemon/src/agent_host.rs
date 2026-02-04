@@ -35,7 +35,8 @@ use nevoflux_mcp::ToolResultContent;
 use nevoflux_protocol::BrowserToolAction;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::trace::collector::TraceCollector;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
@@ -129,6 +130,10 @@ pub struct DaemonHostFunctions {
     sidebar_stream_tx: Option<tokio::sync::mpsc::UnboundedSender<SidebarStreamChunk>>,
     /// Current session ID for browser tool requests.
     session_id: Option<String>,
+    /// Optional trace collector for recording LLM call spans.
+    trace_collector: Option<Arc<TraceCollector>>,
+    /// Current agent iteration counter (for trace recording).
+    current_iteration: AtomicU32,
 }
 
 impl DaemonHostFunctions {
@@ -142,6 +147,8 @@ impl DaemonHostFunctions {
             stream_registry: Arc::new(LlmStreamRegistry::new()),
             sidebar_stream_tx: None,
             session_id: None,
+            trace_collector: None,
+            current_iteration: AtomicU32::new(0),
         }
     }
 
@@ -164,6 +171,17 @@ impl DaemonHostFunctions {
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
         self
+    }
+
+    /// Set the trace collector for recording LLM call spans.
+    pub fn with_trace_collector(mut self, collector: Arc<TraceCollector>) -> Self {
+        self.trace_collector = Some(collector);
+        self
+    }
+
+    /// Update the current iteration counter for trace recording.
+    pub fn set_iteration(&self, iteration: u32) {
+        self.current_iteration.store(iteration, Ordering::Relaxed);
     }
 
     /// Convert agent LlmRequest to daemon LlmChatRequest with custom messages.
@@ -397,6 +415,15 @@ impl HostFunctions for DaemonHostFunctions {
             }
         };
 
+        // Serialize the request for trace recording before it's consumed by execute_llm_chat
+        let trace_request_value = if self.trace_collector.is_some() {
+            serde_json::to_value(&daemon_request).ok()
+        } else {
+            None
+        };
+
+        let llm_start = std::time::Instant::now();
+
         // Execute LLM call synchronously using block_in_place
         // (allows blocking in async context by moving to blocking thread pool)
         let runtime = self.runtime.clone();
@@ -408,6 +435,23 @@ impl HostFunctions for DaemonHostFunctions {
 
         match result {
             Ok(response) => {
+                let duration_ms = llm_start.elapsed().as_millis() as u64;
+                let iteration = self.current_iteration.load(Ordering::Relaxed);
+                if let Some(tc) = &self.trace_collector {
+                    let session_id = self.session_id.as_deref().unwrap_or("unknown");
+                    let full_response = serde_json::to_value(&response).ok();
+                    tc.record_llm_call(
+                        session_id,
+                        iteration,
+                        true,
+                        None,
+                        None,
+                        duration_ms,
+                        trace_request_value,
+                        full_response,
+                    );
+                }
+
                 // Convert tool calls, preserving call_id for OpenAI Responses API compatibility
                 let tool_calls = response
                     .tool_calls
@@ -428,6 +472,21 @@ impl HostFunctions for DaemonHostFunctions {
                 })
             }
             Err(e) => {
+                let duration_ms = llm_start.elapsed().as_millis() as u64;
+                let iteration = self.current_iteration.load(Ordering::Relaxed);
+                if let Some(tc) = &self.trace_collector {
+                    let session_id = self.session_id.as_deref().unwrap_or("unknown");
+                    tc.record_llm_call(
+                        session_id,
+                        iteration,
+                        false,
+                        Some(format!("{:?}", e)),
+                        Some(e.to_string()),
+                        duration_ms,
+                        trace_request_value,
+                        None,
+                    );
+                }
                 error!("LLM chat failed: {}", e);
                 Err(HostError {
                     code: 100,
@@ -1733,6 +1792,10 @@ impl DaemonHostFunctions {
             stream_registry: self.stream_registry.clone(),
             sidebar_stream_tx: self.sidebar_stream_tx.clone(),
             session_id: self.session_id.clone(),
+            trace_collector: self.trace_collector.clone(),
+            current_iteration: AtomicU32::new(
+                self.current_iteration.load(Ordering::Relaxed),
+            ),
         }
     }
 
@@ -1880,12 +1943,28 @@ impl DaemonHostFunctions {
         match result {
             Ok(response) => {
                 if response.success {
-                    Ok(BrowserToolResult {
-                        success: true,
-                        data: response.result,
-                        error: None,
-                        screenshot: None,
-                    })
+                    // For Screenshot actions, put the base64 data in the screenshot field
+                    // so that downstream extract_screenshot_from_tool_result can find it
+                    if action == BrowserToolAction::Screenshot {
+                        let screenshot_base64 = response
+                            .result
+                            .as_ref()
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        Ok(BrowserToolResult {
+                            success: true,
+                            data: None,
+                            error: None,
+                            screenshot: screenshot_base64,
+                        })
+                    } else {
+                        Ok(BrowserToolResult {
+                            success: true,
+                            data: response.result,
+                            error: None,
+                            screenshot: None,
+                        })
+                    }
                 } else {
                     let error_msg = response
                         .error
