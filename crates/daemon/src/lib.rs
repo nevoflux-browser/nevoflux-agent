@@ -40,6 +40,7 @@ pub mod session;
 pub mod skills;
 pub mod validation;
 pub mod wasm;
+pub mod trace;
 
 pub use config::{
     AgentConfig, ConfigError, ContextConfig, DaemonConfig, LlmConfig, LoggingConfig, SessionConfig,
@@ -77,6 +78,7 @@ pub use health::{HealthMonitor, HealthStatus};
 pub use retry::{with_retry, RetryConfig, Retryable};
 pub use secrets::{ApiKey, ApiKeyManager, KeySource, SecretError};
 pub use skills::SkillsManager;
+pub use trace::{FullTraceSpan, SpanType, TraceSpan};
 pub use validation::{
     validate_extension_id, validate_length, validate_path, validate_port, validate_session_id,
     ValidationError,
