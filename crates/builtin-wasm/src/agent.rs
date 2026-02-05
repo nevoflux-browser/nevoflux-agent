@@ -3676,4 +3676,53 @@ mod tests {
             .iter()
             .any(|t| t.name == "browser_element_info"));
     }
+
+    #[test]
+    fn test_switch_model_tool_registered_in_all_modes() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        for mode in [AgentMode::Chat, AgentMode::Browser, AgentMode::Agent] {
+            let tools = agent.get_tools_for_mode(mode);
+            let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+            assert!(
+                tool_names.contains(&"switch_model"),
+                "switch_model should be registered in {:?} mode",
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn test_switch_model_tool_schema() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let tools = agent.get_tools_for_mode(AgentMode::Chat);
+        let switch_model = tools.iter().find(|t| t.name == "switch_model").unwrap();
+
+        // Verify it requires provider and model
+        let required = switch_model.input_schema["required"].as_array().unwrap();
+        let required_names: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(required_names.contains(&"provider"));
+        assert!(required_names.contains(&"model"));
+    }
+
+    #[test]
+    fn test_switch_model_handler_empty_args() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let tool_call = ToolCall {
+            id: "call-001".into(),
+            call_id: None,
+            name: "switch_model".into(),
+            arguments: serde_json::json!({"provider": "", "model": ""}),
+            signature: None,
+        };
+
+        let result = agent.execute_tool(&tool_call).unwrap();
+        assert!(result.content.contains("error"));
+        assert!(result.content.contains("required"));
+    }
 }

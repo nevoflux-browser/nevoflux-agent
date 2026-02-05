@@ -3152,4 +3152,130 @@ mod tests {
             Some("from_screenshot".into())
         );
     }
+
+    #[test]
+    fn test_model_override_fields_default_none() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        assert!(host.model_override_provider.lock().unwrap().is_none());
+        assert!(host.model_override_model.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_model_override_fields_set_and_read() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        *host.model_override_provider.lock().unwrap() = Some("openai".to_string());
+        *host.model_override_model.lock().unwrap() = Some("gpt-4o".to_string());
+
+        assert_eq!(
+            host.model_override_provider.lock().unwrap().as_deref(),
+            Some("openai")
+        );
+        assert_eq!(
+            host.model_override_model.lock().unwrap().as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn test_set_model_override_invalid_provider() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        let result = host.set_model_override("nonexistent_provider", "some-model");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, 10);
+        assert!(err.message.contains("Invalid provider"));
+    }
+
+    #[test]
+    fn test_set_model_override_valid_provider_with_key() {
+        let mut config = AgentConfig::default();
+        config.llm.openai.api_key = Some("test-key-123".to_string());
+        let config = Arc::new(config);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        let result = host.set_model_override("openai", "gpt-4o");
+        assert!(result.is_ok());
+
+        assert_eq!(
+            host.model_override_provider.lock().unwrap().as_deref(),
+            Some("openai")
+        );
+        assert_eq!(
+            host.model_override_model.lock().unwrap().as_deref(),
+            Some("gpt-4o")
+        );
+    }
+
+    #[test]
+    fn test_set_model_override_no_api_key() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        // openai provider exists but has no API key in default config
+        let result = host.set_model_override("openai", "gpt-4o");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, 2);
+        assert!(err.message.contains("No API key"));
+    }
+
+    #[test]
+    fn test_resolve_provider_uses_override_when_set() {
+        let mut config = AgentConfig::default();
+        config.llm.provider = Some("anthropic".to_string());
+        config.llm.anthropic.api_key = Some("anthropic-key".to_string());
+        config.llm.anthropic.model = Some("claude-sonnet-4-20250514".to_string());
+        config.llm.openai.api_key = Some("openai-key".to_string());
+        let config = Arc::new(config);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        // Without override, should use anthropic from config
+        let (provider, api_key, _model) = host.resolve_provider_and_model().unwrap();
+        assert_eq!(provider, "anthropic");
+        assert_eq!(api_key, "anthropic-key");
+
+        // Set override to openai
+        *host.model_override_provider.lock().unwrap() = Some("openai".to_string());
+        *host.model_override_model.lock().unwrap() = Some("gpt-4o".to_string());
+
+        let (provider, api_key, model) = host.resolve_provider_and_model().unwrap();
+        assert_eq!(provider, "openai");
+        assert_eq!(api_key, "openai-key");
+        assert_eq!(model, "gpt-4o");
+    }
+
+    #[test]
+    fn test_model_override_preserved_in_clone_for_builtin() {
+        let mut config = AgentConfig::default();
+        config.llm.openai.api_key = Some("test-key".to_string());
+        let config = Arc::new(config);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        // Set override
+        host.set_model_override("openai", "gpt-4o").unwrap();
+
+        // Clone for builtin should share the same Arc<Mutex<...>>
+        let cloned = host.clone_for_builtin();
+        assert_eq!(
+            cloned.model_override_provider.lock().unwrap().as_deref(),
+            Some("openai")
+        );
+        assert_eq!(
+            cloned.model_override_model.lock().unwrap().as_deref(),
+            Some("gpt-4o")
+        );
+    }
 }
