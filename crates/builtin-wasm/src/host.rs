@@ -242,7 +242,7 @@ pub trait HostFunctions {
     fn browser_scroll(
         &self,
         direction: &str,
-        amount: i32,
+        amount: &str,
         tab_id: Option<i64>,
     ) -> HostResult<BrowserToolResult>;
 
@@ -256,6 +256,25 @@ pub trait HostFunctions {
 
     /// Get accessibility tree with element IDs for interaction.
     fn browser_get_elements(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
+
+    /// Wait for page to stabilize after an action.
+    fn browser_wait_for_stable(
+        &self,
+        strategy: &str,
+        max_wait: u64,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
+
+    /// Take a viewport-only snapshot (returns flat list of visible interactive elements).
+    fn browser_viewport_snapshot(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
+
+    /// Press a keyboard key.
+    fn browser_key_press(
+        &self,
+        key: &str,
+        modifiers: &[String],
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
 
     // =========================================================================
     // Session Control Functions
@@ -339,6 +358,16 @@ pub trait HostFunctions {
     /// # Returns
     /// `Ok(())` on success.
     fn stream_end(&self) -> HostResult<()>;
+
+    // =========================================================================
+    // Trace Functions
+    // =========================================================================
+
+    /// Update the current iteration counter for trace recording.
+    ///
+    /// Called by the agent loop after incrementing its iteration count so the
+    /// host can associate LLM call traces with the correct iteration number.
+    fn set_iteration(&self, iteration: u32) -> HostResult<()>;
 }
 
 /// Mock host functions for testing.
@@ -661,7 +690,7 @@ impl HostFunctions for MockHostFunctions {
     fn browser_scroll(
         &self,
         direction: &str,
-        amount: i32,
+        amount: &str,
         _tab_id: Option<i64>,
     ) -> HostResult<BrowserToolResult> {
         Ok(BrowserToolResult::success(serde_json::json!({
@@ -687,6 +716,38 @@ impl HostFunctions for MockHostFunctions {
                 {"id": "e1", "role": "button", "name": "Submit"},
                 {"id": "e2", "role": "textbox", "name": "Email"}
             ]
+        })))
+    }
+
+    fn browser_wait_for_stable(
+        &self,
+        strategy: &str,
+        _max_wait: u64,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(serde_json::json!({
+            "stable": true,
+            "strategy": strategy,
+            "duration_ms": 100
+        })))
+    }
+
+    fn browser_viewport_snapshot(&self, _tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(serde_json::json!({
+            "tree": "Page: \"Test\" | URL: https://example.com\nViewport: 1920x1080 | Scroll: 0/2000 (top)\n\n[e1] button \"Submit\"\n[e2] textbox \"Email\"",
+            "refs": {"e1": {"selector": "#submit", "role": "button", "name": "Submit"}, "e2": {"selector": "#email", "role": "textbox", "name": "Email"}},
+            "viewportInfo": {"scrollTop": 0, "scrollHeight": 2000, "viewportHeight": 1080, "viewportWidth": 1920, "canScrollUp": false, "canScrollDown": true, "pageTitle": "Test", "url": "https://example.com"}
+        })))
+    }
+
+    fn browser_key_press(
+        &self,
+        key: &str,
+        _modifiers: &[String],
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(serde_json::json!({
+            "pressed": key
         })))
     }
 
@@ -761,6 +822,10 @@ impl HostFunctions for MockHostFunctions {
 
     fn stream_end(&self) -> HostResult<()> {
         // Mock: just accept the end signal
+        Ok(())
+    }
+
+    fn set_iteration(&self, _iteration: u32) -> HostResult<()> {
         Ok(())
     }
 }
@@ -997,7 +1062,7 @@ mod tests {
     #[test]
     fn test_mock_host_functions_browser_scroll() {
         let mock = MockHostFunctions::new();
-        let result = mock.browser_scroll("down", 500, None).unwrap();
+        let result = mock.browser_scroll("down", "page", None).unwrap();
         assert!(result.success);
     }
 

@@ -21,6 +21,7 @@
 
 use crate::config::AgentConfig;
 use crate::context::{CompressionResult, ContextCompressor, ContextMessage, TokenBudget};
+use crate::trace::collector::TraceCollector;
 use crate::wasm::llm::{
     execute_llm_chat, start_llm_stream, LlmChatRequest, LlmMessage as DaemonLlmMessage,
     LlmStreamRegistry,
@@ -35,9 +36,8 @@ use nevoflux_mcp::ToolResultContent;
 use nevoflux_protocol::BrowserToolAction;
 use std::collections::HashMap;
 use std::str::FromStr;
-use crate::trace::collector::TraceCollector;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
@@ -103,6 +103,14 @@ impl Default for SubagentRegistry {
     }
 }
 
+/// Trace metadata stored during a streaming LLM call.
+struct StreamTraceData {
+    /// When the stream was started.
+    start: std::time::Instant,
+    /// Serialized request payload (captured before the request is consumed).
+    request: Option<serde_json::Value>,
+}
+
 /// A streaming chunk to send to the sidebar.
 #[derive(Debug, Clone)]
 pub struct SidebarStreamChunk {
@@ -134,6 +142,8 @@ pub struct DaemonHostFunctions {
     trace_collector: Option<Arc<TraceCollector>>,
     /// Current agent iteration counter (for trace recording).
     current_iteration: AtomicU32,
+    /// Trace metadata for in-flight streaming LLM calls, keyed by stream_id.
+    stream_trace_data: Arc<Mutex<HashMap<u64, StreamTraceData>>>,
 }
 
 impl DaemonHostFunctions {
@@ -149,6 +159,7 @@ impl DaemonHostFunctions {
             session_id: None,
             trace_collector: None,
             current_iteration: AtomicU32::new(0),
+            stream_trace_data: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -374,7 +385,7 @@ impl HostFunctions for DaemonHostFunctions {
         // Estimate tokens and calculate budget
         let estimated_tokens = ContextCompressor::estimate_tokens(&context_messages);
         let token_budget = TokenBudget::for_model(
-            128_000, // Default context window (TODO: make configurable per model)
+            self.config.llm.context_window(),
             self.config.llm.max_tokens,
             &self.config.daemon.context,
         );
@@ -530,6 +541,13 @@ impl HostFunctions for DaemonHostFunctions {
         // Convert request to daemon format
         let daemon_request = self.convert_request_to_daemon(request);
 
+        // Serialize request for trace recording before it's consumed
+        let trace_request_value = self
+            .trace_collector
+            .as_ref()
+            .and_then(|_| serde_json::to_value(&daemon_request).ok());
+        let llm_start = std::time::Instant::now();
+
         // Start the stream
         let registry = Arc::clone(&self.stream_registry);
         let api_key_owned = api_key.to_string();
@@ -551,6 +569,17 @@ impl HostFunctions for DaemonHostFunctions {
                 code: 100,
                 message: format!("Failed to start stream: {}", e),
             })?;
+
+        // Store trace data for this stream
+        if self.trace_collector.is_some() {
+            self.stream_trace_data.lock().unwrap().insert(
+                stream_id,
+                StreamTraceData {
+                    start: llm_start,
+                    request: trace_request_value,
+                },
+            );
+        }
 
         debug!("llm_stream_start: stream_id={}", stream_id);
         Ok(stream_id)
@@ -590,6 +619,27 @@ impl HostFunctions for DaemonHostFunctions {
 
     fn llm_stream_close(&self, stream_id: u64) -> HostResult<()> {
         debug!("llm_stream_close: stream_id={}", stream_id);
+
+        // Record trace for this stream
+        if let Some(tc) = &self.trace_collector {
+            let trace_data = self.stream_trace_data.lock().unwrap().remove(&stream_id);
+            if let Some(data) = trace_data {
+                let duration_ms = data.start.elapsed().as_millis() as u64;
+                let iteration = self.current_iteration.load(Ordering::Relaxed);
+                let session_id = self.session_id.as_deref().unwrap_or("unknown");
+                tc.record_llm_call(
+                    session_id,
+                    iteration,
+                    true,
+                    None,
+                    None,
+                    duration_ms,
+                    data.request,
+                    None, // Streaming response is accumulated in WASM, not available here
+                );
+            }
+        }
+
         self.stream_registry.close(stream_id);
         Ok(())
     }
@@ -1515,7 +1565,7 @@ impl HostFunctions for DaemonHostFunctions {
     fn browser_scroll(
         &self,
         direction: &str,
-        amount: i32,
+        amount: &str,
         tab_id: Option<i64>,
     ) -> HostResult<BrowserToolResult> {
         debug!("browser_scroll: direction={}, amount={}", direction, amount);
@@ -1546,6 +1596,46 @@ impl HostFunctions for DaemonHostFunctions {
     fn browser_get_elements(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
         debug!("browser_get_elements: getting accessibility tree");
         self.execute_browser_action(BrowserToolAction::Snapshot, serde_json::json!({}), tab_id)
+    }
+
+    fn browser_wait_for_stable(
+        &self,
+        strategy: &str,
+        max_wait: u64,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        debug!(
+            "browser_wait_for_stable: strategy={}, max_wait={}",
+            strategy, max_wait
+        );
+        self.execute_browser_action(
+            BrowserToolAction::WaitForStable,
+            serde_json::json!({"strategy": strategy, "maxWait": max_wait}),
+            tab_id,
+        )
+    }
+
+    fn browser_viewport_snapshot(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+        debug!("browser_viewport_snapshot: taking viewport-only snapshot");
+        self.execute_browser_action(
+            BrowserToolAction::Snapshot,
+            serde_json::json!({"viewport_only": true}),
+            tab_id,
+        )
+    }
+
+    fn browser_key_press(
+        &self,
+        key: &str,
+        modifiers: &[String],
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        debug!("browser_key_press: key={}, modifiers={:?}", key, modifiers);
+        self.execute_browser_action(
+            BrowserToolAction::KeyPress,
+            serde_json::json!({"key": key, "modifiers": modifiers}),
+            tab_id,
+        )
     }
 
     fn is_interrupted(&self) -> HostResult<bool> {
@@ -1779,6 +1869,11 @@ impl HostFunctions for DaemonHostFunctions {
         }
         Ok(())
     }
+
+    fn set_iteration(&self, iteration: u32) -> HostResult<()> {
+        self.current_iteration.store(iteration, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 impl DaemonHostFunctions {
@@ -1793,9 +1888,8 @@ impl DaemonHostFunctions {
             sidebar_stream_tx: self.sidebar_stream_tx.clone(),
             session_id: self.session_id.clone(),
             trace_collector: self.trace_collector.clone(),
-            current_iteration: AtomicU32::new(
-                self.current_iteration.load(Ordering::Relaxed),
-            ),
+            current_iteration: AtomicU32::new(self.current_iteration.load(Ordering::Relaxed)),
+            stream_trace_data: self.stream_trace_data.clone(),
         }
     }
 
@@ -2684,7 +2778,7 @@ mod tests {
         let services = HostServices::new(db);
         let host = DaemonHostFunctions::new(config, rt.handle().clone()).with_services(services);
 
-        let result = host.browser_scroll("down", 500, None);
+        let result = host.browser_scroll("down", "page", None);
         assert!(result.is_err());
     }
 

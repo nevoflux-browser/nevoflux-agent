@@ -9,6 +9,7 @@
 use crate::host::{HostFunctions, HostResult};
 use crate::types::*;
 use nevoflux_protocol::LocalFileRef;
+use std::cell::RefCell;
 
 /// Format local file references for injection into user message.
 fn format_local_files(files: &[LocalFileRef]) -> String {
@@ -98,12 +99,218 @@ impl AgentConfig {
     }
 }
 
+/// Bounding rectangle for a cached element.
+#[derive(Debug, Clone)]
+struct ElementRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// A cached element from browser_get_elements.
+#[derive(Debug, Clone)]
+struct CachedElement {
+    id: String,
+    role: String,
+    name: String,
+    selector: String,
+    rect: Option<ElementRect>,
+    /// Preserve all original fields for browser_element_info.
+    raw: serde_json::Value,
+}
+
+/// Cache of elements from the last browser_get_elements call.
+struct ElementsCache {
+    elements: Vec<CachedElement>,
+}
+
+/// Interactive ARIA roles that represent actionable UI elements.
+const INTERACTIVE_ROLES: &[&str] = &[
+    "button",
+    "link",
+    "textbox",
+    "checkbox",
+    "radio",
+    "combobox",
+    "menuitem",
+    "tab",
+    "slider",
+    "switch",
+    "spinbutton",
+    "searchbox",
+];
+
+/// Parse element data from browser_get_elements into a cache.
+///
+/// Supports two formats:
+/// 1. `refs` map format (from browser sidebar): `{ "refs": { "e10": {...}, ... } }`
+/// 2. `elements` array format: `{ "elements": [{ "id": "e10", ... }, ...] }`
+fn parse_elements_from_data(data: &serde_json::Value) -> Option<ElementsCache> {
+    let mut elements = Vec::new();
+
+    if let Some(refs) = data.get("refs").and_then(|r| r.as_object()) {
+        // Format 1: refs map { "e10": { "name": "...", "role": "...", ... } }
+        for (id, elem) in refs {
+            let cached = parse_single_element(id, elem);
+            elements.push(cached);
+        }
+    } else if let Some(elems) = data.get("elements").and_then(|e| e.as_array()) {
+        // Format 2: elements array [{ "id": "e10", "name": "...", ... }]
+        for elem in elems {
+            let id = elem
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let cached = parse_single_element(&id, elem);
+            elements.push(cached);
+        }
+    } else {
+        return None;
+    }
+
+    if elements.is_empty() {
+        return None;
+    }
+
+    Some(ElementsCache { elements })
+}
+
+/// Parse a single element value into a CachedElement.
+fn parse_single_element(id: &str, elem: &serde_json::Value) -> CachedElement {
+    let role = elem
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let name = elem
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let selector = elem
+        .get("selector")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let rect = elem.get("rect").and_then(|r| {
+        Some(ElementRect {
+            x: r.get("x")?.as_f64()?,
+            y: r.get("y")?.as_f64()?,
+            width: r.get("width")?.as_f64()?,
+            height: r.get("height")?.as_f64()?,
+        })
+    });
+
+    CachedElement {
+        id: id.to_string(),
+        role,
+        name,
+        selector,
+        rect,
+        raw: elem.clone(),
+    }
+}
+
+/// Build a compact summary of cached elements for the LLM.
+fn build_elements_summary(elements: &[CachedElement]) -> String {
+    use std::collections::HashMap;
+
+    // Count elements by role
+    let mut role_counts: HashMap<&str, usize> = HashMap::new();
+    for elem in elements {
+        *role_counts.entry(&elem.role).or_insert(0) += 1;
+    }
+
+    // Collect interactive elements with non-empty names (max 20)
+    let interactive_elements: Vec<serde_json::Value> = elements
+        .iter()
+        .filter(|e| {
+            !e.name.is_empty()
+                && INTERACTIVE_ROLES
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(&e.role))
+        })
+        .take(20)
+        .map(|e| {
+            let mut obj = serde_json::json!({
+                "id": e.id,
+                "role": e.role,
+                "name": e.name,
+            });
+            if let Some(ref rect) = e.rect {
+                obj["rect"] = serde_json::json!({
+                    "x": rect.x as i64,
+                    "y": rect.y as i64,
+                    "width": rect.width as i64,
+                    "height": rect.height as i64,
+                });
+            }
+            obj
+        })
+        .collect();
+
+    // Collect unnamed interactive elements (all of them)
+    let unnamed_interactive: Vec<serde_json::Value> = elements
+        .iter()
+        .filter(|e| {
+            e.name.is_empty()
+                && INTERACTIVE_ROLES
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(&e.role))
+        })
+        .map(|e| {
+            let mut obj = serde_json::json!({
+                "id": e.id,
+                "role": e.role,
+                "name": "",
+            });
+            if let Some(ref rect) = e.rect {
+                obj["rect"] = serde_json::json!({
+                    "x": rect.x as i64,
+                    "y": rect.y as i64,
+                    "width": rect.width as i64,
+                    "height": rect.height as i64,
+                });
+            }
+            obj
+        })
+        .collect();
+
+    let unnamed_count = unnamed_interactive.len();
+
+    // Build role counts map sorted by count descending
+    let mut sorted_roles: Vec<(&str, usize)> = role_counts.into_iter().collect();
+    sorted_roles.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let mut roles_map = serde_json::Map::new();
+    for (role, count) in sorted_roles {
+        roles_map.insert(role.to_string(), serde_json::json!(count));
+    }
+
+    let summary = serde_json::json!({
+        "success": true,
+        "element_count": elements.len(),
+        "roles": roles_map,
+        "interactive_elements": interactive_elements,
+        "unnamed_interactive_count": unnamed_count,
+        "unnamed_interactive_elements": unnamed_interactive,
+        "hint": "IMPORTANT: Do NOT summarize this data in natural language. You MUST follow this workflow: (1) Call browser_screenshot to capture the current page. (2) For unnamed elements, cross-reference their rect coordinates with the screenshot to determine their visual meaning/label. (3) Use browser_find_elements to search by role/name/selector/position. (4) Use browser_element_info(id) for full element details. (5) Output structured data, not a prose summary."
+    });
+
+    summary.to_string()
+}
+
 /// The built-in agent.
 pub struct Agent<H: HostFunctions> {
     /// Host functions interface.
     host: H,
     /// Configuration.
     config: AgentConfig,
+    /// Cached elements from browser_get_elements (replaced on each call).
+    elements_cache: RefCell<Option<ElementsCache>>,
+    /// Cached screenshot base64 from browser_screenshot (consumed once per call).
+    screenshot_cache: RefCell<Option<String>>,
 }
 
 impl<H: HostFunctions> Agent<H> {
@@ -112,12 +319,19 @@ impl<H: HostFunctions> Agent<H> {
         Self {
             host,
             config: AgentConfig::default(),
+            elements_cache: RefCell::new(None),
+            screenshot_cache: RefCell::new(None),
         }
     }
 
     /// Create a new agent with custom configuration.
     pub fn with_config(host: H, config: AgentConfig) -> Self {
-        Self { host, config }
+        Self {
+            host,
+            config,
+            elements_cache: RefCell::new(None),
+            screenshot_cache: RefCell::new(None),
+        }
     }
 
     /// Run the agent for a single turn.
@@ -211,6 +425,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
         loop {
             iterations += 1;
+            let _ = self.host.set_iteration(iterations as u32);
             if iterations > self.config.max_iterations {
                 break;
             }
@@ -268,9 +483,32 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 // Dynamic truncation based on current message size
                 let content = truncate_tool_result_if_needed(&messages, &result.content);
 
+                // Check if there's a cached screenshot to attach (base64 stays out of content)
+                let attachments = if tool_call.name == "browser_screenshot" {
+                    self.screenshot_cache
+                        .borrow_mut()
+                        .take()
+                        .map(|base64| {
+                            vec![Attachment {
+                                name: "screenshot.png".into(),
+                                mime_type: "image/png".into(),
+                                data: base64,
+                            }]
+                        })
+                        .unwrap_or_default()
+                } else {
+                    vec![]
+                };
+
                 // Use call_id (from result.tool_call_id) for the tool message
                 // This was set in execute_tool to use call_id when available
-                messages.push(Message::tool(&result.tool_call_id, &content));
+                messages.push(Message {
+                    role: MessageRole::Tool,
+                    content,
+                    tool_call_id: Some(result.tool_call_id.clone()),
+                    tool_calls: vec![],
+                    attachments,
+                });
 
                 // Check interrupt after each tool execution
                 if self.host.is_interrupted()? {
@@ -529,7 +767,13 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let full_page = tool_call.arguments["full_page"].as_bool().unwrap_or(false);
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_screenshot(full_page, tab_id)?;
-                serde_json::to_string(&result).unwrap_or_default()
+                if let Some(base64_data) = &result.screenshot {
+                    // Cache the screenshot for attachment (stripped from content)
+                    *self.screenshot_cache.borrow_mut() = Some(base64_data.clone());
+                    r#"{"success":true,"screenshot_available":true}"#.to_string()
+                } else {
+                    serde_json::to_string(&result).unwrap_or_default()
+                }
             }
             "browser_eval_js" => {
                 let script = tool_call.arguments["script"].as_str().unwrap_or("");
@@ -539,7 +783,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             }
             "browser_scroll" => {
                 let direction = tool_call.arguments["direction"].as_str().unwrap_or("down");
-                let amount = tool_call.arguments["amount"].as_i64().unwrap_or(500) as i32;
+                let amount = tool_call.arguments["amount"].as_str().unwrap_or("page");
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_scroll(direction, amount, tab_id)?;
                 serde_json::to_string(&result).unwrap_or_default()
@@ -554,7 +798,119 @@ The following skill instructions MUST be followed exactly. These instructions ta
             "browser_get_elements" => {
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_get_elements(tab_id)?;
-                serde_json::to_string(&result).unwrap_or_default()
+                // Parse and cache elements, return compact summary
+                if let Some(data) = &result.data {
+                    if let Some(cache) = parse_elements_from_data(data) {
+                        let summary = build_elements_summary(&cache.elements);
+                        *self.elements_cache.borrow_mut() = Some(cache);
+                        summary
+                    } else {
+                        // Parse failed — fallback to original behavior
+                        serde_json::to_string(&result).unwrap_or_default()
+                    }
+                } else {
+                    serde_json::to_string(&result).unwrap_or_default()
+                }
+            }
+            "browser_find_elements" => {
+                let cache = self.elements_cache.borrow();
+                match cache.as_ref() {
+                    None => r#"{"success":false,"error":"No elements cached. Call browser_get_elements first."}"#.to_string(),
+                    Some(cache) => {
+                        let role_filter = tool_call.arguments.get("role").and_then(|v| v.as_str());
+                        let name_filter = tool_call.arguments.get("name").and_then(|v| v.as_str());
+                        let selector_filter = tool_call.arguments.get("selector").and_then(|v| v.as_str());
+                        let near_x = tool_call.arguments.get("near_x").and_then(|v| v.as_f64());
+                        let near_y = tool_call.arguments.get("near_y").and_then(|v| v.as_f64());
+                        let radius = tool_call.arguments.get("radius").and_then(|v| v.as_f64()).unwrap_or(50.0);
+                        let unnamed_only = tool_call.arguments.get("unnamed_only").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let limit = tool_call.arguments.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+
+                        let results: Vec<serde_json::Value> = cache
+                            .elements
+                            .iter()
+                            .filter(|e| {
+                                if let Some(role) = role_filter {
+                                    if !e.role.eq_ignore_ascii_case(role) {
+                                        return false;
+                                    }
+                                }
+                                if let Some(name) = name_filter {
+                                    if !e.name.to_lowercase().contains(&name.to_lowercase()) {
+                                        return false;
+                                    }
+                                }
+                                if let Some(sel) = selector_filter {
+                                    if !e.selector.contains(sel) {
+                                        return false;
+                                    }
+                                }
+                                if unnamed_only && !e.name.is_empty() {
+                                    return false;
+                                }
+                                if let (Some(nx), Some(ny)) = (near_x, near_y) {
+                                    if let Some(ref rect) = e.rect {
+                                        let cx = rect.x + rect.width / 2.0;
+                                        let cy = rect.y + rect.height / 2.0;
+                                        let dist = ((cx - nx).powi(2) + (cy - ny).powi(2)).sqrt();
+                                        if dist > radius {
+                                            return false;
+                                        }
+                                    } else {
+                                        return false;
+                                    }
+                                }
+                                true
+                            })
+                            .take(limit)
+                            .map(|e| {
+                                let mut obj = serde_json::json!({
+                                    "id": e.id,
+                                    "role": e.role,
+                                    "name": e.name,
+                                    "selector": e.selector,
+                                });
+                                if let Some(ref rect) = e.rect {
+                                    obj["rect"] = serde_json::json!({
+                                        "x": rect.x as i64,
+                                        "y": rect.y as i64,
+                                        "width": rect.width as i64,
+                                        "height": rect.height as i64,
+                                    });
+                                }
+                                obj
+                            })
+                            .collect();
+
+                        serde_json::json!({
+                            "success": true,
+                            "count": results.len(),
+                            "elements": results,
+                        })
+                        .to_string()
+                    }
+                }
+            }
+            "browser_element_info" => {
+                let id = tool_call
+                    .arguments
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let cache = self.elements_cache.borrow();
+                match cache.as_ref() {
+                    None => r#"{"success":false,"error":"No elements cached. Call browser_get_elements first."}"#.to_string(),
+                    Some(cache) => {
+                        match cache.elements.iter().find(|e| e.id == id) {
+                            Some(el) => serde_json::json!({
+                                "success": true,
+                                "element": el.raw,
+                            })
+                            .to_string(),
+                            None => format!(r#"{{"success":false,"error":"Element '{}' not found"}}"#, id),
+                        }
+                    }
+                }
             }
             // Subagent tools
             "subagent_spawn" => {
@@ -660,6 +1016,16 @@ ONLY browser_get_elements provides element IDs needed for clicking!
 ### For Navigation
 - browser_navigate, browser_scroll, browser_wait_for
 
+## Handling Unnamed Interactive Elements
+
+After calling browser_get_elements, if the response contains unnamed_interactive_elements:
+
+1. **Call browser_screenshot** to capture the page visually
+2. **Cross-reference** each unnamed element's rect coordinates with the screenshot to determine what the element represents visually (its label, placeholder text, icon, or surrounding context)
+3. **Use browser_find_elements** to query specific elements by role/selector/position
+4. **Use browser_element_info(id)** to get full details for individual elements
+5. **Do NOT** write a natural language summary of the elements — use the tools to identify and interact with them
+
 Always confirm before taking actions that might have side effects."#;
 
         self.append_skills_section(base_prompt)
@@ -680,7 +1046,17 @@ You can:
 
 Think step by step. Use tools to gather information before making changes.
 Always verify your work after making modifications.
-Ask for permission before destructive operations."#;
+Ask for permission before destructive operations.
+
+## Handling Unnamed Interactive Elements
+
+After calling browser_get_elements, if the response contains unnamed_interactive_elements:
+
+1. **Call browser_screenshot** to capture the page visually
+2. **Cross-reference** each unnamed element's rect coordinates with the screenshot to determine what the element represents visually (its label, placeholder text, icon, or surrounding context)
+3. **Use browser_find_elements** to query specific elements by role/selector/position
+4. **Use browser_element_info(id)** to get full details for individual elements
+5. **Do NOT** write a natural language summary of the elements — use the tools to identify and interact with them"#;
 
         self.append_skills_section(base_prompt)
     }
@@ -696,13 +1072,20 @@ Ask for permission before destructive operations."#;
         // When tab_ids is provided, those are the target tabs for the user's action
         if !tab_ids.is_empty() {
             context.push_str("\n\n## Browser Tab Context\n\n");
-            context.push_str("**IMPORTANT:** The user has attached the following tabs for processing.\n");
+            context.push_str(
+                "**IMPORTANT:** The user has attached the following tabs for processing.\n",
+            );
             context.push_str("When the user asks to summarize, analyze, or process content, you should process ALL of these attached tabs:\n\n");
 
             // Group tabs by space
-            let mut tabs_by_space: std::collections::BTreeMap<&str, Vec<&TabInfo>> = std::collections::BTreeMap::new();
+            let mut tabs_by_space: std::collections::BTreeMap<&str, Vec<&TabInfo>> =
+                std::collections::BTreeMap::new();
             for tab in tab_ids {
-                let space = if tab.space.is_empty() { "Default" } else { &tab.space };
+                let space = if tab.space.is_empty() {
+                    "Default"
+                } else {
+                    &tab.space
+                };
                 tabs_by_space.entry(space).or_default().push(tab);
             }
 
@@ -717,7 +1100,10 @@ Ask for permission before destructive operations."#;
 
             // Add active tab info as secondary context
             if let Some(id) = tab_id {
-                context.push_str(&format!("\n\n(Current active tab ID: {} - for reference only)", id));
+                context.push_str(&format!(
+                    "\n\n(Current active tab ID: {} - for reference only)",
+                    id
+                ));
             }
         } else if let Some(id) = tab_id {
             // Only show active tab info when no specific tabs are attached
@@ -851,7 +1237,8 @@ Ask for permission before destructive operations."#;
             },
             ToolDefinition {
                 name: "browser_get_markdown".into(),
-                description: "Get the current page content as markdown (better for summarization)".into(),
+                description: "Get the current page content as markdown (better for summarization)"
+                    .into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1168,7 +1555,7 @@ Ask for permission before destructive operations."#;
         // Get elements - REQUIRED before any page interaction
         tools.push(ToolDefinition {
             name: "browser_get_elements".into(),
-            description: "REQUIRED before clicking/typing/filling. Returns accessibility tree with element IDs for browser_click_by_id, browser_fill_by_id, browser_type_by_id.".into(),
+            description: "REQUIRED before clicking/typing/filling. Returns a compact summary with interactive elements and role counts. Use browser_find_elements to search and browser_element_info(id) for full details.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1177,6 +1564,68 @@ Ask for permission before destructive operations."#;
                         "description": "Optional tab ID"
                     }
                 }
+            }),
+        });
+
+        // Find elements in cache (after browser_get_elements)
+        tools.push(ToolDefinition {
+            name: "browser_find_elements".into(),
+            description: "Search cached elements from the last browser_get_elements call. Filters are AND-combined.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "role": {
+                        "type": "string",
+                        "description": "Filter by ARIA role (exact match, case-insensitive)"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Substring match on element name/text (case-insensitive)"
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": "Substring match on CSS selector"
+                    },
+                    "near_x": {
+                        "type": "integer",
+                        "description": "Find elements near this X coordinate (requires near_y)"
+                    },
+                    "near_y": {
+                        "type": "integer",
+                        "description": "Find elements near this Y coordinate (requires near_x)"
+                    },
+                    "radius": {
+                        "type": "integer",
+                        "description": "Search radius in pixels (default: 50, requires near_x + near_y)",
+                        "default": 50
+                    },
+                    "unnamed_only": {
+                        "type": "boolean",
+                        "description": "Only return elements with empty name (default: false)",
+                        "default": false
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum results (default: 20)",
+                        "default": 20
+                    }
+                }
+            }),
+        });
+
+        // Get full details for one element from cache
+        tools.push(ToolDefinition {
+            name: "browser_element_info".into(),
+            description: "Get full details for a single element by ID from the cache. Call browser_get_elements first.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Element ID (e.g., \"e42\")"
+                    }
+                },
+                "required": ["id"]
             }),
         });
 
@@ -1501,9 +1950,9 @@ fn calculate_messages_size(messages: &[Message]) -> usize {
 fn truncate_tool_result_if_needed(messages: &[Message], content: &str) -> String {
     // Total message size limit (~75K tokens for most models)
     const MAX_TOTAL_MESSAGE_SIZE: usize = 300 * 1024; // 300KB
-    // Reserved space for LLM output
+                                                      // Reserved space for LLM output
     const RESERVED_OUTPUT_SIZE: usize = 50 * 1024; // 50KB
-    // Minimum tool result size (don't truncate below this)
+                                                   // Minimum tool result size (don't truncate below this)
     const MIN_TOOL_RESULT_SIZE: usize = 10 * 1024; // 10KB
 
     let current_size = calculate_messages_size(messages);
@@ -1638,9 +2087,21 @@ mod tests {
 
         // Test with tab_ids list (attached tabs for processing)
         let tab_ids = vec![
-            TabInfo { space: "Work".into(), tab_id: 1, tab_title: "GitHub".into() },
-            TabInfo { space: "Work".into(), tab_id: 2, tab_title: "Docs".into() },
-            TabInfo { space: "Personal".into(), tab_id: 3, tab_title: "Email".into() },
+            TabInfo {
+                space: "Work".into(),
+                tab_id: 1,
+                tab_title: "GitHub".into(),
+            },
+            TabInfo {
+                space: "Work".into(),
+                tab_id: 2,
+                tab_title: "Docs".into(),
+            },
+            TabInfo {
+                space: "Personal".into(),
+                tab_id: 3,
+                tab_title: "Email".into(),
+            },
         ];
         let context_with_tabs = agent.format_tab_context(Some(99), &tab_ids);
         assert!(context_with_tabs.contains("attached the following tabs"));
@@ -1748,6 +2209,7 @@ mod tests {
                 call_id: None,
                 name: "web_search".into(),
                 arguments: serde_json::json!({"query": "rust programming"}),
+                signature: None,
             }],
         });
         mock.add_llm_response(LlmResponse {
@@ -1921,6 +2383,7 @@ mod tests {
             call_id: None,
             name: "web_search".into(),
             arguments: serde_json::json!({"query": "test"}),
+            signature: None,
         };
 
         let result = agent.execute_tool(&tool_call).unwrap();
@@ -1938,6 +2401,7 @@ mod tests {
             call_id: None,
             name: "unknown_tool".into(),
             arguments: serde_json::json!({}),
+            signature: None,
         };
 
         let result = agent.execute_tool(&tool_call).unwrap();
@@ -1954,6 +2418,7 @@ mod tests {
             call_id: None,
             name: "tool_search".into(),
             arguments: serde_json::json!({"query": "file", "max_results": 5}),
+            signature: None,
         };
 
         let result = agent.execute_tool(&tool_call).unwrap();
@@ -1975,6 +2440,7 @@ mod tests {
                 "tool_name": "read_file",
                 "arguments": r#"{"path": "/test.txt"}"#
             }),
+            signature: None,
         };
 
         let result = agent.execute_tool(&tool_call).unwrap();
@@ -2002,6 +2468,7 @@ mod tests {
             call_id: None,
             name: "browser_navigate".into(),
             arguments: serde_json::json!({"url": "https://example.com"}),
+            signature: None,
         };
 
         let result = agent.execute_tool(&tool_call).unwrap();
@@ -2019,6 +2486,7 @@ mod tests {
             call_id: None,
             name: "browser_click".into(),
             arguments: serde_json::json!({"selector": "#submit-btn"}),
+            signature: None,
         };
 
         let result = agent.execute_tool(&tool_call).unwrap();
@@ -2035,6 +2503,7 @@ mod tests {
             call_id: None,
             name: "browser_type".into(),
             arguments: serde_json::json!({"selector": "#input", "text": "Hello World"}),
+            signature: None,
         };
 
         let result = agent.execute_tool(&tool_call).unwrap();
@@ -2051,6 +2520,7 @@ mod tests {
             call_id: None,
             name: "browser_screenshot".into(),
             arguments: serde_json::json!({"full_page": true}),
+            signature: None,
         };
 
         let result = agent.execute_tool(&tool_call).unwrap();
@@ -2067,7 +2537,8 @@ mod tests {
             id: "call-001".into(),
             call_id: None,
             name: "browser_scroll".into(),
-            arguments: serde_json::json!({"direction": "down", "amount": 500}),
+            arguments: serde_json::json!({"direction": "down", "amount": "page"}),
+            signature: None,
         };
 
         let result = agent.execute_tool(&tool_call).unwrap();
@@ -2084,6 +2555,7 @@ mod tests {
             call_id: None,
             name: "browser_wait_for".into(),
             arguments: serde_json::json!({"selector": "#loading", "timeout_ms": 5000}),
+            signature: None,
         };
 
         let result = agent.execute_tool(&tool_call).unwrap();
@@ -2097,8 +2569,9 @@ mod tests {
 
         let browser_tools = agent.get_browser_tools();
         let chat_tools = agent.get_chat_tools();
-        // Browser tools = chat tools + 13 browser-specific tools
-        assert_eq!(browser_tools.len(), chat_tools.len() + 13);
+        // Browser tools = chat tools + 16 browser-specific tools
+        // (14 original + browser_find_elements + browser_element_info)
+        assert_eq!(browser_tools.len(), chat_tools.len() + 16);
     }
 
     #[test]
@@ -2176,6 +2649,7 @@ mod tests {
             call_id: None,
             name: "subagent_spawn".into(),
             arguments: serde_json::json!({"task": "Search for files", "mode": "agent"}),
+            signature: None,
         };
 
         let result = agent.execute_tool(&tool_call).unwrap();
@@ -2193,6 +2667,7 @@ mod tests {
             call_id: None,
             name: "subagent_spawn".into(),
             arguments: serde_json::json!({"task": "Do something"}),
+            signature: None,
         };
 
         let result = agent.execute_tool(&tool_call).unwrap();
@@ -2211,6 +2686,7 @@ mod tests {
             call_id: None,
             name: "subagent_spawn".into(),
             arguments: serde_json::json!({"task": "Test task"}),
+            signature: None,
         };
         agent.execute_tool(&spawn_call).unwrap();
 
@@ -2220,6 +2696,7 @@ mod tests {
             call_id: None,
             name: "subagent_status".into(),
             arguments: serde_json::json!({"id": 1}),
+            signature: None,
         };
 
         let result = agent.execute_tool(&status_call).unwrap();
@@ -2238,6 +2715,7 @@ mod tests {
             call_id: None,
             name: "subagent_spawn".into(),
             arguments: serde_json::json!({"task": "Test task"}),
+            signature: None,
         };
         agent.execute_tool(&spawn_call).unwrap();
 
@@ -2247,6 +2725,7 @@ mod tests {
             call_id: None,
             name: "subagent_wait".into(),
             arguments: serde_json::json!({"id": 1}),
+            signature: None,
         };
 
         let result = agent.execute_tool(&wait_call).unwrap();
@@ -2265,6 +2744,7 @@ mod tests {
             call_id: None,
             name: "subagent_spawn".into(),
             arguments: serde_json::json!({"task": "Long running task"}),
+            signature: None,
         };
         agent.execute_tool(&spawn_call).unwrap();
 
@@ -2274,6 +2754,7 @@ mod tests {
             call_id: None,
             name: "subagent_kill".into(),
             arguments: serde_json::json!({"id": 1}),
+            signature: None,
         };
 
         let result = agent.execute_tool(&kill_call).unwrap();
@@ -2293,6 +2774,7 @@ mod tests {
             call_id: None,
             name: "subagent_spawn".into(),
             arguments: serde_json::json!({"task": "Task 1", "mode": "agent"}),
+            signature: None,
         };
         agent.execute_tool(&spawn_call1).unwrap();
 
@@ -2301,6 +2783,7 @@ mod tests {
             call_id: None,
             name: "subagent_spawn".into(),
             arguments: serde_json::json!({"task": "Task 2", "mode": "browser"}),
+            signature: None,
         };
         agent.execute_tool(&spawn_call2).unwrap();
 
@@ -2310,6 +2793,7 @@ mod tests {
             call_id: None,
             name: "subagent_list".into(),
             arguments: serde_json::json!({}),
+            signature: None,
         };
 
         let result = agent.execute_tool(&list_call).unwrap();
@@ -2445,5 +2929,524 @@ mod tests {
 
         // Should have at least 10KB (MIN_TOOL_RESULT_SIZE)
         assert!(result.len() >= 10 * 1024);
+    }
+
+    // =========================================================================
+    // Elements caching tests
+    // =========================================================================
+
+    #[test]
+    fn test_parse_elements_from_data_refs_format() {
+        let data = serde_json::json!({
+            "refs": {
+                "e1": {"name": "Submit", "role": "button", "selector": "#submit", "rect": {"x": 10.0, "y": 20.0, "width": 100.0, "height": 30.0}},
+                "e2": {"name": "Email", "role": "textbox", "selector": "input[name=email]"}
+            }
+        });
+        let cache = parse_elements_from_data(&data).unwrap();
+        assert_eq!(cache.elements.len(), 2);
+
+        let e1 = cache.elements.iter().find(|e| e.id == "e1").unwrap();
+        assert_eq!(e1.role, "button");
+        assert_eq!(e1.name, "Submit");
+        assert!(e1.rect.is_some());
+        let rect = e1.rect.as_ref().unwrap();
+        assert_eq!(rect.x, 10.0);
+        assert_eq!(rect.width, 100.0);
+
+        let e2 = cache.elements.iter().find(|e| e.id == "e2").unwrap();
+        assert_eq!(e2.role, "textbox");
+        assert!(e2.rect.is_none());
+    }
+
+    #[test]
+    fn test_parse_elements_from_data_elements_format() {
+        let data = serde_json::json!({
+            "elements": [
+                {"id": "e1", "name": "Submit", "role": "button"},
+                {"id": "e2", "name": "", "role": "generic"}
+            ]
+        });
+        let cache = parse_elements_from_data(&data).unwrap();
+        assert_eq!(cache.elements.len(), 2);
+        assert_eq!(cache.elements[0].id, "e1");
+        assert_eq!(cache.elements[1].role, "generic");
+    }
+
+    #[test]
+    fn test_parse_elements_missing_refs() {
+        let data = serde_json::json!({"other": "data"});
+        assert!(parse_elements_from_data(&data).is_none());
+    }
+
+    #[test]
+    fn test_parse_elements_empty_refs() {
+        let data = serde_json::json!({"refs": {}});
+        assert!(parse_elements_from_data(&data).is_none());
+    }
+
+    #[test]
+    fn test_build_summary_interactive_elements() {
+        let elements = vec![
+            CachedElement {
+                id: "e1".into(),
+                role: "button".into(),
+                name: "Submit".into(),
+                selector: "#submit".into(),
+                rect: Some(ElementRect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 100.0,
+                    height: 30.0,
+                }),
+                raw: serde_json::json!({}),
+            },
+            CachedElement {
+                id: "e2".into(),
+                role: "generic".into(),
+                name: "Container".into(),
+                selector: "div".into(),
+                rect: None,
+                raw: serde_json::json!({}),
+            },
+        ];
+        let summary = build_elements_summary(&elements);
+        let parsed: serde_json::Value = serde_json::from_str(&summary).unwrap();
+
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["element_count"], 2);
+        // Button is interactive and named, should appear in interactive_elements
+        assert_eq!(parsed["interactive_elements"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["interactive_elements"][0]["id"], "e1");
+        // Generic is not interactive, should not appear
+        assert_eq!(parsed["unnamed_interactive_count"], 0);
+    }
+
+    #[test]
+    fn test_build_summary_unnamed_elements() {
+        let elements = vec![CachedElement {
+            id: "e1".into(),
+            role: "button".into(),
+            name: "".into(),
+            selector: "button.icon".into(),
+            rect: Some(ElementRect {
+                x: 50.0,
+                y: 60.0,
+                width: 32.0,
+                height: 32.0,
+            }),
+            raw: serde_json::json!({}),
+        }];
+        let summary = build_elements_summary(&elements);
+        let parsed: serde_json::Value = serde_json::from_str(&summary).unwrap();
+
+        assert_eq!(parsed["interactive_elements"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["unnamed_interactive_count"], 1);
+        assert_eq!(parsed["unnamed_interactive_elements"][0]["id"], "e1");
+        assert_eq!(parsed["unnamed_interactive_elements"][0]["name"], "");
+    }
+
+    #[test]
+    fn test_build_summary_role_counts() {
+        let elements = vec![
+            CachedElement {
+                id: "e1".into(),
+                role: "button".into(),
+                name: "A".into(),
+                selector: "".into(),
+                rect: None,
+                raw: serde_json::json!({}),
+            },
+            CachedElement {
+                id: "e2".into(),
+                role: "button".into(),
+                name: "B".into(),
+                selector: "".into(),
+                rect: None,
+                raw: serde_json::json!({}),
+            },
+            CachedElement {
+                id: "e3".into(),
+                role: "link".into(),
+                name: "C".into(),
+                selector: "".into(),
+                rect: None,
+                raw: serde_json::json!({}),
+            },
+        ];
+        let summary = build_elements_summary(&elements);
+        let parsed: serde_json::Value = serde_json::from_str(&summary).unwrap();
+
+        assert_eq!(parsed["roles"]["button"], 2);
+        assert_eq!(parsed["roles"]["link"], 1);
+    }
+
+    #[test]
+    fn test_find_elements_by_role() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        // Populate cache
+        *agent.elements_cache.borrow_mut() = Some(ElementsCache {
+            elements: vec![
+                CachedElement {
+                    id: "e1".into(),
+                    role: "button".into(),
+                    name: "Submit".into(),
+                    selector: "".into(),
+                    rect: None,
+                    raw: serde_json::json!({}),
+                },
+                CachedElement {
+                    id: "e2".into(),
+                    role: "textbox".into(),
+                    name: "Email".into(),
+                    selector: "".into(),
+                    rect: None,
+                    raw: serde_json::json!({}),
+                },
+                CachedElement {
+                    id: "e3".into(),
+                    role: "button".into(),
+                    name: "Cancel".into(),
+                    selector: "".into(),
+                    rect: None,
+                    raw: serde_json::json!({}),
+                },
+            ],
+        });
+
+        let tool_call = ToolCall {
+            id: "call-001".into(),
+            call_id: None,
+            name: "browser_find_elements".into(),
+            arguments: serde_json::json!({"role": "button"}),
+            signature: None,
+        };
+        let result = agent.execute_tool(&tool_call).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["count"], 2);
+    }
+
+    #[test]
+    fn test_find_elements_by_name() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        *agent.elements_cache.borrow_mut() = Some(ElementsCache {
+            elements: vec![
+                CachedElement {
+                    id: "e1".into(),
+                    role: "button".into(),
+                    name: "Submit Form".into(),
+                    selector: "".into(),
+                    rect: None,
+                    raw: serde_json::json!({}),
+                },
+                CachedElement {
+                    id: "e2".into(),
+                    role: "button".into(),
+                    name: "Cancel".into(),
+                    selector: "".into(),
+                    rect: None,
+                    raw: serde_json::json!({}),
+                },
+            ],
+        });
+
+        let tool_call = ToolCall {
+            id: "call-001".into(),
+            call_id: None,
+            name: "browser_find_elements".into(),
+            arguments: serde_json::json!({"name": "submit"}),
+            signature: None,
+        };
+        let result = agent.execute_tool(&tool_call).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(parsed["count"], 1);
+        assert_eq!(parsed["elements"][0]["id"], "e1");
+    }
+
+    #[test]
+    fn test_find_elements_by_position() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        *agent.elements_cache.borrow_mut() = Some(ElementsCache {
+            elements: vec![
+                CachedElement {
+                    id: "e1".into(),
+                    role: "button".into(),
+                    name: "Near".into(),
+                    selector: "".into(),
+                    rect: Some(ElementRect {
+                        x: 100.0,
+                        y: 100.0,
+                        width: 20.0,
+                        height: 20.0,
+                    }),
+                    raw: serde_json::json!({}),
+                },
+                CachedElement {
+                    id: "e2".into(),
+                    role: "button".into(),
+                    name: "Far".into(),
+                    selector: "".into(),
+                    rect: Some(ElementRect {
+                        x: 500.0,
+                        y: 500.0,
+                        width: 20.0,
+                        height: 20.0,
+                    }),
+                    raw: serde_json::json!({}),
+                },
+            ],
+        });
+
+        let tool_call = ToolCall {
+            id: "call-001".into(),
+            call_id: None,
+            name: "browser_find_elements".into(),
+            arguments: serde_json::json!({"near_x": 115, "near_y": 115, "radius": 50}),
+            signature: None,
+        };
+        let result = agent.execute_tool(&tool_call).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(parsed["count"], 1);
+        assert_eq!(parsed["elements"][0]["id"], "e1");
+    }
+
+    #[test]
+    fn test_find_elements_unnamed_only() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        *agent.elements_cache.borrow_mut() = Some(ElementsCache {
+            elements: vec![
+                CachedElement {
+                    id: "e1".into(),
+                    role: "button".into(),
+                    name: "Submit".into(),
+                    selector: "".into(),
+                    rect: None,
+                    raw: serde_json::json!({}),
+                },
+                CachedElement {
+                    id: "e2".into(),
+                    role: "button".into(),
+                    name: "".into(),
+                    selector: "".into(),
+                    rect: None,
+                    raw: serde_json::json!({}),
+                },
+            ],
+        });
+
+        let tool_call = ToolCall {
+            id: "call-001".into(),
+            call_id: None,
+            name: "browser_find_elements".into(),
+            arguments: serde_json::json!({"unnamed_only": true}),
+            signature: None,
+        };
+        let result = agent.execute_tool(&tool_call).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(parsed["count"], 1);
+        assert_eq!(parsed["elements"][0]["id"], "e2");
+    }
+
+    #[test]
+    fn test_find_elements_combined_filters() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        *agent.elements_cache.borrow_mut() = Some(ElementsCache {
+            elements: vec![
+                CachedElement {
+                    id: "e1".into(),
+                    role: "button".into(),
+                    name: "Submit".into(),
+                    selector: "".into(),
+                    rect: None,
+                    raw: serde_json::json!({}),
+                },
+                CachedElement {
+                    id: "e2".into(),
+                    role: "link".into(),
+                    name: "Submit Link".into(),
+                    selector: "".into(),
+                    rect: None,
+                    raw: serde_json::json!({}),
+                },
+                CachedElement {
+                    id: "e3".into(),
+                    role: "button".into(),
+                    name: "Cancel".into(),
+                    selector: "".into(),
+                    rect: None,
+                    raw: serde_json::json!({}),
+                },
+            ],
+        });
+
+        let tool_call = ToolCall {
+            id: "call-001".into(),
+            call_id: None,
+            name: "browser_find_elements".into(),
+            arguments: serde_json::json!({"role": "button", "name": "submit"}),
+            signature: None,
+        };
+        let result = agent.execute_tool(&tool_call).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(parsed["count"], 1);
+        assert_eq!(parsed["elements"][0]["id"], "e1");
+    }
+
+    #[test]
+    fn test_element_info_found() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let raw = serde_json::json!({"name": "Submit", "role": "button", "extra_field": "value"});
+        *agent.elements_cache.borrow_mut() = Some(ElementsCache {
+            elements: vec![CachedElement {
+                id: "e42".into(),
+                role: "button".into(),
+                name: "Submit".into(),
+                selector: "".into(),
+                rect: None,
+                raw: raw.clone(),
+            }],
+        });
+
+        let tool_call = ToolCall {
+            id: "call-001".into(),
+            call_id: None,
+            name: "browser_element_info".into(),
+            arguments: serde_json::json!({"id": "e42"}),
+            signature: None,
+        };
+        let result = agent.execute_tool(&tool_call).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["element"]["extra_field"], "value");
+    }
+
+    #[test]
+    fn test_element_info_not_found() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        *agent.elements_cache.borrow_mut() = Some(ElementsCache {
+            elements: vec![CachedElement {
+                id: "e1".into(),
+                role: "button".into(),
+                name: "X".into(),
+                selector: "".into(),
+                rect: None,
+                raw: serde_json::json!({}),
+            }],
+        });
+
+        let tool_call = ToolCall {
+            id: "call-001".into(),
+            call_id: None,
+            name: "browser_element_info".into(),
+            arguments: serde_json::json!({"id": "e999"}),
+            signature: None,
+        };
+        let result = agent.execute_tool(&tool_call).unwrap();
+        assert!(result.content.contains("not found"));
+    }
+
+    #[test]
+    fn test_cache_empty_error() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        // Don't populate cache
+
+        let find_call = ToolCall {
+            id: "call-001".into(),
+            call_id: None,
+            name: "browser_find_elements".into(),
+            arguments: serde_json::json!({"role": "button"}),
+            signature: None,
+        };
+        let result = agent.execute_tool(&find_call).unwrap();
+        assert!(result.content.contains("No elements cached"));
+
+        let info_call = ToolCall {
+            id: "call-002".into(),
+            call_id: None,
+            name: "browser_element_info".into(),
+            arguments: serde_json::json!({"id": "e1"}),
+            signature: None,
+        };
+        let result = agent.execute_tool(&info_call).unwrap();
+        assert!(result.content.contains("No elements cached"));
+    }
+
+    #[test]
+    fn test_screenshot_cached_and_stripped() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let tool_call = ToolCall {
+            id: "call-001".into(),
+            call_id: None,
+            name: "browser_screenshot".into(),
+            arguments: serde_json::json!({"full_page": false}),
+            signature: None,
+        };
+        let result = agent.execute_tool(&tool_call).unwrap();
+
+        // Content should NOT contain base64 data
+        assert!(result.content.contains("screenshot_available"));
+        assert!(!result.content.contains("iVBOR"));
+
+        // Screenshot should be in cache
+        let cached = agent.screenshot_cache.borrow();
+        assert!(cached.is_some());
+        assert!(cached.as_ref().unwrap().starts_with("iVBOR"));
+    }
+
+    #[test]
+    fn test_browser_get_elements_caches() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let tool_call = ToolCall {
+            id: "call-001".into(),
+            call_id: None,
+            name: "browser_get_elements".into(),
+            arguments: serde_json::json!({}),
+            signature: None,
+        };
+        let result = agent.execute_tool(&tool_call).unwrap();
+
+        // Mock returns elements array format
+        let parsed: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["element_count"], 2);
+
+        // Cache should be populated
+        let cache = agent.elements_cache.borrow();
+        assert!(cache.is_some());
+        assert_eq!(cache.as_ref().unwrap().elements.len(), 2);
+    }
+
+    #[test]
+    fn test_browser_tools_include_companion_tools() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let browser_tools = agent.get_browser_tools();
+        assert!(browser_tools
+            .iter()
+            .any(|t| t.name == "browser_find_elements"));
+        assert!(browser_tools
+            .iter()
+            .any(|t| t.name == "browser_element_info"));
     }
 }
