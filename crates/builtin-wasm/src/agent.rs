@@ -398,6 +398,18 @@ The following skill instructions MUST be followed exactly. These instructions ta
         let local_files_prefix = format_local_files(&input.local_files);
         let tab_context_prefix = self.format_tab_context(input.tab_id, &input.tab_ids);
 
+        // For browser/agent mode: take initial viewport snapshot and append to user message
+        let initial_snapshot = if matches!(input.mode, AgentMode::Browser | AgentMode::Agent) {
+            let snapshot_text = self.get_viewport_snapshot_text(input.tab_id);
+            if !snapshot_text.is_empty() {
+                format!("\n\nCurrent page state:\n{}", snapshot_text)
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
         // Combine prefixes with user message
         let user_content = match (local_files_prefix.is_empty(), tab_context_prefix.is_empty()) {
             (true, true) => input.user_message.clone(),
@@ -408,6 +420,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 local_files_prefix, tab_context_prefix, input.user_message
             ),
         };
+        let user_content = format!("{}{}", user_content, initial_snapshot);
 
         // Create user message with optional attachments
         if input.attachments.is_empty() {
@@ -711,47 +724,54 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let url = tool_call.arguments["url"].as_str().unwrap_or("");
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_navigate(url, tab_id)?;
-                serde_json::to_string(&result).unwrap_or_default()
+                let result_str = serde_json::to_string(&result).unwrap_or_default();
+                self.auto_snapshot_after_action(&result_str, "navigation", tab_id)
             }
             "browser_click" => {
                 let selector = tool_call.arguments["selector"].as_str().unwrap_or("");
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_click(selector, tab_id)?;
-                serde_json::to_string(&result).unwrap_or_default()
+                let result_str = serde_json::to_string(&result).unwrap_or_default();
+                self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
             }
             "browser_click_by_id" => {
                 let element_id = tool_call.arguments["element_id"].as_str().unwrap_or("");
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_click_by_id(element_id, tab_id)?;
-                serde_json::to_string(&result).unwrap_or_default()
+                let result_str = serde_json::to_string(&result).unwrap_or_default();
+                self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
             }
             "browser_type" => {
                 let selector = tool_call.arguments["selector"].as_str().unwrap_or("");
                 let text = tool_call.arguments["text"].as_str().unwrap_or("");
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_type(selector, text, tab_id)?;
-                serde_json::to_string(&result).unwrap_or_default()
+                let result_str = serde_json::to_string(&result).unwrap_or_default();
+                self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
             }
             "browser_type_by_id" => {
                 let element_id = tool_call.arguments["element_id"].as_str().unwrap_or("");
                 let text = tool_call.arguments["text"].as_str().unwrap_or("");
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_type_by_id(element_id, text, tab_id)?;
-                serde_json::to_string(&result).unwrap_or_default()
+                let result_str = serde_json::to_string(&result).unwrap_or_default();
+                self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
             }
             "browser_fill" => {
                 let selector = tool_call.arguments["selector"].as_str().unwrap_or("");
                 let value = tool_call.arguments["value"].as_str().unwrap_or("");
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_fill(selector, value, tab_id)?;
-                serde_json::to_string(&result).unwrap_or_default()
+                let result_str = serde_json::to_string(&result).unwrap_or_default();
+                self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
             }
             "browser_fill_by_id" => {
                 let element_id = tool_call.arguments["element_id"].as_str().unwrap_or("");
                 let value = tool_call.arguments["value"].as_str().unwrap_or("");
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_fill_by_id(element_id, value, tab_id)?;
-                serde_json::to_string(&result).unwrap_or_default()
+                let result_str = serde_json::to_string(&result).unwrap_or_default();
+                self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
             }
             "browser_get_content" => {
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
@@ -786,7 +806,8 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let amount = tool_call.arguments["amount"].as_str().unwrap_or("page");
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_scroll(direction, amount, tab_id)?;
-                serde_json::to_string(&result).unwrap_or_default()
+                let result_str = serde_json::to_string(&result).unwrap_or_default();
+                self.auto_snapshot_after_action(&result_str, "scroll", tab_id)
             }
             "browser_wait_for" => {
                 let selector = tool_call.arguments["selector"].as_str().unwrap_or("");
@@ -959,6 +980,50 @@ The following skill instructions MUST be followed exactly. These instructions ta
         })
     }
 
+    /// Execute wait-for-stable + viewport snapshot and append to action result.
+    fn auto_snapshot_after_action(
+        &self,
+        action_result: &str,
+        wait_strategy: &str,
+        tab_id: Option<i64>,
+    ) -> String {
+        // 1. Wait for page stability (ignore errors — best effort)
+        let _ = self.host.browser_wait_for_stable(wait_strategy, 3000, tab_id);
+
+        // 2. Take viewport snapshot
+        let snapshot_text = self.get_viewport_snapshot_text(tab_id);
+
+        if snapshot_text.is_empty() {
+            action_result.to_string()
+        } else {
+            format!("{}\n\nCurrent page state:\n{}", action_result, snapshot_text)
+        }
+    }
+
+    /// Get viewport snapshot text for initial context.
+    fn get_viewport_snapshot_text(&self, tab_id: Option<i64>) -> String {
+        match self.host.browser_viewport_snapshot(tab_id) {
+            Ok(result) => {
+                if let Some(data) = &result.data {
+                    if let Some(result_obj) = data.get("result") {
+                        result_obj
+                            .get("tree")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    } else if let Some(tree) = data.get("tree") {
+                        tree.as_str().unwrap_or("").to_string()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            }
+            Err(_) => String::new(),
+        }
+    }
+
     /// Build system prompt for chat mode.
     fn build_chat_system_prompt(&self) -> String {
         let base_prompt = r#"You are a helpful AI assistant integrated into a web browser.
@@ -984,49 +1049,22 @@ Be helpful, accurate, and concise."#;
     /// Build system prompt for browser mode.
     /// Note: Tab context is injected into user message to preserve API cache.
     fn build_browser_system_prompt(&self) -> String {
-        let base_prompt = r#"You are a helpful AI assistant with browser automation capabilities.
+        let base_prompt = r#"You are a browser automation agent. Each turn, you see the current page state (visible interactive elements in the viewport).
 
-## MOST IMPORTANT RULE - READ THIS FIRST
+## How to interact
+- Use browser_click_by_id(element_id) to click elements shown in the page state (e.g., click "e3")
+- Use browser_fill_by_id(element_id, value) to fill form fields
+- Use browser_type_by_id(element_id, text) to type character by character
+- Use browser_scroll(direction) to scroll up/down and reveal more elements
+- Use browser_navigate(url) to go to a new page
+- Use browser_screenshot() to see the page visually
 
-When user asks to CLICK, TYPE, FILL, LOGIN, SIGNUP, or interact with ANY page element:
-
-**STEP 1: Call browser_get_elements** - This returns element IDs you need
-**STEP 2: Call browser_click_by_id / browser_fill_by_id / browser_type_by_id** with the element ID
-
-NEVER use these tools for interaction tasks:
-- browser_get_content ❌ (only returns HTML, no element IDs)
-- browser_get_markdown ❌ (only returns text, no element IDs)
-- browser_screenshot ❌ (only returns image, no element IDs)
-
-ONLY browser_get_elements provides element IDs needed for clicking!
-
-## Tool Reference
-
-### For Reading Page Content (NOT for clicking)
-- browser_get_markdown: Get page text (for reading/summarizing)
-- browser_get_content: Get raw HTML
-- browser_screenshot: Get visual image
-
-### For Interacting with Page Elements
-- browser_get_elements: **MUST call first** - returns accessibility tree with element IDs
-- browser_click_by_id: Click using element ID from snapshot
-- browser_fill_by_id: Fill form using element ID from snapshot
-- browser_type_by_id: Type text using element ID from snapshot
-
-### For Navigation
-- browser_navigate, browser_scroll, browser_wait_for
-
-## Handling Unnamed Interactive Elements
-
-After calling browser_get_elements, if the response contains unnamed_interactive_elements:
-
-1. **Call browser_screenshot** to capture the page visually
-2. **Cross-reference** each unnamed element's rect coordinates with the screenshot to determine what the element represents visually (its label, placeholder text, icon, or surrounding context)
-3. **Use browser_find_elements** to query specific elements by role/selector/position
-4. **Use browser_element_info(id)** to get full details for individual elements
-5. **Do NOT** write a natural language summary of the elements — use the tools to identify and interact with them
-
-Always confirm before taking actions that might have side effects."#;
+## Rules
+- Only interact with elements shown in the current page state [e1], [e2], etc.
+- If you don't see the target element, use browser_scroll("down") or browser_scroll("up") to find it
+- After each action, you'll automatically receive the updated page state
+- Never guess element IDs — they change after each action
+- When the task is done, respond with a summary of what you did"#;
 
         self.append_skills_section(base_prompt)
     }
@@ -1037,7 +1075,7 @@ Always confirm before taking actions that might have side effects."#;
         let base_prompt = r#"You are a powerful AI agent with full system access.
 
 You can:
-- Everything from browser mode
+- Browser automation: page state is auto-injected each turn, interact via element IDs [e1], [e2], scroll to find elements
 - Read, write, and edit local files
 - Execute bash commands
 - Use computer control (mouse, keyboard)
@@ -1046,17 +1084,7 @@ You can:
 
 Think step by step. Use tools to gather information before making changes.
 Always verify your work after making modifications.
-Ask for permission before destructive operations.
-
-## Handling Unnamed Interactive Elements
-
-After calling browser_get_elements, if the response contains unnamed_interactive_elements:
-
-1. **Call browser_screenshot** to capture the page visually
-2. **Cross-reference** each unnamed element's rect coordinates with the screenshot to determine what the element represents visually (its label, placeholder text, icon, or surrounding context)
-3. **Use browser_find_elements** to query specific elements by role/selector/position
-4. **Use browser_element_info(id)** to get full details for individual elements
-5. **Do NOT** write a natural language summary of the elements — use the tools to identify and interact with them"#;
+Ask for permission before destructive operations."#;
 
         self.append_skills_section(base_prompt)
     }
@@ -1317,7 +1345,7 @@ After calling browser_get_elements, if the response contains unnamed_interactive
         // Click by ID
         tools.push(ToolDefinition {
             name: "browser_click_by_id".into(),
-            description: "Click on an element by its ID attribute".into(),
+            description: "Click an element by its ref ID from the page state (e.g., 'e3'). Returns action result + updated page state.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1361,7 +1389,7 @@ After calling browser_get_elements, if the response contains unnamed_interactive
         // Type by ID
         tools.push(ToolDefinition {
             name: "browser_type_by_id".into(),
-            description: "Type text into an element by ID (simulates keystrokes)".into(),
+            description: "Type text into element by ref ID. Returns action result + updated page state.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1410,7 +1438,7 @@ After calling browser_get_elements, if the response contains unnamed_interactive
         // Fill by ID
         tools.push(ToolDefinition {
             name: "browser_fill_by_id".into(),
-            description: "Fill an input element with a value by ID (sets value directly)".into(),
+            description: "Fill a form field by ref ID. Returns action result + updated page state.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1504,7 +1532,7 @@ After calling browser_get_elements, if the response contains unnamed_interactive
         // Scroll
         tools.push(ToolDefinition {
             name: "browser_scroll".into(),
-            description: "Scroll the page in a direction".into(),
+            description: "Scroll page. direction: 'up' or 'down', amount: 'page', 'half', or pixel count. Returns updated page state.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1552,10 +1580,10 @@ After calling browser_get_elements, if the response contains unnamed_interactive
             }),
         });
 
-        // Get elements - REQUIRED before any page interaction
+        // Get elements (usually not needed — page state is auto-injected)
         tools.push(ToolDefinition {
             name: "browser_get_elements".into(),
-            description: "REQUIRED before clicking/typing/filling. Returns a compact summary with interactive elements and role counts. Use browser_find_elements to search and browser_element_info(id) for full details.".into(),
+            description: "Get full accessibility tree (usually not needed — page state is auto-injected). Use browser_find_elements to search and browser_element_info(id) for full details.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {

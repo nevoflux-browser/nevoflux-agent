@@ -197,7 +197,7 @@ fn create_browser_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "browser_scroll".to_string(),
-            description: "Scroll the page or an element in a specified direction".to_string(),
+            description: "Scroll page. direction: 'up' or 'down', amount: 'page', 'half', or pixel count. Returns updated page state.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -263,7 +263,7 @@ fn create_browser_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "browser_get_elements".to_string(),
-            description: "REQUIRED before any page interaction (click, type, fill). Takes an accessibility tree snapshot with element IDs needed for browser_click_by_id, browser_fill_by_id, browser_type_by_id. Use this FIRST when you need to click buttons, fill forms, or interact with page elements.".to_string(),
+            description: "Get full accessibility tree (usually not needed — page state is auto-injected). Takes an accessibility tree snapshot with element IDs.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -284,7 +284,7 @@ fn create_browser_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "browser_click_by_id".to_string(),
-            description: "Click an element by its element ID. REQUIRES browser_get_elements first to get element IDs."
+            description: "Click an element by its ref ID from the page state (e.g., 'e3'). Returns action result + updated page state."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -305,7 +305,7 @@ fn create_browser_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "browser_fill_by_id".to_string(),
-            description: "Fill a form field by its element ID. REQUIRES browser_get_elements first to get element IDs."
+            description: "Fill a form field by ref ID. Returns action result + updated page state."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -324,7 +324,7 @@ fn create_browser_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "browser_type_by_id".to_string(),
-            description: "Type text into an element by its element ID. REQUIRES browser_get_elements first to get element IDs."
+            description: "Type text into element by ref ID. Returns action result + updated page state."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -637,7 +637,7 @@ mod tests {
             .find(|t| t.name == "browser_screenshot")
             .unwrap();
 
-        assert!(screenshot.description.contains("screenshot"));
+        assert!(screenshot.description.contains("IMAGE"));
 
         let schema = &screenshot.input_schema;
         assert_eq!(schema["properties"]["full_page"]["type"], "boolean");
@@ -796,7 +796,7 @@ mod tests {
             .find(|t| t.name == "browser_get_content")
             .unwrap();
 
-        assert!(tool.description.contains("text content"));
+        assert!(tool.description.contains("READING only"));
 
         let schema = &tool.input_schema;
         assert_eq!(schema["properties"]["selector"]["type"], "string");
@@ -853,7 +853,10 @@ mod tests {
     #[test]
     fn test_browser_get_elements_tool_schema() {
         let tools = create_browser_tools();
-        let tool = tools.iter().find(|t| t.name == "browser_get_elements").unwrap();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "browser_get_elements")
+            .unwrap();
 
         assert!(tool.description.contains("accessibility tree"));
 
@@ -870,7 +873,7 @@ mod tests {
             .find(|t| t.name == "browser_click_by_id")
             .unwrap();
 
-        assert!(tool.description.contains("accessibility tree"));
+        assert!(tool.description.contains("ref ID"));
 
         let schema = &tool.input_schema;
         assert_eq!(schema["properties"]["element_id"]["type"], "string");
