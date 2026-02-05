@@ -17,7 +17,7 @@ use crate::error::{DaemonError, Result};
 use crate::trace::collector::TraceCollector;
 use crate::trace::detection::{DetectionContext, PatternEngine};
 use crate::wasm::{HostServices, WasmInstance, WasmRuntime};
-use nevoflux_protocol::{ChatMessage, StreamFormat, StreamMetadata};
+use nevoflux_protocol::{ChatMessage, PlanProposal, StreamFormat, StreamMetadata};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
@@ -78,6 +78,8 @@ pub struct AgentOutput {
     pub tool_calls: Vec<ToolCall>,
     /// Number of iterations executed.
     pub iterations: u32,
+    /// Plan proposal awaiting user confirmation.
+    pub plan_proposal: Option<PlanProposal>,
 }
 
 /// A tool call made by the agent.
@@ -208,6 +210,7 @@ impl AgentRunner {
                     continue_loop: true, // Indicate we stopped due to max iterations
                     tool_calls: all_tool_calls,
                     iterations: iteration,
+                    plan_proposal: None,
                 });
             }
 
@@ -236,6 +239,17 @@ impl AgentRunner {
                 accumulated_text.push_str(&output.text);
             }
 
+            // Check for plan proposal - pause and return to caller
+            if output.plan_proposal.is_some() {
+                return Ok(AgentOutput {
+                    text: accumulated_text,
+                    continue_loop: false,
+                    tool_calls: all_tool_calls,
+                    iterations: iteration + 1,
+                    plan_proposal: output.plan_proposal,
+                });
+            }
+
             // Convert pending tool calls to ToolCall structs
             let tool_calls: Vec<ToolCall> = output
                 .tool_calls
@@ -258,6 +272,7 @@ impl AgentRunner {
                     continue_loop: false,
                     tool_calls: all_tool_calls,
                     iterations: iteration + 1,
+                    plan_proposal: None,
                 });
             }
 
@@ -457,6 +472,7 @@ impl AgentRunner {
                     continue_loop: true,
                     tool_calls: all_tool_calls,
                     iterations: iteration,
+                    plan_proposal: None,
                 });
             }
 
@@ -490,6 +506,24 @@ impl AgentRunner {
                 accumulated_text.push_str(&output.text);
             }
 
+            // Check for plan proposal - pause, end stream, return
+            if output.plan_proposal.is_some() {
+                let metadata = StreamMetadata {
+                    total_tokens: None,
+                    duration_ms: Some(start_time.elapsed().as_millis() as u64),
+                    model: None,
+                };
+                let _ = stream_handle.end(Some(metadata)).await;
+
+                return Ok(AgentOutput {
+                    text: accumulated_text,
+                    continue_loop: false,
+                    tool_calls: all_tool_calls,
+                    iterations: iteration + 1,
+                    plan_proposal: output.plan_proposal,
+                });
+            }
+
             // Convert pending tool calls to ToolCall structs
             let tool_calls: Vec<ToolCall> = output
                 .tool_calls
@@ -520,6 +554,7 @@ impl AgentRunner {
                     continue_loop: false,
                     tool_calls: all_tool_calls,
                     iterations: iteration + 1,
+                    plan_proposal: None,
                 });
             }
 
@@ -769,6 +804,7 @@ mod tests {
                 result: None,
             }],
             iterations: 3,
+            plan_proposal: None,
         };
 
         assert_eq!(output.text, "Response text");
