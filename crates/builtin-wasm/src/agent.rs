@@ -319,7 +319,7 @@ const THINK_PLAN_GUIDANCE: &str = r#"
 
 ## Thinking and Planning
 
-You have two tools for reasoning and planning:
+You have tools for reasoning, planning, and model selection:
 
 ### think
 Use `think` to reason through problems before acting:
@@ -334,7 +334,14 @@ Use `plan` to propose a multi-step execution plan for the user to review:
 - When the task has significant consequences (file writes, system changes)
 - Include a model suggestion per step if different steps need different capabilities
 The plan will be shown to the user for approval. They may provide feedback via chat, in which case you should revise and call plan() again.
-Do NOT use plan for simple single-step tasks."#;
+Do NOT use plan for simple single-step tasks.
+
+### switch_model
+Use `switch_model` to change the active LLM provider and model during plan execution:
+- When a plan step specifies a different model, call switch_model before executing that step
+- The switch persists for the rest of the session until changed again
+- Only switch to models listed in the Available Models section
+Do NOT switch models unless a plan step explicitly requests it."#;
 
 impl<H: HostFunctions> Agent<H> {
     /// Create a new agent with the given host functions.
@@ -2271,18 +2278,21 @@ mod tests {
         assert!(chat_prompt.contains("## Thinking and Planning"));
         assert!(chat_prompt.contains("think"));
         assert!(chat_prompt.contains("plan"));
+        assert!(chat_prompt.contains("switch_model"));
 
         let browser_prompt = agent.build_system_prompt_for_mode(AgentMode::Browser);
         assert!(browser_prompt.contains("browser automation"));
         assert!(browser_prompt.contains("## Thinking and Planning"));
         assert!(browser_prompt.contains("think"));
         assert!(browser_prompt.contains("plan"));
+        assert!(browser_prompt.contains("switch_model"));
 
         let agent_prompt = agent.build_system_prompt_for_mode(AgentMode::Agent);
         assert!(agent_prompt.contains("full system access"));
         assert!(agent_prompt.contains("## Thinking and Planning"));
         assert!(agent_prompt.contains("think"));
         assert!(agent_prompt.contains("plan"));
+        assert!(agent_prompt.contains("switch_model"));
     }
 
     #[test]
