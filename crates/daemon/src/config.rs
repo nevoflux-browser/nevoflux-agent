@@ -275,11 +275,10 @@ impl LlmConfig {
         for (name, config) in &providers {
             if config.api_key.is_some() {
                 let model = config.model.clone().unwrap_or_else(|| {
-                    nevoflux_llm::default_model_for(
-                        name.parse::<nevoflux_llm::ProviderType>()
-                            .unwrap_or(nevoflux_llm::ProviderType::Anthropic),
-                    )
-                    .to_string()
+                    match name.parse::<nevoflux_llm::ProviderType>() {
+                        Ok(pt) => nevoflux_llm::default_model_for(pt).to_string(),
+                        Err(_) => name.to_string(),
+                    }
                 });
                 let is_active = active == Some(*name);
                 let suffix = if is_active { " (active)" } else { "" };

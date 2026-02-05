@@ -955,8 +955,10 @@ async fn handle_chat_message_streaming(
                     Ok(PlanResponse::Confirmed) => {
                         info!("Plan confirmed for session {}", session_id);
                         let plan_text = format_plan_as_context(proposal);
-                        // Send the confirmed plan as a stream chunk so the frontend
-                        // knows execution will proceed
+                        // TODO(phase-2): Re-run the agent with plan_text injected as
+                        // context, so the agent actually executes the confirmed plan.
+                        // Currently we just send the plan text back to the frontend.
+                        // Phase 2 will add: agent re-invocation with plan as user message.
                         let confirmed_payload = serde_json::json!({
                             "type": "stream_chunk",
                             "payload": {
