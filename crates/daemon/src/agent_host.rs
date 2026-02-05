@@ -144,6 +144,10 @@ pub struct DaemonHostFunctions {
     current_iteration: AtomicU32,
     /// Trace metadata for in-flight streaming LLM calls, keyed by stream_id.
     stream_trace_data: Arc<Mutex<HashMap<u64, StreamTraceData>>>,
+    /// Override for the active LLM provider (set via switch_model tool).
+    model_override_provider: Arc<Mutex<Option<String>>>,
+    /// Override for the active LLM model (set via switch_model tool).
+    model_override_model: Arc<Mutex<Option<String>>>,
 }
 
 impl DaemonHostFunctions {
@@ -160,6 +164,8 @@ impl DaemonHostFunctions {
             trace_collector: None,
             current_iteration: AtomicU32::new(0),
             stream_trace_data: Arc::new(Mutex::new(HashMap::new())),
+            model_override_provider: Arc::new(Mutex::new(None)),
+            model_override_model: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -330,29 +336,80 @@ impl DaemonHostFunctions {
             tools,
         }
     }
+
+    /// Resolve the active provider name, API key, and model.
+    /// Uses model override if set, otherwise falls back to config.
+    fn resolve_provider_and_model(&self) -> Result<(String, String, String), HostError> {
+        let override_provider = self.model_override_provider.lock().unwrap().clone();
+        let override_model = self.model_override_model.lock().unwrap().clone();
+
+        if let (Some(provider), Some(model)) = (override_provider, override_model) {
+            let api_key = self.get_api_key_for_provider(&provider)?;
+            Ok((provider, api_key, model))
+        } else {
+            let provider = self
+                .config
+                .llm
+                .active_provider()
+                .ok_or_else(|| HostError {
+                    code: 1,
+                    message: "No LLM provider configured".into(),
+                })?
+                .to_string();
+            let api_key = self
+                .config
+                .llm
+                .active_api_key()
+                .filter(|k| !k.is_empty())
+                .ok_or_else(|| HostError {
+                    code: 2,
+                    message: "No API key configured".into(),
+                })?
+                .to_string();
+            let model = self
+                .config
+                .llm
+                .active_model()
+                .unwrap_or("gpt-4o-mini")
+                .to_string();
+            Ok((provider, api_key, model))
+        }
+    }
+
+    /// Get API key for a specific provider from config or environment.
+    fn get_api_key_for_provider(&self, provider: &str) -> Result<String, HostError> {
+        // First check config struct for known providers
+        let key = match provider {
+            "anthropic" => self.config.llm.anthropic.api_key.as_deref(),
+            "openai" => self.config.llm.openai.api_key.as_deref(),
+            "qwen" => self.config.llm.qwen.api_key.as_deref(),
+            "deepseek" => self.config.llm.deepseek.api_key.as_deref(),
+            _ => None,
+        };
+
+        if let Some(k) = key.filter(|k| !k.is_empty()) {
+            return Ok(k.to_string());
+        }
+
+        // Fall back to environment variable
+        let pt = ProviderType::from_str(provider).map_err(|_| HostError {
+            code: 3,
+            message: format!("Invalid provider: {}", provider),
+        })?;
+        let env_var = nevoflux_llm::api_key_env_var(pt);
+        std::env::var(env_var).map_err(|_| HostError {
+            code: 2,
+            message: format!("No API key found for provider: {}", provider),
+        })
+    }
 }
 
 impl HostFunctions for DaemonHostFunctions {
     fn llm_chat(&self, request: &LlmRequest) -> HostResult<LlmResponse> {
-        // Get provider configuration
-        let provider_name = self.config.llm.active_provider().ok_or_else(|| HostError {
-            code: 1,
-            message: "No LLM provider configured".into(),
-        })?;
+        // Resolve provider (uses override if set, otherwise config)
+        let (provider_name, api_key, model) = self.resolve_provider_and_model()?;
 
-        let api_key = self
-            .config
-            .llm
-            .active_api_key()
-            .filter(|k| !k.is_empty())
-            .ok_or_else(|| HostError {
-                code: 2,
-                message: "No API key configured".into(),
-            })?;
-
-        let model = self.config.llm.active_model().unwrap_or("gpt-4o-mini");
-
-        let provider = ProviderType::from_str(provider_name).map_err(|_| HostError {
+        let provider = ProviderType::from_str(&provider_name).map_err(|_| HostError {
             code: 3,
             message: format!("Invalid provider: {}", provider_name),
         })?;
@@ -440,7 +497,7 @@ impl HostFunctions for DaemonHostFunctions {
         let runtime = self.runtime.clone();
         let result = tokio::task::block_in_place(|| {
             runtime.block_on(async {
-                execute_llm_chat(provider, api_key, model, daemon_request).await
+                execute_llm_chat(provider, &api_key, &model, daemon_request).await
             })
         });
 
@@ -508,25 +565,10 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn llm_stream_start(&self, request: &LlmRequest) -> HostResult<u64> {
-        // Get provider configuration
-        let provider_name = self.config.llm.active_provider().ok_or_else(|| HostError {
-            code: 1,
-            message: "No LLM provider configured".into(),
-        })?;
+        // Resolve provider (uses override if set, otherwise config)
+        let (provider_name, api_key, model) = self.resolve_provider_and_model()?;
 
-        let api_key = self
-            .config
-            .llm
-            .active_api_key()
-            .filter(|k| !k.is_empty())
-            .ok_or_else(|| HostError {
-                code: 2,
-                message: "No API key configured".into(),
-            })?;
-
-        let model = self.config.llm.active_model().unwrap_or("gpt-4o-mini");
-
-        let provider = ProviderType::from_str(provider_name).map_err(|_| HostError {
+        let provider = ProviderType::from_str(&provider_name).map_err(|_| HostError {
             code: 3,
             message: format!("Invalid provider: {}", provider_name),
         })?;
@@ -550,16 +592,14 @@ impl HostFunctions for DaemonHostFunctions {
 
         // Start the stream
         let registry = Arc::clone(&self.stream_registry);
-        let api_key_owned = api_key.to_string();
-        let model_owned = model.to_string();
 
         let stream_id = self
             .runtime
             .block_on(async {
                 start_llm_stream(
                     provider,
-                    &api_key_owned,
-                    &model_owned,
+                    &api_key,
+                    &model,
                     daemon_request,
                     registry,
                 )
@@ -1875,8 +1915,20 @@ impl HostFunctions for DaemonHostFunctions {
         Ok(())
     }
 
-    fn set_model_override(&self, _provider: &str, _model: &str) -> HostResult<()> {
-        Ok(()) // TODO: implement in Task 3
+    fn set_model_override(&self, provider: &str, model: &str) -> HostResult<()> {
+        // Validate provider name
+        let _provider_type = ProviderType::from_str(provider).map_err(|_| HostError {
+            code: 10,
+            message: format!("Invalid provider: {}", provider),
+        })?;
+
+        // Validate API key exists for this provider
+        self.get_api_key_for_provider(provider)?;
+
+        info!("Model override set: provider={}, model={}", provider, model);
+        *self.model_override_provider.lock().unwrap() = Some(provider.to_string());
+        *self.model_override_model.lock().unwrap() = Some(model.to_string());
+        Ok(())
     }
 }
 
@@ -1894,6 +1946,8 @@ impl DaemonHostFunctions {
             trace_collector: self.trace_collector.clone(),
             current_iteration: AtomicU32::new(self.current_iteration.load(Ordering::Relaxed)),
             stream_trace_data: self.stream_trace_data.clone(),
+            model_override_provider: self.model_override_provider.clone(),
+            model_override_model: self.model_override_model.clone(),
         }
     }
 
