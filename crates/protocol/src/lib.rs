@@ -38,9 +38,9 @@ pub use error::{ProtocolError, Result};
 // Re-export chat messages
 pub use chat::{
     AccountStatus, AgentMessage, AgentStateMessage, BrowserToolRequest, BrowserToolResponse,
-    ChatMessage, ContentBlock, ErrorMessage, PermissionRequest, PermissionResponse, PluginCommand,
-    SidebarMessage, SkillCommand, StopGeneration, StreamChunk, StreamEnd, SystemCommand,
-    SystemResponse, TabInfo,
+    ChatMessage, ContentBlock, ErrorMessage, PermissionRequest, PermissionResponse, PlanProposal,
+    PlanResponse, PlanStep, PluginCommand, SidebarMessage, SkillCommand, StopGeneration,
+    StreamChunk, StreamEnd, SystemCommand, SystemResponse, TabInfo,
 };
 
 // Re-export MCP messages

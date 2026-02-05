@@ -257,6 +257,39 @@ pub struct BrowserToolRequest {
 }
 
 // ============================================================================
+// Plan Types
+// ============================================================================
+
+/// A single step in a plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanStep {
+    /// Description of what this step does.
+    pub description: String,
+    /// Optional model override for this step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// A proposed plan with a summary and ordered steps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanProposal {
+    /// High-level summary of the plan.
+    pub summary: String,
+    /// Ordered list of steps.
+    pub steps: Vec<PlanStep>,
+}
+
+/// User response to a plan proposal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanResponse {
+    /// The user confirmed the plan.
+    Confirmed,
+    /// The user cancelled the plan.
+    Cancelled,
+}
+
+// ============================================================================
 // Tagged Message Enums (for serialization with type field)
 // ============================================================================
 
@@ -271,6 +304,7 @@ pub enum SidebarMessage {
     PluginCommand(PluginCommand),
     SystemCommand(SystemCommand),
     BrowserToolResponse(BrowserToolResponse),
+    PlanResponse(PlanResponse),
 }
 
 /// All messages from Agent to Sidebar
@@ -286,6 +320,7 @@ pub enum AgentMessage {
     AccountStatus(AccountStatus),
     SystemResponse(SystemResponse),
     BrowserToolRequest(BrowserToolRequest),
+    PlanProposal(PlanProposal),
 }
 
 #[cfg(test)]
@@ -542,5 +577,126 @@ mod tests {
         } else {
             panic!("Expected ContentBlock variant");
         }
+    }
+
+    // ====================================================================
+    // Plan types tests
+    // ====================================================================
+
+    #[test]
+    fn test_plan_step_serialization_roundtrip() {
+        let step = PlanStep {
+            description: "Navigate to the settings page".into(),
+            model: Some("gpt-4o".into()),
+        };
+
+        let json = serde_json::to_string(&step).unwrap();
+        let decoded: PlanStep = serde_json::from_str(&json).unwrap();
+        assert_eq!(step, decoded);
+    }
+
+    #[test]
+    fn test_plan_step_model_none_skipped() {
+        let step = PlanStep {
+            description: "Click the button".into(),
+            model: None,
+        };
+
+        let json = serde_json::to_string(&step).unwrap();
+        assert!(!json.contains("model"));
+
+        let decoded: PlanStep = serde_json::from_str(&json).unwrap();
+        assert_eq!(step, decoded);
+    }
+
+    #[test]
+    fn test_plan_proposal_serialization_roundtrip() {
+        let proposal = PlanProposal {
+            summary: "Automate login flow".into(),
+            steps: vec![
+                PlanStep {
+                    description: "Open browser".into(),
+                    model: None,
+                },
+                PlanStep {
+                    description: "Enter credentials".into(),
+                    model: Some("gpt-4o".into()),
+                },
+                PlanStep {
+                    description: "Click submit".into(),
+                    model: None,
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&proposal).unwrap();
+        let decoded: PlanProposal = serde_json::from_str(&json).unwrap();
+        assert_eq!(proposal, decoded);
+    }
+
+    #[test]
+    fn test_plan_proposal_empty_steps() {
+        let proposal = PlanProposal {
+            summary: "Empty plan".into(),
+            steps: vec![],
+        };
+
+        let json = serde_json::to_string(&proposal).unwrap();
+        let decoded: PlanProposal = serde_json::from_str(&json).unwrap();
+        assert_eq!(proposal, decoded);
+        assert!(decoded.steps.is_empty());
+    }
+
+    #[test]
+    fn test_plan_response_serialization() {
+        let confirmed = PlanResponse::Confirmed;
+        let json = serde_json::to_string(&confirmed).unwrap();
+        assert_eq!(json, "\"confirmed\"");
+        let decoded: PlanResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, PlanResponse::Confirmed);
+
+        let cancelled = PlanResponse::Cancelled;
+        let json = serde_json::to_string(&cancelled).unwrap();
+        assert_eq!(json, "\"cancelled\"");
+        let decoded: PlanResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, PlanResponse::Cancelled);
+    }
+
+    #[test]
+    fn test_agent_message_plan_proposal_tagged() {
+        let msg = AgentMessage::PlanProposal(PlanProposal {
+            summary: "Test plan".into(),
+            steps: vec![PlanStep {
+                description: "Step one".into(),
+                model: None,
+            }],
+        });
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"plan_proposal\""));
+        assert!(json.contains("\"payload\""));
+        assert!(json.contains("\"summary\":\"Test plan\""));
+
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, AgentMessage::PlanProposal(_)));
+    }
+
+    #[test]
+    fn test_sidebar_message_plan_response_tagged() {
+        let msg = SidebarMessage::PlanResponse(PlanResponse::Confirmed);
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"plan_response\""));
+        assert!(json.contains("\"payload\":\"confirmed\""));
+
+        let decoded: SidebarMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, SidebarMessage::PlanResponse(PlanResponse::Confirmed)));
+
+        let msg2 = SidebarMessage::PlanResponse(PlanResponse::Cancelled);
+        let json2 = serde_json::to_string(&msg2).unwrap();
+        assert!(json2.contains("\"payload\":\"cancelled\""));
+
+        let decoded2: SidebarMessage = serde_json::from_str(&json2).unwrap();
+        assert!(matches!(decoded2, SidebarMessage::PlanResponse(PlanResponse::Cancelled)));
     }
 }
