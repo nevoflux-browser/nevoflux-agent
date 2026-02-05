@@ -315,6 +315,27 @@ pub struct Agent<H: HostFunctions> {
     pending_plan: RefCell<Option<PlanProposal>>,
 }
 
+const THINK_PLAN_GUIDANCE: &str = r#"
+
+## Thinking and Planning
+
+You have two tools for reasoning and planning:
+
+### think
+Use `think` to reason through problems before acting:
+- When you receive a new task, think about the approach
+- When a tool call fails, think about why and what to try next
+- When facing multiple options, think through trade-offs
+Do NOT use think for simple, obvious actions.
+
+### plan
+Use `plan` to propose a multi-step execution plan for the user to review:
+- When a task involves 3+ steps or could go multiple directions
+- When the task has significant consequences (file writes, system changes)
+- Include a model suggestion per step if different steps need different capabilities
+The plan will be shown to the user for approval. They may provide feedback via chat, in which case you should revise and call plan() again.
+Do NOT use plan for simple single-step tasks."#;
+
 impl<H: HostFunctions> Agent<H> {
     /// Create a new agent with the given host functions.
     pub fn new(host: H) -> Self {
@@ -372,11 +393,12 @@ The following skill instructions MUST be followed exactly. These instructions ta
     /// Build system prompt for a specific mode.
     /// Note: Tab context is injected into user message to preserve API cache.
     fn build_system_prompt_for_mode(&self, mode: AgentMode) -> String {
-        match mode {
+        let prompt = match mode {
             AgentMode::Chat => self.build_chat_system_prompt(),
             AgentMode::Browser => self.build_browser_system_prompt(),
             AgentMode::Agent => self.build_agent_system_prompt(),
-        }
+        };
+        format!("{}{}", prompt, THINK_PLAN_GUIDANCE)
     }
 
     /// Get tools for a specific mode.
@@ -2194,12 +2216,21 @@ mod tests {
         // System prompts are now static (no tab context) for API cache preservation
         let chat_prompt = agent.build_system_prompt_for_mode(AgentMode::Chat);
         assert!(chat_prompt.contains("helpful AI assistant"));
+        assert!(chat_prompt.contains("## Thinking and Planning"));
+        assert!(chat_prompt.contains("think"));
+        assert!(chat_prompt.contains("plan"));
 
         let browser_prompt = agent.build_system_prompt_for_mode(AgentMode::Browser);
         assert!(browser_prompt.contains("browser automation"));
+        assert!(browser_prompt.contains("## Thinking and Planning"));
+        assert!(browser_prompt.contains("think"));
+        assert!(browser_prompt.contains("plan"));
 
         let agent_prompt = agent.build_system_prompt_for_mode(AgentMode::Agent);
         assert!(agent_prompt.contains("full system access"));
+        assert!(agent_prompt.contains("## Thinking and Planning"));
+        assert!(agent_prompt.contains("think"));
+        assert!(agent_prompt.contains("plan"));
     }
 
     #[test]
