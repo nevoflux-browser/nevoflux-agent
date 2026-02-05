@@ -9,10 +9,10 @@ use crate::trace::collector::TraceCollector;
 use crate::trace::file_writer::TraceFileWriter;
 use crate::wasm::{BrowserRequest, BrowserResponse, HostServices};
 use bytes::Bytes;
-use nevoflux_builtin_wasm::{Agent, AgentInput, AgentMode, Attachment};
-use nevoflux_protocol::{Channel, DaemonEnvelope, ProxyEnvelope};
+use nevoflux_builtin_wasm::{Agent, AgentInput, AgentMode, Attachment, Message as WasmMessage};
+use nevoflux_protocol::{AgentMessage, Channel, DaemonEnvelope, PlanProposal, PlanResponse, ProxyEnvelope};
 use nevoflux_skills::{check_tool_availability, format_missing_tools_message, ToolCheckResult};
-use nevoflux_storage::{ListSessionsParams, MessageRole};
+use nevoflux_storage::{ListSessionsParams, Message as StorageMessage, MessageRole};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -22,6 +22,10 @@ use zeromq::{Socket, SocketSend, ZmqMessage};
 /// Registry for pending browser tool requests.
 /// Maps request_id to the response sender.
 type BrowserRequestRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<BrowserResponse>>>>;
+
+/// Registry for pending plan proposals.
+/// Maps session_id to the response sender.
+type PlanRequestRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<PlanResponse>>>>;
 
 /// Registry for active streaming sessions that can be cancelled.
 /// Maps session_id to the cancellation token.
@@ -111,6 +115,9 @@ pub async fn start_server(
 
     // Create cancellation registry for active streaming sessions
     let cancellation_registry: CancellationRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+    // Create plan request registry for pending plan proposals
+    let plan_registry: PlanRequestRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     let services = HostServices::new(Arc::new(db)).with_browser_sender(browser_tx);
 
@@ -269,6 +276,7 @@ pub async fn start_server(
     let process_runtime = tokio::runtime::Handle::current();
     let process_browser_registry = browser_registry.clone();
     let process_cancellation_registry = cancellation_registry.clone();
+    let process_plan_registry = plan_registry.clone();
     let process_trace_enabled = config.trace_enabled;
     tokio::spawn(async move {
         while let Some((identity, envelope)) = msg_rx.recv().await {
@@ -370,6 +378,31 @@ pub async fn start_server(
                 }
             }
 
+            // Check for PlanResponse messages from frontend
+            if msg_type == "plan_response" {
+                info!("Processing plan_response message");
+                if let Some(payload) = envelope.payload.get("payload") {
+                    // PlanResponse serializes as a bare string ("confirmed"/"cancelled"),
+                    // so session_id must be extracted from the envelope payload level,
+                    // not from within the PlanResponse value itself.
+                    let session_id = envelope
+                        .payload
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    if let Ok(response) = serde_json::from_value::<PlanResponse>(payload.clone()) {
+                        if let Some(tx) = process_plan_registry.lock().await.remove(&session_id) {
+                            let _ = tx.send(response);
+                        } else {
+                            warn!("No pending plan request for session: {}", session_id);
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Register proxy if not already registered (pid 0 for native messaging)
             if !process_router.proxy_registry().is_registered(&proxy_id) {
                 process_router.proxy_registry().register(&proxy_id, 0);
@@ -408,6 +441,7 @@ pub async fn start_server(
                     let runtime = process_runtime.clone();
                     let response_tx = process_response_tx.clone();
                     let cancellation_registry = process_cancellation_registry.clone();
+                    let plan_registry = process_plan_registry.clone();
                     let trace_enabled = process_trace_enabled;
                     tokio::spawn(async move {
                         handle_chat_message_streaming(
@@ -422,6 +456,7 @@ pub async fn start_server(
                             channel,
                             response_tx,
                             cancellation_registry,
+                            plan_registry,
                             trace_enabled,
                         )
                         .await;
@@ -446,6 +481,48 @@ pub async fn start_server(
     })
 }
 
+/// Convert storage messages to wasm messages for the agent history.
+fn convert_history_messages(messages: Vec<StorageMessage>) -> Vec<WasmMessage> {
+    messages
+        .into_iter()
+        .filter_map(|msg| match msg.role {
+            MessageRole::User => Some(WasmMessage::user(msg.content)),
+            MessageRole::Assistant => Some(WasmMessage::assistant(msg.content)),
+            MessageRole::System => None,
+        })
+        .collect()
+}
+
+/// Load session history messages for the agent.
+///
+/// Retrieves all messages from the session, removes the last one (which is the
+/// current user message just saved), and truncates to `max_messages` most recent.
+async fn load_session_history(
+    session_manager: &SessionManager,
+    session_id: &str,
+    max_messages: u32,
+) -> Vec<WasmMessage> {
+    match session_manager.get_messages(session_id).await {
+        Ok(mut messages) => {
+            // Remove the last message (the current user message we just saved)
+            if !messages.is_empty() {
+                messages.pop();
+            }
+            // Keep only the most recent max_messages
+            let len = messages.len();
+            let max = max_messages as usize;
+            if len > max {
+                messages = messages.split_off(len - max);
+            }
+            convert_history_messages(messages)
+        }
+        Err(e) => {
+            warn!("Failed to load session history for {}: {}", session_id, e);
+            vec![]
+        }
+    }
+}
+
 /// Handle chat channel messages with streaming support.
 ///
 /// This function processes chat messages and streams the response back to the sidebar
@@ -463,6 +540,7 @@ async fn handle_chat_message_streaming(
     channel: Channel,
     response_tx: mpsc::Sender<(Vec<u8>, DaemonEnvelope)>,
     cancellation_registry: CancellationRegistry,
+    plan_registry: PlanRequestRegistry,
     trace_enabled: bool,
 ) {
     let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -715,7 +793,12 @@ async fn handle_chat_message_streaming(
         session_id: session_id.clone(),
         mode,
         user_message: message_content.to_string(),
-        history: vec![], // TODO: Load history from session
+        history: load_session_history(
+            session_manager,
+            &session_id,
+            config.daemon.context.max_history_messages,
+        )
+        .await,
         attachments,
         local_files,
         custom_system_prompt: None, // Use default mode-based prompt
@@ -844,6 +927,98 @@ async fn handle_chat_message_streaming(
     // Handle agent result
     match agent_result {
         Ok(Ok(output)) => {
+            // Handle plan proposal if present
+            if let Some(proposal) = &output.plan_proposal {
+                info!("Agent returned plan proposal for session {}", session_id);
+
+                // Register oneshot channel BEFORE sending proposal to frontend
+                // to avoid race condition if frontend responds very quickly
+                let (plan_tx, plan_rx) = oneshot::channel();
+                plan_registry
+                    .lock()
+                    .await
+                    .insert(session_id.clone(), plan_tx);
+
+                // Send proposal to frontend
+                let msg = AgentMessage::PlanProposal(proposal.clone());
+                let payload = serde_json::to_value(&msg).unwrap();
+                let envelope = DaemonEnvelope::new(&proxy_id, channel, payload)
+                    .with_request_id(&request_id);
+                if let Err(e) = response_tx
+                    .send((identity.clone(), envelope))
+                    .await
+                {
+                    error!("Failed to send plan proposal: {}", e);
+                }
+
+                match plan_rx.await {
+                    Ok(PlanResponse::Confirmed) => {
+                        info!("Plan confirmed for session {}", session_id);
+                        let plan_text = format_plan_as_context(proposal);
+                        // Send the confirmed plan as a stream chunk so the frontend
+                        // knows execution will proceed
+                        let confirmed_payload = serde_json::json!({
+                            "type": "stream_chunk",
+                            "payload": {
+                                "content": plan_text,
+                                "done": true
+                            }
+                        });
+                        let response = DaemonEnvelope::new(
+                            &proxy_id,
+                            channel,
+                            confirmed_payload,
+                        )
+                        .with_request_id(&request_id);
+                        if let Err(e) = response_tx.send((identity, response)).await {
+                            error!("Failed to send plan confirmation response: {}", e);
+                        }
+                    }
+                    Ok(PlanResponse::Cancelled) => {
+                        info!("Plan cancelled for session {}", session_id);
+                        let cancel_payload = serde_json::json!({
+                            "type": "stream_chunk",
+                            "payload": {
+                                "content": "Plan cancelled by user.",
+                                "done": true
+                            }
+                        });
+                        let response = DaemonEnvelope::new(
+                            &proxy_id,
+                            channel,
+                            cancel_payload,
+                        )
+                        .with_request_id(&request_id);
+                        if let Err(e) = response_tx.send((identity, response)).await {
+                            error!("Failed to send plan cancellation response: {}", e);
+                        }
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Plan response channel dropped for session {}, treating as cancelled",
+                            session_id
+                        );
+                        let cancel_payload = serde_json::json!({
+                            "type": "stream_chunk",
+                            "payload": {
+                                "content": "Plan cancelled (connection lost).",
+                                "done": true
+                            }
+                        });
+                        let response = DaemonEnvelope::new(
+                            &proxy_id,
+                            channel,
+                            cancel_payload,
+                        )
+                        .with_request_id(&request_id);
+                        if let Err(e) = response_tx.send((identity, response)).await {
+                            error!("Failed to send plan drop response: {}", e);
+                        }
+                    }
+                }
+                return;
+            }
+
             // Save assistant response to database
             let final_text = if output.text.is_empty() {
                 accumulated_text
@@ -935,6 +1110,20 @@ async fn handle_chat_message_streaming(
             }
         }
     }
+}
+
+/// Format a plan proposal as context text for the agent.
+fn format_plan_as_context(proposal: &PlanProposal) -> String {
+    let mut text = format!("Approved plan: {}\n\n", proposal.summary);
+    for (i, step) in proposal.steps.iter().enumerate() {
+        text.push_str(&format!("{}. {}", i + 1, step.description));
+        if let Some(model) = &step.model {
+            text.push_str(&format!(" [model: {}]", model));
+        }
+        text.push('\n');
+    }
+    text.push_str("\nExecute this plan now.");
+    text
 }
 
 /// Handle chat channel messages using the Agent (non-streaming).
@@ -1219,7 +1408,12 @@ async fn handle_chat_message(
                 session_id: session_id.clone(),
                 mode,
                 user_message,
-                history: vec![], // TODO: Load history from session
+                history: load_session_history(
+                    session_manager,
+                    &session_id,
+                    config.daemon.context.max_history_messages,
+                )
+                .await,
                 attachments,
                 local_files,
                 custom_system_prompt: None, // Use default mode-based prompt
