@@ -710,6 +710,28 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
                 "Plan submitted for user review.".to_string()
             }
+            "switch_model" => {
+                let provider = tool_call.arguments["provider"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                let model = tool_call.arguments["model"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+
+                if provider.is_empty() || model.is_empty() {
+                    r#"{"error":"provider and model are required"}"#.to_string()
+                } else {
+                    match self.host.set_model_override(&provider, &model) {
+                        Ok(()) => format!(
+                            r#"{{"status":"ok","provider":"{}","model":"{}"}}"#,
+                            provider, model
+                        ),
+                        Err(e) => format!(r#"{{"error":"{}"}}"#, e.message),
+                    }
+                }
+            }
             "web_search" => {
                 let query = tool_call.arguments["query"].as_str().unwrap_or("");
                 self.host.tool_web_search(query)?
@@ -1294,6 +1316,24 @@ Ask for permission before destructive operations."#;
                         }
                     },
                     "required": ["summary", "steps"]
+                }),
+            },
+            ToolDefinition {
+                name: "switch_model".into(),
+                description: "Switch the active LLM provider and model for subsequent operations. Use this when executing plan steps that specify a different model.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "provider": {
+                            "type": "string",
+                            "description": "Provider name (e.g., 'anthropic', 'openai', 'deepseek')"
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Model name (e.g., 'claude-sonnet-4-20250514', 'gpt-4o')"
+                        }
+                    },
+                    "required": ["provider", "model"]
                 }),
             },
             ToolDefinition {

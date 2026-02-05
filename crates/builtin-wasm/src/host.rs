@@ -368,6 +368,9 @@ pub trait HostFunctions {
     /// Called by the agent loop after incrementing its iteration count so the
     /// host can associate LLM call traces with the correct iteration number.
     fn set_iteration(&self, iteration: u32) -> HostResult<()>;
+
+    /// Override the active LLM provider and model for subsequent calls.
+    fn set_model_override(&self, provider: &str, model: &str) -> HostResult<()>;
 }
 
 /// Mock host functions for testing.
@@ -829,6 +832,10 @@ impl HostFunctions for MockHostFunctions {
     }
 
     fn set_iteration(&self, _iteration: u32) -> HostResult<()> {
+        Ok(())
+    }
+
+    fn set_model_override(&self, _provider: &str, _model: &str) -> HostResult<()> {
         Ok(())
     }
 }

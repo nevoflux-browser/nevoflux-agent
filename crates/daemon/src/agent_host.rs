@@ -1874,6 +1874,10 @@ impl HostFunctions for DaemonHostFunctions {
         self.current_iteration.store(iteration, Ordering::Relaxed);
         Ok(())
     }
+
+    fn set_model_override(&self, _provider: &str, _model: &str) -> HostResult<()> {
+        Ok(()) // TODO: implement in Task 3
+    }
 }
 
 impl DaemonHostFunctions {
