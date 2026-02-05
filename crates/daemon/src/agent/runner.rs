@@ -274,9 +274,7 @@ impl AgentRunner {
                         let params_summary =
                             extract_tool_params_summary(&pending.name, &pending.arguments);
                         let (success, err_code, err_msg) = match &result.error {
-                            Some(err) => {
-                                (false, Some("TOOL_ERROR".to_string()), Some(err.clone()))
-                            }
+                            Some(err) => (false, Some("TOOL_ERROR".to_string()), Some(err.clone())),
                             None => (true, None, None),
                         };
                         tc.record_tool_exec(
@@ -305,9 +303,7 @@ impl AgentRunner {
                 }
 
                 // Pattern detection - check for anomalous patterns
-                if let (Some(tc), Some(engine)) =
-                    (&self.trace_collector, &self.pattern_engine)
-                {
+                if let (Some(tc), Some(engine)) = (&self.trace_collector, &self.pattern_engine) {
                     let recent = tc.recent_tool_spans(&input.session_id, 10);
                     let ctx = DetectionContext {
                         session_id: &input.session_id,
@@ -349,6 +345,7 @@ impl AgentRunner {
                     text: format!("Agent processed: {}", text),
                     tool_calls: vec![],
                     complete: true,
+                    plan_proposal: None,
                 })
             }
             AgentContent::ToolResults { results } => {
@@ -370,6 +367,7 @@ impl AgentRunner {
                     text: format!("Tool results: {}", result_summary.join(", ")),
                     tool_calls: vec![],
                     complete: true,
+                    plan_proposal: None,
                 })
             }
         }
@@ -538,9 +536,7 @@ impl AgentRunner {
                         let params_summary =
                             extract_tool_params_summary(&pending.name, &pending.arguments);
                         let (success, err_code, err_msg) = match &result.error {
-                            Some(err) => {
-                                (false, Some("TOOL_ERROR".to_string()), Some(err.clone()))
-                            }
+                            Some(err) => (false, Some("TOOL_ERROR".to_string()), Some(err.clone())),
                             None => (true, None, None),
                         };
                         tc.record_tool_exec(
@@ -569,9 +565,7 @@ impl AgentRunner {
                 }
 
                 // Pattern detection - check for anomalous patterns
-                if let (Some(tc), Some(engine)) =
-                    (&self.trace_collector, &self.pattern_engine)
-                {
+                if let (Some(tc), Some(engine)) = (&self.trace_collector, &self.pattern_engine) {
                     let recent = tc.recent_tool_spans(&input.session_id, 10);
                     let ctx = DetectionContext {
                         session_id: &input.session_id,

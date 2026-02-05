@@ -102,6 +102,7 @@ fn test_agent_process_output_serialization() {
         text: "I'll help you with that.".into(),
         tool_calls: vec![],
         complete: true,
+        plan_proposal: None,
     };
 
     let json = serde_json::to_string(&output).unwrap();
@@ -346,6 +347,7 @@ fn test_agent_process_output_with_tool_calls() {
             arguments: serde_json::json!({"path": "/tmp/test.txt"}),
         }],
         complete: false,
+        plan_proposal: None,
     };
 
     let json = serde_json::to_string(&output).unwrap();

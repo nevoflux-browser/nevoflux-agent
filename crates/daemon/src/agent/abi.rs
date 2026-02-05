@@ -4,6 +4,7 @@
 //! the host (daemon) and guest (Wasm agent). It includes constants for function
 //! names, data structures for input/output, and result codes.
 
+use nevoflux_protocol::PlanProposal;
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -135,6 +136,9 @@ pub struct AgentProcessOutput {
     pub tool_calls: Vec<PendingToolCall>,
     /// Whether the agent has completed processing.
     pub complete: bool,
+    /// Optional plan proposal for multi-step tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_proposal: Option<PlanProposal>,
 }
 
 /// A pending tool call requested by the agent.
@@ -265,6 +269,7 @@ mod tests {
                 }),
             }],
             complete: false,
+            plan_proposal: None,
         };
 
         let json = serde_json::to_string(&output).unwrap();
@@ -340,5 +345,77 @@ mod tests {
         assert_eq!(ABI_VERSION_FUNC, "get_abi_version");
         assert_eq!(ALLOC_FUNC, "alloc");
         assert_eq!(FREE_FUNC, "free");
+    }
+
+    #[test]
+    fn test_agent_process_output_with_plan_proposal() {
+        use nevoflux_protocol::PlanStep;
+
+        let proposal = PlanProposal {
+            summary: "Refactor the login module".to_string(),
+            steps: vec![
+                PlanStep {
+                    description: "Extract validation logic".to_string(),
+                    model: None,
+                },
+                PlanStep {
+                    description: "Add unit tests".to_string(),
+                    model: Some("claude-opus-4-5-20251101".to_string()),
+                },
+            ],
+        };
+
+        let output = AgentProcessOutput {
+            text: "Here is my plan.".to_string(),
+            tool_calls: vec![],
+            complete: false,
+            plan_proposal: Some(proposal.clone()),
+        };
+
+        // Verify serialization roundtrip
+        let json = serde_json::to_string(&output).unwrap();
+        let deserialized: AgentProcessOutput = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.text, "Here is my plan.");
+        assert!(!deserialized.complete);
+        assert!(deserialized.tool_calls.is_empty());
+
+        let plan = deserialized.plan_proposal.expect("plan_proposal should be Some");
+        assert_eq!(plan.summary, "Refactor the login module");
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].description, "Extract validation logic");
+        assert!(plan.steps[0].model.is_none());
+        assert_eq!(plan.steps[1].description, "Add unit tests");
+        assert_eq!(
+            plan.steps[1].model.as_deref(),
+            Some("claude-opus-4-5-20251101")
+        );
+
+        // Verify "plan_proposal" appears in JSON
+        assert!(json.contains("plan_proposal"));
+    }
+
+    #[test]
+    fn test_agent_process_output_without_plan_proposal() {
+        let output = AgentProcessOutput {
+            text: "Done.".to_string(),
+            tool_calls: vec![],
+            complete: true,
+            plan_proposal: None,
+        };
+
+        let json = serde_json::to_string(&output).unwrap();
+
+        // Verify "plan_proposal" does NOT appear in JSON (skip_serializing_if)
+        assert!(
+            !json.contains("plan_proposal"),
+            "plan_proposal should be omitted from JSON when None"
+        );
+
+        // Verify roundtrip still works
+        let deserialized: AgentProcessOutput = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.text, "Done.");
+        assert!(deserialized.complete);
+        assert!(deserialized.plan_proposal.is_none());
     }
 }
