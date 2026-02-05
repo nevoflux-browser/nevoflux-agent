@@ -663,6 +663,24 @@ mod tests {
     }
 
     #[test]
+    fn test_plan_response_confirmed_serialization() {
+        let response = PlanResponse::Confirmed;
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(json, "\"confirmed\"");
+        let decoded: PlanResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, PlanResponse::Confirmed);
+    }
+
+    #[test]
+    fn test_plan_response_cancelled_serialization() {
+        let response = PlanResponse::Cancelled;
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(json, "\"cancelled\"");
+        let decoded: PlanResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, PlanResponse::Cancelled);
+    }
+
+    #[test]
     fn test_agent_message_plan_proposal_tagged() {
         let msg = AgentMessage::PlanProposal(PlanProposal {
             summary: "Test plan".into(),
@@ -690,13 +708,19 @@ mod tests {
         assert!(json.contains("\"payload\":\"confirmed\""));
 
         let decoded: SidebarMessage = serde_json::from_str(&json).unwrap();
-        assert!(matches!(decoded, SidebarMessage::PlanResponse(PlanResponse::Confirmed)));
+        assert!(matches!(
+            decoded,
+            SidebarMessage::PlanResponse(PlanResponse::Confirmed)
+        ));
 
         let msg2 = SidebarMessage::PlanResponse(PlanResponse::Cancelled);
         let json2 = serde_json::to_string(&msg2).unwrap();
         assert!(json2.contains("\"payload\":\"cancelled\""));
 
         let decoded2: SidebarMessage = serde_json::from_str(&json2).unwrap();
-        assert!(matches!(decoded2, SidebarMessage::PlanResponse(PlanResponse::Cancelled)));
+        assert!(matches!(
+            decoded2,
+            SidebarMessage::PlanResponse(PlanResponse::Cancelled)
+        ));
     }
 }

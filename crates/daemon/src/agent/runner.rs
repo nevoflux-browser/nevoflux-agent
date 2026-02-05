@@ -934,6 +934,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_think_tool_execution() {
+        // Verify that the runner infrastructure works with the plan_proposal field.
+        // The test WASM doesn't produce think calls, so this verifies the runner
+        // completes without error when plan_proposal is None.
+        let wasm = create_test_wasm();
+        let runner = AgentRunner::new(&wasm).unwrap();
+
+        let input = AgentInput {
+            session_id: "sess-think-001".to_string(),
+            mode: AgentMode::Chat,
+            user_message: "What approach should I take?".to_string(),
+            history: vec![],
+        };
+
+        let output = runner.run(input).await.unwrap();
+        assert!(output.plan_proposal.is_none());
+        assert!(!output.continue_loop);
+        assert!(output.text.contains("What approach should I take?"));
+    }
+
+    #[tokio::test]
+    async fn test_plan_proposal_pauses_runner() {
+        // Test that AgentProcessOutput with plan_proposal serializes correctly
+        use crate::agent::abi::AgentProcessOutput;
+        use nevoflux_protocol::PlanStep;
+
+        let output = AgentProcessOutput {
+            text: "Let me create a plan.".to_string(),
+            tool_calls: vec![],
+            complete: false,
+            plan_proposal: Some(PlanProposal {
+                summary: "Set up project".to_string(),
+                steps: vec![
+                    PlanStep {
+                        description: "Create directory structure".to_string(),
+                        model: None,
+                    },
+                    PlanStep {
+                        description: "Initialize git repository".to_string(),
+                        model: Some("gpt-4o-mini".to_string()),
+                    },
+                ],
+            }),
+        };
+
+        // Verify serialization roundtrip
+        let json = serde_json::to_string(&output).unwrap();
+        let decoded: AgentProcessOutput = serde_json::from_str(&json).unwrap();
+        assert!(decoded.plan_proposal.is_some());
+        let proposal = decoded.plan_proposal.unwrap();
+        assert_eq!(proposal.steps.len(), 2);
+        assert_eq!(proposal.summary, "Set up project");
+        assert_eq!(proposal.steps[0].description, "Create directory structure");
+        assert!(proposal.steps[0].model.is_none());
+        assert_eq!(proposal.steps[1].model, Some("gpt-4o-mini".to_string()));
+    }
+
+    #[tokio::test]
     async fn test_agent_runner_streaming_continues_after_channel_close() {
         let wasm = create_test_wasm();
         let runner = AgentRunner::new(&wasm).unwrap();

@@ -2809,6 +2809,7 @@ async fn gather_available_tools(services: &HostServices) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nevoflux_protocol::PlanStep;
 
     #[test]
     fn test_server_config_default() {
@@ -2825,6 +2826,46 @@ mod tests {
         assert!(port.is_ok());
         let port = port.unwrap();
         assert!(port >= 19500 && port <= 19600);
+    }
+
+    #[test]
+    fn test_format_plan_as_context() {
+        let proposal = PlanProposal {
+            summary: "Deploy the application".to_string(),
+            steps: vec![
+                PlanStep {
+                    description: "Build the project".to_string(),
+                    model: None,
+                },
+                PlanStep {
+                    description: "Run tests".to_string(),
+                    model: Some("gpt-4o".to_string()),
+                },
+                PlanStep {
+                    description: "Deploy to production".to_string(),
+                    model: None,
+                },
+            ],
+        };
+
+        let text = format_plan_as_context(&proposal);
+        assert!(text.contains("Approved plan: Deploy the application"));
+        assert!(text.contains("1. Build the project"));
+        assert!(text.contains("2. Run tests [model: gpt-4o]"));
+        assert!(text.contains("3. Deploy to production"));
+        assert!(text.contains("Execute this plan now."));
+    }
+
+    #[test]
+    fn test_format_plan_as_context_empty_steps() {
+        let proposal = PlanProposal {
+            summary: "Empty plan".to_string(),
+            steps: vec![],
+        };
+
+        let text = format_plan_as_context(&proposal);
+        assert!(text.contains("Approved plan: Empty plan"));
+        assert!(text.contains("Execute this plan now."));
     }
 
     #[tokio::test]
