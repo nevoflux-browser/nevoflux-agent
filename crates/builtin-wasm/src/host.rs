@@ -575,6 +575,7 @@ impl HostFunctions for MockHostFunctions {
             text: format!("Chat response to: {}", input.user_message),
             tool_calls: vec![],
             continue_loop: false,
+            plan_proposal: None,
         })
     }
 
@@ -583,6 +584,7 @@ impl HostFunctions for MockHostFunctions {
             text: format!("Browser response to: {}", input.user_message),
             tool_calls: vec![],
             continue_loop: false,
+            plan_proposal: None,
         })
     }
 
@@ -591,6 +593,7 @@ impl HostFunctions for MockHostFunctions {
             text: format!("Agent response to: {}", input.user_message),
             tool_calls: vec![],
             continue_loop: false,
+            plan_proposal: None,
         })
     }
 

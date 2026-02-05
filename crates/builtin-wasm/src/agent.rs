@@ -8,7 +8,7 @@
 
 use crate::host::{HostFunctions, HostResult};
 use crate::types::*;
-use nevoflux_protocol::LocalFileRef;
+use nevoflux_protocol::{LocalFileRef, PlanProposal, PlanStep};
 use std::cell::RefCell;
 
 /// Format local file references for injection into user message.
@@ -311,6 +311,8 @@ pub struct Agent<H: HostFunctions> {
     elements_cache: RefCell<Option<ElementsCache>>,
     /// Cached screenshot base64 from browser_screenshot (consumed once per call).
     screenshot_cache: RefCell<Option<String>>,
+    /// Pending plan proposal from the plan tool (consumed by run_loop to break out).
+    pending_plan: RefCell<Option<PlanProposal>>,
 }
 
 impl<H: HostFunctions> Agent<H> {
@@ -321,6 +323,7 @@ impl<H: HostFunctions> Agent<H> {
             config: AgentConfig::default(),
             elements_cache: RefCell::new(None),
             screenshot_cache: RefCell::new(None),
+            pending_plan: RefCell::new(None),
         }
     }
 
@@ -331,6 +334,7 @@ impl<H: HostFunctions> Agent<H> {
             config,
             elements_cache: RefCell::new(None),
             screenshot_cache: RefCell::new(None),
+            pending_plan: RefCell::new(None),
         }
     }
 
@@ -533,6 +537,21 @@ The following skill instructions MUST be followed exactly. These instructions ta
             if self.host.is_interrupted()? {
                 break;
             }
+
+            // Check if a plan was proposed — break out and return to runner
+            if let Some(proposal) = self.pending_plan.borrow_mut().take() {
+                // Signal end of stream if streaming was enabled
+                if self.config.use_streaming && !self.config.suppress_streaming {
+                    let _ = self.host.stream_end();
+                }
+
+                return Ok(AgentOutput {
+                    text: final_text,
+                    tool_calls: all_tool_calls,
+                    continue_loop: false,
+                    plan_proposal: Some(proposal),
+                });
+            }
         }
 
         // Signal end of stream if streaming was enabled
@@ -544,6 +563,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             text: final_text,
             tool_calls: all_tool_calls,
             continue_loop: false,
+            plan_proposal: None,
         })
     }
 
@@ -635,6 +655,27 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 // Think tool: no side effects, just returns acknowledgment.
                 // The thought content is recorded in trace via the tool_call arguments.
                 r#"{"status":"ok"}"#.to_string()
+            }
+            "plan" => {
+                let summary = tool_call.arguments["summary"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                let steps: Vec<PlanStep> = tool_call.arguments["steps"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|s| PlanStep {
+                                description: s["description"].as_str().unwrap_or("").to_string(),
+                                model: s["model"].as_str().map(|m| m.to_string()),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                *self.pending_plan.borrow_mut() = Some(PlanProposal { summary, steps });
+
+                "Plan submitted for user review.".to_string()
             }
             "web_search" => {
                 let query = tool_call.arguments["query"].as_str().unwrap_or("");
@@ -993,7 +1034,9 @@ The following skill instructions MUST be followed exactly. These instructions ta
         tab_id: Option<i64>,
     ) -> String {
         // 1. Wait for page stability (ignore errors — best effort)
-        let _ = self.host.browser_wait_for_stable(wait_strategy, 3000, tab_id);
+        let _ = self
+            .host
+            .browser_wait_for_stable(wait_strategy, 3000, tab_id);
 
         // 2. Take viewport snapshot
         let snapshot_text = self.get_viewport_snapshot_text(tab_id);
@@ -1001,7 +1044,10 @@ The following skill instructions MUST be followed exactly. These instructions ta
         if snapshot_text.is_empty() {
             action_result.to_string()
         } else {
-            format!("{}\n\nCurrent page state:\n{}", action_result, snapshot_text)
+            format!(
+                "{}\n\nCurrent page state:\n{}",
+                action_result, snapshot_text
+            )
         }
     }
 
@@ -1183,6 +1229,38 @@ Ask for permission before destructive operations."#;
                         }
                     },
                     "required": ["thought"]
+                }),
+            },
+            ToolDefinition {
+                name: "plan".into(),
+                description: "Create an execution plan for the user to review and approve. The plan will be displayed in the sidebar. The user can provide feedback via chat to request changes, and you should revise and call plan() again. Use this for multi-step tasks.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "summary": {
+                            "type": "string",
+                            "description": "Brief overview of what the plan accomplishes"
+                        },
+                        "steps": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "description": {
+                                        "type": "string",
+                                        "description": "What this step does"
+                                    },
+                                    "model": {
+                                        "type": "string",
+                                        "description": "Optional: suggested model for this step"
+                                    }
+                                },
+                                "required": ["description"]
+                            },
+                            "description": "Ordered list of steps"
+                        }
+                    },
+                    "required": ["summary", "steps"]
                 }),
             },
             ToolDefinition {
@@ -1408,7 +1486,9 @@ Ask for permission before destructive operations."#;
         // Type by ID
         tools.push(ToolDefinition {
             name: "browser_type_by_id".into(),
-            description: "Type text into element by ref ID. Returns action result + updated page state.".into(),
+            description:
+                "Type text into element by ref ID. Returns action result + updated page state."
+                    .into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1457,7 +1537,8 @@ Ask for permission before destructive operations."#;
         // Fill by ID
         tools.push(ToolDefinition {
             name: "browser_fill_by_id".into(),
-            description: "Fill a form field by ref ID. Returns action result + updated page state.".into(),
+            description: "Fill a form field by ref ID. Returns action result + updated page state."
+                .into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {

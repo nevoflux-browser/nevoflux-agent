@@ -2,7 +2,7 @@
 //!
 //! These types are serialized via MessagePack for efficient transfer.
 
-use nevoflux_protocol::LocalFileRef;
+use nevoflux_protocol::{LocalFileRef, PlanProposal};
 use serde::{Deserialize, Serialize};
 
 /// Information about a browser tab.
@@ -281,6 +281,12 @@ pub struct AgentOutput {
     pub tool_calls: Vec<ToolCall>,
     /// Whether the agent loop should continue.
     pub continue_loop: bool,
+    /// Optional plan proposal for multi-step tasks.
+    ///
+    /// When the agent calls the `plan` tool, the proposed plan is returned here
+    /// so the runner can pause execution and wait for user confirmation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_proposal: Option<PlanProposal>,
 }
 
 /// Skill summary (from skill_list).
@@ -465,6 +471,7 @@ mod tests {
             call_id: None,
             name: "bash".into(),
             arguments: serde_json::json!({"command": "ls -la"}),
+            signature: None,
         };
         assert_eq!(call.name, "bash");
     }
@@ -561,6 +568,7 @@ mod tests {
             text: "Here's my response".into(),
             tool_calls: vec![],
             continue_loop: false,
+            plan_proposal: None,
         };
         assert!(!output.continue_loop);
     }
@@ -829,9 +837,21 @@ mod tests {
             custom_system_prompt: None,
             tab_id: Some(1),
             tab_ids: vec![
-                TabInfo { space: "Work".into(), tab_id: 1, tab_title: "GitHub".into() },
-                TabInfo { space: "Work".into(), tab_id: 2, tab_title: "Docs".into() },
-                TabInfo { space: "Personal".into(), tab_id: 3, tab_title: "Email".into() },
+                TabInfo {
+                    space: "Work".into(),
+                    tab_id: 1,
+                    tab_title: "GitHub".into(),
+                },
+                TabInfo {
+                    space: "Work".into(),
+                    tab_id: 2,
+                    tab_title: "Docs".into(),
+                },
+                TabInfo {
+                    space: "Personal".into(),
+                    tab_id: 3,
+                    tab_title: "Email".into(),
+                },
             ],
             skill_context: None,
         };
