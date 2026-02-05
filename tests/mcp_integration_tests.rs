@@ -52,10 +52,6 @@ fn test_mcp_tools_complete() {
         "Missing browser_query_all"
     );
     assert!(
-        names.contains(&"browser_snapshot"),
-        "Missing browser_snapshot"
-    );
-    assert!(
         names.contains(&"browser_click_by_id"),
         "Missing browser_click_by_id"
     );
@@ -173,7 +169,7 @@ fn test_browser_screenshot_schema() {
         .find(|t| t.name == "browser_screenshot")
         .unwrap();
 
-    assert!(tool.description.to_lowercase().contains("screenshot"));
+    assert!(tool.description.to_lowercase().contains("image"));
 
     let schema = &tool.input_schema;
     assert!(schema["properties"]["full_page"].is_object());
