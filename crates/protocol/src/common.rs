@@ -139,6 +139,23 @@ pub enum BrowserToolAction {
     FillById,
     TypeById,
     GetMarkdown,
+    /// Wait for page to stabilize after an action.
+    ///
+    /// Params:
+    /// - `strategy`: "navigation" | "interaction" | "scroll"
+    /// - `maxWait`: Optional max wait time in ms (default 3000)
+    ///
+    /// Returns:
+    /// - `stable`: boolean
+    /// - `strategy`: which strategy was used
+    /// - `duration_ms`: how long it took to stabilize
+    WaitForStable,
+    /// Press a keyboard key (keydown + keyup).
+    ///
+    /// Params:
+    /// - `key`: Key name (e.g., "Enter", "Tab", "Escape")
+    /// - `modifiers`: Optional array of modifiers (e.g., ["Ctrl", "Shift"])
+    KeyPress,
     /// Fetch URL content and save to cache file.
     ///
     /// Params:
