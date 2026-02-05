@@ -631,6 +631,11 @@ The following skill instructions MUST be followed exactly. These instructions ta
     /// Execute a single tool call.
     fn execute_tool(&self, tool_call: &ToolCall) -> HostResult<ToolResult> {
         let content = match tool_call.name.as_str() {
+            "think" => {
+                // Think tool: no side effects, just returns acknowledgment.
+                // The thought content is recorded in trace via the tool_call arguments.
+                r#"{"status":"ok"}"#.to_string()
+            }
             "web_search" => {
                 let query = tool_call.arguments["query"].as_str().unwrap_or("");
                 self.host.tool_web_search(query)?
@@ -1166,6 +1171,20 @@ Ask for permission before destructive operations."#;
     /// Get available tools for chat mode.
     fn get_chat_tools(&self) -> Vec<ToolDefinition> {
         vec![
+            ToolDefinition {
+                name: "think".into(),
+                description: "Use this tool to think through problems step by step before acting. Analyze the situation, reason about the best approach, reflect on results, or plan your next move. This tool has no side effects - it simply records your thought process.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "thought": {
+                            "type": "string",
+                            "description": "Your thought process, reasoning, or analysis"
+                        }
+                    },
+                    "required": ["thought"]
+                }),
+            },
             ToolDefinition {
                 name: "web_search".into(),
                 description: "Search the web for information".into(),
