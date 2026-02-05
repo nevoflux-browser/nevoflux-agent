@@ -790,6 +790,9 @@ async fn handle_chat_message_streaming(
     // Create agent with host functions
     let agent = Agent::new(host);
 
+    // Clone tab_ids for potential plan re-run (before move into AgentInput)
+    let tab_ids_for_rerun = tab_ids.clone();
+
     // Build agent input
     let input = AgentInput {
         session_id: session_id.clone(),
@@ -953,23 +956,218 @@ async fn handle_chat_message_streaming(
 
                 match plan_rx.await {
                     Ok(PlanResponse::Confirmed) => {
-                        info!("Plan confirmed for session {}", session_id);
+                        info!(
+                            "Plan confirmed for session {}, re-running agent with plan context",
+                            session_id
+                        );
                         let plan_text = format_plan_as_context(proposal);
-                        // TODO(phase-2): Re-run the agent with plan_text injected as
-                        // context, so the agent actually executes the confirmed plan.
-                        // Currently we just send the plan text back to the frontend.
-                        // Phase 2 will add: agent re-invocation with plan as user message.
-                        let confirmed_payload = serde_json::json!({
-                            "type": "stream_chunk",
-                            "payload": {
-                                "content": plan_text,
-                                "done": true
+
+                        // Save plan proposal as assistant message for history
+                        if let Err(e) = session_manager
+                            .add_message(
+                                &session_id,
+                                MessageRole::Assistant,
+                                &format!("Plan proposed:\n{}", plan_text),
+                            )
+                            .await
+                        {
+                            error!("Failed to save plan message: {}", e);
+                        }
+
+                        // Save plan text as user message (the "execute" instruction)
+                        if let Err(e) = session_manager
+                            .add_message(&session_id, MessageRole::User, &plan_text)
+                            .await
+                        {
+                            error!("Failed to save plan user message: {}", e);
+                        }
+
+                        // Create new streaming channel for re-run
+                        let (rerun_stream_tx, mut rerun_stream_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<SidebarStreamChunk>();
+
+                        // Create new host functions
+                        let rerun_services = services
+                            .clone()
+                            .with_client_context(identity.clone(), proxy_id.clone());
+                        let rerun_host =
+                            DaemonHostFunctions::new(config.clone(), runtime.clone())
+                                .with_services(rerun_services)
+                                .with_sidebar_stream(rerun_stream_tx)
+                                .with_session_id(session_id.clone())
+                                .with_trace_collector(trace_collector.clone());
+
+                        let rerun_agent = Agent::new(rerun_host);
+
+                        // Build new input with plan as user message
+                        let rerun_input = AgentInput {
+                            session_id: session_id.clone(),
+                            mode,
+                            user_message: plan_text.clone(),
+                            history: load_session_history(
+                                session_manager,
+                                &session_id,
+                                config.daemon.context.max_history_messages,
+                            )
+                            .await,
+                            attachments: vec![],
+                            local_files: vec![],
+                            custom_system_prompt: None,
+                            tab_id,
+                            tab_ids: tab_ids_for_rerun.clone(),
+                            skill_context: None,
+                            available_models: config.llm.configured_providers(),
+                        };
+
+                        // Spawn stream forwarder for re-run
+                        let rerun_proxy_id = proxy_id.clone();
+                        let rerun_channel = channel;
+                        let rerun_request_id = request_id.clone();
+                        let rerun_identity = identity.clone();
+                        let rerun_response_tx = response_tx.clone();
+
+                        let rerun_forwarder = tokio::spawn(async move {
+                            let mut rerun_accumulated = String::new();
+                            while let Some(chunk) = rerun_stream_rx.recv().await {
+                                rerun_accumulated.push_str(&chunk.text);
+                                let chunk_payload = serde_json::json!({
+                                    "type": "stream_chunk",
+                                    "payload": {
+                                        "content": chunk.text,
+                                        "done": chunk.done
+                                    }
+                                });
+                                let response = DaemonEnvelope::new(
+                                    &rerun_proxy_id,
+                                    rerun_channel,
+                                    chunk_payload,
+                                )
+                                .with_request_id(&rerun_request_id);
+                                if let Err(e) = rerun_response_tx
+                                    .send((rerun_identity.clone(), response))
+                                    .await
+                                {
+                                    error!("Failed to send rerun stream chunk: {}", e);
+                                    break;
+                                }
+                                if chunk.done {
+                                    break;
+                                }
                             }
+                            rerun_accumulated
                         });
-                        let response = DaemonEnvelope::new(&proxy_id, channel, confirmed_payload)
-                            .with_request_id(&request_id);
-                        if let Err(e) = response_tx.send((identity, response)).await {
-                            error!("Failed to send plan confirmation response: {}", e);
+
+                        // Run agent with plan context
+                        let rerun_result =
+                            tokio::task::spawn_blocking(move || rerun_agent.run(&rerun_input))
+                                .await;
+
+                        // Wait for forwarder
+                        let rerun_text = match rerun_forwarder.await {
+                            Ok(text) => text,
+                            Err(e) => {
+                                error!("Rerun forwarder failed: {}", e);
+                                String::new()
+                            }
+                        };
+
+                        // Handle rerun result
+                        match rerun_result {
+                            Ok(Ok(output)) => {
+                                let final_text = if output.text.is_empty() {
+                                    rerun_text
+                                } else {
+                                    output.text.clone()
+                                };
+
+                                if !final_text.is_empty() {
+                                    if let Err(e) = session_manager
+                                        .add_message(
+                                            &session_id,
+                                            MessageRole::Assistant,
+                                            &final_text,
+                                        )
+                                        .await
+                                    {
+                                        error!(
+                                            "Failed to save rerun response: {}",
+                                            e
+                                        );
+                                    }
+                                }
+
+                                // Send final completion
+                                let final_payload = serde_json::json!({
+                                    "type": "stream_chunk",
+                                    "payload": {
+                                        "content": "",
+                                        "tool_calls": output.tool_calls,
+                                        "done": true
+                                    }
+                                });
+                                let response = DaemonEnvelope::new(
+                                    &proxy_id,
+                                    channel,
+                                    final_payload,
+                                )
+                                .with_request_id(&request_id);
+                                if let Err(e) =
+                                    response_tx.send((identity, response)).await
+                                {
+                                    error!(
+                                        "Failed to send rerun final response: {}",
+                                        e
+                                    );
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                error!("Plan execution failed: {}", e);
+                                let error_payload = serde_json::json!({
+                                    "type": "error",
+                                    "payload": {
+                                        "code": "PLAN_EXECUTION_ERROR",
+                                        "message": format!("Plan execution error: {}", e)
+                                    }
+                                });
+                                let response = DaemonEnvelope::new(
+                                    &proxy_id,
+                                    channel,
+                                    error_payload,
+                                )
+                                .with_request_id(&request_id);
+                                if let Err(e) =
+                                    response_tx.send((identity, response)).await
+                                {
+                                    error!(
+                                        "Failed to send plan error: {}",
+                                        e
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!("Plan execution task panicked: {}", e);
+                                let error_payload = serde_json::json!({
+                                    "type": "error",
+                                    "payload": {
+                                        "code": "PLAN_EXECUTION_PANIC",
+                                        "message": format!("Plan execution task failed: {}", e)
+                                    }
+                                });
+                                let response = DaemonEnvelope::new(
+                                    &proxy_id,
+                                    channel,
+                                    error_payload,
+                                )
+                                .with_request_id(&request_id);
+                                if let Err(e) =
+                                    response_tx.send((identity, response)).await
+                                {
+                                    error!(
+                                        "Failed to send plan panic error: {}",
+                                        e
+                                    );
+                                }
+                            }
                         }
                     }
                     Ok(PlanResponse::Cancelled) => {
