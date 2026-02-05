@@ -127,6 +127,7 @@ mod tests {
             tab_id: None,
             tab_ids: vec![],
             skill_context: None,
+            available_models: vec![],
         };
 
         let output = agent.run(&input).unwrap();
@@ -152,6 +153,7 @@ mod tests {
                 tab_id: None,
                 tab_ids: vec![],
                 skill_context: None,
+                available_models: vec![],
             };
 
             let output = agent.run(&input);
@@ -175,6 +177,7 @@ mod tests {
             tab_id: None,
             tab_ids: vec![],
             skill_context: None,
+            available_models: vec![],
         };
 
         let output = agent.run(&input).unwrap();
@@ -202,6 +205,7 @@ mod tests {
             tab_id: None,
             tab_ids: vec![],
             skill_context: None,
+            available_models: vec![],
         };
 
         let output = agent.run(&input);

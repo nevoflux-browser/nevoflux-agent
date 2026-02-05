@@ -135,11 +135,17 @@ impl AgentConfig {
         if other.llm.anthropic.model.is_some() {
             self.llm.anthropic.model = other.llm.anthropic.model.clone();
         }
+        if other.llm.anthropic.context_window.is_some() {
+            self.llm.anthropic.context_window = other.llm.anthropic.context_window;
+        }
         if other.llm.openai.api_key.is_some() {
             self.llm.openai.api_key = other.llm.openai.api_key.clone();
         }
         if other.llm.openai.model.is_some() {
             self.llm.openai.model = other.llm.openai.model.clone();
+        }
+        if other.llm.openai.context_window.is_some() {
+            self.llm.openai.context_window = other.llm.openai.context_window;
         }
 
         // Merge storage config
@@ -218,6 +224,10 @@ pub struct ProviderConfig {
     /// Model name for this provider.
     #[serde(default)]
     pub model: Option<String>,
+
+    /// Context window size in tokens (overrides provider default).
+    #[serde(default)]
+    pub context_window: Option<u32>,
 }
 
 impl LlmConfig {
@@ -248,6 +258,68 @@ impl LlmConfig {
             "deepseek" => self.deepseek.model.as_deref(),
             _ => self.default_model.as_deref(),
         }
+    }
+
+    /// Get list of configured providers with their model names.
+    /// Returns (provider_name, model_name) pairs for all providers with API keys.
+    pub fn configured_providers(&self) -> Vec<(String, String)> {
+        let mut result = Vec::new();
+        let active = self.active_provider();
+        let providers: [(&str, &ProviderConfig); 4] = [
+            ("anthropic", &self.anthropic),
+            ("openai", &self.openai),
+            ("qwen", &self.qwen),
+            ("deepseek", &self.deepseek),
+        ];
+
+        for (name, config) in &providers {
+            if config.api_key.is_some() {
+                let model = config.model.clone().unwrap_or_else(|| {
+                    nevoflux_llm::default_model_for(
+                        name.parse::<nevoflux_llm::ProviderType>()
+                            .unwrap_or(nevoflux_llm::ProviderType::Anthropic),
+                    )
+                    .to_string()
+                });
+                let is_active = active == Some(*name);
+                let suffix = if is_active { " (active)" } else { "" };
+                result.push((name.to_string(), format!("{}{}", model, suffix)));
+            }
+        }
+        result
+    }
+
+    /// Get the context window size for the active provider.
+    ///
+    /// Resolution order:
+    /// 1. Provider-specific `context_window` from config
+    /// 2. Known default for the provider type
+    /// 3. Fallback: 128,000 tokens
+    pub fn context_window(&self) -> u32 {
+        use nevoflux_llm::ProviderType;
+
+        // Check provider-specific config override
+        let provider_config_window = match self.active_provider() {
+            Some("anthropic") => self.anthropic.context_window,
+            Some("openai") => self.openai.context_window,
+            Some("qwen") => self.qwen.context_window,
+            Some("deepseek") => self.deepseek.context_window,
+            _ => None,
+        };
+
+        if let Some(window) = provider_config_window {
+            return window;
+        }
+
+        // Fall back to known provider default
+        if let Some(provider_name) = self.active_provider() {
+            if let Ok(provider_type) = provider_name.parse::<ProviderType>() {
+                return nevoflux_llm::default_context_window_for(provider_type);
+            }
+        }
+
+        // Ultimate fallback
+        128_000
     }
 }
 
@@ -966,6 +1038,44 @@ fuel_limit = 10000000
         assert_eq!(config.timeout_secs, 120);
         assert_eq!(config.memory_pages, 2048);
         assert_eq!(config.fuel_limit, Some(10_000_000));
+    }
+
+    #[test]
+    fn test_configured_providers() {
+        let mut config = LlmConfig::default();
+        config.provider = Some("anthropic".to_string());
+        config.anthropic.api_key = Some("sk-test".to_string());
+        config.anthropic.model = Some("claude-sonnet-4-20250514".to_string());
+        config.openai.api_key = Some("sk-openai".to_string());
+
+        let providers = config.configured_providers();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].0, "anthropic");
+        assert!(providers[0].1.contains("(active)"));
+        assert!(providers[0].1.contains("claude-sonnet-4-20250514"));
+        assert_eq!(providers[1].0, "openai");
+        assert!(!providers[1].1.contains("(active)"));
+    }
+
+    #[test]
+    fn test_configured_providers_empty() {
+        let config = LlmConfig::default();
+        let providers = config.configured_providers();
+        assert!(providers.is_empty());
+    }
+
+    #[test]
+    fn test_configured_providers_default_model() {
+        let mut config = LlmConfig::default();
+        config.provider = Some("openai".to_string());
+        config.openai.api_key = Some("sk-openai".to_string());
+        // No model specified, should use default
+
+        let providers = config.configured_providers();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].0, "openai");
+        assert!(providers[0].1.contains("gpt-4o-mini"));
+        assert!(providers[0].1.contains("(active)"));
     }
 
     #[test]

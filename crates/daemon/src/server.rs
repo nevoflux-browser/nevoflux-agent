@@ -10,7 +10,9 @@ use crate::trace::file_writer::TraceFileWriter;
 use crate::wasm::{BrowserRequest, BrowserResponse, HostServices};
 use bytes::Bytes;
 use nevoflux_builtin_wasm::{Agent, AgentInput, AgentMode, Attachment, Message as WasmMessage};
-use nevoflux_protocol::{AgentMessage, Channel, DaemonEnvelope, PlanProposal, PlanResponse, ProxyEnvelope};
+use nevoflux_protocol::{
+    AgentMessage, Channel, DaemonEnvelope, PlanProposal, PlanResponse, ProxyEnvelope,
+};
 use nevoflux_skills::{check_tool_availability, format_missing_tools_message, ToolCheckResult};
 use nevoflux_storage::{ListSessionsParams, Message as StorageMessage, MessageRole};
 use std::collections::HashMap;
@@ -805,6 +807,7 @@ async fn handle_chat_message_streaming(
         tab_id,
         tab_ids,
         skill_context: None,
+        available_models: config.llm.configured_providers(),
     };
 
     // Create cancellation token for this streaming session
@@ -942,12 +945,9 @@ async fn handle_chat_message_streaming(
                 // Send proposal to frontend
                 let msg = AgentMessage::PlanProposal(proposal.clone());
                 let payload = serde_json::to_value(&msg).unwrap();
-                let envelope = DaemonEnvelope::new(&proxy_id, channel, payload)
-                    .with_request_id(&request_id);
-                if let Err(e) = response_tx
-                    .send((identity.clone(), envelope))
-                    .await
-                {
+                let envelope =
+                    DaemonEnvelope::new(&proxy_id, channel, payload).with_request_id(&request_id);
+                if let Err(e) = response_tx.send((identity.clone(), envelope)).await {
                     error!("Failed to send plan proposal: {}", e);
                 }
 
@@ -964,12 +964,8 @@ async fn handle_chat_message_streaming(
                                 "done": true
                             }
                         });
-                        let response = DaemonEnvelope::new(
-                            &proxy_id,
-                            channel,
-                            confirmed_payload,
-                        )
-                        .with_request_id(&request_id);
+                        let response = DaemonEnvelope::new(&proxy_id, channel, confirmed_payload)
+                            .with_request_id(&request_id);
                         if let Err(e) = response_tx.send((identity, response)).await {
                             error!("Failed to send plan confirmation response: {}", e);
                         }
@@ -983,12 +979,8 @@ async fn handle_chat_message_streaming(
                                 "done": true
                             }
                         });
-                        let response = DaemonEnvelope::new(
-                            &proxy_id,
-                            channel,
-                            cancel_payload,
-                        )
-                        .with_request_id(&request_id);
+                        let response = DaemonEnvelope::new(&proxy_id, channel, cancel_payload)
+                            .with_request_id(&request_id);
                         if let Err(e) = response_tx.send((identity, response)).await {
                             error!("Failed to send plan cancellation response: {}", e);
                         }
@@ -1005,12 +997,8 @@ async fn handle_chat_message_streaming(
                                 "done": true
                             }
                         });
-                        let response = DaemonEnvelope::new(
-                            &proxy_id,
-                            channel,
-                            cancel_payload,
-                        )
-                        .with_request_id(&request_id);
+                        let response = DaemonEnvelope::new(&proxy_id, channel, cancel_payload)
+                            .with_request_id(&request_id);
                         if let Err(e) = response_tx.send((identity, response)).await {
                             error!("Failed to send plan drop response: {}", e);
                         }
@@ -1420,6 +1408,7 @@ async fn handle_chat_message(
                 tab_id,
                 tab_ids,
                 skill_context,
+                available_models: config.llm.configured_providers(),
             };
 
             // Run agent

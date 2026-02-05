@@ -367,6 +367,17 @@ impl<H: HostFunctions> Agent<H> {
             None => self.build_system_prompt_for_mode(input.mode),
         };
 
+        // Append available models section
+        let base_prompt = if !input.available_models.is_empty() {
+            let mut models_section = "\n\n## Available Models\n\nThe following LLM providers and models are configured:\n".to_string();
+            for (provider, model) in &input.available_models {
+                models_section.push_str(&format!("- {}: {}\n", provider, model));
+            }
+            format!("{}{}", base_prompt, models_section)
+        } else {
+            base_prompt
+        };
+
         // Prepend skill context with high priority if present
         let system_prompt = match &input.skill_context {
             Some(skill) => {
@@ -2201,6 +2212,7 @@ mod tests {
             tab_id: None,
             tab_ids: vec![],
             skill_context: None,
+            available_models: vec![],
         };
 
         // Should run successfully with custom prompt
@@ -2308,6 +2320,7 @@ mod tests {
             tab_id: None,
             tab_ids: vec![],
             skill_context: None,
+            available_models: vec![],
         };
 
         let output = agent.run(&input).unwrap();
@@ -2330,6 +2343,7 @@ mod tests {
             tab_id: None,
             tab_ids: vec![],
             skill_context: None,
+            available_models: vec![],
         };
 
         let output = agent.run(&input).unwrap();
@@ -2352,6 +2366,7 @@ mod tests {
             tab_id: None,
             tab_ids: vec![],
             skill_context: None,
+            available_models: vec![],
         };
 
         let output = agent.run(&input).unwrap();
@@ -2394,6 +2409,7 @@ mod tests {
             tab_id: None,
             tab_ids: vec![],
             skill_context: None,
+            available_models: vec![],
         };
 
         let output = agent.run(&input).unwrap();
@@ -2750,6 +2766,7 @@ mod tests {
             tab_id: None,
             tab_ids: vec![],
             skill_context: None,
+            available_models: vec![],
         };
 
         // Should complete normally
@@ -2776,6 +2793,7 @@ mod tests {
             tab_id: None,
             tab_ids: vec![],
             skill_context: None,
+            available_models: vec![],
         };
 
         // Should exit early due to interrupt

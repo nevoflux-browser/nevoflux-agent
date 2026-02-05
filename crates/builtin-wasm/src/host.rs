@@ -966,6 +966,7 @@ mod tests {
             tab_id: None,
             tab_ids: vec![],
             skill_context: None,
+            available_models: vec![],
         };
 
         let chat_output = mock.builtin_chat(&input).unwrap();

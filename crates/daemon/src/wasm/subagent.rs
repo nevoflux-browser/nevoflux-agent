@@ -439,6 +439,7 @@ impl SubagentExecutor {
             tab_id: None,    // Sub-agents don't inherit browser tab context
             tab_ids: vec![], // Sub-agents don't inherit tab list
             skill_context: None,
+            available_models: vec![],
         };
 
         // Check for kill before running
