@@ -89,7 +89,7 @@ pub trait HostFunctions {
     // =========================================================================
 
     /// Read a file.
-    fn tool_read(&self, path: &str, offset: Option<u64>, limit: Option<u64>) -> HostResult<String>;
+    fn tool_read(&self, path: &str, offset: Option<u64>, limit: Option<u64>) -> HostResult<ReadResult>;
 
     /// Write a file.
     fn tool_write(&self, path: &str, content: &str) -> HostResult<()>;
@@ -104,7 +104,7 @@ pub trait HostFunctions {
     ) -> HostResult<()>;
 
     /// Execute a bash command.
-    fn tool_bash(&self, command: &str, timeout_ms: Option<u64>) -> HostResult<String>;
+    fn tool_bash(&self, command: &str, timeout_ms: Option<u64>) -> HostResult<BashResult>;
 
     /// Glob file patterns.
     fn tool_glob(&self, pattern: &str, path: Option<&str>) -> HostResult<Vec<String>>;
@@ -115,7 +115,9 @@ pub trait HostFunctions {
         pattern: &str,
         path: Option<&str>,
         file_type: Option<&str>,
-    ) -> HostResult<Vec<String>>;
+        case_insensitive: Option<bool>,
+        max_results: Option<u64>,
+    ) -> HostResult<GrepResult>;
 
     /// Web search.
     fn tool_web_search(&self, query: &str) -> HostResult<String>;
@@ -496,8 +498,15 @@ impl HostFunctions for MockHostFunctions {
         _path: &str,
         _offset: Option<u64>,
         _limit: Option<u64>,
-    ) -> HostResult<String> {
-        Ok("File content".into())
+    ) -> HostResult<ReadResult> {
+        Ok(ReadResult {
+            total_lines: 1,
+            total_bytes: 12,
+            returned_lines: 1,
+            offset: 0,
+            content: "File content".into(),
+            truncated: false,
+        })
     }
 
     fn tool_write(&self, _path: &str, _content: &str) -> HostResult<()> {
@@ -514,8 +523,18 @@ impl HostFunctions for MockHostFunctions {
         Ok(())
     }
 
-    fn tool_bash(&self, _command: &str, _timeout_ms: Option<u64>) -> HostResult<String> {
-        Ok("Command output".into())
+    fn tool_bash(&self, _command: &str, _timeout_ms: Option<u64>) -> HostResult<BashResult> {
+        Ok(BashResult {
+            exit_code: Some(0),
+            status: BashStatus::Success,
+            total_lines: 1,
+            total_bytes: 14,
+            returned_lines: 1,
+            stdout: "Command output".into(),
+            stderr: None,
+            truncated: false,
+            hint: None,
+        })
     }
 
     fn tool_glob(&self, _pattern: &str, _path: Option<&str>) -> HostResult<Vec<String>> {
@@ -527,8 +546,20 @@ impl HostFunctions for MockHostFunctions {
         _pattern: &str,
         _path: Option<&str>,
         _file_type: Option<&str>,
-    ) -> HostResult<Vec<String>> {
-        Ok(vec!["match1".into()])
+        _case_insensitive: Option<bool>,
+        _max_results: Option<u64>,
+    ) -> HostResult<GrepResult> {
+        Ok(GrepResult {
+            total_matches: 1,
+            total_files: 1,
+            returned: 1,
+            results: vec![GrepMatch {
+                file: "file.rs".into(),
+                line: 1,
+                content: "match1".into(),
+            }],
+            truncated: false,
+        })
     }
 
     fn tool_web_search(&self, _query: &str) -> HostResult<String> {
@@ -718,10 +749,10 @@ impl HostFunctions for MockHostFunctions {
 
     fn browser_get_elements(&self, _tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
         Ok(BrowserToolResult::success(serde_json::json!({
-            "elements": [
-                {"id": "e1", "role": "button", "name": "Submit"},
-                {"id": "e2", "role": "textbox", "name": "Email"}
-            ]
+            "refs": {
+                "e1": {"role": "button", "name": "Submit", "selectors": [{"type": "css", "strategy": "id", "value": "#submit"}]},
+                "e2": {"role": "textbox", "name": "Email", "selectors": [{"type": "css", "strategy": "id", "value": "#email"}]}
+            }
         })))
     }
 
@@ -741,7 +772,7 @@ impl HostFunctions for MockHostFunctions {
     fn browser_viewport_snapshot(&self, _tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
         Ok(BrowserToolResult::success(serde_json::json!({
             "tree": "Page: \"Test\" | URL: https://example.com\nViewport: 1920x1080 | Scroll: 0/2000 (top)\n\n[e1] button \"Submit\"\n[e2] textbox \"Email\"",
-            "refs": {"e1": {"selector": "#submit", "role": "button", "name": "Submit"}, "e2": {"selector": "#email", "role": "textbox", "name": "Email"}},
+            "refs": {"e1": {"selectors": [{"type": "css", "strategy": "id", "value": "#submit"}], "role": "button", "name": "Submit"}, "e2": {"selectors": [{"type": "css", "strategy": "id", "value": "#email"}], "role": "textbox", "name": "Email"}},
             "viewportInfo": {"scrollTop": 0, "scrollHeight": 2000, "viewportHeight": 1080, "viewportWidth": 1920, "canScrollUp": false, "canScrollDown": true, "pageTitle": "Test", "url": "https://example.com"}
         })))
     }
@@ -943,7 +974,7 @@ mod tests {
         assert!(mock.tool_edit("/path", "old", "new", false).is_ok());
         assert!(mock.tool_bash("ls", None).is_ok());
         assert!(mock.tool_glob("*.rs", None).is_ok());
-        assert!(mock.tool_grep("pattern", None, None).is_ok());
+        assert!(mock.tool_grep("pattern", None, None, None, None).is_ok());
         assert!(mock.tool_web_search("query").is_ok());
         assert!(mock.tool_web_fetch("http://example.com", "prompt").is_ok());
         assert!(mock

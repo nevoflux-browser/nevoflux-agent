@@ -273,6 +273,9 @@ pub struct SkillContext {
     pub base_path: String,
     /// Skill content/instructions.
     pub content: String,
+    /// Files available in the skill directory (filenames only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_files: Vec<String>,
 }
 
 /// Agent output to host.
@@ -415,6 +418,59 @@ pub struct ToolSearchResult {
     /// Source of the tool (e.g., "mcp:filesystem", "builtin").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+}
+
+/// Result of a file read operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadResult {
+    pub total_lines: u64,
+    pub total_bytes: u64,
+    pub returned_lines: u64,
+    pub offset: u64,
+    pub content: String,
+    pub truncated: bool,
+}
+
+/// A single grep match entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrepMatch {
+    pub file: String,
+    pub line: u64,
+    pub content: String,
+}
+
+/// Result of a grep search operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrepResult {
+    pub total_matches: u64,
+    pub total_files: u64,
+    pub returned: u64,
+    pub results: Vec<GrepMatch>,
+    pub truncated: bool,
+}
+
+/// Status of a bash command execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BashStatus {
+    Success,
+    Error,
+    Timeout,
+    Killed,
+}
+
+/// Result of a bash command execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BashResult {
+    pub exit_code: Option<i32>,
+    pub status: BashStatus,
+    pub total_lines: u64,
+    pub total_bytes: u64,
+    pub returned_lines: u64,
+    pub stdout: String,
+    pub stderr: Option<String>,
+    pub truncated: bool,
+    pub hint: Option<String>,
 }
 
 #[cfg(test)]
