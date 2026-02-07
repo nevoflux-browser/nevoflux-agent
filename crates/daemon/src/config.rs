@@ -1289,10 +1289,7 @@ denied_commands = ["sudo *"]
         base.merge(&other);
 
         assert!(!base.auth.workspace_auto_allow);
-        assert_eq!(
-            base.auth.allowed_commands,
-            vec!["cargo *", "make *"]
-        );
+        assert_eq!(base.auth.allowed_commands, vec!["cargo *", "make *"]);
         assert_eq!(base.auth.sensitive_patterns, vec![".env*"]);
         assert_eq!(base.auth.denied_commands, vec!["sudo *"]);
     }

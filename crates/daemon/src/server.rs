@@ -440,9 +440,7 @@ pub async fn start_server(
                         serde_json::from_value::<ToolAuthResponse>(payload.clone())
                     {
                         let tool_id = response.tool_id.clone();
-                        if let Some(tx) =
-                            process_tool_auth_registry.lock().await.remove(&tool_id)
-                        {
+                        if let Some(tx) = process_tool_auth_registry.lock().await.remove(&tool_id) {
                             let _ = tx.send(response);
                         } else {
                             warn!("No pending tool auth request for tool_id: {}", tool_id);
@@ -1112,7 +1110,8 @@ async fn handle_chat_message_streaming(
                                 // Add event if present
                                 if let Some(event) = &chunk.event {
                                     if let Some(p) = chunk_payload.get_mut("payload") {
-                                        p["event"] = serde_json::to_value(event).unwrap_or_default();
+                                        p["event"] =
+                                            serde_json::to_value(event).unwrap_or_default();
                                     }
                                 }
                                 let response = DaemonEnvelope::new(

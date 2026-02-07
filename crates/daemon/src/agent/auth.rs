@@ -75,7 +75,7 @@ impl AuthMatcher {
             AuthMatcher::ExactCommand { command } => command == path_or_command,
             AuthMatcher::CommandPrefix { program } => {
                 let parts: Vec<&str> = path_or_command.splitn(2, ' ').collect();
-                parts.first().map_or(false, |cmd| *cmd == program.as_str())
+                parts.first().is_some_and(|cmd| *cmd == program.as_str())
             }
             AuthMatcher::SensitivePattern { pattern } => {
                 let filename = Path::new(path_or_command)
@@ -89,9 +89,8 @@ impl AuthMatcher {
                     // Contains match: *credential*
                     let inner = &pattern[1..pattern.len() - 1];
                     path_or_command.contains(inner)
-                } else if pattern.starts_with('*') {
+                } else if let Some(suffix) = pattern.strip_prefix('*') {
                     // Suffix match: *.pem
-                    let suffix = &pattern[1..];
                     path_or_command.ends_with(suffix)
                 } else {
                     filename == pattern
@@ -216,10 +215,9 @@ pub fn check_authorization(
     if let Some(decision) = store.check(path_or_command) {
         return match decision {
             AuthDecision::Allow => AuthCheckResult::Allowed,
-            AuthDecision::Deny => AuthCheckResult::Denied(format!(
-                "Denied by session rule: {}",
-                path_or_command
-            )),
+            AuthDecision::Deny => {
+                AuthCheckResult::Denied(format!("Denied by session rule: {}", path_or_command))
+            }
         };
     }
 
@@ -595,17 +593,9 @@ mod tests {
     fn test_auth_config() -> AuthConfig {
         AuthConfig {
             workspace_auto_allow: true,
-            allowed_commands: vec![
-                "cargo *".to_string(),
-                "git *".to_string(),
-            ],
-            sensitive_patterns: vec![
-                ".env".to_string(),
-                "*credential*".to_string(),
-            ],
-            denied_commands: vec![
-                "sudo *".to_string(),
-            ],
+            allowed_commands: vec!["cargo *".to_string(), "git *".to_string()],
+            sensitive_patterns: vec![".env".to_string(), "*credential*".to_string()],
+            denied_commands: vec!["sudo *".to_string()],
         }
     }
 
