@@ -55,6 +55,14 @@ uuid = { version = "1", features = ["v4"] }
 # File glob matching
 glob = "0.3"
 
+# Grep engine (ripgrep)
+grep-regex = "0.1"
+grep-searcher = "0.1"
+grep-matcher = "0.1"
+
+# .gitignore-aware file traversal
+ignore = "0.4"
+
 # Configuration file support
 dirs = "5.0"
 directories = { workspace = true }
@@ -68,6 +76,9 @@ notify = { version = "6.1", default-features = false, features = ["macos_fsevent
 
 # Native file dialog
 rfd = "0.15"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal", "process"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

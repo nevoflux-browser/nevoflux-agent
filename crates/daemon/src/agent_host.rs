@@ -28,8 +28,9 @@ use crate::wasm::llm::{
 };
 use crate::wasm::HostServices;
 use nevoflux_builtin_wasm::{
-    AgentInput, AgentMode, AgentOutput, BrowserToolResult, HostError, HostFunctions, HostResult,
-    LlmRequest, LlmResponse, MemoryChunk, SkillSummary, SubagentInfo, ToolSearchResult,
+    AgentInput, AgentMode, AgentOutput, BashResult, BashStatus, BrowserToolResult, GrepMatch,
+    GrepResult, HostError, HostFunctions, HostResult, LlmRequest, LlmResponse, MemoryChunk,
+    ReadResult, SkillSummary, SubagentInfo, ToolSearchResult,
 };
 use nevoflux_llm::ProviderType;
 use nevoflux_mcp::ToolResultContent;
@@ -109,6 +110,10 @@ struct StreamTraceData {
     start: std::time::Instant,
     /// Serialized request payload (captured before the request is consumed).
     request: Option<serde_json::Value>,
+    /// Accumulated text content from all stream chunks.
+    accumulated_text: String,
+    /// Accumulated tool calls from all stream chunks.
+    accumulated_tool_calls: Vec<crate::wasm::llm::LlmToolCall>,
 }
 
 /// A streaming chunk to send to the sidebar.
@@ -148,6 +153,8 @@ pub struct DaemonHostFunctions {
     model_override_provider: Arc<Mutex<Option<String>>>,
     /// Override for the active LLM model (set via switch_model tool).
     model_override_model: Arc<Mutex<Option<String>>>,
+    /// Base path for skill's auxiliary files (for relative path resolution in tool_read/tool_write).
+    skill_base_path: Option<std::path::PathBuf>,
 }
 
 impl DaemonHostFunctions {
@@ -166,6 +173,7 @@ impl DaemonHostFunctions {
             stream_trace_data: Arc::new(Mutex::new(HashMap::new())),
             model_override_provider: Arc::new(Mutex::new(None)),
             model_override_model: Arc::new(Mutex::new(None)),
+            skill_base_path: None,
         }
     }
 
@@ -196,9 +204,100 @@ impl DaemonHostFunctions {
         self
     }
 
+    /// Set the skill base path for resolving relative file paths in tool_read/tool_write.
+    pub fn with_skill_base_path(mut self, base_path: impl Into<std::path::PathBuf>) -> Self {
+        self.skill_base_path = Some(base_path.into());
+        self
+    }
+
+    /// Resolve a file path using skill_base_path if available.
+    ///
+    /// For reads:
+    /// - Relative paths are resolved against skill_base_path
+    /// - Absolute paths that don't exist fall back to skill_base_path/filename
+    ///
+    /// For writes:
+    /// - Only relative paths are resolved (no fallback for absolute paths)
+    ///
+    /// Returns None if no resolution is possible (no skill_base_path set).
+    fn resolve_skill_path(
+        &self,
+        path: &str,
+        allow_absolute_fallback: bool,
+    ) -> Option<std::path::PathBuf> {
+        use std::path::{Component, Path};
+
+        let skill_base = self.skill_base_path.as_ref()?;
+        let p = Path::new(path);
+
+        // Security: reject paths with ".." components to prevent path traversal
+        if p.components().any(|c| matches!(c, Component::ParentDir)) {
+            warn!("Rejecting path with traversal components: {}", path);
+            return None;
+        }
+
+        if p.is_relative() {
+            // Relative path: resolve against skill base
+            let resolved = skill_base.join(p);
+            debug!(
+                "Resolved relative skill path: {} -> {}",
+                path,
+                resolved.display()
+            );
+            Some(resolved)
+        } else if allow_absolute_fallback && !p.exists() {
+            // Absolute path that doesn't exist: try filename in skill directory
+            if let Some(filename) = p.file_name() {
+                let fallback = skill_base.join(filename);
+                if fallback.exists() {
+                    debug!(
+                        "Resolved absolute path via skill fallback: {} -> {}",
+                        path,
+                        fallback.display()
+                    );
+                    return Some(fallback);
+                }
+            }
+            None
+        } else {
+            None
+        }
+    }
+
     /// Update the current iteration counter for trace recording.
     pub fn set_iteration(&self, iteration: u32) {
         self.current_iteration.store(iteration, Ordering::Relaxed);
+    }
+
+    /// Record a tool execution span if trace collection is enabled.
+    #[allow(clippy::too_many_arguments)]
+    fn record_tool(
+        &self,
+        tool_name: &str,
+        params_summary: Option<String>,
+        success: bool,
+        error_code: Option<String>,
+        error_msg: Option<String>,
+        duration_ms: u64,
+        full_params: Option<serde_json::Value>,
+        full_result: Option<serde_json::Value>,
+    ) {
+        if let Some(tc) = &self.trace_collector {
+            let session_id = self.session_id.as_deref().unwrap_or("unknown");
+            let iteration = self.current_iteration.load(Ordering::Relaxed);
+            tc.record_tool_exec(
+                session_id,
+                iteration,
+                tool_name,
+                params_summary,
+                success,
+                error_code,
+                error_msg,
+                duration_ms,
+                full_params,
+                full_result,
+            );
+        }
     }
 
     /// Convert agent LlmRequest to daemon LlmChatRequest with custom messages.
@@ -384,6 +483,7 @@ impl DaemonHostFunctions {
             "openai" => self.config.llm.openai.api_key.as_deref(),
             "qwen" => self.config.llm.qwen.api_key.as_deref(),
             "deepseek" => self.config.llm.deepseek.api_key.as_deref(),
+            "claude-code" | "claude_code" => self.config.llm.claude_code.api_key.as_deref(),
             _ => None,
         };
 
@@ -397,10 +497,17 @@ impl DaemonHostFunctions {
             message: format!("Invalid provider: {}", provider),
         })?;
         let env_var = nevoflux_llm::api_key_env_var(pt);
-        std::env::var(env_var).map_err(|_| HostError {
-            code: 2,
-            message: format!("No API key found for provider: {}", provider),
-        })
+        match std::env::var(env_var) {
+            Ok(k) => Ok(k),
+            Err(_) if pt == ProviderType::ClaudeCode => {
+                // Claude Code CLI manages its own auth; return a placeholder
+                Ok("claude-code-cli".to_string())
+            }
+            Err(_) => Err(HostError {
+                code: 2,
+                message: format!("No API key found for provider: {}", provider),
+            }),
+        }
     }
 }
 
@@ -596,14 +703,7 @@ impl HostFunctions for DaemonHostFunctions {
         let stream_id = self
             .runtime
             .block_on(async {
-                start_llm_stream(
-                    provider,
-                    &api_key,
-                    &model,
-                    daemon_request,
-                    registry,
-                )
-                .await
+                start_llm_stream(provider, &api_key, &model, daemon_request, registry).await
             })
             .map_err(|e| HostError {
                 code: 100,
@@ -617,6 +717,8 @@ impl HostFunctions for DaemonHostFunctions {
                 StreamTraceData {
                     start: llm_start,
                     request: trace_request_value,
+                    accumulated_text: String::new(),
+                    accumulated_tool_calls: Vec::new(),
                 },
             );
         }
@@ -631,6 +733,18 @@ impl HostFunctions for DaemonHostFunctions {
     ) -> HostResult<Option<nevoflux_builtin_wasm::LlmChunk>> {
         match self.stream_registry.next_chunk(stream_id) {
             Ok(Some(chunk)) => {
+                // Accumulate for trace recording
+                if self.trace_collector.is_some() {
+                    if let Ok(mut trace_map) = self.stream_trace_data.lock() {
+                        if let Some(data) = trace_map.get_mut(&stream_id) {
+                            if let Some(ref text) = chunk.text {
+                                data.accumulated_text.push_str(text);
+                            }
+                            data.accumulated_tool_calls.extend(chunk.tool_calls.clone());
+                        }
+                    }
+                }
+
                 // Convert daemon chunk to builtin-wasm chunk, preserving call_id
                 let wasm_chunk = nevoflux_builtin_wasm::LlmChunk {
                     text: chunk.text,
@@ -667,6 +781,15 @@ impl HostFunctions for DaemonHostFunctions {
                 let duration_ms = data.start.elapsed().as_millis() as u64;
                 let iteration = self.current_iteration.load(Ordering::Relaxed);
                 let session_id = self.session_id.as_deref().unwrap_or("unknown");
+                let full_response =
+                    if data.accumulated_text.is_empty() && data.accumulated_tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::json!({
+                            "content": data.accumulated_text,
+                            "tool_calls": data.accumulated_tool_calls,
+                        }))
+                    };
                 tc.record_llm_call(
                     session_id,
                     iteration,
@@ -675,7 +798,7 @@ impl HostFunctions for DaemonHostFunctions {
                     None,
                     duration_ms,
                     data.request,
-                    None, // Streaming response is accumulated in WASM, not available here
+                    full_response,
                 );
             }
         }
@@ -833,6 +956,7 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn skill_load(&self, name: &str) -> HostResult<String> {
+        let start = std::time::Instant::now();
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
             message: "Services not available".into(),
@@ -844,13 +968,40 @@ impl HostFunctions for DaemonHostFunctions {
         self.ensure_skills_loaded(services);
 
         let registry = services.skills.blocking_read();
-        let skill = registry.get(name).ok_or_else(|| HostError {
+        let result = registry.get(name).ok_or_else(|| HostError {
             code: 404,
             message: format!("Skill not found: {}", name),
-        })?;
+        });
 
-        // Return the skill content (Level 2 loading)
-        Ok(skill.content.clone())
+        let duration_ms = start.elapsed().as_millis() as u64;
+        match result {
+            Ok(skill) => {
+                self.record_tool(
+                    "skill_load",
+                    Some(format!("name={}", name)),
+                    true,
+                    None,
+                    None,
+                    duration_ms,
+                    Some(serde_json::json!({ "name": name })),
+                    None,
+                );
+                Ok(skill.content.clone())
+            }
+            Err(e) => {
+                self.record_tool(
+                    "skill_load",
+                    Some(format!("name={}", name)),
+                    false,
+                    Some(e.code.to_string()),
+                    Some(e.message.clone()),
+                    duration_ms,
+                    Some(serde_json::json!({ "name": name })),
+                    None,
+                );
+                Err(e)
+            }
+        }
     }
 
     fn skill_read(&self, name: &str, path: &str) -> HostResult<String> {
@@ -884,6 +1035,7 @@ impl HostFunctions for DaemonHostFunctions {
         script: &str,
         args: &serde_json::Value,
     ) -> HostResult<String> {
+        let start = std::time::Instant::now();
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
             message: "Services not available".into(),
@@ -898,7 +1050,7 @@ impl HostFunctions for DaemonHostFunctions {
         self.ensure_skills_loaded(services);
 
         let registry = services.skills.blocking_read();
-        let output = registry
+        let result = registry
             .execute_script(name, script, args)
             .map_err(|e| HostError {
                 code: match e {
@@ -907,53 +1059,163 @@ impl HostFunctions for DaemonHostFunctions {
                     _ => 100,
                 },
                 message: format!("Skill execute failed: {}", e),
-            })?;
+            });
 
-        Ok(output)
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let params_summary = Some(format!("name={}, script={}", name, script));
+        match result {
+            Ok(output) => {
+                self.record_tool(
+                    "skill_execute",
+                    params_summary,
+                    true,
+                    None,
+                    None,
+                    duration_ms,
+                    Some(serde_json::json!({ "name": name, "script": script })),
+                    None,
+                );
+                Ok(output)
+            }
+            Err(e) => {
+                self.record_tool(
+                    "skill_execute",
+                    params_summary,
+                    false,
+                    Some(e.code.to_string()),
+                    Some(e.message.clone()),
+                    duration_ms,
+                    Some(serde_json::json!({ "name": name, "script": script })),
+                    None,
+                );
+                Err(e)
+            }
+        }
     }
 
-    fn tool_read(&self, path: &str, offset: Option<u64>, limit: Option<u64>) -> HostResult<String> {
+    fn tool_read(&self, path: &str, offset: Option<u64>, limit: Option<u64>) -> HostResult<ReadResult> {
         use std::fs;
         use std::io::{BufRead, BufReader};
 
-        debug!(
-            "tool_read: path={}, offset={:?}, limit={:?}",
-            path, offset, limit
-        );
+        let start = std::time::Instant::now();
+        debug!("tool_read: path={}, offset={:?}, limit={:?}", path, offset, limit);
 
-        let file = fs::File::open(path).map_err(|e| HostError {
-            code: 1,
-            message: format!("Failed to open file: {}", e),
-        })?;
+        let resolved_path = self
+            .resolve_skill_path(path, true)
+            .unwrap_or_else(|| std::path::PathBuf::from(path));
 
-        let reader = BufReader::new(file);
-        let offset = offset.unwrap_or(0) as usize;
-        let limit = limit.unwrap_or(2000) as usize;
+        let result: HostResult<ReadResult> = (|| {
+            let file = fs::File::open(resolved_path.as_path()).map_err(|e| HostError {
+                code: 1,
+                message: format!("Failed to open file: {}", e),
+            })?;
 
-        let lines: Vec<String> = reader
-            .lines()
-            .skip(offset)
-            .take(limit)
-            .filter_map(|l| l.ok())
-            .collect();
+            let metadata = file.metadata().map_err(|e| HostError {
+                code: 1,
+                message: format!("Failed to read metadata: {}", e),
+            })?;
+            let total_bytes = metadata.len();
 
-        let result = lines.join("\n");
-        debug!(
-            "tool_read: read {} lines, content_len={}",
-            lines.len(),
-            result.len()
-        );
-        debug!("tool_read: content={:?}", result);
-        Ok(result)
+            let reader = BufReader::new(file);
+            let all_lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+            let total_lines = all_lines.len() as u64;
+
+            let off = offset.unwrap_or(0) as usize;
+            let lim = limit.unwrap_or(200) as usize;
+
+            let selected: Vec<&String> = all_lines.iter().skip(off).take(lim).collect();
+            let returned_lines = selected.len() as u64;
+
+            // Truncate individual long lines
+            let content: String = selected
+                .iter()
+                .map(|line| {
+                    if line.len() > 2000 {
+                        format!("{}\u{2026}[truncated]", &line[..2000])
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let truncated = (off + lim) < all_lines.len();
+
+            Ok(ReadResult {
+                total_lines,
+                total_bytes,
+                returned_lines,
+                offset: off as u64,
+                content,
+                truncated,
+            })
+        })();
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        match &result {
+            Ok(_) => self.record_tool(
+                "tool_read",
+                Some(format!("path={}", path)),
+                true,
+                None,
+                None,
+                duration_ms,
+                Some(serde_json::json!({ "path": path, "offset": offset, "limit": limit })),
+                None,
+            ),
+            Err(e) => self.record_tool(
+                "tool_read",
+                Some(format!("path={}", path)),
+                false,
+                Some(e.code.to_string()),
+                Some(e.message.clone()),
+                duration_ms,
+                Some(serde_json::json!({ "path": path, "offset": offset, "limit": limit })),
+                None,
+            ),
+        }
+        result
     }
 
     fn tool_write(&self, path: &str, content: &str) -> HostResult<()> {
         use std::fs;
 
-        fs::write(path, content).map_err(|e| HostError {
+        let start = std::time::Instant::now();
+
+        // Resolve path using skill base if available (no absolute fallback for writes)
+        let resolved_path = self
+            .resolve_skill_path(path, false)
+            .unwrap_or_else(|| std::path::PathBuf::from(path));
+
+        let result = fs::write(resolved_path.as_path(), content).map_err(|e| HostError {
             code: 1,
             message: format!("Failed to write file: {}", e),
-        })
+        });
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        match &result {
+            Ok(()) => self.record_tool(
+                "tool_write",
+                Some(format!("path={}", path)),
+                true,
+                None,
+                None,
+                duration_ms,
+                Some(serde_json::json!({ "path": path })),
+                None,
+            ),
+            Err(e) => self.record_tool(
+                "tool_write",
+                Some(format!("path={}", path)),
+                false,
+                Some(e.code.to_string()),
+                Some(e.message.clone()),
+                duration_ms,
+                Some(serde_json::json!({ "path": path })),
+                None,
+            ),
+        }
+        result
     }
 
     fn tool_edit(
@@ -965,29 +1227,62 @@ impl HostFunctions for DaemonHostFunctions {
     ) -> HostResult<()> {
         use std::fs;
 
-        let content = fs::read_to_string(path).map_err(|e| HostError {
-            code: 1,
-            message: format!("Failed to read file: {}", e),
-        })?;
+        let start = std::time::Instant::now();
+        let result = (|| {
+            let content = fs::read_to_string(path).map_err(|e| HostError {
+                code: 1,
+                message: format!("Failed to read file: {}", e),
+            })?;
 
-        let new_content = if replace_all {
-            content.replace(old_string, new_string)
-        } else {
-            content.replacen(old_string, new_string, 1)
-        };
+            let new_content = if replace_all {
+                content.replace(old_string, new_string)
+            } else {
+                content.replacen(old_string, new_string, 1)
+            };
 
-        fs::write(path, new_content).map_err(|e| HostError {
-            code: 1,
-            message: format!("Failed to write file: {}", e),
-        })
+            fs::write(path, new_content).map_err(|e| HostError {
+                code: 1,
+                message: format!("Failed to write file: {}", e),
+            })
+        })();
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        match &result {
+            Ok(()) => self.record_tool(
+                "tool_edit",
+                Some(format!("path={}", path)),
+                true,
+                None,
+                None,
+                duration_ms,
+                Some(serde_json::json!({ "path": path })),
+                None,
+            ),
+            Err(e) => self.record_tool(
+                "tool_edit",
+                Some(format!("path={}", path)),
+                false,
+                Some(e.code.to_string()),
+                Some(e.message.clone()),
+                duration_ms,
+                Some(serde_json::json!({ "path": path })),
+                None,
+            ),
+        }
+        result
     }
 
-    fn tool_bash(&self, command: &str, timeout_ms: Option<u64>) -> HostResult<String> {
+    fn tool_bash(&self, command: &str, timeout_ms: Option<u64>) -> HostResult<BashResult> {
         use std::process::{Command, Stdio};
         use std::time::Duration;
 
+        let start = std::time::Instant::now();
+
         // Default timeout: 2 minutes (120000ms)
         let timeout = Duration::from_millis(timeout_ms.unwrap_or(120_000));
+
+        // Truncate command for params_summary
+        let cmd_summary: String = command.chars().take(100).collect();
 
         // Spawn the command
         let child = Command::new("bash")
@@ -1011,49 +1306,123 @@ impl HostFunctions for DaemonHostFunctions {
                     Ok(Ok(output)) => output.map_err(|e| format!("Command failed: {}", e)),
                     Ok(Err(e)) => Err(format!("Task join error: {}", e)),
                     Err(_) => {
-                        // Timeout occurred - try to kill the process
-                        // Note: child was moved, so we can't kill it here directly
-                        // The spawn_blocking task owns it now
                         Err(format!("Command timed out after {}ms", timeout.as_millis()))
                     }
                 }
             })
         });
 
-        match result {
+        let host_result: HostResult<BashResult> = match result {
             Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-
-                if output.status.success() {
-                    Ok(stdout.to_string())
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let exit_code = output.status.code();
+                let status = if output.status.success() {
+                    BashStatus::Success
                 } else {
-                    Ok(format!("STDOUT:\n{}\nSTDERR:\n{}", stdout, stderr))
-                }
+                    BashStatus::Error
+                };
+                let stdout_lines = stdout.lines().count() as u64;
+                let total_bytes = (stdout.len() + stderr.len()) as u64;
+
+                Ok(BashResult {
+                    exit_code,
+                    status,
+                    total_lines: stdout_lines,
+                    total_bytes,
+                    returned_lines: stdout_lines,
+                    stdout,
+                    stderr: if stderr.is_empty() { None } else { Some(stderr) },
+                    truncated: false,
+                    hint: None,
+                })
             }
-            Err(e) => Err(HostError {
-                code: 408, // Request Timeout
-                message: e,
+            Err(e) => Ok(BashResult {
+                exit_code: None,
+                status: BashStatus::Timeout,
+                total_lines: 0,
+                total_bytes: 0,
+                returned_lines: 0,
+                stdout: String::new(),
+                stderr: Some(e),
+                truncated: false,
+                hint: None,
             }),
+        };
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        match &host_result {
+            Ok(_) => self.record_tool(
+                "tool_bash",
+                Some(cmd_summary),
+                true,
+                None,
+                None,
+                duration_ms,
+                Some(
+                    serde_json::json!({ "command": command.chars().take(500).collect::<String>() }),
+                ),
+                None,
+            ),
+            Err(e) => self.record_tool(
+                "tool_bash",
+                Some(cmd_summary),
+                false,
+                Some(e.code.to_string()),
+                Some(e.message.clone()),
+                duration_ms,
+                Some(
+                    serde_json::json!({ "command": command.chars().take(500).collect::<String>() }),
+                ),
+                None,
+            ),
         }
+        host_result
     }
 
     fn tool_glob(&self, pattern: &str, path: Option<&str>) -> HostResult<Vec<String>> {
+        let start = std::time::Instant::now();
         let full_pattern = match path {
             Some(p) => format!("{}/{}", p, pattern),
             None => pattern.to_string(),
         };
 
-        let entries: Vec<String> = glob::glob(&full_pattern)
+        let result: HostResult<Vec<String>> = glob::glob(&full_pattern)
             .map_err(|e| HostError {
                 code: 1,
                 message: format!("Invalid glob pattern: {}", e),
-            })?
-            .filter_map(|r| r.ok())
-            .map(|p| p.display().to_string())
-            .collect();
+            })
+            .map(|paths| {
+                paths
+                    .filter_map(|r| r.ok())
+                    .map(|p| p.display().to_string())
+                    .collect()
+            });
 
-        Ok(entries)
+        let duration_ms = start.elapsed().as_millis() as u64;
+        match &result {
+            Ok(_) => self.record_tool(
+                "tool_glob",
+                Some(format!("pattern={}", pattern)),
+                true,
+                None,
+                None,
+                duration_ms,
+                Some(serde_json::json!({ "pattern": pattern, "path": path })),
+                None,
+            ),
+            Err(e) => self.record_tool(
+                "tool_glob",
+                Some(format!("pattern={}", pattern)),
+                false,
+                Some(e.code.to_string()),
+                Some(e.message.clone()),
+                duration_ms,
+                Some(serde_json::json!({ "pattern": pattern, "path": path })),
+                None,
+            ),
+        }
+        result
     }
 
     fn tool_grep(
@@ -1061,9 +1430,12 @@ impl HostFunctions for DaemonHostFunctions {
         pattern: &str,
         path: Option<&str>,
         _file_type: Option<&str>,
-    ) -> HostResult<Vec<String>> {
+        _case_insensitive: Option<bool>,
+        _max_results: Option<u64>,
+    ) -> HostResult<GrepResult> {
         use std::process::Command;
 
+        let start = std::time::Instant::now();
         let mut cmd = Command::new("grep");
         cmd.arg("-r").arg("-n").arg(pattern);
 
@@ -1073,13 +1445,63 @@ impl HostFunctions for DaemonHostFunctions {
             cmd.arg(".");
         }
 
-        let output = cmd.output().map_err(|e| HostError {
-            code: 1,
-            message: format!("Failed to run grep: {}", e),
-        })?;
+        let result: HostResult<GrepResult> = cmd
+            .output()
+            .map_err(|e| HostError {
+                code: 1,
+                message: format!("Failed to run grep: {}", e),
+            })
+            .map(|output| {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let matches: Vec<GrepMatch> = stdout
+                    .lines()
+                    .filter_map(|line| {
+                        // Parse "file:line:content" format
+                        let mut parts = line.splitn(3, ':');
+                        let file = parts.next()?.to_string();
+                        let line_num: u64 = parts.next()?.parse().ok()?;
+                        let content = parts.next().unwrap_or("").to_string();
+                        Some(GrepMatch { file, line: line_num, content })
+                    })
+                    .collect();
+                let total_matches = matches.len() as u64;
+                let mut files = std::collections::HashSet::new();
+                for m in &matches {
+                    files.insert(m.file.clone());
+                }
+                GrepResult {
+                    total_matches,
+                    total_files: files.len() as u64,
+                    returned: total_matches,
+                    results: matches,
+                    truncated: false,
+                }
+            });
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(stdout.lines().map(|s| s.to_string()).collect())
+        let duration_ms = start.elapsed().as_millis() as u64;
+        match &result {
+            Ok(_) => self.record_tool(
+                "tool_grep",
+                Some(format!("pattern={}", pattern)),
+                true,
+                None,
+                None,
+                duration_ms,
+                Some(serde_json::json!({ "pattern": pattern, "path": path })),
+                None,
+            ),
+            Err(e) => self.record_tool(
+                "tool_grep",
+                Some(format!("pattern={}", pattern)),
+                false,
+                Some(e.code.to_string()),
+                Some(e.message.clone()),
+                duration_ms,
+                Some(serde_json::json!({ "pattern": pattern, "path": path })),
+                None,
+            ),
+        }
+        result
     }
 
     fn tool_web_search(&self, query: &str) -> HostResult<String> {
@@ -1388,6 +1810,7 @@ impl HostFunctions for DaemonHostFunctions {
         tool_name: &str,
         arguments: &serde_json::Value,
     ) -> HostResult<String> {
+        let start = std::time::Instant::now();
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
             message: "Services not available".into(),
@@ -1403,6 +1826,14 @@ impl HostFunctions for DaemonHostFunctions {
             tool_name, arguments
         );
 
+        // Capture params for trace before arguments is consumed
+        let trace_params = if self.trace_collector.is_some() {
+            Some(arguments.clone())
+        } else {
+            None
+        };
+        let params_summary = serde_json::to_string(arguments).ok();
+
         // Execute MCP call using block_in_place + block_on pattern
         let runtime = self.runtime.clone();
         let manager = mcp_manager.clone();
@@ -1413,7 +1844,7 @@ impl HostFunctions for DaemonHostFunctions {
             runtime.block_on(async move { manager.call_tool_any(&tool, args).await })
         });
 
-        match result {
+        let host_result = match result {
             Ok(tool_result) => {
                 // Extract text content from the result
                 let content: String = tool_result
@@ -1445,7 +1876,33 @@ impl HostFunctions for DaemonHostFunctions {
                     message: format!("Tool call failed: {}", e),
                 })
             }
+        };
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let traced_name = format!("dynamic:{}", tool_name);
+        match &host_result {
+            Ok(_) => self.record_tool(
+                &traced_name,
+                params_summary,
+                true,
+                None,
+                None,
+                duration_ms,
+                trace_params,
+                None,
+            ),
+            Err(e) => self.record_tool(
+                &traced_name,
+                params_summary,
+                false,
+                Some(e.code.to_string()),
+                Some(e.message.clone()),
+                duration_ms,
+                trace_params,
+                None,
+            ),
         }
+        host_result
     }
 
     fn builtin_chat(&self, input: &AgentInput) -> HostResult<AgentOutput> {
@@ -1948,6 +2405,7 @@ impl DaemonHostFunctions {
             stream_trace_data: self.stream_trace_data.clone(),
             model_override_provider: self.model_override_provider.clone(),
             model_override_model: self.model_override_model.clone(),
+            skill_base_path: self.skill_base_path.clone(),
         }
     }
 
@@ -2062,6 +2520,21 @@ impl DaemonHostFunctions {
     ) -> HostResult<BrowserToolResult> {
         use crate::wasm::services::{BrowserRequest, BrowserResponse};
 
+        let start = std::time::Instant::now();
+
+        // Derive tool name from action (e.g. "browser_navigate", "browser_click")
+        let tool_name = serde_json::to_value(action)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| format!("browser_{}", s)))
+            .unwrap_or_else(|| format!("browser_{:?}", action).to_lowercase());
+
+        // Capture params summary for trace (guard clone with trace check)
+        let params_summary = if self.trace_collector.is_some() {
+            serde_json::to_string(&params).ok()
+        } else {
+            None
+        };
+
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
             message: "Services not available".into(),
@@ -2123,7 +2596,7 @@ impl DaemonHostFunctions {
             })
         });
 
-        match result {
+        let host_result = match result {
             Ok(response) => {
                 if response.success {
                     // For Screenshot actions, put the base64 data in the screenshot field
@@ -2169,7 +2642,27 @@ impl DaemonHostFunctions {
                 warn!("Browser action failed: {}", e);
                 Ok(BrowserToolResult::error(e))
             }
-        }
+        };
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let success = host_result.as_ref().map(|r| r.success).unwrap_or(false);
+        let error_msg = host_result.as_ref().ok().and_then(|r| r.error.clone());
+        self.record_tool(
+            &tool_name,
+            params_summary,
+            success,
+            if success {
+                None
+            } else {
+                Some("BROWSER_ERROR".to_string())
+            },
+            error_msg,
+            duration_ms,
+            None,
+            None,
+        );
+
+        host_result
     }
 
     /// Legacy subagent spawn implementation using Tokio tasks.
@@ -3277,5 +3770,94 @@ mod tests {
             cloned.model_override_model.lock().unwrap().as_deref(),
             Some("gpt-4o")
         );
+    }
+
+    // ==================== tool_read Tests ====================
+
+    #[test]
+    fn test_tool_read_default_limit() {
+        let (host, _rt) = setup_host_with_services();
+
+        // Create a temp file with 300 lines
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test_300_lines.txt");
+        let content: String = (1..=300)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, &content).unwrap();
+
+        let result = host.tool_read(file_path.to_str().unwrap(), None, None);
+        let read = result.unwrap();
+        assert_eq!(read.total_lines, 300);
+        assert_eq!(read.returned_lines, 200);
+        assert_eq!(read.offset, 0);
+        assert!(read.truncated);
+        // First line should be "line 1"
+        assert!(read.content.starts_with("line 1\n"));
+        // Last returned line should be "line 200"
+        assert!(read.content.ends_with("line 200"));
+    }
+
+    #[test]
+    fn test_tool_read_with_offset_and_limit() {
+        let (host, _rt) = setup_host_with_services();
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test_offset.txt");
+        let content: String = (1..=300)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, &content).unwrap();
+
+        let result = host.tool_read(file_path.to_str().unwrap(), Some(5), Some(3));
+        let read = result.unwrap();
+        assert_eq!(read.total_lines, 300);
+        assert_eq!(read.returned_lines, 3);
+        assert_eq!(read.offset, 5);
+        assert!(read.truncated);
+        // Lines at offsets 5, 6, 7 (0-indexed) = "line 6", "line 7", "line 8"
+        assert_eq!(read.content, "line 6\nline 7\nline 8");
+    }
+
+    #[test]
+    fn test_tool_read_no_truncation() {
+        let (host, _rt) = setup_host_with_services();
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test_short.txt");
+        let content: String = (1..=10)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, &content).unwrap();
+
+        let result = host.tool_read(file_path.to_str().unwrap(), None, None);
+        let read = result.unwrap();
+        assert_eq!(read.total_lines, 10);
+        assert_eq!(read.returned_lines, 10);
+        assert_eq!(read.offset, 0);
+        assert!(!read.truncated);
+    }
+
+    #[test]
+    fn test_tool_read_long_line_truncation() {
+        let (host, _rt) = setup_host_with_services();
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test_long_line.txt");
+        // Create a file with one very long line (3000 chars)
+        let long_line = "x".repeat(3000);
+        std::fs::write(&file_path, &long_line).unwrap();
+
+        let result = host.tool_read(file_path.to_str().unwrap(), None, None);
+        let read = result.unwrap();
+        assert_eq!(read.total_lines, 1);
+        assert_eq!(read.returned_lines, 1);
+        assert!(!read.truncated);
+        // Line should be truncated at 2000 chars + "…[truncated]"
+        assert!(read.content.contains("\u{2026}[truncated]"));
+        assert!(read.content.len() < 3000);
     }
 }
