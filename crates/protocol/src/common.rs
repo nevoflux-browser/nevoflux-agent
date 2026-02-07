@@ -241,6 +241,93 @@ pub struct ToolInfo {
     pub status: ToolStatus,
     /// Target resource
     pub target: Option<String>,
+    /// Emoji icon for sidebar display (auto-populated from name)
+    #[serde(default, skip_deserializing)]
+    pub icon: String,
+}
+
+impl ToolInfo {
+    /// Create a new ToolInfo with auto-populated icon.
+    pub fn new(name: impl Into<String>, status: ToolStatus, target: Option<String>) -> Self {
+        let name = name.into();
+        let icon = tool_icon(&name).to_string();
+        Self {
+            name,
+            status,
+            target,
+            icon,
+        }
+    }
+}
+
+/// Map a tool name to an emoji icon for sidebar display.
+///
+/// Handles both PascalCase (Claude Code CLI native tools) and
+/// lowercase/snake_case (WASM agent custom tools) variants.
+pub fn tool_icon(name: &str) -> &'static str {
+    match name {
+        // CLI / agent file tools
+        "Read" | "read" => "\u{1F4C4}", // 📄
+        "Write" | "Edit" | "write" | "edit" => "\u{270F}\u{FE0F}", // ✏️
+        "NotebookEdit" => "\u{1F4D3}",  // 📓
+
+        // CLI / agent shell tools
+        "Bash" | "bash" | "browser_eval_js" => "\u{1F4BB}", // 💻
+
+        // CLI / agent search tools
+        "Grep"
+        | "Glob"
+        | "grep"
+        | "glob"
+        | "browser_get_elements"
+        | "browser_find_elements"
+        | "browser_element_info" => {
+            "\u{1F50D}" // 🔍
+        }
+
+        // CLI / agent web tools
+        "WebFetch" | "WebSearch" | "web_fetch" | "web_search" | "browser_navigate" | "navigate"
+        | "goto" | "open_url" => {
+            "\u{1F310}" // 🌐
+        }
+
+        // Agent-specific tools
+        "Task" | "think" => "\u{1F4AD}",                    // 💭
+        "plan" => "\u{1F4DD}",                              // 📝
+        "switch_model" => "\u{1F504}",                      // 🔄
+        "ask_user" => "\u{2753}",                           // ❓
+        "memory_search" => "\u{1F9E0}",                     // 🧠
+        "skill_load" => "\u{1F4E6}",                        // 📦
+        "tool_search" | "tool_call_dynamic" => "\u{1F50E}", // 🔎
+        "subagent_spawn" | "subagent_status" | "subagent_wait" | "subagent_kill"
+        | "subagent_list" => "\u{1F916}", // 🤖
+
+        // Browser click tools
+        "browser_click" | "browser_click_by_id" | "click_element" | "click" => {
+            "\u{1F5B1}" // 🖱
+        }
+
+        // Browser typing tools
+        "browser_type" | "browser_type_by_id" | "browser_fill" | "browser_fill_by_id"
+        | "type_text" | "type" | "input" => "\u{2328}\u{FE0F}", // ⌨️
+
+        // Browser screenshot
+        "browser_screenshot" | "screenshot" | "capture" => "\u{1F4F7}", // 📷
+
+        // Browser scroll
+        "browser_scroll" | "scroll" | "scroll_page" => "\u{2195}\u{FE0F}", // ↕️
+
+        // Browser content extraction
+        "browser_get_content" | "browser_get_markdown" | "extract_content" | "get_text" => {
+            "\u{1F4CB}"
+        } // 📋
+
+        // Browser wait
+        "browser_wait_for" | "wait" | "sleep" | "waitForStable" => "\u{23F1}", // ⏱
+
+        // Default
+        _ => "\u{2699}\u{FE0F}", // ⚙️
+    }
 }
 
 /// Stream metadata
@@ -361,6 +448,82 @@ pub enum PickFilesError {
     NoDisplay,
     /// Another dialog is already open
     AlreadyPicking,
+}
+
+/// Result of a file read operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadResult {
+    /// Total lines in the file.
+    pub total_lines: u64,
+    /// Total bytes in the file.
+    pub total_bytes: u64,
+    /// Number of lines actually returned.
+    pub returned_lines: u64,
+    /// Start line offset (0-based).
+    pub offset: u64,
+    /// File content (may be truncated).
+    pub content: String,
+    /// Whether content was truncated.
+    pub truncated: bool,
+}
+
+/// A single grep match entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrepMatch {
+    /// File path of the match.
+    pub file: String,
+    /// Line number (1-based).
+    pub line: u64,
+    /// Content of the matching line.
+    pub content: String,
+}
+
+/// Result of a grep search operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrepResult {
+    /// Total matches found (even if exceeding max_results).
+    pub total_matches: u64,
+    /// Number of files with matches.
+    pub total_files: u64,
+    /// Number of results returned.
+    pub returned: u64,
+    /// Match results.
+    pub results: Vec<GrepMatch>,
+    /// Whether results were truncated.
+    pub truncated: bool,
+}
+
+/// Status of a bash command execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BashStatus {
+    Success,
+    Error,
+    Timeout,
+    Killed,
+}
+
+/// Result of a bash command execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BashResult {
+    /// Exit code, None means timeout or killed.
+    pub exit_code: Option<i32>,
+    /// Execution status.
+    pub status: BashStatus,
+    /// Total output lines (before truncation).
+    pub total_lines: u64,
+    /// Total output bytes (before truncation).
+    pub total_bytes: u64,
+    /// Lines actually returned.
+    pub returned_lines: u64,
+    /// stdout content (may be truncated).
+    pub stdout: String,
+    /// stderr content (only on failure).
+    pub stderr: Option<String>,
+    /// Whether output was truncated.
+    pub truncated: bool,
+    /// Hint for model (timeout, binary, etc.).
+    pub hint: Option<String>,
 }
 
 #[cfg(test)]
@@ -514,5 +677,281 @@ mod tests {
         let err = PickFilesError::NoDisplay;
         let json = serde_json::to_string(&err).unwrap();
         assert!(json.contains("no_display"));
+    }
+
+    #[test]
+    fn test_tool_icon_cli_tools() {
+        // PascalCase (Claude Code CLI native tool names)
+        assert_eq!(tool_icon("Read"), "\u{1F4C4}");
+        assert_eq!(tool_icon("Write"), "\u{270F}\u{FE0F}");
+        assert_eq!(tool_icon("Edit"), "\u{270F}\u{FE0F}");
+        assert_eq!(tool_icon("Bash"), "\u{1F4BB}");
+        assert_eq!(tool_icon("Grep"), "\u{1F50D}");
+        assert_eq!(tool_icon("Glob"), "\u{1F50D}");
+        assert_eq!(tool_icon("WebFetch"), "\u{1F310}");
+        assert_eq!(tool_icon("WebSearch"), "\u{1F310}");
+        assert_eq!(tool_icon("Task"), "\u{1F4AD}");
+        assert_eq!(tool_icon("NotebookEdit"), "\u{1F4D3}");
+    }
+
+    #[test]
+    fn test_tool_icon_wasm_agent_tools() {
+        // lowercase/snake_case (WASM agent custom tool names)
+        assert_eq!(tool_icon("read"), "\u{1F4C4}");
+        assert_eq!(tool_icon("write"), "\u{270F}\u{FE0F}");
+        assert_eq!(tool_icon("edit"), "\u{270F}\u{FE0F}");
+        assert_eq!(tool_icon("bash"), "\u{1F4BB}");
+        assert_eq!(tool_icon("grep"), "\u{1F50D}");
+        assert_eq!(tool_icon("glob"), "\u{1F50D}");
+        assert_eq!(tool_icon("web_fetch"), "\u{1F310}");
+        assert_eq!(tool_icon("web_search"), "\u{1F310}");
+        assert_eq!(tool_icon("think"), "\u{1F4AD}");
+        assert_eq!(tool_icon("plan"), "\u{1F4DD}");
+        assert_eq!(tool_icon("switch_model"), "\u{1F504}");
+        assert_eq!(tool_icon("ask_user"), "\u{2753}");
+        assert_eq!(tool_icon("memory_search"), "\u{1F9E0}");
+        assert_eq!(tool_icon("skill_load"), "\u{1F4E6}");
+    }
+
+    #[test]
+    fn test_tool_icon_browser_tools() {
+        assert_eq!(tool_icon("browser_click"), "\u{1F5B1}");
+        assert_eq!(tool_icon("browser_click_by_id"), "\u{1F5B1}");
+        assert_eq!(tool_icon("browser_type"), "\u{2328}\u{FE0F}");
+        assert_eq!(tool_icon("browser_type_by_id"), "\u{2328}\u{FE0F}");
+        assert_eq!(tool_icon("browser_fill"), "\u{2328}\u{FE0F}");
+        assert_eq!(tool_icon("browser_fill_by_id"), "\u{2328}\u{FE0F}");
+        assert_eq!(tool_icon("browser_screenshot"), "\u{1F4F7}");
+        assert_eq!(tool_icon("browser_scroll"), "\u{2195}\u{FE0F}");
+        assert_eq!(tool_icon("browser_navigate"), "\u{1F310}");
+        assert_eq!(tool_icon("browser_get_content"), "\u{1F4CB}");
+        assert_eq!(tool_icon("browser_get_markdown"), "\u{1F4CB}");
+        assert_eq!(tool_icon("browser_wait_for"), "\u{23F1}");
+        assert_eq!(tool_icon("browser_eval_js"), "\u{1F4BB}");
+        assert_eq!(tool_icon("browser_get_elements"), "\u{1F50D}");
+        assert_eq!(tool_icon("browser_find_elements"), "\u{1F50D}");
+        assert_eq!(tool_icon("browser_element_info"), "\u{1F50D}");
+    }
+
+    #[test]
+    fn test_tool_icon_subagent_tools() {
+        assert_eq!(tool_icon("subagent_spawn"), "\u{1F916}");
+        assert_eq!(tool_icon("subagent_status"), "\u{1F916}");
+        assert_eq!(tool_icon("subagent_wait"), "\u{1F916}");
+        assert_eq!(tool_icon("subagent_kill"), "\u{1F916}");
+        assert_eq!(tool_icon("subagent_list"), "\u{1F916}");
+    }
+
+    #[test]
+    fn test_tool_icon_dynamic_tools() {
+        assert_eq!(tool_icon("tool_search"), "\u{1F50E}");
+        assert_eq!(tool_icon("tool_call_dynamic"), "\u{1F50E}");
+    }
+
+    #[test]
+    fn test_tool_icon_unknown_returns_default() {
+        assert_eq!(tool_icon("unknown_tool"), "\u{2699}\u{FE0F}");
+        assert_eq!(tool_icon("custom_mcp_tool"), "\u{2699}\u{FE0F}");
+    }
+
+    #[test]
+    fn test_tool_info_new_populates_icon() {
+        let info = ToolInfo::new("Bash", ToolStatus::Running, None);
+        assert_eq!(info.name, "Bash");
+        assert_eq!(info.icon, "\u{1F4BB}");
+        assert_eq!(info.status, ToolStatus::Running);
+        assert!(info.target.is_none());
+    }
+
+    #[test]
+    fn test_tool_info_serialization_includes_icon() {
+        let info = ToolInfo::new("browser_click", ToolStatus::Success, Some("/page".into()));
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"icon\""));
+        assert!(json.contains("\u{1F5B1}"));
+    }
+
+    #[test]
+    fn test_tool_info_deserialization_without_icon() {
+        // Sidebar may send ToolInfo without icon field — should deserialize fine
+        let json = r#"{"name":"Read","status":"running","target":null}"#;
+        let info: ToolInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.name, "Read");
+        // icon defaults to empty when deserialized (skip_deserializing)
+        assert_eq!(info.icon, "");
+    }
+}
+
+#[cfg(test)]
+mod tool_result_tests {
+    use super::*;
+
+    #[test]
+    fn test_read_result_serialization_roundtrip() {
+        let result = ReadResult {
+            total_lines: 100,
+            total_bytes: 4096,
+            returned_lines: 50,
+            offset: 10,
+            content: "fn main() {\n    println!(\"hello\");\n}".into(),
+            truncated: true,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: ReadResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.total_lines, 100);
+        assert_eq!(decoded.total_bytes, 4096);
+        assert_eq!(decoded.returned_lines, 50);
+        assert_eq!(decoded.offset, 10);
+        assert_eq!(decoded.content, "fn main() {\n    println!(\"hello\");\n}");
+        assert!(decoded.truncated);
+    }
+
+    #[test]
+    fn test_read_result_empty_file() {
+        let result = ReadResult {
+            total_lines: 0,
+            total_bytes: 0,
+            returned_lines: 0,
+            offset: 0,
+            content: String::new(),
+            truncated: false,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: ReadResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.total_lines, 0);
+        assert_eq!(decoded.total_bytes, 0);
+        assert_eq!(decoded.returned_lines, 0);
+        assert_eq!(decoded.offset, 0);
+        assert_eq!(decoded.content, "");
+        assert!(!decoded.truncated);
+    }
+
+    #[test]
+    fn test_grep_result_serialization_roundtrip() {
+        let result = GrepResult {
+            total_matches: 5,
+            total_files: 3,
+            returned: 3,
+            results: vec![
+                GrepMatch {
+                    file: "src/main.rs".into(),
+                    line: 10,
+                    content: "fn main() {".into(),
+                },
+                GrepMatch {
+                    file: "src/lib.rs".into(),
+                    line: 25,
+                    content: "pub fn init() {".into(),
+                },
+                GrepMatch {
+                    file: "tests/test.rs".into(),
+                    line: 1,
+                    content: "fn test_main() {".into(),
+                },
+            ],
+            truncated: true,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: GrepResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.total_matches, 5);
+        assert_eq!(decoded.total_files, 3);
+        assert_eq!(decoded.returned, 3);
+        assert_eq!(decoded.results.len(), 3);
+        assert_eq!(decoded.results[0].file, "src/main.rs");
+        assert_eq!(decoded.results[0].line, 10);
+        assert_eq!(decoded.results[0].content, "fn main() {");
+        assert_eq!(decoded.results[1].file, "src/lib.rs");
+        assert_eq!(decoded.results[2].line, 1);
+        assert!(decoded.truncated);
+    }
+
+    #[test]
+    fn test_grep_result_no_matches() {
+        let result = GrepResult {
+            total_matches: 0,
+            total_files: 0,
+            returned: 0,
+            results: vec![],
+            truncated: false,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: GrepResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.total_matches, 0);
+        assert_eq!(decoded.total_files, 0);
+        assert_eq!(decoded.returned, 0);
+        assert!(decoded.results.is_empty());
+        assert!(!decoded.truncated);
+    }
+
+    #[test]
+    fn test_bash_result_success() {
+        let result = BashResult {
+            exit_code: Some(0),
+            status: BashStatus::Success,
+            total_lines: 10,
+            total_bytes: 256,
+            returned_lines: 10,
+            stdout: "Hello, world!\n".into(),
+            stderr: None,
+            truncated: false,
+            hint: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: BashResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.exit_code, Some(0));
+        assert_eq!(decoded.total_lines, 10);
+        assert_eq!(decoded.total_bytes, 256);
+        assert_eq!(decoded.returned_lines, 10);
+        assert_eq!(decoded.stdout, "Hello, world!\n");
+        assert!(decoded.stderr.is_none());
+        assert!(!decoded.truncated);
+        assert!(decoded.hint.is_none());
+    }
+
+    #[test]
+    fn test_bash_result_timeout() {
+        let result = BashResult {
+            exit_code: None,
+            status: BashStatus::Timeout,
+            total_lines: 0,
+            total_bytes: 0,
+            returned_lines: 0,
+            stdout: String::new(),
+            stderr: Some("command timed out after 30s".into()),
+            truncated: false,
+            hint: Some("Command exceeded timeout limit".into()),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        let decoded: BashResult = serde_json::from_str(&json).unwrap();
+        assert!(decoded.exit_code.is_none());
+        assert_eq!(decoded.stderr.as_deref(), Some("command timed out after 30s"));
+        assert_eq!(decoded.hint.as_deref(), Some("Command exceeded timeout limit"));
+    }
+
+    #[test]
+    fn test_bash_status_serialization() {
+        // Verify serde rename_all = "snake_case" works correctly
+        assert_eq!(
+            serde_json::to_string(&BashStatus::Success).unwrap(),
+            "\"success\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BashStatus::Error).unwrap(),
+            "\"error\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BashStatus::Timeout).unwrap(),
+            "\"timeout\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BashStatus::Killed).unwrap(),
+            "\"killed\""
+        );
+
+        // Verify deserialization
+        let status: BashStatus = serde_json::from_str("\"success\"").unwrap();
+        assert!(matches!(status, BashStatus::Success));
+        let status: BashStatus = serde_json::from_str("\"timeout\"").unwrap();
+        assert!(matches!(status, BashStatus::Timeout));
     }
 }
