@@ -55,6 +55,116 @@ fn format_file_size(bytes: u64) -> String {
     }
 }
 
+/// Format a `ReadResult` into model-readable text with line numbers and metadata.
+fn format_read_result(result: &ReadResult, path: &str) -> String {
+    let mut output = String::new();
+    let end_line = result.offset + result.returned_lines;
+    let size_str = if result.total_bytes >= 1024 * 1024 {
+        format!("{:.1}MB", result.total_bytes as f64 / (1024.0 * 1024.0))
+    } else if result.total_bytes >= 1024 {
+        format!("{:.0}KB", result.total_bytes as f64 / 1024.0)
+    } else {
+        format!("{}B", result.total_bytes)
+    };
+
+    output.push_str(&format!(
+        "[File: {} | Lines: {}-{} of {} | {}]\n",
+        path,
+        result.offset + 1,
+        end_line,
+        result.total_lines,
+        size_str
+    ));
+
+    for (i, line) in result.content.lines().enumerate() {
+        let line_num = result.offset + i as u64 + 1;
+        output.push_str(&format!("{:>4}|{}\n", line_num, line));
+    }
+
+    if result.truncated {
+        let remaining = result.total_lines - end_line;
+        output.push_str(&format!(
+            "[Truncated: {} lines remaining. Use offset={} to continue.]",
+            remaining, end_line
+        ));
+    }
+
+    output
+}
+
+/// Format a `GrepResult` into model-readable text with match locations.
+fn format_grep_result(result: &GrepResult, pattern: &str) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "[Search: \"{}\" | {} matches in {} files | showing {}]\n",
+        pattern, result.total_matches, result.total_files, result.returned
+    ));
+
+    for m in &result.results {
+        output.push_str(&format!("{}:{}: {}\n", m.file, m.line, m.content));
+    }
+
+    if result.truncated {
+        let remaining = result.total_matches - result.returned;
+        output.push_str(&format!(
+            "[Truncated: {} more matches. Narrow your pattern or use max_results.]",
+            remaining
+        ));
+    }
+
+    output
+}
+
+/// Format a `BashResult` into model-readable text with status and output.
+fn format_bash_result(result: &BashResult) -> String {
+    let mut output = String::new();
+
+    let status_str = match result.status {
+        BashStatus::Success => format!("exit={}", result.exit_code.unwrap_or(0)),
+        BashStatus::Error => format!("exit={} | error", result.exit_code.unwrap_or(-1)),
+        BashStatus::Timeout => "timeout".into(),
+        BashStatus::Killed => "killed".into(),
+    };
+
+    output.push_str(&format!(
+        "[Bash: {} | {} lines]\n",
+        status_str, result.returned_lines
+    ));
+
+    if !result.stdout.is_empty() {
+        if result.stderr.is_some() {
+            output.push_str("STDOUT:\n");
+        }
+        output.push_str(&result.stdout);
+        if !result.stdout.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+
+    if let Some(stderr) = &result.stderr {
+        if !stderr.is_empty() {
+            output.push_str("STDERR:\n");
+            output.push_str(stderr);
+            if !stderr.ends_with('\n') {
+                output.push('\n');
+            }
+        }
+    }
+
+    if result.truncated {
+        output.push_str(&format!(
+            "[Truncated: showing {} of {} lines]",
+            result.returned_lines, result.total_lines
+        ));
+    }
+
+    if let Some(hint) = &result.hint {
+        output.push_str(&format!("[Hint: {}]", hint));
+    }
+
+    output
+}
+
 /// Maximum iterations in the agent loop to prevent infinite loops.
 const MAX_ITERATIONS: usize = 100;
 
@@ -177,6 +287,32 @@ fn parse_elements_from_data(data: &serde_json::Value) -> Option<ElementsCache> {
     Some(ElementsCache { elements })
 }
 
+/// Extract the best CSS selector from an element's selectors array or legacy selector field.
+fn extract_best_selector(elem: &serde_json::Value) -> String {
+    // New format: "selectors" array of {type, strategy, value}
+    if let Some(selectors) = elem.get("selectors").and_then(|v| v.as_array()) {
+        // Prefer CSS selectors (skip a11y: locators)
+        for s in selectors {
+            if s.get("type").and_then(|t| t.as_str()) == Some("css") {
+                if let Some(val) = s.get("value").and_then(|v| v.as_str()) {
+                    return val.to_string();
+                }
+            }
+        }
+        // Fallback: first selector of any type
+        if let Some(first) = selectors.first() {
+            if let Some(val) = first.get("value").and_then(|v| v.as_str()) {
+                return val.to_string();
+            }
+        }
+    }
+    // Legacy format: "selector" string
+    elem.get("selector")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Parse a single element value into a CachedElement.
 fn parse_single_element(id: &str, elem: &serde_json::Value) -> CachedElement {
     let role = elem
@@ -189,11 +325,7 @@ fn parse_single_element(id: &str, elem: &serde_json::Value) -> CachedElement {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let selector = elem
-        .get("selector")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    let selector = extract_best_selector(elem);
     let rect = elem.get("rect").and_then(|r| {
         Some(ElementRect {
             x: r.get("x")?.as_f64()?,
@@ -388,17 +520,37 @@ impl<H: HostFunctions> Agent<H> {
         // Prepend skill context with high priority if present
         let system_prompt = match &input.skill_context {
             Some(skill) => {
+                let files_section = if !skill.available_files.is_empty() {
+                    let file_list: String = skill
+                        .available_files
+                        .iter()
+                        .map(|f| format!("- {}", f))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!(
+                        r#"
+
+<available_files base_path="{}">
+{}
+</available_files>
+To read files listed above, use the `read` tool with just the filename (e.g., `resume.md`). Do NOT fabricate absolute paths."#,
+                        skill.base_path, file_list
+                    )
+                } else {
+                    String::new()
+                };
+
                 format!(
                     r#"<CRITICAL_INSTRUCTIONS priority="highest">
 The following skill instructions MUST be followed exactly. These instructions take absolute priority over all other guidance.
 
 <skill name="{}" base_path="{}">
 {}
-</skill>
+</skill>{}
 </CRITICAL_INSTRUCTIONS>
 
 {}"#,
-                    skill.name, skill.base_path, skill.content, base_prompt
+                    skill.name, skill.base_path, skill.content, files_section, base_prompt
                 )
             }
             None => base_prompt,
@@ -767,7 +919,8 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let path = tool_call.arguments["file_path"].as_str().unwrap_or("");
                 let offset = tool_call.arguments["offset"].as_u64();
                 let limit = tool_call.arguments["limit"].as_u64();
-                self.host.tool_read(path, offset, limit)?
+                let result = self.host.tool_read(path, offset, limit)?;
+                format_read_result(&result, path)
             }
             "write" => {
                 let path = tool_call.arguments["file_path"].as_str().unwrap_or("");
@@ -789,7 +942,8 @@ The following skill instructions MUST be followed exactly. These instructions ta
             "bash" => {
                 let command = tool_call.arguments["command"].as_str().unwrap_or("");
                 let timeout = tool_call.arguments["timeout"].as_u64();
-                self.host.tool_bash(command, timeout)?
+                let result = self.host.tool_bash(command, timeout)?;
+                format_bash_result(&result)
             }
             "glob" => {
                 let pattern = tool_call.arguments["pattern"].as_str().unwrap_or("*");
@@ -801,8 +955,10 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let pattern = tool_call.arguments["pattern"].as_str().unwrap_or("");
                 let path = tool_call.arguments["path"].as_str();
                 let file_type = tool_call.arguments["type"].as_str();
-                let matches = self.host.tool_grep(pattern, path, file_type)?;
-                matches.join("\n")
+                let case_insensitive = tool_call.arguments["case_insensitive"].as_bool();
+                let max_results = tool_call.arguments["max_results"].as_u64();
+                let result = self.host.tool_grep(pattern, path, file_type, case_insensitive, max_results)?;
+                format_grep_result(&result, pattern)
             }
             "memory_search" => {
                 let query = tool_call.arguments["query"].as_str().unwrap_or("");
@@ -1847,7 +2003,7 @@ Ask for permission before destructive operations."#;
         // Add file tools
         tools.push(ToolDefinition {
             name: "read".into(),
-            description: "Read a file from the filesystem".into(),
+            description: "Read file contents. Returns partial content with metadata (total_lines, total_bytes). Default: first 200 lines. Use offset/limit to paginate. Prefer this over Bash for file reading.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1916,7 +2072,7 @@ Ask for permission before destructive operations."#;
 
         tools.push(ToolDefinition {
             name: "bash".into(),
-            description: "Execute a bash command".into(),
+            description: "Execute a shell command. Returns structured output with exit code and status. Default timeout: 30s. Output capped at 200 lines. Only use when Read/Grep/Glob cannot accomplish the task.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1954,7 +2110,7 @@ Ask for permission before destructive operations."#;
 
         tools.push(ToolDefinition {
             name: "grep".into(),
-            description: "Search file contents".into(),
+            description: "Search file contents with regex. Returns structured matches with counts (total_matches, total_files). Default: first 50 results. Supports file type filter. Respects .gitignore. Prefer this over Bash for text search.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1968,7 +2124,15 @@ Ask for permission before destructive operations."#;
                     },
                     "type": {
                         "type": "string",
-                        "description": "File type filter (e.g., 'rs', 'py')"
+                        "description": "File type filter (e.g., 'rs', 'py', 'js') \u{2014} same types as ripgrep"
+                    },
+                    "case_insensitive": {
+                        "type": "boolean",
+                        "description": "Case insensitive search (default: false)"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum results to return (default: 50)"
                     }
                 },
                 "required": ["pattern"]
@@ -3166,8 +3330,8 @@ mod tests {
     fn test_parse_elements_from_data_refs_format() {
         let data = serde_json::json!({
             "refs": {
-                "e1": {"name": "Submit", "role": "button", "selector": "#submit", "rect": {"x": 10.0, "y": 20.0, "width": 100.0, "height": 30.0}},
-                "e2": {"name": "Email", "role": "textbox", "selector": "input[name=email]"}
+                "e1": {"name": "Submit", "role": "button", "selectors": [{"type": "css", "strategy": "id", "value": "#submit"}], "rect": {"x": 10.0, "y": 20.0, "width": 100.0, "height": 30.0}},
+                "e2": {"name": "Email", "role": "textbox", "selectors": [{"type": "css", "strategy": "css", "value": "input[name=email]"}]}
             }
         });
         let cache = parse_elements_from_data(&data).unwrap();
@@ -3176,6 +3340,7 @@ mod tests {
         let e1 = cache.elements.iter().find(|e| e.id == "e1").unwrap();
         assert_eq!(e1.role, "button");
         assert_eq!(e1.name, "Submit");
+        assert_eq!(e1.selector, "#submit");
         assert!(e1.rect.is_some());
         let rect = e1.rect.as_ref().unwrap();
         assert_eq!(rect.x, 10.0);
@@ -3183,6 +3348,7 @@ mod tests {
 
         let e2 = cache.elements.iter().find(|e| e.id == "e2").unwrap();
         assert_eq!(e2.role, "textbox");
+        assert_eq!(e2.selector, "input[name=email]");
         assert!(e2.rect.is_none());
     }
 
@@ -3652,7 +3818,7 @@ mod tests {
         };
         let result = agent.execute_tool(&tool_call).unwrap();
 
-        // Mock returns elements array format
+        // Mock returns refs map format with selectors array
         let parsed: serde_json::Value = serde_json::from_str(&result.content).unwrap();
         assert_eq!(parsed["success"], true);
         assert_eq!(parsed["element_count"], 2);
