@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::config::AuthConfig;
+
 /// Authorization rule
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthRule {
@@ -153,6 +155,133 @@ impl AuthStore {
     /// Check if the store is empty.
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
+    }
+}
+
+/// Result of an authorization check.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AuthCheckResult {
+    /// Allowed - proceed with tool execution.
+    Allowed,
+    /// Denied - reject with reason.
+    Denied(String),
+    /// Needs user confirmation - present options to sidebar.
+    NeedsConfirmation {
+        detail: String,
+        options: Vec<(String, String)>, // (label, scope)
+    },
+}
+
+/// Tool type for authorization context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolType {
+    Read,
+    Grep,
+    Bash,
+}
+
+/// Check authorization for a tool operation.
+///
+/// 4-step flow:
+/// 1. Sensitive file check (always require confirmation)
+/// 2. Existing session rules (allow/deny)
+/// 3. Config allowed/denied commands (for Bash)
+/// 4. Working directory auto-allow (Read/Grep only) or needs confirmation
+pub fn check_authorization(
+    tool: ToolType,
+    path_or_command: &str,
+    working_dir: &str,
+    store: &AuthStore,
+    config: &AuthConfig,
+) -> AuthCheckResult {
+    // Step 1: Sensitive file check (applies to Read/Grep paths)
+    if tool == ToolType::Read || tool == ToolType::Grep {
+        for pattern in &config.sensitive_patterns {
+            let matcher = AuthMatcher::SensitivePattern {
+                pattern: pattern.clone(),
+            };
+            if matcher.matches(path_or_command) {
+                return AuthCheckResult::NeedsConfirmation {
+                    detail: format!("Sensitive file: {}", path_or_command),
+                    options: vec![
+                        ("Allow once".into(), "once".into()),
+                        ("Deny".into(), "once".into()),
+                    ],
+                };
+            }
+        }
+    }
+
+    // Step 2: Check existing session rules
+    if let Some(decision) = store.check(path_or_command) {
+        return match decision {
+            AuthDecision::Allow => AuthCheckResult::Allowed,
+            AuthDecision::Deny => AuthCheckResult::Denied(format!(
+                "Denied by session rule: {}",
+                path_or_command
+            )),
+        };
+    }
+
+    // Step 3: Config denied/allowed commands (for Bash)
+    if tool == ToolType::Bash {
+        // Check denied commands first (deny overrides allow)
+        for denied in &config.denied_commands {
+            let program = denied.trim_end_matches(" *").to_string();
+            let matcher = AuthMatcher::CommandPrefix { program };
+            if matcher.matches(path_or_command) {
+                return AuthCheckResult::Denied(format!(
+                    "Command denied by config: {}",
+                    path_or_command
+                ));
+            }
+        }
+
+        // Check allowed commands
+        for allowed in &config.allowed_commands {
+            let program = allowed.trim_end_matches(" *").to_string();
+            let matcher = AuthMatcher::CommandPrefix { program };
+            if matcher.matches(path_or_command) {
+                return AuthCheckResult::Allowed;
+            }
+        }
+    }
+
+    // Step 4: Working directory check
+    let is_inside_workdir = path_or_command.starts_with(working_dir);
+    match tool {
+        ToolType::Read | ToolType::Grep => {
+            if config.workspace_auto_allow && is_inside_workdir {
+                return AuthCheckResult::Allowed;
+            }
+            // Outside working dir - needs confirmation with path-based options
+            AuthCheckResult::NeedsConfirmation {
+                detail: path_or_command.to_string(),
+                options: vec![
+                    ("Allow once".into(), "once".into()),
+                    ("Always allow this file".into(), "session".into()),
+                    (
+                        format!("Always allow files under {}", working_dir),
+                        "session".into(),
+                    ),
+                    ("Deny".into(), "once".into()),
+                ],
+            }
+        }
+        ToolType::Bash => {
+            // Bash always needs confirmation for unknown commands
+            let parts: Vec<&str> = path_or_command.splitn(2, ' ').collect();
+            let program = parts.first().unwrap_or(&"");
+            AuthCheckResult::NeedsConfirmation {
+                detail: path_or_command.to_string(),
+                options: vec![
+                    ("Allow once".into(), "once".into()),
+                    ("Always allow this command".into(), "session".into()),
+                    (format!("Always allow {} *", program), "session".into()),
+                    ("Deny".into(), "once".into()),
+                ],
+            }
+        }
     }
 }
 
@@ -459,5 +588,281 @@ mod tests {
         assert_eq!(deserialized.decision, rule.decision);
         assert_eq!(deserialized.source, rule.source);
         assert_eq!(deserialized.created_at, rule.created_at);
+    }
+
+    // --- check_authorization tests ---
+
+    fn test_auth_config() -> AuthConfig {
+        AuthConfig {
+            workspace_auto_allow: true,
+            allowed_commands: vec![
+                "cargo *".to_string(),
+                "git *".to_string(),
+            ],
+            sensitive_patterns: vec![
+                ".env".to_string(),
+                "*credential*".to_string(),
+            ],
+            denied_commands: vec![
+                "sudo *".to_string(),
+            ],
+        }
+    }
+
+    #[test]
+    fn test_check_sensitive_file_read() {
+        let store = AuthStore::new();
+        let config = test_auth_config();
+        let result = check_authorization(
+            ToolType::Read,
+            "/home/user/project/.env",
+            "/home/user/project",
+            &store,
+            &config,
+        );
+        match result {
+            AuthCheckResult::NeedsConfirmation { detail, .. } => {
+                assert!(detail.contains("Sensitive file"));
+                assert!(detail.contains(".env"));
+            }
+            other => panic!("Expected NeedsConfirmation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_check_sensitive_file_grep() {
+        let store = AuthStore::new();
+        let config = test_auth_config();
+        let result = check_authorization(
+            ToolType::Grep,
+            "/home/user/credentials.json",
+            "/home/user",
+            &store,
+            &config,
+        );
+        match result {
+            AuthCheckResult::NeedsConfirmation { detail, .. } => {
+                assert!(detail.contains("Sensitive file"));
+                assert!(detail.contains("credential"));
+            }
+            other => panic!("Expected NeedsConfirmation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_check_sensitive_bash_not_checked() {
+        // Bash doesn't check sensitive file patterns (it checks commands, not paths)
+        let store = AuthStore::new();
+        let config = test_auth_config();
+        let result = check_authorization(
+            ToolType::Bash,
+            "cat /home/user/.env",
+            "/home/user",
+            &store,
+            &config,
+        );
+        // Should NOT trigger sensitive file check; should go through command checks
+        // "cat" is not in allowed or denied commands, so it should be NeedsConfirmation
+        // but NOT with a "Sensitive file" detail
+        match result {
+            AuthCheckResult::NeedsConfirmation { detail, .. } => {
+                assert!(!detail.contains("Sensitive file"));
+            }
+            _ => {} // Other results are also acceptable as long as it's not sensitive-file triggered
+        }
+    }
+
+    #[test]
+    fn test_check_session_rule_allow() {
+        let mut store = AuthStore::new();
+        store.add_rule(
+            AuthMatcher::ExactPath {
+                path: "/tmp/allowed.txt".to_string(),
+            },
+            AuthDecision::Allow,
+        );
+        let config = test_auth_config();
+        let result = check_authorization(
+            ToolType::Read,
+            "/tmp/allowed.txt",
+            "/home/user/project",
+            &store,
+            &config,
+        );
+        assert_eq!(result, AuthCheckResult::Allowed);
+    }
+
+    #[test]
+    fn test_check_session_rule_deny() {
+        let mut store = AuthStore::new();
+        store.add_rule(
+            AuthMatcher::ExactPath {
+                path: "/tmp/denied.txt".to_string(),
+            },
+            AuthDecision::Deny,
+        );
+        let config = test_auth_config();
+        let result = check_authorization(
+            ToolType::Read,
+            "/tmp/denied.txt",
+            "/home/user/project",
+            &store,
+            &config,
+        );
+        match result {
+            AuthCheckResult::Denied(reason) => {
+                assert!(reason.contains("Denied by session rule"));
+            }
+            other => panic!("Expected Denied, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_check_config_denied_command() {
+        let store = AuthStore::new();
+        let config = test_auth_config();
+        let result = check_authorization(
+            ToolType::Bash,
+            "sudo rm -rf /",
+            "/home/user/project",
+            &store,
+            &config,
+        );
+        match result {
+            AuthCheckResult::Denied(reason) => {
+                assert!(reason.contains("Command denied by config"));
+            }
+            other => panic!("Expected Denied, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_check_config_allowed_command() {
+        let store = AuthStore::new();
+        let config = test_auth_config();
+        let result = check_authorization(
+            ToolType::Bash,
+            "cargo test",
+            "/home/user/project",
+            &store,
+            &config,
+        );
+        assert_eq!(result, AuthCheckResult::Allowed);
+    }
+
+    #[test]
+    fn test_check_denied_overrides_allowed() {
+        let store = AuthStore::new();
+        // Create config where a command matches both denied and allowed
+        let config = AuthConfig {
+            workspace_auto_allow: true,
+            allowed_commands: vec!["cargo *".to_string()],
+            sensitive_patterns: vec![],
+            denied_commands: vec!["cargo *".to_string()],
+        };
+        let result = check_authorization(
+            ToolType::Bash,
+            "cargo test",
+            "/home/user/project",
+            &store,
+            &config,
+        );
+        // Denied should take precedence since it is checked first
+        match result {
+            AuthCheckResult::Denied(reason) => {
+                assert!(reason.contains("Command denied by config"));
+            }
+            other => panic!("Expected Denied, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_check_workspace_auto_allow_read() {
+        let store = AuthStore::new();
+        let config = test_auth_config();
+        let result = check_authorization(
+            ToolType::Read,
+            "/home/user/project/src/main.rs",
+            "/home/user/project",
+            &store,
+            &config,
+        );
+        assert_eq!(result, AuthCheckResult::Allowed);
+    }
+
+    #[test]
+    fn test_check_workspace_auto_allow_grep() {
+        let store = AuthStore::new();
+        let config = test_auth_config();
+        let result = check_authorization(
+            ToolType::Grep,
+            "/home/user/project/src/lib.rs",
+            "/home/user/project",
+            &store,
+            &config,
+        );
+        assert_eq!(result, AuthCheckResult::Allowed);
+    }
+
+    #[test]
+    fn test_check_read_outside_workdir() {
+        let store = AuthStore::new();
+        let config = test_auth_config();
+        let result = check_authorization(
+            ToolType::Read,
+            "/etc/passwd",
+            "/home/user/project",
+            &store,
+            &config,
+        );
+        match result {
+            AuthCheckResult::NeedsConfirmation { detail, options } => {
+                assert_eq!(detail, "/etc/passwd");
+                assert!(options.len() >= 3);
+            }
+            other => panic!("Expected NeedsConfirmation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_check_bash_unknown_command() {
+        let store = AuthStore::new();
+        let config = test_auth_config();
+        let result = check_authorization(
+            ToolType::Bash,
+            "python script.py",
+            "/home/user/project",
+            &store,
+            &config,
+        );
+        match result {
+            AuthCheckResult::NeedsConfirmation { detail, options } => {
+                assert_eq!(detail, "python script.py");
+                // Should include program-specific option
+                let option_labels: Vec<&str> = options.iter().map(|(l, _)| l.as_str()).collect();
+                assert!(option_labels.iter().any(|l| l.contains("python")));
+            }
+            other => panic!("Expected NeedsConfirmation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_check_workspace_auto_allow_disabled() {
+        let store = AuthStore::new();
+        let mut config = test_auth_config();
+        config.workspace_auto_allow = false;
+        let result = check_authorization(
+            ToolType::Read,
+            "/home/user/project/src/main.rs",
+            "/home/user/project",
+            &store,
+            &config,
+        );
+        match result {
+            AuthCheckResult::NeedsConfirmation { detail, .. } => {
+                assert_eq!(detail, "/home/user/project/src/main.rs");
+            }
+            other => panic!("Expected NeedsConfirmation, got {:?}", other),
+        }
     }
 }
