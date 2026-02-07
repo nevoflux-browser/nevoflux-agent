@@ -123,6 +123,8 @@ pub struct SidebarStreamChunk {
     pub text: String,
     /// Whether this is the final chunk.
     pub done: bool,
+    /// Optional tool event to send alongside the text stream.
+    pub event: Option<nevoflux_protocol::ToolEvent>,
 }
 
 /// Daemon's implementation of HostFunctions for the Agent.
@@ -2421,6 +2423,7 @@ impl HostFunctions for DaemonHostFunctions {
             let chunk = SidebarStreamChunk {
                 text: text.to_string(),
                 done: false,
+                event: None,
             };
             tx.send(chunk).map_err(|_| HostError {
                 code: 500,
@@ -2439,6 +2442,7 @@ impl HostFunctions for DaemonHostFunctions {
             let chunk = SidebarStreamChunk {
                 text: String::new(),
                 done: true,
+                event: None,
             };
             tx.send(chunk).map_err(|_| HostError {
                 code: 500,
@@ -2474,6 +2478,22 @@ impl HostFunctions for DaemonHostFunctions {
 }
 
 impl DaemonHostFunctions {
+    /// Send a tool event to the sidebar without any text content.
+    pub fn stream_tool_event(&self, event: nevoflux_protocol::ToolEvent) -> HostResult<()> {
+        if let Some(tx) = &self.sidebar_stream_tx {
+            let chunk = SidebarStreamChunk {
+                text: String::new(),
+                done: false,
+                event: Some(event),
+            };
+            tx.send(chunk).map_err(|_| HostError {
+                code: 500,
+                message: "stream closed".to_string(),
+            })?;
+        }
+        Ok(())
+    }
+
     /// Create a clone for builtin proxy calls to avoid infinite recursion.
     fn clone_for_builtin(&self) -> Self {
         Self {

@@ -12,6 +12,7 @@ use bytes::Bytes;
 use nevoflux_builtin_wasm::{Agent, AgentInput, AgentMode, Attachment, Message as WasmMessage};
 use nevoflux_protocol::{
     AgentMessage, Channel, DaemonEnvelope, PlanProposal, PlanResponse, ProxyEnvelope,
+    ToolAuthResponse,
 };
 use nevoflux_skills::{check_tool_availability, format_missing_tools_message, ToolCheckResult};
 use nevoflux_storage::{ListSessionsParams, Message as StorageMessage, MessageRole};
@@ -37,6 +38,10 @@ type CancellationRegistry = Arc<Mutex<HashMap<String, tokio_util::sync::Cancella
 /// Registry for active agent interrupt flags.
 /// Maps session_id to the interrupt flag so stop_generation can signal the agent to stop.
 type InterruptRegistry = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
+
+/// Registry for pending tool authorization requests.
+/// Maps tool_id to the response sender.
+type ToolAuthRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<ToolAuthResponse>>>>;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -128,6 +133,9 @@ pub async fn start_server(
 
     // Create plan request registry for pending plan proposals
     let plan_registry: PlanRequestRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+    // Create tool auth registry for pending tool authorization requests
+    let tool_auth_registry: ToolAuthRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     let services = HostServices::new(Arc::new(db)).with_browser_sender(browser_tx);
 
@@ -288,6 +296,7 @@ pub async fn start_server(
     let process_cancellation_registry = cancellation_registry.clone();
     let process_interrupt_registry = interrupt_registry.clone();
     let process_plan_registry = plan_registry.clone();
+    let process_tool_auth_registry = tool_auth_registry.clone();
     let process_trace_enabled = config.trace_enabled;
     tokio::spawn(async move {
         while let Some((identity, envelope)) = msg_rx.recv().await {
@@ -417,6 +426,26 @@ pub async fn start_server(
                             let _ = tx.send(response);
                         } else {
                             warn!("No pending plan request for session: {}", session_id);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Check for ToolAuthResponse messages from frontend
+            if msg_type == "tool_auth_response" {
+                info!("Processing tool_auth_response message");
+                if let Some(payload) = envelope.payload.get("payload") {
+                    if let Ok(response) =
+                        serde_json::from_value::<ToolAuthResponse>(payload.clone())
+                    {
+                        let tool_id = response.tool_id.clone();
+                        if let Some(tx) =
+                            process_tool_auth_registry.lock().await.remove(&tool_id)
+                        {
+                            let _ = tx.send(response);
+                        } else {
+                            warn!("No pending tool auth request for tool_id: {}", tool_id);
                         }
                     }
                 }
@@ -891,6 +920,13 @@ async fn handle_chat_message_streaming(
                                 }
                             });
 
+                            // Add event if present
+                            if let Some(event) = &chunk.event {
+                                if let Some(p) = chunk_payload.get_mut("payload") {
+                                    p["event"] = serde_json::to_value(event).unwrap_or_default();
+                                }
+                            }
+
                             // Include session title on first chunk if available
                             if !accumulated_text.is_empty() && accumulated_text == chunk.text {
                                 if let Some(ref title) = stream_title {
@@ -1065,13 +1101,20 @@ async fn handle_chat_message_streaming(
                             let mut rerun_accumulated = String::new();
                             while let Some(chunk) = rerun_stream_rx.recv().await {
                                 rerun_accumulated.push_str(&chunk.text);
-                                let chunk_payload = serde_json::json!({
+                                let mut chunk_payload = serde_json::json!({
                                     "type": "stream_chunk",
                                     "payload": {
                                         "content": chunk.text,
                                         "done": chunk.done
                                     }
                                 });
+
+                                // Add event if present
+                                if let Some(event) = &chunk.event {
+                                    if let Some(p) = chunk_payload.get_mut("payload") {
+                                        p["event"] = serde_json::to_value(event).unwrap_or_default();
+                                    }
+                                }
                                 let response = DaemonEnvelope::new(
                                     &rerun_proxy_id,
                                     rerun_channel,
