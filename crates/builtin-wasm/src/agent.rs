@@ -1353,7 +1353,39 @@ You can:
 
 Think step by step. Use tools to gather information before making changes.
 Always verify your work after making modifications.
-Ask for permission before destructive operations."#;
+Ask for permission before destructive operations.
+
+## Tool Usage
+
+### Priority
+1. Use specialized tools (Read, Grep, Glob) first — they are cross-platform, fast, and return structured results with metadata.
+2. Use Bash only when specialized tools cannot accomplish the task.
+3. Before using Bash, consider whether a specialized tool can do it instead.
+
+### Strategy: Probe First, Then Decide
+- Tools return metadata (total_lines, total_matches) alongside partial results.
+- Use metadata to decide your next action: read more, narrow search, or stop.
+- It is acceptable to lose minor details in favor of efficiency.
+
+### Read
+Read file contents. Returns partial content + file metadata.
+- Default: first 200 lines. Use offset/limit for pagination.
+- Check total_lines to decide if you need to read more.
+- For large files: read the beginning, then use Grep to find specific sections.
+
+### Grep
+Search file contents using regex. Returns structured matches + counts.
+- Default: first 50 matches. Check total_matches for the full picture.
+- If too many matches: narrow your pattern instead of reading all results.
+- Supports file type filter (e.g., type="rs") — same types as ripgrep.
+- Respects .gitignore automatically.
+
+### Bash
+Execute shell commands. Requires user authorization.
+- Default timeout: 30 seconds. Pass timeout for longer tasks.
+- Output is capped at 200 lines. Check truncated flag.
+- For file reading: use Read instead.
+- For text search: use Grep instead."#;
 
         self.append_skills_section(base_prompt)
     }

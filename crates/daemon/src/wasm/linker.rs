@@ -1398,19 +1398,47 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
                     }
                 };
 
-                // Apply offset and limit
-                let start = (offset as usize).min(content.len());
-                let end = if limit > 0 {
-                    (start + limit as usize).min(content.len())
+                let total_bytes = content.len() as u64;
+                let total_lines = content.lines().count() as u64;
+
+                // Apply offset and limit (line-based)
+                let lines: Vec<&str> = content.lines().collect();
+                let start_line = (offset as usize).min(lines.len());
+                let end_line = if limit > 0 {
+                    (start_line + limit as usize).min(lines.len())
                 } else {
-                    content.len()
+                    lines.len()
                 };
 
-                let slice = &content.as_bytes()[start..end];
-                let write_len = slice.len().min(result_len as usize);
+                let selected: Vec<&str> = lines[start_line..end_line].to_vec();
+                let returned_lines = selected.len() as u64;
+                let truncated = end_line < lines.len();
+                let selected_content = selected.join("\n");
+
+                let read_result = nevoflux_protocol::ReadResult {
+                    total_lines,
+                    total_bytes,
+                    returned_lines,
+                    offset: start_line as u64,
+                    content: selected_content,
+                    truncated,
+                };
+
+                let json = match serde_json::to_string(&read_result) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        caller
+                            .data_mut()
+                            .set_error(format!("Failed to serialize ReadResult: {}", e));
+                        return -1;
+                    }
+                };
+
+                let json_bytes = json.as_bytes();
+                let write_len = json_bytes.len().min(result_len as usize);
 
                 if memory
-                    .write(&mut caller, result_ptr as usize, &slice[..write_len])
+                    .write(&mut caller, result_ptr as usize, &json_bytes[..write_len])
                     .is_err()
                 {
                     return -1;
@@ -2244,6 +2272,18 @@ mod tests {
         let temp_path = temp_file.path().to_string_lossy().to_string();
         let path_len = temp_path.len();
 
+        // Build expected JSON to know the expected byte count
+        let expected_result = nevoflux_protocol::ReadResult {
+            total_lines: 1,
+            total_bytes: 13,
+            returned_lines: 1,
+            offset: 0,
+            content: "Hello, World!".into(),
+            truncated: false,
+        };
+        let expected_json = serde_json::to_string(&expected_result).unwrap();
+        let expected_len = expected_json.len();
+
         // Create WAT with the path embedded
         let wat = format!(
             r#"
@@ -2257,7 +2297,7 @@ mod tests {
                     i64.const 0    ;; offset
                     i64.const 0    ;; limit (0 = no limit)
                     i32.const 200  ;; result_ptr
-                    i32.const 256  ;; result_len
+                    i32.const 1024 ;; result_len (larger for JSON)
                     call $tool_read
                 )
             )
@@ -2276,7 +2316,23 @@ mod tests {
             .expect("Failed to get test function");
 
         let result = test_func.call(&mut store, ()).expect("Failed to call test");
-        assert_eq!(result, 13); // "Hello, World!".len()
+        assert_eq!(result as usize, expected_len); // JSON-serialized ReadResult length
+
+        // Verify the JSON content written to memory
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("Failed to get memory");
+        let mut buf = vec![0u8; result as usize];
+        memory
+            .read(&store, 200, &mut buf)
+            .expect("Failed to read memory");
+        let json_str = String::from_utf8(buf).expect("Invalid UTF-8");
+        let read_result: nevoflux_protocol::ReadResult =
+            serde_json::from_str(&json_str).expect("Invalid JSON");
+        assert_eq!(read_result.content, "Hello, World!");
+        assert_eq!(read_result.total_lines, 1);
+        assert_eq!(read_result.total_bytes, 13);
+        assert!(!read_result.truncated);
     }
 
     #[test]
@@ -2286,15 +2342,15 @@ mod tests {
         let engine = Engine::default();
         let linker = create_linker(&engine).expect("Failed to create linker");
 
-        // Create a temporary file to read
+        // Create a temporary file with multiple lines
         let mut temp_file = tempfile::NamedTempFile::new().expect("Failed to create temp file");
         temp_file
-            .write_all(b"Hello, World!")
+            .write_all(b"line one\nline two\nline three\nline four\nline five")
             .expect("Failed to write temp file");
         let temp_path = temp_file.path().to_string_lossy().to_string();
         let path_len = temp_path.len();
 
-        // Create WAT with offset=7 and limit=5 to read "World"
+        // offset=1 means skip first line, limit=2 means read 2 lines
         let wat = format!(
             r#"
             (module
@@ -2304,10 +2360,10 @@ mod tests {
                 (func (export "test") (result i32)
                     i32.const 0    ;; path_ptr
                     i32.const {}   ;; path_len
-                    i64.const 7    ;; offset (skip "Hello, ")
-                    i64.const 5    ;; limit (read "World")
+                    i64.const 1    ;; offset (skip 1 line)
+                    i64.const 2    ;; limit (read 2 lines)
                     i32.const 200  ;; result_ptr
-                    i32.const 256  ;; result_len
+                    i32.const 1024 ;; result_len (larger for JSON)
                     call $tool_read
                 )
             )
@@ -2326,7 +2382,24 @@ mod tests {
             .expect("Failed to get test function");
 
         let result = test_func.call(&mut store, ()).expect("Failed to call test");
-        assert_eq!(result, 5); // "World".len()
+        assert!(result > 0);
+
+        // Verify the JSON content
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .expect("Failed to get memory");
+        let mut buf = vec![0u8; result as usize];
+        memory
+            .read(&store, 200, &mut buf)
+            .expect("Failed to read memory");
+        let json_str = String::from_utf8(buf).expect("Invalid UTF-8");
+        let read_result: nevoflux_protocol::ReadResult =
+            serde_json::from_str(&json_str).expect("Invalid JSON");
+        assert_eq!(read_result.content, "line two\nline three");
+        assert_eq!(read_result.offset, 1);
+        assert_eq!(read_result.returned_lines, 2);
+        assert_eq!(read_result.total_lines, 5);
+        assert!(read_result.truncated); // 2 lines remaining
     }
 
     #[test]
