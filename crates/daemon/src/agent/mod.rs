@@ -1,6 +1,7 @@
 //! Agent execution module.
 
 pub mod abi;
+pub mod auth;
 pub mod computer_tools;
 pub mod runner;
 pub mod streaming;
