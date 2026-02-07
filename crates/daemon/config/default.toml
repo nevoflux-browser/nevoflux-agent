@@ -122,3 +122,16 @@
 
 # Whether to use JSON format for logs
 # json_format = false
+
+[auth]
+# Auto-allow Read/Grep inside working directory
+# workspace_auto_allow = true
+
+# Global command whitelist (commands matching these are auto-allowed)
+# allowed_commands = ["cargo *", "git *", "npm *", "just *"]
+
+# Sensitive file patterns (always require confirmation)
+# sensitive_patterns = [".env*", "*credential*", "*secret*", "*_key*", "*.pem"]
+
+# Denied command patterns (always denied)
+# denied_commands = []

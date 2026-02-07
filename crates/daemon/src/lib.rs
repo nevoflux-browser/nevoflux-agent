@@ -43,8 +43,8 @@ pub mod validation;
 pub mod wasm;
 
 pub use config::{
-    AgentConfig, ConfigError, ContextConfig, DaemonConfig, LlmConfig, LoggingConfig, SessionConfig,
-    StorageConfig,
+    AgentConfig, AuthConfig, ConfigError, ContextConfig, DaemonConfig, LlmConfig, LoggingConfig,
+    SessionConfig, StorageConfig,
 };
 pub use config_watcher::{create_config_watcher, ConfigReceiver, ConfigWatcher, WatcherError};
 pub use error::{DaemonError, Result};

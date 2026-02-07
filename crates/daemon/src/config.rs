@@ -48,6 +48,10 @@ pub struct AgentConfig {
     /// Logging configuration.
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    /// Authorization configuration.
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 impl AgentConfig {
@@ -186,6 +190,24 @@ impl AgentConfig {
         }
         if other.logging.file.is_some() {
             self.logging.file = other.logging.file.clone();
+        }
+
+        // Merge auth config
+        if other.auth.workspace_auto_allow != AuthConfig::default().workspace_auto_allow {
+            self.auth.workspace_auto_allow = other.auth.workspace_auto_allow;
+        }
+        if !other.auth.allowed_commands.is_empty()
+            && other.auth.allowed_commands != default_allowed_commands()
+        {
+            self.auth.allowed_commands = other.auth.allowed_commands.clone();
+        }
+        if !other.auth.sensitive_patterns.is_empty()
+            && other.auth.sensitive_patterns != default_sensitive_patterns()
+        {
+            self.auth.sensitive_patterns = other.auth.sensitive_patterns.clone();
+        }
+        if !other.auth.denied_commands.is_empty() {
+            self.auth.denied_commands = other.auth.denied_commands.clone();
         }
     }
 }
@@ -723,6 +745,55 @@ impl SubagentConfig {
     }
 }
 
+// ==================== AuthConfig ====================
+
+/// Authorization configuration for tool access control.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// Auto-allow Read/Grep inside working directory.
+    #[serde(default = "default_true")]
+    pub workspace_auto_allow: bool,
+    /// Global command whitelist patterns (e.g. "cargo *", "git *").
+    #[serde(default = "default_allowed_commands")]
+    pub allowed_commands: Vec<String>,
+    /// Sensitive file patterns (e.g. ".env*", "*credential*").
+    #[serde(default = "default_sensitive_patterns")]
+    pub sensitive_patterns: Vec<String>,
+    /// Denied command patterns (e.g. "rm -rf *", "sudo *").
+    #[serde(default)]
+    pub denied_commands: Vec<String>,
+}
+
+fn default_allowed_commands() -> Vec<String> {
+    vec![
+        "cargo *".to_string(),
+        "git *".to_string(),
+        "npm *".to_string(),
+        "just *".to_string(),
+    ]
+}
+
+fn default_sensitive_patterns() -> Vec<String> {
+    vec![
+        ".env*".to_string(),
+        "*credential*".to_string(),
+        "*secret*".to_string(),
+        "*_key*".to_string(),
+        "*.pem".to_string(),
+    ]
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            workspace_auto_allow: true,
+            allowed_commands: default_allowed_commands(),
+            sensitive_patterns: default_sensitive_patterns(),
+            denied_commands: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,5 +1211,89 @@ max_concurrent = 2
         assert_eq!(config.timeout_secs, 300); // default
         assert_eq!(config.memory_pages, 4096); // default
         assert!(config.fuel_limit.is_none()); // default
+    }
+
+    // ==================== AuthConfig Tests ====================
+
+    #[test]
+    fn test_auth_config_defaults() {
+        let config = AuthConfig::default();
+
+        assert!(config.workspace_auto_allow);
+        assert_eq!(
+            config.allowed_commands,
+            vec!["cargo *", "git *", "npm *", "just *"]
+        );
+        assert_eq!(
+            config.sensitive_patterns,
+            vec![".env*", "*credential*", "*secret*", "*_key*", "*.pem"]
+        );
+        assert!(config.denied_commands.is_empty());
+    }
+
+    #[test]
+    fn test_auth_config_toml_parsing() {
+        let toml_str = r#"
+workspace_auto_allow = false
+allowed_commands = ["cargo *", "git *", "make *"]
+sensitive_patterns = [".env*", "*.key"]
+denied_commands = ["rm -rf *", "sudo *"]
+"#;
+        let config: AuthConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.workspace_auto_allow);
+        assert_eq!(config.allowed_commands, vec!["cargo *", "git *", "make *"]);
+        assert_eq!(config.sensitive_patterns, vec![".env*", "*.key"]);
+        assert_eq!(config.denied_commands, vec!["rm -rf *", "sudo *"]);
+    }
+
+    #[test]
+    fn test_auth_config_partial_toml() {
+        let toml_str = r#"
+denied_commands = ["sudo *"]
+"#;
+        let config: AuthConfig = toml::from_str(toml_str).unwrap();
+        // Defaults should be used for unspecified fields
+        assert!(config.workspace_auto_allow);
+        assert_eq!(
+            config.allowed_commands,
+            vec!["cargo *", "git *", "npm *", "just *"]
+        );
+        assert_eq!(
+            config.sensitive_patterns,
+            vec![".env*", "*credential*", "*secret*", "*_key*", "*.pem"]
+        );
+        assert_eq!(config.denied_commands, vec!["sudo *"]);
+    }
+
+    #[test]
+    fn test_agent_config_includes_auth() {
+        let config = AgentConfig::default();
+
+        assert!(config.auth.workspace_auto_allow);
+        assert_eq!(config.auth.allowed_commands.len(), 4);
+        assert_eq!(config.auth.sensitive_patterns.len(), 5);
+        assert!(config.auth.denied_commands.is_empty());
+    }
+
+    #[test]
+    fn test_auth_config_merge() {
+        let mut base = AgentConfig::default();
+        let mut other = AgentConfig::default();
+
+        // Modify auth in other
+        other.auth.workspace_auto_allow = false;
+        other.auth.allowed_commands = vec!["cargo *".to_string(), "make *".to_string()];
+        other.auth.sensitive_patterns = vec![".env*".to_string()];
+        other.auth.denied_commands = vec!["sudo *".to_string()];
+
+        base.merge(&other);
+
+        assert!(!base.auth.workspace_auto_allow);
+        assert_eq!(
+            base.auth.allowed_commands,
+            vec!["cargo *", "make *"]
+        );
+        assert_eq!(base.auth.sensitive_patterns, vec![".env*"]);
+        assert_eq!(base.auth.denied_commands, vec!["sudo *"]);
     }
 }
