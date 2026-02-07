@@ -1429,54 +1429,81 @@ impl HostFunctions for DaemonHostFunctions {
         &self,
         pattern: &str,
         path: Option<&str>,
-        _file_type: Option<&str>,
-        _case_insensitive: Option<bool>,
-        _max_results: Option<u64>,
+        file_type: Option<&str>,
+        case_insensitive: Option<bool>,
+        max_results: Option<u64>,
     ) -> HostResult<GrepResult> {
-        use std::process::Command;
+        use grep_regex::RegexMatcherBuilder;
+        use grep_searcher::{sinks::UTF8, SearcherBuilder};
 
         let start = std::time::Instant::now();
-        let mut cmd = Command::new("grep");
-        cmd.arg("-r").arg("-n").arg(pattern);
+        let search_path = path.unwrap_or(".");
+        let max = max_results.unwrap_or(50) as usize;
 
-        if let Some(p) = path {
-            cmd.arg(p);
-        } else {
-            cmd.arg(".");
-        }
+        let result: HostResult<GrepResult> = (|| {
+            let matcher = RegexMatcherBuilder::new()
+                .case_insensitive(case_insensitive.unwrap_or(false))
+                .build(pattern)
+                .map_err(|e| HostError {
+                    code: 1,
+                    message: format!("Invalid regex pattern: {}", e),
+                })?;
 
-        let result: HostResult<GrepResult> = cmd
-            .output()
-            .map_err(|e| HostError {
+            // Set up file type filtering
+            let mut types_builder = ignore::types::TypesBuilder::new();
+            types_builder.add_defaults();
+            if let Some(ft) = file_type {
+                types_builder.select(ft);
+            }
+            let types = types_builder.build().map_err(|e| HostError {
                 code: 1,
-                message: format!("Failed to run grep: {}", e),
+                message: format!("Invalid file type: {}", e),
+            })?;
+
+            let mut all_matches: Vec<GrepMatch> = Vec::new();
+            let mut file_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+            // Walk directories respecting .gitignore
+            let walker = ignore::WalkBuilder::new(search_path)
+                .types(types)
+                .build();
+
+            for entry in walker.flatten() {
+                if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                    continue;
+                }
+                let file_path = entry.path().to_string_lossy().to_string();
+
+                let mut searcher = SearcherBuilder::new().build();
+
+                let _ = searcher.search_path(
+                    &matcher,
+                    entry.path(),
+                    UTF8(|line_num, line| {
+                        file_set.insert(file_path.clone());
+                        all_matches.push(GrepMatch {
+                            file: file_path.clone(),
+                            line: line_num,
+                            content: line.trim_end().to_string(),
+                        });
+                        Ok(true)
+                    }),
+                );
+            }
+
+            let total_matches = all_matches.len() as u64;
+            let total_files = file_set.len() as u64;
+            let returned = std::cmp::min(all_matches.len(), max);
+            let truncated = all_matches.len() > max;
+
+            Ok(GrepResult {
+                total_matches,
+                total_files,
+                returned: returned as u64,
+                results: all_matches.into_iter().take(max).collect(),
+                truncated,
             })
-            .map(|output| {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let matches: Vec<GrepMatch> = stdout
-                    .lines()
-                    .filter_map(|line| {
-                        // Parse "file:line:content" format
-                        let mut parts = line.splitn(3, ':');
-                        let file = parts.next()?.to_string();
-                        let line_num: u64 = parts.next()?.parse().ok()?;
-                        let content = parts.next().unwrap_or("").to_string();
-                        Some(GrepMatch { file, line: line_num, content })
-                    })
-                    .collect();
-                let total_matches = matches.len() as u64;
-                let mut files = std::collections::HashSet::new();
-                for m in &matches {
-                    files.insert(m.file.clone());
-                }
-                GrepResult {
-                    total_matches,
-                    total_files: files.len() as u64,
-                    returned: total_matches,
-                    results: matches,
-                    truncated: false,
-                }
-            });
+        })();
 
         let duration_ms = start.elapsed().as_millis() as u64;
         match &result {
@@ -3859,5 +3886,93 @@ mod tests {
         // Line should be truncated at 2000 chars + "…[truncated]"
         assert!(read.content.contains("\u{2026}[truncated]"));
         assert!(read.content.len() < 3000);
+    }
+
+    // ==================== tool_grep Tests ====================
+
+    #[test]
+    fn test_tool_grep_with_grep_crate() {
+        use std::io::Write;
+        let (host, _rt) = setup_host_with_services();
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.rs");
+        let mut file = std::fs::File::create(&file_path).unwrap();
+        writeln!(file, "fn main() {{").unwrap();
+        writeln!(file, "    println!(\"hello\");").unwrap();
+        writeln!(file, "}}").unwrap();
+
+        let result = host
+            .tool_grep(
+                "fn main",
+                Some(dir.path().to_str().unwrap()),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(result.total_matches >= 1);
+        assert!(result.total_files >= 1);
+        assert!(!result.results.is_empty());
+        assert!(result.results[0].content.contains("fn main"));
+    }
+
+    #[test]
+    fn test_tool_grep_case_insensitive() {
+        use std::io::Write;
+        let (host, _rt) = setup_host_with_services();
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        let mut file = std::fs::File::create(&file_path).unwrap();
+        writeln!(file, "Hello World").unwrap();
+        writeln!(file, "hello world").unwrap();
+        writeln!(file, "HELLO WORLD").unwrap();
+
+        let result = host
+            .tool_grep(
+                "hello",
+                Some(dir.path().to_str().unwrap()),
+                None,
+                Some(true),
+                None,
+            )
+            .unwrap();
+        assert_eq!(result.total_matches, 3);
+    }
+
+    #[test]
+    fn test_tool_grep_max_results() {
+        use std::io::Write;
+        let (host, _rt) = setup_host_with_services();
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        let mut file = std::fs::File::create(&file_path).unwrap();
+        for i in 1..=20 {
+            writeln!(file, "match line {}", i).unwrap();
+        }
+
+        let result = host
+            .tool_grep(
+                "match",
+                Some(dir.path().to_str().unwrap()),
+                None,
+                None,
+                Some(5),
+            )
+            .unwrap();
+        assert_eq!(result.total_matches, 20);
+        assert_eq!(result.returned, 5);
+        assert_eq!(result.results.len(), 5);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn test_tool_grep_invalid_regex() {
+        let (host, _rt) = setup_host_with_services();
+        let result = host.tool_grep("[invalid", Some("."), None, None, None);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, 1);
     }
 }
