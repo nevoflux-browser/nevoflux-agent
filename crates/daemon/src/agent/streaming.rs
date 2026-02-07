@@ -65,6 +65,7 @@ impl StreamHandle {
             stream_id: self.stream_id.clone(),
             delta,
             format,
+            event: None,
         };
 
         self.tx
@@ -321,6 +322,7 @@ mod tests {
             stream_id: "stream-001".to_string(),
             delta: "Hello".to_string(),
             format: StreamFormat::Markdown,
+            event: None,
         };
         let chunk_event = StreamEvent::Chunk(chunk);
 

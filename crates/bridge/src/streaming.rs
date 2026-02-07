@@ -231,6 +231,7 @@ mod tests {
             stream_id: stream_id.to_string(),
             delta: delta.to_string(),
             format: StreamFormat::Markdown,
+            event: None,
         }
     }
 

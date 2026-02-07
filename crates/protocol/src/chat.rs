@@ -122,6 +122,9 @@ pub struct StreamChunk {
     pub delta: String,
     /// Content format
     pub format: StreamFormat,
+    /// Optional tool event for real-time sidebar updates
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<ToolEvent>,
 }
 
 /// Streaming response end marker
@@ -290,6 +293,69 @@ pub enum PlanResponse {
 }
 
 // ============================================================================
+// Tool Event Types
+// ============================================================================
+
+/// Tool execution event for real-time sidebar updates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ToolEvent {
+    /// Tool started executing
+    #[serde(rename = "tool_start")]
+    Start {
+        tool_id: String,
+        tool_name: String,
+        icon: String,
+        summary: String,
+    },
+    /// Tool waiting for authorization
+    #[serde(rename = "tool_auth")]
+    Auth {
+        tool_id: String,
+        request: ToolAuthRequest,
+    },
+    /// Tool finished executing
+    #[serde(rename = "tool_end")]
+    End {
+        tool_id: String,
+        status: ToolStatus,
+        duration_ms: u64,
+        summary: String,
+    },
+}
+
+/// Authorization request sent to sidebar when a tool needs permission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolAuthRequest {
+    /// Tool name: "read", "grep", "bash"
+    pub tool: String,
+    /// Human-readable detail (path or command)
+    pub detail: String,
+    /// Authorization options for the user to choose from
+    pub options: Vec<AuthOption>,
+}
+
+/// A single authorization option presented to the user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthOption {
+    /// Display text, e.g. "Always allow cargo *"
+    pub label: String,
+    /// Scope: "once", "session", "always"
+    pub scope: String,
+}
+
+/// User's response to a tool authorization request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolAuthResponse {
+    /// Tool ID correlating to the original ToolEvent::Auth
+    pub tool_id: String,
+    /// Index of the selected option
+    pub option_index: usize,
+    /// Whether the user granted access
+    pub granted: bool,
+}
+
+// ============================================================================
 // Tagged Message Enums (for serialization with type field)
 // ============================================================================
 
@@ -305,6 +371,7 @@ pub enum SidebarMessage {
     SystemCommand(SystemCommand),
     BrowserToolResponse(BrowserToolResponse),
     PlanResponse(PlanResponse),
+    ToolAuthResponse(ToolAuthResponse),
 }
 
 /// All messages from Agent to Sidebar
@@ -410,6 +477,7 @@ mod tests {
             stream_id: "stream-001".into(),
             delta: "Hello".into(),
             format: StreamFormat::Markdown,
+            event: None,
         });
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -722,5 +790,145 @@ mod tests {
             decoded2,
             SidebarMessage::PlanResponse(PlanResponse::Cancelled)
         ));
+    }
+
+    // ====================================================================
+    // ToolEvent / ToolAuth tests
+    // ====================================================================
+
+    #[test]
+    fn test_tool_event_start_roundtrip() {
+        let event = ToolEvent::Start {
+            tool_id: "t-001".into(),
+            tool_name: "bash".into(),
+            icon: "\u{1F4BB}".into(),
+            summary: "Running cargo test".into(),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"tool_start\""));
+        assert!(json.contains("\"tool_id\":\"t-001\""));
+
+        let decoded: ToolEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_tool_event_auth_roundtrip() {
+        let event = ToolEvent::Auth {
+            tool_id: "t-002".into(),
+            request: ToolAuthRequest {
+                tool: "bash".into(),
+                detail: "cargo build --release".into(),
+                options: vec![
+                    AuthOption {
+                        label: "Allow once".into(),
+                        scope: "once".into(),
+                    },
+                    AuthOption {
+                        label: "Always allow cargo *".into(),
+                        scope: "always".into(),
+                    },
+                ],
+            },
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"tool_auth\""));
+        assert!(json.contains("\"tool\":\"bash\""));
+
+        let decoded: ToolEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_tool_event_end_roundtrip() {
+        let event = ToolEvent::End {
+            tool_id: "t-003".into(),
+            status: ToolStatus::Success,
+            duration_ms: 1234,
+            summary: "Completed successfully".into(),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"type\":\"tool_end\""));
+        assert!(json.contains("\"status\":\"success\""));
+        assert!(json.contains("\"duration_ms\":1234"));
+
+        let decoded: ToolEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_stream_chunk_without_event_omits_field() {
+        let chunk = StreamChunk {
+            session_id: "sess-001".into(),
+            stream_id: "stream-001".into(),
+            delta: "Hello".into(),
+            format: StreamFormat::Markdown,
+            event: None,
+        };
+
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(!json.contains("\"event\""));
+
+        let decoded: StreamChunk = serde_json::from_str(&json).unwrap();
+        assert_eq!(chunk, decoded);
+    }
+
+    #[test]
+    fn test_stream_chunk_with_event_includes_field() {
+        let chunk = StreamChunk {
+            session_id: "sess-001".into(),
+            stream_id: "stream-001".into(),
+            delta: "".into(),
+            format: StreamFormat::Markdown,
+            event: Some(ToolEvent::Start {
+                tool_id: "t-010".into(),
+                tool_name: "grep".into(),
+                icon: "\u{1F50D}".into(),
+                summary: "Searching for pattern".into(),
+            }),
+        };
+
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(json.contains("\"event\""));
+        assert!(json.contains("\"tool_start\""));
+
+        let decoded: StreamChunk = serde_json::from_str(&json).unwrap();
+        assert_eq!(chunk, decoded);
+    }
+
+    #[test]
+    fn test_tool_auth_response_roundtrip() {
+        let resp = ToolAuthResponse {
+            tool_id: "t-002".into(),
+            option_index: 1,
+            granted: true,
+        };
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"tool_id\":\"t-002\""));
+        assert!(json.contains("\"option_index\":1"));
+        assert!(json.contains("\"granted\":true"));
+
+        let decoded: ToolAuthResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, decoded);
+    }
+
+    #[test]
+    fn test_sidebar_message_tool_auth_response_tagged() {
+        let msg = SidebarMessage::ToolAuthResponse(ToolAuthResponse {
+            tool_id: "t-005".into(),
+            option_index: 0,
+            granted: false,
+        });
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"tool_auth_response\""));
+        assert!(json.contains("\"payload\""));
+
+        let decoded: SidebarMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, SidebarMessage::ToolAuthResponse(_)));
     }
 }

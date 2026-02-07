@@ -25,6 +25,7 @@ pub fn sample_stream_chunk(session_id: &str, delta: &str) -> StreamChunk {
         stream_id: format!("stream-{}", uuid_short()),
         delta: delta.to_string(),
         format: StreamFormat::Markdown,
+        event: None,
     }
 }
 
