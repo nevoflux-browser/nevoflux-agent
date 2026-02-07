@@ -1277,63 +1277,126 @@ impl HostFunctions for DaemonHostFunctions {
         use std::time::Duration;
 
         let start = std::time::Instant::now();
-
-        // Default timeout: 2 minutes (120000ms)
-        let timeout = Duration::from_millis(timeout_ms.unwrap_or(120_000));
-
-        // Truncate command for params_summary
+        let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000));
         let cmd_summary: String = command.chars().take(100).collect();
+        let max_lines: usize = 200;
+        let max_bytes: usize = 50 * 1024; // 50KB
 
-        // Spawn the command
-        let child = Command::new("bash")
-            .arg("-c")
+        let (shell, shell_flag) = if cfg!(target_os = "windows") {
+            ("powershell", "-Command")
+        } else {
+            ("bash", "-c")
+        };
+
+        let mut cmd = Command::new(shell);
+        cmd.arg(shell_flag)
             .arg(command)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| HostError {
-                code: 1,
-                message: format!("Failed to spawn command: {}", e),
-            })?;
+            .stderr(Stdio::piped());
 
-        // Wait with timeout using tokio
+        // Set up process group on Unix for clean timeout kills
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                nix::unistd::setsid().map(|_| ()).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("setsid failed: {}", e),
+                    )
+                })
+            });
+        }
+
+        let child = cmd.spawn().map_err(|e| HostError {
+            code: 1,
+            message: format!("Failed to spawn command: {}", e),
+        })?;
+
+        #[cfg(unix)]
+        let child_pid = child.id();
+
         let runtime = self.runtime.clone();
-        let result: Result<std::process::Output, String> = tokio::task::block_in_place(|| {
-            runtime.block_on(async {
-                let wait_future = tokio::task::spawn_blocking(move || child.wait_with_output());
+        let output_result: Result<std::process::Output, String> =
+            tokio::task::block_in_place(|| {
+                runtime.block_on(async {
+                    let wait_future =
+                        tokio::task::spawn_blocking(move || child.wait_with_output());
 
-                match tokio::time::timeout(timeout, wait_future).await {
-                    Ok(Ok(output)) => output.map_err(|e| format!("Command failed: {}", e)),
-                    Ok(Err(e)) => Err(format!("Task join error: {}", e)),
-                    Err(_) => {
-                        Err(format!("Command timed out after {}ms", timeout.as_millis()))
+                    match tokio::time::timeout(timeout, wait_future).await {
+                        Ok(Ok(output)) => {
+                            output.map_err(|e| format!("Command failed: {}", e))
+                        }
+                        Ok(Err(e)) => Err(format!("Task join error: {}", e)),
+                        Err(_) => {
+                            // Kill the entire process group on timeout
+                            #[cfg(unix)]
+                            {
+                                use nix::sys::signal::{killpg, Signal};
+                                use nix::unistd::Pid;
+                                let _ = killpg(
+                                    Pid::from_raw(child_pid as i32),
+                                    Signal::SIGKILL,
+                                );
+                            }
+                            Err(format!(
+                                "Command timed out after {}ms",
+                                timeout.as_millis()
+                            ))
+                        }
                     }
-                }
-            })
-        });
+                })
+            });
 
-        let host_result: HostResult<BashResult> = match result {
+        let host_result: HostResult<BashResult> = match output_result {
             Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                let exit_code = output.status.code();
+                let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let raw_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+                let all_lines: Vec<&str> = raw_stdout.lines().collect();
+                let total_lines = all_lines.len() as u64;
+                let total_bytes = raw_stdout.len() as u64;
+
+                // Truncate by byte count and line count
+                let mut truncated = false;
+                let stdout = if raw_stdout.len() > max_bytes {
+                    truncated = true;
+                    // Find the last newline within max_bytes to avoid cutting mid-line
+                    let truncated_str = &raw_stdout[..max_bytes];
+                    match truncated_str.rfind('\n') {
+                        Some(pos) => truncated_str[..pos].to_string(),
+                        None => truncated_str.to_string(),
+                    }
+                } else if all_lines.len() > max_lines {
+                    truncated = true;
+                    all_lines[..max_lines].join("\n")
+                } else {
+                    raw_stdout.clone()
+                };
+
+                let returned_lines = stdout.lines().count() as u64;
+
                 let status = if output.status.success() {
                     BashStatus::Success
                 } else {
                     BashStatus::Error
                 };
-                let stdout_lines = stdout.lines().count() as u64;
-                let total_bytes = (stdout.len() + stderr.len()) as u64;
+
+                let stderr = if !output.status.success() && !raw_stderr.is_empty() {
+                    Some(raw_stderr)
+                } else {
+                    None
+                };
 
                 Ok(BashResult {
-                    exit_code,
+                    exit_code: output.status.code(),
                     status,
-                    total_lines: stdout_lines,
+                    total_lines,
                     total_bytes,
-                    returned_lines: stdout_lines,
+                    returned_lines,
                     stdout,
-                    stderr: if stderr.is_empty() { None } else { Some(stderr) },
-                    truncated: false,
+                    stderr,
+                    truncated,
                     hint: None,
                 })
             }
@@ -1344,9 +1407,9 @@ impl HostFunctions for DaemonHostFunctions {
                 total_bytes: 0,
                 returned_lines: 0,
                 stdout: String::new(),
-                stderr: Some(e),
+                stderr: None,
                 truncated: false,
-                hint: None,
+                hint: Some(e),
             }),
         };
 
@@ -3974,5 +4037,47 @@ mod tests {
         let result = host.tool_grep("[invalid", Some("."), None, None, None);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, 1);
+    }
+
+    // ==================== tool_bash Tests ====================
+
+    #[test]
+    fn test_tool_bash_success_with_result() {
+        let (host, _rt) = setup_host_with_services();
+        let result = host.tool_bash("echo hello", None).unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        assert!(matches!(result.status, BashStatus::Success));
+        assert!(result.stdout.contains("hello"));
+        assert!(result.stderr.is_none());
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn test_tool_bash_error_status() {
+        let (host, _rt) = setup_host_with_services();
+        let result = host.tool_bash("exit 42", None).unwrap();
+        assert_eq!(result.exit_code, Some(42));
+        assert!(matches!(result.status, BashStatus::Error));
+    }
+
+    #[test]
+    fn test_tool_bash_output_truncation() {
+        let (host, _rt) = setup_host_with_services();
+        // Generate 300 lines
+        let result = host.tool_bash("seq 1 300", None).unwrap();
+        assert_eq!(result.total_lines, 300);
+        assert!(result.returned_lines <= 200);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn test_tool_bash_timeout_with_hint() {
+        let (host, _rt) = setup_host_with_services();
+        // Use a very short timeout
+        let result = host.tool_bash("sleep 60", Some(500)).unwrap();
+        assert!(matches!(result.status, BashStatus::Timeout));
+        assert!(result.exit_code.is_none());
+        assert!(result.hint.is_some());
+        assert!(result.hint.unwrap().contains("timed out"));
     }
 }
