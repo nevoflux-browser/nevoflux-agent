@@ -957,7 +957,9 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let file_type = tool_call.arguments["type"].as_str();
                 let case_insensitive = tool_call.arguments["case_insensitive"].as_bool();
                 let max_results = tool_call.arguments["max_results"].as_u64();
-                let result = self.host.tool_grep(pattern, path, file_type, case_insensitive, max_results)?;
+                let result =
+                    self.host
+                        .tool_grep(pattern, path, file_type, case_insensitive, max_results)?;
                 format_grep_result(&result, pattern)
             }
             "memory_search" => {
@@ -1320,13 +1322,19 @@ Be helpful, accurate, and concise."#;
     fn build_browser_system_prompt(&self) -> String {
         let base_prompt = r#"You are a browser automation agent. Each turn, you see the current page state (visible interactive elements in the viewport).
 
+## How to read page content
+- The page state (text tree of visible elements) is ALREADY provided in the user message — use it directly to answer content questions.
+- If the user asks what the page is about, to summarize it, or asks about specific content → answer from the page state first. If you need the full page text, call `browser_get_markdown()`.
+- Do NOT call `browser_screenshot()` for content-reading questions. Screenshots are only useful when visual layout, images, or styling matter.
+- Do NOT call extra tools (scroll, snapshot, screenshot) when the answer is already visible in the page state.
+
 ## How to interact
 - Use browser_click_by_id(element_id) to click elements shown in the page state (e.g., click "e3")
 - Use browser_fill_by_id(element_id, value) to fill form fields
 - Use browser_type_by_id(element_id, text) to type character by character
 - Use browser_scroll(direction) to scroll up/down and reveal more elements
 - Use browser_navigate(url) to go to a new page
-- Use browser_screenshot() to see the page visually
+- Use browser_screenshot() to see the page visually (only when you need to inspect visual layout, images, or styling)
 
 ## Rules
 - Only interact with elements shown in the current page state [e1], [e2], etc.
@@ -1354,6 +1362,12 @@ You can:
 Think step by step. Use tools to gather information before making changes.
 Always verify your work after making modifications.
 Ask for permission before destructive operations.
+
+## Browser Content Reading
+- When a browser tab is active, the page state (text tree) is already in the user message — use it directly for content questions.
+- For full-page content, call `browser_get_markdown()` — do NOT use `browser_screenshot()` for reading text.
+- `browser_screenshot()` is only for visual layout inspection (images, styling, positioning).
+- Avoid unnecessary tool calls (scroll, snapshot, screenshot) when the answer is already in the page state.
 
 ## Tool Usage
 

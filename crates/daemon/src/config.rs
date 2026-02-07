@@ -147,6 +147,30 @@ impl AgentConfig {
         if other.llm.openai.context_window.is_some() {
             self.llm.openai.context_window = other.llm.openai.context_window;
         }
+        if other.llm.claude_code.api_key.is_some() {
+            self.llm.claude_code.api_key = other.llm.claude_code.api_key.clone();
+        }
+        if other.llm.claude_code.model.is_some() {
+            self.llm.claude_code.model = other.llm.claude_code.model.clone();
+        }
+        if other.llm.claude_code.context_window.is_some() {
+            self.llm.claude_code.context_window = other.llm.claude_code.context_window;
+        }
+        if other.llm.claude_code.add_dirs.is_some() {
+            self.llm.claude_code.add_dirs = other.llm.claude_code.add_dirs.clone();
+        }
+        if other.llm.gemini_cli.api_key.is_some() {
+            self.llm.gemini_cli.api_key = other.llm.gemini_cli.api_key.clone();
+        }
+        if other.llm.gemini_cli.model.is_some() {
+            self.llm.gemini_cli.model = other.llm.gemini_cli.model.clone();
+        }
+        if other.llm.gemini_cli.context_window.is_some() {
+            self.llm.gemini_cli.context_window = other.llm.gemini_cli.context_window;
+        }
+        if other.llm.gemini_cli.add_dirs.is_some() {
+            self.llm.gemini_cli.add_dirs = other.llm.gemini_cli.add_dirs.clone();
+        }
 
         // Merge storage config
         if other.storage.data_dir.is_some() {
@@ -197,6 +221,14 @@ pub struct LlmConfig {
     #[serde(default)]
     pub deepseek: ProviderConfig,
 
+    /// Claude Code CLI-specific configuration.
+    #[serde(default)]
+    pub claude_code: ProviderConfig,
+
+    /// Gemini CLI-specific configuration.
+    #[serde(default)]
+    pub gemini_cli: ProviderConfig,
+
     /// Maximum tokens for responses.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
@@ -228,6 +260,10 @@ pub struct ProviderConfig {
     /// Context window size in tokens (overrides provider default).
     #[serde(default)]
     pub context_window: Option<u32>,
+
+    /// Additional directories to pass via `--add-dir` (Claude Code CLI only).
+    #[serde(default)]
+    pub add_dirs: Option<Vec<String>>,
 }
 
 impl LlmConfig {
@@ -245,6 +281,14 @@ impl LlmConfig {
             "openai" => self.openai.api_key.as_deref(),
             "qwen" => self.qwen.api_key.as_deref(),
             "deepseek" => self.deepseek.api_key.as_deref(),
+            "claude-code" | "claude_code" => self
+                .claude_code
+                .api_key
+                .as_deref()
+                .or(Some("claude-code-cli")),
+            "gemini-cli" | "gemini_cli" => {
+                self.gemini_cli.api_key.as_deref().or(Some("gemini-cli"))
+            }
             _ => None,
         }
     }
@@ -256,6 +300,8 @@ impl LlmConfig {
             "openai" => self.openai.model.as_deref(),
             "qwen" => self.qwen.model.as_deref(),
             "deepseek" => self.deepseek.model.as_deref(),
+            "claude-code" | "claude_code" => self.claude_code.model.as_deref(),
+            "gemini-cli" | "gemini_cli" => self.gemini_cli.model.as_deref(),
             _ => self.default_model.as_deref(),
         }
     }
@@ -265,20 +311,22 @@ impl LlmConfig {
     pub fn configured_providers(&self) -> Vec<(String, String)> {
         let mut result = Vec::new();
         let active = self.active_provider();
-        let providers: [(&str, &ProviderConfig); 4] = [
+        let providers: [(&str, &ProviderConfig); 6] = [
             ("anthropic", &self.anthropic),
             ("openai", &self.openai),
             ("qwen", &self.qwen),
             ("deepseek", &self.deepseek),
+            ("claude-code", &self.claude_code),
+            ("gemini-cli", &self.gemini_cli),
         ];
 
         for (name, config) in &providers {
             if config.api_key.is_some() {
-                let model = config.model.clone().unwrap_or_else(|| {
-                    match name.parse::<nevoflux_llm::ProviderType>() {
-                        Ok(pt) => nevoflux_llm::default_model_for(pt).to_string(),
-                        Err(_) => name.to_string(),
-                    }
+                let model = config.model.clone().unwrap_or_else(|| match name
+                    .parse::<nevoflux_llm::ProviderType>(
+                ) {
+                    Ok(pt) => nevoflux_llm::default_model_for(pt).to_string(),
+                    Err(_) => name.to_string(),
                 });
                 let is_active = active == Some(*name);
                 let suffix = if is_active { " (active)" } else { "" };
@@ -303,6 +351,8 @@ impl LlmConfig {
             Some("openai") => self.openai.context_window,
             Some("qwen") => self.qwen.context_window,
             Some("deepseek") => self.deepseek.context_window,
+            Some("claude-code") | Some("claude_code") => self.claude_code.context_window,
+            Some("gemini-cli") | Some("gemini_cli") => self.gemini_cli.context_window,
             _ => None,
         };
 
@@ -332,6 +382,8 @@ impl Default for LlmConfig {
             openai: ProviderConfig::default(),
             qwen: ProviderConfig::default(),
             deepseek: ProviderConfig::default(),
+            claude_code: ProviderConfig::default(),
+            gemini_cli: ProviderConfig::default(),
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
             timeout_secs: default_timeout_secs(),

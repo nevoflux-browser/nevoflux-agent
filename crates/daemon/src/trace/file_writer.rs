@@ -26,8 +26,7 @@ impl TraceFileWriter {
             .create(true)
             .append(true)
             .open(&self.file_path)?;
-        let line = serde_json::to_string(span)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let line = serde_json::to_string(span).map_err(std::io::Error::other)?;
         writeln!(file, "{}", line)?;
         Ok(())
     }

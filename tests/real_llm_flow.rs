@@ -30,6 +30,8 @@ fn has_api_key(provider: ProviderType) -> Option<String> {
         ProviderType::Cohere => "COHERE_API_KEY",
         ProviderType::Perplexity => "PERPLEXITY_API_KEY",
         ProviderType::Together => "TOGETHER_API_KEY",
+        ProviderType::ClaudeCode => "ANTHROPIC_API_KEY",
+        ProviderType::GeminiCli => "GEMINI_API_KEY",
     };
 
     std::env::var(env_var).ok().filter(|k| !k.is_empty())

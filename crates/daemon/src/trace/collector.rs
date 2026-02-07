@@ -32,6 +32,7 @@ impl TraceCollector {
     }
 
     /// Record a tool execution span.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_tool_exec(
         &self,
         session_id: &str,
@@ -78,6 +79,7 @@ impl TraceCollector {
     }
 
     /// Record an LLM call span.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_llm_call(
         &self,
         session_id: &str,

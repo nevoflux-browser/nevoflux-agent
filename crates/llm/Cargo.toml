@@ -9,8 +9,8 @@ description = "LLM Provider abstraction layer for NevoFlux Agent"
 
 [dependencies]
 rig-core = { workspace = true }
-tokio = { workspace = true }
-tokio-stream = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
+tokio-stream = { workspace = true, features = ["io-util"] }
 reqwest = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
@@ -21,3 +21,6 @@ thiserror = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 mockall = { workspace = true }
+toml = "0.8"
+dirs = "5.0"
+serde = { workspace = true }

@@ -4,10 +4,10 @@ use std::path::Path;
 
 use crate::connection::Database;
 use crate::error::Result;
+use crate::repositories::traces::TraceRepository;
 use crate::repositories::{
     ConfigRepository, MessageRepository, PermissionRepository, SessionRepository,
 };
-use crate::repositories::traces::TraceRepository;
 
 /// Main storage facade providing access to all repositories.
 ///

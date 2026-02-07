@@ -38,9 +38,9 @@ pub mod secrets;
 pub mod server;
 pub mod session;
 pub mod skills;
+pub mod trace;
 pub mod validation;
 pub mod wasm;
-pub mod trace;
 
 pub use config::{
     AgentConfig, ConfigError, ContextConfig, DaemonConfig, LlmConfig, LoggingConfig, SessionConfig,

@@ -20,5 +20,6 @@ pub use rig;
 
 pub use error::{LlmError, Result};
 pub use factory::{
-    api_key_env_var, default_model_for, gemini_models, ProviderConfig, ProviderType,
+    api_key_env_var, default_context_window_for, default_model_for, gemini_models, ProviderConfig,
+    ProviderType,
 };

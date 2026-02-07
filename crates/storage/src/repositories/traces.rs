@@ -243,10 +243,7 @@ mod tests {
         // Verify second span fields
         assert_eq!(spans[1].span_type, "tool_exec");
         assert_eq!(spans[1].tool_name, Some("bash".to_string()));
-        assert_eq!(
-            spans[1].tool_params,
-            Some("{\"cmd\":\"ls\"}".to_string())
-        );
+        assert_eq!(spans[1].tool_params, Some("{\"cmd\":\"ls\"}".to_string()));
         assert!(!spans[1].success);
         assert_eq!(spans[1].error_code, Some("TIMEOUT".to_string()));
         assert_eq!(spans[1].error_msg, Some("Command timed out".to_string()));

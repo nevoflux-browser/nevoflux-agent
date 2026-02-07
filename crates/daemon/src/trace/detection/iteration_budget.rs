@@ -7,23 +7,36 @@ pub struct IterationBudgetDetector {
 }
 
 impl IterationBudgetDetector {
-    pub fn new(warn_ratio: f32) -> Self { Self { warn_ratio } }
+    pub fn new(warn_ratio: f32) -> Self {
+        Self { warn_ratio }
+    }
 }
 
 impl PatternDetector for IterationBudgetDetector {
     fn check(&self, ctx: &DetectionContext) -> Option<String> {
-        if ctx.max_iterations == 0 { return None; }
+        if ctx.max_iterations == 0 {
+            return None;
+        }
         let ratio = ctx.iteration as f32 / ctx.max_iterations as f32;
-        if ratio < self.warn_ratio { return None; }
+        if ratio < self.warn_ratio {
+            return None;
+        }
 
         let total = ctx.recent_tool_spans.len();
         let success_count = ctx.recent_tool_spans.iter().filter(|s| s.success).count();
         let fail_count = total - success_count;
 
-        let mut tool_names: Vec<&str> = ctx.recent_tool_spans.iter()
-            .filter_map(|s| s.tool_name.as_deref()).collect();
+        let mut tool_names: Vec<&str> = ctx
+            .recent_tool_spans
+            .iter()
+            .filter_map(|s| s.tool_name.as_deref())
+            .collect();
         tool_names.dedup();
-        let tools_summary = if tool_names.is_empty() { "no tools".to_string() } else { tool_names.join(", ") };
+        let tools_summary = if tool_names.is_empty() {
+            "no tools".to_string()
+        } else {
+            tool_names.join(", ")
+        };
 
         Some(format!(
             "[Trace Summary] Used {}/{} iterations. Tools called: {} ({} succeeded, {} failed). Please evaluate whether to adjust strategy or conclude the task.",
@@ -59,7 +72,12 @@ mod tests {
             make_tool_span(0, "read_file", true),
             make_tool_span(1, "write_file", false),
         ];
-        let ctx = DetectionContext { session_id: "sess-1", iteration: 35, max_iterations: 50, recent_tool_spans: &spans };
+        let ctx = DetectionContext {
+            session_id: "sess-1",
+            iteration: 35,
+            max_iterations: 50,
+            recent_tool_spans: &spans,
+        };
         let result = detector.check(&ctx);
         assert!(result.is_some());
         let msg = result.unwrap();
@@ -70,7 +88,12 @@ mod tests {
     fn test_no_trigger_below_threshold() {
         let detector = IterationBudgetDetector::new(0.7);
         let spans = vec![make_tool_span(0, "read_file", true)];
-        let ctx = DetectionContext { session_id: "sess-1", iteration: 10, max_iterations: 50, recent_tool_spans: &spans };
+        let ctx = DetectionContext {
+            session_id: "sess-1",
+            iteration: 10,
+            max_iterations: 50,
+            recent_tool_spans: &spans,
+        };
         assert!(detector.check(&ctx).is_none());
     }
 
@@ -82,7 +105,12 @@ mod tests {
             make_tool_span(1, "write_file", true),
             make_tool_span(2, "write_file", false),
         ];
-        let ctx = DetectionContext { session_id: "sess-1", iteration: 40, max_iterations: 50, recent_tool_spans: &spans };
+        let ctx = DetectionContext {
+            session_id: "sess-1",
+            iteration: 40,
+            max_iterations: 50,
+            recent_tool_spans: &spans,
+        };
         let result = detector.check(&ctx);
         assert!(result.is_some());
         let msg = result.unwrap();

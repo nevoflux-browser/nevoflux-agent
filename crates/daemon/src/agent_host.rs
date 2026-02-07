@@ -1093,12 +1093,20 @@ impl HostFunctions for DaemonHostFunctions {
         }
     }
 
-    fn tool_read(&self, path: &str, offset: Option<u64>, limit: Option<u64>) -> HostResult<ReadResult> {
+    fn tool_read(
+        &self,
+        path: &str,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> HostResult<ReadResult> {
         use std::fs;
         use std::io::{BufRead, BufReader};
 
         let start = std::time::Instant::now();
-        debug!("tool_read: path={}, offset={:?}, limit={:?}", path, offset, limit);
+        debug!(
+            "tool_read: path={}, offset={:?}, limit={:?}",
+            path, offset, limit
+        );
 
         let resolved_path = self
             .resolve_skill_path(path, true)
@@ -1117,7 +1125,7 @@ impl HostFunctions for DaemonHostFunctions {
             let total_bytes = metadata.len();
 
             let reader = BufReader::new(file);
-            let all_lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+            let all_lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
             let total_lines = all_lines.len() as u64;
 
             let off = offset.unwrap_or(0) as usize;
@@ -1299,12 +1307,9 @@ impl HostFunctions for DaemonHostFunctions {
         unsafe {
             use std::os::unix::process::CommandExt;
             cmd.pre_exec(|| {
-                nix::unistd::setsid().map(|_| ()).map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("setsid failed: {}", e),
-                    )
-                })
+                nix::unistd::setsid()
+                    .map(|_| ())
+                    .map_err(|e| std::io::Error::other(format!("setsid failed: {}", e)))
             });
         }
 
@@ -1320,13 +1325,10 @@ impl HostFunctions for DaemonHostFunctions {
         let output_result: Result<std::process::Output, String> =
             tokio::task::block_in_place(|| {
                 runtime.block_on(async {
-                    let wait_future =
-                        tokio::task::spawn_blocking(move || child.wait_with_output());
+                    let wait_future = tokio::task::spawn_blocking(move || child.wait_with_output());
 
                     match tokio::time::timeout(timeout, wait_future).await {
-                        Ok(Ok(output)) => {
-                            output.map_err(|e| format!("Command failed: {}", e))
-                        }
+                        Ok(Ok(output)) => output.map_err(|e| format!("Command failed: {}", e)),
                         Ok(Err(e)) => Err(format!("Task join error: {}", e)),
                         Err(_) => {
                             // Kill the entire process group on timeout
@@ -1334,15 +1336,9 @@ impl HostFunctions for DaemonHostFunctions {
                             {
                                 use nix::sys::signal::{killpg, Signal};
                                 use nix::unistd::Pid;
-                                let _ = killpg(
-                                    Pid::from_raw(child_pid as i32),
-                                    Signal::SIGKILL,
-                                );
+                                let _ = killpg(Pid::from_raw(child_pid as i32), Signal::SIGKILL);
                             }
-                            Err(format!(
-                                "Command timed out after {}ms",
-                                timeout.as_millis()
-                            ))
+                            Err(format!("Command timed out after {}ms", timeout.as_millis()))
                         }
                     }
                 })
@@ -1527,12 +1523,10 @@ impl HostFunctions for DaemonHostFunctions {
             let mut file_set: std::collections::HashSet<String> = std::collections::HashSet::new();
 
             // Walk directories respecting .gitignore
-            let walker = ignore::WalkBuilder::new(search_path)
-                .types(types)
-                .build();
+            let walker = ignore::WalkBuilder::new(search_path).types(types).build();
 
             for entry in walker.flatten() {
-                if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                     continue;
                 }
                 let file_path = entry.path().to_string_lossy().to_string();

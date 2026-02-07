@@ -7,30 +7,49 @@ pub struct RepeatedToolFailureDetector {
 }
 
 impl RepeatedToolFailureDetector {
-    pub fn new(threshold: u32) -> Self { Self { threshold } }
+    pub fn new(threshold: u32) -> Self {
+        Self { threshold }
+    }
 }
 
 impl PatternDetector for RepeatedToolFailureDetector {
     fn check(&self, ctx: &DetectionContext) -> Option<String> {
         let spans = ctx.recent_tool_spans;
-        if spans.len() < self.threshold as usize { return None; }
+        if spans.len() < self.threshold as usize {
+            return None;
+        }
 
         let recent = &spans[spans.len().saturating_sub(self.threshold as usize)..];
 
         // All must be failures
-        if !recent.iter().all(|s| !s.success) { return None; }
+        if !recent.iter().all(|s| !s.success) {
+            return None;
+        }
 
         // All must have the same tool name
         let first_tool = recent[0].tool_name.as_deref()?;
-        if !recent.iter().all(|s| s.tool_name.as_deref() == Some(first_tool)) { return None; }
+        if !recent
+            .iter()
+            .all(|s| s.tool_name.as_deref() == Some(first_tool))
+        {
+            return None;
+        }
 
         // All must have similar params
         let first_params = recent[0].tool_params.as_deref();
-        if !recent.iter().all(|s| s.tool_params.as_deref() == first_params) { return None; }
+        if !recent
+            .iter()
+            .all(|s| s.tool_params.as_deref() == first_params)
+        {
+            return None;
+        }
 
         let start_iter = recent.first().map(|s| s.iteration).unwrap_or(0);
         let end_iter = recent.last().map(|s| s.iteration).unwrap_or(0);
-        let error_code = recent.last().and_then(|s| s.error_code.as_deref()).unwrap_or("unknown");
+        let error_code = recent
+            .last()
+            .and_then(|s| s.error_code.as_deref())
+            .unwrap_or("unknown");
         let target = first_params.unwrap_or("unknown");
 
         Some(format!(
@@ -45,7 +64,13 @@ mod tests {
     use super::*;
     use nevoflux_storage::TraceSpanRecord;
 
-    fn make_tool_span(iteration: u32, tool: &str, params: &str, success: bool, error_code: Option<&str>) -> TraceSpanRecord {
+    fn make_tool_span(
+        iteration: u32,
+        tool: &str,
+        params: &str,
+        success: bool,
+        error_code: Option<&str>,
+    ) -> TraceSpanRecord {
         TraceSpanRecord {
             id: iteration as i64,
             session_id: "sess-1".into(),
@@ -68,7 +93,12 @@ mod tests {
             make_tool_span(1, "write_file", "/etc/config", false, Some("PERM")),
             make_tool_span(2, "write_file", "/etc/config", false, Some("PERM")),
         ];
-        let ctx = DetectionContext { session_id: "sess-1", iteration: 3, max_iterations: 50, recent_tool_spans: &spans };
+        let ctx = DetectionContext {
+            session_id: "sess-1",
+            iteration: 3,
+            max_iterations: 50,
+            recent_tool_spans: &spans,
+        };
         let result = detector.check(&ctx);
         assert!(result.is_some());
         let msg = result.unwrap();
@@ -85,7 +115,12 @@ mod tests {
             make_tool_span(1, "write_file", "/etc/config", true, None),
             make_tool_span(2, "write_file", "/etc/config", false, Some("PERM")),
         ];
-        let ctx = DetectionContext { session_id: "sess-1", iteration: 3, max_iterations: 50, recent_tool_spans: &spans };
+        let ctx = DetectionContext {
+            session_id: "sess-1",
+            iteration: 3,
+            max_iterations: 50,
+            recent_tool_spans: &spans,
+        };
         assert!(detector.check(&ctx).is_none());
     }
 
@@ -97,7 +132,12 @@ mod tests {
             make_tool_span(1, "read_file", "/etc/config", false, Some("PERM")),
             make_tool_span(2, "write_file", "/etc/config", false, Some("PERM")),
         ];
-        let ctx = DetectionContext { session_id: "sess-1", iteration: 3, max_iterations: 50, recent_tool_spans: &spans };
+        let ctx = DetectionContext {
+            session_id: "sess-1",
+            iteration: 3,
+            max_iterations: 50,
+            recent_tool_spans: &spans,
+        };
         assert!(detector.check(&ctx).is_none());
     }
 
@@ -108,7 +148,12 @@ mod tests {
             make_tool_span(0, "write_file", "/etc/config", false, Some("PERM")),
             make_tool_span(1, "write_file", "/etc/config", false, Some("PERM")),
         ];
-        let ctx = DetectionContext { session_id: "sess-1", iteration: 2, max_iterations: 50, recent_tool_spans: &spans };
+        let ctx = DetectionContext {
+            session_id: "sess-1",
+            iteration: 2,
+            max_iterations: 50,
+            recent_tool_spans: &spans,
+        };
         assert!(detector.check(&ctx).is_none());
     }
 }

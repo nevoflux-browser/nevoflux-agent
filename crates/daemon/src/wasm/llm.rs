@@ -5,6 +5,8 @@
 
 use crate::error::{DaemonError, Result};
 use futures::StreamExt;
+use nevoflux_llm::providers::claude_code::ClaudeCodeClient;
+use nevoflux_llm::providers::gemini_cli::GeminiCliClient;
 use nevoflux_llm::providers::qwen::QwenClient;
 use nevoflux_llm::ProviderType;
 use rig::client::CompletionClient;
@@ -220,6 +222,54 @@ pub struct LlmAttachment {
     pub data: String,
 }
 
+/// Result of extracting a screenshot from a tool result JSON.
+struct ExtractedScreenshot {
+    /// The tool result JSON with the screenshot field removed.
+    text_without_screenshot: String,
+    /// The cleaned base64-encoded screenshot data.
+    base64_data: String,
+}
+
+/// Extract screenshot base64 data from a tool result JSON string.
+///
+/// Looks for a `"screenshot"` key in the top-level JSON object.
+/// If found and non-empty, returns the remaining JSON (without the screenshot field)
+/// and the cleaned base64 data (data URL prefix stripped, whitespace removed).
+fn extract_screenshot_from_tool_result(text: &str) -> Option<ExtractedScreenshot> {
+    let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let obj = value.as_object_mut()?;
+
+    let screenshot = obj.remove("screenshot")?;
+    let raw_base64 = screenshot.as_str()?;
+    if raw_base64.is_empty() {
+        return None;
+    }
+
+    // Strip data URL prefix if present (e.g., "data:image/png;base64,")
+    let base64_data = if raw_base64.starts_with("data:") {
+        raw_base64
+            .find(',')
+            .map(|i| &raw_base64[i + 1..])
+            .unwrap_or(raw_base64)
+    } else {
+        raw_base64
+    };
+
+    // Remove whitespace/newlines from base64
+    let clean_base64: String = base64_data.chars().filter(|c| !c.is_whitespace()).collect();
+    if clean_base64.is_empty() {
+        return None;
+    }
+
+    let text_without_screenshot =
+        serde_json::to_string(&value).unwrap_or_else(|_| text.to_string());
+
+    Some(ExtractedScreenshot {
+        text_without_screenshot,
+        base64_data: clean_base64,
+    })
+}
+
 /// Execute an LLM chat request.
 ///
 /// This function routes the request to the appropriate provider based on the
@@ -249,19 +299,27 @@ pub async fn execute_llm_chat(
     request: LlmChatRequest,
 ) -> Result<LlmChatResponse> {
     match provider {
-        ProviderType::Anthropic => execute_anthropic_chat(api_key, model, request).await,
-        ProviderType::OpenAi => execute_openai_chat(api_key, model, request).await,
-        ProviderType::OpenRouter => execute_openrouter_chat(api_key, model, request).await,
-        ProviderType::DeepSeek => execute_deepseek_chat(api_key, model, request).await,
-        ProviderType::Qwen => execute_qwen_chat(api_key, model, request).await,
-        ProviderType::Gemini => execute_gemini_chat(api_key, model, request).await,
-        ProviderType::Groq => execute_groq_chat(api_key, model, request).await,
-        ProviderType::Ollama => execute_ollama_chat(api_key, model, request).await,
-        ProviderType::Mistral => execute_mistral_chat(api_key, model, request).await,
-        ProviderType::XAi => execute_xai_chat(api_key, model, request).await,
-        ProviderType::Cohere => execute_cohere_chat(api_key, model, request).await,
-        ProviderType::Perplexity => execute_perplexity_chat(api_key, model, request).await,
-        ProviderType::Together => execute_together_chat(api_key, model, request).await,
+        ProviderType::Anthropic => execute_anthropic_chat(api_key, model, request, provider).await,
+        ProviderType::OpenAi => execute_openai_chat(api_key, model, request, provider).await,
+        ProviderType::OpenRouter => {
+            execute_openrouter_chat(api_key, model, request, provider).await
+        }
+        ProviderType::DeepSeek => execute_deepseek_chat(api_key, model, request, provider).await,
+        ProviderType::Qwen => execute_qwen_chat(api_key, model, request, provider).await,
+        ProviderType::Gemini => execute_gemini_chat(api_key, model, request, provider).await,
+        ProviderType::Groq => execute_groq_chat(api_key, model, request, provider).await,
+        ProviderType::Ollama => execute_ollama_chat(api_key, model, request, provider).await,
+        ProviderType::Mistral => execute_mistral_chat(api_key, model, request, provider).await,
+        ProviderType::XAi => execute_xai_chat(api_key, model, request, provider).await,
+        ProviderType::Cohere => execute_cohere_chat(api_key, model, request, provider).await,
+        ProviderType::Perplexity => {
+            execute_perplexity_chat(api_key, model, request, provider).await
+        }
+        ProviderType::Together => execute_together_chat(api_key, model, request, provider).await,
+        ProviderType::ClaudeCode => {
+            execute_claude_code_chat(api_key, model, request, provider).await
+        }
+        ProviderType::GeminiCli => execute_gemini_cli_chat(api_key, model, request, provider).await,
     }
 }
 
@@ -270,6 +328,7 @@ async fn execute_anthropic_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
+    provider: ProviderType,
 ) -> Result<LlmChatResponse> {
     let client: anthropic::Client = anthropic::Client::builder()
         .api_key(api_key)
@@ -278,7 +337,7 @@ async fn execute_anthropic_chat(
             DaemonError::InternalError(format!("Failed to create Anthropic client: {}", e))
         })?;
     let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request).await
+    execute_rig_completion(completion_model, request, provider).await
 }
 
 /// Execute a chat request using the OpenAI provider.
@@ -286,6 +345,7 @@ async fn execute_openai_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
+    provider: ProviderType,
 ) -> Result<LlmChatResponse> {
     let client: openai::Client =
         openai::Client::builder()
@@ -295,7 +355,7 @@ async fn execute_openai_chat(
                 DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
             })?;
     let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request).await
+    execute_rig_completion(completion_model, request, provider).await
 }
 
 /// Execute a chat request using the OpenRouter provider (native rig provider).
@@ -303,6 +363,7 @@ async fn execute_openrouter_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
+    provider: ProviderType,
 ) -> Result<LlmChatResponse> {
     let client: openrouter::Client = openrouter::Client::builder()
         .api_key(api_key)
@@ -311,7 +372,7 @@ async fn execute_openrouter_chat(
             DaemonError::InternalError(format!("Failed to create OpenRouter client: {}", e))
         })?;
     let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request).await
+    execute_rig_completion(completion_model, request, provider).await
 }
 
 /// Execute a chat request using the DeepSeek provider (native rig provider).
@@ -319,6 +380,7 @@ async fn execute_deepseek_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
+    provider: ProviderType,
 ) -> Result<LlmChatResponse> {
     let client: deepseek::Client = deepseek::Client::builder()
         .api_key(api_key)
@@ -327,7 +389,7 @@ async fn execute_deepseek_chat(
             DaemonError::InternalError(format!("Failed to create DeepSeek client: {}", e))
         })?;
     let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request).await
+    execute_rig_completion(completion_model, request, provider).await
 }
 
 /// Execute a chat request using the Qwen provider (custom implementation).
@@ -335,10 +397,83 @@ async fn execute_qwen_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
+    provider: ProviderType,
 ) -> Result<LlmChatResponse> {
     let client = QwenClient::new(api_key);
     let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request).await
+    execute_rig_completion(completion_model, request, provider).await
+}
+
+/// Execute a chat request using the Claude Code CLI provider.
+async fn execute_claude_code_chat(
+    api_key: &str,
+    model: &str,
+    request: LlmChatRequest,
+    provider: ProviderType,
+) -> Result<LlmChatResponse> {
+    let client = if api_key == "claude-code-cli" {
+        ClaudeCodeClient::new("claude")
+    } else {
+        ClaudeCodeClient::new("claude").with_api_key(api_key)
+    };
+
+    // Set CWD to isolated workspace directory
+    let workspace_dir = resolve_workspace_dir();
+    let client = client
+        .with_working_dir(workspace_dir)
+        .with_add_dirs(resolve_skills_dirs());
+
+    let completion_model = client.completion_model(model);
+    execute_rig_completion(completion_model, request, provider).await
+}
+
+/// Execute a chat request using the Gemini CLI provider.
+async fn execute_gemini_cli_chat(
+    api_key: &str,
+    model: &str,
+    request: LlmChatRequest,
+    provider: ProviderType,
+) -> Result<LlmChatResponse> {
+    let client = if api_key == "gemini-cli" {
+        GeminiCliClient::new("gemini")
+    } else {
+        GeminiCliClient::new("gemini").with_api_key(api_key)
+    };
+
+    let workspace_dir = resolve_workspace_dir();
+    let client = client
+        .with_working_dir(workspace_dir)
+        .with_add_dirs(resolve_skills_dirs());
+
+    let completion_model = client.completion_model(model);
+    execute_rig_completion(completion_model, request, provider).await
+}
+
+/// Resolve the default workspace directory for the Claude Code CLI subprocess.
+///
+/// Uses `$NEVOFLUX_DATA_DIR/workspace` or `~/.local/share/nevoflux/workspace`.
+fn resolve_workspace_dir() -> String {
+    let data_dir = std::env::var("NEVOFLUX_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            directories::ProjectDirs::from("com", "nevoflux", "nevoflux")
+                .map(|dirs| dirs.data_dir().to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+        });
+    let workspace = data_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).ok();
+    workspace.to_string_lossy().to_string()
+}
+
+/// Resolve skills directories to pass as `--add-dir` to CLI providers.
+///
+/// Returns existing user skills directories so the CLI subprocess can access skill files.
+fn resolve_skills_dirs() -> Vec<String> {
+    nevoflux_skills::default_user_skills_dirs()
+        .into_iter()
+        .filter(|d| d.exists())
+        .map(|d| d.to_string_lossy().to_string())
+        .collect()
 }
 
 /// Execute a chat request using the Google Gemini provider.
@@ -346,6 +481,7 @@ async fn execute_gemini_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
+    provider: ProviderType,
 ) -> Result<LlmChatResponse> {
     let client: gemini::Client =
         gemini::Client::builder()
@@ -355,7 +491,7 @@ async fn execute_gemini_chat(
                 DaemonError::InternalError(format!("Failed to create Gemini client: {}", e))
             })?;
     let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request).await
+    execute_rig_completion(completion_model, request, provider).await
 }
 
 /// Execute a chat request using the Groq provider.
@@ -363,13 +499,14 @@ async fn execute_groq_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
+    provider: ProviderType,
 ) -> Result<LlmChatResponse> {
     let client: groq::Client = groq::Client::builder()
         .api_key(api_key)
         .build()
         .map_err(|e| DaemonError::InternalError(format!("Failed to create Groq client: {}", e)))?;
     let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request).await
+    execute_rig_completion(completion_model, request, provider).await
 }
 
 /// Execute a chat request using the Ollama provider (local models).
@@ -377,6 +514,7 @@ async fn execute_ollama_chat(
     _api_key: &str,
     model: &str,
     request: LlmChatRequest,
+    provider: ProviderType,
 ) -> Result<LlmChatResponse> {
     // Ollama doesn't need an API key for local usage, use Nothing
     let client: ollama::Client =
@@ -387,7 +525,7 @@ async fn execute_ollama_chat(
                 DaemonError::InternalError(format!("Failed to create Ollama client: {}", e))
             })?;
     let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request).await
+    execute_rig_completion(completion_model, request, provider).await
 }
 
 /// Execute a chat request using the Mistral provider.
@@ -395,6 +533,7 @@ async fn execute_mistral_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
+    provider: ProviderType,
 ) -> Result<LlmChatResponse> {
     let client: mistral::Client = mistral::Client::builder()
         .api_key(api_key)
@@ -403,7 +542,7 @@ async fn execute_mistral_chat(
             DaemonError::InternalError(format!("Failed to create Mistral client: {}", e))
         })?;
     let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request).await
+    execute_rig_completion(completion_model, request, provider).await
 }
 
 /// Execute a chat request using the xAI (Grok) provider.
@@ -411,13 +550,14 @@ async fn execute_xai_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
+    provider: ProviderType,
 ) -> Result<LlmChatResponse> {
     let client: xai::Client = xai::Client::builder()
         .api_key(api_key)
         .build()
         .map_err(|e| DaemonError::InternalError(format!("Failed to create xAI client: {}", e)))?;
     let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request).await
+    execute_rig_completion(completion_model, request, provider).await
 }
 
 /// Execute a chat request using the Cohere provider.
@@ -425,6 +565,7 @@ async fn execute_cohere_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
+    provider: ProviderType,
 ) -> Result<LlmChatResponse> {
     let client: cohere::Client =
         cohere::Client::builder()
@@ -434,7 +575,7 @@ async fn execute_cohere_chat(
                 DaemonError::InternalError(format!("Failed to create Cohere client: {}", e))
             })?;
     let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request).await
+    execute_rig_completion(completion_model, request, provider).await
 }
 
 /// Execute a chat request using the Perplexity provider.
@@ -442,6 +583,7 @@ async fn execute_perplexity_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
+    provider: ProviderType,
 ) -> Result<LlmChatResponse> {
     let client: perplexity::Client = perplexity::Client::builder()
         .api_key(api_key)
@@ -450,7 +592,7 @@ async fn execute_perplexity_chat(
             DaemonError::InternalError(format!("Failed to create Perplexity client: {}", e))
         })?;
     let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request).await
+    execute_rig_completion(completion_model, request, provider).await
 }
 
 /// Execute a chat request using the Together AI provider.
@@ -458,6 +600,7 @@ async fn execute_together_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
+    provider: ProviderType,
 ) -> Result<LlmChatResponse> {
     let client: together::Client = together::Client::builder()
         .api_key(api_key)
@@ -466,13 +609,14 @@ async fn execute_together_chat(
             DaemonError::InternalError(format!("Failed to create Together client: {}", e))
         })?;
     let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request).await
+    execute_rig_completion(completion_model, request, provider).await
 }
 
 /// Generic completion execution for any rig-compatible model.
 async fn execute_rig_completion<M>(
     completion_model: M,
     request: LlmChatRequest,
+    provider: ProviderType,
 ) -> Result<LlmChatResponse>
 where
     M: CompletionModel,
@@ -496,25 +640,123 @@ where
                 system_prompt = Some(msg.content.clone());
             }
             "tool" => {
-                // Tool results must be sent as ToolResult content, not plain text
                 let tool_call_id = msg.tool_call_id.clone().unwrap_or_default();
                 tracing::info!(
-                    "Converting tool result: tool_call_id={}, content_len={}, starts_with_call={}, starts_with_fc={}",
+                    "Converting tool result: tool_call_id={}, content_len={}, attachments={}, starts_with_call={}, starts_with_fc={}",
                     tool_call_id,
                     msg.content.len(),
+                    msg.attachments.len(),
                     tool_call_id.starts_with("call_"),
                     tool_call_id.starts_with("fc_")
                 );
-                let tool_result = ToolResult {
-                    id: tool_call_id.clone(),
-                    call_id: Some(tool_call_id),
-                    content: OneOrMany::one(ToolResultContent::Text(Text {
-                        text: msg.content.clone(),
-                    })),
-                };
-                chat_history.push(Message::User {
-                    content: OneOrMany::one(UserContent::ToolResult(tool_result)),
-                });
+
+                // Check for image attachments first (from agent-level screenshot handling)
+                let image_attachment = msg
+                    .attachments
+                    .iter()
+                    .find(|a| a.mime_type.starts_with("image/"));
+
+                match image_attachment {
+                    Some(attachment) if provider == ProviderType::Anthropic => {
+                        // Anthropic: image inside tool result (native multimodal tool results)
+                        let tool_result = ToolResult {
+                            id: tool_call_id.clone(),
+                            call_id: Some(tool_call_id),
+                            content: OneOrMany::many(vec![
+                                ToolResultContent::text(&msg.content),
+                                ToolResultContent::image_base64(
+                                    &attachment.data,
+                                    Some(ImageMediaType::PNG),
+                                    None,
+                                ),
+                            ])
+                            .unwrap_or_else(|_| {
+                                OneOrMany::one(ToolResultContent::text(&msg.content))
+                            }),
+                        };
+                        chat_history.push(Message::User {
+                            content: OneOrMany::one(UserContent::ToolResult(tool_result)),
+                        });
+                    }
+                    Some(attachment) => {
+                        // OpenAI/others: text tool result + separate user image message
+                        let tool_result = ToolResult {
+                            id: tool_call_id.clone(),
+                            call_id: Some(tool_call_id),
+                            content: OneOrMany::one(ToolResultContent::text(&msg.content)),
+                        };
+                        chat_history.push(Message::User {
+                            content: OneOrMany::one(UserContent::ToolResult(tool_result)),
+                        });
+                        chat_history.push(Message::User {
+                            content: OneOrMany::one(UserContent::Image(Image {
+                                data: DocumentSourceKind::Base64(attachment.data.clone()),
+                                media_type: Some(ImageMediaType::PNG),
+                                detail: None,
+                                additional_params: None,
+                            })),
+                        });
+                    }
+                    None => {
+                        // No attachment — fallback to extract_screenshot_from_tool_result
+                        match extract_screenshot_from_tool_result(&msg.content) {
+                            Some(screenshot) if provider == ProviderType::Anthropic => {
+                                let tool_result = ToolResult {
+                                    id: tool_call_id.clone(),
+                                    call_id: Some(tool_call_id),
+                                    content: OneOrMany::many(vec![
+                                        ToolResultContent::text(
+                                            &screenshot.text_without_screenshot,
+                                        ),
+                                        ToolResultContent::image_base64(
+                                            &screenshot.base64_data,
+                                            Some(ImageMediaType::PNG),
+                                            None,
+                                        ),
+                                    ])
+                                    .unwrap_or_else(|_| {
+                                        OneOrMany::one(ToolResultContent::text(&msg.content))
+                                    }),
+                                };
+                                chat_history.push(Message::User {
+                                    content: OneOrMany::one(UserContent::ToolResult(tool_result)),
+                                });
+                            }
+                            Some(screenshot) => {
+                                let tool_result = ToolResult {
+                                    id: tool_call_id.clone(),
+                                    call_id: Some(tool_call_id),
+                                    content: OneOrMany::one(ToolResultContent::text(
+                                        &screenshot.text_without_screenshot,
+                                    )),
+                                };
+                                chat_history.push(Message::User {
+                                    content: OneOrMany::one(UserContent::ToolResult(tool_result)),
+                                });
+                                chat_history.push(Message::User {
+                                    content: OneOrMany::one(UserContent::Image(Image {
+                                        data: DocumentSourceKind::Base64(screenshot.base64_data),
+                                        media_type: Some(ImageMediaType::PNG),
+                                        detail: None,
+                                        additional_params: None,
+                                    })),
+                                });
+                            }
+                            None => {
+                                let tool_result = ToolResult {
+                                    id: tool_call_id.clone(),
+                                    call_id: Some(tool_call_id),
+                                    content: OneOrMany::one(ToolResultContent::Text(Text {
+                                        text: msg.content.clone(),
+                                    })),
+                                };
+                                chat_history.push(Message::User {
+                                    content: OneOrMany::one(UserContent::ToolResult(tool_result)),
+                                });
+                            }
+                        }
+                    }
+                }
             }
             "assistant" => {
                 // Build assistant content - may include text and/or tool calls
@@ -942,17 +1184,19 @@ async fn execute_llm_stream_inner(
     tx: mpsc::Sender<LlmStreamChunk>,
 ) -> Result<()> {
     match provider {
-        ProviderType::Anthropic => stream_anthropic(api_key, model, request, tx).await,
-        ProviderType::OpenAi => stream_openai(api_key, model, request, tx).await,
-        ProviderType::OpenRouter => stream_openrouter(api_key, model, request, tx).await,
-        ProviderType::DeepSeek => stream_deepseek(api_key, model, request, tx).await,
-        ProviderType::Gemini => stream_gemini(api_key, model, request, tx).await,
-        ProviderType::Groq => stream_groq(api_key, model, request, tx).await,
-        ProviderType::Mistral => stream_mistral(api_key, model, request, tx).await,
-        ProviderType::XAi => stream_xai(api_key, model, request, tx).await,
-        ProviderType::Cohere => stream_cohere(api_key, model, request, tx).await,
-        ProviderType::Perplexity => stream_perplexity(api_key, model, request, tx).await,
-        ProviderType::Together => stream_together(api_key, model, request, tx).await,
+        ProviderType::Anthropic => stream_anthropic(api_key, model, request, tx, provider).await,
+        ProviderType::OpenAi => stream_openai(api_key, model, request, tx, provider).await,
+        ProviderType::OpenRouter => stream_openrouter(api_key, model, request, tx, provider).await,
+        ProviderType::DeepSeek => stream_deepseek(api_key, model, request, tx, provider).await,
+        ProviderType::Gemini => stream_gemini(api_key, model, request, tx, provider).await,
+        ProviderType::Groq => stream_groq(api_key, model, request, tx, provider).await,
+        ProviderType::Mistral => stream_mistral(api_key, model, request, tx, provider).await,
+        ProviderType::XAi => stream_xai(api_key, model, request, tx, provider).await,
+        ProviderType::Cohere => stream_cohere(api_key, model, request, tx, provider).await,
+        ProviderType::Perplexity => stream_perplexity(api_key, model, request, tx, provider).await,
+        ProviderType::Together => stream_together(api_key, model, request, tx, provider).await,
+        ProviderType::ClaudeCode => stream_claude_code(api_key, model, request, tx, provider).await,
+        ProviderType::GeminiCli => stream_gemini_cli(api_key, model, request, tx, provider).await,
         // Qwen and Ollama don't support streaming in rig yet
         ProviderType::Qwen | ProviderType::Ollama => Err(DaemonError::InternalError(format!(
             "Streaming not supported for provider {:?}",
@@ -967,6 +1211,7 @@ async fn stream_anthropic(
     model: &str,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
+    provider: ProviderType,
 ) -> Result<()> {
     let client: anthropic::Client = anthropic::Client::builder()
         .api_key(api_key)
@@ -975,7 +1220,7 @@ async fn stream_anthropic(
             DaemonError::InternalError(format!("Failed to create Anthropic client: {}", e))
         })?;
     let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx).await
+    stream_rig_completion(completion_model, request, tx, provider).await
 }
 
 /// Stream from OpenAI provider.
@@ -984,6 +1229,7 @@ async fn stream_openai(
     model: &str,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
+    provider: ProviderType,
 ) -> Result<()> {
     let client: openai::Client =
         openai::Client::builder()
@@ -993,7 +1239,7 @@ async fn stream_openai(
                 DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
             })?;
     let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx).await
+    stream_rig_completion(completion_model, request, tx, provider).await
 }
 
 /// Stream from OpenRouter provider.
@@ -1002,6 +1248,7 @@ async fn stream_openrouter(
     model: &str,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
+    provider: ProviderType,
 ) -> Result<()> {
     let client: openrouter::Client = openrouter::Client::builder()
         .api_key(api_key)
@@ -1010,7 +1257,7 @@ async fn stream_openrouter(
             DaemonError::InternalError(format!("Failed to create OpenRouter client: {}", e))
         })?;
     let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx).await
+    stream_rig_completion(completion_model, request, tx, provider).await
 }
 
 /// Stream from DeepSeek provider.
@@ -1019,6 +1266,7 @@ async fn stream_deepseek(
     model: &str,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
+    provider: ProviderType,
 ) -> Result<()> {
     let client: deepseek::Client = deepseek::Client::builder()
         .api_key(api_key)
@@ -1027,7 +1275,7 @@ async fn stream_deepseek(
             DaemonError::InternalError(format!("Failed to create DeepSeek client: {}", e))
         })?;
     let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx).await
+    stream_rig_completion(completion_model, request, tx, provider).await
 }
 
 /// Stream from Gemini provider.
@@ -1036,6 +1284,7 @@ async fn stream_gemini(
     model: &str,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
+    provider: ProviderType,
 ) -> Result<()> {
     let client: gemini::Client =
         gemini::Client::builder()
@@ -1045,7 +1294,7 @@ async fn stream_gemini(
                 DaemonError::InternalError(format!("Failed to create Gemini client: {}", e))
             })?;
     let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx).await
+    stream_rig_completion(completion_model, request, tx, provider).await
 }
 
 /// Stream from Groq provider.
@@ -1054,13 +1303,14 @@ async fn stream_groq(
     model: &str,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
+    provider: ProviderType,
 ) -> Result<()> {
     let client: groq::Client = groq::Client::builder()
         .api_key(api_key)
         .build()
         .map_err(|e| DaemonError::InternalError(format!("Failed to create Groq client: {}", e)))?;
     let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx).await
+    stream_rig_completion(completion_model, request, tx, provider).await
 }
 
 /// Stream from Mistral provider.
@@ -1069,6 +1319,7 @@ async fn stream_mistral(
     model: &str,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
+    provider: ProviderType,
 ) -> Result<()> {
     let client: mistral::Client = mistral::Client::builder()
         .api_key(api_key)
@@ -1077,7 +1328,7 @@ async fn stream_mistral(
             DaemonError::InternalError(format!("Failed to create Mistral client: {}", e))
         })?;
     let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx).await
+    stream_rig_completion(completion_model, request, tx, provider).await
 }
 
 /// Stream from xAI provider.
@@ -1086,13 +1337,14 @@ async fn stream_xai(
     model: &str,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
+    provider: ProviderType,
 ) -> Result<()> {
     let client: xai::Client = xai::Client::builder()
         .api_key(api_key)
         .build()
         .map_err(|e| DaemonError::InternalError(format!("Failed to create xAI client: {}", e)))?;
     let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx).await
+    stream_rig_completion(completion_model, request, tx, provider).await
 }
 
 /// Stream from Cohere provider.
@@ -1101,6 +1353,7 @@ async fn stream_cohere(
     model: &str,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
+    provider: ProviderType,
 ) -> Result<()> {
     let client: cohere::Client =
         cohere::Client::builder()
@@ -1110,7 +1363,7 @@ async fn stream_cohere(
                 DaemonError::InternalError(format!("Failed to create Cohere client: {}", e))
             })?;
     let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx).await
+    stream_rig_completion(completion_model, request, tx, provider).await
 }
 
 /// Stream from Perplexity provider.
@@ -1119,6 +1372,7 @@ async fn stream_perplexity(
     model: &str,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
+    provider: ProviderType,
 ) -> Result<()> {
     let client: perplexity::Client = perplexity::Client::builder()
         .api_key(api_key)
@@ -1127,7 +1381,7 @@ async fn stream_perplexity(
             DaemonError::InternalError(format!("Failed to create Perplexity client: {}", e))
         })?;
     let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx).await
+    stream_rig_completion(completion_model, request, tx, provider).await
 }
 
 /// Stream from Together provider.
@@ -1136,6 +1390,7 @@ async fn stream_together(
     model: &str,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
+    provider: ProviderType,
 ) -> Result<()> {
     let client: together::Client = together::Client::builder()
         .api_key(api_key)
@@ -1144,7 +1399,54 @@ async fn stream_together(
             DaemonError::InternalError(format!("Failed to create Together client: {}", e))
         })?;
     let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx).await
+    stream_rig_completion(completion_model, request, tx, provider).await
+}
+
+/// Stream from Claude Code CLI provider.
+async fn stream_claude_code(
+    api_key: &str,
+    model: &str,
+    request: LlmChatRequest,
+    tx: mpsc::Sender<LlmStreamChunk>,
+    provider: ProviderType,
+) -> Result<()> {
+    let client = if api_key == "claude-code-cli" {
+        ClaudeCodeClient::new("claude")
+    } else {
+        ClaudeCodeClient::new("claude").with_api_key(api_key)
+    };
+
+    // Set CWD to isolated workspace directory
+    let workspace_dir = resolve_workspace_dir();
+    let client = client
+        .with_working_dir(workspace_dir)
+        .with_add_dirs(resolve_skills_dirs());
+
+    let completion_model = client.completion_model(model);
+    stream_rig_completion(completion_model, request, tx, provider).await
+}
+
+/// Stream from Gemini CLI provider.
+async fn stream_gemini_cli(
+    api_key: &str,
+    model: &str,
+    request: LlmChatRequest,
+    tx: mpsc::Sender<LlmStreamChunk>,
+    provider: ProviderType,
+) -> Result<()> {
+    let client = if api_key == "gemini-cli" {
+        GeminiCliClient::new("gemini")
+    } else {
+        GeminiCliClient::new("gemini").with_api_key(api_key)
+    };
+
+    let workspace_dir = resolve_workspace_dir();
+    let client = client
+        .with_working_dir(workspace_dir)
+        .with_add_dirs(resolve_skills_dirs());
+
+    let completion_model = client.completion_model(model);
+    stream_rig_completion(completion_model, request, tx, provider).await
 }
 
 /// Generic streaming completion for any rig-compatible model.
@@ -1152,6 +1454,7 @@ async fn stream_rig_completion<M>(
     completion_model: M,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
+    provider: ProviderType,
 ) -> Result<()>
 where
     M: CompletionModel,
@@ -1181,25 +1484,123 @@ where
                 system_prompt = Some(msg.content.clone());
             }
             "tool" => {
-                // Tool results must be sent as ToolResult content, not plain text
                 let tool_call_id = msg.tool_call_id.clone().unwrap_or_default();
                 tracing::info!(
-                    "Converting tool result: tool_call_id={}, content_len={}, starts_with_call={}, starts_with_fc={}",
+                    "Converting tool result (stream): tool_call_id={}, content_len={}, attachments={}, starts_with_call={}, starts_with_fc={}",
                     tool_call_id,
                     msg.content.len(),
+                    msg.attachments.len(),
                     tool_call_id.starts_with("call_"),
                     tool_call_id.starts_with("fc_")
                 );
-                let tool_result = ToolResult {
-                    id: tool_call_id.clone(),
-                    call_id: Some(tool_call_id),
-                    content: OneOrMany::one(ToolResultContent::Text(Text {
-                        text: msg.content.clone(),
-                    })),
-                };
-                chat_history.push(Message::User {
-                    content: OneOrMany::one(UserContent::ToolResult(tool_result)),
-                });
+
+                // Check for image attachments first (from agent-level screenshot handling)
+                let image_attachment = msg
+                    .attachments
+                    .iter()
+                    .find(|a| a.mime_type.starts_with("image/"));
+
+                match image_attachment {
+                    Some(attachment) if provider == ProviderType::Anthropic => {
+                        // Anthropic: image inside tool result
+                        let tool_result = ToolResult {
+                            id: tool_call_id.clone(),
+                            call_id: Some(tool_call_id),
+                            content: OneOrMany::many(vec![
+                                ToolResultContent::text(&msg.content),
+                                ToolResultContent::image_base64(
+                                    &attachment.data,
+                                    Some(ImageMediaType::PNG),
+                                    None,
+                                ),
+                            ])
+                            .unwrap_or_else(|_| {
+                                OneOrMany::one(ToolResultContent::text(&msg.content))
+                            }),
+                        };
+                        chat_history.push(Message::User {
+                            content: OneOrMany::one(UserContent::ToolResult(tool_result)),
+                        });
+                    }
+                    Some(attachment) => {
+                        // OpenAI/others: text tool result + separate user image message
+                        let tool_result = ToolResult {
+                            id: tool_call_id.clone(),
+                            call_id: Some(tool_call_id),
+                            content: OneOrMany::one(ToolResultContent::text(&msg.content)),
+                        };
+                        chat_history.push(Message::User {
+                            content: OneOrMany::one(UserContent::ToolResult(tool_result)),
+                        });
+                        chat_history.push(Message::User {
+                            content: OneOrMany::one(UserContent::Image(Image {
+                                data: DocumentSourceKind::Base64(attachment.data.clone()),
+                                media_type: Some(ImageMediaType::PNG),
+                                detail: None,
+                                additional_params: None,
+                            })),
+                        });
+                    }
+                    None => {
+                        // No attachment — fallback to extract_screenshot_from_tool_result
+                        match extract_screenshot_from_tool_result(&msg.content) {
+                            Some(screenshot) if provider == ProviderType::Anthropic => {
+                                let tool_result = ToolResult {
+                                    id: tool_call_id.clone(),
+                                    call_id: Some(tool_call_id),
+                                    content: OneOrMany::many(vec![
+                                        ToolResultContent::text(
+                                            &screenshot.text_without_screenshot,
+                                        ),
+                                        ToolResultContent::image_base64(
+                                            &screenshot.base64_data,
+                                            Some(ImageMediaType::PNG),
+                                            None,
+                                        ),
+                                    ])
+                                    .unwrap_or_else(|_| {
+                                        OneOrMany::one(ToolResultContent::text(&msg.content))
+                                    }),
+                                };
+                                chat_history.push(Message::User {
+                                    content: OneOrMany::one(UserContent::ToolResult(tool_result)),
+                                });
+                            }
+                            Some(screenshot) => {
+                                let tool_result = ToolResult {
+                                    id: tool_call_id.clone(),
+                                    call_id: Some(tool_call_id),
+                                    content: OneOrMany::one(ToolResultContent::text(
+                                        &screenshot.text_without_screenshot,
+                                    )),
+                                };
+                                chat_history.push(Message::User {
+                                    content: OneOrMany::one(UserContent::ToolResult(tool_result)),
+                                });
+                                chat_history.push(Message::User {
+                                    content: OneOrMany::one(UserContent::Image(Image {
+                                        data: DocumentSourceKind::Base64(screenshot.base64_data),
+                                        media_type: Some(ImageMediaType::PNG),
+                                        detail: None,
+                                        additional_params: None,
+                                    })),
+                                });
+                            }
+                            None => {
+                                let tool_result = ToolResult {
+                                    id: tool_call_id.clone(),
+                                    call_id: Some(tool_call_id),
+                                    content: OneOrMany::one(ToolResultContent::Text(Text {
+                                        text: msg.content.clone(),
+                                    })),
+                                };
+                                chat_history.push(Message::User {
+                                    content: OneOrMany::one(UserContent::ToolResult(tool_result)),
+                                });
+                            }
+                        }
+                    }
+                }
             }
             "assistant" => {
                 // Build assistant content - may include text and/or tool calls
@@ -2078,5 +2479,123 @@ mod tests {
         // Next call should return None (stream is done)
         let chunk = registry.next_chunk(id).unwrap();
         assert!(chunk.is_none());
+    }
+
+    // =========================================================================
+    // Screenshot Extraction Tests
+    // =========================================================================
+
+    #[test]
+    fn test_extract_screenshot_with_screenshot() {
+        let json = r#"{"success":true,"data":"some data","screenshot":"aW1hZ2VfZGF0YQ=="}"#;
+        let result = extract_screenshot_from_tool_result(json);
+        assert!(result.is_some());
+        let extracted = result.unwrap();
+        assert_eq!(extracted.base64_data, "aW1hZ2VfZGF0YQ==");
+        // The remaining JSON should not contain "screenshot"
+        assert!(!extracted.text_without_screenshot.contains("screenshot"));
+        assert!(extracted.text_without_screenshot.contains("success"));
+        assert!(extracted.text_without_screenshot.contains("some data"));
+    }
+
+    #[test]
+    fn test_extract_screenshot_without_screenshot() {
+        let json = r#"{"success":true,"data":"some data"}"#;
+        let result = extract_screenshot_from_tool_result(json);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_screenshot_empty_screenshot() {
+        let json = r#"{"success":true,"screenshot":""}"#;
+        let result = extract_screenshot_from_tool_result(json);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_screenshot_non_json() {
+        let text = "This is just plain text, not JSON";
+        let result = extract_screenshot_from_tool_result(text);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_screenshot_data_url_prefix() {
+        let json = r#"{"success":true,"screenshot":"data:image/png;base64,aW1hZ2VfZGF0YQ=="}"#;
+        let result = extract_screenshot_from_tool_result(json);
+        assert!(result.is_some());
+        let extracted = result.unwrap();
+        // data URL prefix should be stripped
+        assert_eq!(extracted.base64_data, "aW1hZ2VfZGF0YQ==");
+        assert!(!extracted.base64_data.starts_with("data:"));
+    }
+
+    #[test]
+    fn test_extract_screenshot_preserves_other_fields() {
+        let json = r#"{"success":true,"data":{"url":"https://example.com","title":"Test"},"error":null,"screenshot":"c2NyZWVuc2hvdA=="}"#;
+        let result = extract_screenshot_from_tool_result(json);
+        assert!(result.is_some());
+        let extracted = result.unwrap();
+        // Verify other fields are preserved
+        let remaining: serde_json::Value =
+            serde_json::from_str(&extracted.text_without_screenshot).unwrap();
+        assert_eq!(remaining["success"], true);
+        assert_eq!(remaining["data"]["url"], "https://example.com");
+        assert_eq!(remaining["data"]["title"], "Test");
+        assert!(remaining["error"].is_null());
+        // screenshot should be gone
+        assert!(remaining.get("screenshot").is_none());
+    }
+
+    #[test]
+    fn test_tool_message_with_image_attachment_serialization() {
+        // Verify that LlmMessage with tool role and attachments serializes correctly
+        let msg = LlmMessage {
+            role: "tool".into(),
+            content: r#"{"success":true,"screenshot_available":true}"#.into(),
+            tool_calls: None,
+            tool_call_id: Some("call_123".into()),
+            attachments: vec![LlmAttachment {
+                name: "screenshot.png".into(),
+                mime_type: "image/png".into(),
+                data: "iVBORw0KGgo=".into(),
+            }],
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("screenshot_available"));
+        assert!(json.contains("image/png"));
+        assert!(json.contains("iVBORw0KGgo="));
+
+        let parsed: LlmMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.role, "tool");
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].mime_type, "image/png");
+    }
+
+    #[test]
+    fn test_tool_message_without_attachment_no_attachment_field() {
+        // When no attachments, the field should be omitted in serialization
+        let msg = LlmMessage {
+            role: "tool".into(),
+            content: r#"{"success":true}"#.into(),
+            tool_calls: None,
+            tool_call_id: Some("call_123".into()),
+            attachments: vec![],
+        };
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("attachments"));
+    }
+
+    #[test]
+    fn test_extract_screenshot_not_triggered_for_compact_result() {
+        // The new compact screenshot result should NOT trigger extract_screenshot_from_tool_result
+        let compact = r#"{"success":true,"screenshot_available":true}"#;
+        let result = extract_screenshot_from_tool_result(compact);
+        assert!(
+            result.is_none(),
+            "Compact screenshot result should not have extractable screenshot"
+        );
     }
 }

@@ -102,11 +102,7 @@ impl AsyncProxyConfig {
 /// - stdin_task: reads from stdin and sends to socket_task
 /// - stdout_task: receives from socket_task and writes to stdout
 /// - socket_task: handles bidirectional ZeroMQ communication using select!
-pub async fn run_async_proxy<R, W>(
-    reader: R,
-    writer: W,
-    config: AsyncProxyConfig,
-) -> Result<()>
+pub async fn run_async_proxy<R, W>(reader: R, writer: W, config: AsyncProxyConfig) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -506,9 +502,10 @@ mod tests {
         // Signal shutdown after message is sent
         tx.send(StdoutMessage::Shutdown).await.unwrap();
 
-        let handle = tokio::spawn(async move {
-            stdout_task(BufWriter::new(&mut output), rx, shutdown_rx).await
-        });
+        let handle =
+            tokio::spawn(
+                async move { stdout_task(BufWriter::new(&mut output), rx, shutdown_rx).await },
+            );
 
         let _ = shutdown_tx.send(());
         let _ = handle.await;
@@ -533,9 +530,8 @@ mod tests {
         .unwrap();
         tx.send(StdoutMessage::Shutdown).await.unwrap();
 
-        let handle = tokio::spawn(async move {
-            stdout_task(BufWriter::new(output), rx, shutdown_rx).await
-        });
+        let handle =
+            tokio::spawn(async move { stdout_task(BufWriter::new(output), rx, shutdown_rx).await });
 
         let result = handle.await.unwrap();
         assert!(result.is_ok());

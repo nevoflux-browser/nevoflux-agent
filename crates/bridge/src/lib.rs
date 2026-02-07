@@ -66,6 +66,7 @@ pub mod proxy;
 pub mod streaming;
 
 // Re-export main types
+pub use async_proxy::{run_async_proxy, AsyncProxyConfig, StdinMessage, StdoutMessage};
 pub use config::BridgeConfig;
 pub use daemon_client::{generate_proxy_id, DaemonClient, DaemonMessageStream};
 pub use error::{BridgeError, Result};
@@ -79,7 +80,6 @@ pub use proxy::{parse_native_message, Proxy, ProxyConfig, ProxyState};
 pub use streaming::{
     extract_stream_message, ActiveStream, StreamAccumulator, StreamError, StreamMessageType,
 };
-pub use async_proxy::{run_async_proxy, AsyncProxyConfig, StdinMessage, StdoutMessage};
 
 #[cfg(test)]
 mod tests {

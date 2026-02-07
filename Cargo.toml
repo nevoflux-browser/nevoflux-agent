@@ -46,7 +46,7 @@ thiserror = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process"] }
 tokio-stream = "0.1"
 
 # HTTP client

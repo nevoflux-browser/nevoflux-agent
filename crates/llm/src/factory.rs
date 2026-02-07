@@ -31,6 +31,10 @@ pub enum ProviderType {
     Perplexity,
     /// Together AI models
     Together,
+    /// Claude Code CLI (subprocess)
+    ClaudeCode,
+    /// Gemini CLI (subprocess)
+    GeminiCli,
 }
 
 impl FromStr for ProviderType {
@@ -51,6 +55,8 @@ impl FromStr for ProviderType {
             "cohere" => Ok(ProviderType::Cohere),
             "perplexity" => Ok(ProviderType::Perplexity),
             "together" => Ok(ProviderType::Together),
+            "claude-code" | "claude_code" => Ok(ProviderType::ClaudeCode),
+            "gemini-cli" | "gemini_cli" => Ok(ProviderType::GeminiCli),
             _ => Err(format!("Unknown provider: {}", s)),
         }
     }
@@ -125,6 +131,29 @@ pub fn default_model_for(provider: ProviderType) -> &'static str {
         ProviderType::Cohere => "command-r-plus",
         ProviderType::Perplexity => "llama-3.1-sonar-small-128k-online",
         ProviderType::Together => "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+        ProviderType::ClaudeCode => "sonnet",
+        ProviderType::GeminiCli => "gemini-2.5-pro",
+    }
+}
+
+/// Get the default context window size (in tokens) for a provider's default model.
+pub fn default_context_window_for(provider: ProviderType) -> u32 {
+    match provider {
+        ProviderType::Anthropic => 200_000,
+        ProviderType::OpenAi => 128_000,
+        ProviderType::OpenRouter => 200_000,
+        ProviderType::DeepSeek => 64_000,
+        ProviderType::Qwen => 32_000,
+        ProviderType::Gemini => 1_000_000,
+        ProviderType::Groq => 128_000,
+        ProviderType::Ollama => 8_000,
+        ProviderType::Mistral => 32_000,
+        ProviderType::XAi => 131_072,
+        ProviderType::Cohere => 128_000,
+        ProviderType::Perplexity => 128_000,
+        ProviderType::Together => 8_000,
+        ProviderType::ClaudeCode => 200_000,
+        ProviderType::GeminiCli => 1_000_000,
     }
 }
 
@@ -144,6 +173,8 @@ pub fn api_key_env_var(provider: ProviderType) -> &'static str {
         ProviderType::Cohere => "COHERE_API_KEY",
         ProviderType::Perplexity => "PERPLEXITY_API_KEY",
         ProviderType::Together => "TOGETHER_API_KEY",
+        ProviderType::ClaudeCode => "ANTHROPIC_API_KEY",
+        ProviderType::GeminiCli => "GEMINI_API_KEY",
     }
 }
 
@@ -267,6 +298,16 @@ mod tests {
     }
 
     #[test]
+    fn test_default_model_for_claude_code() {
+        assert_eq!(default_model_for(ProviderType::ClaudeCode), "sonnet");
+    }
+
+    #[test]
+    fn test_default_model_for_gemini_cli() {
+        assert_eq!(default_model_for(ProviderType::GeminiCli), "gemini-2.5-pro");
+    }
+
+    #[test]
     fn test_provider_type_debug() {
         assert_eq!(format!("{:?}", ProviderType::Anthropic), "Anthropic");
         assert_eq!(format!("{:?}", ProviderType::Gemini), "Gemini");
@@ -333,6 +374,8 @@ mod tests {
             ProviderType::Cohere,
             ProviderType::Perplexity,
             ProviderType::Together,
+            ProviderType::ClaudeCode,
+            ProviderType::GeminiCli,
         ];
 
         for provider in providers {
@@ -361,6 +404,8 @@ mod tests {
             ProviderType::Cohere,
             ProviderType::Perplexity,
             ProviderType::Together,
+            ProviderType::ClaudeCode,
+            ProviderType::GeminiCli,
         ];
 
         for provider in providers {
@@ -423,6 +468,22 @@ mod tests {
         assert_eq!(
             ProviderType::from_str("together").unwrap(),
             ProviderType::Together
+        );
+        assert_eq!(
+            ProviderType::from_str("claude-code").unwrap(),
+            ProviderType::ClaudeCode
+        );
+        assert_eq!(
+            ProviderType::from_str("claude_code").unwrap(),
+            ProviderType::ClaudeCode
+        );
+        assert_eq!(
+            ProviderType::from_str("gemini-cli").unwrap(),
+            ProviderType::GeminiCli
+        );
+        assert_eq!(
+            ProviderType::from_str("gemini_cli").unwrap(),
+            ProviderType::GeminiCli
         );
     }
 

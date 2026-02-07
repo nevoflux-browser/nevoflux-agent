@@ -32,7 +32,12 @@ pub struct PatternEngine {
 impl PatternEngine {
     pub fn new(detectors: Vec<Box<dyn PatternDetector + Send>>, max_injections: u32) -> Self {
         let fired = vec![false; detectors.len()];
-        Self { detectors, max_injections, fired, injection_count: 0 }
+        Self {
+            detectors,
+            max_injections,
+            fired,
+            injection_count: 0,
+        }
     }
 
     pub fn default_engine() -> Self {
@@ -51,7 +56,9 @@ impl PatternEngine {
             return None;
         }
         for (i, detector) in self.detectors.iter().enumerate() {
-            if self.fired[i] { continue; }
+            if self.fired[i] {
+                continue;
+            }
             if let Some(summary) = detector.check(ctx) {
                 self.fired[i] = true;
                 self.injection_count += 1;
@@ -93,8 +100,17 @@ mod tests {
     #[test]
     fn test_engine_fires_once_per_detector() {
         let mut engine = PatternEngine::default_engine();
-        let spans = vec![make_failing_span(0), make_failing_span(1), make_failing_span(2)];
-        let ctx = DetectionContext { session_id: "sess-1", iteration: 3, max_iterations: 50, recent_tool_spans: &spans };
+        let spans = vec![
+            make_failing_span(0),
+            make_failing_span(1),
+            make_failing_span(2),
+        ];
+        let ctx = DetectionContext {
+            session_id: "sess-1",
+            iteration: 3,
+            max_iterations: 50,
+            recent_tool_spans: &spans,
+        };
         assert!(engine.check(&ctx).is_some());
         assert_eq!(engine.injection_count(), 1);
         assert!(engine.check(&ctx).is_none()); // Already fired
@@ -107,15 +123,29 @@ mod tests {
             0, // max 0
         );
         let spans = vec![make_failing_span(0)];
-        let ctx = DetectionContext { session_id: "sess-1", iteration: 0, max_iterations: 50, recent_tool_spans: &spans };
+        let ctx = DetectionContext {
+            session_id: "sess-1",
+            iteration: 0,
+            max_iterations: 50,
+            recent_tool_spans: &spans,
+        };
         assert!(engine.check(&ctx).is_none());
     }
 
     #[test]
     fn test_engine_reset() {
         let mut engine = PatternEngine::default_engine();
-        let spans = vec![make_failing_span(0), make_failing_span(1), make_failing_span(2)];
-        let ctx = DetectionContext { session_id: "sess-1", iteration: 3, max_iterations: 50, recent_tool_spans: &spans };
+        let spans = vec![
+            make_failing_span(0),
+            make_failing_span(1),
+            make_failing_span(2),
+        ];
+        let ctx = DetectionContext {
+            session_id: "sess-1",
+            iteration: 3,
+            max_iterations: 50,
+            recent_tool_spans: &spans,
+        };
         assert!(engine.check(&ctx).is_some());
         engine.reset();
         assert!(engine.check(&ctx).is_some());

@@ -380,7 +380,9 @@ mod tests {
         assert!(!deserialized.complete);
         assert!(deserialized.tool_calls.is_empty());
 
-        let plan = deserialized.plan_proposal.expect("plan_proposal should be Some");
+        let plan = deserialized
+            .plan_proposal
+            .expect("plan_proposal should be Some");
         assert_eq!(plan.summary, "Refactor the login module");
         assert_eq!(plan.steps.len(), 2);
         assert_eq!(plan.steps[0].description, "Extract validation logic");

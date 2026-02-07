@@ -16,6 +16,7 @@ use nevoflux_protocol::{
 use nevoflux_skills::{check_tool_availability, format_missing_tools_message, ToolCheckResult};
 use nevoflux_storage::{ListSessionsParams, Message as StorageMessage, MessageRole};
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, warn};
@@ -32,6 +33,10 @@ type PlanRequestRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<PlanRespons
 /// Registry for active streaming sessions that can be cancelled.
 /// Maps session_id to the cancellation token.
 type CancellationRegistry = Arc<Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>;
+
+/// Registry for active agent interrupt flags.
+/// Maps session_id to the interrupt flag so stop_generation can signal the agent to stop.
+type InterruptRegistry = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -117,6 +122,9 @@ pub async fn start_server(
 
     // Create cancellation registry for active streaming sessions
     let cancellation_registry: CancellationRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+    // Create interrupt registry for signalling agents to stop
+    let interrupt_registry: InterruptRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     // Create plan request registry for pending plan proposals
     let plan_registry: PlanRequestRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -278,6 +286,7 @@ pub async fn start_server(
     let process_runtime = tokio::runtime::Handle::current();
     let process_browser_registry = browser_registry.clone();
     let process_cancellation_registry = cancellation_registry.clone();
+    let process_interrupt_registry = interrupt_registry.clone();
     let process_plan_registry = plan_registry.clone();
     let process_trace_enabled = config.trace_enabled;
     tokio::spawn(async move {
@@ -312,7 +321,16 @@ pub async fn start_server(
 
                 info!("Received stop_generation for session: {}", session_id);
 
-                // Cancel the active streaming session
+                // Signal the agent to stop via interrupt flag
+                {
+                    let mut registry = process_interrupt_registry.lock().await;
+                    if let Some(flag) = registry.remove(session_id) {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        info!("Set interrupt flag for session: {}", session_id);
+                    }
+                }
+
+                // Cancel the active streaming session forwarder
                 let cancelled = {
                     let mut registry = process_cancellation_registry.lock().await;
                     if let Some(token) = registry.remove(session_id) {
@@ -443,6 +461,7 @@ pub async fn start_server(
                     let runtime = process_runtime.clone();
                     let response_tx = process_response_tx.clone();
                     let cancellation_registry = process_cancellation_registry.clone();
+                    let interrupt_registry = process_interrupt_registry.clone();
                     let plan_registry = process_plan_registry.clone();
                     let trace_enabled = process_trace_enabled;
                     tokio::spawn(async move {
@@ -458,6 +477,7 @@ pub async fn start_server(
                             channel,
                             response_tx,
                             cancellation_registry,
+                            interrupt_registry,
                             plan_registry,
                             trace_enabled,
                         )
@@ -542,6 +562,7 @@ async fn handle_chat_message_streaming(
     channel: Channel,
     response_tx: mpsc::Sender<(Vec<u8>, DaemonEnvelope)>,
     cancellation_registry: CancellationRegistry,
+    interrupt_registry: InterruptRegistry,
     plan_registry: PlanRequestRegistry,
     trace_enabled: bool,
 ) {
@@ -778,9 +799,19 @@ async fn handle_chat_message_streaming(
 
     // Create host functions with streaming support
     // Set client context on services so browser tool requests can be routed back
-    let services_with_context = services
+    let mut services_with_context = services
         .clone()
         .with_client_context(identity.clone(), proxy_id.clone());
+
+    // Create a per-session interrupt flag and register it so stop_generation can find it
+    let session_interrupt_flag = Arc::new(AtomicBool::new(false));
+    services_with_context.interrupt_flag = session_interrupt_flag.clone();
+    {
+        let mut registry = interrupt_registry.lock().await;
+        registry.insert(session_id.clone(), session_interrupt_flag);
+        debug!("Registered interrupt flag for session: {}", session_id);
+    }
+
     let host = DaemonHostFunctions::new(config.clone(), runtime.clone())
         .with_services(services_with_context)
         .with_sidebar_stream(stream_tx)
@@ -911,11 +942,16 @@ async fn handle_chat_message_streaming(
         }
     };
 
-    // Cleanup cancellation token from registry
+    // Cleanup cancellation token and interrupt flag from registries
     {
         let mut registry = cancellation_registry.lock().await;
         registry.remove(&session_id);
         debug!("Removed cancellation token for session: {}", session_id);
+    }
+    {
+        let mut registry = interrupt_registry.lock().await;
+        registry.remove(&session_id);
+        debug!("Removed interrupt flag for session: {}", session_id);
     }
 
     // Cleanup trace collector session data
@@ -990,12 +1026,11 @@ async fn handle_chat_message_streaming(
                         let rerun_services = services
                             .clone()
                             .with_client_context(identity.clone(), proxy_id.clone());
-                        let rerun_host =
-                            DaemonHostFunctions::new(config.clone(), runtime.clone())
-                                .with_services(rerun_services)
-                                .with_sidebar_stream(rerun_stream_tx)
-                                .with_session_id(session_id.clone())
-                                .with_trace_collector(trace_collector.clone());
+                        let rerun_host = DaemonHostFunctions::new(config.clone(), runtime.clone())
+                            .with_services(rerun_services)
+                            .with_sidebar_stream(rerun_stream_tx)
+                            .with_session_id(session_id.clone())
+                            .with_trace_collector(trace_collector.clone());
 
                         let rerun_agent = Agent::new(rerun_host);
 
@@ -1089,10 +1124,7 @@ async fn handle_chat_message_streaming(
                                         )
                                         .await
                                     {
-                                        error!(
-                                            "Failed to save rerun response: {}",
-                                            e
-                                        );
+                                        error!("Failed to save rerun response: {}", e);
                                     }
                                 }
 
@@ -1105,19 +1137,11 @@ async fn handle_chat_message_streaming(
                                         "done": true
                                     }
                                 });
-                                let response = DaemonEnvelope::new(
-                                    &proxy_id,
-                                    channel,
-                                    final_payload,
-                                )
-                                .with_request_id(&request_id);
-                                if let Err(e) =
-                                    response_tx.send((identity, response)).await
-                                {
-                                    error!(
-                                        "Failed to send rerun final response: {}",
-                                        e
-                                    );
+                                let response =
+                                    DaemonEnvelope::new(&proxy_id, channel, final_payload)
+                                        .with_request_id(&request_id);
+                                if let Err(e) = response_tx.send((identity, response)).await {
+                                    error!("Failed to send rerun final response: {}", e);
                                 }
                             }
                             Ok(Err(e)) => {
@@ -1129,19 +1153,11 @@ async fn handle_chat_message_streaming(
                                         "message": format!("Plan execution error: {}", e)
                                     }
                                 });
-                                let response = DaemonEnvelope::new(
-                                    &proxy_id,
-                                    channel,
-                                    error_payload,
-                                )
-                                .with_request_id(&request_id);
-                                if let Err(e) =
-                                    response_tx.send((identity, response)).await
-                                {
-                                    error!(
-                                        "Failed to send plan error: {}",
-                                        e
-                                    );
+                                let response =
+                                    DaemonEnvelope::new(&proxy_id, channel, error_payload)
+                                        .with_request_id(&request_id);
+                                if let Err(e) = response_tx.send((identity, response)).await {
+                                    error!("Failed to send plan error: {}", e);
                                 }
                             }
                             Err(e) => {
@@ -1153,19 +1169,11 @@ async fn handle_chat_message_streaming(
                                         "message": format!("Plan execution task failed: {}", e)
                                     }
                                 });
-                                let response = DaemonEnvelope::new(
-                                    &proxy_id,
-                                    channel,
-                                    error_payload,
-                                )
-                                .with_request_id(&request_id);
-                                if let Err(e) =
-                                    response_tx.send((identity, response)).await
-                                {
-                                    error!(
-                                        "Failed to send plan panic error: {}",
-                                        e
-                                    );
+                                let response =
+                                    DaemonEnvelope::new(&proxy_id, channel, error_payload)
+                                        .with_request_id(&request_id);
+                                if let Err(e) = response_tx.send((identity, response)).await {
+                                    error!("Failed to send plan panic error: {}", e);
                                 }
                             }
                         }
@@ -1357,9 +1365,10 @@ async fn handle_chat_message(
 
             // Detect and process /skillname commands
             // Returns (user_message, skill_context)
-            let (user_message, skill_context) = if message_content.starts_with('/') {
+            let (user_message, skill_context) = if let Some(trimmed) =
+                message_content.strip_prefix('/')
+            {
                 // Parse: "/skillname args" -> ("skillname", "args")
-                let trimmed = &message_content[1..];
                 let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
                 let skill_name = parts[0].trim();
                 let args = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
@@ -1372,7 +1381,7 @@ async fn handle_chat_message(
                     let registry = services.skills.read().await;
                     if let Some(skill) = registry.get(skill_name) {
                         // Check if required tools are available
-                        let available_tools = gather_available_tools(&services).await;
+                        let available_tools = gather_available_tools(services).await;
                         match check_tool_availability(&skill.metadata, &available_tools) {
                             ToolCheckResult::Satisfied => {
                                 // All tools available, proceed with skill injection
@@ -1404,9 +1413,43 @@ async fn handle_chat_message(
                             .map(|p| p.to_string_lossy().to_string())
                             .unwrap_or_default();
 
+                        // Enumerate files in skill directory (non-recursive, skip SKILL.md)
+                        let available_files = if !base_path.is_empty() {
+                            match std::fs::read_dir(&base_path) {
+                                Ok(entries) => {
+                                    let mut files: Vec<String> = entries
+                                        .filter_map(|e| e.ok())
+                                        .filter(|e| {
+                                            e.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+                                        })
+                                        .filter_map(|e| {
+                                            let name = e.file_name().to_string_lossy().to_string();
+                                            // Skip the skill definition file itself
+                                            if name.to_uppercase() == "SKILL.MD" {
+                                                None
+                                            } else {
+                                                Some(name)
+                                            }
+                                        })
+                                        .collect();
+                                    files.sort();
+                                    files
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to enumerate skill directory {}: {}",
+                                        base_path, e
+                                    );
+                                    vec![]
+                                }
+                            }
+                        } else {
+                            vec![]
+                        };
+
                         info!(
-                            "Injecting skill '{}' into system prompt (base_path={})",
-                            skill_name, base_path
+                            "Injecting skill '{}' into system prompt (base_path={}, files={:?})",
+                            skill_name, base_path, available_files
                         );
 
                         // Return user args as message, skill content as context
@@ -1414,6 +1457,7 @@ async fn handle_chat_message(
                             name: skill.metadata.name.clone(),
                             base_path,
                             content: skill.content.clone(),
+                            available_files,
                         };
                         (args, Some(ctx))
                     } else {
@@ -1584,9 +1628,16 @@ async fn handle_chat_message(
             }
 
             // Create host functions with config and runtime
-            let host = DaemonHostFunctions::new(config.clone(), runtime)
+            let mut host = DaemonHostFunctions::new(config.clone(), runtime)
                 .with_services(services.clone())
                 .with_session_id(session_id.clone());
+
+            // Pass skill base path to host for relative path resolution
+            if let Some(ref ctx) = skill_context {
+                if !ctx.base_path.is_empty() {
+                    host = host.with_skill_base_path(&ctx.base_path);
+                }
+            }
 
             // Create agent with host functions
             let agent = Agent::new(host);
@@ -1727,6 +1778,10 @@ async fn handle_chat_message(
                 "session.resolve" => handle_session_resolve(session_manager, &params).await,
                 "session.list" => handle_session_list(session_manager, &params).await,
                 "session.clone" => handle_session_clone(session_manager, &params).await,
+                "session.delete" => handle_session_delete(session_manager, &params).await,
+                "session.rename" => handle_session_rename(session_manager, &params).await,
+                "session.pin" => handle_session_pin(session_manager, &params, true).await,
+                "session.unpin" => handle_session_pin(session_manager, &params, false).await,
                 // MCP server configuration commands
                 "mcp.list" => handle_mcp_list(&params).await,
                 "mcp.add" => handle_mcp_add(&params).await,
@@ -1901,7 +1956,8 @@ async fn handle_session_list(
                     "id": session.id,
                     "title": session.title,
                     "updated_at": session.updated_at,
-                    "message_count": message_count
+                    "message_count": message_count,
+                    "pinned": session.pinned
                 }));
             }
 
@@ -2076,6 +2132,229 @@ async fn handle_session_clone(
             }
         }
     })
+}
+
+/// Handle session.delete command.
+///
+/// Deletes a session by ID.
+async fn handle_session_delete(
+    session_manager: &Arc<SessionManager>,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let session_id = match params.get("session_id").and_then(|s| s.as_str()) {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "session.delete",
+                    "success": false,
+                    "error": {
+                        "code": "MISSING_PARAM",
+                        "message": "Missing or empty session_id parameter"
+                    }
+                }
+            });
+        }
+    };
+
+    match session_manager.delete_session(session_id).await {
+        Ok(deleted) => {
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "session.delete",
+                    "success": true,
+                    "data": {
+                        "id": session_id,
+                        "deleted": deleted
+                    }
+                }
+            })
+        }
+        Err(e) => {
+            error!("Failed to delete session: {}", e);
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "session.delete",
+                    "success": false,
+                    "error": {
+                        "code": "DELETE_FAILED",
+                        "message": format!("Failed to delete session: {}", e)
+                    }
+                }
+            })
+        }
+    }
+}
+
+/// Handle session.rename command.
+///
+/// Renames a session by setting its title.
+async fn handle_session_rename(
+    session_manager: &Arc<SessionManager>,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let session_id = match params.get("session_id").and_then(|s| s.as_str()) {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "session.rename",
+                    "success": false,
+                    "error": {
+                        "code": "MISSING_PARAM",
+                        "message": "Missing or empty session_id parameter"
+                    }
+                }
+            });
+        }
+    };
+
+    let title = match params.get("title").and_then(|t| t.as_str()) {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "session.rename",
+                    "success": false,
+                    "error": {
+                        "code": "MISSING_PARAM",
+                        "message": "Missing or empty title parameter"
+                    }
+                }
+            });
+        }
+    };
+
+    match session_manager.set_title(session_id, title).await {
+        Ok(session) => {
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "session.rename",
+                    "success": true,
+                    "data": {
+                        "id": session.id,
+                        "title": session.title
+                    }
+                }
+            })
+        }
+        Err(e) => {
+            error!("Failed to rename session: {}", e);
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "session.rename",
+                    "success": false,
+                    "error": {
+                        "code": "RENAME_FAILED",
+                        "message": format!("Failed to rename session: {}", e)
+                    }
+                }
+            })
+        }
+    }
+}
+
+/// Handle session.pin and session.unpin commands.
+///
+/// Pins or unpins a session.
+async fn handle_session_pin(
+    session_manager: &Arc<SessionManager>,
+    params: &serde_json::Value,
+    pin: bool,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let command = if pin { "session.pin" } else { "session.unpin" };
+
+    let session_id = match params.get("session_id").and_then(|s| s.as_str()) {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": command,
+                    "success": false,
+                    "error": {
+                        "code": "MISSING_PARAM",
+                        "message": "Missing or empty session_id parameter"
+                    }
+                }
+            });
+        }
+    };
+
+    let result = if pin {
+        session_manager.pin_session(session_id).await
+    } else {
+        session_manager.unpin_session(session_id).await
+    };
+
+    match result {
+        Ok(session) => {
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": command,
+                    "success": true,
+                    "data": {
+                        "id": session.id,
+                        "pinned": session.pinned
+                    }
+                }
+            })
+        }
+        Err(e) => {
+            error!(
+                "Failed to {} session: {}",
+                if pin { "pin" } else { "unpin" },
+                e
+            );
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": command,
+                    "success": false,
+                    "error": {
+                        "code": if pin { "PIN_FAILED" } else { "UNPIN_FAILED" },
+                        "message": format!("Failed to {} session: {}", if pin { "pin" } else { "unpin" }, e)
+                    }
+                }
+            })
+        }
+    }
 }
 
 /// Handle MCP channel messages

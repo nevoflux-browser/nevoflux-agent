@@ -72,7 +72,8 @@ mod tests {
             "INSERT INTO trace_spans (session_id, iteration, span_type, success)
              VALUES ('sess-1', 0, 'tool_exec', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM trace_spans", [], |row| row.get(0))
@@ -89,14 +90,17 @@ mod tests {
             "INSERT INTO trace_spans (session_id, iteration, span_type, success)
              VALUES ('sess-1', 0, 'llm_call', 1)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO trace_spans (session_id, iteration, span_type, success)
              VALUES ('sess-2', 0, 'tool_exec', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
-        conn.execute("DELETE FROM trace_spans WHERE session_id = 'sess-1'", []).unwrap();
+        conn.execute("DELETE FROM trace_spans WHERE session_id = 'sess-1'", [])
+            .unwrap();
 
         let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM trace_spans", [], |row| row.get(0))

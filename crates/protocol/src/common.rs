@@ -924,8 +924,14 @@ mod tool_result_tests {
         let json = serde_json::to_string(&result).unwrap();
         let decoded: BashResult = serde_json::from_str(&json).unwrap();
         assert!(decoded.exit_code.is_none());
-        assert_eq!(decoded.stderr.as_deref(), Some("command timed out after 30s"));
-        assert_eq!(decoded.hint.as_deref(), Some("Command exceeded timeout limit"));
+        assert_eq!(
+            decoded.stderr.as_deref(),
+            Some("command timed out after 30s")
+        );
+        assert_eq!(
+            decoded.hint.as_deref(),
+            Some("Command exceeded timeout limit")
+        );
     }
 
     #[test]

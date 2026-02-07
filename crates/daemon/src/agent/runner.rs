@@ -282,7 +282,9 @@ impl AgentRunner {
 
                 for pending in &output.tool_calls {
                     // Execute the tool (simulated for now)
+                    let tool_start = std::time::Instant::now();
                     let result = self.execute_tool(pending).await;
+                    let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
 
                     // Record tool execution in trace
                     if let Some(tc) = &self.trace_collector {
@@ -300,7 +302,7 @@ impl AgentRunner {
                             success,
                             err_code,
                             err_msg,
-                            0, // duration_ms - not tracked at this level currently
+                            tool_duration_ms,
                             None,
                             None,
                         );
@@ -564,7 +566,9 @@ impl AgentRunner {
 
                 for pending in &output.tool_calls {
                     // Execute the tool
+                    let tool_start = std::time::Instant::now();
                     let result = self.execute_tool(pending).await;
+                    let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
 
                     // Record tool execution in trace
                     if let Some(tc) = &self.trace_collector {
@@ -582,7 +586,7 @@ impl AgentRunner {
                             success,
                             err_code,
                             err_msg,
-                            0, // duration_ms - not tracked at this level currently
+                            tool_duration_ms,
                             None,
                             None,
                         );

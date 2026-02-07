@@ -74,6 +74,29 @@
 # Maximum retries for failed requests
 # max_retries = 3
 
+# Provider-specific settings
+# Each provider section supports an optional context_window override (in tokens).
+# If not set, a sensible default is used per provider
+# (e.g., Anthropic=200K, OpenAI=128K, DeepSeek=64K, Gemini=1M).
+#
+# [llm.anthropic]
+# model = "claude-sonnet-4-20250514"
+# context_window = 200000
+#
+# [llm.openai]
+# model = "gpt-4o"
+# context_window = 128000
+#
+# [llm.claude_code]
+# model = "sonnet"
+# context_window = 200000
+# add_dirs = ["/path/to/allowed/dir"]
+#
+# [llm.gemini_cli]
+# model = "gemini-2.5-pro"
+# context_window = 1000000
+# add_dirs = ["/path/to/allowed/dir"]
+
 [storage]
 # Custom data directory path (default: system data dir)
 # data_dir = "/path/to/custom/data"

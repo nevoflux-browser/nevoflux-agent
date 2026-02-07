@@ -89,7 +89,12 @@ pub trait HostFunctions {
     // =========================================================================
 
     /// Read a file.
-    fn tool_read(&self, path: &str, offset: Option<u64>, limit: Option<u64>) -> HostResult<ReadResult>;
+    fn tool_read(
+        &self,
+        path: &str,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> HostResult<ReadResult>;
 
     /// Write a file.
     fn tool_write(&self, path: &str, content: &str) -> HostResult<()>;
