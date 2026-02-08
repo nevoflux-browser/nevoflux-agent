@@ -767,7 +767,22 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
         // Build context prefixes for user message
         let local_files_prefix = format_local_files(&input.local_files);
-        let tab_context_prefix = self.format_tab_context(input.tab_id, &input.tab_ids);
+        // Build active_tab TabInfo from tab_id if we don't have it in tab_ids
+        let active_tab_info = input.tab_id.map(|id| {
+            input
+                .tab_ids
+                .iter()
+                .find(|t| t.tab_id == id)
+                .cloned()
+                .unwrap_or(TabInfo {
+                    tab_id: id,
+                    tab_title: String::new(),
+                    url: String::new(),
+                    space: String::new(),
+                })
+        });
+        let tab_context_prefix =
+            Self::format_tab_context(active_tab_info.as_ref(), &input.tab_ids);
 
         // For browser/agent mode: take initial viewport snapshot and append to user message
         let initial_snapshot = if matches!(input.mode, AgentMode::Browser | AgentMode::Agent) {
@@ -1490,64 +1505,45 @@ The following skill instructions MUST be followed exactly. These instructions ta
         }
     }
 
-    /// Format tab context for system prompt.
-    ///
-    /// When `tab_ids` is provided, it means the user has attached specific tabs for processing.
-    /// The user's action should be performed on ALL tabs in `tab_ids`, not on `tab_id`.
-    /// `tab_id` is just the current active tab (for reference only when `tab_ids` is present).
-    fn format_tab_context(&self, tab_id: Option<i64>, tab_ids: &[TabInfo]) -> String {
-        let mut context = String::new();
+    /// Format tab context as pure data for injection into user messages.
+    fn format_tab_context(active_tab: Option<&TabInfo>, extra_tabs: &[TabInfo]) -> String {
+        if extra_tabs.is_empty() && active_tab.is_none() {
+            return String::new();
+        }
 
-        // When tab_ids is provided, those are the target tabs for the user's action
-        if !tab_ids.is_empty() {
-            context.push_str("\n\n## Browser Tab Context\n\n");
-            context.push_str(
-                "**IMPORTANT:** The user has attached the following tabs for processing.\n",
-            );
-            context.push_str("When the user asks to summarize, analyze, or process content, you should process ALL of these attached tabs:\n\n");
+        let mut ctx = String::from("\n\n## Active Tabs\n");
 
-            // Group tabs by space
-            let mut tabs_by_space: std::collections::BTreeMap<&str, Vec<&TabInfo>> =
+        if !extra_tabs.is_empty() {
+            let mut by_space: std::collections::BTreeMap<&str, Vec<&TabInfo>> =
                 std::collections::BTreeMap::new();
-            for tab in tab_ids {
+            for tab in extra_tabs {
                 let space = if tab.space.is_empty() {
                     "Default"
                 } else {
                     &tab.space
                 };
-                tabs_by_space.entry(space).or_default().push(tab);
+                by_space.entry(space).or_default().push(tab);
             }
-
-            for (space, tabs) in tabs_by_space {
-                context.push_str(&format!("[{}]\n", space));
+            for (space, tabs) in &by_space {
+                ctx.push_str(&format!("[{}]\n", space));
                 for tab in tabs {
-                    context.push_str(&format!("- tab_id={}: {}\n", tab.tab_id, tab.tab_title));
+                    ctx.push_str(&format!(
+                        "- {}: \"{}\" | {}\n",
+                        tab.tab_id, tab.tab_title, tab.url
+                    ));
                 }
             }
-
-            context.push_str("\nTo get content from each tab, use `browser_get_markdown(tab_id=<id>)` for each tab listed above.");
-
-            // Add active tab info as secondary context
-            if let Some(id) = tab_id {
-                context.push_str(&format!(
-                    "\n\n(Current active tab ID: {} - for reference only)",
-                    id
-                ));
+            if let Some(tab) = active_tab {
+                ctx.push_str(&format!("current_tab: {}\n", tab.tab_id));
             }
-        } else if let Some(id) = tab_id {
-            // Only show active tab info when no specific tabs are attached
-            // Emphasize using the current page for actions
-            context.push_str(&format!(
-                "\n\n## Browser Tab Context\n\n\
-                **IMPORTANT:** The user is viewing a webpage and wants you to work with it.\n\
-                **Current Page Tab ID:** {}\n\n\
-                When the user asks to summarize, analyze, or process content, use this current page.\n\
-                To get the page content, use `browser_get_markdown(tab_id={})`.",
-                id, id
+        } else if let Some(tab) = active_tab {
+            ctx.push_str(&format!(
+                "current_tab: {} | \"{}\" | {}\n",
+                tab.tab_id, tab.tab_title, tab.url
             ));
         }
 
-        context
+        ctx
     }
 
     /// Get available tools for chat mode.
