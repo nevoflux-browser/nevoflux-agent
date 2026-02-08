@@ -28,9 +28,9 @@ use crate::wasm::llm::{
 };
 use crate::wasm::HostServices;
 use nevoflux_builtin_wasm::{
-    AgentInput, AgentMode, AgentOutput, BashResult, BashStatus, BrowserToolResult, GrepMatch,
-    GrepResult, HostError, HostFunctions, HostResult, LlmRequest, LlmResponse, MemoryChunk,
-    ReadResult, SkillSummary, SubagentInfo, ToolSearchResult,
+    Agent, AgentInput, AgentMode, AgentOutput, BashResult, BashStatus, BrowserToolResult,
+    GrepMatch, GrepResult, HostError, HostFunctions, HostResult, LlmRequest, LlmResponse,
+    MemoryChunk, ReadResult, SkillSummary, SubagentInfo, ToolSearchResult,
 };
 use nevoflux_llm::ProviderType;
 use nevoflux_mcp::ToolResultContent;
@@ -308,30 +308,6 @@ impl DaemonHostFunctions {
     /// Update the current iteration counter for trace recording.
     pub fn set_iteration(&self, iteration: u32) {
         self.current_iteration.store(iteration, Ordering::Relaxed);
-    }
-
-    /// Build a mode-aware, tab-aware system prompt for a sub-agent.
-    fn build_subagent_prompt(task: &str, mode: &str, has_tab: bool) -> String {
-        let capabilities = match (mode, has_tab) {
-            ("chat", false) => "- web_search: Search the web for information\n- web_fetch: Fetch and analyze content from a URL",
-            ("chat", true) => "- web_search: Search the web for information\n- web_fetch: Fetch and analyze content from a URL\n- browser_get_markdown: Get page content as markdown (use with your assigned tab_id)\n- browser_screenshot: Take a screenshot of the page\n\nIMPORTANT: You have READ-ONLY access to a browser tab. You CANNOT interact with the page (no clicking, typing, scrolling, or navigating).",
-            ("browser", false) => "- web_search: Search the web for information\n- web_fetch: Fetch and analyze content from a URL",
-            ("browser", true) => "- web_search: Search the web for information\n- web_fetch: Fetch and analyze content from a URL\n- browser_get_content: Get page content as text/HTML\n- browser_get_markdown: Get page content as markdown\n- browser_screenshot: Take a screenshot of the page\n\nIMPORTANT: You have READ-ONLY access to a browser tab. You CANNOT interact with the page (no clicking, typing, scrolling, or navigating).",
-            ("agent", false) => "- web_search: Search the web for information\n- web_fetch: Fetch and analyze content from a URL\n- read/write/edit: File system access\n- bash: Execute shell commands\n- glob/grep: Search files",
-            ("agent", true) => "- web_search: Search the web for information\n- web_fetch: Fetch and analyze content from a URL\n- read/write/edit: File system access\n- bash: Execute shell commands\n- glob/grep: Search files\n- browser_get_content: Get page content as text/HTML\n- browser_get_markdown: Get page content as markdown\n- browser_screenshot: Take a screenshot of the page\n\nIMPORTANT: You have READ-ONLY access to a browser tab. You CANNOT interact with the page (no clicking, typing, scrolling, or navigating).",
-            _ => "- web_search: Search the web for information\n- web_fetch: Fetch and analyze content from a URL",
-        };
-
-        format!(
-            "You are a sub-agent executing a specific task.\n\n\
-             ## Task\n{}\n\n\
-             ## Available Capabilities\n{}\n\n\
-             ## Output Format\nReturn your findings in a structured format:\n\
-             ### Result\nThe main output of your task.\n\
-             ### Summary\nA brief summary of what you did and found.\n\n\
-             Focus on completing this task efficiently and accurately.",
-            task, capabilities
-        )
     }
 
     /// Record a tool execution span if trace collection is enabled.
@@ -2323,8 +2299,10 @@ impl HostFunctions for DaemonHostFunctions {
             if let Some(executor) = &services.subagent_executor {
                 debug!("Using WASM sandboxed executor for subagent");
 
-                let has_tab = tab_id.is_some();
-                let custom_prompt = Some(Self::build_subagent_prompt(task, mode, has_tab));
+                let custom_prompt = Some(
+                    Agent::<DaemonHostFunctions>::subagent_prompt_for_mode(agent_mode)
+                        .to_string(),
+                );
 
                 let handle = executor
                     .spawn(task.to_string(), agent_mode, custom_prompt, tab_id)
@@ -2920,7 +2898,6 @@ impl DaemonHostFunctions {
             }
 
             // Create agent input with custom prompt for sub-agent
-            let has_tab = tab_id.is_some();
             let input = AgentInput {
                 session_id: format!("subagent-{}", id),
                 mode: agent_mode,
@@ -2928,9 +2905,10 @@ impl DaemonHostFunctions {
                 history: vec![],
                 attachments: vec![],
                 local_files: vec![],
-                custom_system_prompt: Some(DaemonHostFunctions::build_subagent_prompt(
-                    &task_str, &mode_str, has_tab,
-                )),
+                custom_system_prompt: Some(
+                    Agent::<DaemonHostFunctions>::subagent_prompt_for_mode(agent_mode)
+                        .to_string(),
+                ),
                 tab_id,
                 tab_ids: vec![],
                 skill_context: None,

@@ -69,6 +69,8 @@ pub struct SubagentHandle {
     task: String,
     /// Execution mode.
     mode: String,
+    /// Optional tab ID for browser content access.
+    tab_id: Option<i64>,
     /// Current status.
     status: Arc<RwLock<SubagentStatus>>,
     /// Result text (set when completed).
@@ -81,11 +83,12 @@ pub struct SubagentHandle {
 
 impl SubagentHandle {
     /// Create a new handle for a subagent.
-    fn new(id: u64, task: String, mode: String) -> Self {
+    fn new(id: u64, task: String, mode: String, tab_id: Option<i64>) -> Self {
         Self {
             id,
             task,
             mode,
+            tab_id,
             status: Arc::new(RwLock::new(SubagentStatus::Running)),
             result: Arc::new(RwLock::new(None)),
             completion: Arc::new(Notify::new()),
@@ -207,6 +210,7 @@ impl Clone for SubagentHandle {
             id: self.id,
             task: self.task.clone(),
             mode: self.mode.clone(),
+            tab_id: self.tab_id,
             status: self.status.clone(),
             result: self.result.clone(),
             completion: self.completion.clone(),
@@ -285,6 +289,7 @@ impl SubagentExecutor {
     /// * `task` - The task description for the subagent
     /// * `mode` - Execution mode (chat, browser, agent)
     /// * `custom_prompt` - Optional custom system prompt
+    /// * `tab_id` - Optional tab ID for browser content access (read-only)
     ///
     /// # Returns
     ///
@@ -294,6 +299,7 @@ impl SubagentExecutor {
         task: String,
         mode: AgentMode,
         custom_prompt: Option<String>,
+        tab_id: Option<i64>,
     ) -> Result<SubagentHandle, String> {
         // Check concurrency limit
         if !self.can_spawn() {
@@ -310,7 +316,7 @@ impl SubagentExecutor {
             AgentMode::Agent => "agent",
         };
 
-        let handle = SubagentHandle::new(id, task.clone(), mode_str.to_string());
+        let handle = SubagentHandle::new(id, task.clone(), mode_str.to_string(), tab_id);
 
         // Register the handle
         {
@@ -319,8 +325,8 @@ impl SubagentExecutor {
         }
 
         debug!(
-            "Spawning subagent {}: task='{}', mode={}",
-            id, task, mode_str
+            "Spawning subagent {}: task='{}', mode={}, tab_id={:?}",
+            id, task, mode_str, tab_id
         );
 
         // Spawn the execution task
@@ -335,6 +341,7 @@ impl SubagentExecutor {
                 task.clone(),
                 mode,
                 custom_prompt,
+                tab_id,
                 base_services,
                 config,
                 Duration::from_secs(timeout_secs),
@@ -372,6 +379,7 @@ impl SubagentExecutor {
         task: String,
         mode: AgentMode,
         custom_prompt: Option<String>,
+        tab_id: Option<i64>,
         base_services: Option<HostServices>,
         config: crate::config::AgentConfig,
         timeout_duration: Duration,
@@ -382,6 +390,7 @@ impl SubagentExecutor {
             task,
             mode,
             custom_prompt,
+            tab_id,
             base_services,
             config,
             handle.clone(),
@@ -398,11 +407,13 @@ impl SubagentExecutor {
     /// This runs the subagent using DaemonHostFunctions, which currently
     /// uses the Tokio-based implementation. In a full WASM sandboxed
     /// implementation, this would create a new WASM instance.
+    #[allow(clippy::too_many_arguments)]
     async fn run_subagent_inner(
         id: u64,
         task: String,
         mode: AgentMode,
         custom_prompt: Option<String>,
+        tab_id: Option<i64>,
         base_services: Option<HostServices>,
         config: crate::config::AgentConfig,
         handle: SubagentHandle,
@@ -423,11 +434,30 @@ impl SubagentExecutor {
             host = host.with_services(subagent_services);
         }
 
+        // Create sandbox for agent-mode subagents
+        let custom_prompt = if matches!(mode, AgentMode::Agent) {
+            let sandbox = format!("/tmp/subagent/{}", id);
+            std::fs::create_dir_all(&sandbox)
+                .map_err(|e| format!("Failed to create sandbox directory: {}", e))?;
+            host = host.with_subagent_sandbox(sandbox.clone());
+
+            // Append sandbox path to prompt for agent-mode subagents
+            custom_prompt.map(|p| {
+                format!(
+                    "{}\n\nYour sandbox directory: {}\n\
+                     All write/edit operations are restricted to this path.",
+                    p, sandbox
+                )
+            })
+        } else {
+            custom_prompt
+        };
+
         // Create agent with subagent configuration
         let agent_config = WasmAgentConfig::for_subagent();
         let agent = Agent::with_config(host, agent_config);
 
-        // Build input with custom prompt
+        // Build input with custom prompt and optional tab access
         let input = AgentInput {
             session_id: format!("subagent-{}", id),
             mode,
@@ -436,8 +466,8 @@ impl SubagentExecutor {
             attachments: vec![],
             local_files: vec![],
             custom_system_prompt: custom_prompt,
-            tab_id: None,    // Sub-agents don't inherit browser tab context
-            tab_ids: vec![], // Sub-agents don't inherit tab list
+            tab_id,
+            tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
         };
@@ -459,6 +489,23 @@ impl SubagentExecutor {
     /// Get the status of a subagent.
     pub fn status(&self, id: u64) -> Option<SubagentStatus> {
         self.handles.read().unwrap().get(&id).map(|h| h.status())
+    }
+
+    /// Wait for multiple subagents to complete.
+    pub async fn wait_all(&self, ids: &[u64]) -> Vec<(u64, Result<String, String>)> {
+        let futures: Vec<_> = ids
+            .iter()
+            .map(|&id| {
+                let handle = self.get(id);
+                async move {
+                    match handle {
+                        Some(h) => (id, h.wait().await),
+                        None => (id, Err(format!("Subagent {} not found", id))),
+                    }
+                }
+            })
+            .collect();
+        futures::future::join_all(futures).await
     }
 
     /// Wait for a subagent to complete.
@@ -530,7 +577,7 @@ mod tests {
 
     #[test]
     fn test_subagent_handle_new() {
-        let handle = SubagentHandle::new(1, "test task".into(), "agent".into());
+        let handle = SubagentHandle::new(1, "test task".into(), "agent".into(), None);
 
         assert_eq!(handle.id, 1);
         assert_eq!(handle.task(), "test task");
@@ -541,7 +588,7 @@ mod tests {
 
     #[test]
     fn test_subagent_handle_complete() {
-        let handle = SubagentHandle::new(1, "task".into(), "chat".into());
+        let handle = SubagentHandle::new(1, "task".into(), "chat".into(), None);
 
         assert!(handle.is_running());
         handle.complete("result text".into());
@@ -552,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_subagent_handle_fail() {
-        let handle = SubagentHandle::new(1, "task".into(), "chat".into());
+        let handle = SubagentHandle::new(1, "task".into(), "chat".into(), None);
 
         handle.fail("something went wrong".into());
 
@@ -562,7 +609,7 @@ mod tests {
 
     #[test]
     fn test_subagent_handle_kill() {
-        let handle = SubagentHandle::new(1, "task".into(), "agent".into());
+        let handle = SubagentHandle::new(1, "task".into(), "agent".into(), None);
 
         assert!(!handle.should_kill());
         let killed = handle.kill();
@@ -577,7 +624,7 @@ mod tests {
 
     #[test]
     fn test_subagent_handle_clone() {
-        let handle = SubagentHandle::new(1, "task".into(), "browser".into());
+        let handle = SubagentHandle::new(1, "task".into(), "browser".into(), None);
         let cloned = handle.clone();
 
         assert_eq!(handle.id, cloned.id);
@@ -620,8 +667,14 @@ mod tests {
         // Add fake running handles to test limit
         {
             let mut handles = executor.handles.write().unwrap();
-            handles.insert(1, SubagentHandle::new(1, "task1".into(), "agent".into()));
-            handles.insert(2, SubagentHandle::new(2, "task2".into(), "agent".into()));
+            handles.insert(
+                1,
+                SubagentHandle::new(1, "task1".into(), "agent".into(), None),
+            );
+            handles.insert(
+                2,
+                SubagentHandle::new(2, "task2".into(), "agent".into(), None),
+            );
         }
 
         assert!(!executor.can_spawn());
@@ -638,8 +691,14 @@ mod tests {
 
         {
             let mut handles = executor.handles.write().unwrap();
-            handles.insert(1, SubagentHandle::new(1, "task1".into(), "agent".into()));
-            handles.insert(2, SubagentHandle::new(2, "task2".into(), "browser".into()));
+            handles.insert(
+                1,
+                SubagentHandle::new(1, "task1".into(), "agent".into(), None),
+            );
+            handles.insert(
+                2,
+                SubagentHandle::new(2, "task2".into(), "browser".into(), None),
+            );
         }
 
         let list = executor.list();
@@ -652,11 +711,14 @@ mod tests {
 
         {
             let mut handles = executor.handles.write().unwrap();
-            let h1 = SubagentHandle::new(1, "task1".into(), "agent".into());
+            let h1 = SubagentHandle::new(1, "task1".into(), "agent".into(), None);
             h1.complete("done".into());
             handles.insert(1, h1);
 
-            handles.insert(2, SubagentHandle::new(2, "task2".into(), "agent".into()));
+            handles.insert(
+                2,
+                SubagentHandle::new(2, "task2".into(), "agent".into(), None),
+            );
         }
 
         assert_eq!(executor.handles.read().unwrap().len(), 2);
