@@ -180,6 +180,8 @@ pub struct AgentConfig {
     /// When true, intermediate results are not sent to the host.
     /// This is useful for sub-agents where only the final result matters.
     pub suppress_streaming: bool,
+    /// Whether this agent is running as a sub-agent (restricts to read-only browser tools).
+    pub is_subagent: bool,
 }
 
 impl Default for AgentConfig {
@@ -188,6 +190,7 @@ impl Default for AgentConfig {
             max_iterations: MAX_ITERATIONS,
             use_streaming: true,
             suppress_streaming: false,
+            is_subagent: false,
         }
     }
 }
@@ -199,6 +202,7 @@ impl AgentConfig {
             max_iterations: MAX_ITERATIONS,
             use_streaming: false,
             suppress_streaming: true,
+            is_subagent: true,
         }
     }
 
@@ -447,33 +451,12 @@ pub struct Agent<H: HostFunctions> {
     pending_plan: RefCell<Option<PlanProposal>>,
 }
 
-const THINK_PLAN_GUIDANCE: &str = r#"
-
-## Thinking and Planning
-
-You have tools for reasoning, planning, and model selection:
-
-### think
-Use `think` to reason through problems before acting:
-- When you receive a new task, think about the approach
-- When a tool call fails, think about why and what to try next
-- When facing multiple options, think through trade-offs
-Do NOT use think for simple, obvious actions.
-
-### plan
-Use `plan` to propose a multi-step execution plan for the user to review:
-- When a task involves 3+ steps or could go multiple directions
-- When the task has significant consequences (file writes, system changes)
-- Include a model suggestion per step if different steps need different capabilities
-The plan will be shown to the user for approval. They may provide feedback via chat, in which case you should revise and call plan() again.
-Do NOT use plan for simple single-step tasks.
-
-### switch_model
-Use `switch_model` to change the active LLM provider and model during plan execution:
-- When a plan step specifies a different model, call switch_model before executing that step
-- The switch persists for the rest of the session until changed again
-- Only switch to models listed in the Available Models section
-Do NOT switch models unless a plan step explicitly requests it."#;
+// Static base prompts, compiled into the binary
+const CHAT_PROMPT: &str = include_str!("../prompts/chat.md");
+const BROWSER_PROMPT: &str = include_str!("../prompts/browser.md");
+const AGENT_PROMPT: &str = include_str!("../prompts/agent.md");
+const SUBAGENT_BROWSER_PROMPT: &str = include_str!("../prompts/subagent_browser.md");
+const SUBAGENT_AGENT_PROMPT: &str = include_str!("../prompts/subagent_agent.md");
 
 impl<H: HostFunctions> Agent<H> {
     /// Create a new agent with the given host functions.
@@ -503,18 +486,10 @@ impl<H: HostFunctions> Agent<H> {
         // Use custom system prompt if provided, otherwise use mode-based prompt
         let base_prompt = match &input.custom_system_prompt {
             Some(custom) => custom.clone(),
-            None => self.build_system_prompt_for_mode(input.mode),
-        };
-
-        // Append available models section
-        let base_prompt = if !input.available_models.is_empty() {
-            let mut models_section = "\n\n## Available Models\n\nThe following LLM providers and models are configured:\n".to_string();
-            for (provider, model) in &input.available_models {
-                models_section.push_str(&format!("- {}: {}\n", provider, model));
-            }
-            format!("{}{}", base_prompt, models_section)
-        } else {
-            base_prompt
+            None => {
+                let skills = self.host.skill_list().unwrap_or_default();
+                Self::build_system_prompt(input.mode, &skills, &input.available_models)
+            },
         };
 
         // Prepend skill context with high priority if present
@@ -556,19 +531,12 @@ The following skill instructions MUST be followed exactly. These instructions ta
             None => base_prompt,
         };
 
-        let tools = self.get_tools_for_mode(input.mode);
-        self.run_loop(input, &system_prompt, &tools)
-    }
-
-    /// Build system prompt for a specific mode.
-    /// Note: Tab context is injected into user message to preserve API cache.
-    fn build_system_prompt_for_mode(&self, mode: AgentMode) -> String {
-        let prompt = match mode {
-            AgentMode::Chat => self.build_chat_system_prompt(),
-            AgentMode::Browser => self.build_browser_system_prompt(),
-            AgentMode::Agent => self.build_agent_system_prompt(),
+        let tools = if self.config.is_subagent {
+            self.get_subagent_tools_for_mode(input.mode)
+        } else {
+            self.get_tools_for_mode(input.mode)
         };
-        format!("{}{}", prompt, THINK_PLAN_GUIDANCE)
+        self.run_loop(input, &system_prompt, &tools)
     }
 
     /// Get tools for a specific mode.
@@ -578,6 +546,213 @@ The following skill instructions MUST be followed exactly. These instructions ta
             AgentMode::Browser => self.get_browser_tools(),
             AgentMode::Agent => self.get_agent_tools(),
         }
+    }
+
+    /// Get the static base prompt for a mode.
+    fn base_prompt_for_mode(mode: AgentMode) -> &'static str {
+        match mode {
+            AgentMode::Chat => CHAT_PROMPT,
+            AgentMode::Browser => BROWSER_PROMPT,
+            AgentMode::Agent => AGENT_PROMPT,
+        }
+    }
+
+    /// Get the static subagent prompt for a mode.
+    pub fn subagent_prompt_for_mode(mode: AgentMode) -> &'static str {
+        match mode {
+            // Chat mode doesn't expose subagent tools,
+            // but fallback to browser-level if somehow called
+            AgentMode::Chat => SUBAGENT_BROWSER_PROMPT,
+            AgentMode::Browser => SUBAGENT_BROWSER_PROMPT,
+            AgentMode::Agent => SUBAGENT_AGENT_PROMPT,
+        }
+    }
+
+    /// Build the full system prompt with dynamic sections appended.
+    /// Called once per session; result should be cached.
+    fn build_system_prompt(
+        mode: AgentMode,
+        skills: &[SkillSummary],
+        models: &[(String, String)],
+    ) -> String {
+        let mut prompt = Self::base_prompt_for_mode(mode).to_string();
+
+        if !models.is_empty() {
+            prompt.push_str("\n\n# Available models\n\n");
+            for (provider, model) in models {
+                prompt.push_str(&format!("- {}: {}\n", provider, model));
+            }
+        }
+
+        if !skills.is_empty() {
+            prompt.push_str("\n\n# Skills\n\n");
+            prompt.push_str(&format_skill_summaries(skills));
+            prompt.push_str("\n\nUse skill_load(name) to load a skill's full content.");
+        }
+
+        prompt
+    }
+
+    /// Get tools for a subagent based on mode (read-only browser access).
+    fn get_subagent_tools_for_mode(&self, mode: AgentMode) -> Vec<ToolDefinition> {
+        match mode {
+            AgentMode::Chat => self.get_chat_tools(),
+            AgentMode::Browser => self.get_subagent_browser_read_tools(),
+            AgentMode::Agent => {
+                let mut tools = self.get_subagent_browser_read_tools();
+                tools.extend(self.get_file_tools());
+                tools
+            }
+        }
+    }
+
+    /// Get read-only browser tools for subagents.
+    ///
+    /// Includes chat tools + browser_get_content, browser_get_markdown, browser_screenshot.
+    /// Does NOT include interaction tools (click, type, fill, scroll, navigate, etc.).
+    fn get_subagent_browser_read_tools(&self) -> Vec<ToolDefinition> {
+        // Start with chat tools (think, plan, switch_model, web_search, web_fetch, ask_user,
+        // memory_search, skill_load, browser_get_content, browser_get_markdown, browser_screenshot)
+        // Chat tools already include browser_get_content, browser_get_markdown, browser_screenshot
+        self.get_chat_tools()
+    }
+
+    /// Get file/system tools (read, write, edit, bash, glob, grep, tool_search, tool_call_dynamic).
+    fn get_file_tools(&self) -> Vec<ToolDefinition> {
+        vec![
+            ToolDefinition {
+                name: "read".into(),
+                description: "Read file contents. Returns partial content with metadata (total_lines, total_bytes). Default: first 200 lines. Use offset/limit to paginate.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "The absolute path to read"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Line offset to start reading from"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum lines to read"
+                        }
+                    },
+                    "required": ["file_path"]
+                }),
+            },
+            ToolDefinition {
+                name: "write".into(),
+                description: "Write content to a file".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "The absolute path to write"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The content to write"
+                        }
+                    },
+                    "required": ["file_path", "content"]
+                }),
+            },
+            ToolDefinition {
+                name: "edit".into(),
+                description: "Edit a file using search and replace".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": {
+                            "type": "string",
+                            "description": "The file to edit"
+                        },
+                        "old_string": {
+                            "type": "string",
+                            "description": "The text to find"
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": "The replacement text"
+                        },
+                        "replace_all": {
+                            "type": "boolean",
+                            "description": "Replace all occurrences"
+                        }
+                    },
+                    "required": ["file_path", "old_string", "new_string"]
+                }),
+            },
+            ToolDefinition {
+                name: "bash".into(),
+                description: "Execute a shell command. Default timeout: 30s. Output capped at 200 lines.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The command to execute"
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Timeout in milliseconds"
+                        }
+                    },
+                    "required": ["command"]
+                }),
+            },
+            ToolDefinition {
+                name: "glob".into(),
+                description: "Find files matching a pattern".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob pattern like '**/*.rs'"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Base directory"
+                        }
+                    },
+                    "required": ["pattern"]
+                }),
+            },
+            ToolDefinition {
+                name: "grep".into(),
+                description: "Search file contents with regex. Returns structured matches with counts.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Search pattern (regex)"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Directory to search"
+                        },
+                        "type": {
+                            "type": "string",
+                            "description": "File type filter (e.g., 'rs', 'py', 'js')"
+                        },
+                        "case_insensitive": {
+                            "type": "boolean",
+                            "description": "Case insensitive search (default: false)"
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Maximum results to return (default: 50)"
+                        }
+                    },
+                    "required": ["pattern"]
+                }),
+            },
+        ]
     }
 
     /// Core agent loop.
@@ -993,6 +1168,18 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let result_str = serde_json::to_string(&result).unwrap_or_default();
                 self.auto_snapshot_after_action(&result_str, "navigation", tab_id)
             }
+            "browser_go_back" => {
+                let tab_id = tool_call.arguments["tab_id"].as_i64();
+                let result = self.host.browser_go_back(tab_id)?;
+                let result_str = serde_json::to_string(&result).unwrap_or_default();
+                self.auto_snapshot_after_action(&result_str, "navigation", tab_id)
+            }
+            "browser_go_forward" => {
+                let tab_id = tool_call.arguments["tab_id"].as_i64();
+                let result = self.host.browser_go_forward(tab_id)?;
+                let result_str = serde_json::to_string(&result).unwrap_or_default();
+                self.auto_snapshot_after_action(&result_str, "navigation", tab_id)
+            }
             "browser_click" => {
                 let selector = tool_call.arguments["selector"].as_str().unwrap_or("");
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
@@ -1203,8 +1390,16 @@ The following skill instructions MUST be followed exactly. These instructions ta
             "subagent_spawn" => {
                 let task = tool_call.arguments["task"].as_str().unwrap_or("");
                 let mode = tool_call.arguments["mode"].as_str().unwrap_or("agent");
-                let id = self.host.subagent_spawn(task, mode)?;
+                let tab_id = tool_call.arguments["tab_id"].as_i64();
+                let id = self.host.subagent_spawn(task, mode, tab_id)?;
                 format!("Spawned sub-agent with ID: {}", id)
+            }
+            "subagent_wait_all" => {
+                let ids: Vec<u64> = tool_call.arguments["ids"]
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+                    .unwrap_or_default();
+                self.host.subagent_wait_all(&ids)?
             }
             "subagent_status" => {
                 let id = tool_call.arguments["id"].as_u64().unwrap_or(0);
@@ -1295,115 +1490,6 @@ The following skill instructions MUST be followed exactly. These instructions ta
         }
     }
 
-    /// Build system prompt for chat mode.
-    fn build_chat_system_prompt(&self) -> String {
-        let base_prompt = r#"You are a helpful AI assistant integrated into a web browser.
-
-You can:
-- Answer questions and have conversations
-- Search the web for current information
-- Get page content using browser_get_content or browser_get_markdown (pass tab_id from context)
-- Take screenshots using browser_screenshot
-- Ask the user clarifying questions
-
-You cannot:
-- Interact with the page (click, type, navigate, etc.)
-- Access local files
-- Execute commands
-
-When the user asks to summarize or analyze a page, use browser_get_markdown with the tab_id from the context.
-Be helpful, accurate, and concise."#;
-
-        self.append_skills_section(base_prompt)
-    }
-
-    /// Build system prompt for browser mode.
-    /// Note: Tab context is injected into user message to preserve API cache.
-    fn build_browser_system_prompt(&self) -> String {
-        let base_prompt = r#"You are a browser automation agent. Each turn, you see the current page state (visible interactive elements in the viewport).
-
-## How to read page content
-- The page state (text tree of visible elements) is ALREADY provided in the user message — use it directly to answer content questions.
-- If the user asks what the page is about, to summarize it, or asks about specific content → answer from the page state first. If you need the full page text, call `browser_get_markdown()`.
-- Do NOT call `browser_screenshot()` for content-reading questions. Screenshots are only useful when visual layout, images, or styling matter.
-- Do NOT call extra tools (scroll, snapshot, screenshot) when the answer is already visible in the page state.
-
-## How to interact
-- Use browser_click_by_id(element_id) to click elements shown in the page state (e.g., click "e3")
-- Use browser_fill_by_id(element_id, value) to fill form fields
-- Use browser_type_by_id(element_id, text) to type character by character
-- Use browser_scroll(direction) to scroll up/down and reveal more elements
-- Use browser_navigate(url) to go to a new page
-- Use browser_screenshot() to see the page visually (only when you need to inspect visual layout, images, or styling)
-
-## Rules
-- Only interact with elements shown in the current page state [e1], [e2], etc.
-- If you don't see the target element, use browser_scroll("down") or browser_scroll("up") to find it
-- After each action, you'll automatically receive the updated page state
-- Never guess element IDs — they change after each action
-- When the task is done, respond with a summary of what you did"#;
-
-        self.append_skills_section(base_prompt)
-    }
-
-    /// Build system prompt for agent mode.
-    /// Note: Tab context is injected into user message to preserve API cache.
-    fn build_agent_system_prompt(&self) -> String {
-        let base_prompt = r#"You are a powerful AI agent with full system access.
-
-You can:
-- Browser automation: page state is auto-injected each turn, interact via element IDs [e1], [e2], scroll to find elements
-- Read, write, and edit local files
-- Execute bash commands
-- Use computer control (mouse, keyboard)
-- Call MCP servers
-- Spawn sub-agents for parallel work
-
-Think step by step. Use tools to gather information before making changes.
-Always verify your work after making modifications.
-Ask for permission before destructive operations.
-
-## Browser Content Reading
-- When a browser tab is active, the page state (text tree) is already in the user message — use it directly for content questions.
-- For full-page content, call `browser_get_markdown()` — do NOT use `browser_screenshot()` for reading text.
-- `browser_screenshot()` is only for visual layout inspection (images, styling, positioning).
-- Avoid unnecessary tool calls (scroll, snapshot, screenshot) when the answer is already in the page state.
-
-## Tool Usage
-
-### Priority
-1. Use specialized tools (Read, Grep, Glob) first — they are cross-platform, fast, and return structured results with metadata.
-2. Use Bash only when specialized tools cannot accomplish the task.
-3. Before using Bash, consider whether a specialized tool can do it instead.
-
-### Strategy: Probe First, Then Decide
-- Tools return metadata (total_lines, total_matches) alongside partial results.
-- Use metadata to decide your next action: read more, narrow search, or stop.
-- It is acceptable to lose minor details in favor of efficiency.
-
-### Read
-Read file contents. Returns partial content + file metadata.
-- Default: first 200 lines. Use offset/limit for pagination.
-- Check total_lines to decide if you need to read more.
-- For large files: read the beginning, then use Grep to find specific sections.
-
-### Grep
-Search file contents using regex. Returns structured matches + counts.
-- Default: first 50 matches. Check total_matches for the full picture.
-- If too many matches: narrow your pattern instead of reading all results.
-- Supports file type filter (e.g., type="rs") — same types as ripgrep.
-- Respects .gitignore automatically.
-
-### Bash
-Execute shell commands. Requires user authorization.
-- Default timeout: 30 seconds. Pass timeout for longer tasks.
-- Output is capped at 200 lines. Check truncated flag.
-- For file reading: use Read instead.
-- For text search: use Grep instead."#;
-
-        self.append_skills_section(base_prompt)
-    }
-
     /// Format tab context for system prompt.
     ///
     /// When `tab_ids` is provided, it means the user has attached specific tabs for processing.
@@ -1462,20 +1548,6 @@ Execute shell commands. Requires user authorization.
         }
 
         context
-    }
-
-    /// Append available skills section to a base prompt.
-    fn append_skills_section(&self, base_prompt: &str) -> String {
-        match self.host.skill_list() {
-            Ok(skills) if !skills.is_empty() => {
-                let summaries = format_skill_summaries(&skills);
-                format!(
-                    "{}\n\n## Available Skills\n\n{}\n\nUse skill_load(name) to load a skill's full content.",
-                    base_prompt, summaries
-                )
-            }
-            _ => base_prompt.to_string(),
-        }
     }
 
     /// Get available tools for chat mode.
@@ -1698,6 +1770,35 @@ Execute shell commands. Requires user authorization.
                     }
                 },
                 "required": ["url"]
+            }),
+        });
+
+        // History navigation
+        tools.push(ToolDefinition {
+            name: "browser_go_back".into(),
+            description: "Go back in browser history. Returns updated page state.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "Optional tab ID (uses active tab if not specified)"
+                    }
+                }
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "browser_go_forward".into(),
+            description: "Go forward in browser history. Returns updated page state.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "Optional tab ID (uses active tab if not specified)"
+                    }
+                }
             }),
         });
 
@@ -1924,9 +2025,8 @@ Execute shell commands. Requires user authorization.
                         "description": "Direction to scroll"
                     },
                     "amount": {
-                        "type": "integer",
-                        "description": "Amount to scroll in pixels (default: 500)",
-                        "default": 500
+                        "type": "string",
+                        "description": "Scroll amount: 'page' (default), 'half', or pixel count as string (e.g., '300')"
                     },
                     "tab_id": {
                         "type": "integer",
@@ -2248,6 +2348,10 @@ Execute shell commands. Requires user authorization.
                         "enum": ["chat", "browser", "agent"],
                         "description": "Execution mode for the sub-agent (default: agent)",
                         "default": "agent"
+                    },
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "Optional tab ID for the sub-agent to read page content from (read-only access)"
                     }
                 },
                 "required": ["task"]
@@ -2283,6 +2387,24 @@ Execute shell commands. Requires user authorization.
                     }
                 },
                 "required": ["id"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "subagent_wait_all".into(),
+            description: "Wait for multiple sub-agents to complete and return all results. \
+                          More efficient than calling subagent_wait for each one."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Sub-agent IDs to wait for"
+                    }
+                },
+                "required": ["ids"]
             }),
         });
 
@@ -2446,6 +2568,7 @@ mod tests {
             max_iterations: 50,
             use_streaming: false,
             suppress_streaming: false,
+            is_subagent: false,
         };
         let agent = Agent::with_config(mock, config);
         assert_eq!(agent.config.max_iterations, 50);
@@ -2659,6 +2782,7 @@ mod tests {
             max_iterations: 100,
             use_streaming: false,
             suppress_streaming: false,
+            is_subagent: false,
         };
         let agent = Agent::with_config(mock, config);
         let input = AgentInput {
@@ -3007,9 +3131,9 @@ mod tests {
 
         let browser_tools = agent.get_browser_tools();
         let chat_tools = agent.get_chat_tools();
-        // Browser tools = chat tools + 16 browser-specific tools
-        // (14 original + browser_find_elements + browser_element_info)
-        assert_eq!(browser_tools.len(), chat_tools.len() + 16);
+        // Browser tools = chat tools + 18 browser-specific tools
+        // (14 original + browser_find_elements + browser_element_info + browser_go_back + browser_go_forward)
+        assert_eq!(browser_tools.len(), chat_tools.len() + 18);
     }
 
     #[test]
@@ -3939,5 +4063,149 @@ mod tests {
         let result = agent.execute_tool(&tool_call).unwrap();
         assert!(result.content.contains("error"));
         assert!(result.content.contains("required"));
+    }
+
+    #[test]
+    fn test_execute_tool_subagent_spawn_with_tab_id() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let tool_call = ToolCall {
+            id: "call-001".into(),
+            call_id: None,
+            name: "subagent_spawn".into(),
+            arguments: serde_json::json!({"task": "Read page", "mode": "browser", "tab_id": 42}),
+            signature: None,
+        };
+
+        let result = agent.execute_tool(&tool_call).unwrap();
+        assert!(result.success);
+        assert!(result.content.contains("Spawned sub-agent with ID:"));
+    }
+
+    #[test]
+    fn test_execute_tool_subagent_wait_all() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        // Spawn two subagents
+        let spawn1 = ToolCall {
+            id: "call-001".into(),
+            call_id: None,
+            name: "subagent_spawn".into(),
+            arguments: serde_json::json!({"task": "Task A"}),
+            signature: None,
+        };
+        agent.execute_tool(&spawn1).unwrap();
+
+        let spawn2 = ToolCall {
+            id: "call-002".into(),
+            call_id: None,
+            name: "subagent_spawn".into(),
+            arguments: serde_json::json!({"task": "Task B"}),
+            signature: None,
+        };
+        agent.execute_tool(&spawn2).unwrap();
+
+        // Wait for both
+        let wait_all = ToolCall {
+            id: "call-003".into(),
+            call_id: None,
+            name: "subagent_wait_all".into(),
+            arguments: serde_json::json!({"ids": [1, 2]}),
+            signature: None,
+        };
+
+        let result = agent.execute_tool(&wait_all).unwrap();
+        assert!(result.success);
+        assert!(result.content.contains("Task A"));
+        assert!(result.content.contains("Task B"));
+    }
+
+    #[test]
+    fn test_subagent_browser_read_tools() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let read_tools = agent.get_subagent_browser_read_tools();
+        let chat_tools = agent.get_chat_tools();
+
+        // Subagent browser read tools should be the same as chat tools
+        // (which already include browser_get_content, browser_get_markdown, browser_screenshot)
+        assert_eq!(read_tools.len(), chat_tools.len());
+
+        // Verify read-only browser tools are present
+        assert!(read_tools.iter().any(|t| t.name == "browser_get_content"));
+        assert!(read_tools.iter().any(|t| t.name == "browser_get_markdown"));
+        assert!(read_tools.iter().any(|t| t.name == "browser_screenshot"));
+
+        // Verify interaction tools are NOT present
+        assert!(!read_tools.iter().any(|t| t.name == "browser_click"));
+        assert!(!read_tools.iter().any(|t| t.name == "browser_click_by_id"));
+        assert!(!read_tools.iter().any(|t| t.name == "browser_type"));
+        assert!(!read_tools.iter().any(|t| t.name == "browser_fill"));
+        assert!(!read_tools.iter().any(|t| t.name == "browser_scroll"));
+        assert!(!read_tools.iter().any(|t| t.name == "browser_navigate"));
+        assert!(!read_tools.iter().any(|t| t.name == "browser_eval_js"));
+    }
+
+    #[test]
+    fn test_subagent_tools_for_mode_browser() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let tools = agent.get_subagent_tools_for_mode(AgentMode::Browser);
+        // Should be read-only browser tools (same as chat tools)
+        assert!(tools.iter().any(|t| t.name == "browser_get_markdown"));
+        assert!(!tools.iter().any(|t| t.name == "browser_click"));
+        assert!(!tools.iter().any(|t| t.name == "read")); // No file tools in browser mode
+    }
+
+    #[test]
+    fn test_subagent_tools_for_mode_agent() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let tools = agent.get_subagent_tools_for_mode(AgentMode::Agent);
+        // Should have read-only browser tools + file tools
+        assert!(tools.iter().any(|t| t.name == "browser_get_markdown"));
+        assert!(tools.iter().any(|t| t.name == "read"));
+        assert!(tools.iter().any(|t| t.name == "write"));
+        assert!(tools.iter().any(|t| t.name == "bash"));
+        assert!(tools.iter().any(|t| t.name == "grep"));
+        // But no browser interaction tools
+        assert!(!tools.iter().any(|t| t.name == "browser_click"));
+        assert!(!tools.iter().any(|t| t.name == "browser_navigate"));
+    }
+
+    #[test]
+    fn test_agent_config_for_subagent_is_subagent() {
+        let config = AgentConfig::for_subagent();
+        assert!(config.is_subagent);
+        assert!(!config.use_streaming);
+        assert!(config.suppress_streaming);
+    }
+
+    #[test]
+    fn test_agent_tools_include_subagent_wait_all() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let agent_tools = agent.get_agent_tools();
+        assert!(agent_tools.iter().any(|t| t.name == "subagent_wait_all"));
+    }
+
+    #[test]
+    fn test_subagent_spawn_schema_has_tab_id() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let agent_tools = agent.get_agent_tools();
+        let spawn_tool = agent_tools
+            .iter()
+            .find(|t| t.name == "subagent_spawn")
+            .unwrap();
+        let props = spawn_tool.input_schema["properties"].as_object().unwrap();
+        assert!(props.contains_key("tab_id"));
     }
 }
