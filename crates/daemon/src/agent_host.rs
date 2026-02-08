@@ -157,6 +157,9 @@ pub struct DaemonHostFunctions {
     model_override_model: Arc<Mutex<Option<String>>>,
     /// Base path for skill's auxiliary files (for relative path resolution in tool_read/tool_write).
     skill_base_path: Option<std::path::PathBuf>,
+    /// Sandbox directory for subagent writes. When set, tool_write and tool_edit
+    /// are restricted to paths within this directory.
+    subagent_sandbox: Option<String>,
 }
 
 impl DaemonHostFunctions {
@@ -176,6 +179,7 @@ impl DaemonHostFunctions {
             model_override_provider: Arc::new(Mutex::new(None)),
             model_override_model: Arc::new(Mutex::new(None)),
             skill_base_path: None,
+            subagent_sandbox: None,
         }
     }
 
@@ -210,6 +214,41 @@ impl DaemonHostFunctions {
     pub fn with_skill_base_path(mut self, base_path: impl Into<std::path::PathBuf>) -> Self {
         self.skill_base_path = Some(base_path.into());
         self
+    }
+
+    /// Set the subagent sandbox directory for write/edit path restrictions.
+    pub fn with_subagent_sandbox(mut self, path: String) -> Self {
+        self.subagent_sandbox = Some(path);
+        self
+    }
+
+    /// Validate that a write/edit target path is within the subagent sandbox.
+    /// Returns Ok(()) for main agents (sandbox=None) or if path is in sandbox.
+    /// Returns Err(403) if path escapes the sandbox.
+    fn validate_sandbox_path(&self, path: &str) -> HostResult<()> {
+        if let Some(ref sandbox) = self.subagent_sandbox {
+            let canonical_result = std::path::Path::new(path).canonicalize();
+            let check_path = if let Ok(canonical) = canonical_result {
+                canonical
+            } else {
+                // File doesn't exist yet -- check parent directory
+                std::path::Path::new(path)
+                    .parent()
+                    .and_then(|p| p.canonicalize().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from(path))
+            };
+            if !check_path.starts_with(sandbox) {
+                return Err(HostError {
+                    code: 403,
+                    message: format!(
+                        "Subagent writes restricted to {}. \
+                         Return content to main agent for writing elsewhere.",
+                        sandbox
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Resolve a file path using skill_base_path if available.
@@ -269,6 +308,30 @@ impl DaemonHostFunctions {
     /// Update the current iteration counter for trace recording.
     pub fn set_iteration(&self, iteration: u32) {
         self.current_iteration.store(iteration, Ordering::Relaxed);
+    }
+
+    /// Build a mode-aware, tab-aware system prompt for a sub-agent.
+    fn build_subagent_prompt(task: &str, mode: &str, has_tab: bool) -> String {
+        let capabilities = match (mode, has_tab) {
+            ("chat", false) => "- web_search: Search the web for information\n- web_fetch: Fetch and analyze content from a URL",
+            ("chat", true) => "- web_search: Search the web for information\n- web_fetch: Fetch and analyze content from a URL\n- browser_get_markdown: Get page content as markdown (use with your assigned tab_id)\n- browser_screenshot: Take a screenshot of the page\n\nIMPORTANT: You have READ-ONLY access to a browser tab. You CANNOT interact with the page (no clicking, typing, scrolling, or navigating).",
+            ("browser", false) => "- web_search: Search the web for information\n- web_fetch: Fetch and analyze content from a URL",
+            ("browser", true) => "- web_search: Search the web for information\n- web_fetch: Fetch and analyze content from a URL\n- browser_get_content: Get page content as text/HTML\n- browser_get_markdown: Get page content as markdown\n- browser_screenshot: Take a screenshot of the page\n\nIMPORTANT: You have READ-ONLY access to a browser tab. You CANNOT interact with the page (no clicking, typing, scrolling, or navigating).",
+            ("agent", false) => "- web_search: Search the web for information\n- web_fetch: Fetch and analyze content from a URL\n- read/write/edit: File system access\n- bash: Execute shell commands\n- glob/grep: Search files",
+            ("agent", true) => "- web_search: Search the web for information\n- web_fetch: Fetch and analyze content from a URL\n- read/write/edit: File system access\n- bash: Execute shell commands\n- glob/grep: Search files\n- browser_get_content: Get page content as text/HTML\n- browser_get_markdown: Get page content as markdown\n- browser_screenshot: Take a screenshot of the page\n\nIMPORTANT: You have READ-ONLY access to a browser tab. You CANNOT interact with the page (no clicking, typing, scrolling, or navigating).",
+            _ => "- web_search: Search the web for information\n- web_fetch: Fetch and analyze content from a URL",
+        };
+
+        format!(
+            "You are a sub-agent executing a specific task.\n\n\
+             ## Task\n{}\n\n\
+             ## Available Capabilities\n{}\n\n\
+             ## Output Format\nReturn your findings in a structured format:\n\
+             ### Result\nThe main output of your task.\n\
+             ### Summary\nA brief summary of what you did and found.\n\n\
+             Focus on completing this task efficiently and accurately.",
+            task, capabilities
+        )
     }
 
     /// Record a tool execution span if trace collection is enabled.
@@ -1191,6 +1254,7 @@ impl HostFunctions for DaemonHostFunctions {
         use std::fs;
 
         let start = std::time::Instant::now();
+        self.validate_sandbox_path(path)?;
 
         // Resolve path using skill base if available (no absolute fallback for writes)
         let resolved_path = self
@@ -1238,6 +1302,7 @@ impl HostFunctions for DaemonHostFunctions {
         use std::fs;
 
         let start = std::time::Instant::now();
+        self.validate_sandbox_path(path)?;
         let result = (|| {
             let content = fs::read_to_string(path).map_err(|e| HostError {
                 code: 1,
@@ -2025,6 +2090,16 @@ impl HostFunctions for DaemonHostFunctions {
         )
     }
 
+    fn browser_go_back(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+        debug!("browser_go_back");
+        self.execute_browser_action(BrowserToolAction::GoBack, serde_json::json!({}), tab_id)
+    }
+
+    fn browser_go_forward(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+        debug!("browser_go_forward");
+        self.execute_browser_action(BrowserToolAction::GoForward, serde_json::json!({}), tab_id)
+    }
+
     fn browser_click(&self, selector: &str, tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
         debug!("browser_click: selector={}", selector);
         self.execute_browser_action(
@@ -2230,8 +2305,11 @@ impl HostFunctions for DaemonHostFunctions {
         Ok(services.is_interrupted())
     }
 
-    fn subagent_spawn(&self, task: &str, mode: &str) -> HostResult<u64> {
-        debug!("subagent_spawn: task='{}', mode={}", task, mode);
+    fn subagent_spawn(&self, task: &str, mode: &str, tab_id: Option<i64>) -> HostResult<u64> {
+        debug!(
+            "subagent_spawn: task='{}', mode={}, tab_id={:?}",
+            task, mode, tab_id
+        );
 
         // Parse the mode
         let agent_mode = match mode {
@@ -2245,17 +2323,11 @@ impl HostFunctions for DaemonHostFunctions {
             if let Some(executor) = &services.subagent_executor {
                 debug!("Using WASM sandboxed executor for subagent");
 
-                // Build custom prompt for sub-agent
-                let custom_prompt = Some(format!(
-                    "You are a sub-agent executing a specific task.\n\
-                     Task: {}\n\n\
-                     Focus on completing this task efficiently. \
-                     Return your findings when complete.",
-                    task
-                ));
+                let has_tab = tab_id.is_some();
+                let custom_prompt = Some(Self::build_subagent_prompt(task, mode, has_tab));
 
                 let handle = executor
-                    .spawn(task.to_string(), agent_mode, custom_prompt)
+                    .spawn(task.to_string(), agent_mode, custom_prompt, tab_id)
                     .map_err(|e| HostError {
                         code: 500,
                         message: format!("Failed to spawn subagent: {}", e),
@@ -2275,6 +2347,7 @@ impl HostFunctions for DaemonHostFunctions {
             task,
             mode,
             agent_mode,
+            tab_id,
         )
     }
 
@@ -2330,6 +2403,28 @@ impl HostFunctions for DaemonHostFunctions {
 
         // Fall back to legacy registry
         Self::wait_legacy_subagent_impl(&self.subagent_registry, &self.runtime, id)
+    }
+
+    fn subagent_wait_all(&self, ids: &[u64]) -> HostResult<String> {
+        debug!("subagent_wait_all: ids={:?}", ids);
+
+        let results: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|&id| match self.subagent_wait(id) {
+                Ok(result) => serde_json::json!({
+                    "id": id,
+                    "status": "completed",
+                    "result": result,
+                }),
+                Err(e) => serde_json::json!({
+                    "id": id,
+                    "status": "failed",
+                    "error": e.message,
+                }),
+            })
+            .collect();
+
+        Ok(serde_json::to_string_pretty(&results).unwrap_or_default())
     }
 
     fn subagent_kill(&self, id: u64) -> HostResult<bool> {
@@ -2510,6 +2605,7 @@ impl DaemonHostFunctions {
             model_override_provider: self.model_override_provider.clone(),
             model_override_model: self.model_override_model.clone(),
             skill_base_path: self.skill_base_path.clone(),
+            subagent_sandbox: self.subagent_sandbox.clone(),
         }
     }
 
@@ -2773,6 +2869,7 @@ impl DaemonHostFunctions {
     ///
     /// This is used when no SubagentExecutor is available.
     /// WARNING: This provides no sandboxing - subagents have full access to HostServices.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_legacy_subagent_impl(
         subagent_registry: &Arc<SubagentRegistry>,
         config: &Arc<AgentConfig>,
@@ -2781,6 +2878,7 @@ impl DaemonHostFunctions {
         task: &str,
         mode: &str,
         agent_mode: AgentMode,
+        tab_id: Option<i64>,
     ) -> HostResult<u64> {
         let id = subagent_registry.allocate_id();
         let task_str = task.to_string();
@@ -2822,6 +2920,7 @@ impl DaemonHostFunctions {
             }
 
             // Create agent input with custom prompt for sub-agent
+            let has_tab = tab_id.is_some();
             let input = AgentInput {
                 session_id: format!("subagent-{}", id),
                 mode: agent_mode,
@@ -2829,15 +2928,11 @@ impl DaemonHostFunctions {
                 history: vec![],
                 attachments: vec![],
                 local_files: vec![],
-                custom_system_prompt: Some(format!(
-                    "You are a sub-agent executing a specific task.\n\
-                     Task: {}\n\n\
-                     Focus on completing this task efficiently. \
-                     Return your findings when complete.",
-                    task_str
+                custom_system_prompt: Some(DaemonHostFunctions::build_subagent_prompt(
+                    &task_str, &mode_str, has_tab,
                 )),
-                tab_id: None,    // Sub-agents don't inherit browser tab context
-                tab_ids: vec![], // Sub-agents don't inherit tab list
+                tab_id,
+                tab_ids: vec![],
                 skill_context: None,
                 available_models: vec![],
             };
@@ -3526,11 +3621,11 @@ mod tests {
         let host = DaemonHostFunctions::new(config, rt.handle().clone());
 
         // Spawn a subagent (will fail to run without services but ID should be assigned)
-        let id = host.subagent_spawn("Test task", "agent").unwrap();
+        let id = host.subagent_spawn("Test task", "agent", None).unwrap();
         assert!(id > 0);
 
         // Spawn another - should get a different ID
-        let id2 = host.subagent_spawn("Task 2", "chat").unwrap();
+        let id2 = host.subagent_spawn("Task 2", "chat", None).unwrap();
         assert!(id2 > id);
     }
 
@@ -3551,7 +3646,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let host = DaemonHostFunctions::new(config, rt.handle().clone());
 
-        let id = host.subagent_spawn("Test task", "agent").unwrap();
+        let id = host.subagent_spawn("Test task", "agent", None).unwrap();
 
         // Status should be "running" initially
         let status = host.subagent_status(id).unwrap();
@@ -3574,8 +3669,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let host = DaemonHostFunctions::new(config, rt.handle().clone());
 
-        host.subagent_spawn("Task 1", "agent").unwrap();
-        host.subagent_spawn("Task 2", "browser").unwrap();
+        host.subagent_spawn("Task 1", "agent", None).unwrap();
+        host.subagent_spawn("Task 2", "browser", None).unwrap();
 
         let list = host.subagent_list().unwrap();
         assert_eq!(list.len(), 2);
@@ -3593,7 +3688,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let host = DaemonHostFunctions::new(config, rt.handle().clone());
 
-        let id = host.subagent_spawn("Long task", "agent").unwrap();
+        let id = host.subagent_spawn("Long task", "agent", None).unwrap();
 
         // Kill the running subagent
         let killed = host.subagent_kill(id).unwrap();
