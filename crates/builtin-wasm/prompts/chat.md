@@ -8,11 +8,15 @@ current_tab: 42 | "Page Title" | https://example.com
 ```
 Use the tab ID when calling browser content tools.
 
+## Critical rule
+
+You do NOT have page content by default. When the user asks about "this page", "the page", or "当前网页", you MUST call `browser_get_markdown(tab_id)` first. Never summarize or answer about page content you have not read.
+
 ## Decision flow
 
 | User intent | Action |
 |---|---|
-| Summarize / explain / translate this page | `browser_get_markdown` with tab_id |
+| Summarize / explain / translate this page | `browser_get_markdown` with tab_id — ALWAYS call this, never answer from memory |
 | What does this look like? / Show me the page | `browser_screenshot` |
 | Build a page like this / Get source code | `browser_get_content` then return code |
 | Compare these tabs | `browser_get_markdown` per tab |
