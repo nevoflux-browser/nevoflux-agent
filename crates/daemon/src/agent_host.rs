@@ -2300,8 +2300,7 @@ impl HostFunctions for DaemonHostFunctions {
                 debug!("Using WASM sandboxed executor for subagent");
 
                 let custom_prompt = Some(
-                    Agent::<DaemonHostFunctions>::subagent_prompt_for_mode(agent_mode)
-                        .to_string(),
+                    Agent::<DaemonHostFunctions>::subagent_prompt_for_mode(agent_mode).to_string(),
                 );
 
                 let handle = executor
@@ -2906,8 +2905,7 @@ impl DaemonHostFunctions {
                 attachments: vec![],
                 local_files: vec![],
                 custom_system_prompt: Some(
-                    Agent::<DaemonHostFunctions>::subagent_prompt_for_mode(agent_mode)
-                        .to_string(),
+                    Agent::<DaemonHostFunctions>::subagent_prompt_for_mode(agent_mode).to_string(),
                 ),
                 tab_id,
                 tab_ids: vec![],

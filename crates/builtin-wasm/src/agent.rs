@@ -489,7 +489,7 @@ impl<H: HostFunctions> Agent<H> {
             None => {
                 let skills = self.host.skill_list().unwrap_or_default();
                 Self::build_system_prompt(input.mode, &skills, &input.available_models)
-            },
+            }
         };
 
         // Prepend skill context with high priority if present
@@ -781,8 +781,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     space: String::new(),
                 })
         });
-        let tab_context_prefix =
-            Self::format_tab_context(active_tab_info.as_ref(), &input.tab_ids);
+        let tab_context_prefix = Self::format_tab_context(active_tab_info.as_ref(), &input.tab_ids);
 
         // For browser/agent mode: take initial viewport snapshot and append to user message
         let initial_snapshot = if matches!(input.mode, AgentMode::Browser | AgentMode::Agent) {
@@ -2229,7 +2228,8 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
         tools.push(ToolDefinition {
             name: "glob".into(),
-            description: "Find files by glob pattern (e.g. 'src/**/*.rs'). PREFER over bash find.".into(),
+            description: "Find files by glob pattern (e.g. 'src/**/*.rs'). PREFER over bash find."
+                .into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2586,26 +2586,14 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt() {
-        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
-            AgentMode::Chat,
-            &[],
-            &[],
-        );
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Chat, &[], &[]);
         assert!(!prompt.is_empty());
         assert_eq!(prompt, CHAT_PROMPT);
 
-        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
-            AgentMode::Browser,
-            &[],
-            &[],
-        );
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Browser, &[], &[]);
         assert_eq!(prompt, BROWSER_PROMPT);
 
-        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
-            AgentMode::Agent,
-            &[],
-            &[],
-        );
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Agent, &[], &[]);
         assert_eq!(prompt, AGENT_PROMPT);
     }
 
@@ -2630,21 +2618,29 @@ mod tests {
     fn test_format_tab_context_multi_tab() {
         let tabs = vec![
             TabInfo {
-                tab_id: 1, tab_title: "Tab A".into(),
-                url: "https://a.com".into(), space: "Work".into(),
+                tab_id: 1,
+                tab_title: "Tab A".into(),
+                url: "https://a.com".into(),
+                space: "Work".into(),
             },
             TabInfo {
-                tab_id: 2, tab_title: "Tab B".into(),
-                url: "https://b.com".into(), space: "Work".into(),
+                tab_id: 2,
+                tab_title: "Tab B".into(),
+                url: "https://b.com".into(),
+                space: "Work".into(),
             },
             TabInfo {
-                tab_id: 3, tab_title: "Tab C".into(),
-                url: "https://c.com".into(), space: String::new(),
+                tab_id: 3,
+                tab_title: "Tab C".into(),
+                url: "https://c.com".into(),
+                space: String::new(),
             },
         ];
         let active = TabInfo {
-            tab_id: 1, tab_title: "Tab A".into(),
-            url: "https://a.com".into(), space: "Work".into(),
+            tab_id: 1,
+            tab_title: "Tab A".into(),
+            url: "https://a.com".into(),
+            space: "Work".into(),
         };
         let ctx = Agent::<MockHostFunctions>::format_tab_context(Some(&active), &tabs);
         assert!(ctx.contains("[Work]"));
@@ -2800,7 +2796,10 @@ mod tests {
         assert!(BROWSER_PROMPT.contains("element ID") || BROWSER_PROMPT.contains("[eN]"));
 
         // Agent prompt should contain tool strategy
-        assert!(AGENT_PROMPT.contains("browser_get_markdown") || AGENT_PROMPT.contains("Tool selection"));
+        assert!(
+            AGENT_PROMPT.contains("browser_get_markdown")
+                || AGENT_PROMPT.contains("Tool selection")
+        );
 
         // Subagent prompts
         assert!(SUBAGENT_BROWSER_PROMPT.contains("CANNOT interact"));
@@ -2842,11 +2841,7 @@ mod tests {
             description: "Web automation tools".into(),
             tags: vec![],
         }];
-        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
-            AgentMode::Chat,
-            &skills,
-            &[],
-        );
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Chat, &skills, &[]);
         assert!(prompt.contains("web-tools"));
         assert!(prompt.contains("# Skills"));
     }
@@ -2854,22 +2849,14 @@ mod tests {
     #[test]
     fn test_build_system_prompt_with_models() {
         let models = vec![("anthropic".into(), "claude-sonnet".into())];
-        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
-            AgentMode::Chat,
-            &[],
-            &models,
-        );
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Chat, &[], &models);
         assert!(prompt.contains("claude-sonnet"));
         assert!(prompt.contains("# Available models"));
     }
 
     #[test]
     fn test_build_system_prompt_no_extras() {
-        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
-            AgentMode::Chat,
-            &[],
-            &[],
-        );
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Chat, &[], &[]);
         // Should be exactly the static prompt, no extras
         assert_eq!(prompt, CHAT_PROMPT);
         assert!(!prompt.contains("# Skills"));
