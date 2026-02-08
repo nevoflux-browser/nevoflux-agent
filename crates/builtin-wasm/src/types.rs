@@ -16,6 +16,9 @@ pub struct TabInfo {
     /// The tab's title.
     #[serde(default)]
     pub tab_title: String,
+    /// The tab's URL.
+    #[serde(default)]
+    pub url: String,
 }
 
 /// Agent execution mode.
@@ -909,16 +912,19 @@ mod tests {
                     space: "Work".into(),
                     tab_id: 1,
                     tab_title: "GitHub".into(),
+                    url: String::new(),
                 },
                 TabInfo {
                     space: "Work".into(),
                     tab_id: 2,
                     tab_title: "Docs".into(),
+                    url: String::new(),
                 },
                 TabInfo {
                     space: "Personal".into(),
                     tab_id: 3,
                     tab_title: "Email".into(),
+                    url: String::new(),
                 },
             ],
             skill_context: None,

@@ -736,10 +736,16 @@ async fn handle_chat_message_streaming(
                         .and_then(|t| t.as_str())
                         .unwrap_or("")
                         .to_string();
+                    let url = v
+                        .get("url")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     Some(nevoflux_builtin_wasm::TabInfo {
                         space,
                         tab_id,
                         tab_title,
+                        url,
                     })
                 })
                 .collect()
@@ -1608,10 +1614,16 @@ async fn handle_chat_message(
                                 .and_then(|t| t.as_str())
                                 .unwrap_or("")
                                 .to_string();
+                            let url = v
+                                .get("url")
+                                .and_then(|u| u.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             Some(nevoflux_builtin_wasm::TabInfo {
                                 space,
                                 tab_id,
                                 tab_title,
+                                url,
                             })
                         })
                         .collect()

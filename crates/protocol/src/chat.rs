@@ -22,6 +22,9 @@ pub struct TabInfo {
     /// The tab's title.
     #[serde(default)]
     pub tab_title: String,
+    /// The tab's URL.
+    #[serde(default)]
+    pub url: String,
 }
 
 /// User chat message

@@ -2522,16 +2522,19 @@ mod tests {
                 space: "Work".into(),
                 tab_id: 1,
                 tab_title: "GitHub".into(),
+                url: String::new(),
             },
             TabInfo {
                 space: "Work".into(),
                 tab_id: 2,
                 tab_title: "Docs".into(),
+                url: String::new(),
             },
             TabInfo {
                 space: "Personal".into(),
                 tab_id: 3,
                 tab_title: "Email".into(),
+                url: String::new(),
             },
         ];
         let context_with_tabs = agent.format_tab_context(Some(99), &tab_ids);
