@@ -2585,76 +2585,79 @@ mod tests {
     }
 
     #[test]
-    fn test_build_system_prompt_for_mode() {
-        let mock = MockHostFunctions::new();
-        let agent = Agent::new(mock);
+    fn test_build_system_prompt() {
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
+            AgentMode::Chat,
+            &[],
+            &[],
+        );
+        assert!(!prompt.is_empty());
+        assert_eq!(prompt, CHAT_PROMPT);
 
-        // System prompts are now static (no tab context) for API cache preservation
-        let chat_prompt = agent.build_system_prompt_for_mode(AgentMode::Chat);
-        assert!(chat_prompt.contains("helpful AI assistant"));
-        assert!(chat_prompt.contains("## Thinking and Planning"));
-        assert!(chat_prompt.contains("think"));
-        assert!(chat_prompt.contains("plan"));
-        assert!(chat_prompt.contains("switch_model"));
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
+            AgentMode::Browser,
+            &[],
+            &[],
+        );
+        assert_eq!(prompt, BROWSER_PROMPT);
 
-        let browser_prompt = agent.build_system_prompt_for_mode(AgentMode::Browser);
-        assert!(browser_prompt.contains("browser automation"));
-        assert!(browser_prompt.contains("## Thinking and Planning"));
-        assert!(browser_prompt.contains("think"));
-        assert!(browser_prompt.contains("plan"));
-        assert!(browser_prompt.contains("switch_model"));
-
-        let agent_prompt = agent.build_system_prompt_for_mode(AgentMode::Agent);
-        assert!(agent_prompt.contains("full system access"));
-        assert!(agent_prompt.contains("## Thinking and Planning"));
-        assert!(agent_prompt.contains("think"));
-        assert!(agent_prompt.contains("plan"));
-        assert!(agent_prompt.contains("switch_model"));
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
+            AgentMode::Agent,
+            &[],
+            &[],
+        );
+        assert_eq!(prompt, AGENT_PROMPT);
     }
 
     #[test]
-    fn test_format_tab_context() {
-        let mock = MockHostFunctions::new();
-        let agent = Agent::new(mock);
+    fn test_format_tab_context_single_tab() {
+        let tab = TabInfo {
+            tab_id: 42,
+            tab_title: "Test Page".into(),
+            url: "https://example.com".into(),
+            space: String::new(),
+        };
+        let ctx = Agent::<MockHostFunctions>::format_tab_context(Some(&tab), &[]);
+        assert!(ctx.contains("current_tab: 42"));
+        assert!(ctx.contains("\"Test Page\""));
+        assert!(ctx.contains("https://example.com"));
+        // Must NOT contain behavioral instructions
+        assert!(!ctx.contains("IMPORTANT"));
+        assert!(!ctx.contains("browser_get_markdown"));
+    }
 
-        // Test with only tab_id (no attached tabs) - emphasize current page
-        let context_with_tab = agent.format_tab_context(Some(42), &[]);
-        assert!(context_with_tab.contains("Current Page Tab ID:** 42"));
-        assert!(context_with_tab.contains("browser_get_markdown(tab_id=42)"));
-        assert!(context_with_tab.contains("use this current page"));
-
-        // Test with tab_ids list (attached tabs for processing)
-        let tab_ids = vec![
+    #[test]
+    fn test_format_tab_context_multi_tab() {
+        let tabs = vec![
             TabInfo {
-                space: "Work".into(),
-                tab_id: 1,
-                tab_title: "GitHub".into(),
-                url: String::new(),
+                tab_id: 1, tab_title: "Tab A".into(),
+                url: "https://a.com".into(), space: "Work".into(),
             },
             TabInfo {
-                space: "Work".into(),
-                tab_id: 2,
-                tab_title: "Docs".into(),
-                url: String::new(),
+                tab_id: 2, tab_title: "Tab B".into(),
+                url: "https://b.com".into(), space: "Work".into(),
             },
             TabInfo {
-                space: "Personal".into(),
-                tab_id: 3,
-                tab_title: "Email".into(),
-                url: String::new(),
+                tab_id: 3, tab_title: "Tab C".into(),
+                url: "https://c.com".into(), space: String::new(),
             },
         ];
-        let context_with_tabs = agent.format_tab_context(Some(99), &tab_ids);
-        assert!(context_with_tabs.contains("attached the following tabs"));
-        assert!(context_with_tabs.contains("[Work]"));
-        assert!(context_with_tabs.contains("[Personal]"));
-        assert!(context_with_tabs.contains("tab_id=1: GitHub"));
-        assert!(context_with_tabs.contains("tab_id=2: Docs"));
-        assert!(context_with_tabs.contains("active tab ID: 99"));
+        let active = TabInfo {
+            tab_id: 1, tab_title: "Tab A".into(),
+            url: "https://a.com".into(), space: "Work".into(),
+        };
+        let ctx = Agent::<MockHostFunctions>::format_tab_context(Some(&active), &tabs);
+        assert!(ctx.contains("[Work]"));
+        assert!(ctx.contains("[Default]"));
+        assert!(ctx.contains("current_tab: 1"));
+        assert!(ctx.contains("\"Tab A\""));
+        assert!(ctx.contains("https://a.com"));
+    }
 
-        // Test with no tab context
-        let empty_context = agent.format_tab_context(None, &[]);
-        assert!(empty_context.is_empty());
+    #[test]
+    fn test_format_tab_context_empty() {
+        let ctx = Agent::<MockHostFunctions>::format_tab_context(None, &[]);
+        assert!(ctx.is_empty());
     }
 
     #[test]
@@ -2789,19 +2792,19 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_system_prompts() {
-        let mock = MockHostFunctions::new();
-        let agent = Agent::new(mock);
+    fn test_static_prompts_content() {
+        // Chat prompt should NOT mention interaction
+        assert!(!CHAT_PROMPT.contains("browser_click"));
 
-        let chat_prompt = agent.build_chat_system_prompt();
-        assert!(chat_prompt.contains("helpful AI assistant"));
-        assert!(chat_prompt.contains("web browser"));
+        // Browser prompt should contain interaction rules
+        assert!(BROWSER_PROMPT.contains("element ID") || BROWSER_PROMPT.contains("[eN]"));
 
-        let browser_prompt = agent.build_browser_system_prompt();
-        assert!(browser_prompt.contains("browser automation"));
+        // Agent prompt should contain tool strategy
+        assert!(AGENT_PROMPT.contains("browser_get_markdown") || AGENT_PROMPT.contains("Tool selection"));
 
-        let agent_prompt = agent.build_agent_system_prompt();
-        assert!(agent_prompt.contains("full system access"));
+        // Subagent prompts
+        assert!(SUBAGENT_BROWSER_PROMPT.contains("CANNOT interact"));
+        assert!(SUBAGENT_AGENT_PROMPT.contains("sandbox"));
     }
 
     #[test]
@@ -2833,52 +2836,44 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompts_with_skills() {
-        let mock = MockHostFunctions::new();
-        mock.add_skill(SkillSummary {
-            name: "code-review".into(),
-            description: "Review code for issues".into(),
+    fn test_build_system_prompt_with_skills() {
+        let skills = vec![SkillSummary {
+            name: "web-tools".into(),
+            description: "Web automation tools".into(),
             tags: vec![],
-        });
-        mock.add_skill(SkillSummary {
-            name: "tdd".into(),
-            description: "Test-driven development".into(),
-            tags: vec![],
-        });
-
-        let agent = Agent::new(mock);
-
-        // Chat prompt should include skills section
-        let chat_prompt = agent.build_chat_system_prompt();
-        assert!(chat_prompt.contains("## Available Skills"));
-        assert!(chat_prompt.contains("**code-review**"));
-        assert!(chat_prompt.contains("**tdd**"));
-        assert!(chat_prompt.contains("Use skill_load(name)"));
-
-        // Browser prompt should include skills section
-        let browser_prompt = agent.build_browser_system_prompt();
-        assert!(browser_prompt.contains("## Available Skills"));
-
-        // Agent prompt should include skills section
-        let agent_prompt = agent.build_agent_system_prompt();
-        assert!(agent_prompt.contains("## Available Skills"));
+        }];
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
+            AgentMode::Chat,
+            &skills,
+            &[],
+        );
+        assert!(prompt.contains("web-tools"));
+        assert!(prompt.contains("# Skills"));
     }
 
     #[test]
-    fn test_system_prompts_without_skills() {
-        let mock = MockHostFunctions::new();
-        // Don't add any skills
-        let agent = Agent::new(mock);
+    fn test_build_system_prompt_with_models() {
+        let models = vec![("anthropic".into(), "claude-sonnet".into())];
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
+            AgentMode::Chat,
+            &[],
+            &models,
+        );
+        assert!(prompt.contains("claude-sonnet"));
+        assert!(prompt.contains("# Available models"));
+    }
 
-        // Prompts should not have skills section when no skills available
-        let chat_prompt = agent.build_chat_system_prompt();
-        assert!(!chat_prompt.contains("## Available Skills"));
-
-        let browser_prompt = agent.build_browser_system_prompt();
-        assert!(!browser_prompt.contains("## Available Skills"));
-
-        let agent_prompt = agent.build_agent_system_prompt();
-        assert!(!agent_prompt.contains("## Available Skills"));
+    #[test]
+    fn test_build_system_prompt_no_extras() {
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
+            AgentMode::Chat,
+            &[],
+            &[],
+        );
+        // Should be exactly the static prompt, no extras
+        assert_eq!(prompt, CHAT_PROMPT);
+        assert!(!prompt.contains("# Skills"));
+        assert!(!prompt.contains("# Available models"));
     }
 
     #[test]

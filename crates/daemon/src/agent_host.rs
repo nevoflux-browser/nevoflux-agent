@@ -4167,4 +4167,43 @@ mod tests {
         assert!(result.hint.is_some());
         assert!(result.hint.unwrap().contains("timed out"));
     }
+
+    // ==================== Sandbox Validation Tests ====================
+
+    #[test]
+    fn test_validate_sandbox_path_allows_sandbox_writes() {
+        let sandbox_dir = tempfile::tempdir().unwrap();
+        let sandbox_path = sandbox_dir.path().to_string_lossy().to_string();
+
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone())
+            .with_subagent_sandbox(sandbox_path.clone());
+
+        let file_in_sandbox = format!("{}/output.txt", sandbox_path);
+        assert!(host.validate_sandbox_path(&file_in_sandbox).is_ok());
+    }
+
+    #[test]
+    fn test_validate_sandbox_path_blocks_escape() {
+        let sandbox_dir = tempfile::tempdir().unwrap();
+        let sandbox_path = sandbox_dir.path().to_string_lossy().to_string();
+
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone())
+            .with_subagent_sandbox(sandbox_path);
+
+        assert!(host.validate_sandbox_path("/etc/passwd").is_err());
+        assert!(host.validate_sandbox_path("/tmp/other/file.txt").is_err());
+    }
+
+    #[test]
+    fn test_validate_sandbox_path_skipped_for_main_agent() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+        // No sandbox set — should allow any path
+        assert!(host.validate_sandbox_path("/any/path/file.txt").is_ok());
+    }
 }
