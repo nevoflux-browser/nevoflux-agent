@@ -187,6 +187,12 @@ pub trait HostFunctions {
     /// Navigate to a URL.
     fn browser_navigate(&self, url: &str, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
 
+    /// Go back in browser history.
+    fn browser_go_back(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
+
+    /// Go forward in browser history.
+    fn browser_go_forward(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
+
     /// Click on an element by CSS selector.
     fn browser_click(&self, selector: &str, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
 
@@ -302,10 +308,20 @@ pub trait HostFunctions {
     /// # Arguments
     /// * `task` - The task description for the sub-agent
     /// * `mode` - Execution mode: "chat", "browser", or "agent"
+    /// * `tab_id` - Optional tab ID for the sub-agent to read page content from
     ///
     /// # Returns
     /// The sub-agent ID on success.
-    fn subagent_spawn(&self, task: &str, mode: &str) -> HostResult<u64>;
+    fn subagent_spawn(&self, task: &str, mode: &str, tab_id: Option<i64>) -> HostResult<u64>;
+
+    /// Wait for multiple sub-agents to complete and return all results.
+    ///
+    /// # Arguments
+    /// * `ids` - The sub-agent IDs to wait for
+    ///
+    /// # Returns
+    /// A JSON string with the results of all sub-agents.
+    fn subagent_wait_all(&self, ids: &[u64]) -> HostResult<String>;
 
     /// Check the status of a sub-agent.
     ///
@@ -642,6 +658,18 @@ impl HostFunctions for MockHostFunctions {
         ))
     }
 
+    fn browser_go_back(&self, _tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(
+            serde_json::json!({"action": "go_back"}),
+        ))
+    }
+
+    fn browser_go_forward(&self, _tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(
+            serde_json::json!({"action": "go_forward"}),
+        ))
+    }
+
     fn browser_click(&self, selector: &str, _tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
         Ok(BrowserToolResult::success(
             serde_json::json!({"clicked": selector}),
@@ -797,7 +825,7 @@ impl HostFunctions for MockHostFunctions {
         Ok(self.interrupted.get())
     }
 
-    fn subagent_spawn(&self, task: &str, mode: &str) -> HostResult<u64> {
+    fn subagent_spawn(&self, task: &str, mode: &str, _tab_id: Option<i64>) -> HostResult<u64> {
         let id = self.next_subagent_id.get();
         self.next_subagent_id.set(id + 1);
 
@@ -810,6 +838,29 @@ impl HostFunctions for MockHostFunctions {
         self.subagents.borrow_mut().push(info);
 
         Ok(id)
+    }
+
+    fn subagent_wait_all(&self, ids: &[u64]) -> HostResult<String> {
+        let results: Vec<serde_json::Value> = ids
+            .iter()
+            .map(|&id| {
+                let subagents = self.subagents.borrow();
+                if let Some(s) = subagents.iter().find(|s| s.id == id) {
+                    serde_json::json!({
+                        "id": id,
+                        "status": s.status,
+                        "result": format!("Result from subagent {}: {}", id, s.task),
+                    })
+                } else {
+                    serde_json::json!({
+                        "id": id,
+                        "status": "not_found",
+                        "error": format!("Subagent not found: {}", id),
+                    })
+                }
+            })
+            .collect();
+        Ok(serde_json::to_string_pretty(&results).unwrap_or_default())
     }
 
     fn subagent_status(&self, id: u64) -> HostResult<String> {
@@ -1144,10 +1195,12 @@ mod tests {
     fn test_mock_host_functions_subagent_spawn() {
         let mock = MockHostFunctions::new();
 
-        let id1 = mock.subagent_spawn("Search for files", "agent").unwrap();
+        let id1 = mock
+            .subagent_spawn("Search for files", "agent", None)
+            .unwrap();
         assert_eq!(id1, 1);
 
-        let id2 = mock.subagent_spawn("Chat with user", "chat").unwrap();
+        let id2 = mock.subagent_spawn("Chat with user", "chat", None).unwrap();
         assert_eq!(id2, 2);
     }
 
@@ -1155,7 +1208,7 @@ mod tests {
     fn test_mock_host_functions_subagent_status() {
         let mock = MockHostFunctions::new();
 
-        let id = mock.subagent_spawn("Test task", "agent").unwrap();
+        let id = mock.subagent_spawn("Test task", "agent", None).unwrap();
         let status = mock.subagent_status(id).unwrap();
         assert_eq!(status, "completed");
     }
@@ -1173,7 +1226,9 @@ mod tests {
     fn test_mock_host_functions_subagent_wait() {
         let mock = MockHostFunctions::new();
 
-        let id = mock.subagent_spawn("Find documents", "agent").unwrap();
+        let id = mock
+            .subagent_spawn("Find documents", "agent", None)
+            .unwrap();
         let result = mock.subagent_wait(id).unwrap();
         assert!(result.contains("Find documents"));
     }
@@ -1191,7 +1246,7 @@ mod tests {
     fn test_mock_host_functions_subagent_kill() {
         let mock = MockHostFunctions::new();
 
-        let id = mock.subagent_spawn("Long task", "agent").unwrap();
+        let id = mock.subagent_spawn("Long task", "agent", None).unwrap();
         // Mock sets status to "completed" immediately, so kill returns false
         let killed = mock.subagent_kill(id).unwrap();
         assert!(!killed);
@@ -1215,8 +1270,8 @@ mod tests {
         assert!(list.is_empty());
 
         // Spawn some subagents
-        mock.subagent_spawn("Task 1", "agent").unwrap();
-        mock.subagent_spawn("Task 2", "browser").unwrap();
+        mock.subagent_spawn("Task 1", "agent", None).unwrap();
+        mock.subagent_spawn("Task 2", "browser", None).unwrap();
 
         let list = mock.subagent_list().unwrap();
         assert_eq!(list.len(), 2);
@@ -1224,5 +1279,41 @@ mod tests {
         assert_eq!(list[0].mode, "agent");
         assert_eq!(list[1].task, "Task 2");
         assert_eq!(list[1].mode, "browser");
+    }
+
+    #[test]
+    fn test_mock_host_functions_subagent_spawn_with_tab_id() {
+        let mock = MockHostFunctions::new();
+
+        let id = mock
+            .subagent_spawn("Read tab content", "browser", Some(42))
+            .unwrap();
+        assert_eq!(id, 1);
+    }
+
+    #[test]
+    fn test_mock_host_functions_subagent_wait_all() {
+        let mock = MockHostFunctions::new();
+
+        let id1 = mock.subagent_spawn("Task 1", "agent", None).unwrap();
+        let id2 = mock.subagent_spawn("Task 2", "browser", None).unwrap();
+
+        let result = mock.subagent_wait_all(&[id1, id2]).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["id"], id1);
+        assert_eq!(parsed[1]["id"], id2);
+        assert!(parsed[0]["result"].as_str().unwrap().contains("Task 1"));
+        assert!(parsed[1]["result"].as_str().unwrap().contains("Task 2"));
+    }
+
+    #[test]
+    fn test_mock_host_functions_subagent_wait_all_not_found() {
+        let mock = MockHostFunctions::new();
+
+        let result = mock.subagent_wait_all(&[999]).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["status"], "not_found");
     }
 }

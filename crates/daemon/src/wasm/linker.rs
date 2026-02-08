@@ -63,7 +63,7 @@ impl SubagentRegistry {
     }
 
     /// Spawn a new subagent and return its ID.
-    pub fn spawn(&self, task: String, mode: String) -> u64 {
+    pub fn spawn(&self, task: String, mode: String, _tab_id: Option<i64>) -> u64 {
         let mut next_id = self.next_id.lock().unwrap();
         let id = *next_id;
         *next_id += 1;
@@ -1177,7 +1177,8 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
         })?;
 
     // Register subagent_spawn: spawns a new subagent
-    // subagent_spawn: task_ptr, task_len, mode_ptr, mode_len -> subagent_id (u64 as i64) or -1 on error
+    // subagent_spawn: task_ptr, task_len, mode_ptr, mode_len, tab_id -> subagent_id (u64 as i64) or -1 on error
+    // tab_id: -1 means None, otherwise the tab ID
     linker
         .func_wrap(
             "nevoflux",
@@ -1186,7 +1187,8 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
              task_ptr: i32,
              task_len: i32,
              mode_ptr: i32,
-             mode_len: i32|
+             mode_len: i32,
+             tab_id: i64|
              -> i64 {
                 let memory = match caller.get_export("memory") {
                     Some(wasmtime::Extern::Memory(mem)) => mem,
@@ -1220,7 +1222,8 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
                 };
 
                 // Spawn the subagent
-                let id = caller.data().subagents.spawn(task, mode);
+                let opt_tab_id = if tab_id < 0 { None } else { Some(tab_id) };
+                let id = caller.data().subagents.spawn(task, mode, opt_tab_id);
                 id as i64
             },
         )
@@ -1689,7 +1692,7 @@ mod tests {
                 (import "nevoflux" "skill_load" (func $skill_load (param i32 i32 i32 i32) (result i32)))
                 (import "nevoflux" "skill_read" (func $skill_read (param i32 i32 i32 i32 i32 i32) (result i32)))
                 (import "nevoflux" "skill_execute" (func $skill_execute (param i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
-                (import "nevoflux" "subagent_spawn" (func $subagent_spawn (param i32 i32 i32 i32) (result i64)))
+                (import "nevoflux" "subagent_spawn" (func $subagent_spawn (param i32 i32 i32 i32 i64) (result i64)))
                 (import "nevoflux" "subagent_status" (func $subagent_status (param i64) (result i32)))
                 (import "nevoflux" "subagent_wait" (func $subagent_wait (param i64 i32 i32) (result i32)))
                 (import "nevoflux" "subagent_kill" (func $subagent_kill (param i64) (result i32)))
@@ -3297,8 +3300,8 @@ mod tests {
     fn test_subagent_registry_spawn() {
         let registry = SubagentRegistry::new();
 
-        let id1 = registry.spawn("task1".to_string(), "chat".to_string());
-        let id2 = registry.spawn("task2".to_string(), "agent".to_string());
+        let id1 = registry.spawn("task1".to_string(), "chat".to_string(), None);
+        let id2 = registry.spawn("task2".to_string(), "agent".to_string(), None);
 
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
@@ -3316,7 +3319,7 @@ mod tests {
     #[test]
     fn test_subagent_registry_complete() {
         let registry = SubagentRegistry::new();
-        let id = registry.spawn("task".to_string(), "chat".to_string());
+        let id = registry.spawn("task".to_string(), "chat".to_string(), None);
 
         registry.complete(id, "result".to_string());
 
@@ -3328,7 +3331,7 @@ mod tests {
     #[test]
     fn test_subagent_registry_fail() {
         let registry = SubagentRegistry::new();
-        let id = registry.spawn("task".to_string(), "chat".to_string());
+        let id = registry.spawn("task".to_string(), "chat".to_string(), None);
 
         registry.fail(id, "error message".to_string());
 
@@ -3342,7 +3345,7 @@ mod tests {
     #[test]
     fn test_subagent_registry_kill() {
         let registry = SubagentRegistry::new();
-        let id = registry.spawn("task".to_string(), "chat".to_string());
+        let id = registry.spawn("task".to_string(), "chat".to_string(), None);
 
         // Kill running subagent
         assert!(registry.kill(id));
@@ -3357,9 +3360,9 @@ mod tests {
     #[test]
     fn test_subagent_registry_list_ids() {
         let registry = SubagentRegistry::new();
-        registry.spawn("task1".to_string(), "chat".to_string());
-        registry.spawn("task2".to_string(), "agent".to_string());
-        registry.spawn("task3".to_string(), "browser".to_string());
+        registry.spawn("task1".to_string(), "chat".to_string(), None);
+        registry.spawn("task2".to_string(), "agent".to_string(), None);
+        registry.spawn("task3".to_string(), "browser".to_string(), None);
 
         let ids = registry.list_ids();
         assert_eq!(ids.len(), 3);
@@ -3375,7 +3378,7 @@ mod tests {
 
         let wat = r#"
             (module
-                (import "nevoflux" "subagent_spawn" (func $subagent_spawn (param i32 i32 i32 i32) (result i64)))
+                (import "nevoflux" "subagent_spawn" (func $subagent_spawn (param i32 i32 i32 i32 i64) (result i64)))
                 (memory (export "memory") 1)
                 (data (i32.const 0) "test task")
                 (data (i32.const 20) "chat")
@@ -3384,6 +3387,7 @@ mod tests {
                     i32.const 9    ;; task_len ("test task")
                     i32.const 20   ;; mode_ptr
                     i32.const 4    ;; mode_len ("chat")
+                    i64.const -1   ;; tab_id (None)
                     call $subagent_spawn
                 )
             )
@@ -3410,13 +3414,13 @@ mod tests {
 
         let wat = r#"
             (module
-                (import "nevoflux" "subagent_spawn" (func $subagent_spawn (param i32 i32 i32 i32) (result i64)))
+                (import "nevoflux" "subagent_spawn" (func $subagent_spawn (param i32 i32 i32 i32 i64) (result i64)))
                 (import "nevoflux" "subagent_status" (func $subagent_status (param i64) (result i32)))
                 (memory (export "memory") 1)
                 (data (i32.const 0) "task")
                 (data (i32.const 10) "chat")
                 (func (export "spawn") (result i64)
-                    i32.const 0  i32.const 4  i32.const 10  i32.const 4  call $subagent_spawn
+                    i32.const 0  i32.const 4  i32.const 10  i32.const 4  i64.const -1  call $subagent_spawn
                 )
                 (func (export "status") (param i64) (result i32)
                     local.get 0  call $subagent_status
@@ -3460,14 +3464,14 @@ mod tests {
 
         let wat = r#"
             (module
-                (import "nevoflux" "subagent_spawn" (func $subagent_spawn (param i32 i32 i32 i32) (result i64)))
+                (import "nevoflux" "subagent_spawn" (func $subagent_spawn (param i32 i32 i32 i32 i64) (result i64)))
                 (import "nevoflux" "subagent_status" (func $subagent_status (param i64) (result i32)))
                 (import "nevoflux" "subagent_kill" (func $subagent_kill (param i64) (result i32)))
                 (memory (export "memory") 1)
                 (data (i32.const 0) "task")
                 (data (i32.const 10) "chat")
                 (func (export "spawn") (result i64)
-                    i32.const 0  i32.const 4  i32.const 10  i32.const 4  call $subagent_spawn
+                    i32.const 0  i32.const 4  i32.const 10  i32.const 4  i64.const -1  call $subagent_spawn
                 )
                 (func (export "status") (param i64) (result i32)
                     local.get 0  call $subagent_status
@@ -3518,17 +3522,17 @@ mod tests {
 
         let wat = r#"
             (module
-                (import "nevoflux" "subagent_spawn" (func $subagent_spawn (param i32 i32 i32 i32) (result i64)))
+                (import "nevoflux" "subagent_spawn" (func $subagent_spawn (param i32 i32 i32 i32 i64) (result i64)))
                 (import "nevoflux" "subagent_list" (func $subagent_list (param i32 i32) (result i32)))
                 (memory (export "memory") 1)
                 (data (i32.const 0) "task1")
                 (data (i32.const 10) "chat")
                 (data (i32.const 20) "task2")
                 (func (export "spawn1") (result i64)
-                    i32.const 0  i32.const 5  i32.const 10  i32.const 4  call $subagent_spawn
+                    i32.const 0  i32.const 5  i32.const 10  i32.const 4  i64.const -1  call $subagent_spawn
                 )
                 (func (export "spawn2") (result i64)
-                    i32.const 20  i32.const 5  i32.const 10  i32.const 4  call $subagent_spawn
+                    i32.const 20  i32.const 5  i32.const 10  i32.const 4  i64.const -1  call $subagent_spawn
                 )
                 (func (export "list") (result i32)
                     i32.const 100  ;; result_ptr

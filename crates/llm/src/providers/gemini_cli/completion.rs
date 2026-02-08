@@ -19,7 +19,7 @@ use super::super::ChildGuardStream;
 use super::client::GEMINI_CLI_KNOWN_MODELS;
 use super::types::{
     extract_tool_calls_from_text, format_tool_call_as_xml, format_tool_definitions_prompt,
-    format_tool_result_as_xml, parse_gemini_output, GeminiCliCompletionResponse, GeminiCliUsage,
+    format_tool_result_as_xml, GeminiCliCompletionResponse, GeminiCliUsage,
 };
 use super::GeminiCliClient;
 
@@ -225,6 +225,67 @@ fn emit_text_and_tool_calls(
     items
 }
 
+/// Parse the JSON output from `gemini -o json`.
+///
+/// The stdout may contain non-JSON preamble lines (e.g. "YOLO mode is enabled").
+/// The JSON response has the form:
+/// ```json
+/// { "response": "...", "stats": { "models": { "<model>": { "tokens": { "input": N, "candidates": N, "total": N } } } } }
+/// ```
+fn parse_gemini_json_response(
+    stdout: &str,
+) -> Result<(String, GeminiCliUsage), CompletionError> {
+    // Find the JSON object in stdout — it starts at the first '{' and ends at the last '}'
+    let start = stdout.find('{').ok_or_else(|| {
+        CompletionError::ProviderError("No JSON found in Gemini CLI output".into())
+    })?;
+    let end = stdout.rfind('}').ok_or_else(|| {
+        CompletionError::ProviderError("No closing brace in Gemini CLI output".into())
+    })?;
+
+    let json_str = &stdout[start..=end];
+    let parsed: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
+        CompletionError::ProviderError(format!("Failed to parse Gemini CLI JSON: {}", e))
+    })?;
+
+    let content = parsed
+        .get("response")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Extract token usage from stats.models.<model>.tokens
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    if let Some(models) = parsed
+        .get("stats")
+        .and_then(|s| s.get("models"))
+        .and_then(|m| m.as_object())
+    {
+        // Take the first model's token stats
+        if let Some(model_stats) = models.values().next() {
+            if let Some(tokens) = model_stats.get("tokens").and_then(|t| t.as_object()) {
+                input_tokens = tokens
+                    .get("input")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                output_tokens = tokens
+                    .get("candidates")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+            }
+        }
+    }
+
+    Ok((
+        content,
+        GeminiCliUsage {
+            input_tokens,
+            output_tokens,
+        },
+    ))
+}
+
 impl completion::CompletionModel for GeminiCliCompletionModel {
     type Response = GeminiCliCompletionResponse;
     type StreamingResponse = GeminiCliStreamingResponse;
@@ -246,6 +307,9 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
             &completion_request.documents,
             &completion_request.tools,
         );
+
+        // Use JSON output format for structured response with token stats
+        cmd.arg("-o").arg("json");
 
         let child = cmd
             .stdout(std::process::Stdio::piped())
@@ -273,20 +337,22 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let response = parse_gemini_output(&stdout).map_err(|e| {
-            CompletionError::ProviderError(format!("Failed to parse CLI output: {}", e))
-        })?;
+
+        // Parse the JSON response from stdout (skip non-JSON preamble lines)
+        let (content, usage) = parse_gemini_json_response(&stdout)?;
+
+        let response = GeminiCliCompletionResponse { content: content.clone(), usage: usage.clone() };
 
         // Check for text-injected tool calls
-        let (cleaned_text, tool_calls) = extract_tool_calls_from_text(&response.content);
+        let (cleaned_text, tool_calls) = extract_tool_calls_from_text(&content);
 
         if tool_calls.is_empty() {
             response.try_into()
         } else {
-            let usage = Usage {
-                input_tokens: response.usage.input_tokens,
-                output_tokens: response.usage.output_tokens,
-                total_tokens: response.usage.input_tokens + response.usage.output_tokens,
+            let rig_usage = Usage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                total_tokens: usage.input_tokens + usage.output_tokens,
             };
 
             let mut contents: Vec<AssistantContent> = Vec::new();
@@ -306,7 +372,7 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
 
             Ok(CompletionResponse {
                 choice,
-                usage,
+                usage: rig_usage,
                 raw_response: response,
             })
         }
@@ -325,6 +391,10 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
             &completion_request.tools,
         );
 
+        // Use stream-json output format for structured streaming events.
+        // Each line is a JSON event with proper content formatting preserved.
+        cmd.arg("-o").arg("stream-json");
+
         let mut child = cmd
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -342,12 +412,12 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
         let lines =
             tokio_stream::wrappers::LinesStream::new(tokio::io::AsyncBufReadExt::lines(reader));
 
-        // Buffer multi-line <tool_call> blocks before extraction.
-        // The Gemini CLI outputs plain text line-by-line, so <tool_call>...</tool_call>
-        // blocks spanning multiple lines must be accumulated before tool call extraction.
-        // Without buffering, each line is processed independently and multi-line tool
-        // calls are never matched (extract_tool_calls_from_text requires both opening
-        // and closing tags in the same string).
+        // Parse stream-json events from the Gemini CLI.
+        // Each line is either a JSON event or a non-JSON preamble line (e.g. "YOLO mode").
+        // Assistant content comes as: {"type":"message","role":"assistant","content":"...","delta":true}
+        // Content fields preserve newlines, so formatting is maintained.
+        // Tool call markers (<tool_call>...</tool_call>) may span multiple delta events,
+        // so we still buffer across chunks.
         type StreamItems =
             Vec<Result<RawStreamingChoice<GeminiCliStreamingResponse>, CompletionError>>;
         let stream = futures::stream::unfold(
@@ -357,48 +427,76 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
                     match StreamExt::next(&mut lines).await {
                         Some(Ok(line)) => {
                             let trimmed = line.trim();
-                            if trimmed.is_empty()
-                                || trimmed.starts_with("Loaded cached credentials")
-                            {
+                            if trimmed.is_empty() || !trimmed.starts_with('{') {
+                                // Skip non-JSON lines (YOLO mode, cached credentials, etc.)
                                 continue;
                             }
 
-                            if in_tool_call {
-                                buffer.push_str(&line);
-                                buffer.push('\n');
-                                if line.contains("</tool_call>") {
-                                    // Tool call block complete — extract and emit
-                                    in_tool_call = false;
-                                    let complete = std::mem::take(&mut buffer);
-                                    let items: StreamItems =
-                                        emit_text_and_tool_calls(&complete);
+                            let Ok(entry) = serde_json::from_str::<serde_json::Value>(trimmed)
+                            else {
+                                continue;
+                            };
+
+                            let event_type = entry.get("type").and_then(|t| t.as_str());
+
+                            // Extract assistant message content from delta events
+                            if event_type == Some("message") {
+                                let role = entry.get("role").and_then(|r| r.as_str());
+                                if role != Some("assistant") {
+                                    continue;
+                                }
+                                let Some(content) =
+                                    entry.get("content").and_then(|c| c.as_str())
+                                else {
+                                    continue;
+                                };
+                                if content.is_empty() {
+                                    continue;
+                                }
+
+                                // Buffer tool call markers that may span multiple chunks
+                                if in_tool_call {
+                                    buffer.push_str(content);
+                                    if content.contains("</tool_call>") {
+                                        in_tool_call = false;
+                                        let complete = std::mem::take(&mut buffer);
+                                        let items: StreamItems =
+                                            emit_text_and_tool_calls(&complete);
+                                        return Some((
+                                            items,
+                                            (lines, buffer, in_tool_call),
+                                        ));
+                                    }
+                                    continue;
+                                }
+
+                                if content.contains("<tool_call>")
+                                    && !content.contains("</tool_call>")
+                                {
+                                    in_tool_call = true;
+                                    let idx = content.find("<tool_call>").unwrap();
+                                    let before = content[..idx].to_string();
+                                    buffer = content[idx..].to_string();
+                                    if !before.trim().is_empty() {
+                                        let items: StreamItems =
+                                            vec![Ok(RawStreamingChoice::Message(before))];
+                                        return Some((
+                                            items,
+                                            (lines, buffer, in_tool_call),
+                                        ));
+                                    }
+                                    continue;
+                                }
+
+                                // Normal text or single-chunk tool call
+                                let items: StreamItems = emit_text_and_tool_calls(content);
+                                if !items.is_empty() {
                                     return Some((items, (lines, buffer, in_tool_call)));
                                 }
                                 continue;
                             }
 
-                            if line.contains("<tool_call>")
-                                && !line.contains("</tool_call>")
-                            {
-                                // Start of multi-line tool call — buffer it
-                                in_tool_call = true;
-                                let idx = line.find("<tool_call>").unwrap();
-                                let before = line[..idx].trim().to_string();
-                                buffer = line[idx..].to_string();
-                                buffer.push('\n');
-                                if !before.is_empty() {
-                                    let items: StreamItems =
-                                        vec![Ok(RawStreamingChoice::Message(before))];
-                                    return Some((items, (lines, buffer, in_tool_call)));
-                                }
-                                continue;
-                            }
-
-                            // Normal line or single-line tool call
-                            let items: StreamItems = emit_text_and_tool_calls(&line);
-                            if !items.is_empty() {
-                                return Some((items, (lines, buffer, in_tool_call)));
-                            }
+                            // Skip other event types (init, user message, result)
                             continue;
                         }
                         Some(Err(e)) => {
@@ -543,6 +641,70 @@ mod tests {
         assert!(prompt.contains("Human: Hi"));
         assert!(prompt.contains("Assistant: Hello!"));
         assert!(prompt.contains("Human: How are you?"));
+    }
+
+    #[test]
+    fn test_parse_gemini_json_response_basic() {
+        let stdout = r#"YOLO mode is enabled.
+{
+  "session_id": "abc",
+  "response": "Hello!\nHow can I help?",
+  "stats": {
+    "models": {
+      "gemini-2.5-flash": {
+        "tokens": {
+          "input": 100,
+          "candidates": 20,
+          "total": 120
+        }
+      }
+    }
+  }
+}"#;
+        let (content, usage) = parse_gemini_json_response(stdout).unwrap();
+        assert_eq!(content, "Hello!\nHow can I help?");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 20);
+    }
+
+    #[test]
+    fn test_parse_gemini_json_response_no_stats() {
+        let stdout = r#"{"response": "Hi there", "stats": {}}"#;
+        let (content, usage) = parse_gemini_json_response(stdout).unwrap();
+        assert_eq!(content, "Hi there");
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+    }
+
+    #[test]
+    fn test_parse_gemini_json_response_no_json() {
+        let stdout = "YOLO mode is enabled.\nNo JSON here.";
+        let result = parse_gemini_json_response(stdout);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stream_json_event_parsing() {
+        // Simulate stream-json events — only assistant delta events should produce items
+        let events = vec![
+            r#"{"type":"init","session_id":"abc"}"#,
+            r#"{"type":"message","role":"user","content":"Hi"}"#,
+            r#"{"type":"message","role":"assistant","content":"Hello!\nI can help you with","delta":true}"#,
+            r#"{"type":"message","role":"assistant","content":" your tasks.\nWhat do you need?","delta":true}"#,
+            r#"{"type":"result","status":"success","stats":{}}"#,
+        ];
+
+        // Only the assistant delta events should produce text items
+        for event in &events {
+            if let Ok(entry) = serde_json::from_str::<serde_json::Value>(event) {
+                let event_type = entry.get("type").and_then(|t| t.as_str());
+                let role = entry.get("role").and_then(|r| r.as_str());
+                if event_type == Some("message") && role == Some("assistant") {
+                    let content = entry.get("content").and_then(|c| c.as_str()).unwrap();
+                    assert!(content.contains('\n'), "Content should preserve newlines");
+                }
+            }
+        }
     }
 
     #[test]

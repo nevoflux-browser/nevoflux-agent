@@ -124,6 +124,8 @@ pub enum PluginAction {
 #[serde(rename_all = "snake_case")]
 pub enum BrowserToolAction {
     Navigate,
+    GoBack,
+    GoForward,
     Click,
     Type,
     Fill,
@@ -286,8 +288,8 @@ pub fn tool_icon(name: &str) -> &'static str {
         }
 
         // CLI / agent web tools
-        "WebFetch" | "WebSearch" | "web_fetch" | "web_search" | "browser_navigate" | "navigate"
-        | "goto" | "open_url" => {
+        "WebFetch" | "WebSearch" | "web_fetch" | "web_search" | "browser_navigate"
+        | "browser_go_back" | "browser_go_forward" | "navigate" | "goto" | "open_url" => {
             "\u{1F310}" // 🌐
         }
 

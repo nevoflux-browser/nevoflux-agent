@@ -192,6 +192,7 @@ mod tests {
             max_iterations: 10,
             use_streaming: false,
             suppress_streaming: false,
+            is_subagent: false,
         };
         let agent = Agent::with_config(mock, config);
 
