@@ -1615,7 +1615,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             },
             ToolDefinition {
                 name: "web_search".into(),
-                description: "Search the web for information".into(),
+                description: "Search the web for information. Use for time-sensitive or unknown topics.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1629,7 +1629,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             },
             ToolDefinition {
                 name: "web_fetch".into(),
-                description: "Fetch and analyze content from a URL".into(),
+                description: "Fetch full content of a specific URL and analyze it with a prompt.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1699,7 +1699,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             // Browser content tools (also available in chat mode for tab context)
             ToolDefinition {
                 name: "browser_get_content".into(),
-                description: "Get the current page content as text/HTML".into(),
+                description: "Get full raw HTML of the page. High token cost. Use ONLY when user needs actual HTML/CSS code structure (e.g., 'build a page like this'). For content reading, use browser_get_markdown instead.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1712,8 +1712,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             },
             ToolDefinition {
                 name: "browser_get_markdown".into(),
-                description: "Get the current page content as markdown (better for summarization)"
-                    .into(),
+                description: "Get page content as clean markdown. Low token cost. DEFAULT tool for reading pages. Use for: summarize, translate, analyze, extract info, Q&A. Prefer over browser_get_content unless user needs actual HTML/CSS structure.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1726,7 +1725,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             },
             ToolDefinition {
                 name: "browser_screenshot".into(),
-                description: "Take a screenshot of the current page".into(),
+                description: "Capture the current tab's visible viewport as an image. Use for: visual layout questions, design analysis, canvas/image content, or when get_markdown returns empty. Do NOT use for reading text content.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1752,7 +1751,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // Browser navigation
         tools.push(ToolDefinition {
             name: "browser_navigate".into(),
-            description: "Navigate to a URL in the browser".into(),
+            description: "Navigate to a specific URL. For returning to previous page, prefer browser_go_back. NEVER use navigate to 'go back'.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1772,7 +1771,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // History navigation
         tools.push(ToolDefinition {
             name: "browser_go_back".into(),
-            description: "Go back in browser history. Returns updated page state.".into(),
+            description: "Go back in browser history. Preserves page state and form data. Preferred over navigate for returning to previous page.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1821,7 +1820,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // Click by ID
         tools.push(ToolDefinition {
             name: "browser_click_by_id".into(),
-            description: "Click an element by its ref ID from the page state (e.g., 'e3'). Returns action result + updated page state.".into(),
+            description: "Click an interactive element by its [eN] ID from the page state snapshot. Only use IDs from the MOST RECENT snapshot — they change after every action.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1865,9 +1864,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // Type by ID
         tools.push(ToolDefinition {
             name: "browser_type_by_id".into(),
-            description:
-                "Type text into element by ref ID. Returns action result + updated page state."
-                    .into(),
+            description: "Type text character by character into an element. Use ONLY for autocomplete, search boxes, or real-time validation. For normal form fields, prefer browser_fill_by_id.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1916,8 +1913,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // Fill by ID
         tools.push(ToolDefinition {
             name: "browser_fill_by_id".into(),
-            description: "Fill a form field by ref ID. Returns action result + updated page state."
-                .into(),
+            description: "Set a form field's value by element ID. DEFAULT for form filling. Faster than type_by_id. If fill doesn't trigger expected behavior, fall back to type_by_id.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2011,7 +2007,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // Scroll
         tools.push(ToolDefinition {
             name: "browser_scroll".into(),
-            description: "Scroll page. direction: 'up' or 'down', amount: 'page', 'half', or pixel count. Returns updated page state.".into(),
+            description: "Scroll the page to reveal more content. Use to find elements not in current snapshot. Returns updated page state.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2145,7 +2141,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // Add file tools
         tools.push(ToolDefinition {
             name: "read".into(),
-            description: "Read file contents. Returns partial content with metadata (total_lines, total_bytes). Default: first 200 lines. Use offset/limit to paginate. Prefer this over Bash for file reading.".into(),
+            description: "Read file contents. Returns partial content with metadata (total_lines). Default: first 200 lines. Use offset/limit for pagination. PREFER over bash cat.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2168,7 +2164,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
         tools.push(ToolDefinition {
             name: "write".into(),
-            description: "Write content to a file".into(),
+            description: "Create a new file or overwrite an existing file entirely. WARNING: Overwrites the full file content. Use edit() for partial changes to existing files.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2187,7 +2183,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
         tools.push(ToolDefinition {
             name: "edit".into(),
-            description: "Edit a file using search and replace".into(),
+            description: "Find and replace exact text in a file. PREFER over write() for modifying existing files. Always read() the file first to see current content. Include surrounding context in old_string to ensure a unique match.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2214,7 +2210,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
         tools.push(ToolDefinition {
             name: "bash".into(),
-            description: "Execute a shell command. Returns structured output with exit code and status. Default timeout: 30s. Output capped at 200 lines. Only use when Read/Grep/Glob cannot accomplish the task.".into(),
+            description: "Execute a shell command. Default timeout: 30s. Output capped at 200 lines. Use ONLY when specialized tools (read, grep, glob, edit) cannot accomplish the task.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2233,7 +2229,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
         tools.push(ToolDefinition {
             name: "glob".into(),
-            description: "Find files matching a pattern".into(),
+            description: "Find files by glob pattern (e.g. 'src/**/*.rs'). PREFER over bash find.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2252,7 +2248,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
         tools.push(ToolDefinition {
             name: "grep".into(),
-            description: "Search file contents with regex. Returns structured matches with counts (total_matches, total_files). Default: first 50 results. Supports file type filter. Respects .gitignore. Prefer this over Bash for text search.".into(),
+            description: "Search file contents using regex. Returns structured matches with counts. PREFER over bash grep. Supports file type filter. Respects .gitignore.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2284,9 +2280,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // Dynamic tool discovery
         tools.push(ToolDefinition {
             name: "tool_search".into(),
-            description: "Search for available tools by keyword. Use this when you need \
-                          capabilities not provided by the built-in tools."
-                .into(),
+            description: "Search for available external tools (MCP) by keyword. Always search first — never guess tool names or schemas.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2306,9 +2300,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
         tools.push(ToolDefinition {
             name: "tool_call_dynamic".into(),
-            description: "Call a tool discovered via tool_search. Provide the exact tool name \
-                          and arguments as a JSON string matching the tool's input_schema."
-                .into(),
+            description: "Call a tool discovered via tool_search. Read the returned schema carefully before calling.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2329,9 +2321,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // Subagent tools for parallel work
         tools.push(ToolDefinition {
             name: "subagent_spawn".into(),
-            description: "Spawn a sub-agent to execute a task in parallel. The sub-agent runs \
-                          independently and can be monitored or waited on."
-                .into(),
+            description: "Spawn a lightweight subagent for a focused parallel task. Returns an ID. Subagents have NO page interaction — read-only browser access (with tab_id) and web search. Use for: parallel research, parallel summarization, independent subtasks.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2388,9 +2378,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
         tools.push(ToolDefinition {
             name: "subagent_wait_all".into(),
-            description: "Wait for multiple sub-agents to complete and return all results. \
-                          More efficient than calling subagent_wait for each one."
-                .into(),
+            description: "Wait for multiple subagents to complete. Returns all results at once. PREFERRED over calling subagent_wait multiple times.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
