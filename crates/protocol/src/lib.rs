@@ -37,11 +37,11 @@ pub use error::{ProtocolError, Result};
 
 // Re-export chat messages
 pub use chat::{
-    AccountStatus, AgentMessage, AgentStateMessage, AuthOption, BrowserToolRequest,
-    BrowserToolResponse, ChatMessage, ContentBlock, ErrorMessage, PermissionRequest,
-    PermissionResponse, PlanProposal, PlanResponse, PlanStep, PluginCommand, SidebarMessage,
-    SkillCommand, StopGeneration, StreamChunk, StreamEnd, SystemCommand, SystemResponse, TabInfo,
-    ToolAuthRequest, ToolAuthResponse, ToolEvent,
+    AccountStatus, AgentMessage, AgentStateMessage, Artifact, ArtifactComplete, ArtifactDelta,
+    ArtifactStart, AuthOption, BrowserToolRequest, BrowserToolResponse, ChatMessage, ContentBlock,
+    ErrorMessage, PermissionRequest, PermissionResponse, PlanProposal, PlanResponse, PlanStep,
+    PluginCommand, SidebarMessage, SkillCommand, StopGeneration, StreamChunk, StreamEnd,
+    SystemCommand, SystemResponse, TabInfo, ToolAuthRequest, ToolAuthResponse, ToolEvent,
 };
 
 // Re-export MCP messages

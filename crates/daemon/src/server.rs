@@ -11,8 +11,8 @@ use crate::wasm::{BrowserRequest, BrowserResponse, HostServices};
 use bytes::Bytes;
 use nevoflux_builtin_wasm::{Agent, AgentInput, AgentMode, Attachment, Message as WasmMessage};
 use nevoflux_protocol::{
-    AgentMessage, Channel, DaemonEnvelope, PlanProposal, PlanResponse, ProxyEnvelope,
-    ToolAuthResponse,
+    AgentMessage, Artifact, ArtifactComplete, ArtifactDelta, ArtifactStart, Channel,
+    DaemonEnvelope, PlanProposal, PlanResponse, ProxyEnvelope, ToolAuthResponse,
 };
 use nevoflux_skills::{check_tool_availability, format_missing_tools_message, ToolCheckResult};
 use nevoflux_storage::{ListSessionsParams, Message as StorageMessage, MessageRole};
@@ -895,9 +895,45 @@ async fn handle_chat_message_streaming(
     let forwarder_cancellation = cancellation_token.clone();
 
     // Spawn task to forward stream chunks to the sidebar
+    // Uses 300ms batch throttle: text chunks are buffered and flushed on interval tick,
+    // while tool events and done signals flush immediately.
     let forwarder_handle = tokio::spawn(async move {
         let mut accumulated_text = String::new();
         let mut cancelled = false;
+        let mut buffer = String::new();
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(300));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the immediate first tick
+        interval.tick().await;
+
+        // Helper closure to build and send a chunk payload
+        macro_rules! send_chunk {
+            ($text:expr, $done:expr, $event:expr, $first:expr) => {{
+                let mut chunk_payload = serde_json::json!({
+                    "type": "stream_chunk",
+                    "payload": {
+                        "content": $text,
+                        "done": $done
+                    }
+                });
+                if let Some(event) = $event {
+                    if let Some(p) = chunk_payload.get_mut("payload") {
+                        p["event"] = serde_json::to_value(event).unwrap_or_default();
+                    }
+                }
+                if $first {
+                    if let Some(ref title) = stream_title {
+                        chunk_payload["payload"]["session_title"] =
+                            serde_json::Value::String(title.clone());
+                    }
+                }
+                let response = DaemonEnvelope::new(&stream_proxy_id, stream_channel, chunk_payload)
+                    .with_request_id(&stream_request_id);
+                stream_response_tx
+                    .send((stream_identity.clone(), response))
+                    .await
+            }};
+        }
 
         loop {
             tokio::select! {
@@ -910,55 +946,75 @@ async fn handle_chat_message_streaming(
                     break;
                 }
 
+                // Flush buffer on 300ms tick
+                _ = interval.tick() => {
+                    if !buffer.is_empty() {
+                        let text = std::mem::take(&mut buffer);
+                        let is_first = accumulated_text.is_empty();
+                        accumulated_text.push_str(&text);
+                        if let Err(e) = send_chunk!(text, false, None::<&serde_json::Value>, is_first) {
+                            error!("Failed to send stream chunk: {}", e);
+                            break;
+                        }
+                    }
+                }
+
                 // Receive stream chunks
                 chunk = stream_rx.recv() => {
                     match chunk {
                         Some(chunk) => {
-                            accumulated_text.push_str(&chunk.text);
-
-                            let mut chunk_payload = serde_json::json!({
-                                "type": "stream_chunk",
-                                "payload": {
-                                    "content": chunk.text,
-                                    "done": chunk.done
+                            if chunk.event.is_some() {
+                                // Tool event: flush text buffer first, then send event immediately
+                                if !buffer.is_empty() {
+                                    let text = std::mem::take(&mut buffer);
+                                    let is_first = accumulated_text.is_empty();
+                                    accumulated_text.push_str(&text);
+                                    if let Err(e) = send_chunk!(text, false, None::<&serde_json::Value>, is_first) {
+                                        error!("Failed to send stream chunk: {}", e);
+                                        break;
+                                    }
                                 }
-                            });
-
-                            // Add event if present
-                            if let Some(event) = &chunk.event {
-                                if let Some(p) = chunk_payload.get_mut("payload") {
-                                    p["event"] = serde_json::to_value(event).unwrap_or_default();
+                                // Send event chunk with any accompanying text
+                                let is_first = accumulated_text.is_empty();
+                                accumulated_text.push_str(&chunk.text);
+                                if let Err(e) = send_chunk!(chunk.text, chunk.done, chunk.event.as_ref(), is_first) {
+                                    error!("Failed to send stream chunk: {}", e);
+                                    break;
                                 }
-                            }
-
-                            // Include session title on first chunk if available
-                            if !accumulated_text.is_empty() && accumulated_text == chunk.text {
-                                if let Some(ref title) = stream_title {
-                                    chunk_payload["payload"]["session_title"] =
-                                        serde_json::Value::String(title.clone());
+                                if chunk.done {
+                                    debug!(
+                                        "Stream completed, total accumulated: {} bytes",
+                                        accumulated_text.len()
+                                    );
+                                    break;
                                 }
-                            }
-
-                            let response = DaemonEnvelope::new(&stream_proxy_id, stream_channel, chunk_payload)
-                                .with_request_id(&stream_request_id);
-
-                            if let Err(e) = stream_response_tx
-                                .send((stream_identity.clone(), response))
-                                .await
-                            {
-                                error!("Failed to send stream chunk: {}", e);
-                                break;
-                            }
-
-                            if chunk.done {
+                            } else if chunk.done {
+                                // Done: flush remaining buffer + final text
+                                buffer.push_str(&chunk.text);
+                                let text = std::mem::take(&mut buffer);
+                                let is_first = accumulated_text.is_empty();
+                                accumulated_text.push_str(&text);
+                                if let Err(e) = send_chunk!(text, true, None::<&serde_json::Value>, is_first) {
+                                    error!("Failed to send stream chunk: {}", e);
+                                }
                                 debug!(
                                     "Stream completed, total accumulated: {} bytes",
                                     accumulated_text.len()
                                 );
                                 break;
+                            } else {
+                                // Normal text: just buffer it
+                                buffer.push_str(&chunk.text);
                             }
                         }
                         None => {
+                            // Channel closed, flush remaining
+                            if !buffer.is_empty() {
+                                let text = std::mem::take(&mut buffer);
+                                let is_first = accumulated_text.is_empty();
+                                accumulated_text.push_str(&text);
+                                let _ = send_chunk!(text, false, None::<&serde_json::Value>, is_first);
+                            }
                             debug!("Stream channel closed");
                             break;
                         }
@@ -1103,38 +1159,156 @@ async fn handle_chat_message_streaming(
 
                         let rerun_forwarder = tokio::spawn(async move {
                             let mut rerun_accumulated = String::new();
-                            while let Some(chunk) = rerun_stream_rx.recv().await {
-                                rerun_accumulated.push_str(&chunk.text);
-                                let mut chunk_payload = serde_json::json!({
-                                    "type": "stream_chunk",
-                                    "payload": {
-                                        "content": chunk.text,
-                                        "done": chunk.done
-                                    }
-                                });
+                            let mut buffer = String::new();
+                            let mut interval =
+                                tokio::time::interval(tokio::time::Duration::from_millis(300));
+                            interval
+                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                            interval.tick().await; // skip immediate first tick
 
-                                // Add event if present
-                                if let Some(event) = &chunk.event {
-                                    if let Some(p) = chunk_payload.get_mut("payload") {
-                                        p["event"] =
-                                            serde_json::to_value(event).unwrap_or_default();
+                            loop {
+                                tokio::select! {
+                                    biased;
+
+                                    _ = interval.tick() => {
+                                        if !buffer.is_empty() {
+                                            let text = std::mem::take(&mut buffer);
+                                            rerun_accumulated.push_str(&text);
+                                            let chunk_payload = serde_json::json!({
+                                                "type": "stream_chunk",
+                                                "payload": {
+                                                    "content": text,
+                                                    "done": false
+                                                }
+                                            });
+                                            let response = DaemonEnvelope::new(
+                                                &rerun_proxy_id,
+                                                rerun_channel,
+                                                chunk_payload,
+                                            )
+                                            .with_request_id(&rerun_request_id);
+                                            if let Err(e) = rerun_response_tx
+                                                .send((rerun_identity.clone(), response))
+                                                .await
+                                            {
+                                                error!("Failed to send rerun stream chunk: {}", e);
+                                                break;
+                                            }
+                                        }
                                     }
-                                }
-                                let response = DaemonEnvelope::new(
-                                    &rerun_proxy_id,
-                                    rerun_channel,
-                                    chunk_payload,
-                                )
-                                .with_request_id(&rerun_request_id);
-                                if let Err(e) = rerun_response_tx
-                                    .send((rerun_identity.clone(), response))
-                                    .await
-                                {
-                                    error!("Failed to send rerun stream chunk: {}", e);
-                                    break;
-                                }
-                                if chunk.done {
-                                    break;
+
+                                    chunk = rerun_stream_rx.recv() => {
+                                        match chunk {
+                                            Some(chunk) => {
+                                                if chunk.event.is_some() {
+                                                    // Flush buffer, then send event immediately
+                                                    if !buffer.is_empty() {
+                                                        let text = std::mem::take(&mut buffer);
+                                                        rerun_accumulated.push_str(&text);
+                                                        let flush_payload = serde_json::json!({
+                                                            "type": "stream_chunk",
+                                                            "payload": {
+                                                                "content": text,
+                                                                "done": false
+                                                            }
+                                                        });
+                                                        let response = DaemonEnvelope::new(
+                                                            &rerun_proxy_id,
+                                                            rerun_channel,
+                                                            flush_payload,
+                                                        )
+                                                        .with_request_id(&rerun_request_id);
+                                                        if let Err(e) = rerun_response_tx
+                                                            .send((rerun_identity.clone(), response))
+                                                            .await
+                                                        {
+                                                            error!("Failed to send rerun stream chunk: {}", e);
+                                                            break;
+                                                        }
+                                                    }
+                                                    rerun_accumulated.push_str(&chunk.text);
+                                                    let mut chunk_payload = serde_json::json!({
+                                                        "type": "stream_chunk",
+                                                        "payload": {
+                                                            "content": chunk.text,
+                                                            "done": chunk.done
+                                                        }
+                                                    });
+                                                    if let Some(event) = &chunk.event {
+                                                        if let Some(p) = chunk_payload.get_mut("payload") {
+                                                            p["event"] =
+                                                                serde_json::to_value(event).unwrap_or_default();
+                                                        }
+                                                    }
+                                                    let response = DaemonEnvelope::new(
+                                                        &rerun_proxy_id,
+                                                        rerun_channel,
+                                                        chunk_payload,
+                                                    )
+                                                    .with_request_id(&rerun_request_id);
+                                                    if let Err(e) = rerun_response_tx
+                                                        .send((rerun_identity.clone(), response))
+                                                        .await
+                                                    {
+                                                        error!("Failed to send rerun stream chunk: {}", e);
+                                                        break;
+                                                    }
+                                                    if chunk.done {
+                                                        break;
+                                                    }
+                                                } else if chunk.done {
+                                                    buffer.push_str(&chunk.text);
+                                                    let text = std::mem::take(&mut buffer);
+                                                    rerun_accumulated.push_str(&text);
+                                                    let chunk_payload = serde_json::json!({
+                                                        "type": "stream_chunk",
+                                                        "payload": {
+                                                            "content": text,
+                                                            "done": true
+                                                        }
+                                                    });
+                                                    let response = DaemonEnvelope::new(
+                                                        &rerun_proxy_id,
+                                                        rerun_channel,
+                                                        chunk_payload,
+                                                    )
+                                                    .with_request_id(&rerun_request_id);
+                                                    if let Err(e) = rerun_response_tx
+                                                        .send((rerun_identity.clone(), response))
+                                                        .await
+                                                    {
+                                                        error!("Failed to send rerun stream chunk: {}", e);
+                                                    }
+                                                    break;
+                                                } else {
+                                                    buffer.push_str(&chunk.text);
+                                                }
+                                            }
+                                            None => {
+                                                if !buffer.is_empty() {
+                                                    let text = std::mem::take(&mut buffer);
+                                                    rerun_accumulated.push_str(&text);
+                                                    let chunk_payload = serde_json::json!({
+                                                        "type": "stream_chunk",
+                                                        "payload": {
+                                                            "content": text,
+                                                            "done": false
+                                                        }
+                                                    });
+                                                    let response = DaemonEnvelope::new(
+                                                        &rerun_proxy_id,
+                                                        rerun_channel,
+                                                        chunk_payload,
+                                                    )
+                                                    .with_request_id(&rerun_request_id);
+                                                    let _ = rerun_response_tx
+                                                        .send((rerun_identity.clone(), response))
+                                                        .await;
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             rerun_accumulated
@@ -1263,6 +1437,23 @@ async fn handle_chat_message_streaming(
                 return;
             }
 
+            // Handle artifact if present (fire-and-forget, no user response needed)
+            if let Some(artifact) = &output.artifact {
+                info!(
+                    "Agent created artifact '{}' for session {}",
+                    artifact.title, session_id
+                );
+                send_artifact_stream(
+                    artifact,
+                    &proxy_id,
+                    channel,
+                    &request_id,
+                    &identity,
+                    &response_tx,
+                )
+                .await;
+            }
+
             // Save assistant response to database
             let final_text = if output.text.is_empty() {
                 accumulated_text
@@ -1353,6 +1544,70 @@ async fn handle_chat_message_streaming(
                 error!("Failed to send error response: {}", e);
             }
         }
+    }
+}
+
+/// Stream an artifact to the sidebar as start/delta/complete messages.
+///
+/// Splits `artifact.content` into ~4 KB chunks (respecting UTF-8 char boundaries)
+/// and sends them as `ArtifactDelta` messages bracketed by `ArtifactStart` and
+/// `ArtifactComplete`.
+async fn send_artifact_stream(
+    artifact: &Artifact,
+    proxy_id: &str,
+    channel: Channel,
+    request_id: &str,
+    identity: &[u8],
+    response_tx: &mpsc::Sender<(Vec<u8>, DaemonEnvelope)>,
+) {
+    const CHUNK_SIZE: usize = 4096;
+
+    // 1. Send artifact_start
+    let start_msg = AgentMessage::ArtifactStart(ArtifactStart {
+        id: artifact.id.clone(),
+        title: artifact.title.clone(),
+        content_type: artifact.content_type.clone(),
+    });
+    let payload = serde_json::to_value(&start_msg).unwrap();
+    let envelope = DaemonEnvelope::new(proxy_id, channel, payload).with_request_id(request_id);
+    if let Err(e) = response_tx.send((identity.to_vec(), envelope)).await {
+        error!("Failed to send artifact_start: {}", e);
+        return;
+    }
+
+    // 2. Send artifact_delta chunks
+    let content = &artifact.content;
+    let bytes = content.as_bytes();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let mut end = (offset + CHUNK_SIZE).min(bytes.len());
+        // Ensure we don't split a multi-byte UTF-8 character
+        while end < bytes.len() && !content.is_char_boundary(end) {
+            end += 1;
+        }
+        let chunk = &content[offset..end];
+
+        let delta_msg = AgentMessage::ArtifactDelta(ArtifactDelta {
+            id: artifact.id.clone(),
+            delta: chunk.to_string(),
+        });
+        let payload = serde_json::to_value(&delta_msg).unwrap();
+        let envelope = DaemonEnvelope::new(proxy_id, channel, payload).with_request_id(request_id);
+        if let Err(e) = response_tx.send((identity.to_vec(), envelope)).await {
+            error!("Failed to send artifact_delta: {}", e);
+            return;
+        }
+        offset = end;
+    }
+
+    // 3. Send artifact_complete
+    let complete_msg = AgentMessage::ArtifactComplete(ArtifactComplete {
+        id: artifact.id.clone(),
+    });
+    let payload = serde_json::to_value(&complete_msg).unwrap();
+    let envelope = DaemonEnvelope::new(proxy_id, channel, payload).with_request_id(request_id);
+    if let Err(e) = response_tx.send((identity.to_vec(), envelope)).await {
+        error!("Failed to send artifact_complete: {}", e);
     }
 }
 
@@ -1863,7 +2118,10 @@ async fn handle_chat_message(
                             }
                         })
                     } else {
-                        let value = params.get("value").cloned().unwrap_or(serde_json::Value::Null);
+                        let value = params
+                            .get("value")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
                         match session_manager.set_config(key, value) {
                             Ok(()) => serde_json::json!({
                                 "type": "system_response",
@@ -1942,11 +2200,13 @@ async fn handle_chat_message(
                             let count = entries.len();
                             let entries_json: Vec<serde_json::Value> = entries
                                 .into_iter()
-                                .map(|e| serde_json::json!({
-                                    "key": e.key,
-                                    "value": e.value,
-                                    "updated_at": e.updated_at
-                                }))
+                                .map(|e| {
+                                    serde_json::json!({
+                                        "key": e.key,
+                                        "value": e.value,
+                                        "updated_at": e.updated_at
+                                    })
+                                })
                                 .collect();
                             serde_json::json!({
                                 "type": "system_response",

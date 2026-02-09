@@ -296,6 +296,54 @@ pub enum PlanResponse {
 }
 
 // ============================================================================
+// Artifact Types
+// ============================================================================
+
+/// An artifact created by the agent (HTML, code, document, etc.)
+///
+/// This is the internal representation used throughout the WASM agent pipeline.
+/// For the wire protocol (server → sidebar), artifacts are streamed using
+/// [`ArtifactStart`], [`ArtifactDelta`], and [`ArtifactComplete`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Artifact {
+    /// Unique artifact ID (UUID).
+    pub id: String,
+    /// Human-readable title.
+    pub title: String,
+    /// MIME type (e.g., "text/html", "text/markdown", "application/json").
+    pub content_type: String,
+    /// The full artifact content.
+    pub content: String,
+}
+
+/// Sent when an artifact begins streaming.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactStart {
+    /// Unique artifact ID.
+    pub id: String,
+    /// Human-readable title.
+    pub title: String,
+    /// MIME type (e.g., "text/html").
+    pub content_type: String,
+}
+
+/// A chunk of artifact content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactDelta {
+    /// Artifact ID (matches the ArtifactStart).
+    pub id: String,
+    /// Content chunk.
+    pub delta: String,
+}
+
+/// Sent when artifact streaming is complete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactComplete {
+    /// Artifact ID.
+    pub id: String,
+}
+
+// ============================================================================
 // Tool Event Types
 // ============================================================================
 
@@ -391,6 +439,9 @@ pub enum AgentMessage {
     SystemResponse(SystemResponse),
     BrowserToolRequest(BrowserToolRequest),
     PlanProposal(PlanProposal),
+    ArtifactStart(ArtifactStart),
+    ArtifactDelta(ArtifactDelta),
+    ArtifactComplete(ArtifactComplete),
 }
 
 #[cfg(test)]
@@ -933,5 +984,84 @@ mod tests {
 
         let decoded: SidebarMessage = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, SidebarMessage::ToolAuthResponse(_)));
+    }
+
+    // ====================================================================
+    // Artifact tests
+    // ====================================================================
+
+    #[test]
+    fn test_artifact_serialization_roundtrip() {
+        let artifact = Artifact {
+            id: "art-001".into(),
+            title: "My Dashboard".into(),
+            content_type: "text/html".into(),
+            content: "<html><body><h1>Hello</h1></body></html>".into(),
+        };
+
+        let json = serde_json::to_string(&artifact).unwrap();
+        assert!(json.contains("\"id\":\"art-001\""));
+        assert!(json.contains("\"content_type\":\"text/html\""));
+
+        let decoded: Artifact = serde_json::from_str(&json).unwrap();
+        assert_eq!(artifact, decoded);
+    }
+
+    #[test]
+    fn test_agent_message_artifact_start_tagged() {
+        let msg = AgentMessage::ArtifactStart(ArtifactStart {
+            id: "art-002".into(),
+            title: "Report".into(),
+            content_type: "text/markdown".into(),
+        });
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"artifact_start\""));
+        assert!(json.contains("\"payload\""));
+        assert!(json.contains("\"title\":\"Report\""));
+
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, AgentMessage::ArtifactStart(_)));
+        if let AgentMessage::ArtifactStart(a) = decoded {
+            assert_eq!(a.id, "art-002");
+            assert_eq!(a.content_type, "text/markdown");
+        }
+    }
+
+    #[test]
+    fn test_agent_message_artifact_delta_tagged() {
+        let msg = AgentMessage::ArtifactDelta(ArtifactDelta {
+            id: "art-002".into(),
+            delta: "<h1>Hello</h1>".into(),
+        });
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"artifact_delta\""));
+        assert!(json.contains("\"payload\""));
+        assert!(json.contains("\"delta\":\"<h1>Hello</h1>\""));
+
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, AgentMessage::ArtifactDelta(_)));
+        if let AgentMessage::ArtifactDelta(d) = decoded {
+            assert_eq!(d.id, "art-002");
+            assert_eq!(d.delta, "<h1>Hello</h1>");
+        }
+    }
+
+    #[test]
+    fn test_agent_message_artifact_complete_tagged() {
+        let msg = AgentMessage::ArtifactComplete(ArtifactComplete {
+            id: "art-002".into(),
+        });
+
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"artifact_complete\""));
+        assert!(json.contains("\"payload\""));
+
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, AgentMessage::ArtifactComplete(_)));
+        if let AgentMessage::ArtifactComplete(c) = decoded {
+            assert_eq!(c.id, "art-002");
+        }
     }
 }
