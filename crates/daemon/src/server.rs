@@ -1846,6 +1846,135 @@ async fn handle_chat_message(
                 "mcp.disconnect" => handle_mcp_disconnect(&params).await,
                 "file.pick" => handle_file_pick(&params).await,
                 "skill.list" => handle_skill_list(services, &params).await,
+                // ContentStore persistence commands
+                "content_store.set" => {
+                    let key = params.get("key").and_then(|k| k.as_str()).unwrap_or("");
+                    if key.is_empty() {
+                        serde_json::json!({
+                            "type": "system_response",
+                            "payload": {
+                                "request_id": request_id,
+                                "command": "content_store.set",
+                                "success": false,
+                                "error": {
+                                    "code": "MISSING_PARAM",
+                                    "message": "Missing key parameter"
+                                }
+                            }
+                        })
+                    } else {
+                        let value = params.get("value").cloned().unwrap_or(serde_json::Value::Null);
+                        match session_manager.set_config(key, value) {
+                            Ok(()) => serde_json::json!({
+                                "type": "system_response",
+                                "payload": {
+                                    "request_id": request_id,
+                                    "command": "content_store.set",
+                                    "success": true,
+                                    "data": { "key": key }
+                                }
+                            }),
+                            Err(e) => serde_json::json!({
+                                "type": "system_response",
+                                "payload": {
+                                    "request_id": request_id,
+                                    "command": "content_store.set",
+                                    "success": false,
+                                    "error": {
+                                        "code": "STORAGE_ERROR",
+                                        "message": format!("{}", e)
+                                    }
+                                }
+                            }),
+                        }
+                    }
+                }
+                "content_store.delete" => {
+                    let key = params.get("key").and_then(|k| k.as_str()).unwrap_or("");
+                    if key.is_empty() {
+                        serde_json::json!({
+                            "type": "system_response",
+                            "payload": {
+                                "request_id": request_id,
+                                "command": "content_store.delete",
+                                "success": false,
+                                "error": {
+                                    "code": "MISSING_PARAM",
+                                    "message": "Missing key parameter"
+                                }
+                            }
+                        })
+                    } else {
+                        match session_manager.delete_config(key) {
+                            Ok(deleted) => serde_json::json!({
+                                "type": "system_response",
+                                "payload": {
+                                    "request_id": request_id,
+                                    "command": "content_store.delete",
+                                    "success": true,
+                                    "data": { "key": key, "deleted": deleted }
+                                }
+                            }),
+                            Err(e) => serde_json::json!({
+                                "type": "system_response",
+                                "payload": {
+                                    "request_id": request_id,
+                                    "command": "content_store.delete",
+                                    "success": false,
+                                    "error": {
+                                        "code": "STORAGE_ERROR",
+                                        "message": format!("{}", e)
+                                    }
+                                }
+                            }),
+                        }
+                    }
+                }
+                "content_store.load" => {
+                    let prefix = params.get("prefix").and_then(|p| p.as_str()).unwrap_or("");
+                    let result = if prefix.is_empty() {
+                        session_manager.list_config()
+                    } else {
+                        session_manager.list_config_by_prefix(prefix)
+                    };
+                    match result {
+                        Ok(entries) => {
+                            let count = entries.len();
+                            let entries_json: Vec<serde_json::Value> = entries
+                                .into_iter()
+                                .map(|e| serde_json::json!({
+                                    "key": e.key,
+                                    "value": e.value,
+                                    "updated_at": e.updated_at
+                                }))
+                                .collect();
+                            serde_json::json!({
+                                "type": "system_response",
+                                "payload": {
+                                    "request_id": request_id,
+                                    "command": "content_store.load",
+                                    "success": true,
+                                    "data": {
+                                        "entries": entries_json,
+                                        "count": count
+                                    }
+                                }
+                            })
+                        }
+                        Err(e) => serde_json::json!({
+                            "type": "system_response",
+                            "payload": {
+                                "request_id": request_id,
+                                "command": "content_store.load",
+                                "success": false,
+                                "error": {
+                                    "code": "STORAGE_ERROR",
+                                    "message": format!("{}", e)
+                                }
+                            }
+                        }),
+                    }
+                }
                 _ => {
                     serde_json::json!({
                         "type": "system_response",

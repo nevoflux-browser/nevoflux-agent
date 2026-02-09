@@ -3,8 +3,8 @@
 use crate::config::SessionConfig;
 use crate::error::{DaemonError, Result};
 use nevoflux_storage::{
-    ContentType, CreateMessageParams, CreateSessionParams, ListMessagesParams, ListSessionsParams,
-    Message, MessageRole, Session, SessionMode, Storage, UpdateSessionParams,
+    ConfigEntry, ContentType, CreateMessageParams, CreateSessionParams, ListMessagesParams,
+    ListSessionsParams, Message, MessageRole, Session, SessionMode, Storage, UpdateSessionParams,
 };
 use std::sync::Arc;
 
@@ -278,6 +278,28 @@ impl SessionManager {
     /// Get session count.
     pub async fn get_session_count(&self, include_archived: bool) -> Result<u32> {
         Ok(self.storage.sessions().count(include_archived)?)
+    }
+
+    // ========== Config (ContentStore persistence) ==========
+
+    /// Set a config entry (upsert).
+    pub fn set_config(&self, key: &str, value: serde_json::Value) -> Result<()> {
+        Ok(self.storage.config().set(key, value)?)
+    }
+
+    /// Delete a config entry by key.
+    pub fn delete_config(&self, key: &str) -> Result<bool> {
+        Ok(self.storage.config().delete(key)?)
+    }
+
+    /// List all config entries.
+    pub fn list_config(&self) -> Result<Vec<ConfigEntry>> {
+        Ok(self.storage.config().list()?)
+    }
+
+    /// List config entries matching a key prefix.
+    pub fn list_config_by_prefix(&self, prefix: &str) -> Result<Vec<ConfigEntry>> {
+        Ok(self.storage.config().list_by_prefix(prefix)?)
     }
 }
 
