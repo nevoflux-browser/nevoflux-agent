@@ -4,7 +4,7 @@
 //! the host (daemon) and guest (Wasm agent). It includes constants for function
 //! names, data structures for input/output, and result codes.
 
-use nevoflux_protocol::PlanProposal;
+use nevoflux_protocol::{Artifact, PlanProposal};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -139,6 +139,9 @@ pub struct AgentProcessOutput {
     /// Optional plan proposal for multi-step tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_proposal: Option<PlanProposal>,
+    /// Optional artifact created by the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<Artifact>,
 }
 
 /// A pending tool call requested by the agent.
@@ -270,6 +273,7 @@ mod tests {
             }],
             complete: false,
             plan_proposal: None,
+            artifact: None,
         };
 
         let json = serde_json::to_string(&output).unwrap();
@@ -370,6 +374,7 @@ mod tests {
             tool_calls: vec![],
             complete: false,
             plan_proposal: Some(proposal.clone()),
+            artifact: None,
         };
 
         // Verify serialization roundtrip
@@ -404,6 +409,7 @@ mod tests {
             tool_calls: vec![],
             complete: true,
             plan_proposal: None,
+            artifact: None,
         };
 
         let json = serde_json::to_string(&output).unwrap();

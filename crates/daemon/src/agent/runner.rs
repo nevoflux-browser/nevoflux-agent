@@ -17,7 +17,7 @@ use crate::error::{DaemonError, Result};
 use crate::trace::collector::TraceCollector;
 use crate::trace::detection::{DetectionContext, PatternEngine};
 use crate::wasm::{HostServices, WasmInstance, WasmRuntime};
-use nevoflux_protocol::{ChatMessage, PlanProposal, StreamFormat, StreamMetadata};
+use nevoflux_protocol::{Artifact, ChatMessage, PlanProposal, StreamFormat, StreamMetadata};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
@@ -80,6 +80,8 @@ pub struct AgentOutput {
     pub iterations: u32,
     /// Plan proposal awaiting user confirmation.
     pub plan_proposal: Option<PlanProposal>,
+    /// Artifact created by the agent.
+    pub artifact: Option<Artifact>,
 }
 
 /// A tool call made by the agent.
@@ -211,6 +213,7 @@ impl AgentRunner {
                     tool_calls: all_tool_calls,
                     iterations: iteration,
                     plan_proposal: None,
+                    artifact: None,
                 });
             }
 
@@ -247,6 +250,19 @@ impl AgentRunner {
                     tool_calls: all_tool_calls,
                     iterations: iteration + 1,
                     plan_proposal: output.plan_proposal,
+                    artifact: None,
+                });
+            }
+
+            // Check for artifact - pause and return to caller
+            if output.artifact.is_some() {
+                return Ok(AgentOutput {
+                    text: accumulated_text,
+                    continue_loop: false,
+                    tool_calls: all_tool_calls,
+                    iterations: iteration + 1,
+                    plan_proposal: None,
+                    artifact: output.artifact,
                 });
             }
 
@@ -273,6 +289,7 @@ impl AgentRunner {
                     tool_calls: all_tool_calls,
                     iterations: iteration + 1,
                     plan_proposal: None,
+                    artifact: None,
                 });
             }
 
@@ -363,6 +380,7 @@ impl AgentRunner {
                     tool_calls: vec![],
                     complete: true,
                     plan_proposal: None,
+                    artifact: None,
                 })
             }
             AgentContent::ToolResults { results } => {
@@ -385,6 +403,7 @@ impl AgentRunner {
                     tool_calls: vec![],
                     complete: true,
                     plan_proposal: None,
+                    artifact: None,
                 })
             }
         }
@@ -475,6 +494,7 @@ impl AgentRunner {
                     tool_calls: all_tool_calls,
                     iterations: iteration,
                     plan_proposal: None,
+                    artifact: None,
                 });
             }
 
@@ -523,6 +543,26 @@ impl AgentRunner {
                     tool_calls: all_tool_calls,
                     iterations: iteration + 1,
                     plan_proposal: output.plan_proposal,
+                    artifact: None,
+                });
+            }
+
+            // Check for artifact - pause, end stream, return
+            if output.artifact.is_some() {
+                let metadata = StreamMetadata {
+                    total_tokens: None,
+                    duration_ms: Some(start_time.elapsed().as_millis() as u64),
+                    model: None,
+                };
+                let _ = stream_handle.end(Some(metadata)).await;
+
+                return Ok(AgentOutput {
+                    text: accumulated_text,
+                    continue_loop: false,
+                    tool_calls: all_tool_calls,
+                    iterations: iteration + 1,
+                    plan_proposal: None,
+                    artifact: output.artifact,
                 });
             }
 
@@ -557,6 +597,7 @@ impl AgentRunner {
                     tool_calls: all_tool_calls,
                     iterations: iteration + 1,
                     plan_proposal: None,
+                    artifact: None,
                 });
             }
 
@@ -809,6 +850,7 @@ mod tests {
             }],
             iterations: 3,
             plan_proposal: None,
+            artifact: None,
         };
 
         assert_eq!(output.text, "Response text");
@@ -981,6 +1023,7 @@ mod tests {
                     },
                 ],
             }),
+            artifact: None,
         };
 
         // Verify serialization roundtrip

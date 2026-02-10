@@ -2,7 +2,7 @@
 //!
 //! These types are serialized via MessagePack for efficient transfer.
 
-use nevoflux_protocol::{LocalFileRef, PlanProposal};
+use nevoflux_protocol::{Artifact, LocalFileRef, PlanProposal};
 use serde::{Deserialize, Serialize};
 
 /// Information about a browser tab.
@@ -297,6 +297,12 @@ pub struct AgentOutput {
     /// so the runner can pause execution and wait for user confirmation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_proposal: Option<PlanProposal>,
+    /// Optional artifact created by the agent.
+    ///
+    /// When the agent calls the `create_artifact` tool, the artifact is returned here
+    /// so the runner can send it to the sidebar for rendering in a canvas tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<Artifact>,
 }
 
 /// Skill summary (from skill_list).
@@ -636,6 +642,7 @@ mod tests {
             tool_calls: vec![],
             continue_loop: false,
             plan_proposal: None,
+            artifact: None,
         };
         assert!(!output.continue_loop);
     }

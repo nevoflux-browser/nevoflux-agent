@@ -8,7 +8,7 @@
 
 use crate::host::{HostFunctions, HostResult};
 use crate::types::*;
-use nevoflux_protocol::{LocalFileRef, PlanProposal, PlanStep};
+use nevoflux_protocol::{Artifact, LocalFileRef, PlanProposal, PlanStep};
 use std::cell::RefCell;
 
 /// Format local file references for injection into user message.
@@ -449,6 +449,8 @@ pub struct Agent<H: HostFunctions> {
     screenshot_cache: RefCell<Option<String>>,
     /// Pending plan proposal from the plan tool (consumed by run_loop to break out).
     pending_plan: RefCell<Option<PlanProposal>>,
+    /// Pending artifact from the create_artifact tool (consumed by run_loop to break out).
+    pending_artifact: RefCell<Option<Artifact>>,
 }
 
 // Static base prompts, compiled into the binary
@@ -467,6 +469,7 @@ impl<H: HostFunctions> Agent<H> {
             elements_cache: RefCell::new(None),
             screenshot_cache: RefCell::new(None),
             pending_plan: RefCell::new(None),
+            pending_artifact: RefCell::new(None),
         }
     }
 
@@ -478,6 +481,7 @@ impl<H: HostFunctions> Agent<H> {
             elements_cache: RefCell::new(None),
             screenshot_cache: RefCell::new(None),
             pending_plan: RefCell::new(None),
+            pending_artifact: RefCell::new(None),
         }
     }
 
@@ -931,6 +935,22 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     tool_calls: all_tool_calls,
                     continue_loop: false,
                     plan_proposal: Some(proposal),
+                    artifact: None,
+                });
+            }
+
+            // Check if an artifact was created — break out and return to runner
+            if let Some(artifact) = self.pending_artifact.borrow_mut().take() {
+                if self.config.use_streaming && !self.config.suppress_streaming {
+                    let _ = self.host.stream_end();
+                }
+
+                return Ok(AgentOutput {
+                    text: final_text,
+                    tool_calls: all_tool_calls,
+                    continue_loop: false,
+                    plan_proposal: None,
+                    artifact: Some(artifact),
                 });
             }
         }
@@ -945,6 +965,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             tool_calls: all_tool_calls,
             continue_loop: false,
             plan_proposal: None,
+            artifact: None,
         })
     }
 
@@ -971,6 +992,10 @@ The following skill instructions MUST be followed exactly. These instructions ta
         let mut tool_calls_map: std::collections::HashMap<String, ToolCall> =
             std::collections::HashMap::new();
 
+        // Buffering state for text-based <tool_call> XML that may span multiple chunks
+        let mut tool_call_buf = String::new();
+        let mut in_tool_call = false;
+
         // Read chunks until done
         loop {
             // Check for interrupt
@@ -981,13 +1006,52 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
             match self.host.llm_stream_next(stream_id)? {
                 Some(chunk) => {
-                    // Accumulate text
+                    // Accumulate text, detecting <tool_call> XML that some providers
+                    // emit as plain text instead of structured tool_use blocks
                     if let Some(ref text) = chunk.text {
                         if !text.is_empty() {
-                            accumulated_text.push_str(text);
-
-                            // Emit to sidebar
-                            self.host.stream_emit(text)?;
+                            if in_tool_call {
+                                // Continue buffering a multi-chunk tool call
+                                tool_call_buf.push_str(text);
+                                if text.contains("</tool_call>") {
+                                    in_tool_call = false;
+                                    let complete = std::mem::take(&mut tool_call_buf);
+                                    let (clean, extracted) = parse_tool_calls_from_text(&complete);
+                                    for tc in extracted {
+                                        tool_calls_map.insert(tc.id.clone(), tc);
+                                    }
+                                    if !clean.is_empty() {
+                                        accumulated_text.push_str(&clean);
+                                        self.host.stream_emit(&clean)?;
+                                    }
+                                }
+                            } else if text.contains("<tool_call>") {
+                                if text.contains("</tool_call>") {
+                                    // Complete tool call in a single chunk
+                                    let (clean, extracted) = parse_tool_calls_from_text(text);
+                                    for tc in extracted {
+                                        tool_calls_map.insert(tc.id.clone(), tc);
+                                    }
+                                    if !clean.is_empty() {
+                                        accumulated_text.push_str(&clean);
+                                        self.host.stream_emit(&clean)?;
+                                    }
+                                } else {
+                                    // Starts here, doesn't end — buffer
+                                    let idx = text.find("<tool_call>").unwrap();
+                                    let before = &text[..idx];
+                                    if !before.trim().is_empty() {
+                                        accumulated_text.push_str(before);
+                                        self.host.stream_emit(before)?;
+                                    }
+                                    tool_call_buf = text[idx..].to_string();
+                                    in_tool_call = true;
+                                }
+                            } else {
+                                // Normal text — no tool call markers
+                                accumulated_text.push_str(text);
+                                self.host.stream_emit(text)?;
+                            }
                         }
                     }
 
@@ -1009,6 +1073,12 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     }
 
                     if chunk.done {
+                        // Flush incomplete tool call buffer as plain text
+                        if in_tool_call {
+                            let buf = std::mem::take(&mut tool_call_buf);
+                            accumulated_text.push_str(&buf);
+                            self.host.stream_emit(&buf)?;
+                        }
                         break;
                     }
                 }
@@ -1057,6 +1127,31 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 *self.pending_plan.borrow_mut() = Some(PlanProposal { summary, steps });
 
                 "Plan submitted for user review.".to_string()
+            }
+            "create_artifact" => {
+                let title = tool_call.arguments["title"]
+                    .as_str()
+                    .unwrap_or("Untitled")
+                    .to_string();
+                let content_type = tool_call.arguments["content_type"]
+                    .as_str()
+                    .unwrap_or("text/html")
+                    .to_string();
+                let content = tool_call.arguments["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                // Derive artifact ID from the tool call ID for uniqueness
+                let id = format!("art-{}", tool_call.id);
+
+                *self.pending_artifact.borrow_mut() = Some(Artifact {
+                    id: id.clone(),
+                    title,
+                    content_type,
+                    content,
+                });
+
+                format!("Artifact created and sent to canvas: {}", id)
             }
             "switch_model" => {
                 let provider = tool_call.arguments["provider"]
@@ -1592,6 +1687,29 @@ The following skill instructions MUST be followed exactly. These instructions ta
                         }
                     },
                     "required": ["summary", "steps"]
+                }),
+            },
+            ToolDefinition {
+                name: "create_artifact".into(),
+                description: "Create a rich artifact (HTML page, code, document) that opens in the browser canvas. Use this instead of write() when generating web pages, interactive demos, visualizations, or documents the user wants to preview. The artifact opens in a dedicated canvas tab.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Human-readable title for the artifact"
+                        },
+                        "content_type": {
+                            "type": "string",
+                            "enum": ["text/html", "text/markdown", "text/plain", "application/json", "text/css", "text/javascript"],
+                            "description": "MIME type of the content"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The full artifact content (HTML, Markdown, code, etc.)"
+                        }
+                    },
+                    "required": ["title", "content"]
                 }),
             },
             ToolDefinition {
@@ -2420,6 +2538,72 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
         tools
     }
+}
+
+/// Parse `<tool_call>...</tool_call>` XML from text into `ToolCall` structs.
+///
+/// Returns `(cleaned_text_without_markers, extracted_tool_calls)`.
+/// Text-based tool calls are emitted by some LLM providers as plain text instead
+/// of structured `tool_use` blocks.
+fn parse_tool_calls_from_text(text: &str) -> (String, Vec<ToolCall>) {
+    let mut tool_calls = Vec::new();
+    let mut cleaned = String::new();
+    let mut remaining = text;
+
+    loop {
+        let Some(start_idx) = remaining.find("<tool_call>") else {
+            cleaned.push_str(remaining);
+            break;
+        };
+
+        // Add text before the marker
+        cleaned.push_str(&remaining[..start_idx]);
+
+        let after_start = &remaining[start_idx + "<tool_call>".len()..];
+
+        let Some(end_idx) = after_start.find("</tool_call>") else {
+            // No closing tag — keep the raw text as-is
+            cleaned.push_str(&remaining[start_idx..]);
+            break;
+        };
+
+        let json_str = after_start[..end_idx].trim();
+
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+            let id = parsed
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = parsed
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let arguments = parsed
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            tool_calls.push(ToolCall {
+                id,
+                name,
+                arguments,
+                call_id: None,
+                signature: None,
+            });
+        } else {
+            // Malformed JSON — keep the raw text
+            cleaned.push_str(
+                &remaining
+                    [start_idx..start_idx + "<tool_call>".len() + end_idx + "</tool_call>".len()],
+            );
+        }
+
+        remaining = &after_start[end_idx + "</tool_call>".len()..];
+    }
+
+    let cleaned = cleaned.trim().to_string();
+    (cleaned, tool_calls)
 }
 
 /// Format skill summaries for system prompt injection.

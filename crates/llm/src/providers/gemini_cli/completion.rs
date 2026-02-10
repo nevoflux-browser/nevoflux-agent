@@ -232,9 +232,7 @@ fn emit_text_and_tool_calls(
 /// ```json
 /// { "response": "...", "stats": { "models": { "<model>": { "tokens": { "input": N, "candidates": N, "total": N } } } } }
 /// ```
-fn parse_gemini_json_response(
-    stdout: &str,
-) -> Result<(String, GeminiCliUsage), CompletionError> {
+fn parse_gemini_json_response(stdout: &str) -> Result<(String, GeminiCliUsage), CompletionError> {
     // Find the JSON object in stdout — it starts at the first '{' and ends at the last '}'
     let start = stdout.find('{').ok_or_else(|| {
         CompletionError::ProviderError("No JSON found in Gemini CLI output".into())
@@ -265,10 +263,7 @@ fn parse_gemini_json_response(
         // Take the first model's token stats
         if let Some(model_stats) = models.values().next() {
             if let Some(tokens) = model_stats.get("tokens").and_then(|t| t.as_object()) {
-                input_tokens = tokens
-                    .get("input")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                input_tokens = tokens.get("input").and_then(|v| v.as_u64()).unwrap_or(0);
                 output_tokens = tokens
                     .get("candidates")
                     .and_then(|v| v.as_u64())
@@ -341,7 +336,10 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
         // Parse the JSON response from stdout (skip non-JSON preamble lines)
         let (content, usage) = parse_gemini_json_response(&stdout)?;
 
-        let response = GeminiCliCompletionResponse { content: content.clone(), usage: usage.clone() };
+        let response = GeminiCliCompletionResponse {
+            content: content.clone(),
+            usage: usage.clone(),
+        };
 
         // Check for text-injected tool calls
         let (cleaned_text, tool_calls) = extract_tool_calls_from_text(&content);
@@ -445,8 +443,7 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
                                 if role != Some("assistant") {
                                     continue;
                                 }
-                                let Some(content) =
-                                    entry.get("content").and_then(|c| c.as_str())
+                                let Some(content) = entry.get("content").and_then(|c| c.as_str())
                                 else {
                                     continue;
                                 };
@@ -462,10 +459,7 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
                                         let complete = std::mem::take(&mut buffer);
                                         let items: StreamItems =
                                             emit_text_and_tool_calls(&complete);
-                                        return Some((
-                                            items,
-                                            (lines, buffer, in_tool_call),
-                                        ));
+                                        return Some((items, (lines, buffer, in_tool_call)));
                                     }
                                     continue;
                                 }
@@ -480,10 +474,7 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
                                     if !before.trim().is_empty() {
                                         let items: StreamItems =
                                             vec![Ok(RawStreamingChoice::Message(before))];
-                                        return Some((
-                                            items,
-                                            (lines, buffer, in_tool_call),
-                                        ));
+                                        return Some((items, (lines, buffer, in_tool_call)));
                                     }
                                     continue;
                                 }
@@ -508,8 +499,7 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
                             // Stream ended — flush any remaining buffer
                             if !buffer.is_empty() {
                                 let remaining = std::mem::take(&mut buffer);
-                                let items: StreamItems =
-                                    emit_text_and_tool_calls(&remaining);
+                                let items: StreamItems = emit_text_and_tool_calls(&remaining);
                                 return Some((items, (lines, buffer, in_tool_call)));
                             }
                             return None;

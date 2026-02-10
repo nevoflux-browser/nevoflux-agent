@@ -103,6 +103,7 @@ fn test_agent_process_output_serialization() {
         tool_calls: vec![],
         complete: true,
         plan_proposal: None,
+        artifact: None,
     };
 
     let json = serde_json::to_string(&output).unwrap();
@@ -348,6 +349,7 @@ fn test_agent_process_output_with_tool_calls() {
         }],
         complete: false,
         plan_proposal: None,
+        artifact: None,
     };
 
     let json = serde_json::to_string(&output).unwrap();

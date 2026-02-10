@@ -631,6 +631,7 @@ impl HostFunctions for MockHostFunctions {
             tool_calls: vec![],
             continue_loop: false,
             plan_proposal: None,
+            artifact: None,
         })
     }
 
@@ -640,6 +641,7 @@ impl HostFunctions for MockHostFunctions {
             tool_calls: vec![],
             continue_loop: false,
             plan_proposal: None,
+            artifact: None,
         })
     }
 
@@ -649,6 +651,7 @@ impl HostFunctions for MockHostFunctions {
             tool_calls: vec![],
             continue_loop: false,
             plan_proposal: None,
+            artifact: None,
         })
     }
 
