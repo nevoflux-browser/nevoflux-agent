@@ -374,14 +374,16 @@ impl ToolExecutor for CanvasRenderTool {
             .and_then(|t| t.as_str())
             .unwrap_or("Generated App");
 
-        // Generate artifact ID
-        let id = format!(
-            "code-mode-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-        );
+        // Generate artifact ID with random suffix to avoid collisions
+        let millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let random = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let id = format!("code-mode-{}-{:x}", millis, random);
 
         // Return artifact data as JSON - the browser side will handle creation
         let result = serde_json::json!({
