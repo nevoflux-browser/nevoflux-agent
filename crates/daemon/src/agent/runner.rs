@@ -85,7 +85,7 @@ pub struct AgentOutput {
 }
 
 /// A tool call made by the agent.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     /// Tool call ID.
     pub id: String,
@@ -242,6 +242,21 @@ impl AgentRunner {
                 accumulated_text.push_str(&output.text);
             }
 
+            // Convert pending tool calls to ToolCall structs BEFORE early-return
+            // checks so that artifact/plan returns include the current iteration's
+            // tool calls (e.g. create_artifact) in the stream_chunk response.
+            let tool_calls: Vec<ToolCall> = output
+                .tool_calls
+                .iter()
+                .map(|tc| ToolCall {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                    result: None,
+                })
+                .collect();
+            all_tool_calls.extend(tool_calls);
+
             // Check for plan proposal - pause and return to caller
             if output.plan_proposal.is_some() {
                 return Ok(AgentOutput {
@@ -266,22 +281,8 @@ impl AgentRunner {
                 });
             }
 
-            // Convert pending tool calls to ToolCall structs
-            let tool_calls: Vec<ToolCall> = output
-                .tool_calls
-                .iter()
-                .map(|tc| ToolCall {
-                    id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    arguments: tc.arguments.clone(),
-                    result: None,
-                })
-                .collect();
-
             // Check if complete
             if output.complete {
-                // Add any final tool calls (shouldn't happen if complete, but for safety)
-                all_tool_calls.extend(tool_calls);
 
                 return Ok(AgentOutput {
                     text: accumulated_text,
@@ -528,6 +529,21 @@ impl AgentRunner {
                 accumulated_text.push_str(&output.text);
             }
 
+            // Convert pending tool calls to ToolCall structs BEFORE early-return
+            // checks so that artifact/plan returns include the current iteration's
+            // tool calls (e.g. create_artifact) in the stream_chunk response.
+            let tool_calls: Vec<ToolCall> = output
+                .tool_calls
+                .iter()
+                .map(|tc| ToolCall {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                    result: None,
+                })
+                .collect();
+            all_tool_calls.extend(tool_calls);
+
             // Check for plan proposal - pause, end stream, return
             if output.plan_proposal.is_some() {
                 let metadata = StreamMetadata {
@@ -566,22 +582,8 @@ impl AgentRunner {
                 });
             }
 
-            // Convert pending tool calls to ToolCall structs
-            let tool_calls: Vec<ToolCall> = output
-                .tool_calls
-                .iter()
-                .map(|tc| ToolCall {
-                    id: tc.id.clone(),
-                    name: tc.name.clone(),
-                    arguments: tc.arguments.clone(),
-                    result: None,
-                })
-                .collect();
-
             // Check if complete
             if output.complete {
-                // Add any final tool calls
-                all_tool_calls.extend(tool_calls);
 
                 // End the stream with metadata
                 let metadata = StreamMetadata {
@@ -681,10 +683,12 @@ fn extract_tool_params_summary(tool_name: &str, args: &serde_json::Value) -> Opt
         .map(|v| serde_json::json!({ key: v }).to_string())
 }
 
-/// Extract Python code from markdown \`\`\`python blocks in LLM response.
-/// Returns None if no Python code block is found.
+/// Extract Python code from markdown \`\`\`python-exec blocks in LLM response.
+/// Only matches the `python-exec` fence marker (not plain `python`),
+/// so normal code examples in responses are never accidentally executed.
+/// Returns None if no `python-exec` code block is found.
 pub fn extract_python_block(text: &str) -> Option<String> {
-    let marker = "```python";
+    let marker = "```python-exec";
     let start = text.find(marker)?;
     let code_start = start + marker.len();
     let remaining = &text[code_start..];
@@ -1084,7 +1088,7 @@ mod tests {
 
     #[test]
     fn test_extract_python_block() {
-        let text = "Here's the code:\n```python\nx = 1 + 2\nprint(x)\n```\nDone.";
+        let text = "Here's the code:\n```python-exec\nx = 1 + 2\nprint(x)\n```\nDone.";
         let code = extract_python_block(text);
         assert_eq!(code, Some("x = 1 + 2\nprint(x)".to_string()));
     }
@@ -1097,15 +1101,22 @@ mod tests {
 
     #[test]
     fn test_extract_python_block_empty() {
-        let text = "```python\n```";
+        let text = "```python-exec\n```";
         assert_eq!(extract_python_block(text), None);
     }
 
     #[test]
     fn test_extract_python_block_with_surrounding_text() {
-        let text = "I'll write a script for you:\n\n```python\nresult = read_file(\"/tmp/test.txt\")\nfor line in result.split(\"\\n\"):\n    print(line)\n```\n\nThis will read and print each line.";
+        let text = "I'll write a script for you:\n\n```python-exec\nresult = read_file(\"/tmp/test.txt\")\nfor line in result.split(\"\\n\"):\n    print(line)\n```\n\nThis will read and print each line.";
         let code = extract_python_block(text).unwrap();
         assert!(code.contains("read_file"));
         assert!(code.contains("for line in"));
+    }
+
+    #[test]
+    fn test_extract_python_block_ignores_plain_python() {
+        // Plain ```python blocks should NOT be extracted (display-only code)
+        let text = "Here's an example:\n```python\nx = 1 + 2\nprint(x)\n```\nThat's how it works.";
+        assert_eq!(extract_python_block(text), None);
     }
 }

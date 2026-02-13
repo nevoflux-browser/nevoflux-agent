@@ -459,7 +459,7 @@ const BROWSER_PROMPT: &str = include_str!("../prompts/browser.md");
 const AGENT_PROMPT: &str = include_str!("../prompts/agent.md");
 const SUBAGENT_BROWSER_PROMPT: &str = include_str!("../prompts/subagent_browser.md");
 const SUBAGENT_AGENT_PROMPT: &str = include_str!("../prompts/subagent_agent.md");
-const CODE_MODE_PROMPT: &str = "You are in Code Mode. Write Python code to accomplish the task. The code will be executed in a sandboxed Python interpreter (Monty). Use only supported syntax: variables, def, if/elif/else, for/while, try/except, comprehensions, f-strings. DO NOT use: class, match, import, with, async/await, yield, decorators. Tools are pre-injected as functions. Return code in a ```python block.";
+const CODE_MODE_PROMPT: &str = "You are in Code Mode. Write Python code to accomplish the task. The code will be executed in a sandboxed Python interpreter (Monty). Use only supported syntax: variables, def, if/elif/else, for/while, try/except, comprehensions, f-strings. DO NOT use: class, match, import, with, async/await, yield, decorators. Tools are pre-injected as functions. Return code in a ```python-exec block (NOT ```python — that is for display-only code examples).\n\nAvailable external function: canvas_render(files, entry, title) — Renders a multi-file project (React/Vue/Svelte) in the browser canvas. 'files' is a dict mapping file paths to content strings, 'entry' is the entry point path (e.g. 'src/index.jsx'), 'title' is a human-readable name. Returns JSON with artifact_id on success.";
 
 impl<H: HostFunctions> Agent<H> {
     /// Create a new agent with the given host functions.
@@ -1191,6 +1191,19 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     .as_str()
                     .unwrap_or("")
                     .to_string();
+                // Extract optional multi-file project fields
+                let files: Option<std::collections::HashMap<String, String>> =
+                    tool_call.arguments.get("files").and_then(|f| {
+                        f.as_object().map(|obj| {
+                            obj.iter()
+                                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                                .collect()
+                        })
+                    });
+                let entry = tool_call.arguments
+                    .get("entry")
+                    .and_then(|e| e.as_str())
+                    .map(|s| s.to_string());
                 // Derive artifact ID from the tool call ID for uniqueness
                 let id = format!("art-{}", tool_call.id);
 
@@ -1199,6 +1212,8 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     title,
                     content_type,
                     content,
+                    files,
+                    entry,
                 });
 
                 format!("Artifact created and sent to canvas: {}", id)
@@ -1764,7 +1779,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             },
             ToolDefinition {
                 name: "create_artifact".into(),
-                description: "Create a rich artifact (HTML page, code, document) that opens in the browser canvas. Use this instead of write() when generating web pages, interactive demos, visualizations, or documents the user wants to preview. The artifact opens in a dedicated canvas tab.".into(),
+                description: "Create a rich artifact that opens in the browser canvas. For single-file content (HTML page, document), provide 'content'. For multi-file projects (React/Vue/Svelte apps), provide 'files' and 'entry' with content_type 'project'. The artifact opens in a dedicated canvas tab.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1774,15 +1789,24 @@ The following skill instructions MUST be followed exactly. These instructions ta
                         },
                         "content_type": {
                             "type": "string",
-                            "enum": ["text/html", "text/markdown", "text/plain", "application/json", "text/css", "text/javascript"],
-                            "description": "MIME type of the content"
+                            "enum": ["text/html", "text/markdown", "text/plain", "application/json", "text/css", "text/javascript", "project"],
+                            "description": "MIME type of the content. Use 'project' for multi-file React/Vue/Svelte apps."
                         },
                         "content": {
                             "type": "string",
-                            "description": "The full artifact content (HTML, Markdown, code, etc.)"
+                            "description": "The full artifact content (for single-file artifacts: HTML, Markdown, code). Optional when using 'files'."
+                        },
+                        "files": {
+                            "type": "object",
+                            "description": "Multi-file project: a map of file paths to file contents. Example: {\"src/App.jsx\": \"export default function App() {...}\", \"src/index.jsx\": \"import App from './App'; ...\"}. Use with content_type 'project'.",
+                            "additionalProperties": { "type": "string" }
+                        },
+                        "entry": {
+                            "type": "string",
+                            "description": "Entry point file path for multi-file projects (e.g. 'src/index.jsx'). Required when 'files' is provided."
                         }
                     },
-                    "required": ["title", "content"]
+                    "required": ["title"]
                 }),
             },
             ToolDefinition {

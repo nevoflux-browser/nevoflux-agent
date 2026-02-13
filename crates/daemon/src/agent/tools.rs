@@ -185,7 +185,7 @@ impl ToolRegistry {
         prompt.push_str("- Instead of with: use try/finally or call tool directly\n\n");
         prompt.push_str(&self.tool_categories_summary());
         prompt.push_str("\nCall get_code_mode_context() to see full function signatures.\n");
-        prompt.push_str("\nReturn only the Python code in a ```python block.\n");
+        prompt.push_str("\nReturn the Python code in a ```python-exec block (NOT ```python — that is for display-only code examples).\n");
         prompt
     }
 
@@ -483,7 +483,7 @@ mod tests {
         assert!(prompt.contains("Code Mode"));
         assert!(prompt.contains("DO NOT use"));
         assert!(prompt.contains("class"));
-        assert!(prompt.contains("```python"));
+        assert!(prompt.contains("```python-exec"));
     }
 
     #[test]
@@ -743,7 +743,11 @@ mod tests {
         };
 
         let result = registry.execute(&call).await;
-        assert!(result.error.is_none(), "Expected success, got error: {:?}", result.error);
+        assert!(
+            result.error.is_none(),
+            "Expected success, got error: {:?}",
+            result.error
+        );
 
         let content = result.content.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -752,9 +756,15 @@ mod tests {
         assert_eq!(parsed["type"], "project");
         assert_eq!(parsed["title"], "My React App");
         assert_eq!(parsed["entry"], "index.html");
-        assert!(parsed["artifact_id"].as_str().unwrap().starts_with("code-mode-"));
+        assert!(parsed["artifact_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("code-mode-"));
         assert!(parsed["files"].is_object());
-        assert_eq!(parsed["files"]["App.jsx"], "export default function App() { return <h1>Hello</h1>; }");
+        assert_eq!(
+            parsed["files"]["App.jsx"],
+            "export default function App() { return <h1>Hello</h1>; }"
+        );
     }
 
     #[tokio::test]
@@ -822,7 +832,11 @@ mod tests {
         };
 
         let result = registry.execute(&call).await;
-        assert!(result.error.is_none(), "Expected success, got error: {:?}", result.error);
+        assert!(
+            result.error.is_none(),
+            "Expected success, got error: {:?}",
+            result.error
+        );
 
         let content = result.content.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -833,7 +847,10 @@ mod tests {
         assert_eq!(parsed["title"], "Generated App");
         // entry should be null when not provided
         assert!(parsed["entry"].is_null());
-        assert!(parsed["artifact_id"].as_str().unwrap().starts_with("code-mode-"));
+        assert!(parsed["artifact_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("code-mode-"));
     }
 
     #[tokio::test]
