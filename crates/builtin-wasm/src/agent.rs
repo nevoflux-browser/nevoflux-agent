@@ -459,6 +459,7 @@ const BROWSER_PROMPT: &str = include_str!("../prompts/browser.md");
 const AGENT_PROMPT: &str = include_str!("../prompts/agent.md");
 const SUBAGENT_BROWSER_PROMPT: &str = include_str!("../prompts/subagent_browser.md");
 const SUBAGENT_AGENT_PROMPT: &str = include_str!("../prompts/subagent_agent.md");
+const CODE_MODE_PROMPT: &str = "You are in Code Mode. Write Python code to accomplish the task. The code will be executed in a sandboxed Python interpreter (Monty). Use only supported syntax: variables, def, if/elif/else, for/while, try/except, comprehensions, f-strings. DO NOT use: class, match, import, with, async/await, yield, decorators. Tools are pre-injected as functions. Return code in a ```python block.";
 
 impl<H: HostFunctions> Agent<H> {
     /// Create a new agent with the given host functions.
@@ -549,6 +550,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             AgentMode::Chat => self.get_chat_tools(),
             AgentMode::Browser => self.get_browser_tools(),
             AgentMode::Agent => self.get_agent_tools(),
+            AgentMode::Code => self.get_agent_tools(),
         }
     }
 
@@ -558,6 +560,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             AgentMode::Chat => CHAT_PROMPT,
             AgentMode::Browser => BROWSER_PROMPT,
             AgentMode::Agent => AGENT_PROMPT,
+            AgentMode::Code => CODE_MODE_PROMPT,
         }
     }
 
@@ -569,6 +572,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             AgentMode::Chat => SUBAGENT_BROWSER_PROMPT,
             AgentMode::Browser => SUBAGENT_BROWSER_PROMPT,
             AgentMode::Agent => SUBAGENT_AGENT_PROMPT,
+            AgentMode::Code => SUBAGENT_AGENT_PROMPT,
         }
     }
 
@@ -602,7 +606,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
         match mode {
             AgentMode::Chat => self.get_chat_tools(),
             AgentMode::Browser => self.get_subagent_browser_read_tools(),
-            AgentMode::Agent => {
+            AgentMode::Agent | AgentMode::Code => {
                 let mut tools = self.get_subagent_browser_read_tools();
                 tools.extend(self.get_file_tools());
                 tools
@@ -995,6 +999,8 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // Buffering state for text-based <tool_call> XML that may span multiple chunks
         let mut tool_call_buf = String::new();
         let mut in_tool_call = false;
+        // Buffer for partial <tool_call> tag prefix split at chunk boundary
+        let mut tag_buf = String::new();
 
         // Read chunks until done
         loop {
@@ -1007,13 +1013,25 @@ The following skill instructions MUST be followed exactly. These instructions ta
             match self.host.llm_stream_next(stream_id)? {
                 Some(chunk) => {
                     // Accumulate text, detecting <tool_call> XML that some providers
-                    // emit as plain text instead of structured tool_use blocks
-                    if let Some(ref text) = chunk.text {
-                        if !text.is_empty() {
+                    // emit as plain text instead of structured tool_use blocks.
+                    // The opening tag may be split across chunks (e.g. "<tool_call"
+                    // in one chunk and ">" in the next), so we buffer partial prefixes.
+                    if let Some(ref chunk_text) = chunk.text {
+                        if !chunk_text.is_empty() {
+                            // Prepend any partial tag prefix from previous chunk
+                            let text = if !tag_buf.is_empty() {
+                                std::mem::take(&mut tag_buf) + chunk_text
+                            } else {
+                                chunk_text.to_string()
+                            };
+                            let text = text.as_str();
+
                             if in_tool_call {
                                 // Continue buffering a multi-chunk tool call
                                 tool_call_buf.push_str(text);
-                                if text.contains("</tool_call>") {
+                                // Check accumulated buffer (not just current chunk)
+                                // so split </tool_call> tags are handled correctly
+                                if tool_call_buf.contains("</tool_call>") {
                                     in_tool_call = false;
                                     let complete = std::mem::take(&mut tool_call_buf);
                                     let (clean, extracted) = parse_tool_calls_from_text(&complete);
@@ -1047,6 +1065,15 @@ The following skill instructions MUST be followed exactly. These instructions ta
                                     tool_call_buf = text[idx..].to_string();
                                     in_tool_call = true;
                                 }
+                            } else if let Some(split) = find_tool_call_tag_prefix_at_end(text) {
+                                // Text ends with a partial <tool_call> prefix —
+                                // hold it back until the next chunk confirms
+                                let (emit, hold) = text.split_at(split);
+                                tag_buf = hold.to_string();
+                                if !emit.is_empty() {
+                                    accumulated_text.push_str(emit);
+                                    self.host.stream_emit(emit)?;
+                                }
                             } else {
                                 // Normal text — no tool call markers
                                 accumulated_text.push_str(text);
@@ -1073,11 +1100,34 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     }
 
                     if chunk.done {
-                        // Flush incomplete tool call buffer as plain text
-                        if in_tool_call {
-                            let buf = std::mem::take(&mut tool_call_buf);
+                        // Flush incomplete tag prefix buffer as plain text
+                        if !tag_buf.is_empty() {
+                            let buf = std::mem::take(&mut tag_buf);
                             accumulated_text.push_str(&buf);
                             self.host.stream_emit(&buf)?;
+                        }
+                        // Handle incomplete tool call buffer — the model
+                        // truncated output before sending </tool_call>.
+                        // Don't dump raw XML to the sidebar; try to extract
+                        // the tool name for a helpful warning instead.
+                        if in_tool_call {
+                            let buf = std::mem::take(&mut tool_call_buf);
+                            // Try to identify which tool was being called
+                            let tool_name = buf
+                                .find("\"name\"")
+                                .and_then(|i| {
+                                    let after = &buf[i + 6..];
+                                    let colon = after.find(':')?;
+                                    let after_colon = after[colon + 1..].trim_start();
+                                    let quote_start = after_colon.strip_prefix('"')?;
+                                    let end = quote_start.find('"')?;
+                                    Some(&quote_start[..end])
+                                })
+                                .unwrap_or("unknown");
+                            let warning =
+                                format!("\n[Tool call `{}` was truncated by the model]", tool_name);
+                            accumulated_text.push_str(&warning);
+                            self.host.stream_emit(&warning)?;
                         }
                         break;
                     }
@@ -1495,6 +1545,29 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     }
                 }
             }
+            // Artifact editing tools
+            "browser_read_artifact" => {
+                let tab_id = tool_call.arguments["tab_id"].as_i64();
+                let params = serde_json::json!({
+                    "id": tool_call.arguments.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                    "offset": tool_call.arguments.get("offset"),
+                    "limit": tool_call.arguments.get("limit"),
+                    "grep": tool_call.arguments.get("grep"),
+                    "context": tool_call.arguments.get("context"),
+                });
+                let result = self.host.browser_read_artifact(&params, tab_id)?;
+                serde_json::to_string(&result).unwrap_or_default()
+            }
+            "browser_edit_artifact" => {
+                let tab_id = tool_call.arguments["tab_id"].as_i64();
+                let params = serde_json::json!({
+                    "id": tool_call.arguments.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                    "old_str": tool_call.arguments.get("old_str").and_then(|v| v.as_str()).unwrap_or(""),
+                    "new_str": tool_call.arguments.get("new_str").and_then(|v| v.as_str()).unwrap_or(""),
+                });
+                let result = self.host.browser_edit_artifact(&params, tab_id)?;
+                serde_json::to_string(&result).unwrap_or_default()
+            }
             // Subagent tools
             "subagent_spawn" => {
                 let task = tool_call.arguments["task"].as_str().unwrap_or("");
@@ -1856,6 +1929,59 @@ The following skill instructions MUST be followed exactly. These instructions ta
                             "description": "Optional tab ID (uses active tab if not specified)"
                         }
                     }
+                }),
+            },
+            // Artifact editing tools (available in all modes)
+            ToolDefinition {
+                name: "browser_read_artifact".into(),
+                description: "Read the source code of a canvas artifact. Returns full content by default (with line numbers). Use offset/limit for large artifacts, or grep to search for specific code sections. Only use when [Active Canvas] hint is present.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Artifact ID (from the [Active Canvas] context hint)"
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "Start from line N (1-based)"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Read N lines"
+                        },
+                        "grep": {
+                            "type": "string",
+                            "description": "Search keyword to find specific code sections"
+                        },
+                        "context": {
+                            "type": "integer",
+                            "description": "Lines of context around grep matches (default 5)"
+                        }
+                    },
+                    "required": ["id"]
+                }),
+            },
+            ToolDefinition {
+                name: "browser_edit_artifact".into(),
+                description: "Edit a canvas artifact using search-and-replace. The old_str must match exactly one location in the artifact. Include surrounding lines for uniqueness. The canvas updates in real-time after each edit. Only use when [Active Canvas] hint is present.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "Artifact ID (from the [Active Canvas] context hint)"
+                        },
+                        "old_str": {
+                            "type": "string",
+                            "description": "Exact string to find in the artifact code"
+                        },
+                        "new_str": {
+                            "type": "string",
+                            "description": "Replacement string"
+                        }
+                    },
+                    "required": ["id", "old_str", "new_str"]
                 }),
             },
         ]
@@ -2538,6 +2664,21 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
         tools
     }
+}
+
+/// Check if `text` ends with a non-empty prefix of `<tool_call>`.
+///
+/// Returns `Some(index)` where the partial prefix starts, or `None`.
+/// This handles the case where the `<tool_call>` opening tag is split across
+/// streaming chunks (e.g. `<tool_call` in one chunk and `>` in the next).
+fn find_tool_call_tag_prefix_at_end(text: &str) -> Option<usize> {
+    const TAG: &str = "<tool_call>";
+    for prefix_len in (1..TAG.len()).rev() {
+        if text.ends_with(&TAG[..prefix_len]) {
+            return Some(text.len() - prefix_len);
+        }
+    }
+    None
 }
 
 /// Parse `<tool_call>...</tool_call>` XML from text into `ToolCall` structs.
@@ -4171,7 +4312,12 @@ mod tests {
         let mock = MockHostFunctions::new();
         let agent = Agent::new(mock);
 
-        for mode in [AgentMode::Chat, AgentMode::Browser, AgentMode::Agent] {
+        for mode in [
+            AgentMode::Chat,
+            AgentMode::Browser,
+            AgentMode::Agent,
+            AgentMode::Code,
+        ] {
             let tools = agent.get_tools_for_mode(mode);
             let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
             assert!(

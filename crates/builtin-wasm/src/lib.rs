@@ -137,7 +137,12 @@ mod tests {
 
     #[test]
     fn test_all_modes() {
-        let modes = [AgentMode::Chat, AgentMode::Browser, AgentMode::Agent];
+        let modes = [
+            AgentMode::Chat,
+            AgentMode::Browser,
+            AgentMode::Agent,
+            AgentMode::Code,
+        ];
 
         for mode in modes {
             let mock = MockHostFunctions::new();

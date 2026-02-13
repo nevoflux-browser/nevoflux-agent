@@ -32,6 +32,8 @@ pub enum AgentMode {
     Browser,
     /// Agent mode - full capabilities including file/bash/computer use.
     Agent,
+    /// Code mode - Python code generation and execution via Monty interpreter.
+    Code,
 }
 
 /// Message role in conversation.

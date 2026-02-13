@@ -81,6 +81,123 @@ impl ToolRegistry {
         self.tools.keys().map(|s| s.as_str()).collect()
     }
 
+    /// Get sorted tool names for deterministic output.
+    fn tool_names_sorted(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.tools.keys().map(|s| s.as_str()).collect();
+        names.sort();
+        names
+    }
+
+    /// Get parameter hints and docs for known built-in tools.
+    /// Returns (params, description) based on tool name conventions.
+    fn tool_signature_hint(name: &str) -> (&'static str, &'static str) {
+        match name {
+            "read_file" => (
+                "path: str",
+                "Read the contents of a file. Returns the file content as a string.",
+            ),
+            "write_file" => (
+                "path: str, content: str",
+                "Write content to a file. Returns success message.",
+            ),
+            "list_files" => (
+                "path: str",
+                "List directory contents. Returns newline-separated entries.",
+            ),
+            "web_search" => ("query: str", "Search the web. Returns search results."),
+            "fetch_page" => ("url: str", "Fetch a web page. Returns the page content."),
+            "canvas_render" => (
+                "files: dict, entry: str",
+                "Render a multi-file project in the canvas.",
+            ),
+            "get_code_mode_context" => (
+                "",
+                "Get Code Mode context with available tool function signatures.",
+            ),
+            _ => ("**kwargs", "Execute this tool with keyword arguments."),
+        }
+    }
+
+    /// Generate Python function signatures for all registered tools.
+    /// Since ToolExecutor doesn't expose schemas, this generates stubs based on tool names only.
+    /// Used by get_code_mode_context() for on-demand tool discovery.
+    pub fn to_python_stubs(&self) -> String {
+        let mut stubs =
+            String::from("# Available tool functions (pre-injected, no imports needed)\n\n");
+
+        for name in self.tool_names_sorted() {
+            let (params, doc) = Self::tool_signature_hint(name);
+            stubs.push_str(&format!("def {}({}):\n", name, params));
+            stubs.push_str(&format!("    \"\"\"{}\"\"\"\n", doc));
+            stubs.push_str("    ...\n\n");
+        }
+
+        stubs
+    }
+
+    /// Generate compact tool category summary for system prompt (~200 tokens).
+    pub fn tool_categories_summary(&self) -> String {
+        let mut categories: std::collections::BTreeMap<&str, Vec<&str>> =
+            std::collections::BTreeMap::new();
+
+        for name in self.tool_names_sorted() {
+            let category = if name.starts_with("web_") || name.starts_with("fetch_") {
+                "Search & Web"
+            } else if name.starts_with("read_")
+                || name.starts_with("write_")
+                || name.starts_with("list_")
+            {
+                "Files"
+            } else if name.starts_with("canvas_") || name.starts_with("browser_") {
+                "Browser & Canvas"
+            } else {
+                "Other"
+            };
+            categories.entry(category).or_default().push(name);
+        }
+
+        let mut summary = String::from("Available tool categories:\n");
+        for (category, tools) in &categories {
+            summary.push_str(&format!("- {}: {}\n", category, tools.join(", ")));
+        }
+        summary
+    }
+
+    /// Generate the Code Mode system prompt with Monty constraints and tool info.
+    pub fn code_mode_system_prompt(&self) -> String {
+        let mut prompt = String::new();
+        prompt.push_str("You are in Code Mode. Write a Python script to accomplish the task.\n\n");
+        prompt.push_str("IMPORTANT: Use ONLY these supported constructs:\n");
+        prompt.push_str("- Statements: variable, def, if/elif/else, for/while, break, continue, try/except/finally, return, pass, del, assert, raise\n");
+        prompt.push_str("- Expressions: arithmetic, comparison, boolean, f-string, lambda, comprehensions, ternary, slice, unpack, walrus (:=)\n");
+        prompt.push_str("- Types: int, float, str, bool, list, dict, set, tuple, None, bytes\n");
+        prompt.push_str("- Built-ins: len, range, sorted, enumerate, zip, map, filter, sum, min, max, abs, round, isinstance, type, print\n\n");
+        prompt.push_str(
+            "DO NOT use: class, match/case, import, with, async/await, yield, decorators\n\n",
+        );
+        prompt.push_str("Pattern corrections:\n");
+        prompt.push_str(
+            "- Instead of class: use dict + factory function: def make_item(x): return {\"x\": x}\n",
+        );
+        prompt.push_str("- Instead of match: use if/elif/else\n");
+        prompt.push_str("- Instead of import: tools are pre-injected as functions\n");
+        prompt.push_str("- Instead of with: use try/finally or call tool directly\n\n");
+        prompt.push_str(&self.tool_categories_summary());
+        prompt.push_str("\nCall get_code_mode_context() to see full function signatures.\n");
+        prompt.push_str("\nReturn only the Python code in a ```python block.\n");
+        prompt
+    }
+
+    /// Register the get_code_mode_context tool that returns Python stubs.
+    /// Call this after all other tools are registered.
+    pub fn register_code_mode_context_tool(&mut self) {
+        let stubs = self.to_python_stubs();
+        self.register(
+            "get_code_mode_context",
+            Box::new(GetCodeModeContextTool::new(stubs)),
+        );
+    }
+
     /// Execute a tool call and return the result.
     ///
     /// # Arguments
@@ -226,6 +343,29 @@ impl ToolExecutor for ListFilesTool {
 }
 
 // ============================================================================
+// Code Mode Context Tool
+// ============================================================================
+
+/// Tool that returns Code Mode context (Python function signatures for available tools).
+pub struct GetCodeModeContextTool {
+    stubs: String,
+}
+
+impl GetCodeModeContextTool {
+    /// Create a new Code Mode context tool with pre-generated Python stubs.
+    pub fn new(stubs: String) -> Self {
+        Self { stubs }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for GetCodeModeContextTool {
+    async fn execute(&self, _name: &str, _arguments: &serde_json::Value) -> Result<String> {
+        Ok(self.stubs.clone())
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -255,7 +395,65 @@ mod tests {
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
         assert!(names.contains(&"list_files"));
+        // 3 built-in tools: read_file, write_file, list_files
         assert_eq!(names.len(), 3);
+    }
+
+    #[test]
+    fn test_python_stubs_generation() {
+        let registry = ToolRegistry::new();
+        let stubs = registry.to_python_stubs();
+        assert!(stubs.contains("def list_files("));
+        assert!(stubs.contains("def read_file("));
+        assert!(stubs.contains("def write_file("));
+        assert!(stubs.contains("# Available tool functions"));
+    }
+
+    #[test]
+    fn test_tool_categories_summary() {
+        let registry = ToolRegistry::new();
+        let summary = registry.tool_categories_summary();
+        assert!(summary.contains("Files"));
+        assert!(summary.contains("read_file"));
+    }
+
+    #[test]
+    fn test_code_mode_system_prompt() {
+        let registry = ToolRegistry::new();
+        let prompt = registry.code_mode_system_prompt();
+        assert!(prompt.contains("Code Mode"));
+        assert!(prompt.contains("DO NOT use"));
+        assert!(prompt.contains("class"));
+        assert!(prompt.contains("```python"));
+    }
+
+    #[test]
+    fn test_register_code_mode_context_tool() {
+        let mut registry = ToolRegistry::new();
+        assert!(!registry.has_tool("get_code_mode_context"));
+
+        registry.register_code_mode_context_tool();
+        assert!(registry.has_tool("get_code_mode_context"));
+        assert_eq!(registry.tool_names().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_code_mode_context_tool_execution() {
+        let mut registry = ToolRegistry::new();
+        registry.register_code_mode_context_tool();
+
+        let call = PendingToolCall {
+            id: "call-ctx".to_string(),
+            name: "get_code_mode_context".to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        let result = registry.execute(&call).await;
+        assert!(result.error.is_none());
+        let content = result.content.unwrap();
+        assert!(content.contains("def read_file("));
+        assert!(content.contains("def write_file("));
+        assert!(content.contains("# Available tool functions"));
     }
 
     #[test]

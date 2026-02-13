@@ -524,6 +524,7 @@ impl DaemonHostFunctions {
             "openai" => self.config.llm.openai.api_key.as_deref(),
             "qwen" => self.config.llm.qwen.api_key.as_deref(),
             "deepseek" => self.config.llm.deepseek.api_key.as_deref(),
+            "openrouter" => self.config.llm.openrouter.api_key.as_deref(),
             "claude-code" | "claude_code" => self.config.llm.claude_code.api_key.as_deref(),
             _ => None,
         };
@@ -2232,6 +2233,38 @@ impl HostFunctions for DaemonHostFunctions {
         self.execute_browser_action(BrowserToolAction::Snapshot, serde_json::json!({}), tab_id)
     }
 
+    fn browser_list_tabs(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+        debug!("browser_list_tabs: listing all open tabs");
+        self.execute_browser_action(BrowserToolAction::ListTabs, serde_json::json!({}), tab_id)
+    }
+
+    fn browser_query_tabs(
+        &self,
+        params: &serde_json::Value,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        debug!("browser_query_tabs: querying tabs with filter");
+        self.execute_browser_action(BrowserToolAction::QueryTabs, params.clone(), tab_id)
+    }
+
+    fn browser_read_artifact(
+        &self,
+        params: &serde_json::Value,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        debug!("browser_read_artifact: reading artifact source");
+        self.execute_browser_action(BrowserToolAction::ReadArtifact, params.clone(), tab_id)
+    }
+
+    fn browser_edit_artifact(
+        &self,
+        params: &serde_json::Value,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        debug!("browser_edit_artifact: editing artifact");
+        self.execute_browser_action(BrowserToolAction::EditArtifact, params.clone(), tab_id)
+    }
+
     fn browser_wait_for_stable(
         &self,
         strategy: &str,
@@ -2917,7 +2950,7 @@ impl DaemonHostFunctions {
             let result = match agent_mode {
                 AgentMode::Chat => host.builtin_chat(&input),
                 AgentMode::Browser => host.builtin_browser(&input),
-                AgentMode::Agent => host.builtin_agent(&input),
+                AgentMode::Agent | AgentMode::Code => host.builtin_agent(&input),
             };
 
             // Update the registry with the result

@@ -663,6 +663,7 @@ async fn handle_chat_message_streaming(
         .map(|m| match m {
             "browser" => AgentMode::Browser,
             "agent" => AgentMode::Agent,
+            "code" => AgentMode::Code,
             _ => AgentMode::Chat,
         })
         .unwrap_or(AgentMode::Chat);
@@ -752,14 +753,124 @@ async fn handle_chat_message_streaming(
         })
         .unwrap_or_default();
 
+    // Detect and process /skillname commands (same logic as non-streaming path)
+    let (effective_message, skill_context) = if let Some(trimmed) =
+        message_content.strip_prefix('/')
+    {
+        let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
+        let skill_name = parts[0].trim();
+        let args = parts.get(1).map(|s| s.trim()).unwrap_or("").to_string();
+
+        if skill_name.is_empty() {
+            (message_content.to_string(), None)
+        } else {
+            let registry = services.skills.read().await;
+            if let Some(skill) = registry.get(skill_name) {
+                // Check if required tools are available
+                let available_tools = gather_available_tools(services).await;
+                match check_tool_availability(&skill.metadata, &available_tools) {
+                    ToolCheckResult::Satisfied => {}
+                    ToolCheckResult::Missing(missing) => {
+                        let message = format_missing_tools_message(skill_name, &missing);
+                        warn!(
+                            "Skill '{}' requires unavailable tools: {:?}",
+                            skill_name, missing
+                        );
+                        let response_payload = serde_json::json!({
+                            "type": "error",
+                            "payload": {
+                                "code": "SKILL_TOOLS_UNAVAILABLE",
+                                "message": message,
+                                "recoverable": true,
+                                "missing_tools": missing
+                            }
+                        });
+                        let response = DaemonEnvelope::new(&proxy_id, channel, response_payload)
+                            .with_request_id(&request_id);
+                        if let Err(e) = response_tx.send((identity, response)).await {
+                            error!("Failed to queue response: {}", e);
+                        }
+                        return;
+                    }
+                }
+
+                let base_path = skill
+                    .file_path
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                let available_files = if !base_path.is_empty() {
+                    match std::fs::read_dir(&base_path) {
+                        Ok(entries) => {
+                            let mut files: Vec<String> = entries
+                                .filter_map(|e| e.ok())
+                                .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+                                .filter_map(|e| {
+                                    let name = e.file_name().to_string_lossy().to_string();
+                                    if name.to_uppercase() == "SKILL.MD" {
+                                        None
+                                    } else {
+                                        Some(name)
+                                    }
+                                })
+                                .collect();
+                            files.sort();
+                            files
+                        }
+                        Err(e) => {
+                            warn!("Failed to enumerate skill directory {}: {}", base_path, e);
+                            vec![]
+                        }
+                    }
+                } else {
+                    vec![]
+                };
+
+                info!(
+                    "Injecting skill '{}' into streaming system prompt (base_path={}, files={:?})",
+                    skill_name, base_path, available_files
+                );
+
+                let ctx = nevoflux_builtin_wasm::SkillContext {
+                    name: skill.metadata.name.clone(),
+                    base_path,
+                    content: skill.content.clone(),
+                    available_files,
+                };
+                (args, Some(ctx))
+            } else {
+                warn!("Skill '{}' not found in streaming path", skill_name);
+                let response_payload = serde_json::json!({
+                    "type": "error",
+                    "payload": {
+                        "code": "SKILL_NOT_FOUND",
+                        "message": format!("Skill '{}' not found. Type / to see available skills.", skill_name),
+                        "recoverable": true
+                    }
+                });
+                let response = DaemonEnvelope::new(&proxy_id, channel, response_payload)
+                    .with_request_id(&request_id);
+                if let Err(e) = response_tx.send((identity, response)).await {
+                    error!("Failed to queue response: {}", e);
+                }
+                return;
+            }
+        }
+    } else {
+        (message_content.to_string(), None)
+    };
+
     info!(
-        "Processing streaming chat message with mode={:?}, session={}, attachments={}, local_files={}, tab_id={:?}, tab_ids={}",
+        "Processing streaming chat message with mode={:?}, session={}, attachments={}, local_files={}, tab_id={:?}, tab_ids={}, skill={:?}",
         mode,
         session_id,
         attachments.len(),
         local_files.len(),
         tab_id,
-        tab_ids.len()
+        tab_ids.len(),
+        skill_context.as_ref().map(|s| &s.name),
     );
 
     // Ensure session exists and save user message
@@ -845,11 +956,18 @@ async fn handle_chat_message_streaming(
         debug!("Registered interrupt flag for session: {}", session_id);
     }
 
-    let host = DaemonHostFunctions::new(config.clone(), runtime.clone())
+    let mut host = DaemonHostFunctions::new(config.clone(), runtime.clone())
         .with_services(services_with_context)
         .with_sidebar_stream(stream_tx)
         .with_session_id(session_id.clone())
         .with_trace_collector(trace_collector.clone());
+
+    // Pass skill base path to host for relative path resolution
+    if let Some(ref ctx) = skill_context {
+        if !ctx.base_path.is_empty() {
+            host = host.with_skill_base_path(&ctx.base_path);
+        }
+    }
 
     // Create agent with host functions
     let agent = Agent::new(host);
@@ -861,7 +979,7 @@ async fn handle_chat_message_streaming(
     let input = AgentInput {
         session_id: session_id.clone(),
         mode,
-        user_message: message_content.to_string(),
+        user_message: effective_message,
         history: load_session_history(
             session_manager,
             &session_id,
@@ -873,7 +991,7 @@ async fn handle_chat_message_streaming(
         custom_system_prompt: None, // Use default mode-based prompt
         tab_id,
         tab_ids,
-        skill_context: None,
+        skill_context,
         available_models: config.llm.configured_providers(),
     };
 

@@ -314,6 +314,7 @@ impl SubagentExecutor {
             AgentMode::Chat => "chat",
             AgentMode::Browser => "browser",
             AgentMode::Agent => "agent",
+            AgentMode::Code => "code",
         };
 
         let handle = SubagentHandle::new(id, task.clone(), mode_str.to_string(), tab_id);
@@ -435,7 +436,7 @@ impl SubagentExecutor {
         }
 
         // Create sandbox for agent-mode subagents
-        let custom_prompt = if matches!(mode, AgentMode::Agent) {
+        let custom_prompt = if matches!(mode, AgentMode::Agent | AgentMode::Code) {
             let sandbox = format!("/tmp/subagent/{}", id);
             std::fs::create_dir_all(&sandbox)
                 .map_err(|e| format!("Failed to create sandbox directory: {}", e))?;

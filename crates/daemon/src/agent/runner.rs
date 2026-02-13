@@ -681,6 +681,24 @@ fn extract_tool_params_summary(tool_name: &str, args: &serde_json::Value) -> Opt
         .map(|v| serde_json::json!({ key: v }).to_string())
 }
 
+/// Extract Python code from markdown \`\`\`python blocks in LLM response.
+/// Returns None if no Python code block is found.
+pub fn extract_python_block(text: &str) -> Option<String> {
+    let marker = "```python";
+    let start = text.find(marker)?;
+    let code_start = start + marker.len();
+    let remaining = &text[code_start..];
+    // Skip optional newline after marker
+    let remaining = remaining.strip_prefix('\n').unwrap_or(remaining);
+    let end = remaining.find("```")?;
+    let code = remaining[..end].trim();
+    if code.is_empty() {
+        None
+    } else {
+        Some(code.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1062,5 +1080,32 @@ mod tests {
 
         let output = result.unwrap();
         assert!(output.text.contains("Hello"));
+    }
+
+    #[test]
+    fn test_extract_python_block() {
+        let text = "Here's the code:\n```python\nx = 1 + 2\nprint(x)\n```\nDone.";
+        let code = extract_python_block(text);
+        assert_eq!(code, Some("x = 1 + 2\nprint(x)".to_string()));
+    }
+
+    #[test]
+    fn test_extract_python_block_none() {
+        let text = "No code here, just text.";
+        assert_eq!(extract_python_block(text), None);
+    }
+
+    #[test]
+    fn test_extract_python_block_empty() {
+        let text = "```python\n```";
+        assert_eq!(extract_python_block(text), None);
+    }
+
+    #[test]
+    fn test_extract_python_block_with_surrounding_text() {
+        let text = "I'll write a script for you:\n\n```python\nresult = read_file(\"/tmp/test.txt\")\nfor line in result.split(\"\\n\"):\n    print(line)\n```\n\nThis will read and print each line.";
+        let code = extract_python_block(text).unwrap();
+        assert!(code.contains("read_file"));
+        assert!(code.contains("for line in"));
     }
 }
