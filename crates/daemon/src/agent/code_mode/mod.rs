@@ -11,5 +11,4 @@ pub mod executor;
 pub mod linter;
 pub mod repair_prompt;
 
-// Re-export will be enabled once CodeModeExecutor is implemented
-// pub use executor::CodeModeExecutor;
+pub use executor::{CodeModeExecutor, CodeModeResult, ToolCallResult};
