@@ -877,6 +877,9 @@ where
         }
     }
 
+    // Merge consecutive same-role messages to ensure strict user/assistant alternation
+    let chat_history = merge_consecutive_same_role_messages(chat_history);
+
     // Check if we have any messages
     if chat_history.is_empty() {
         return Err(DaemonError::InternalError(
@@ -947,6 +950,67 @@ where
 
     // Extract the response content and handle tool calls
     process_completion_response(completion_response.choice)
+}
+
+/// Merge consecutive messages with the same role into single messages.
+///
+/// LLM APIs typically require strict user/assistant alternation. This function
+/// consolidates consecutive same-role messages by combining their content items
+/// into a single message.
+fn merge_consecutive_same_role_messages(messages: Vec<Message>) -> Vec<Message> {
+    let original_len = messages.len();
+    if original_len <= 1 {
+        return messages;
+    }
+
+    let mut merged: Vec<Message> = Vec::with_capacity(original_len);
+
+    for msg in messages {
+        let should_merge = match (&merged.last(), &msg) {
+            (Some(Message::User { .. }), Message::User { .. }) => true,
+            (Some(Message::Assistant { .. }), Message::Assistant { .. }) => true,
+            _ => false,
+        };
+
+        if should_merge {
+            let last = merged.last_mut().unwrap();
+            match (last, msg) {
+                (
+                    Message::User {
+                        content: existing, ..
+                    },
+                    Message::User { content: new, .. },
+                ) => {
+                    for item in new.into_iter() {
+                        existing.push(item);
+                    }
+                }
+                (
+                    Message::Assistant {
+                        content: existing, ..
+                    },
+                    Message::Assistant { content: new, .. },
+                ) => {
+                    for item in new.into_iter() {
+                        existing.push(item);
+                    }
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            merged.push(msg);
+        }
+    }
+
+    if merged.len() < original_len {
+        tracing::info!(
+            "Merged consecutive same-role messages: {} -> {}",
+            original_len,
+            merged.len()
+        );
+    }
+
+    merged
 }
 
 /// Convert MIME type string to rig ImageMediaType.
@@ -1718,6 +1782,9 @@ where
         }
     }
 
+    // Merge consecutive same-role messages to ensure strict user/assistant alternation
+    let chat_history = merge_consecutive_same_role_messages(chat_history);
+
     // Check if we have any messages
     if chat_history.is_empty() {
         return Err(DaemonError::InternalError(
@@ -1862,13 +1929,25 @@ where
         std::collections::HashSet::new();
     // Track tool calls being built from deltas (not yet sent)
     let mut accumulated_tool_calls: HashMap<String, LlmToolCall> = HashMap::new();
+    // Diagnostics: track bytes and chunks sent
+    let mut total_text_bytes: usize = 0;
+    let mut total_text_chunks: usize = 0;
+    let mut receiver_dropped = false;
 
     while let Some(chunk_result) = stream_response.next().await {
         match chunk_result {
             Ok(choice) => {
                 let chunk = match choice {
                     StreamedAssistantContent::Text(text) => {
-                        tracing::debug!("Stream chunk: Text({})", text.text);
+                        let len = text.text.len();
+                        total_text_bytes += len;
+                        total_text_chunks += 1;
+                        if total_text_chunks <= 3 || total_text_chunks % 50 == 0 {
+                            tracing::info!(
+                                "Stream chunk #{}: Text({} bytes), total={} bytes",
+                                total_text_chunks, len, total_text_bytes
+                            );
+                        }
                         LlmStreamChunk {
                             text: Some(text.text),
                             tool_calls: vec![],
@@ -1951,18 +2030,34 @@ where
                         }
                     }
                     StreamedAssistantContent::Final(_) => {
-                        tracing::debug!("Stream chunk: Final");
-                        continue; // Skip final response, we'll send done chunk below
+                        tracing::info!(
+                            "Stream chunk: Final (text_so_far={} bytes, {} chunks)",
+                            total_text_bytes, total_text_chunks
+                        );
+                        continue; // Final is a summary; content was already streamed as Text/ToolCall chunks
                     }
                 };
 
                 if tx.send(chunk).await.is_err() {
-                    // Receiver dropped, stop streaming
+                    tracing::warn!(
+                        "Stream receiver dropped after {} text chunks ({} bytes). Stopping.",
+                        total_text_chunks, total_text_bytes
+                    );
+                    receiver_dropped = true;
                     break;
                 }
             }
             Err(e) => {
                 tracing::error!("Stream chunk error: {}", e);
+                // Send the error as text so the WASM agent can display it
+                let error_text = format!("\n[Error: {}]", e);
+                let _ = tx
+                    .send(LlmStreamChunk {
+                        text: Some(error_text),
+                        tool_calls: vec![],
+                        done: false,
+                    })
+                    .await;
                 break;
             }
         }
@@ -1985,9 +2080,9 @@ where
         );
     }
     tracing::info!(
-        "Stream complete. sent_tool_call_ids={:?}, final_tool_calls_count={}",
-        sent_tool_call_ids,
-        final_tool_calls.len()
+        "Stream complete. text_chunks={}, text_bytes={}, sent_tool_call_ids={:?}, final_tool_calls_count={}, receiver_dropped={}",
+        total_text_chunks, total_text_bytes, sent_tool_call_ids,
+        final_tool_calls.len(), receiver_dropped
     );
 
     let _ = tx
