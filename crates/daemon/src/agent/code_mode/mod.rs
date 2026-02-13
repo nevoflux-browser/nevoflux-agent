@@ -11,4 +11,4 @@ pub mod executor;
 pub mod linter;
 pub mod repair_prompt;
 
-pub use executor::{CodeModeExecutor, CodeModeResult, ToolCallResult};
+pub use executor::{execute_code_mode, CodeModeExecutor, CodeModeResult, ToolCallResult};

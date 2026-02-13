@@ -1572,13 +1572,106 @@ async fn handle_chat_message_streaming(
                 .await;
             }
 
-            // Save assistant response to database
-            let final_text = if output.text.is_empty() {
-                accumulated_text
+            // Execute Code Mode if agent returned Python code
+            let raw_text = if output.text.is_empty() {
+                &accumulated_text
             } else {
-                output.text.clone()
+                &output.text
             };
 
+            let (final_text, code_mode_tool_calls) = if mode == AgentMode::Code {
+                match crate::agent::code_mode::execute_code_mode(raw_text, &config).await {
+                    Some(code_result) => {
+                        let mut summary = String::new();
+
+                        if code_result.success {
+                            if !code_result.output.is_empty() {
+                                summary.push_str(&code_result.output);
+                            }
+                            for tr in &code_result.tool_results {
+                                if tr.tool_name == "canvas_render" {
+                                    if let Ok(artifact_data) =
+                                        serde_json::from_str::<serde_json::Value>(
+                                            tr.result.as_str().unwrap_or(""),
+                                        )
+                                        .or_else(|_| Ok::<_, serde_json::Error>(tr.result.clone()))
+                                    {
+                                        if artifact_data
+                                            .get("success")
+                                            .and_then(|s| s.as_bool())
+                                            .unwrap_or(false)
+                                        {
+                                            let artifact = nevoflux_protocol::Artifact {
+                                                id: artifact_data
+                                                    .get("artifact_id")
+                                                    .and_then(|a| a.as_str())
+                                                    .unwrap_or("unknown")
+                                                    .to_string(),
+                                                title: artifact_data
+                                                    .get("title")
+                                                    .and_then(|t| t.as_str())
+                                                    .unwrap_or("Generated App")
+                                                    .to_string(),
+                                                content_type: "application/project+json"
+                                                    .to_string(),
+                                                content: serde_json::to_string(&artifact_data)
+                                                    .unwrap_or_default(),
+                                            };
+                                            send_artifact_stream(
+                                                &artifact,
+                                                &proxy_id,
+                                                channel,
+                                                &request_id,
+                                                &identity,
+                                                &response_tx,
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                }
+                            }
+                        } else if let Some(err) = &code_result.error {
+                            summary = format!("Code execution failed: {}", err);
+                        }
+
+                        // Stream the Code Mode result to sidebar
+                        if !summary.is_empty() {
+                            let chunk_payload = serde_json::json!({
+                                "type": "stream_chunk",
+                                "payload": {
+                                    "content": summary,
+                                    "done": false,
+                                    "code_mode": true
+                                }
+                            });
+                            let response = DaemonEnvelope::new(&proxy_id, channel, chunk_payload)
+                                .with_request_id(&request_id);
+                            if let Err(e) = response_tx.send((identity.clone(), response)).await {
+                                error!("Failed to send code mode result: {}", e);
+                            }
+                        }
+
+                        let final_text = if summary.is_empty() {
+                            raw_text.to_string()
+                        } else {
+                            format!(
+                                "{}\n\n---\n**Code execution result:**\n{}",
+                                raw_text, summary
+                            )
+                        };
+
+                        let cm_tool_calls: Vec<crate::agent::code_mode::ToolCallResult> =
+                            code_result.tool_results;
+
+                        (final_text, cm_tool_calls)
+                    }
+                    None => (raw_text.to_string(), vec![]),
+                }
+            } else {
+                (raw_text.to_string(), vec![])
+            };
+
+            // Save assistant response to database
             if !final_text.is_empty() {
                 match session_manager
                     .add_message(&session_id, MessageRole::Assistant, &final_text)
@@ -1609,6 +1702,22 @@ async fn handle_chat_message_streaming(
                     .await
                 {
                     error!("Failed to save tool call {}: {}", tool_call.name, e);
+                }
+            }
+
+            // Save code mode tool calls to session history
+            for tr in &code_mode_tool_calls {
+                if let Err(e) = session_manager
+                    .add_tool_use_message(
+                        &session_id,
+                        &format!("cm-{}", tr.tool_name),
+                        &tr.tool_name,
+                        &tr.arguments,
+                        Some(&tr.result.to_string()),
+                    )
+                    .await
+                {
+                    error!("Failed to save code mode tool call {}: {}", tr.tool_name, e);
                 }
             }
 
@@ -1914,6 +2023,7 @@ async fn handle_chat_message(
                 .map(|m| match m {
                     "browser" => AgentMode::Browser,
                     "agent" => AgentMode::Agent,
+                    "code" => AgentMode::Code,
                     _ => AgentMode::Chat,
                 })
                 .unwrap_or(AgentMode::Chat);
@@ -2092,10 +2202,40 @@ async fn handle_chat_message(
             // Run agent
             match agent.run(&input) {
                 Ok(output) => {
+                    // Execute Code Mode if applicable
+                    let (final_text, code_mode_tool_results) = if mode == AgentMode::Code {
+                        match crate::agent::code_mode::execute_code_mode(&output.text, &config)
+                            .await
+                        {
+                            Some(code_result) => {
+                                let summary = if code_result.success {
+                                    code_result.output.clone()
+                                } else {
+                                    code_result
+                                        .error
+                                        .clone()
+                                        .unwrap_or_else(|| "Unknown error".to_string())
+                                };
+                                let final_text = if summary.is_empty() {
+                                    output.text.clone()
+                                } else {
+                                    format!(
+                                        "{}\n\n---\n**Code execution result:**\n{}",
+                                        output.text, summary
+                                    )
+                                };
+                                (final_text, code_result.tool_results)
+                            }
+                            None => (output.text.clone(), vec![]),
+                        }
+                    } else {
+                        (output.text.clone(), vec![])
+                    };
+
                     // Save assistant response to database
-                    if !output.text.is_empty() {
+                    if !final_text.is_empty() {
                         match session_manager
-                            .add_message(&session_id, MessageRole::Assistant, &output.text)
+                            .add_message(&session_id, MessageRole::Assistant, &final_text)
                             .await
                         {
                             Ok(msg) => {
@@ -2118,7 +2258,7 @@ async fn handle_chat_message(
                                 &tool_call.id,
                                 &tool_call.name,
                                 &tool_call.arguments,
-                                None, // Result is not available in ToolCall struct
+                                None,
                             )
                             .await
                         {
@@ -2126,12 +2266,28 @@ async fn handle_chat_message(
                         }
                     }
 
+                    // Save code mode tool calls to session history
+                    for tr in &code_mode_tool_results {
+                        if let Err(e) = session_manager
+                            .add_tool_use_message(
+                                &session_id,
+                                &format!("cm-{}", tr.tool_name),
+                                &tr.tool_name,
+                                &tr.arguments,
+                                Some(&tr.result.to_string()),
+                            )
+                            .await
+                        {
+                            error!("Failed to save code mode tool call {}: {}", tr.tool_name, e);
+                        }
+                    }
+
                     let mut response = serde_json::json!({
                         "type": "stream_chunk",
                         "payload": {
-                            "content": output.text,
+                            "content": final_text,
                             "tool_calls": output.tool_calls,
-                            "done": true  // Always mark as done for now since we're not streaming
+                            "done": true
                         }
                     });
 

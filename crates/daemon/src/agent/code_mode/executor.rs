@@ -440,6 +440,151 @@ impl CodeModeExecutor {
     }
 }
 
+// ============================================================================
+// Integration function: wires CodeModeExecutor into the daemon response path
+// ============================================================================
+
+use crate::agent::tools::ToolRegistry;
+use crate::wasm::llm::{execute_llm_chat, LlmChatRequest, LlmMessage};
+use nevoflux_llm::ProviderType;
+use std::str::FromStr;
+
+/// Execute Code Mode: extract Python from text, run through 4-layer pipeline.
+///
+/// Returns `Some(CodeModeResult)` if a Python block was found and executed,
+/// or `None` if no Python block was found in the text.
+pub async fn execute_code_mode(
+    text: &str,
+    config: &crate::config::AgentConfig,
+) -> Option<CodeModeResult> {
+    // Extract Python block from LLM response
+    let python_code = crate::agent::runner::extract_python_block(text)?;
+
+    let registry = ToolRegistry::new();
+    let external_names: Vec<String> = registry
+        .tool_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let executor = CodeModeExecutor::new();
+
+    // Tool executor callback: dispatches to ToolRegistry
+    let tool_executor =
+        |name: &str,
+         args: serde_json::Value|
+         -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send>> {
+            let name = name.to_string();
+            let args = args.clone();
+            Box::pin(async move {
+                let registry = ToolRegistry::new();
+                let named_args = positional_to_named(&name, &args);
+                let call = crate::agent::abi::PendingToolCall {
+                    id: format!("code-mode-{}", uuid_simple()),
+                    name: name.clone(),
+                    arguments: named_args,
+                };
+                let result = registry.execute(&call).await;
+                if let Some(error) = result.error {
+                    Err(error)
+                } else {
+                    let content = result.content.unwrap_or_default();
+                    match serde_json::from_str::<serde_json::Value>(&content) {
+                        Ok(val) => Ok(val),
+                        Err(_) => Ok(serde_json::Value::String(content)),
+                    }
+                }
+            })
+        };
+
+    // LLM rewrite callback: sends repair prompt to the LLM
+    let provider_name = config
+        .llm
+        .active_provider()
+        .unwrap_or("anthropic")
+        .to_string();
+    let api_key = config.llm.active_api_key().unwrap_or("").to_string();
+    let model = config
+        .llm
+        .active_model()
+        .unwrap_or("gpt-4o-mini")
+        .to_string();
+
+    let llm_rewrite =
+        move |prompt: &str| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+            let prompt = prompt.to_string();
+            let provider_name = provider_name.clone();
+            let api_key = api_key.clone();
+            let model = model.clone();
+            Box::pin(async move {
+                if api_key.is_empty() {
+                    return Err("No API key configured for LLM rewrite".to_string());
+                }
+                let provider = ProviderType::from_str(&provider_name)
+                    .map_err(|_| format!("Invalid provider: {provider_name}"))?;
+                let request = LlmChatRequest {
+                    messages: vec![LlmMessage::user(&prompt)],
+                    system: None,
+                    temperature: Some(0.0),
+                    max_tokens: Some(4096),
+                    tools: None,
+                };
+                let response = execute_llm_chat(provider, &api_key, &model, request)
+                    .await
+                    .map_err(|e| format!("LLM rewrite failed: {e}"))?;
+                // Extract Python code from the rewrite response, or use raw content
+                let code = crate::agent::runner::extract_python_block(&response.content)
+                    .unwrap_or(response.content);
+                Ok(code)
+            })
+        };
+
+    Some(
+        executor
+            .execute(&python_code, &external_names, tool_executor, llm_rewrite)
+            .await,
+    )
+}
+
+/// Convert positional args (JSON array from Monty) to named args (JSON object for ToolRegistry).
+fn positional_to_named(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
+    if args.is_object() {
+        return args.clone();
+    }
+    let arr = match args.as_array() {
+        Some(a) => a,
+        None => return serde_json::json!({}),
+    };
+    let param_names: &[&str] = match tool_name {
+        "read_file" => &["path"],
+        "write_file" => &["path", "content"],
+        "list_files" => &["path"],
+        "canvas_render" => &["files", "entry"],
+        "web_search" => &["query"],
+        "fetch_page" => &["url"],
+        "get_code_mode_context" => &[],
+        _ => &[],
+    };
+    let mut obj = serde_json::Map::new();
+    for (i, val) in arr.iter().enumerate() {
+        let key = if i < param_names.len() {
+            param_names[i].to_string()
+        } else {
+            format!("arg{}", i)
+        };
+        obj.insert(key, val.clone());
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Generate a simple unique ID (timestamp + nanos).
+fn uuid_simple() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}-{:x}", now.as_millis(), now.subsec_nanos())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,5 +822,45 @@ mod tests {
         // (depends on Monty behavior with empty input)
         // Just verify it doesn't panic
         assert!(result.output.is_empty() || result.success || result.error.is_some());
+    }
+
+    #[test]
+    fn test_positional_to_named_read_file() {
+        let args = serde_json::json!(["/tmp/test.txt"]);
+        let named = positional_to_named("read_file", &args);
+        assert_eq!(named, serde_json::json!({"path": "/tmp/test.txt"}));
+    }
+
+    #[test]
+    fn test_positional_to_named_write_file() {
+        let args = serde_json::json!(["/tmp/out.txt", "hello"]);
+        let named = positional_to_named("write_file", &args);
+        assert_eq!(
+            named,
+            serde_json::json!({"path": "/tmp/out.txt", "content": "hello"})
+        );
+    }
+
+    #[test]
+    fn test_positional_to_named_object_passthrough() {
+        let args = serde_json::json!({"path": "/test"});
+        let named = positional_to_named("read_file", &args);
+        assert_eq!(named, serde_json::json!({"path": "/test"}));
+    }
+
+    #[test]
+    fn test_positional_to_named_canvas_render() {
+        let files = serde_json::json!({"index.tsx": "code"});
+        let args = serde_json::json!([files, "index.tsx"]);
+        let named = positional_to_named("canvas_render", &args);
+        assert_eq!(named["files"], serde_json::json!({"index.tsx": "code"}));
+        assert_eq!(named["entry"], serde_json::json!("index.tsx"));
+    }
+
+    #[test]
+    fn test_positional_to_named_unknown_tool() {
+        let args = serde_json::json!(["a", "b"]);
+        let named = positional_to_named("unknown_tool", &args);
+        assert_eq!(named, serde_json::json!({"arg0": "a", "arg1": "b"}));
     }
 }
