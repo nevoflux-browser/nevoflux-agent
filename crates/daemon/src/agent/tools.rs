@@ -51,6 +51,7 @@ impl ToolRegistry {
         registry.register("read_file", Box::new(ReadFileTool));
         registry.register("write_file", Box::new(WriteFileTool));
         registry.register("list_files", Box::new(ListFilesTool));
+        registry.register("canvas_render", Box::new(CanvasRenderTool));
 
         registry
     }
@@ -343,6 +344,60 @@ impl ToolExecutor for ListFilesTool {
 }
 
 // ============================================================================
+// Canvas Render Tool
+// ============================================================================
+
+/// Tool for rendering multi-file projects in the browser canvas.
+///
+/// When Python code in Code Mode calls `canvas_render(files, entry)`, this tool
+/// validates the arguments and returns artifact data as JSON. The browser side
+/// (background.js) handles the actual artifact creation and canvas tab opening.
+pub struct CanvasRenderTool;
+
+#[async_trait]
+impl ToolExecutor for CanvasRenderTool {
+    async fn execute(&self, _name: &str, arguments: &serde_json::Value) -> Result<String> {
+        // Validate: files is required and must be an object mapping file paths to content
+        let files = arguments
+            .get("files")
+            .ok_or_else(|| DaemonError::InternalError("Missing 'files' argument".to_string()))?;
+
+        if !files.is_object() {
+            return Err(DaemonError::InternalError(
+                "'files' must be an object mapping file paths to content".to_string(),
+            ));
+        }
+
+        let entry = arguments.get("entry").and_then(|e| e.as_str());
+        let title = arguments
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("Generated App");
+
+        // Generate artifact ID
+        let id = format!(
+            "code-mode-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
+
+        // Return artifact data as JSON - the browser side will handle creation
+        let result = serde_json::json!({
+            "success": true,
+            "artifact_id": id,
+            "type": "project",
+            "title": title,
+            "files": files,
+            "entry": entry,
+        });
+
+        Ok(result.to_string())
+    }
+}
+
+// ============================================================================
 // Code Mode Context Tool
 // ============================================================================
 
@@ -382,6 +437,7 @@ mod tests {
         assert!(registry.has_tool("read_file"));
         assert!(registry.has_tool("write_file"));
         assert!(registry.has_tool("list_files"));
+        assert!(registry.has_tool("canvas_render"));
 
         // Check that unknown tools are not registered
         assert!(!registry.has_tool("unknown_tool"));
@@ -395,8 +451,9 @@ mod tests {
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
         assert!(names.contains(&"list_files"));
-        // 3 built-in tools: read_file, write_file, list_files
-        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"canvas_render"));
+        // 4 built-in tools: read_file, write_file, list_files, canvas_render
+        assert_eq!(names.len(), 4);
     }
 
     #[test]
@@ -434,7 +491,7 @@ mod tests {
 
         registry.register_code_mode_context_tool();
         assert!(registry.has_tool("get_code_mode_context"));
-        assert_eq!(registry.tool_names().len(), 4);
+        assert_eq!(registry.tool_names().len(), 5);
     }
 
     #[tokio::test]
@@ -659,5 +716,137 @@ mod tests {
         assert!(registry.has_tool("read_file"));
         assert!(registry.has_tool("write_file"));
         assert!(registry.has_tool("list_files"));
+        assert!(registry.has_tool("canvas_render"));
+    }
+
+    // ========================================================================
+    // Canvas Render Tool Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_canvas_render_with_valid_files_and_entry() {
+        let registry = ToolRegistry::new();
+        let call = PendingToolCall {
+            id: "call-cr-1".to_string(),
+            name: "canvas_render".to_string(),
+            arguments: serde_json::json!({
+                "files": {
+                    "index.html": "<html><body><div id=\"root\"></div></body></html>",
+                    "App.jsx": "export default function App() { return <h1>Hello</h1>; }",
+                    "style.css": "body { margin: 0; }"
+                },
+                "entry": "index.html",
+                "title": "My React App"
+            }),
+        };
+
+        let result = registry.execute(&call).await;
+        assert!(result.error.is_none(), "Expected success, got error: {:?}", result.error);
+
+        let content = result.content.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["type"], "project");
+        assert_eq!(parsed["title"], "My React App");
+        assert_eq!(parsed["entry"], "index.html");
+        assert!(parsed["artifact_id"].as_str().unwrap().starts_with("code-mode-"));
+        assert!(parsed["files"].is_object());
+        assert_eq!(parsed["files"]["App.jsx"], "export default function App() { return <h1>Hello</h1>; }");
+    }
+
+    #[tokio::test]
+    async fn test_canvas_render_missing_files() {
+        let registry = ToolRegistry::new();
+        let call = PendingToolCall {
+            id: "call-cr-2".to_string(),
+            name: "canvas_render".to_string(),
+            arguments: serde_json::json!({
+                "entry": "index.html"
+            }),
+        };
+
+        let result = registry.execute(&call).await;
+        assert!(result.content.is_none());
+        assert!(result.error.is_some());
+        assert!(result.error.unwrap().contains("Missing 'files' argument"));
+    }
+
+    #[tokio::test]
+    async fn test_canvas_render_invalid_files_type() {
+        let registry = ToolRegistry::new();
+        let call = PendingToolCall {
+            id: "call-cr-3".to_string(),
+            name: "canvas_render".to_string(),
+            arguments: serde_json::json!({
+                "files": "not-an-object"
+            }),
+        };
+
+        let result = registry.execute(&call).await;
+        assert!(result.content.is_none());
+        assert!(result.error.is_some());
+        assert!(result.error.unwrap().contains("'files' must be an object"));
+    }
+
+    #[tokio::test]
+    async fn test_canvas_render_files_as_array() {
+        let registry = ToolRegistry::new();
+        let call = PendingToolCall {
+            id: "call-cr-3b".to_string(),
+            name: "canvas_render".to_string(),
+            arguments: serde_json::json!({
+                "files": ["file1.js", "file2.js"]
+            }),
+        };
+
+        let result = registry.execute(&call).await;
+        assert!(result.content.is_none());
+        assert!(result.error.is_some());
+        assert!(result.error.unwrap().contains("'files' must be an object"));
+    }
+
+    #[tokio::test]
+    async fn test_canvas_render_minimal_args() {
+        let registry = ToolRegistry::new();
+        let call = PendingToolCall {
+            id: "call-cr-4".to_string(),
+            name: "canvas_render".to_string(),
+            arguments: serde_json::json!({
+                "files": {
+                    "index.html": "<h1>Hello</h1>"
+                }
+            }),
+        };
+
+        let result = registry.execute(&call).await;
+        assert!(result.error.is_none(), "Expected success, got error: {:?}", result.error);
+
+        let content = result.content.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["type"], "project");
+        // Default title when none provided
+        assert_eq!(parsed["title"], "Generated App");
+        // entry should be null when not provided
+        assert!(parsed["entry"].is_null());
+        assert!(parsed["artifact_id"].as_str().unwrap().starts_with("code-mode-"));
+    }
+
+    #[tokio::test]
+    async fn test_canvas_render_registered_in_default_registry() {
+        let registry = ToolRegistry::new();
+        assert!(registry.has_tool("canvas_render"));
+
+        // Also verify it appears in python stubs
+        let stubs = registry.to_python_stubs();
+        assert!(stubs.contains("def canvas_render("));
+        assert!(stubs.contains("files: dict, entry: str"));
+
+        // Verify it appears in tool categories summary under Browser & Canvas
+        let summary = registry.tool_categories_summary();
+        assert!(summary.contains("canvas_render"));
+        assert!(summary.contains("Browser & Canvas"));
     }
 }
