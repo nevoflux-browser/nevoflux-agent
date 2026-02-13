@@ -1579,7 +1579,10 @@ async fn handle_chat_message_streaming(
                 &output.text
             };
 
-            let (final_text, code_mode_tool_calls) = if mode == AgentMode::Code {
+            // Try Code Mode: if LLM returned a ```python block, extract and execute it.
+            // This works across all modes (Chat, Browser, Agent) — the LLM decides
+            // whether to use direct tool calls or emit Python for complex tasks.
+            let (final_text, code_mode_tool_calls) =
                 match crate::agent::code_mode::execute_code_mode(raw_text, &config).await {
                     Some(code_result) => {
                         let mut summary = String::new();
@@ -1616,6 +1619,8 @@ async fn handle_chat_message_streaming(
                                                     .to_string(),
                                                 content: serde_json::to_string(&artifact_data)
                                                     .unwrap_or_default(),
+                                                files: None,
+                                                entry: None,
                                             };
                                             send_artifact_stream(
                                                 &artifact,
@@ -1644,9 +1649,12 @@ async fn handle_chat_message_streaming(
                                     "code_mode": true
                                 }
                             });
-                            let response = DaemonEnvelope::new(&proxy_id, channel, chunk_payload)
-                                .with_request_id(&request_id);
-                            if let Err(e) = response_tx.send((identity.clone(), response)).await {
+                            let response =
+                                DaemonEnvelope::new(&proxy_id, channel, chunk_payload)
+                                    .with_request_id(&request_id);
+                            if let Err(e) =
+                                response_tx.send((identity.clone(), response)).await
+                            {
                                 error!("Failed to send code mode result: {}", e);
                             }
                         }
@@ -1666,10 +1674,7 @@ async fn handle_chat_message_streaming(
                         (final_text, cm_tool_calls)
                     }
                     None => (raw_text.to_string(), vec![]),
-                }
-            } else {
-                (raw_text.to_string(), vec![])
-            };
+                };
 
             // Save assistant response to database
             if !final_text.is_empty() {
@@ -1789,11 +1794,13 @@ async fn send_artifact_stream(
 ) {
     const CHUNK_SIZE: usize = 4096;
 
-    // 1. Send artifact_start
+    // 1. Send artifact_start (includes files/entry for project-type artifacts)
     let start_msg = AgentMessage::ArtifactStart(ArtifactStart {
         id: artifact.id.clone(),
         title: artifact.title.clone(),
         content_type: artifact.content_type.clone(),
+        files: artifact.files.clone(),
+        entry: artifact.entry.clone(),
     });
     let payload = serde_json::to_value(&start_msg).unwrap();
     let envelope = DaemonEnvelope::new(proxy_id, channel, payload).with_request_id(request_id);
@@ -1802,29 +1809,32 @@ async fn send_artifact_stream(
         return;
     }
 
-    // 2. Send artifact_delta chunks
+    // 2. Send artifact_delta chunks (for single-file artifacts with content)
     let content = &artifact.content;
-    let bytes = content.as_bytes();
-    let mut offset = 0;
-    while offset < bytes.len() {
-        let mut end = (offset + CHUNK_SIZE).min(bytes.len());
-        // Ensure we don't split a multi-byte UTF-8 character
-        while end < bytes.len() && !content.is_char_boundary(end) {
-            end += 1;
-        }
-        let chunk = &content[offset..end];
+    if !content.is_empty() {
+        let bytes = content.as_bytes();
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let mut end = (offset + CHUNK_SIZE).min(bytes.len());
+            // Ensure we don't split a multi-byte UTF-8 character
+            while end < bytes.len() && !content.is_char_boundary(end) {
+                end += 1;
+            }
+            let chunk = &content[offset..end];
 
-        let delta_msg = AgentMessage::ArtifactDelta(ArtifactDelta {
-            id: artifact.id.clone(),
-            delta: chunk.to_string(),
-        });
-        let payload = serde_json::to_value(&delta_msg).unwrap();
-        let envelope = DaemonEnvelope::new(proxy_id, channel, payload).with_request_id(request_id);
-        if let Err(e) = response_tx.send((identity.to_vec(), envelope)).await {
-            error!("Failed to send artifact_delta: {}", e);
-            return;
+            let delta_msg = AgentMessage::ArtifactDelta(ArtifactDelta {
+                id: artifact.id.clone(),
+                delta: chunk.to_string(),
+            });
+            let payload = serde_json::to_value(&delta_msg).unwrap();
+            let envelope =
+                DaemonEnvelope::new(proxy_id, channel, payload).with_request_id(request_id);
+            if let Err(e) = response_tx.send((identity.to_vec(), envelope)).await {
+                error!("Failed to send artifact_delta: {}", e);
+                return;
+            }
+            offset = end;
         }
-        offset = end;
     }
 
     // 3. Send artifact_complete
@@ -2202,8 +2212,8 @@ async fn handle_chat_message(
             // Run agent
             match agent.run(&input) {
                 Ok(output) => {
-                    // Execute Code Mode if applicable
-                    let (final_text, code_mode_tool_results) = if mode == AgentMode::Code {
+                    // Try Code Mode: if LLM returned a ```python block, extract and execute it.
+                    let (final_text, code_mode_tool_results) =
                         match crate::agent::code_mode::execute_code_mode(&output.text, &config)
                             .await
                         {
@@ -2227,10 +2237,7 @@ async fn handle_chat_message(
                                 (final_text, code_result.tool_results)
                             }
                             None => (output.text.clone(), vec![]),
-                        }
-                    } else {
-                        (output.text.clone(), vec![])
-                    };
+                        };
 
                     // Save assistant response to database
                     if !final_text.is_empty() {
