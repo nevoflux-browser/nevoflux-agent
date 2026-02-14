@@ -553,6 +553,16 @@ impl DaemonHostFunctions {
     }
 }
 
+/// Expand ~ to actual home directory in a file path.
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(&path[2..]);
+        }
+    }
+    std::path::PathBuf::from(path)
+}
+
 impl HostFunctions for DaemonHostFunctions {
     fn llm_chat(&self, request: &LlmRequest) -> HostResult<LlmResponse> {
         // Resolve provider (uses override if set, otherwise config)
@@ -1722,40 +1732,53 @@ impl HostFunctions for DaemonHostFunctions {
             });
         }
 
-        // Step 2: Extract file path from response
+        // Step 2: Extract result data from response
         let result_data = browser_result.data.ok_or_else(|| HostError {
             code: 6001,
             message: "No result data from web fetch".into(),
         })?;
 
-        let file_path = result_data["file_path"].as_str().ok_or_else(|| HostError {
-            code: 6001,
-            message: "No file_path in response".into(),
-        })?;
-
         let page_title = result_data["title"].as_str().unwrap_or("Untitled");
 
-        debug!(
-            "tool_web_fetch: fetched to file={}, title={}",
-            file_path, page_title
-        );
-
-        // Step 3: Read markdown content from cache file
-        // Expand ~ to actual home directory (sidebar may return paths with ~)
-        let expanded_path = if file_path.starts_with("~/") {
-            if let Some(home) = dirs::home_dir() {
-                home.join(&file_path[2..])
-            } else {
-                std::path::PathBuf::from(file_path)
+        // Step 3: Get markdown content — prefer inline _markdown from sidebar,
+        // fall back to reading cache file on disk.
+        // The browser extension includes content directly in _markdown since
+        // it cannot write to the local filesystem (sandbox restriction).
+        let markdown_content = if let Some(inline) = result_data["_markdown"].as_str() {
+            debug!(
+                "tool_web_fetch: got inline markdown, title={}, len={}",
+                page_title,
+                inline.len()
+            );
+            // Opportunistically save to cache for future use
+            if let Some(file_path) = result_data["file_path"].as_str() {
+                let expanded = expand_tilde(file_path);
+                if let Some(parent) = expanded.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&expanded, inline);
             }
-        } else {
-            std::path::PathBuf::from(file_path)
-        };
-        let markdown_content =
-            std::fs::read_to_string(&expanded_path).map_err(|e| HostError {
+            inline.to_string()
+        } else if let Some(file_path) = result_data["file_path"].as_str() {
+            debug!(
+                "tool_web_fetch: reading cache file={}, title={}",
+                file_path, page_title
+            );
+            let expanded = expand_tilde(file_path);
+            std::fs::read_to_string(&expanded).map_err(|e| HostError {
                 code: 6005,
-                message: format!("Failed to read cache file '{}': {}", expanded_path.display(), e),
-            })?;
+                message: format!(
+                    "Failed to read cache file '{}': {}",
+                    expanded.display(),
+                    e
+                ),
+            })?
+        } else {
+            return Err(HostError {
+                code: 6001,
+                message: "No content in web fetch response (no _markdown or file_path)".into(),
+            });
+        };
 
         // Step 4: If prompt is empty, return raw content
         if prompt.trim().is_empty() {
