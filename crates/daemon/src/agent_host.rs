@@ -1741,10 +1741,21 @@ impl HostFunctions for DaemonHostFunctions {
         );
 
         // Step 3: Read markdown content from cache file
-        let markdown_content = std::fs::read_to_string(file_path).map_err(|e| HostError {
-            code: 6005,
-            message: format!("Failed to read cache file: {}", e),
-        })?;
+        // Expand ~ to actual home directory (sidebar may return paths with ~)
+        let expanded_path = if file_path.starts_with("~/") {
+            if let Some(home) = dirs::home_dir() {
+                home.join(&file_path[2..])
+            } else {
+                std::path::PathBuf::from(file_path)
+            }
+        } else {
+            std::path::PathBuf::from(file_path)
+        };
+        let markdown_content =
+            std::fs::read_to_string(&expanded_path).map_err(|e| HostError {
+                code: 6005,
+                message: format!("Failed to read cache file '{}': {}", expanded_path.display(), e),
+            })?;
 
         // Step 4: If prompt is empty, return raw content
         if prompt.trim().is_empty() {
