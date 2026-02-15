@@ -133,48 +133,21 @@ impl AgentConfig {
             self.llm.max_tokens = other.llm.max_tokens;
         }
         // Merge provider-specific configs
-        if other.llm.anthropic.api_key.is_some() {
-            self.llm.anthropic.api_key = other.llm.anthropic.api_key.clone();
-        }
-        if other.llm.anthropic.model.is_some() {
-            self.llm.anthropic.model = other.llm.anthropic.model.clone();
-        }
-        if other.llm.anthropic.context_window.is_some() {
-            self.llm.anthropic.context_window = other.llm.anthropic.context_window;
-        }
-        if other.llm.openai.api_key.is_some() {
-            self.llm.openai.api_key = other.llm.openai.api_key.clone();
-        }
-        if other.llm.openai.model.is_some() {
-            self.llm.openai.model = other.llm.openai.model.clone();
-        }
-        if other.llm.openai.context_window.is_some() {
-            self.llm.openai.context_window = other.llm.openai.context_window;
-        }
-        if other.llm.claude_code.api_key.is_some() {
-            self.llm.claude_code.api_key = other.llm.claude_code.api_key.clone();
-        }
-        if other.llm.claude_code.model.is_some() {
-            self.llm.claude_code.model = other.llm.claude_code.model.clone();
-        }
-        if other.llm.claude_code.context_window.is_some() {
-            self.llm.claude_code.context_window = other.llm.claude_code.context_window;
-        }
-        if other.llm.claude_code.add_dirs.is_some() {
-            self.llm.claude_code.add_dirs = other.llm.claude_code.add_dirs.clone();
-        }
-        if other.llm.gemini_cli.api_key.is_some() {
-            self.llm.gemini_cli.api_key = other.llm.gemini_cli.api_key.clone();
-        }
-        if other.llm.gemini_cli.model.is_some() {
-            self.llm.gemini_cli.model = other.llm.gemini_cli.model.clone();
-        }
-        if other.llm.gemini_cli.context_window.is_some() {
-            self.llm.gemini_cli.context_window = other.llm.gemini_cli.context_window;
-        }
-        if other.llm.gemini_cli.add_dirs.is_some() {
-            self.llm.gemini_cli.add_dirs = other.llm.gemini_cli.add_dirs.clone();
-        }
+        merge_provider(&mut self.llm.anthropic, &other.llm.anthropic);
+        merge_provider(&mut self.llm.openai, &other.llm.openai);
+        merge_provider(&mut self.llm.qwen, &other.llm.qwen);
+        merge_provider(&mut self.llm.deepseek, &other.llm.deepseek);
+        merge_provider(&mut self.llm.openrouter, &other.llm.openrouter);
+        merge_provider(&mut self.llm.claude_code, &other.llm.claude_code);
+        merge_provider(&mut self.llm.gemini_cli, &other.llm.gemini_cli);
+        merge_provider(&mut self.llm.gemini, &other.llm.gemini);
+        merge_provider(&mut self.llm.groq, &other.llm.groq);
+        merge_provider(&mut self.llm.ollama, &other.llm.ollama);
+        merge_provider(&mut self.llm.mistral, &other.llm.mistral);
+        merge_provider(&mut self.llm.xai, &other.llm.xai);
+        merge_provider(&mut self.llm.cohere, &other.llm.cohere);
+        merge_provider(&mut self.llm.perplexity, &other.llm.perplexity);
+        merge_provider(&mut self.llm.together, &other.llm.together);
 
         // Merge storage config
         if other.storage.data_dir.is_some() {
@@ -209,6 +182,22 @@ impl AgentConfig {
         if !other.auth.denied_commands.is_empty() {
             self.auth.denied_commands = other.auth.denied_commands.clone();
         }
+    }
+}
+
+/// Merge a provider config, preferring non-None values from `other`.
+fn merge_provider(target: &mut ProviderConfig, other: &ProviderConfig) {
+    if other.api_key.is_some() {
+        target.api_key = other.api_key.clone();
+    }
+    if other.model.is_some() {
+        target.model = other.model.clone();
+    }
+    if other.context_window.is_some() {
+        target.context_window = other.context_window;
+    }
+    if other.add_dirs.is_some() {
+        target.add_dirs = other.add_dirs.clone();
     }
 }
 
@@ -247,9 +236,45 @@ pub struct LlmConfig {
     #[serde(default)]
     pub claude_code: ProviderConfig,
 
+    /// OpenRouter-specific configuration.
+    #[serde(default)]
+    pub openrouter: ProviderConfig,
+
     /// Gemini CLI-specific configuration.
     #[serde(default)]
     pub gemini_cli: ProviderConfig,
+
+    /// Gemini API-specific configuration.
+    #[serde(default)]
+    pub gemini: ProviderConfig,
+
+    /// Groq-specific configuration.
+    #[serde(default)]
+    pub groq: ProviderConfig,
+
+    /// Ollama-specific configuration.
+    #[serde(default)]
+    pub ollama: ProviderConfig,
+
+    /// Mistral-specific configuration.
+    #[serde(default)]
+    pub mistral: ProviderConfig,
+
+    /// XAI (Grok)-specific configuration.
+    #[serde(default)]
+    pub xai: ProviderConfig,
+
+    /// Cohere-specific configuration.
+    #[serde(default)]
+    pub cohere: ProviderConfig,
+
+    /// Perplexity-specific configuration.
+    #[serde(default)]
+    pub perplexity: ProviderConfig,
+
+    /// Together AI-specific configuration.
+    #[serde(default)]
+    pub together: ProviderConfig,
 
     /// Maximum tokens for responses.
     #[serde(default = "default_max_tokens")]
@@ -303,6 +328,7 @@ impl LlmConfig {
             "openai" => self.openai.api_key.as_deref(),
             "qwen" => self.qwen.api_key.as_deref(),
             "deepseek" => self.deepseek.api_key.as_deref(),
+            "openrouter" => self.openrouter.api_key.as_deref(),
             "claude-code" | "claude_code" => self
                 .claude_code
                 .api_key
@@ -311,6 +337,14 @@ impl LlmConfig {
             "gemini-cli" | "gemini_cli" => {
                 self.gemini_cli.api_key.as_deref().or(Some("gemini-cli"))
             }
+            "gemini" => self.gemini.api_key.as_deref(),
+            "groq" => self.groq.api_key.as_deref(),
+            "ollama" => self.ollama.api_key.as_deref().or(Some("ollama-local")),
+            "mistral" => self.mistral.api_key.as_deref(),
+            "xai" | "grok" => self.xai.api_key.as_deref(),
+            "cohere" => self.cohere.api_key.as_deref(),
+            "perplexity" => self.perplexity.api_key.as_deref(),
+            "together" => self.together.api_key.as_deref(),
             _ => None,
         }
     }
@@ -322,8 +356,17 @@ impl LlmConfig {
             "openai" => self.openai.model.as_deref(),
             "qwen" => self.qwen.model.as_deref(),
             "deepseek" => self.deepseek.model.as_deref(),
+            "openrouter" => self.openrouter.model.as_deref(),
             "claude-code" | "claude_code" => self.claude_code.model.as_deref(),
             "gemini-cli" | "gemini_cli" => self.gemini_cli.model.as_deref(),
+            "gemini" => self.gemini.model.as_deref(),
+            "groq" => self.groq.model.as_deref(),
+            "ollama" => self.ollama.model.as_deref(),
+            "mistral" => self.mistral.model.as_deref(),
+            "xai" | "grok" => self.xai.model.as_deref(),
+            "cohere" => self.cohere.model.as_deref(),
+            "perplexity" => self.perplexity.model.as_deref(),
+            "together" => self.together.model.as_deref(),
             _ => self.default_model.as_deref(),
         }
     }
@@ -333,13 +376,22 @@ impl LlmConfig {
     pub fn configured_providers(&self) -> Vec<(String, String)> {
         let mut result = Vec::new();
         let active = self.active_provider();
-        let providers: [(&str, &ProviderConfig); 6] = [
+        let providers: [(&str, &ProviderConfig); 15] = [
             ("anthropic", &self.anthropic),
             ("openai", &self.openai),
+            ("openrouter", &self.openrouter),
             ("qwen", &self.qwen),
             ("deepseek", &self.deepseek),
             ("claude-code", &self.claude_code),
             ("gemini-cli", &self.gemini_cli),
+            ("gemini", &self.gemini),
+            ("groq", &self.groq),
+            ("ollama", &self.ollama),
+            ("mistral", &self.mistral),
+            ("xai", &self.xai),
+            ("cohere", &self.cohere),
+            ("perplexity", &self.perplexity),
+            ("together", &self.together),
         ];
 
         for (name, config) in &providers {
@@ -375,6 +427,14 @@ impl LlmConfig {
             Some("deepseek") => self.deepseek.context_window,
             Some("claude-code") | Some("claude_code") => self.claude_code.context_window,
             Some("gemini-cli") | Some("gemini_cli") => self.gemini_cli.context_window,
+            Some("gemini") => self.gemini.context_window,
+            Some("groq") => self.groq.context_window,
+            Some("ollama") => self.ollama.context_window,
+            Some("mistral") => self.mistral.context_window,
+            Some("xai") | Some("grok") => self.xai.context_window,
+            Some("cohere") => self.cohere.context_window,
+            Some("perplexity") => self.perplexity.context_window,
+            Some("together") => self.together.context_window,
             _ => None,
         };
 
@@ -404,8 +464,17 @@ impl Default for LlmConfig {
             openai: ProviderConfig::default(),
             qwen: ProviderConfig::default(),
             deepseek: ProviderConfig::default(),
+            openrouter: ProviderConfig::default(),
             claude_code: ProviderConfig::default(),
             gemini_cli: ProviderConfig::default(),
+            gemini: ProviderConfig::default(),
+            groq: ProviderConfig::default(),
+            ollama: ProviderConfig::default(),
+            mistral: ProviderConfig::default(),
+            xai: ProviderConfig::default(),
+            cohere: ProviderConfig::default(),
+            perplexity: ProviderConfig::default(),
+            together: ProviderConfig::default(),
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
             timeout_secs: default_timeout_secs(),

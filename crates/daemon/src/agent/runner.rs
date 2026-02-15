@@ -692,9 +692,14 @@ pub fn extract_python_block(text: &str) -> Option<String> {
     let start = text.find(marker)?;
     let code_start = start + marker.len();
     let remaining = &text[code_start..];
-    // Skip optional newline after marker
-    let remaining = remaining.strip_prefix('\n').unwrap_or(remaining);
-    let end = remaining.find("```")?;
+    // Skip the rest of the marker line (handles trailing spaces, extra chars, \r\n)
+    let remaining = match remaining.find('\n') {
+        Some(nl) => &remaining[nl + 1..],
+        None => return None, // No newline after marker = no code body
+    };
+    // Find the closing fence: 3+ backticks at the start of a line
+    let end = remaining.find("\n```").map(|p| p + 1) // newline + ```
+        .or_else(|| if remaining.starts_with("```") { Some(0) } else { None })?;
     let code = remaining[..end].trim();
     if code.is_empty() {
         None
@@ -1118,5 +1123,30 @@ mod tests {
         // Plain ```python blocks should NOT be extracted (display-only code)
         let text = "Here's an example:\n```python\nx = 1 + 2\nprint(x)\n```\nThat's how it works.";
         assert_eq!(extract_python_block(text), None);
+    }
+
+    #[test]
+    fn test_extract_python_block_extra_backticks() {
+        // LLM sometimes uses 4+ backticks
+        let text = "````python-exec\nx = 42\nprint(x)\n````";
+        let code = extract_python_block(text).unwrap();
+        assert_eq!(code, "x = 42\nprint(x)");
+        assert!(!code.starts_with('`'));
+    }
+
+    #[test]
+    fn test_extract_python_block_trailing_space_on_marker() {
+        // Trailing space after marker
+        let text = "```python-exec \nx = 1\n```";
+        let code = extract_python_block(text).unwrap();
+        assert_eq!(code, "x = 1");
+    }
+
+    #[test]
+    fn test_extract_python_block_crlf() {
+        // Windows-style line endings
+        let text = "```python-exec\r\nx = 1\r\n```";
+        let code = extract_python_block(text).unwrap();
+        assert_eq!(code, "x = 1");
     }
 }

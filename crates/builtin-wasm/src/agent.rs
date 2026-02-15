@@ -9,7 +9,7 @@
 use crate::host::{HostFunctions, HostResult};
 use crate::types::*;
 use nevoflux_protocol::{Artifact, LocalFileRef, PlanProposal, PlanStep};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 /// Format local file references for injection into user message.
 fn format_local_files(files: &[LocalFileRef]) -> String {
@@ -451,6 +451,8 @@ pub struct Agent<H: HostFunctions> {
     pending_plan: RefCell<Option<PlanProposal>>,
     /// Pending artifact from the create_artifact tool (consumed by run_loop to break out).
     pending_artifact: RefCell<Option<Artifact>>,
+    /// Monotonic counter for generating unique artifact IDs.
+    artifact_counter: Cell<u32>,
 }
 
 // Static base prompts, compiled into the binary
@@ -459,7 +461,7 @@ const BROWSER_PROMPT: &str = include_str!("../prompts/browser.md");
 const AGENT_PROMPT: &str = include_str!("../prompts/agent.md");
 const SUBAGENT_BROWSER_PROMPT: &str = include_str!("../prompts/subagent_browser.md");
 const SUBAGENT_AGENT_PROMPT: &str = include_str!("../prompts/subagent_agent.md");
-const CODE_MODE_PROMPT: &str = "You are in Code Mode. Write Python code to accomplish the task. The code will be executed in a sandboxed Python interpreter (Monty). Use only supported syntax: variables, def, if/elif/else, for/while, try/except, comprehensions, f-strings. DO NOT use: class, match, import, with, async/await, yield, decorators. Tools are pre-injected as functions. Return code in a ```python-exec block (NOT ```python — that is for display-only code examples).\n\nAvailable external function: canvas_render(files, entry, title) — Renders a multi-file project (React/Vue/Svelte) in the browser canvas. 'files' is a dict mapping file paths to content strings, 'entry' is the entry point path (e.g. 'src/index.jsx'), 'title' is a human-readable name. Returns JSON with artifact_id on success.";
+const CODE_MODE_PROMPT: &str = "You are in Code Mode. You MUST write a Python script to accomplish the task. Do NOT make individual tool calls — write a single ```python-exec script that orchestrates everything.\n\nThe code runs in a sandboxed Python interpreter (Monty).\n\nSupported syntax: variables, def, if/elif/else, for/while, try/except, comprehensions, f-strings, lambda, slicing.\nDO NOT use: class, match/case, import, with, async/await, yield, decorators.\n\nPre-injected functions (call directly, no import):\n- read_file(path) → str\n- write_file(path, content) → str\n- list_files(path) → list[str]\n- web_search(query) → list[dict] with keys: title, url, snippet\n- fetch_page(url) → str (markdown content)\n- canvas_render(files, entry, title) → dict (renders React/Vue/Svelte app in browser canvas)\n\nReturn code in a ```python-exec block. Use ```python (without -exec) ONLY for display-only code examples shown to the user.";
 
 impl<H: HostFunctions> Agent<H> {
     /// Create a new agent with the given host functions.
@@ -471,6 +473,7 @@ impl<H: HostFunctions> Agent<H> {
             screenshot_cache: RefCell::new(None),
             pending_plan: RefCell::new(None),
             pending_artifact: RefCell::new(None),
+            artifact_counter: Cell::new(0),
         }
     }
 
@@ -483,6 +486,7 @@ impl<H: HostFunctions> Agent<H> {
             screenshot_cache: RefCell::new(None),
             pending_plan: RefCell::new(None),
             pending_artifact: RefCell::new(None),
+            artifact_counter: Cell::new(0),
         }
     }
 
@@ -895,9 +899,16 @@ The following skill instructions MUST be followed exactly. These instructions ta
                         .borrow_mut()
                         .take()
                         .map(|base64| {
+                            // Detect actual image format from base64 magic bytes
+                            let mime_type: String = if base64.starts_with("/9j/") {
+                                "image/jpeg"
+                            } else {
+                                "image/png" // PNG or default fallback
+                            }
+                            .into();
                             vec![Attachment {
                                 name: "screenshot.png".into(),
-                                mime_type: "image/png".into(),
+                                mime_type,
                                 data: base64,
                             }]
                         })
@@ -1204,13 +1215,26 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     .get("entry")
                     .and_then(|e| e.as_str())
                     .map(|s| s.to_string());
-                // Derive artifact ID from the tool call ID for uniqueness
-                let id = format!("art-{}", tool_call.id);
+                let description = tool_call.arguments
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(|s| s.to_string());
+                // Generate a unique artifact ID using timestamp + counter.
+                // LLM-generated tool call IDs (e.g. "call_1") reset each turn
+                // and would cause collisions, so we use server-side generation.
+                let seq = self.artifact_counter.get() + 1;
+                self.artifact_counter.set(seq);
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let id = format!("art-{}-{}", ts, seq);
 
                 *self.pending_artifact.borrow_mut() = Some(Artifact {
                     id: id.clone(),
                     title,
                     content_type,
+                    description,
                     content,
                     files,
                     entry,
@@ -1791,6 +1815,10 @@ The following skill instructions MUST be followed exactly. These instructions ta
                             "type": "string",
                             "enum": ["text/html", "text/markdown", "text/plain", "application/json", "text/css", "text/javascript", "project"],
                             "description": "MIME type of the content. Use 'project' for multi-file React/Vue/Svelte apps."
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Brief description of what this artifact contains (1-2 sentences)"
                         },
                         "content": {
                             "type": "string",

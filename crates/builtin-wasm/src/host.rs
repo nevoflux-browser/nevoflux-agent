@@ -270,6 +270,30 @@ pub trait HostFunctions {
     /// Get accessibility tree with element IDs for interaction.
     fn browser_get_elements(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
 
+    /// List all open browser tabs.
+    fn browser_list_tabs(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
+
+    /// Query tabs with optional filters (url, title, active).
+    fn browser_query_tabs(
+        &self,
+        params: &serde_json::Value,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
+
+    /// Read canvas artifact source code.
+    fn browser_read_artifact(
+        &self,
+        params: &serde_json::Value,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
+
+    /// Edit canvas artifact using search-and-replace.
+    fn browser_edit_artifact(
+        &self,
+        params: &serde_json::Value,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
+
     /// Wait for page to stabilize after an action.
     fn browser_wait_for_stable(
         &self,
@@ -789,6 +813,51 @@ impl HostFunctions for MockHostFunctions {
                 "e1": {"role": "button", "name": "Submit", "selectors": [{"type": "css", "strategy": "id", "value": "#submit"}]},
                 "e2": {"role": "textbox", "name": "Email", "selectors": [{"type": "css", "strategy": "id", "value": "#email"}]}
             }
+        })))
+    }
+
+    fn browser_list_tabs(&self, _tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(serde_json::json!({
+            "tabs": [
+                {"id": 1, "url": "https://example.com", "title": "Example", "active": true, "windowId": 1},
+                {"id": 2, "url": "https://test.com", "title": "Test Page", "active": false, "windowId": 1}
+            ]
+        })))
+    }
+
+    fn browser_query_tabs(
+        &self,
+        _params: &serde_json::Value,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(serde_json::json!({
+            "tabs": [
+                {"id": 1, "url": "https://example.com", "title": "Example", "active": true, "windowId": 1}
+            ]
+        })))
+    }
+
+    fn browser_read_artifact(
+        &self,
+        _params: &serde_json::Value,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(serde_json::json!({
+            "content": "<!DOCTYPE html><html><body>Mock artifact</body></html>",
+            "totalLines": 1,
+            "truncated": false,
+            "title": "Mock Artifact",
+            "type": "html"
+        })))
+    }
+
+    fn browser_edit_artifact(
+        &self,
+        _params: &serde_json::Value,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        Ok(BrowserToolResult::success(serde_json::json!({
+            "lines": 1
         })))
     }
 

@@ -360,6 +360,8 @@ pub struct ListSessionsParams {
     pub offset: Option<u32>,
     /// Search query for title.
     pub search: Option<String>,
+    /// Exclude sessions with no messages (default: false).
+    pub exclude_empty: Option<bool>,
 }
 
 impl ListSessionsParams {
@@ -401,6 +403,12 @@ impl ListSessionsParams {
     /// Set search query.
     pub fn with_search(mut self, search: impl Into<String>) -> Self {
         self.search = Some(search.into());
+        self
+    }
+
+    /// Exclude sessions that have no messages.
+    pub fn exclude_empty(mut self, exclude: bool) -> Self {
+        self.exclude_empty = Some(exclude);
         self
     }
 }

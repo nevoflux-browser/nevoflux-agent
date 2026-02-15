@@ -1,11 +1,13 @@
 //! Data models for the storage layer.
 
+pub(crate) mod artifact;
 mod config;
 mod memory;
 mod message;
 mod permission;
 mod session;
 
+pub use artifact::{ArtifactRecord, CreateArtifactParams};
 pub use config::ConfigEntry;
 pub use memory::MemoryChunk;
 pub use message::{ContentType, CreateMessageParams, ListMessagesParams, Message, MessageRole};

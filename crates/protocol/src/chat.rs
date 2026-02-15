@@ -310,10 +310,19 @@ pub struct Artifact {
     pub id: String,
     /// Human-readable title.
     pub title: String,
-    /// MIME type (e.g., "text/html", "text/markdown", "application/json").
+    /// MIME type (e.g., "text/html", "text/markdown", "project").
     pub content_type: String,
-    /// The full artifact content.
+    /// Brief description of what this artifact contains.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The full artifact content (single-file artifacts).
     pub content: String,
+    /// Multi-file project: map of file paths to content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<std::collections::HashMap<String, String>>,
+    /// Multi-file project: entry point file path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
 }
 
 /// Sent when an artifact begins streaming.
@@ -323,8 +332,17 @@ pub struct ArtifactStart {
     pub id: String,
     /// Human-readable title.
     pub title: String,
-    /// MIME type (e.g., "text/html").
+    /// MIME type (e.g., "text/html", "project").
     pub content_type: String,
+    /// Brief description of what this artifact contains.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Multi-file project: map of file paths to content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<std::collections::HashMap<String, String>>,
+    /// Multi-file project: entry point file path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
 }
 
 /// A chunk of artifact content.
@@ -996,7 +1014,10 @@ mod tests {
             id: "art-001".into(),
             title: "My Dashboard".into(),
             content_type: "text/html".into(),
+            description: None,
             content: "<html><body><h1>Hello</h1></body></html>".into(),
+            files: None,
+            entry: None,
         };
 
         let json = serde_json::to_string(&artifact).unwrap();
@@ -1013,6 +1034,9 @@ mod tests {
             id: "art-002".into(),
             title: "Report".into(),
             content_type: "text/markdown".into(),
+            description: None,
+            files: None,
+            entry: None,
         });
 
         let json = serde_json::to_string(&msg).unwrap();

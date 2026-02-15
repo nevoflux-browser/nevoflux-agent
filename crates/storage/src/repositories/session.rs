@@ -187,6 +187,12 @@ impl<'a> SessionRepository<'a> {
                 values.push(Box::new(format!("%{}%", search)));
             }
 
+            if params.exclude_empty.unwrap_or(false) {
+                conditions.push(
+                    "EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id)",
+                );
+            }
+
             let where_clause = if conditions.is_empty() {
                 String::new()
             } else {
@@ -227,14 +233,29 @@ impl<'a> SessionRepository<'a> {
 
     /// Count total sessions.
     pub fn count(&self, include_archived: bool) -> Result<u32> {
-        self.db.with_connection(|conn| {
-            let sql = if include_archived {
-                "SELECT COUNT(*) FROM sessions"
-            } else {
-                "SELECT COUNT(*) FROM sessions WHERE archived = 0"
-            };
+        self.count_filtered(include_archived, false)
+    }
 
-            let count: i64 = conn.query_row(sql, [], |row| row.get(0))?;
+    /// Count total sessions with optional empty-session filtering.
+    pub fn count_filtered(&self, include_archived: bool, exclude_empty: bool) -> Result<u32> {
+        self.db.with_connection(|conn| {
+            let mut conditions = Vec::new();
+            if !include_archived {
+                conditions.push("archived = 0");
+            }
+            if exclude_empty {
+                conditions.push(
+                    "EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id)",
+                );
+            }
+            let where_clause = if conditions.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", conditions.join(" AND "))
+            };
+            let sql = format!("SELECT COUNT(*) FROM sessions{}", where_clause);
+
+            let count: i64 = conn.query_row(&sql, [], |row| row.get(0))?;
             Ok(count as u32)
         })
     }
@@ -432,6 +453,17 @@ impl<'a> SessionRepository<'a> {
             }
 
             Ok((deleted, bytes_freed))
+        })
+    }
+
+    /// Delete sessions that have no messages.
+    pub fn cleanup_empty(&self) -> Result<u32> {
+        self.db.with_connection(|conn| {
+            let rows_affected = conn.execute(
+                "DELETE FROM sessions WHERE NOT EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id)",
+                [],
+            )?;
+            Ok(rows_affected as u32)
         })
     }
 

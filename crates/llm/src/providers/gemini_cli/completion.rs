@@ -487,7 +487,25 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
                                 continue;
                             }
 
-                            // Skip other event types (init, user message, result)
+                            // Handle "result" events — propagate errors to the caller
+                            if event_type == Some("result") {
+                                let status = entry.get("status").and_then(|s| s.as_str());
+                                if status == Some("error") {
+                                    let error_msg = entry
+                                        .get("error")
+                                        .and_then(|e| e.get("message"))
+                                        .and_then(|m| m.as_str())
+                                        .unwrap_or("Unknown Gemini CLI error");
+                                    let items: StreamItems =
+                                        vec![Err(CompletionError::ProviderError(format!(
+                                            "Gemini API error: {}",
+                                            error_msg
+                                        )))];
+                                    return Some((items, (lines, buffer, in_tool_call)));
+                                }
+                                // status=success — stream is done, let None handle it
+                                continue;
+                            }
                             continue;
                         }
                         Some(Err(e)) => {

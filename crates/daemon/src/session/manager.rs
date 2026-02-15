@@ -3,8 +3,9 @@
 use crate::config::SessionConfig;
 use crate::error::{DaemonError, Result};
 use nevoflux_storage::{
-    ConfigEntry, ContentType, CreateMessageParams, CreateSessionParams, ListMessagesParams,
-    ListSessionsParams, Message, MessageRole, Session, SessionMode, Storage, UpdateSessionParams,
+    ArtifactRecord, ConfigEntry, ContentType, CreateArtifactParams, CreateMessageParams,
+    CreateSessionParams, ListMessagesParams, ListSessionsParams, Message, MessageRole, Session,
+    SessionMode, Storage, UpdateSessionParams,
 };
 use std::sync::Arc;
 
@@ -138,7 +139,8 @@ impl SessionManager {
 
     /// Delete a session.
     pub async fn delete_session(&self, session_id: &str) -> Result<bool> {
-        // Delete messages first
+        // Delete related data first
+        self.storage.artifacts().delete_by_session(session_id)?;
         self.storage.messages().delete_by_session(session_id)?;
         // Then delete the session
         Ok(self.storage.sessions().delete(session_id)?)
@@ -278,6 +280,35 @@ impl SessionManager {
     /// Get session count.
     pub async fn get_session_count(&self, include_archived: bool) -> Result<u32> {
         Ok(self.storage.sessions().count(include_archived)?)
+    }
+
+    /// Get the total number of sessions, optionally excluding empty ones.
+    pub async fn get_session_count_filtered(
+        &self,
+        include_archived: bool,
+        exclude_empty: bool,
+    ) -> Result<u32> {
+        Ok(self
+            .storage
+            .sessions()
+            .count_filtered(include_archived, exclude_empty)?)
+    }
+
+    // ========== Artifacts ==========
+
+    /// Save an artifact to storage.
+    pub fn save_artifact(&self, params: CreateArtifactParams) -> Result<ArtifactRecord> {
+        Ok(self.storage.artifacts().create(params)?)
+    }
+
+    /// Get a full artifact by ID.
+    pub fn get_artifact(&self, id: &str) -> Result<Option<ArtifactRecord>> {
+        Ok(self.storage.artifacts().get(id)?)
+    }
+
+    /// List artifacts for a session (summaries only).
+    pub fn list_artifacts(&self, session_id: &str) -> Result<Vec<ArtifactRecord>> {
+        Ok(self.storage.artifacts().list_by_session(session_id)?)
     }
 
     // ========== Config (ContentStore persistence) ==========

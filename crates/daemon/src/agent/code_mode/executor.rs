@@ -219,6 +219,13 @@ impl CodeModeExecutor {
                 Err(exc) => {
                     let error_msg = exc.message().unwrap_or("parse error").to_string();
                     let error_type = format!("{}", exc.exc_type());
+                    tracing::warn!(
+                        "Code Mode: parse error (retry {}/{}): {}: {}",
+                        retries,
+                        MAX_RETRIES,
+                        error_type,
+                        error_msg
+                    );
 
                     if retries < MAX_RETRIES {
                         // Extract line number from traceback if available
@@ -229,13 +236,19 @@ impl CodeModeExecutor {
                             &error_msg,
                             line,
                         );
+                        tracing::info!("Code Mode: requesting LLM rewrite for parse error");
                         match llm_rewrite(&repair_prompt).await {
                             Ok(rewritten) => {
+                                tracing::info!(
+                                    "Code Mode: LLM rewrite succeeded ({} bytes)",
+                                    rewritten.len()
+                                );
                                 current_code = rewritten;
                                 retries += 1;
                                 continue;
                             }
                             Err(e) => {
+                                tracing::error!("Code Mode: LLM rewrite failed: {}", e);
                                 return CodeModeResult {
                                     output: String::new(),
                                     tool_results: Vec::new(),
@@ -459,6 +472,11 @@ pub async fn execute_code_mode(
 ) -> Option<CodeModeResult> {
     // Extract Python block from LLM response
     let python_code = crate::agent::runner::extract_python_block(text)?;
+    tracing::info!(
+        "Code Mode: extracted python block ({} bytes), first 200 chars: {:?}",
+        python_code.len(),
+        &python_code[..python_code.len().min(200)]
+    );
 
     let registry = ToolRegistry::new();
     let external_names: Vec<String> = registry
@@ -539,11 +557,17 @@ pub async fn execute_code_mode(
             })
         };
 
-    Some(
-        executor
-            .execute(&python_code, &external_names, tool_executor, llm_rewrite)
-            .await,
-    )
+    let result = executor
+        .execute(&python_code, &external_names, tool_executor, llm_rewrite)
+        .await;
+    tracing::info!(
+        "Code Mode: execution complete. success={}, retries={}, output_len={}, error={:?}",
+        result.success,
+        result.retries,
+        result.output.len(),
+        result.error
+    );
+    Some(result)
 }
 
 /// Convert positional args (JSON array from Monty) to named args (JSON object for ToolRegistry).
@@ -562,6 +586,7 @@ fn positional_to_named(tool_name: &str, args: &serde_json::Value) -> serde_json:
         "canvas_render" => &["files", "entry"],
         "web_search" => &["query"],
         "fetch_page" => &["url"],
+        "run_command" => &["command"],
         "get_code_mode_context" => &[],
         _ => &[],
     };

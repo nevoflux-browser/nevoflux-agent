@@ -659,14 +659,16 @@ where
                 match image_attachment {
                     Some(attachment) if provider == ProviderType::Anthropic => {
                         // Anthropic: image inside tool result (native multimodal tool results)
+                        let clean_b64 = clean_base64_data(&attachment.data);
+                        let detected_media_type = detect_image_media_type_from_base64(&clean_b64, &attachment.mime_type);
                         let tool_result = ToolResult {
                             id: tool_call_id.clone(),
                             call_id: Some(tool_call_id),
                             content: OneOrMany::many(vec![
                                 ToolResultContent::text(&msg.content),
                                 ToolResultContent::image_base64(
-                                    &attachment.data,
-                                    Some(ImageMediaType::PNG),
+                                    &clean_b64,
+                                    Some(detected_media_type),
                                     None,
                                 ),
                             ])
@@ -680,6 +682,8 @@ where
                     }
                     Some(attachment) => {
                         // OpenAI/others: text tool result + separate user image message
+                        let clean_b64 = clean_base64_data(&attachment.data);
+                        let detected_media_type = detect_image_media_type_from_base64(&clean_b64, &attachment.mime_type);
                         let tool_result = ToolResult {
                             id: tool_call_id.clone(),
                             call_id: Some(tool_call_id),
@@ -690,8 +694,8 @@ where
                         });
                         chat_history.push(Message::User {
                             content: OneOrMany::one(UserContent::Image(Image {
-                                data: DocumentSourceKind::Base64(attachment.data.clone()),
-                                media_type: Some(ImageMediaType::PNG),
+                                data: DocumentSourceKind::Base64(clean_b64),
+                                media_type: Some(detected_media_type),
                                 detail: None,
                                 additional_params: None,
                             })),
@@ -701,6 +705,7 @@ where
                         // No attachment — fallback to extract_screenshot_from_tool_result
                         match extract_screenshot_from_tool_result(&msg.content) {
                             Some(screenshot) if provider == ProviderType::Anthropic => {
+                                let detected_media_type = detect_image_media_type_from_base64(&screenshot.base64_data, "image/png");
                                 let tool_result = ToolResult {
                                     id: tool_call_id.clone(),
                                     call_id: Some(tool_call_id),
@@ -710,7 +715,7 @@ where
                                         ),
                                         ToolResultContent::image_base64(
                                             &screenshot.base64_data,
-                                            Some(ImageMediaType::PNG),
+                                            Some(detected_media_type),
                                             None,
                                         ),
                                     ])
@@ -723,6 +728,7 @@ where
                                 });
                             }
                             Some(screenshot) => {
+                                let detected_media_type = detect_image_media_type_from_base64(&screenshot.base64_data, "image/png");
                                 let tool_result = ToolResult {
                                     id: tool_call_id.clone(),
                                     call_id: Some(tool_call_id),
@@ -736,7 +742,7 @@ where
                                 chat_history.push(Message::User {
                                     content: OneOrMany::one(UserContent::Image(Image {
                                         data: DocumentSourceKind::Base64(screenshot.base64_data),
-                                        media_type: Some(ImageMediaType::PNG),
+                                        media_type: Some(detected_media_type),
                                         detail: None,
                                         additional_params: None,
                                     })),
@@ -795,16 +801,16 @@ where
                     }
                 }
 
-                // If no content at all, add empty text
+                // If no content at all, add a single space (Anthropic rejects empty text with cache_control)
                 if assistant_contents.is_empty() {
-                    assistant_contents.push(AssistantContent::text(""));
+                    assistant_contents.push(AssistantContent::text(" "));
                 }
 
                 let content = if assistant_contents.len() == 1 {
                     OneOrMany::one(assistant_contents.remove(0))
                 } else {
                     OneOrMany::many(assistant_contents)
-                        .unwrap_or_else(|_| OneOrMany::one(AssistantContent::text("")))
+                        .unwrap_or_else(|_| OneOrMany::one(AssistantContent::text(" ")))
                 };
                 chat_history.push(Message::Assistant { id: None, content });
             }
@@ -839,7 +845,7 @@ where
                         );
                     }
 
-                    if let Some(media_type) = mime_to_image_media_type(&attachment.mime_type) {
+                    if mime_to_image_media_type(&attachment.mime_type).is_some() {
                         // Strip data URL prefix if present (e.g., "data:image/png;base64,")
                         let base64_data = if attachment.data.starts_with("data:") {
                             attachment
@@ -858,9 +864,10 @@ where
                             base64_data.len(),
                             clean_base64.len()
                         );
+                        let detected_media_type = detect_image_media_type_from_base64(&clean_base64, &attachment.mime_type);
                         user_content.push(UserContent::Image(Image {
                             data: DocumentSourceKind::Base64(clean_base64),
-                            media_type: Some(media_type),
+                            media_type: Some(detected_media_type),
                             detail: None,
                             additional_params: None,
                         }));
@@ -870,7 +877,7 @@ where
                 if !user_content.is_empty() {
                     chat_history.push(Message::User {
                         content: OneOrMany::many(user_content)
-                            .unwrap_or_else(|_| OneOrMany::one(UserContent::text(""))),
+                            .unwrap_or_else(|_| OneOrMany::one(UserContent::text(" "))),
                     });
                 }
             }
@@ -1022,6 +1029,56 @@ fn mime_to_image_media_type(mime: &str) -> Option<ImageMediaType> {
         "image/webp" => Some(ImageMediaType::WEBP),
         _ => None,
     }
+}
+
+/// Detect image format from base64-encoded data by checking magic bytes.
+/// Returns the detected ImageMediaType, falling back to the declared MIME type.
+fn detect_image_media_type_from_base64(base64_data: &str, declared_mime: &str) -> ImageMediaType {
+    // Base64-encoded magic byte prefixes:
+    // JPEG: /9j/       (0xFF 0xD8 0xFF)
+    // PNG:  iVBORw0KGo (0x89 0x50 0x4E 0x47 = \x89PNG)
+    // GIF:  R0lGOD      (GIF87a/GIF89a)
+    // WEBP: UklGR       (RIFF....WEBP)
+    let detected = if base64_data.starts_with("/9j/") {
+        Some(ImageMediaType::JPEG)
+    } else if base64_data.starts_with("iVBORw0KGo") {
+        Some(ImageMediaType::PNG)
+    } else if base64_data.starts_with("R0lGOD") {
+        Some(ImageMediaType::GIF)
+    } else if base64_data.starts_with("UklGR") {
+        Some(ImageMediaType::WEBP)
+    } else {
+        None
+    };
+
+    match detected {
+        Some(media_type) => {
+            if let Some(declared) = mime_to_image_media_type(declared_mime) {
+                if std::mem::discriminant(&media_type) != std::mem::discriminant(&declared) {
+                    tracing::warn!(
+                        "Image format mismatch: declared={}, detected={:?}. Using detected format.",
+                        declared_mime,
+                        media_type
+                    );
+                }
+            }
+            media_type
+        }
+        None => mime_to_image_media_type(declared_mime).unwrap_or(ImageMediaType::PNG),
+    }
+}
+
+/// Clean base64 data by stripping data URL prefix and removing whitespace.
+///
+/// Some encoders produce `data:image/png;base64,iVBOR...` or add line breaks.
+/// The Anthropic API requires raw base64 without prefix or whitespace.
+fn clean_base64_data(data: &str) -> String {
+    let stripped = if data.starts_with("data:") {
+        data.find(",").map(|i| &data[i + 1..]).unwrap_or(data)
+    } else {
+        data
+    };
+    stripped.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// Extract text content from a rig Message.
@@ -1567,14 +1624,16 @@ where
                 match image_attachment {
                     Some(attachment) if provider == ProviderType::Anthropic => {
                         // Anthropic: image inside tool result
+                        let clean_b64 = clean_base64_data(&attachment.data);
+                        let detected_media_type = detect_image_media_type_from_base64(&clean_b64, &attachment.mime_type);
                         let tool_result = ToolResult {
                             id: tool_call_id.clone(),
                             call_id: Some(tool_call_id),
                             content: OneOrMany::many(vec![
                                 ToolResultContent::text(&msg.content),
                                 ToolResultContent::image_base64(
-                                    &attachment.data,
-                                    Some(ImageMediaType::PNG),
+                                    &clean_b64,
+                                    Some(detected_media_type),
                                     None,
                                 ),
                             ])
@@ -1588,6 +1647,8 @@ where
                     }
                     Some(attachment) => {
                         // OpenAI/others: text tool result + separate user image message
+                        let clean_b64 = clean_base64_data(&attachment.data);
+                        let detected_media_type = detect_image_media_type_from_base64(&clean_b64, &attachment.mime_type);
                         let tool_result = ToolResult {
                             id: tool_call_id.clone(),
                             call_id: Some(tool_call_id),
@@ -1598,8 +1659,8 @@ where
                         });
                         chat_history.push(Message::User {
                             content: OneOrMany::one(UserContent::Image(Image {
-                                data: DocumentSourceKind::Base64(attachment.data.clone()),
-                                media_type: Some(ImageMediaType::PNG),
+                                data: DocumentSourceKind::Base64(clean_b64),
+                                media_type: Some(detected_media_type),
                                 detail: None,
                                 additional_params: None,
                             })),
@@ -1609,6 +1670,7 @@ where
                         // No attachment — fallback to extract_screenshot_from_tool_result
                         match extract_screenshot_from_tool_result(&msg.content) {
                             Some(screenshot) if provider == ProviderType::Anthropic => {
+                                let detected_media_type = detect_image_media_type_from_base64(&screenshot.base64_data, "image/png");
                                 let tool_result = ToolResult {
                                     id: tool_call_id.clone(),
                                     call_id: Some(tool_call_id),
@@ -1618,7 +1680,7 @@ where
                                         ),
                                         ToolResultContent::image_base64(
                                             &screenshot.base64_data,
-                                            Some(ImageMediaType::PNG),
+                                            Some(detected_media_type),
                                             None,
                                         ),
                                     ])
@@ -1631,6 +1693,7 @@ where
                                 });
                             }
                             Some(screenshot) => {
+                                let detected_media_type = detect_image_media_type_from_base64(&screenshot.base64_data, "image/png");
                                 let tool_result = ToolResult {
                                     id: tool_call_id.clone(),
                                     call_id: Some(tool_call_id),
@@ -1644,7 +1707,7 @@ where
                                 chat_history.push(Message::User {
                                     content: OneOrMany::one(UserContent::Image(Image {
                                         data: DocumentSourceKind::Base64(screenshot.base64_data),
-                                        media_type: Some(ImageMediaType::PNG),
+                                        media_type: Some(detected_media_type),
                                         detail: None,
                                         additional_params: None,
                                     })),
@@ -1703,16 +1766,16 @@ where
                     }
                 }
 
-                // If no content at all, add empty text
+                // If no content at all, add a single space (Anthropic rejects empty text with cache_control)
                 if assistant_contents.is_empty() {
-                    assistant_contents.push(AssistantContent::text(""));
+                    assistant_contents.push(AssistantContent::text(" "));
                 }
 
                 let content = if assistant_contents.len() == 1 {
                     OneOrMany::one(assistant_contents.remove(0))
                 } else {
                     OneOrMany::many(assistant_contents)
-                        .unwrap_or_else(|_| OneOrMany::one(AssistantContent::text("")))
+                        .unwrap_or_else(|_| OneOrMany::one(AssistantContent::text(" ")))
                 };
                 chat_history.push(Message::Assistant { id: None, content });
             }
@@ -1740,7 +1803,7 @@ where
                         );
                     }
 
-                    if let Some(media_type) = mime_to_image_media_type(&attachment.mime_type) {
+                    if mime_to_image_media_type(&attachment.mime_type).is_some() {
                         // Strip data URL prefix if present (e.g., "data:image/png;base64,")
                         let base64_data = if attachment.data.starts_with("data:") {
                             attachment
@@ -1759,9 +1822,10 @@ where
                             base64_data.len(),
                             clean_base64.len()
                         );
+                        let detected_media_type = detect_image_media_type_from_base64(&clean_base64, &attachment.mime_type);
                         user_content.push(UserContent::Image(Image {
                             data: DocumentSourceKind::Base64(clean_base64),
-                            media_type: Some(media_type),
+                            media_type: Some(detected_media_type),
                             detail: None,
                             additional_params: None,
                         }));
@@ -1775,7 +1839,7 @@ where
                 if !user_content.is_empty() {
                     chat_history.push(Message::User {
                         content: OneOrMany::many(user_content)
-                            .unwrap_or_else(|_| OneOrMany::one(UserContent::text(""))),
+                            .unwrap_or_else(|_| OneOrMany::one(UserContent::text(" "))),
                     });
                 }
             }
@@ -1945,7 +2009,9 @@ where
                         if total_text_chunks <= 3 || total_text_chunks % 50 == 0 {
                             tracing::info!(
                                 "Stream chunk #{}: Text({} bytes), total={} bytes",
-                                total_text_chunks, len, total_text_bytes
+                                total_text_chunks,
+                                len,
+                                total_text_bytes
                             );
                         }
                         LlmStreamChunk {
@@ -2032,7 +2098,8 @@ where
                     StreamedAssistantContent::Final(_) => {
                         tracing::info!(
                             "Stream chunk: Final (text_so_far={} bytes, {} chunks)",
-                            total_text_bytes, total_text_chunks
+                            total_text_bytes,
+                            total_text_chunks
                         );
                         continue; // Final is a summary; content was already streamed as Text/ToolCall chunks
                     }
@@ -2041,7 +2108,8 @@ where
                 if tx.send(chunk).await.is_err() {
                     tracing::warn!(
                         "Stream receiver dropped after {} text chunks ({} bytes). Stopping.",
-                        total_text_chunks, total_text_bytes
+                        total_text_chunks,
+                        total_text_bytes
                     );
                     receiver_dropped = true;
                     break;

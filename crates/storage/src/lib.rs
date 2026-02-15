@@ -49,16 +49,16 @@ pub use storage::Storage;
 
 // Re-export model types for convenience
 pub use models::{
-    CheckPermissionParams, CleanupPolicy, CleanupResult, ConfigEntry, ContentType,
-    CreateMessageParams, CreatePermissionParams, CreateSessionParams, ListMessagesParams,
-    ListSessionsParams, MemoryChunk, Message, MessageRole, Permission, PermissionScope, Session,
-    SessionMode, UpdateSessionParams,
+    ArtifactRecord, CheckPermissionParams, CleanupPolicy, CleanupResult, ConfigEntry, ContentType,
+    CreateArtifactParams, CreateMessageParams, CreatePermissionParams, CreateSessionParams,
+    ListMessagesParams, ListSessionsParams, MemoryChunk, Message, MessageRole, Permission,
+    PermissionScope, Session, SessionMode, UpdateSessionParams,
 };
 
 // Re-export repository types for convenience
 pub use repositories::{
-    ConfigRepository, MemoryRepository, MessageRepository, PermissionRepository, SessionRepository,
-    TraceRepository,
+    ArtifactRepository, ConfigRepository, MemoryRepository, MessageRepository,
+    PermissionRepository, SessionRepository, TraceRepository,
 };
 
 pub use repositories::traces::{CreateTraceSpanParams, TraceSpanRecord};

@@ -2744,7 +2744,7 @@ impl DaemonHostFunctions {
 
         // Case 2: JSON object with known keys
         if let Some(obj) = value.as_object() {
-            for key in &["screenshot", "data", "image", "base64"] {
+            for key in &["screenshot", "data", "data_url", "image", "base64"] {
                 if let Some(serde_json::Value::String(s)) = obj.get(*key) {
                     if !s.is_empty() {
                         return Some(s.to_string());

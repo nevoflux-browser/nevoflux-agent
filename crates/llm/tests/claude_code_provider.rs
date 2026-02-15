@@ -470,6 +470,7 @@ fn test_completion_response_conversion_with_usage() {
             input_tokens: 100,
             output_tokens: 20,
         },
+        tool_calls: Vec::new(),
     };
 
     let rig_resp: CompletionResponse<ClaudeCodeCompletionResponse> = resp.try_into().unwrap();
@@ -491,6 +492,7 @@ fn test_completion_response_conversion_empty_is_error() {
     let resp = ClaudeCodeCompletionResponse {
         content: String::new(),
         usage: ClaudeUsage::default(),
+        tool_calls: Vec::new(),
     };
 
     let result: Result<CompletionResponse<ClaudeCodeCompletionResponse>, _> = resp.try_into();
@@ -505,6 +507,7 @@ fn test_completion_response_raw_response_preserved() {
             input_tokens: 5,
             output_tokens: 1,
         },
+        tool_calls: Vec::new(),
     };
 
     let rig_resp: CompletionResponse<ClaudeCodeCompletionResponse> = resp.try_into().unwrap();

@@ -198,6 +198,59 @@ pub enum BrowserToolAction {
     /// - `is_custom`: Whether the answer was custom input
     /// - `selected_index`: Index of selected option (-1 if custom)
     AskUser,
+    /// List all open browser tabs.
+    ///
+    /// Params: none
+    ///
+    /// Returns:
+    /// - `tabs`: Array of {id, url, title, active, windowId}
+    ListTabs,
+    /// Query tabs with optional filters.
+    ///
+    /// Params:
+    /// - `url`: Optional glob pattern (e.g., "https://example.com/*")
+    /// - `title`: Optional glob pattern (case-insensitive)
+    /// - `active`: Optional boolean
+    ///
+    /// Returns:
+    /// - `tabs`: Filtered array of {id, url, title, active, windowId}
+    QueryTabs,
+    /// Get all interactive elements on the page (alias for Snapshot).
+    ///
+    /// Params: none
+    ///
+    /// Returns:
+    /// - Array of {id, tag, text, role} for interactive elements
+    GetElements,
+    /// Read the source code of a canvas artifact.
+    ///
+    /// Params:
+    /// - `id`: Artifact ID (e.g., "art-xxx")
+    /// - `offset`: Optional start line (1-based)
+    /// - `limit`: Optional number of lines
+    /// - `grep`: Optional search keyword
+    /// - `context`: Optional lines around grep matches
+    ///
+    /// Returns:
+    /// - `success`: boolean
+    /// - `content`: code string
+    /// - `totalLines`: total line count
+    /// - `truncated`: whether output was truncated
+    /// - `title`: artifact title
+    /// - `type`: artifact type
+    ReadArtifact,
+    /// Edit a canvas artifact using search-and-replace.
+    ///
+    /// Params:
+    /// - `id`: Artifact ID
+    /// - `old_str`: Exact string to find (must match exactly once)
+    /// - `new_str`: Replacement string
+    ///
+    /// Returns:
+    /// - `success`: boolean
+    /// - `lines`: new line count (on success)
+    /// - `error`: error message (on failure)
+    EditArtifact,
 }
 
 /// File attachment
@@ -326,6 +379,15 @@ pub fn tool_icon(name: &str) -> &'static str {
 
         // Browser wait
         "browser_wait_for" | "wait" | "sleep" | "waitForStable" => "\u{23F1}", // ⏱
+
+        // Browser tab management
+        "browser_list_tabs" | "browser_query_tabs" | "list_tabs" | "query_tabs" => {
+            "\u{1F4C2}" // 📂
+        }
+
+        // Artifact editing
+        "browser_read_artifact" | "read_artifact" => "\u{1F4C4}", // 📄
+        "browser_edit_artifact" | "edit_artifact" => "\u{270F}\u{FE0F}", // ✏️
 
         // Default
         _ => "\u{2699}\u{FE0F}", // ⚙️

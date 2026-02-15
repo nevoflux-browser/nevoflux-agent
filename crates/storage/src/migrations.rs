@@ -8,6 +8,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("001_initial", include_str!("migrations/001_initial.sql")),
     ("002_memory", include_str!("migrations/002_memory.sql")),
     ("003_traces", include_str!("migrations/003_traces.sql")),
+    ("004_artifacts", include_str!("migrations/004_artifacts.sql")),
 ];
 
 /// Run all pending migrations on the given connection.
@@ -60,7 +61,7 @@ mod tests {
         let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
     }
 
     #[test]

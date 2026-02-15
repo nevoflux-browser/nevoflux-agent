@@ -9,7 +9,10 @@ use rig::completion::{
     self, AssistantContent, CompletionError, CompletionRequest, CompletionResponse, Document,
     ToolDefinition, Usage,
 };
-use rig::message::{Message, ToolCall, ToolFunction, ToolResultContent, UserContent};
+use rig::message::{
+    DocumentSourceKind, Image, MimeType, Message, ToolCall, ToolFunction,
+    ToolResultContent, UserContent,
+};
 use rig::streaming::{RawStreamingChoice, RawStreamingToolCall, StreamingCompletionResponse};
 use rig::OneOrMany;
 use serde::{Deserialize, Serialize};
@@ -104,11 +107,24 @@ struct CliMessage {
 }
 
 /// Content item for CLI message serialization.
+///
+/// Supports text and image content blocks for the Claude CLI stream-json format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct CliContent {
+#[serde(tag = "type")]
+enum CliContent {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image { source: CliImageSource },
+}
+
+/// Image source for CLI serialization (base64 encoded).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CliImageSource {
     #[serde(rename = "type")]
-    content_type: String,
-    text: String,
+    source_type: String,
+    media_type: String,
+    data: String,
 }
 
 /// A single stream-json input line for the Claude CLI stdin.
@@ -167,14 +183,17 @@ fn build_stdin_input(messages: &[Message], documents: &[Document]) -> String {
             "</conversation_history>\n\nContinue the conversation based on the history above.",
         );
 
+        // Build content blocks: image blocks first, then conversation text
+        let mut content_blocks = collect_image_blocks(messages);
+        content_blocks.push(CliContent::Text {
+            text: combined,
+        });
+
         let input = StreamJsonInput {
             msg_type: "user".to_string(),
             message: CliMessage {
                 role: "user".to_string(),
-                content: vec![CliContent {
-                    content_type: "text".to_string(),
-                    text: combined,
-                }],
+                content: content_blocks,
             },
         };
         serde_json::to_string(&input).unwrap_or_default()
@@ -184,7 +203,7 @@ fn build_stdin_input(messages: &[Message], documents: &[Document]) -> String {
 
         for (i, msg) in messages.iter().enumerate() {
             if let Message::User { content } = msg {
-                let mut text = extract_text_from_user_content(content);
+                let mut content_blocks = build_cli_content_blocks(content);
 
                 // Prepend documents to the first user message
                 if i == 0 && !documents.is_empty() {
@@ -196,17 +215,18 @@ fn build_stdin_input(messages: &[Message], documents: &[Document]) -> String {
                             .collect::<Vec<_>>()
                             .join("")
                     );
-                    text = format!("{}\n\n{}", doc_text, text);
+                    // Prepend document text block before existing content
+                    content_blocks.insert(
+                        0,
+                        CliContent::Text { text: doc_text },
+                    );
                 }
 
                 let input = StreamJsonInput {
                     msg_type: "user".to_string(),
                     message: CliMessage {
                         role: "user".to_string(),
-                        content: vec![CliContent {
-                            content_type: "text".to_string(),
-                            text,
-                        }],
+                        content: content_blocks,
                     },
                 };
                 if let Ok(json) = serde_json::to_string(&input) {
@@ -219,7 +239,7 @@ fn build_stdin_input(messages: &[Message], documents: &[Document]) -> String {
     }
 }
 
-/// Extract text content from UserContent.
+/// Extract text content from UserContent (text-only, for multi-turn serialization).
 fn extract_text_from_user_content(content: &OneOrMany<UserContent>) -> String {
     content
         .iter()
@@ -240,6 +260,78 @@ fn extract_text_from_user_content(content: &OneOrMany<UserContent>) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Build CLI content blocks from UserContent, including image blocks.
+fn build_cli_content_blocks(content: &OneOrMany<UserContent>) -> Vec<CliContent> {
+    let mut blocks = Vec::new();
+    for c in content.iter() {
+        match c {
+            UserContent::Text(t) => {
+                blocks.push(CliContent::Text {
+                    text: t.text.clone(),
+                });
+            }
+            UserContent::ToolResult(tr) => {
+                let result_text: Vec<String> = tr
+                    .content
+                    .iter()
+                    .filter_map(|rc| match rc {
+                        ToolResultContent::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                blocks.push(CliContent::Text {
+                    text: format_tool_result_as_xml(&tr.id, &result_text.join("")),
+                });
+            }
+            UserContent::Image(img) => {
+                if let Some(cli_img) = image_to_cli_content(img) {
+                    blocks.push(cli_img);
+                }
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// Convert a rig Image to a CLI image content block.
+fn image_to_cli_content(img: &Image) -> Option<CliContent> {
+    let base64_data = match &img.data {
+        DocumentSourceKind::Base64(data) => data.clone(),
+        _ => return None,
+    };
+    let media_type = img
+        .media_type
+        .as_ref()
+        .map(|m| m.to_mime_type().to_string())
+        .unwrap_or_else(|| "image/png".to_string());
+
+    Some(CliContent::Image {
+        source: CliImageSource {
+            source_type: "base64".to_string(),
+            media_type,
+            data: base64_data,
+        },
+    })
+}
+
+/// Collect image content blocks from all user messages.
+fn collect_image_blocks(messages: &[Message]) -> Vec<CliContent> {
+    messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::User { content } => Some(content),
+            _ => None,
+        })
+        .flat_map(|content| {
+            content.iter().filter_map(|c| match c {
+                UserContent::Image(img) => image_to_cli_content(img),
+                _ => None,
+            })
+        })
+        .collect()
 }
 
 /// Extract text content from AssistantContent.
@@ -308,6 +400,127 @@ fn emit_text_and_tool_calls(
     items
 }
 
+/// Process a single stream-json event from the Claude CLI.
+///
+/// `saw_native_tool_use` is mutable state carried across events. Once an `assistant`
+/// event with native `tool_use` content blocks is seen, all subsequent `<tool_call>`
+/// XML extraction from text/delta events is suppressed to prevent duplicate tool calls.
+fn process_stream_event(
+    entry: serde_json::Value,
+    saw_native_tool_use: &mut bool,
+) -> Vec<Result<RawStreamingChoice<ClaudeCodeStreamingResponse>, CompletionError>> {
+    let event_type = entry.get("type").and_then(|t| t.as_str());
+
+    // Handle stream-json "assistant" events
+    if event_type == Some("assistant") {
+        if let Some(contents) = entry
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        {
+            let mut items = Vec::new();
+
+            // Check if there are native tool_use items
+            let has_native_tool_use = contents
+                .iter()
+                .any(|c| c.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
+
+            if has_native_tool_use {
+                *saw_native_tool_use = true;
+            }
+
+            // Collect text content
+            let text: String = contents
+                .iter()
+                .filter_map(|c| {
+                    if c.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        c.get("text").and_then(|t| t.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            if !text.is_empty() {
+                if *saw_native_tool_use {
+                    // Clean <tool_call> markers from text but don't emit text-extracted
+                    // tool calls — native tool_use items are preferred to avoid duplicates.
+                    let (cleaned, _) = extract_tool_calls_from_text(&text);
+                    if !cleaned.is_empty() {
+                        items.push(Ok(RawStreamingChoice::Message(cleaned)));
+                    }
+                } else {
+                    // No native tool_use seen — extract tool calls from text as fallback
+                    items.extend(emit_text_and_tool_calls(&text));
+                }
+            }
+
+            // Collect native tool_use content items
+            for c in contents {
+                if c.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                    let id = c
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let name = c
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let arguments = c
+                        .get("input")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                    items.push(Ok(RawStreamingChoice::ToolCall(
+                        RawStreamingToolCall::new(id, name, arguments),
+                    )));
+                }
+            }
+
+            if !items.is_empty() {
+                return items;
+            }
+        }
+    }
+
+    // Handle content_block_delta events
+    if let Some(text) = entry
+        .get("delta")
+        .and_then(|d| d.get("text"))
+        .and_then(|t| t.as_str())
+    {
+        if !text.is_empty() {
+            if *saw_native_tool_use {
+                // Suppress <tool_call> XML extraction — native tool_use already covers these
+                let (cleaned, _) = extract_tool_calls_from_text(text);
+                if !cleaned.is_empty() {
+                    return vec![Ok(RawStreamingChoice::Message(cleaned))];
+                }
+                return vec![];
+            }
+            return emit_text_and_tool_calls(text);
+        }
+    }
+
+    // Handle plain text output at top level
+    if let Some(text) = entry.get("text").and_then(|t| t.as_str()) {
+        if !text.is_empty() {
+            if *saw_native_tool_use {
+                // Suppress <tool_call> XML extraction — native tool_use already covers these
+                let (cleaned, _) = extract_tool_calls_from_text(text);
+                if !cleaned.is_empty() {
+                    return vec![Ok(RawStreamingChoice::Message(cleaned))];
+                }
+                return vec![];
+            }
+            return emit_text_and_tool_calls(text);
+        }
+    }
+
+    vec![]
+}
+
 impl completion::CompletionModel for ClaudeCodeCompletionModel {
     type Response = ClaudeCodeCompletionResponse;
     type StreamingResponse = ClaudeCodeStreamingResponse;
@@ -369,8 +582,16 @@ impl completion::CompletionModel for ClaudeCodeCompletionModel {
             CompletionError::ProviderError(format!("Failed to parse CLI output: {}", e))
         })?;
 
-        // Check for text-injected tool calls
-        let (cleaned_text, tool_calls) = extract_tool_calls_from_text(&response.content);
+        // Extract <tool_call> XML markers from text (also cleans the text).
+        // Prefer native tool_use items over text-extracted ones to avoid duplicates —
+        // Claude CLI may return the same call as both a native tool_use content block
+        // AND as <tool_call> XML in the text output.
+        let (cleaned_text, text_tool_calls) = extract_tool_calls_from_text(&response.content);
+        let tool_calls = if response.tool_calls.is_empty() {
+            text_tool_calls
+        } else {
+            response.tool_calls.clone()
+        };
 
         if tool_calls.is_empty() {
             response.try_into()
@@ -448,75 +669,34 @@ impl completion::CompletionModel for ClaudeCodeCompletionModel {
         let lines =
             tokio_stream::wrappers::LinesStream::new(tokio::io::AsyncBufReadExt::lines(reader));
 
-        // Use flat_map to emit multiple items (text + tool calls) from a single assistant message
+        // Use scan + flat_map to emit multiple items (text + tool calls) from stream events.
+        // The `bool` state tracks whether native tool_use blocks have been seen in any
+        // assistant event. Once set, <tool_call> XML extraction from text/delta events
+        // is suppressed to avoid duplicate tool calls — Claude CLI may output the same
+        // calls as both native tool_use content blocks AND <tool_call> XML in text.
+        type StreamItems =
+            Vec<Result<RawStreamingChoice<ClaudeCodeStreamingResponse>, CompletionError>>;
         let stream = lines
-            .map(
-                |line_result| -> Vec<
-                    Result<RawStreamingChoice<ClaudeCodeStreamingResponse>, CompletionError>,
-                > {
-                    match line_result {
-                        Ok(line) => {
-                            if line.trim().is_empty() {
-                                return vec![];
-                            }
-                            // Try to parse each line as a JSON event
-                            if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) {
-                                let event_type = entry.get("type").and_then(|t| t.as_str());
-
-                                // Handle stream-json "assistant" events
-                                if event_type == Some("assistant") {
-                                    if let Some(contents) = entry
-                                        .get("message")
-                                        .and_then(|m| m.get("content"))
-                                        .and_then(|c| c.as_array())
-                                    {
-                                        let text: String = contents
-                                            .iter()
-                                            .filter_map(|c| {
-                                                if c.get("type").and_then(|t| t.as_str())
-                                                    == Some("text")
-                                                {
-                                                    c.get("text").and_then(|t| t.as_str())
-                                                } else {
-                                                    None
-                                                }
-                                            })
-                                            .collect::<Vec<_>>()
-                                            .join("");
-                                        if !text.is_empty() {
-                                            return emit_text_and_tool_calls(&text);
-                                        }
-                                    }
-                                }
-
-                                // Handle content_block_delta events
-                                if let Some(text) = entry
-                                    .get("delta")
-                                    .and_then(|d| d.get("text"))
-                                    .and_then(|t| t.as_str())
-                                {
-                                    if !text.is_empty() {
-                                        return emit_text_and_tool_calls(text);
-                                    }
-                                }
-
-                                // Handle plain text output at top level
-                                if let Some(text) = entry.get("text").and_then(|t| t.as_str()) {
-                                    if !text.is_empty() {
-                                        return emit_text_and_tool_calls(text);
-                                    }
-                                }
-                            }
-                            // If not JSON, pass through as text
-                            if !line.starts_with('{') {
-                                return vec![Ok(RawStreamingChoice::Message(line))];
-                            }
+            .scan(false, |saw_native_tool_use, line_result| {
+                let items: StreamItems = match line_result {
+                    Ok(line) => {
+                        if line.trim().is_empty() {
+                            vec![]
+                        } else if let Ok(entry) =
+                            serde_json::from_str::<serde_json::Value>(&line)
+                        {
+                            process_stream_event(entry, saw_native_tool_use)
+                        } else if !line.starts_with('{') {
+                            // Non-JSON line — pass through as text
+                            vec![Ok(RawStreamingChoice::Message(line))]
+                        } else {
                             vec![]
                         }
-                        Err(e) => vec![Err(CompletionError::ProviderError(e.to_string()))],
                     }
-                },
-            )
+                    Err(e) => vec![Err(CompletionError::ProviderError(e.to_string()))],
+                };
+                futures::future::ready(Some(items))
+            })
             .flat_map(futures::stream::iter);
 
         // Wrap in ChildGuardStream to kill the CLI subprocess when the stream is dropped
@@ -612,8 +792,7 @@ mod tests {
             msg_type: "user".to_string(),
             message: CliMessage {
                 role: "user".to_string(),
-                content: vec![CliContent {
-                    content_type: "text".to_string(),
+                content: vec![CliContent::Text {
                     text: "Hello".to_string(),
                 }],
             },
@@ -696,5 +875,170 @@ mod tests {
         assert!(text.contains("<tool_result call_id=\"call_1\">"));
         assert!(text.contains("screenshot taken successfully"));
         assert!(text.contains("</tool_result>"));
+    }
+
+    #[test]
+    fn test_build_stdin_input_with_image() {
+        use rig::message::{DocumentSourceKind, Image};
+
+        let messages = vec![Message::User {
+            content: OneOrMany::many(vec![
+                UserContent::text("Describe this image"),
+                UserContent::Image(Image {
+                    data: DocumentSourceKind::Base64("iVBOR...".to_string()),
+                    media_type: Some(rig::message::ImageMediaType::PNG),
+                    detail: None,
+                    additional_params: None,
+                }),
+            ])
+            .unwrap(),
+        }];
+        let result = build_stdin_input(&messages, &[]);
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let content = parsed["message"]["content"].as_array().unwrap();
+
+        // Should have both text and image content blocks
+        assert_eq!(content.len(), 2);
+
+        // First block: text
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Describe this image");
+
+        // Second block: image
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "iVBOR...");
+    }
+
+    #[test]
+    fn test_build_stdin_input_multi_turn_with_image() {
+        use rig::message::{DocumentSourceKind, Image};
+
+        let messages = vec![
+            Message::User {
+                content: OneOrMany::many(vec![
+                    UserContent::text("What's in this screenshot?"),
+                    UserContent::Image(Image {
+                        data: DocumentSourceKind::Base64("AAAA".to_string()),
+                        media_type: Some(rig::message::ImageMediaType::JPEG),
+                        detail: None,
+                        additional_params: None,
+                    }),
+                ])
+                .unwrap(),
+            },
+            Message::Assistant {
+                id: None,
+                content: OneOrMany::one(AssistantContent::text("It's a dashboard.")),
+            },
+            Message::User {
+                content: OneOrMany::one(UserContent::text("Make it better")),
+            },
+        ];
+        let result = build_stdin_input(&messages, &[]);
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let content = parsed["message"]["content"].as_array().unwrap();
+
+        // Should have image block + text block
+        assert!(content.len() >= 2);
+
+        // Image block should be present
+        let has_image = content
+            .iter()
+            .any(|c| c["type"] == "image" && c["source"]["data"] == "AAAA");
+        assert!(has_image, "Image block should be included in multi-turn");
+
+        // Conversation text should be present
+        let text_block = content.iter().find(|c| c["type"] == "text").unwrap();
+        let text = text_block["text"].as_str().unwrap();
+        assert!(text.contains("<conversation_history>"));
+        assert!(text.contains("[user]: What's in this screenshot?"));
+        assert!(text.contains("[assistant]: It's a dashboard."));
+    }
+
+    #[test]
+    fn test_process_stream_event_native_tool_use_suppresses_text_xml() {
+        // Simulate: assistant event with native tool_use sets the flag
+        let mut saw_native = false;
+        let assistant_event = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "Let me take a screenshot."},
+                    {"type": "tool_use", "id": "toolu_abc", "name": "browser_screenshot", "input": {"tab_id": 5}}
+                ]
+            }
+        });
+        let items = process_stream_event(assistant_event, &mut saw_native);
+        assert!(saw_native, "Flag should be set after native tool_use");
+
+        // Should emit text + 1 native tool call (not text-extracted)
+        let tool_calls: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i, Ok(RawStreamingChoice::ToolCall(_))))
+            .collect();
+        assert_eq!(tool_calls.len(), 1, "Only 1 native tool call");
+
+        // Now simulate: a later text event with <tool_call> XML should be suppressed
+        let text_event = serde_json::json!({
+            "type": "content_block_delta",
+            "delta": {
+                "text": "<tool_call>\n{\"id\":\"call_1\",\"name\":\"browser_screenshot\",\"arguments\":{\"tab_id\":5}}\n</tool_call>"
+            }
+        });
+        let items2 = process_stream_event(text_event, &mut saw_native);
+        let tool_calls2: Vec<_> = items2
+            .iter()
+            .filter(|i| matches!(i, Ok(RawStreamingChoice::ToolCall(_))))
+            .collect();
+        assert_eq!(
+            tool_calls2.len(),
+            0,
+            "Text-extracted tool calls should be suppressed after native tool_use"
+        );
+    }
+
+    #[test]
+    fn test_process_stream_event_no_native_allows_text_xml() {
+        // When no native tool_use is seen, text XML extraction should work
+        let mut saw_native = false;
+        let text_event = serde_json::json!({
+            "text": "I'll help.\n<tool_call>\n{\"id\":\"call_1\",\"name\":\"screenshot\",\"arguments\":{}}\n</tool_call>"
+        });
+        let items = process_stream_event(text_event, &mut saw_native);
+        assert!(!saw_native);
+        let tool_calls: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i, Ok(RawStreamingChoice::ToolCall(_))))
+            .collect();
+        assert_eq!(tool_calls.len(), 1, "Text-extracted tool call should work");
+    }
+
+    #[test]
+    fn test_process_stream_event_assistant_with_only_text_tool_calls() {
+        // assistant event with NO native tool_use — text extraction is the fallback
+        let mut saw_native = false;
+        let event = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "Sure.\n<tool_call>\n{\"id\":\"call_1\",\"name\":\"read\",\"arguments\":{\"path\":\"a.txt\"}}\n</tool_call>"}
+                ]
+            }
+        });
+        let items = process_stream_event(event, &mut saw_native);
+        assert!(!saw_native, "Flag should NOT be set without native tool_use");
+        let tool_calls: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i, Ok(RawStreamingChoice::ToolCall(_))))
+            .collect();
+        assert_eq!(
+            tool_calls.len(),
+            1,
+            "Text-extracted tool call should be used as fallback"
+        );
     }
 }

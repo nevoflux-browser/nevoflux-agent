@@ -15,7 +15,7 @@ use nevoflux_protocol::{
     DaemonEnvelope, PlanProposal, PlanResponse, ProxyEnvelope, ToolAuthResponse,
 };
 use nevoflux_skills::{check_tool_availability, format_missing_tools_message, ToolCheckResult};
-use nevoflux_storage::{ListSessionsParams, Message as StorageMessage, MessageRole};
+use nevoflux_storage::{ContentType, ListSessionsParams, Message as StorageMessage, MessageRole};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -536,7 +536,15 @@ fn convert_history_messages(messages: Vec<StorageMessage>) -> Vec<WasmMessage> {
         .into_iter()
         .filter_map(|msg| match msg.role {
             MessageRole::User => Some(WasmMessage::user(msg.content)),
-            MessageRole::Assistant => Some(WasmMessage::assistant(msg.content)),
+            MessageRole::Assistant => {
+                // Skip tool use messages — they are internal implementation details
+                // of the WASM agent's tool loop and should not appear as plain text
+                // in the conversation history sent to the LLM.
+                if msg.content_type == ContentType::ToolUse {
+                    return None;
+                }
+                Some(WasmMessage::assistant(msg.content))
+            }
             MessageRole::System => None,
         })
         .collect()
@@ -1563,6 +1571,8 @@ async fn handle_chat_message_streaming(
                 );
                 send_artifact_stream(
                     artifact,
+                    &session_id,
+                    session_manager,
                     &proxy_id,
                     channel,
                     &request_id,
@@ -1617,6 +1627,7 @@ async fn handle_chat_message_streaming(
                                                     .to_string(),
                                                 content_type: "application/project+json"
                                                     .to_string(),
+                                                description: None,
                                                 content: serde_json::to_string(&artifact_data)
                                                     .unwrap_or_default(),
                                                 files: None,
@@ -1624,6 +1635,8 @@ async fn handle_chat_message_streaming(
                                             };
                                             send_artifact_stream(
                                                 &artifact,
+                                                &session_id,
+                                                session_manager,
                                                 &proxy_id,
                                                 channel,
                                                 &request_id,
@@ -1779,13 +1792,17 @@ async fn handle_chat_message_streaming(
     }
 }
 
-/// Stream an artifact to the sidebar as start/delta/complete messages.
+/// Stream an artifact to the sidebar as start/delta/complete messages,
+/// persisting it to storage first.
 ///
 /// Splits `artifact.content` into ~4 KB chunks (respecting UTF-8 char boundaries)
 /// and sends them as `ArtifactDelta` messages bracketed by `ArtifactStart` and
 /// `ArtifactComplete`.
+#[allow(clippy::too_many_arguments)]
 async fn send_artifact_stream(
     artifact: &Artifact,
+    session_id: &str,
+    session_manager: &Arc<SessionManager>,
     proxy_id: &str,
     channel: Channel,
     request_id: &str,
@@ -1794,11 +1811,37 @@ async fn send_artifact_stream(
 ) {
     const CHUNK_SIZE: usize = 4096;
 
+    // Persist artifact to storage
+    let mut params = nevoflux_storage::CreateArtifactParams::new(
+        &artifact.id,
+        session_id,
+        &artifact.title,
+        &artifact.content_type,
+    )
+    .with_content(&artifact.content);
+    if let Some(desc) = &artifact.description {
+        params = params.with_description(desc);
+    }
+    if let Some(files) = &artifact.files {
+        params = params.with_files(files.clone());
+    }
+    if let Some(entry) = &artifact.entry {
+        params = params.with_entry(entry);
+    }
+    match session_manager.save_artifact(params) {
+        Ok(_) => info!(
+            "Persisted artifact {} (session={}, type={}, content_len={})",
+            artifact.id, session_id, artifact.content_type, artifact.content.len()
+        ),
+        Err(e) => error!("Failed to persist artifact {}: {}", artifact.id, e),
+    }
+
     // 1. Send artifact_start (includes files/entry for project-type artifacts)
     let start_msg = AgentMessage::ArtifactStart(ArtifactStart {
         id: artifact.id.clone(),
         title: artifact.title.clone(),
         content_type: artifact.content_type.clone(),
+        description: artifact.description.clone(),
         files: artifact.files.clone(),
         entry: artifact.entry.clone(),
     });
@@ -2382,6 +2425,9 @@ async fn handle_chat_message(
                 "mcp.disconnect" => handle_mcp_disconnect(&params).await,
                 "file.pick" => handle_file_pick(&params).await,
                 "skill.list" => handle_skill_list(services, &params).await,
+                // Artifact persistence commands
+                "artifact.get" => handle_artifact_get(session_manager, &params).await,
+                "artifact.list" => handle_artifact_list(session_manager, &params).await,
                 // ContentStore persistence commands
                 "content_store.set" => {
                     let key = params.get("key").and_then(|k| k.as_str()).unwrap_or("");
@@ -2590,15 +2636,35 @@ async fn handle_session_resolve(
             // Get messages for the session
             let messages = match session_manager.get_messages(&session.id).await {
                 Ok(msgs) => {
-                    info!("Found {} messages for session {}", msgs.len(), session.id);
+                    // Debug: log content_type distribution
+                    let type_counts: std::collections::HashMap<String, usize> = msgs.iter().fold(
+                        std::collections::HashMap::new(),
+                        |mut acc, m| {
+                            *acc.entry(m.content_type.as_str().to_string()).or_insert(0) += 1;
+                            acc
+                        },
+                    );
+                    info!(
+                        "Found {} messages for session {} (content_types: {:?})",
+                        msgs.len(),
+                        session.id,
+                        type_counts
+                    );
                     msgs.into_iter()
                         .map(|m| {
-                            serde_json::json!({
+                            let mut msg = serde_json::json!({
                                 "id": m.id,
                                 "role": format!("{:?}", m.role).to_lowercase(),
                                 "content": m.content,
+                                "content_type": m.content_type.as_str(),
                                 "created_at": m.created_at
-                            })
+                            });
+                            if let Some(metadata) = m.metadata {
+                                msg.as_object_mut()
+                                    .unwrap()
+                                    .insert("metadata".to_string(), serde_json::json!(metadata));
+                            }
+                            msg
                         })
                         .collect::<Vec<_>>()
                 }
@@ -2607,6 +2673,27 @@ async fn handle_session_resolve(
                     vec![]
                 }
             };
+
+            // Get artifacts for the session
+            let artifacts: Vec<serde_json::Value> =
+                match session_manager.list_artifacts(&session.id) {
+                    Ok(arts) => arts
+                        .into_iter()
+                        .map(|a| {
+                            serde_json::json!({
+                                "id": a.id,
+                                "title": a.title,
+                                "description": a.description,
+                                "content_type": a.content_type,
+                                "created_at": a.created_at
+                            })
+                        })
+                        .collect(),
+                    Err(e) => {
+                        error!("Failed to get artifacts for {}: {}", session.id, e);
+                        vec![]
+                    }
+                };
 
             serde_json::json!({
                 "type": "system_response",
@@ -2623,6 +2710,7 @@ async fn handle_session_resolve(
                             "updated_at": session.updated_at
                         },
                         "messages": messages,
+                        "artifacts": artifacts,
                         "created": created
                     }
                 }
@@ -2661,16 +2749,22 @@ async fn handle_session_list(
 
     let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as u32;
     let offset = params.get("offset").and_then(|o| o.as_u64()).unwrap_or(0) as u32;
+    let exclude_empty = params
+        .get("exclude_empty")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(true);
 
     let list_params = ListSessionsParams::new()
         .with_limit(limit)
-        .with_offset(offset);
+        .with_offset(offset)
+        .exclude_empty(exclude_empty);
 
     match session_manager.list_sessions(list_params).await {
         Ok(sessions) => {
+            info!("session.list: returning {} sessions (exclude_empty={})", sessions.len(), exclude_empty);
             // Get message counts for each session
             let mut session_summaries = Vec::new();
-            for session in sessions {
+            for session in &sessions {
                 let message_count = session_manager
                     .get_message_count(&session.id)
                     .await
@@ -2685,8 +2779,11 @@ async fn handle_session_list(
                 }));
             }
 
-            // Get total count
-            let total = session_manager.get_session_count(false).await.unwrap_or(0);
+            // Get total count (matching the same filter)
+            let total = session_manager
+                .get_session_count_filtered(false, exclude_empty)
+                .await
+                .unwrap_or(0);
 
             serde_json::json!({
                 "type": "system_response",
@@ -3078,6 +3175,167 @@ async fn handle_session_pin(
                 }
             })
         }
+    }
+}
+
+/// Handle artifact.get command.
+async fn handle_artifact_get(
+    session_manager: &Arc<SessionManager>,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let artifact_id = match params.get("artifact_id").and_then(|s| s.as_str()) {
+        Some(id) => id,
+        None => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "artifact.get",
+                    "success": false,
+                    "error": {
+                        "code": "MISSING_PARAM",
+                        "message": "Missing artifact_id parameter"
+                    }
+                }
+            });
+        }
+    };
+
+    info!("artifact.get: looking up artifact_id={}", artifact_id);
+
+    match session_manager.get_artifact(artifact_id) {
+        Ok(Some(artifact)) => {
+            info!(
+                "artifact.get: found artifact {} (title={}, content_len={})",
+                artifact.id, artifact.title, artifact.content.len()
+            );
+            let files_json = artifact
+                .files
+                .as_ref()
+                .map(|f| serde_json::to_value(f).unwrap_or_default());
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "artifact.get",
+                    "success": true,
+                    "data": {
+                        "id": artifact.id,
+                        "session_id": artifact.session_id,
+                        "title": artifact.title,
+                        "description": artifact.description,
+                        "content_type": artifact.content_type,
+                        "content": artifact.content,
+                        "files": files_json,
+                        "entry": artifact.entry,
+                        "created_at": artifact.created_at
+                    }
+                }
+            })
+        }
+        Ok(None) => {
+            warn!("artifact.get: artifact not found: {}", artifact_id);
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "artifact.get",
+                    "success": false,
+                    "error": {
+                        "code": "NOT_FOUND",
+                        "message": format!("Artifact not found: {}", artifact_id)
+                    }
+                }
+            })
+        }
+        Err(e) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "artifact.get",
+                "success": false,
+                "error": {
+                    "code": "STORAGE_ERROR",
+                    "message": format!("{}", e)
+                }
+            }
+        }),
+    }
+}
+
+/// Handle artifact.list command.
+async fn handle_artifact_list(
+    session_manager: &Arc<SessionManager>,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let session_id = match params.get("session_id").and_then(|s| s.as_str()) {
+        Some(id) => id,
+        None => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "artifact.list",
+                    "success": false,
+                    "error": {
+                        "code": "MISSING_PARAM",
+                        "message": "Missing session_id parameter"
+                    }
+                }
+            });
+        }
+    };
+
+    match session_manager.list_artifacts(session_id) {
+        Ok(artifacts) => {
+            let artifacts_json: Vec<serde_json::Value> = artifacts
+                .into_iter()
+                .map(|a| {
+                    serde_json::json!({
+                        "id": a.id,
+                        "title": a.title,
+                        "description": a.description,
+                        "content_type": a.content_type,
+                        "created_at": a.created_at
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "artifact.list",
+                    "success": true,
+                    "data": {
+                        "artifacts": artifacts_json
+                    }
+                }
+            })
+        }
+        Err(e) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "artifact.list",
+                "success": false,
+                "error": {
+                    "code": "STORAGE_ERROR",
+                    "message": format!("{}", e)
+                }
+            }
+        }),
     }
 }
 

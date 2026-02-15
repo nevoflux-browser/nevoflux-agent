@@ -52,6 +52,7 @@ impl ToolRegistry {
         registry.register("write_file", Box::new(WriteFileTool));
         registry.register("list_files", Box::new(ListFilesTool));
         registry.register("canvas_render", Box::new(CanvasRenderTool));
+        registry.register("run_command", Box::new(RunCommandTool));
 
         registry
     }
@@ -111,6 +112,10 @@ impl ToolRegistry {
                 "files: dict, entry: str",
                 "Render a multi-file project in the canvas.",
             ),
+            "run_command" => (
+                "command: str",
+                "Run a shell command and return stdout. Use for operations requiring system tools (regex, datetime, etc).",
+            ),
             "get_code_mode_context" => (
                 "",
                 "Get Code Mode context with available tool function signatures.",
@@ -151,6 +156,8 @@ impl ToolRegistry {
                 "Files"
             } else if name.starts_with("canvas_") || name.starts_with("browser_") {
                 "Browser & Canvas"
+            } else if name.starts_with("run_") {
+                "System"
             } else {
                 "Other"
             };
@@ -167,8 +174,9 @@ impl ToolRegistry {
     /// Generate the Code Mode system prompt with Monty constraints and tool info.
     pub fn code_mode_system_prompt(&self) -> String {
         let mut prompt = String::new();
-        prompt.push_str("You are in Code Mode. Write a Python script to accomplish the task.\n\n");
-        prompt.push_str("IMPORTANT: Use ONLY these supported constructs:\n");
+        prompt.push_str("You are in Code Mode. You MUST write a single Python script to accomplish the task.\n");
+        prompt.push_str("Do NOT make individual tool calls — write a ```python-exec script that orchestrates everything.\n\n");
+        prompt.push_str("Supported constructs:\n");
         prompt.push_str("- Statements: variable, def, if/elif/else, for/while, break, continue, try/except/finally, return, pass, del, assert, raise\n");
         prompt.push_str("- Expressions: arithmetic, comparison, boolean, f-string, lambda, comprehensions, ternary, slice, unpack, walrus (:=)\n");
         prompt.push_str("- Types: int, float, str, bool, list, dict, set, tuple, None, bytes\n");
@@ -344,6 +352,82 @@ impl ToolExecutor for ListFilesTool {
 }
 
 // ============================================================================
+// Run Command Tool
+// ============================================================================
+
+/// Tool for executing shell commands from Code Mode.
+///
+/// Used by AutoFixer-injected helpers to bridge missing stdlib modules
+/// (re, datetime, random) by running `python3 -c "..."` or shell commands.
+///
+/// Safety: commands are timeout-limited (30s) and output-size-limited (1MB).
+pub struct RunCommandTool;
+
+#[async_trait]
+impl ToolExecutor for RunCommandTool {
+    async fn execute(&self, _name: &str, arguments: &serde_json::Value) -> Result<String> {
+        let command = arguments
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                DaemonError::InternalError("Missing 'command' argument".to_string())
+            })?;
+
+        // Safety: reject obviously dangerous commands
+        let trimmed = command.trim();
+        if trimmed.starts_with("rm ")
+            || trimmed.starts_with("sudo ")
+            || trimmed.contains("rm -rf")
+            || trimmed.starts_with("dd ")
+            || trimmed.starts_with("mkfs")
+            || trimmed.contains("> /dev/")
+        {
+            return Err(DaemonError::InternalError(
+                "Command rejected: potentially destructive operation".to_string(),
+            ));
+        }
+
+        use tokio::process::Command;
+
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            Command::new("sh").arg("-c").arg(command).output(),
+        )
+        .await
+        .map_err(|_| {
+            DaemonError::InternalError("Command timed out after 30 seconds".to_string())
+        })?
+        .map_err(|e| {
+            DaemonError::InternalError(format!("Failed to execute command: {}", e))
+        })?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Limit output size to 1MB
+        let max_size = 1024 * 1024;
+
+        if output.status.success() {
+            let result = if stdout.len() > max_size {
+                format!("{}... (truncated)", &stdout[..max_size])
+            } else {
+                stdout.to_string()
+            };
+            Ok(result)
+        } else {
+            let err_msg = if stderr.is_empty() {
+                format!("Command exited with code {}", output.status.code().unwrap_or(-1))
+            } else if stderr.len() > max_size {
+                format!("{}... (truncated)", &stderr[..max_size])
+            } else {
+                stderr.to_string()
+            };
+            Err(DaemonError::InternalError(err_msg))
+        }
+    }
+}
+
+// ============================================================================
 // Canvas Render Tool
 // ============================================================================
 
@@ -440,6 +524,7 @@ mod tests {
         assert!(registry.has_tool("write_file"));
         assert!(registry.has_tool("list_files"));
         assert!(registry.has_tool("canvas_render"));
+        assert!(registry.has_tool("run_command"));
 
         // Check that unknown tools are not registered
         assert!(!registry.has_tool("unknown_tool"));
@@ -454,8 +539,8 @@ mod tests {
         assert!(names.contains(&"write_file"));
         assert!(names.contains(&"list_files"));
         assert!(names.contains(&"canvas_render"));
-        // 4 built-in tools: read_file, write_file, list_files, canvas_render
-        assert_eq!(names.len(), 4);
+        // 5 built-in tools: read_file, write_file, list_files, canvas_render, run_command
+        assert_eq!(names.len(), 5);
     }
 
     #[test]
@@ -465,6 +550,7 @@ mod tests {
         assert!(stubs.contains("def list_files("));
         assert!(stubs.contains("def read_file("));
         assert!(stubs.contains("def write_file("));
+        assert!(stubs.contains("def run_command("));
         assert!(stubs.contains("# Available tool functions"));
     }
 
@@ -493,7 +579,7 @@ mod tests {
 
         registry.register_code_mode_context_tool();
         assert!(registry.has_tool("get_code_mode_context"));
-        assert_eq!(registry.tool_names().len(), 5);
+        assert_eq!(registry.tool_names().len(), 6);
     }
 
     #[tokio::test]
@@ -719,6 +805,7 @@ mod tests {
         assert!(registry.has_tool("write_file"));
         assert!(registry.has_tool("list_files"));
         assert!(registry.has_tool("canvas_render"));
+        assert!(registry.has_tool("run_command"));
     }
 
     // ========================================================================
@@ -851,6 +938,93 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("code-mode-"));
+    }
+
+    // ========================================================================
+    // Run Command Tool Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_run_command_echo() {
+        let registry = ToolRegistry::new();
+        let call = PendingToolCall {
+            id: "call-rc-1".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"command": "echo hello"}),
+        };
+
+        let result = registry.execute(&call).await;
+        assert!(result.error.is_none(), "Error: {:?}", result.error);
+        assert_eq!(result.content.unwrap().trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn test_run_command_python3() {
+        let registry = ToolRegistry::new();
+        let call = PendingToolCall {
+            id: "call-rc-2".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"command": "python3 -c \"print(2 + 3)\""}),
+        };
+
+        let result = registry.execute(&call).await;
+        assert!(result.error.is_none(), "Error: {:?}", result.error);
+        assert_eq!(result.content.unwrap().trim(), "5");
+    }
+
+    #[tokio::test]
+    async fn test_run_command_reject_rm() {
+        let registry = ToolRegistry::new();
+        let call = PendingToolCall {
+            id: "call-rc-3".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"command": "rm -rf /tmp/test"}),
+        };
+
+        let result = registry.execute(&call).await;
+        assert!(result.error.is_some());
+        assert!(result.error.unwrap().contains("rejected"));
+    }
+
+    #[tokio::test]
+    async fn test_run_command_reject_sudo() {
+        let registry = ToolRegistry::new();
+        let call = PendingToolCall {
+            id: "call-rc-4".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"command": "sudo ls"}),
+        };
+
+        let result = registry.execute(&call).await;
+        assert!(result.error.is_some());
+        assert!(result.error.unwrap().contains("rejected"));
+    }
+
+    #[tokio::test]
+    async fn test_run_command_missing_arg() {
+        let registry = ToolRegistry::new();
+        let call = PendingToolCall {
+            id: "call-rc-5".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        let result = registry.execute(&call).await;
+        assert!(result.error.is_some());
+        assert!(result.error.unwrap().contains("Missing 'command'"));
+    }
+
+    #[tokio::test]
+    async fn test_run_command_nonzero_exit() {
+        let registry = ToolRegistry::new();
+        let call = PendingToolCall {
+            id: "call-rc-6".to_string(),
+            name: "run_command".to_string(),
+            arguments: serde_json::json!({"command": "false"}),
+        };
+
+        let result = registry.execute(&call).await;
+        assert!(result.error.is_some());
     }
 
     #[tokio::test]

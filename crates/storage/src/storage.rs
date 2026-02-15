@@ -6,7 +6,8 @@ use crate::connection::Database;
 use crate::error::Result;
 use crate::repositories::traces::TraceRepository;
 use crate::repositories::{
-    ConfigRepository, MessageRepository, PermissionRepository, SessionRepository,
+    ArtifactRepository, ConfigRepository, MessageRepository, PermissionRepository,
+    SessionRepository,
 };
 
 /// Main storage facade providing access to all repositories.
@@ -68,6 +69,13 @@ impl Storage {
     /// Use this to create, read, and delete trace span records.
     pub fn traces(&self) -> TraceRepository<'_> {
         TraceRepository::new(&self.db)
+    }
+
+    /// Get an artifact repository.
+    ///
+    /// Use this to create, read, and delete artifacts.
+    pub fn artifacts(&self) -> ArtifactRepository<'_> {
+        ArtifactRepository::new(&self.db)
     }
 
     /// Get the underlying database (for advanced operations).

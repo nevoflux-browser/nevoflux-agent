@@ -67,6 +67,9 @@ pub struct ClaudeCodeCompletionResponse {
     pub content: String,
     /// Token usage statistics.
     pub usage: ClaudeUsage,
+    /// Native tool_use calls from the CLI (not text-extracted).
+    #[serde(default)]
+    pub tool_calls: Vec<ExtractedToolCall>,
 }
 
 impl TryFrom<ClaudeCodeCompletionResponse> for CompletionResponse<ClaudeCodeCompletionResponse> {
@@ -79,14 +82,30 @@ impl TryFrom<ClaudeCodeCompletionResponse> for CompletionResponse<ClaudeCodeComp
             total_tokens: value.usage.input_tokens + value.usage.output_tokens,
         };
 
-        if value.content.is_empty() {
+        if value.content.is_empty() && value.tool_calls.is_empty() {
             return Err(CompletionError::ResponseError(
                 "Empty response from Claude Code CLI".into(),
             ));
         }
 
+        // Build content list: text + native tool calls
+        let mut contents: Vec<AssistantContent> = Vec::new();
+        if !value.content.is_empty() {
+            contents.push(AssistantContent::text(&value.content));
+        }
+        for tc in &value.tool_calls {
+            contents.push(AssistantContent::ToolCall(rig::message::ToolCall::new(
+                tc.id.clone(),
+                rig::message::ToolFunction::new(tc.name.clone(), tc.arguments.clone()),
+            )));
+        }
+
+        let choice = OneOrMany::many(contents).map_err(|_| {
+            CompletionError::ResponseError("Empty response from Claude Code CLI".into())
+        })?;
+
         Ok(CompletionResponse {
-            choice: OneOrMany::one(AssistantContent::text(&value.content)),
+            choice,
             usage,
             raw_response: value,
         })
@@ -97,8 +116,9 @@ impl TryFrom<ClaudeCodeCompletionResponse> for CompletionResponse<ClaudeCodeComp
 ///
 /// Extracts text from assistant messages. The `result` entry's text field is only
 /// used as a fallback when no assistant text was found (it duplicates assistant content).
-fn collect_from_entries(values: &[serde_json::Value]) -> (String, ClaudeUsage) {
+fn collect_from_entries(values: &[serde_json::Value]) -> (String, Vec<ExtractedToolCall>, ClaudeUsage) {
     let mut assistant_text = Vec::new();
+    let mut native_tool_calls = Vec::new();
     let mut result_text: Option<String> = None;
     let mut usage = ClaudeUsage::default();
 
@@ -110,8 +130,17 @@ fn collect_from_entries(values: &[serde_json::Value]) -> (String, ClaudeUsage) {
         match &entry {
             ClaudeOutputEntry::Assistant { message } => {
                 for item in &message.content {
-                    if let ClaudeContentItem::Text { text } = item {
-                        assistant_text.push(text.clone());
+                    match item {
+                        ClaudeContentItem::Text { text } => {
+                            assistant_text.push(text.clone());
+                        }
+                        ClaudeContentItem::ToolUse { id, name, input } => {
+                            native_tool_calls.push(ExtractedToolCall {
+                                id: id.clone(),
+                                name: name.clone(),
+                                arguments: input.clone(),
+                            });
+                        }
                     }
                 }
                 if let Some(u) = &message.usage {
@@ -143,7 +172,7 @@ fn collect_from_entries(values: &[serde_json::Value]) -> (String, ClaudeUsage) {
         assistant_text.join("")
     };
 
-    (content, usage)
+    (content, native_tool_calls, usage)
 }
 
 /// Parse the Claude CLI JSON output into text content and usage.
@@ -157,8 +186,8 @@ pub fn parse_claude_output(output: &str) -> Result<ClaudeCodeCompletionResponse,
     // Try parsing as a JSON array first (standard --output-format json).
     // We parse as Vec<Value> to tolerate unknown entry types like "system".
     if let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(output) {
-        let (content, usage) = collect_from_entries(&values);
-        return Ok(ClaudeCodeCompletionResponse { content, usage });
+        let (content, tool_calls, usage) = collect_from_entries(&values);
+        return Ok(ClaudeCodeCompletionResponse { content, usage, tool_calls });
     }
 
     // Try newline-delimited JSON (stream-json output format)
@@ -169,28 +198,29 @@ pub fn parse_claude_output(output: &str) -> Result<ClaudeCodeCompletionResponse,
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect();
         if !values.is_empty() {
-            let (content, usage) = collect_from_entries(&values);
-            if !content.is_empty() || values.len() > 1 {
-                return Ok(ClaudeCodeCompletionResponse { content, usage });
+            let (content, tool_calls, usage) = collect_from_entries(&values);
+            if !content.is_empty() || !tool_calls.is_empty() || values.len() > 1 {
+                return Ok(ClaudeCodeCompletionResponse { content, usage, tool_calls });
             }
         }
     }
 
     // Try parsing as a single JSON object (some CLI versions)
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(output) {
-        let (content, usage) = collect_from_entries(&[value]);
-        return Ok(ClaudeCodeCompletionResponse { content, usage });
+        let (content, tool_calls, usage) = collect_from_entries(&[value]);
+        return Ok(ClaudeCodeCompletionResponse { content, usage, tool_calls });
     }
 
     // Fall back to treating the entire output as plain text
     Ok(ClaudeCodeCompletionResponse {
         content: output.trim().to_string(),
         usage: ClaudeUsage::default(),
+        tool_calls: Vec::new(),
     })
 }
 
-/// A tool call extracted from text-injected XML markers.
-#[derive(Debug, Clone)]
+/// A tool call extracted from text-injected XML markers or native CLI tool_use.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedToolCall {
     pub id: String,
     pub name: String,
@@ -254,7 +284,16 @@ pub fn extract_tool_calls_from_text(text: &str) -> (String, Vec<ExtractedToolCal
 
         let json_str = after_start[..end_idx].trim();
 
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+        // Use streaming deserializer to tolerate trailing garbage (e.g. extra `}`)
+        // that LLMs sometimes produce. This parses the first complete JSON value
+        // and ignores any trailing content.
+        let parsed_result = serde_json::from_str::<serde_json::Value>(json_str)
+            .or_else(|_| {
+                let mut de = serde_json::Deserializer::from_str(json_str);
+                serde_json::Value::deserialize(&mut de)
+            });
+
+        if let Ok(parsed) = parsed_result {
             let id = parsed
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -386,6 +425,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
             },
+            tool_calls: Vec::new(),
         };
 
         let rig_resp: CompletionResponse<ClaudeCodeCompletionResponse> = resp.try_into().unwrap();
@@ -399,10 +439,70 @@ mod tests {
         let resp = ClaudeCodeCompletionResponse {
             content: String::new(),
             usage: ClaudeUsage::default(),
+            tool_calls: Vec::new(),
         };
 
         let result: Result<CompletionResponse<ClaudeCodeCompletionResponse>, _> = resp.try_into();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_native_tool_use_in_response() {
+        let resp = ClaudeCodeCompletionResponse {
+            content: "I'll create that for you.".to_string(),
+            usage: ClaudeUsage { input_tokens: 10, output_tokens: 20 },
+            tool_calls: vec![ExtractedToolCall {
+                id: "tool_1".to_string(),
+                name: "create_artifact".to_string(),
+                arguments: serde_json::json!({"content": "<h1>Hello</h1>"}),
+            }],
+        };
+
+        let rig_resp: CompletionResponse<ClaudeCodeCompletionResponse> = resp.try_into().unwrap();
+        let items: Vec<_> = rig_resp.choice.iter().collect();
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], AssistantContent::Text(_)));
+        assert!(matches!(items[1], AssistantContent::ToolCall(_)));
+    }
+
+    #[test]
+    fn test_tool_use_only_response() {
+        let resp = ClaudeCodeCompletionResponse {
+            content: String::new(),
+            usage: ClaudeUsage { input_tokens: 5, output_tokens: 10 },
+            tool_calls: vec![ExtractedToolCall {
+                id: "tool_1".to_string(),
+                name: "screenshot".to_string(),
+                arguments: serde_json::json!({}),
+            }],
+        };
+
+        let rig_resp: CompletionResponse<ClaudeCodeCompletionResponse> = resp.try_into().unwrap();
+        let first = rig_resp.choice.first();
+        assert!(matches!(first, AssistantContent::ToolCall(_)));
+    }
+
+    #[test]
+    fn test_parse_output_with_native_tool_use() {
+        let json = r#"[
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Let me do that."},
+                        {"type": "tool_use", "id": "tool_1", "name": "bash", "input": {"command": "ls"}}
+                    ],
+                    "usage": {"input_tokens": 10, "output_tokens": 5}
+                }
+            },
+            {"type": "result", "result": "", "usage": {"input_tokens": 10, "output_tokens": 5}}
+        ]"#;
+
+        let resp = parse_claude_output(json).unwrap();
+        assert_eq!(resp.content, "Let me do that.");
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].name, "bash");
+        assert_eq!(resp.tool_calls[0].arguments["command"], "ls");
     }
 
     #[test]
@@ -595,6 +695,31 @@ Done!"#;
         assert!(calls.is_empty());
         // Malformed JSON is kept in cleaned text
         assert!(cleaned.contains("{not valid json}"));
+    }
+
+    #[test]
+    fn test_extract_tool_calls_trailing_brace() {
+        // LLMs sometimes generate an extra trailing `}` in nested JSON
+        let text = r#"<tool_call>
+{"id":"call_1","name":"create_artifact","arguments":{"title":"Test","files":{"index.html":"<h1>Hi</h1>"}}}
+}
+</tool_call>"#;
+        let (cleaned, calls) = extract_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 1, "Should parse despite trailing brace");
+        assert_eq!(calls[0].name, "create_artifact");
+        assert_eq!(calls[0].arguments["title"], "Test");
+        assert!(cleaned.is_empty() || cleaned.trim().is_empty());
+    }
+
+    #[test]
+    fn test_extract_tool_calls_trailing_braces_multiple() {
+        // Multiple extra trailing braces
+        let text = r#"<tool_call>
+{"id":"call_1","name":"screenshot","arguments":{}}}}
+</tool_call>"#;
+        let (_cleaned, calls) = extract_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 1, "Should parse despite multiple trailing braces");
+        assert_eq!(calls[0].name, "screenshot");
     }
 
     #[test]
