@@ -52,6 +52,10 @@ pub struct AgentConfig {
     /// Authorization configuration.
     #[serde(default)]
     pub auth: AuthConfig,
+
+    /// Learning system configuration.
+    #[serde(default)]
+    pub learning: LearningConfig,
 }
 
 impl AgentConfig {
@@ -814,6 +818,102 @@ impl SubagentConfig {
     }
 }
 
+// ==================== LearningConfig ====================
+
+/// Configuration for the self-learning system.
+///
+/// Controls how the agent learns from interactions, validates learned
+/// patterns, and promotes them to long-term memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LearningConfig {
+    /// Whether the learning system is enabled.
+    pub enabled: bool,
+    /// Number of pending observations before flushing to storage.
+    pub flush_threshold: usize,
+    /// Interval in seconds between automatic flushes.
+    pub flush_interval_secs: u64,
+    /// Maximum number of learning events per hour.
+    pub rate_limit_per_hour: u32,
+    /// Optional custom directory for soul/memory files.
+    pub soul_dir: Option<String>,
+    /// Validation thresholds for learned patterns.
+    pub validation: ValidationConfig,
+    /// Promotion thresholds for graduating patterns.
+    pub promotion: PromotionConfig,
+}
+
+impl Default for LearningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            flush_threshold: 20,
+            flush_interval_secs: 30,
+            rate_limit_per_hour: 5,
+            soul_dir: None,
+            validation: ValidationConfig::default(),
+            promotion: PromotionConfig::default(),
+        }
+    }
+}
+
+/// Validation thresholds for learned patterns.
+///
+/// A pattern must meet these criteria before being considered valid.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ValidationConfig {
+    /// Minimum hours a pattern must survive before validation.
+    pub min_alive_hours: u64,
+    /// Minimum number of occurrences before validation.
+    pub min_occurrences: u32,
+    /// Minimum confidence score (0.0 - 1.0) before validation.
+    pub min_confidence: f64,
+}
+
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        Self {
+            min_alive_hours: 24,
+            min_occurrences: 3,
+            min_confidence: 0.6,
+        }
+    }
+}
+
+/// Promotion thresholds for graduating learned patterns to long-term memory.
+///
+/// Different pattern categories have different promotion criteria.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PromotionConfig {
+    /// Minimum hits for site interaction patterns.
+    pub site_interaction_min_hits: u32,
+    /// Minimum effectiveness for site interaction patterns.
+    pub site_interaction_min_effectiveness: f64,
+    /// Minimum hits for tool optimization patterns.
+    pub tool_optimization_min_hits: u32,
+    /// Minimum effectiveness for tool optimization patterns.
+    pub tool_optimization_min_effectiveness: f64,
+    /// Minimum hits for user preference patterns.
+    pub user_preference_min_hits: u32,
+    /// Minimum days a pattern must survive before promotion.
+    pub min_alive_days: u64,
+}
+
+impl Default for PromotionConfig {
+    fn default() -> Self {
+        Self {
+            site_interaction_min_hits: 10,
+            site_interaction_min_effectiveness: 0.6,
+            tool_optimization_min_hits: 10,
+            tool_optimization_min_effectiveness: 0.7,
+            user_preference_min_hits: 5,
+            min_alive_days: 7,
+        }
+    }
+}
+
 // ==================== AuthConfig ====================
 
 /// Authorization configuration for tool access control.
@@ -1342,6 +1442,21 @@ denied_commands = ["sudo *"]
         assert_eq!(config.auth.allowed_commands.len(), 4);
         assert_eq!(config.auth.sensitive_patterns.len(), 5);
         assert!(config.auth.denied_commands.is_empty());
+    }
+
+    // ==================== LearningConfig Tests ====================
+
+    #[test]
+    fn learning_config_defaults() {
+        let config = LearningConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.flush_threshold, 20);
+        assert_eq!(config.flush_interval_secs, 30);
+        assert_eq!(config.validation.min_alive_hours, 24);
+        assert_eq!(config.validation.min_occurrences, 3);
+        assert_eq!(config.validation.min_confidence, 0.6);
+        assert_eq!(config.promotion.site_interaction_min_hits, 10);
+        assert_eq!(config.promotion.min_alive_days, 7);
     }
 
     #[test]
