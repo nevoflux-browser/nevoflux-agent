@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use nevoflux_storage::{CreateKnowledgeParams, Storage};
+use nevoflux_storage::{CreateKnowledgeParams, CreateLearningMetricParams, Storage};
 
 use super::buffer::MemoryBuffer;
 use super::routing;
@@ -93,6 +93,23 @@ impl LearningPipeline {
         Self { buffer, storage }
     }
 
+    /// Record a learning metric for tracking pipeline operations.
+    ///
+    /// This is best-effort: errors are logged but not propagated so that
+    /// metrics recording never causes a pipeline operation to fail.
+    fn record_metric(&self, metric_type: &str, value: f64, metadata: Option<&str>) {
+        let period = Utc::now().format("%Y-%m-%d").to_string();
+        let params = CreateLearningMetricParams::new(metric_type, &period, value)
+            .with_sample_count(metadata.map_or(0, |_| 1));
+        if let Err(e) = self.storage.learning_metrics().create(params) {
+            tracing::warn!(
+                metric_type = metric_type,
+                error = %e,
+                "failed to record learning metric"
+            );
+        }
+    }
+
     /// Drain all entries from the buffer and insert them into the SQLite
     /// knowledge table.
     ///
@@ -105,6 +122,7 @@ impl LearningPipeline {
             self.storage.knowledge().create(params)?;
         }
         self.buffer.mark_flushed();
+        self.record_metric("flush", count as f64, None);
         Ok(count)
     }
 
@@ -164,6 +182,7 @@ impl LearningPipeline {
             validated_count += 1;
         }
 
+        self.record_metric("validation", validated_count as f64, None);
         Ok(validated_count)
     }
 
@@ -266,6 +285,12 @@ impl LearningPipeline {
                 }
             }
         }
+
+        let metadata = format!(
+            "promoted={},skipped_protection={},skipped_threshold={},failed={}",
+            result.promoted, result.skipped_protection, result.skipped_threshold, result.failed
+        );
+        self.record_metric("promotion", result.promoted as f64, Some(&metadata));
 
         Ok(result)
     }
@@ -1283,5 +1308,156 @@ mod tests {
 
         let result = pipeline.resurrect("K-00000000-000000").unwrap();
         assert!(!result, "should return false for nonexistent entry");
+    }
+
+    // --- Metrics recording tests ---
+
+    #[test]
+    fn flush_records_metric() {
+        let (pipeline, storage) = setup();
+
+        pipeline.buffer().insert(LearningEntry::new(
+            LearningCategory::SiteInteraction,
+            "click_failed",
+            "Button click failed",
+        ));
+
+        pipeline.flush().unwrap();
+
+        let metrics = storage.learning_metrics().query_by_type("flush", 10).unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert!((metrics[0].value - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn flush_empty_records_zero_metric() {
+        let (pipeline, storage) = setup();
+
+        pipeline.flush().unwrap();
+
+        let metrics = storage.learning_metrics().query_by_type("flush", 10).unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert!((metrics[0].value - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn validate_records_metric() {
+        let (pipeline, storage) = setup();
+
+        // Create a qualifying entry
+        let created = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "metric test entry".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET hit_count = 5, confidence = 0.8 WHERE id = ?1",
+                    params![created.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let thresholds = ValidationThresholds {
+            min_occurrences: 3,
+            min_confidence: 0.6,
+            min_alive_hours: 0,
+        };
+
+        pipeline.validate(&thresholds).unwrap();
+
+        let metrics = storage
+            .learning_metrics()
+            .query_by_type("validation", 10)
+            .unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert!((metrics[0].value - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn validate_records_zero_metric_when_nothing_qualifies() {
+        let (pipeline, storage) = setup();
+
+        let thresholds = ValidationThresholds::default();
+        pipeline.validate(&thresholds).unwrap();
+
+        let metrics = storage
+            .learning_metrics()
+            .query_by_type("validation", 10)
+            .unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert!((metrics[0].value - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn promote_records_metric() {
+        let (pipeline, storage) = setup();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        create_validated_entry(
+            &storage,
+            "site_interaction",
+            None,
+            Some("example.com"),
+            "Metric test entry",
+            0.85,
+        );
+
+        let thresholds = PromotionThresholds {
+            min_confidence: 0.6,
+            batch_size: 10,
+        };
+
+        pipeline.promote(&thresholds, &mut manager).await.unwrap();
+
+        let metrics = storage
+            .learning_metrics()
+            .query_by_type("promotion", 10)
+            .unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert!((metrics[0].value - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn promote_records_metric_with_skipped_counts() {
+        let (pipeline, storage) = setup();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        // One entry that will be skipped due to low confidence
+        create_validated_entry(
+            &storage,
+            "site_interaction",
+            None,
+            None,
+            "Low confidence",
+            0.3,
+        );
+
+        let thresholds = PromotionThresholds {
+            min_confidence: 0.6,
+            batch_size: 10,
+        };
+
+        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        assert_eq!(result.skipped_threshold, 1);
+
+        let metrics = storage
+            .learning_metrics()
+            .query_by_type("promotion", 10)
+            .unwrap();
+        assert_eq!(metrics.len(), 1);
+        assert!((metrics[0].value - 0.0).abs() < f64::EPSILON);
     }
 }
