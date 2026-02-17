@@ -1,5 +1,6 @@
 pub mod buffer;
 pub mod collector;
+pub mod conflict;
 pub mod decay;
 pub mod pipeline;
 pub mod retriever;
