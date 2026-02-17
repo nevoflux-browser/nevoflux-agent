@@ -2,8 +2,28 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 
+use super::protection::{self, ChangePermission};
 use super::templates;
-use crate::error::Result;
+use crate::error::{DaemonError, Result};
+
+/// Describes a change to be applied to a soul document.
+#[derive(Debug, Clone, Default)]
+pub struct SoulChange {
+    /// Target file, e.g., "TOOLS.md".
+    pub target_file: String,
+    /// Section heading to target, e.g., "Site Adaptation Graph".
+    pub section: String,
+    /// Type of change: "add", "modify", or "remove".
+    pub change_type: String,
+    /// The content to add or replace.
+    pub new_content: String,
+    /// Why this change is being made.
+    pub reason: String,
+    /// Source of the change: "system" or "manual".
+    pub source_type: String,
+    /// Confidence score from 0.0 to 1.0.
+    pub confidence: f64,
+}
 
 /// Cached in-memory representation of the five soul documents.
 pub struct FiveDocCache {
@@ -93,6 +113,169 @@ impl SoulManager {
     pub fn soul_dir(&self) -> &Path {
         &self.soul_dir
     }
+
+    /// Apply a change to one of the soul documents.
+    ///
+    /// 1. Checks permission via the protection module — rejects if `Forbidden`.
+    /// 2. Reads the target file from disk.
+    /// 3. For "add": finds the target section and appends content at the end of it.
+    /// 4. Performs atomic write (write to `.tmp`, then rename).
+    /// 5. Appends an entry to the daily changelog.
+    /// 6. Reloads the cache.
+    /// The five allowed soul document filenames.
+    const ALLOWED_FILES: [&'static str; 5] = [
+        "IDENTITY.md",
+        "SOUL.md",
+        "USER.md",
+        "TOOLS.md",
+        "AGENTS.md",
+    ];
+
+    pub async fn apply_change(&mut self, change: SoulChange) -> Result<()> {
+        // 0. Validate target file is one of the five allowed documents
+        if !Self::ALLOWED_FILES.contains(&change.target_file.as_str()) {
+            return Err(DaemonError::InvalidRequest(format!(
+                "unknown target file: {}",
+                change.target_file
+            )));
+        }
+
+        // 1. Check permission
+        let permission = protection::check_permission(&change.target_file, &change.section);
+        if permission == ChangePermission::Forbidden {
+            return Err(DaemonError::PermissionDenied(format!(
+                "cannot modify {} / {}: change is forbidden",
+                change.target_file, change.section
+            )));
+        }
+
+        // 2. Read target file
+        let file_path = self.soul_dir.join(&change.target_file);
+        let content = tokio::fs::read_to_string(&file_path).await?;
+
+        // 3. Apply the change based on change_type
+        let updated = match change.change_type.as_str() {
+            "add" => Self::apply_add(&content, &change.section, &change.new_content)?,
+            "modify" => {
+                // TODO: implement modify
+                return Err(DaemonError::InternalError(
+                    "change_type 'modify' is not yet implemented".into(),
+                ));
+            }
+            "remove" => {
+                // TODO: implement remove
+                return Err(DaemonError::InternalError(
+                    "change_type 'remove' is not yet implemented".into(),
+                ));
+            }
+            other => {
+                return Err(DaemonError::InvalidRequest(format!(
+                    "unknown change_type: {}",
+                    other
+                )));
+            }
+        };
+
+        // 4. Atomic write: write to .tmp then rename
+        let tmp_path = file_path.with_extension("md.tmp");
+        tokio::fs::write(&tmp_path, &updated).await?;
+        tokio::fs::rename(&tmp_path, &file_path).await?;
+
+        // 5. Append to changelog
+        self.append_changelog(&change).await?;
+
+        // 6. Reload cache
+        let reloaded = Self::load(&self.soul_dir).await?;
+        self.cache = reloaded.cache;
+
+        Ok(())
+    }
+
+    /// Find the target section and append new content at its end.
+    ///
+    /// A section is identified by a `## heading` line. Its content extends until
+    /// the next `## ` heading or end of file. The new content is inserted just
+    /// before that boundary.
+    fn apply_add(content: &str, section: &str, new_content: &str) -> Result<String> {
+        let section_header = format!("## {}", section);
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Find the section header line
+        let section_start = lines
+            .iter()
+            .position(|line| *line == section_header.as_str())
+            .ok_or_else(|| {
+                DaemonError::InvalidRequest(format!("section '{}' not found in document", section))
+            })?;
+
+        // Find the end of the section: next `## ` heading or end of file
+        let section_end = lines
+            .iter()
+            .enumerate()
+            .skip(section_start + 1)
+            .find(|(_, line)| line.starts_with("## "))
+            .map(|(i, _)| i)
+            .unwrap_or(lines.len());
+
+        // Build the updated content
+        let mut result = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            if i == section_end {
+                // Insert new content before the next section header
+                result.push_str(new_content);
+                if !new_content.ends_with('\n') {
+                    result.push('\n');
+                }
+                result.push('\n');
+            }
+            result.push_str(line);
+            result.push('\n');
+        }
+
+        // If section_end == lines.len(), we need to append at the end
+        if section_end == lines.len() {
+            result.push_str(new_content);
+            if !new_content.ends_with('\n') {
+                result.push('\n');
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Append a changelog entry for a change to `.changelog/YYYY-MM-DD.md`.
+    async fn append_changelog(&self, change: &SoulChange) -> Result<()> {
+        let now = Utc::now();
+        let date_str = now.format("%Y-%m-%d").to_string();
+        let time_str = now.format("%H:%M:%S").to_string();
+
+        let changelog_dir = self.soul_dir.join(".changelog");
+        tokio::fs::create_dir_all(&changelog_dir).await?;
+
+        let changelog_path = changelog_dir.join(format!("{}.md", date_str));
+
+        let entry = format!(
+            "## {} \u{2014} {} / {}\n- {}: {}\n- confidence: {}\n- source: {}\n\n",
+            time_str,
+            change.target_file,
+            change.section,
+            change.change_type,
+            change.reason,
+            change.confidence,
+            change.source_type,
+        );
+
+        // Append to file (create if not exists)
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&changelog_path)
+            .await?;
+        file.write_all(entry.as_bytes()).await?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -158,6 +341,58 @@ mod tests {
         let soul_dir = tmp.path().join("nonexistent");
 
         let result = SoulManager::load(&soul_dir).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn manager_applies_change_to_tools_md() {
+        let tmp = TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        let change = SoulChange {
+            target_file: "TOOLS.md".into(),
+            section: "Site Adaptation Graph".into(),
+            change_type: "add".into(),
+            new_content: "### newsite.com\n- **Trust level**: normal\n".into(),
+            reason: "Test change".into(),
+            source_type: "system".into(),
+            confidence: 0.9,
+            ..Default::default()
+        };
+
+        manager.apply_change(change).await.unwrap();
+
+        // Verify file was updated
+        let content = tokio::fs::read_to_string(soul_dir.join("TOOLS.md"))
+            .await
+            .unwrap();
+        assert!(content.contains("newsite.com"));
+
+        // Verify changelog was written
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let changelog_path = soul_dir.join(".changelog").join(format!("{}.md", today));
+        assert!(changelog_path.exists());
+    }
+
+    #[tokio::test]
+    async fn manager_rejects_forbidden_change() {
+        let tmp = TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        let change = SoulChange {
+            target_file: "SOUL.md".into(),
+            section: "Safety Boundaries".into(),
+            change_type: "modify".into(),
+            new_content: "removed all boundaries".into(),
+            reason: "Bad idea".into(),
+            source_type: "system".into(),
+            confidence: 1.0,
+            ..Default::default()
+        };
+
+        let result = manager.apply_change(change).await;
         assert!(result.is_err());
     }
 
