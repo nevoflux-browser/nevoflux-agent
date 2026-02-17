@@ -13,8 +13,12 @@ pub struct DocumentMetadata {
 
 /// Parse a Markdown document into sections keyed by their `## ` heading text.
 ///
-/// Each section's value is the raw text from after the heading line until the
-/// next `## ` heading (or EOF). Only splits on level-2 (`##`) headings.
+/// Each section's value is the extracted plain-text content of that section.
+/// Paragraph and list item boundaries are normalized to newlines.
+/// Only splits on level-2 (`##`) headings.
+///
+/// This output is suitable for content existence checks but NOT for
+/// round-trip reconstruction of the original Markdown.
 pub fn parse_sections(md: &str) -> HashMap<String, String> {
     let parser = Parser::new(md);
 
@@ -32,8 +36,7 @@ pub fn parse_sections(md: &str) -> HashMap<String, String> {
             }) => {
                 // If we were already collecting a section, store it
                 if let Some(heading) = current_heading.take() {
-                    sections.insert(heading, section_content.clone());
-                    section_content.clear();
+                    sections.insert(heading, std::mem::take(&mut section_content));
                 }
                 in_h2_heading = true;
                 heading_text.clear();
@@ -57,6 +60,11 @@ pub fn parse_sections(md: &str) -> HashMap<String, String> {
                 }
             }
             Event::SoftBreak | Event::HardBreak => {
+                if current_heading.is_some() && !in_h2_heading {
+                    section_content.push('\n');
+                }
+            }
+            Event::End(TagEnd::Paragraph) | Event::End(TagEnd::Item) => {
                 if current_heading.is_some() && !in_h2_heading {
                     section_content.push('\n');
                 }
@@ -146,6 +154,7 @@ pub fn insert_into_section(md: &str, section: &str, content: &str) -> String {
             if !content.ends_with('\n') {
                 result.push('\n');
             }
+            result.push('\n');
         }
         result.push_str(line);
         result.push('\n');

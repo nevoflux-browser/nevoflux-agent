@@ -114,14 +114,6 @@ impl SoulManager {
         &self.soul_dir
     }
 
-    /// Apply a change to one of the soul documents.
-    ///
-    /// 1. Checks permission via the protection module — rejects if `Forbidden`.
-    /// 2. Reads the target file from disk.
-    /// 3. For "add": finds the target section and appends content at the end of it.
-    /// 4. Performs atomic write (write to `.tmp`, then rename).
-    /// 5. Appends an entry to the daily changelog.
-    /// 6. Reloads the cache.
     /// The five allowed soul document filenames.
     const ALLOWED_FILES: [&'static str; 5] = [
         "IDENTITY.md",
@@ -131,6 +123,14 @@ impl SoulManager {
         "AGENTS.md",
     ];
 
+    /// Apply a change to one of the soul documents.
+    ///
+    /// 1. Checks permission via the protection module — rejects if `Forbidden`.
+    /// 2. Reads the target file from disk.
+    /// 3. For "add": finds the target section and appends content at the end of it.
+    /// 4. Performs atomic write (write to `.tmp`, then rename).
+    /// 5. Appends an entry to the daily changelog.
+    /// 6. Reloads the cache.
     pub async fn apply_change(&mut self, change: SoulChange) -> Result<()> {
         // 0. Validate target file is one of the five allowed documents
         if !Self::ALLOWED_FILES.contains(&change.target_file.as_str()) {
@@ -266,6 +266,26 @@ impl SoulManager {
     /// Restores all five document files from the given snapshot directory
     /// back into the soul directory, then reloads the in-memory cache.
     pub async fn rollback(&mut self, snapshot_path: &Path) -> Result<()> {
+        // Validate snapshot path is within the snapshots directory
+        let snapshots_root = self.soul_dir.join(".snapshots");
+        if !snapshot_path.starts_with(&snapshots_root) {
+            return Err(DaemonError::InvalidRequest(format!(
+                "snapshot path is not within the snapshots directory: {}",
+                snapshot_path.display()
+            )));
+        }
+
+        // Pre-check all source files exist before touching the destination
+        for name in &Self::ALLOWED_FILES {
+            let src = snapshot_path.join(name);
+            tokio::fs::metadata(&src).await.map_err(|_| {
+                DaemonError::InvalidRequest(format!(
+                    "snapshot is incomplete — missing file: {}",
+                    name
+                ))
+            })?;
+        }
+
         for name in &Self::ALLOWED_FILES {
             let src = snapshot_path.join(name);
             let dst = self.soul_dir.join(name);
