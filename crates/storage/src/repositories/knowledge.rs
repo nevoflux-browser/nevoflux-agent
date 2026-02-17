@@ -243,6 +243,30 @@ impl<'a> KnowledgeRepository<'a> {
         })
     }
 
+    /// Query all knowledge entries regardless of status, ordered by creation time (newest first).
+    ///
+    /// Returns up to `limit` entries.
+    pub fn query_all(&self, limit: usize) -> Result<Vec<Knowledge>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, category, subcategory, domain, summary, details,
+                        resolution, confidence, hit_count, success_count, fail_count,
+                        effectiveness, priority, status, source_ids, related_ids, tags,
+                        privacy_level, promotion_target, promoted_section,
+                        source_type, created_at, updated_at, last_hit_at, promoted_at
+                 FROM knowledge
+                 ORDER BY created_at DESC
+                 LIMIT ?1",
+            )?;
+
+            let rows = stmt
+                .query_map(params![limit as i64], row_to_knowledge)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            Ok(rows)
+        })
+    }
+
     /// Delete all knowledge entries.
     ///
     /// Returns the number of deleted rows.
