@@ -14,6 +14,7 @@ use crate::agent::abi::{
 use crate::agent::streaming::StreamHandle;
 use crate::agent::tools::ToolRegistry;
 use crate::error::{DaemonError, Result};
+use crate::learning::retriever::KnowledgeRetriever;
 use crate::trace::collector::TraceCollector;
 use crate::trace::detection::{DetectionContext, PatternEngine};
 use crate::wasm::{HostServices, WasmInstance, WasmRuntime};
@@ -156,6 +157,16 @@ impl AgentRunner {
     /// Get a reference to the tool registry.
     pub fn tools(&self) -> &ToolRegistry {
         &self.tools
+    }
+
+    /// Access the KnowledgeRetriever if one was injected via HostServices.
+    ///
+    /// Returns `None` if no services were set or if the services were
+    /// created without a knowledge retriever.
+    pub fn knowledge_retriever(&self) -> Option<&Arc<KnowledgeRetriever>> {
+        self.services
+            .as_ref()
+            .and_then(|s| s.knowledge_retriever.as_ref())
     }
 
     /// Run the agent with the given input.
@@ -1148,5 +1159,58 @@ mod tests {
         let text = "```python-exec\r\nx = 1\r\n```";
         let code = extract_python_block(text).unwrap();
         assert_eq!(code, "x = 1");
+    }
+
+    #[test]
+    fn test_knowledge_retriever_none_without_services() {
+        let wasm = create_test_wasm();
+        let runner = AgentRunner::new(&wasm).unwrap();
+
+        assert!(
+            runner.knowledge_retriever().is_none(),
+            "should be None when no services are set"
+        );
+    }
+
+    #[test]
+    fn test_knowledge_retriever_none_without_retriever_in_services() {
+        use nevoflux_storage::Database;
+
+        let wasm = create_test_wasm();
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let services = HostServices::new(db);
+        let runner = AgentRunner::new(&wasm).unwrap().with_services(services);
+
+        assert!(
+            runner.knowledge_retriever().is_none(),
+            "should be None when services lack a retriever"
+        );
+    }
+
+    #[test]
+    fn test_knowledge_retriever_accessible_through_services() {
+        use crate::learning::retriever::KnowledgeRetriever;
+        use crate::learning::soul::manager::FiveDocCache;
+        use nevoflux_storage::{Database, Storage};
+
+        let wasm = create_test_wasm();
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let cache = Arc::new(FiveDocCache {
+            identity_raw: String::new(),
+            soul_raw: String::new(),
+            user_raw: String::new(),
+            tools_raw: String::new(),
+            agents_raw: String::new(),
+            last_parsed_at: chrono::Utc::now(),
+        });
+        let retriever = Arc::new(KnowledgeRetriever::new(cache, storage));
+
+        let services = HostServices::new(db).with_knowledge_retriever(retriever.clone());
+        let runner = AgentRunner::new(&wasm).unwrap().with_services(services);
+
+        let retrieved = runner.knowledge_retriever();
+        assert!(retrieved.is_some(), "should be Some when retriever is set");
+        assert!(Arc::ptr_eq(retrieved.unwrap(), &retriever));
     }
 }

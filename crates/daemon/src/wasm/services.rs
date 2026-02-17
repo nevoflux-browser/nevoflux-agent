@@ -4,6 +4,7 @@
 //! dependencies needed by Wasm host functions to interact with
 //! the NevoFlux system.
 
+use crate::learning::retriever::KnowledgeRetriever;
 use crate::wasm::subagent::SubagentExecutor;
 use nevoflux_llm::ProviderType;
 use nevoflux_mcp::{McpManager, ToolSearchIndex};
@@ -132,6 +133,11 @@ pub struct HostServices {
     pub client_identity: Vec<u8>,
     /// Current proxy ID for the response envelope.
     pub proxy_id: String,
+    /// Knowledge retriever for injecting learned context into agent execution.
+    ///
+    /// When set, enables the agent to retrieve relevant knowledge entries
+    /// and site adaptations from the learning system.
+    pub knowledge_retriever: Option<Arc<KnowledgeRetriever>>,
 }
 
 impl HostServices {
@@ -174,6 +180,7 @@ impl HostServices {
             subagent_executor: None,
             client_identity: Vec::new(),
             proxy_id: String::new(),
+            knowledge_retriever: None,
         }
     }
 
@@ -195,6 +202,7 @@ impl HostServices {
             subagent_executor: None,
             client_identity: Vec::new(),
             proxy_id: String::new(),
+            knowledge_retriever: None,
         }
     }
 
@@ -327,6 +335,23 @@ impl HostServices {
         self
     }
 
+    /// Add a knowledge retriever to the services.
+    ///
+    /// This enables the agent to retrieve relevant knowledge entries
+    /// and site adaptations from the learning system during execution.
+    ///
+    /// # Arguments
+    ///
+    /// * `retriever` - The knowledge retriever to use.
+    ///
+    /// # Returns
+    ///
+    /// Returns self for method chaining.
+    pub fn with_knowledge_retriever(mut self, retriever: Arc<KnowledgeRetriever>) -> Self {
+        self.knowledge_retriever = Some(retriever);
+        self
+    }
+
     /// Check if subagent execution is available.
     pub fn has_subagent_executor(&self) -> bool {
         self.subagent_executor.is_some()
@@ -381,6 +406,10 @@ impl std::fmt::Debug for HostServices {
             .field(
                 "subagent_executor",
                 &self.subagent_executor.as_ref().map(|_| "Some(...)"),
+            )
+            .field(
+                "knowledge_retriever",
+                &self.knowledge_retriever.as_ref().map(|_| "Some(...)"),
             )
             .finish()
     }
@@ -686,6 +715,94 @@ mod tests {
         let debug_str = format!("{:?}", services);
 
         assert!(debug_str.contains("subagent_executor"));
+        assert!(debug_str.contains("Some(...)"));
+    }
+
+    #[test]
+    fn test_host_services_without_knowledge_retriever() {
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let services = HostServices::new(db);
+
+        assert!(services.knowledge_retriever.is_none());
+    }
+
+    #[test]
+    fn test_host_services_with_knowledge_retriever() {
+        use crate::learning::retriever::KnowledgeRetriever;
+        use crate::learning::soul::manager::FiveDocCache;
+        use nevoflux_storage::Storage;
+
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let cache = Arc::new(FiveDocCache {
+            identity_raw: String::new(),
+            soul_raw: String::new(),
+            user_raw: String::new(),
+            tools_raw: String::new(),
+            agents_raw: String::new(),
+            last_parsed_at: chrono::Utc::now(),
+        });
+        let retriever = Arc::new(KnowledgeRetriever::new(cache, storage));
+
+        let services = HostServices::new(db).with_knowledge_retriever(retriever.clone());
+
+        assert!(services.knowledge_retriever.is_some());
+        assert!(Arc::ptr_eq(
+            services.knowledge_retriever.as_ref().unwrap(),
+            &retriever
+        ));
+    }
+
+    #[test]
+    fn test_host_services_knowledge_retriever_clone_shares_arc() {
+        use crate::learning::retriever::KnowledgeRetriever;
+        use crate::learning::soul::manager::FiveDocCache;
+        use nevoflux_storage::Storage;
+
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let cache = Arc::new(FiveDocCache {
+            identity_raw: String::new(),
+            soul_raw: String::new(),
+            user_raw: String::new(),
+            tools_raw: String::new(),
+            agents_raw: String::new(),
+            last_parsed_at: chrono::Utc::now(),
+        });
+        let retriever = Arc::new(KnowledgeRetriever::new(cache, storage));
+
+        let services = HostServices::new(db).with_knowledge_retriever(retriever);
+        let cloned = services.clone();
+
+        // Both should point to the same Arc
+        assert!(Arc::ptr_eq(
+            services.knowledge_retriever.as_ref().unwrap(),
+            cloned.knowledge_retriever.as_ref().unwrap(),
+        ));
+    }
+
+    #[test]
+    fn test_host_services_knowledge_retriever_debug() {
+        use crate::learning::retriever::KnowledgeRetriever;
+        use crate::learning::soul::manager::FiveDocCache;
+        use nevoflux_storage::Storage;
+
+        let db = Arc::new(Database::open_in_memory().expect("Failed to open in-memory database"));
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let cache = Arc::new(FiveDocCache {
+            identity_raw: String::new(),
+            soul_raw: String::new(),
+            user_raw: String::new(),
+            tools_raw: String::new(),
+            agents_raw: String::new(),
+            last_parsed_at: chrono::Utc::now(),
+        });
+        let retriever = Arc::new(KnowledgeRetriever::new(cache, storage));
+
+        let services = HostServices::new(db).with_knowledge_retriever(retriever);
+        let debug_str = format!("{:?}", services);
+
+        assert!(debug_str.contains("knowledge_retriever"));
         assert!(debug_str.contains("Some(...)"));
     }
 }
