@@ -26,6 +26,7 @@ pub struct SoulChange {
 }
 
 /// Cached in-memory representation of the five soul documents.
+#[derive(Clone)]
 pub struct FiveDocCache {
     pub identity_raw: String,
     pub soul_raw: String,
