@@ -140,6 +140,30 @@ impl<'a> KnowledgeRepository<'a> {
         })
     }
 
+    /// Query all pending knowledge entries, ordered by creation time (oldest first).
+    ///
+    /// Returns up to `limit` entries with status = 'pending'.
+    pub fn query_pending(&self, limit: usize) -> Result<Vec<Knowledge>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, category, subcategory, domain, summary, details,
+                        resolution, confidence, hit_count, success_count, fail_count,
+                        effectiveness, priority, status, source_ids, related_ids, tags,
+                        privacy_level, promotion_target, promoted_section,
+                        source_type, created_at, updated_at, last_hit_at, promoted_at
+                 FROM knowledge WHERE status = 'pending'
+                 ORDER BY created_at ASC
+                 LIMIT ?1",
+            )?;
+
+            let rows = stmt
+                .query_map(params![limit as i64], row_to_knowledge)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            Ok(rows)
+        })
+    }
+
     /// Delete a knowledge entry by ID.
     pub fn delete(&self, id: &str) -> Result<bool> {
         self.db.with_connection(|conn| {
