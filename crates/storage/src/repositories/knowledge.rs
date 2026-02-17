@@ -23,7 +23,9 @@ impl<'a> KnowledgeRepository<'a> {
         let id = generate_knowledge_id();
         let now = rfc3339_now();
         let priority = params.priority.unwrap_or_else(|| "medium".to_string());
-        let privacy_level = params.privacy_level.unwrap_or_else(|| "internal".to_string());
+        let privacy_level = params
+            .privacy_level
+            .unwrap_or_else(|| "internal".to_string());
         let source_type = params.source_type.unwrap_or_else(|| "system".to_string());
 
         self.db.with_connection(|conn| {
@@ -237,8 +239,7 @@ impl<'a> KnowledgeRepository<'a> {
     /// Delete a knowledge entry by ID.
     pub fn delete(&self, id: &str) -> Result<bool> {
         self.db.with_connection(|conn| {
-            let rows_affected =
-                conn.execute("DELETE FROM knowledge WHERE id = ?1", params![id])?;
+            let rows_affected = conn.execute("DELETE FROM knowledge WHERE id = ?1", params![id])?;
             Ok(rows_affected > 0)
         })
     }
@@ -326,7 +327,13 @@ fn generate_knowledge_id() -> String {
     let nanos = now.as_nanos();
     let random_part = (nanos as u64).wrapping_mul(6364136223846793005);
 
-    format!("K-{:04}{:02}{:02}-{:06x}", year, month, day, random_part & 0xFFFFFF)
+    format!(
+        "K-{:04}{:02}{:02}-{:06x}",
+        year,
+        month,
+        day,
+        random_part & 0xFFFFFF
+    )
 }
 
 /// Convert days since Unix epoch to (year, month, day).
@@ -459,10 +466,7 @@ mod tests {
     #[test]
     fn test_delete_returns_false_for_nonexistent() {
         let storage = Storage::open_in_memory().unwrap();
-        let deleted = storage
-            .knowledge()
-            .delete("K-00000000-000000")
-            .unwrap();
+        let deleted = storage.knowledge().delete("K-00000000-000000").unwrap();
         assert!(!deleted);
     }
 
@@ -484,13 +488,16 @@ mod tests {
         assert_eq!(created.effectiveness, 0.5);
 
         // Manually update counts to test the GENERATED ALWAYS column
-        storage.database().with_connection(|conn| {
-            conn.execute(
-                "UPDATE knowledge SET success_count = 8, fail_count = 2 WHERE id = ?1",
-                params![created.id],
-            )?;
-            Ok(())
-        }).unwrap();
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET success_count = 8, fail_count = 2 WHERE id = ?1",
+                    params![created.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
 
         let updated = storage.knowledge().get(&created.id).unwrap().unwrap();
         assert!((updated.effectiveness - 0.8).abs() < 0.001);
@@ -677,9 +684,7 @@ mod tests {
     #[test]
     fn test_resurrect_entry_not_found() {
         let storage = Storage::open_in_memory().unwrap();
-        let result = storage
-            .knowledge()
-            .resurrect_entry("K-00000000-000000");
+        let result = storage.knowledge().resurrect_entry("K-00000000-000000");
         assert!(result.is_err());
     }
 }

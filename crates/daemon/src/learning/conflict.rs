@@ -241,7 +241,9 @@ mod tests {
     fn make_knowledge(overrides: KnowledgeOverrides) -> Knowledge {
         Knowledge {
             id: overrides.id.unwrap_or_else(|| "K-20260101-aaa111".into()),
-            category: overrides.category.unwrap_or_else(|| "site_interaction".into()),
+            category: overrides
+                .category
+                .unwrap_or_else(|| "site_interaction".into()),
             subcategory: overrides.subcategory,
             domain: overrides.domain,
             summary: overrides.summary.unwrap_or_else(|| "test summary".into()),

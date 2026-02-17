@@ -29,18 +29,15 @@ pub struct RouteTarget {
 pub fn route_knowledge(entry: &Knowledge) -> RouteTarget {
     // If the entry already has a promotion_target set, use it as the file name
     // and fall through to category-based section routing.
-    let target_file = entry
-        .promotion_target
-        .as_deref()
-        .map(|t| {
-            // Strip a trailing ".md" (case-insensitive), uppercase the stem, add ".md"
-            let stem = t
-                .strip_suffix(".md")
-                .or_else(|| t.strip_suffix(".MD"))
-                .or_else(|| t.strip_suffix(".Md"))
-                .unwrap_or(t);
-            format!("{}.md", stem.to_uppercase())
-        });
+    let target_file = entry.promotion_target.as_deref().map(|t| {
+        // Strip a trailing ".md" (case-insensitive), uppercase the stem, add ".md"
+        let stem = t
+            .strip_suffix(".md")
+            .or_else(|| t.strip_suffix(".MD"))
+            .or_else(|| t.strip_suffix(".Md"))
+            .unwrap_or(t);
+        format!("{}.md", stem.to_uppercase())
+    });
 
     let subcategory = entry.subcategory.as_deref().unwrap_or("");
 

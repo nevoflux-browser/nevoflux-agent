@@ -160,13 +160,8 @@ impl SoulManager {
     }
 
     /// The five allowed soul document filenames.
-    const ALLOWED_FILES: [&'static str; 5] = [
-        "IDENTITY.md",
-        "SOUL.md",
-        "USER.md",
-        "TOOLS.md",
-        "AGENTS.md",
-    ];
+    const ALLOWED_FILES: [&'static str; 5] =
+        ["IDENTITY.md", "SOUL.md", "USER.md", "TOOLS.md", "AGENTS.md"];
 
     /// Apply a change to one of the soul documents.
     ///
@@ -660,7 +655,10 @@ mod tests {
         let raw_on_disk = tokio::fs::read_to_string(soul_dir.join("USER.md"))
             .await
             .unwrap();
-        assert_ne!(raw_on_disk, original_user, "on-disk content should be encrypted");
+        assert_ne!(
+            raw_on_disk, original_user,
+            "on-disk content should be encrypted"
+        );
 
         // The cache should still hold the decrypted version
         assert_eq!(manager.cache().user_raw, original_user);
@@ -668,7 +666,8 @@ mod tests {
         // Now simulate a fresh load without encryption — cache would have ciphertext
         let manager2 = SoulManager::load(&soul_dir).await.unwrap();
         assert_ne!(
-            manager2.cache().user_raw, original_user,
+            manager2.cache().user_raw,
+            original_user,
             "loading without encryption should see ciphertext"
         );
 
@@ -677,7 +676,8 @@ mod tests {
         manager3.set_encryption(Arc::clone(&enc));
         manager3.decrypt_user_md().await.unwrap();
         assert_eq!(
-            manager3.cache().user_raw, original_user,
+            manager3.cache().user_raw,
+            original_user,
             "decrypted cache should match original"
         );
     }

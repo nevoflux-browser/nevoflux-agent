@@ -260,10 +260,7 @@ impl<'a> ToolStatsRepository<'a> {
     /// Delete a tool stat by ID.
     pub fn delete(&self, id: &str) -> Result<bool> {
         self.db.with_connection(|conn| {
-            let rows = conn.execute(
-                "DELETE FROM tool_stats WHERE id = ?1",
-                params![id],
-            )?;
+            let rows = conn.execute("DELETE FROM tool_stats WHERE id = ?1", params![id])?;
             Ok(rows > 0)
         })
     }
@@ -345,10 +342,8 @@ mod tests {
         let storage = Storage::open_in_memory().unwrap();
         let repo = ToolStatsRepository::new(storage.database());
 
-        repo.create(
-            CreateToolStatParams::new("browser_click").with_id("TS-inc"),
-        )
-        .unwrap();
+        repo.create(CreateToolStatParams::new("browser_click").with_id("TS-inc"))
+            .unwrap();
 
         // First call: success with 100ms latency
         let stat = repo
@@ -381,9 +376,7 @@ mod tests {
         let repo = ToolStatsRepository::new(storage.database());
 
         // No pre-existing record
-        let stat = repo
-            .increment_call("new_tool", true, Some(50.0))
-            .unwrap();
+        let stat = repo.increment_call("new_tool", true, Some(50.0)).unwrap();
         assert!(stat.id.starts_with("TS-"));
         assert_eq!(stat.tool_name, "new_tool");
         assert_eq!(stat.call_count, 1);
@@ -415,10 +408,8 @@ mod tests {
         let storage = Storage::open_in_memory().unwrap();
         let repo = ToolStatsRepository::new(storage.database());
 
-        repo.create(
-            CreateToolStatParams::new("browser_click").with_id("TS-del"),
-        )
-        .unwrap();
+        repo.create(CreateToolStatParams::new("browser_click").with_id("TS-del"))
+            .unwrap();
 
         let deleted = repo.delete("TS-del").unwrap();
         assert!(deleted);
@@ -435,9 +426,7 @@ mod tests {
         let storage = Storage::open_in_memory().unwrap();
         let repo = ToolStatsRepository::new(storage.database());
 
-        let record = repo
-            .create(CreateToolStatParams::new("some_tool"))
-            .unwrap();
+        let record = repo.create(CreateToolStatParams::new("some_tool")).unwrap();
 
         assert!(record.id.starts_with("TS-"));
         assert!(record.id.len() > 3);

@@ -14,13 +14,7 @@ use tokio::sync::mpsc;
 use crate::error::{DaemonError, Result};
 
 /// Filenames that the watcher considers "soul documents".
-const WATCHED_FILES: [&str; 5] = [
-    "IDENTITY.md",
-    "SOUL.md",
-    "USER.md",
-    "TOOLS.md",
-    "AGENTS.md",
-];
+const WATCHED_FILES: [&str; 5] = ["IDENTITY.md", "SOUL.md", "USER.md", "TOOLS.md", "AGENTS.md"];
 
 /// Watches the soul directory for external modifications to soul documents.
 ///
@@ -49,18 +43,15 @@ impl SoulWatcher {
 
         let soul_dir_clone = soul_dir.clone();
 
-        let mut watcher = notify::recommended_watcher(
-            move |res: std::result::Result<Event, notify::Error>| {
+        let mut watcher =
+            notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
                 if let Ok(event) = res {
                     match event.kind {
                         EventKind::Modify(_) | EventKind::Create(_) => {
                             for path in &event.paths {
-                                if let Some(filename) =
-                                    path.file_name().and_then(|f| f.to_str())
-                                {
+                                if let Some(filename) = path.file_name().and_then(|f| f.to_str()) {
                                     if WATCHED_FILES.contains(&filename)
-                                        && path.parent()
-                                            == Some(soul_dir_clone.as_path())
+                                        && path.parent() == Some(soul_dir_clone.as_path())
                                     {
                                         let _ = tx.blocking_send(path.clone());
                                     }
@@ -70,22 +61,15 @@ impl SoulWatcher {
                         _ => {}
                     }
                 }
-            },
-        )
-        .map_err(|e| {
-            DaemonError::InternalError(format!(
-                "Failed to create file watcher: {}",
-                e
-            ))
-        })?;
+            })
+            .map_err(|e| {
+                DaemonError::InternalError(format!("Failed to create file watcher: {}", e))
+            })?;
 
         watcher
             .watch(&soul_dir, RecursiveMode::NonRecursive)
             .map_err(|e| {
-                DaemonError::InternalError(format!(
-                    "Failed to watch soul directory: {}",
-                    e
-                ))
+                DaemonError::InternalError(format!("Failed to watch soul directory: {}", e))
             })?;
 
         Ok(Self {
@@ -131,11 +115,7 @@ mod tests {
         std::fs::write(soul_dir.join("TOOLS.md"), "# modified").unwrap();
 
         // Wait for the event with timeout
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            watcher.next_change(),
-        )
-        .await;
+        let result = tokio::time::timeout(Duration::from_secs(5), watcher.next_change()).await;
         assert!(result.is_ok(), "Should receive change event within timeout");
 
         let changed_path = result.unwrap().unwrap();
@@ -151,15 +131,10 @@ mod tests {
 
         // Create a non-soul file
         tokio::time::sleep(Duration::from_millis(100)).await;
-        std::fs::write(soul_dir.join("random.txt"), "not a soul file")
-            .unwrap();
+        std::fs::write(soul_dir.join("random.txt"), "not a soul file").unwrap();
 
         // Should NOT get an event (use short timeout)
-        let result = tokio::time::timeout(
-            Duration::from_millis(500),
-            watcher.next_change(),
-        )
-        .await;
+        let result = tokio::time::timeout(Duration::from_millis(500), watcher.next_change()).await;
         assert!(
             result.is_err(),
             "Should NOT receive event for non-soul files"
@@ -187,11 +162,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         std::fs::write(soul_dir.join("USER.md"), "# updated user").unwrap();
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            watcher.next_change(),
-        )
-        .await;
+        let result = tokio::time::timeout(Duration::from_secs(5), watcher.next_change()).await;
         assert!(result.is_ok(), "Should detect USER.md change");
     }
 }

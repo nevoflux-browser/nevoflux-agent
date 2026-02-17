@@ -183,10 +183,7 @@ impl<'a> SiteAdaptationRepository<'a> {
     /// Delete a site adaptation by ID.
     pub fn delete(&self, id: &str) -> Result<bool> {
         self.db.with_connection(|conn| {
-            let rows = conn.execute(
-                "DELETE FROM site_adaptations WHERE id = ?1",
-                params![id],
-            )?;
+            let rows = conn.execute("DELETE FROM site_adaptations WHERE id = ?1", params![id])?;
             Ok(rows > 0)
         })
     }

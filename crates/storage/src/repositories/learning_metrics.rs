@@ -153,10 +153,7 @@ impl<'a> LearningMetricsRepository<'a> {
     /// Delete a learning metric by ID.
     pub fn delete(&self, id: &str) -> Result<bool> {
         self.db.with_connection(|conn| {
-            let rows = conn.execute(
-                "DELETE FROM learning_metrics WHERE id = ?1",
-                params![id],
-            )?;
+            let rows = conn.execute("DELETE FROM learning_metrics WHERE id = ?1", params![id])?;
             Ok(rows > 0)
         })
     }
@@ -234,8 +231,12 @@ mod tests {
 
         for i in 0..5 {
             repo.create(
-                CreateLearningMetricParams::new("success_rate", &format!("2026-02-{:02}", 10 + i), 0.5)
-                    .with_id(&format!("LM-{:03}", i)),
+                CreateLearningMetricParams::new(
+                    "success_rate",
+                    &format!("2026-02-{:02}", 10 + i),
+                    0.5,
+                )
+                .with_id(&format!("LM-{:03}", i)),
             )
             .unwrap();
         }
@@ -250,20 +251,17 @@ mod tests {
         let repo = LearningMetricsRepository::new(storage.database());
 
         repo.create(
-            CreateLearningMetricParams::new("success_rate", "2026-02-17", 0.85)
-                .with_id("LM-p01"),
+            CreateLearningMetricParams::new("success_rate", "2026-02-17", 0.85).with_id("LM-p01"),
         )
         .unwrap();
 
         repo.create(
-            CreateLearningMetricParams::new("retry_rate", "2026-02-17", 0.12)
-                .with_id("LM-p02"),
+            CreateLearningMetricParams::new("retry_rate", "2026-02-17", 0.12).with_id("LM-p02"),
         )
         .unwrap();
 
         repo.create(
-            CreateLearningMetricParams::new("success_rate", "2026-02-16", 0.80)
-                .with_id("LM-p03"),
+            CreateLearningMetricParams::new("success_rate", "2026-02-16", 0.80).with_id("LM-p03"),
         )
         .unwrap();
 
@@ -305,8 +303,7 @@ mod tests {
         let repo = LearningMetricsRepository::new(storage.database());
 
         repo.create(
-            CreateLearningMetricParams::new("success_rate", "2026-02-17", 0.85)
-                .with_id("LM-del"),
+            CreateLearningMetricParams::new("success_rate", "2026-02-17", 0.85).with_id("LM-del"),
         )
         .unwrap();
 

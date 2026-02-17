@@ -155,12 +155,7 @@ mod tests {
         Storage::open_in_memory().unwrap()
     }
 
-    fn create_entry(
-        storage: &Storage,
-        category: &str,
-        domain: Option<&str>,
-        privacy_level: &str,
-    ) {
+    fn create_entry(storage: &Storage, category: &str, domain: Option<&str>, privacy_level: &str) {
         storage
             .knowledge()
             .create(CreateKnowledgeParams {

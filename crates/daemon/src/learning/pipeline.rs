@@ -180,10 +180,7 @@ impl LearningPipeline {
 
             // Encrypt sensitive fields when an encryption service is available
             if let Some(ref enc) = self.encryption {
-                let privacy = params
-                    .privacy_level
-                    .as_deref()
-                    .unwrap_or("internal");
+                let privacy = params.privacy_level.as_deref().unwrap_or("internal");
                 if privacy == "sensitive" {
                     params.summary = enc.encrypt_if_sensitive(&params.summary, privacy)?;
                     params.details = enc.encrypt_if_sensitive(&params.details, privacy)?;
@@ -253,7 +250,9 @@ impl LearningPipeline {
             }
 
             // Entry meets all thresholds — promote to validated
-            self.storage.knowledge().update_status(&entry.id, "validated")?;
+            self.storage
+                .knowledge()
+                .update_status(&entry.id, "validated")?;
             validated_count += 1;
         }
 
@@ -546,10 +545,7 @@ mod tests {
         assert_eq!(count, 1);
 
         // Retrieve from SQLite — summary and details should be encrypted
-        let results = storage
-            .knowledge()
-            .query_by_domain("bank.com", 10)
-            .unwrap();
+        let results = storage.knowledge().query_by_domain("bank.com", 10).unwrap();
         assert_eq!(results.len(), 1);
 
         let row = &results[0];
@@ -1490,7 +1486,10 @@ mod tests {
 
         pipeline.flush().unwrap();
 
-        let metrics = storage.learning_metrics().query_by_type("flush", 10).unwrap();
+        let metrics = storage
+            .learning_metrics()
+            .query_by_type("flush", 10)
+            .unwrap();
         assert_eq!(metrics.len(), 1);
         assert!((metrics[0].value - 1.0).abs() < f64::EPSILON);
     }
@@ -1501,7 +1500,10 @@ mod tests {
 
         pipeline.flush().unwrap();
 
-        let metrics = storage.learning_metrics().query_by_type("flush", 10).unwrap();
+        let metrics = storage
+            .learning_metrics()
+            .query_by_type("flush", 10)
+            .unwrap();
         assert_eq!(metrics.len(), 1);
         assert!((metrics[0].value - 0.0).abs() < f64::EPSILON);
     }
@@ -1713,12 +1715,8 @@ mod tests {
         storage
             .learning_metrics()
             .create(
-                nevoflux_storage::CreateLearningMetricParams::new(
-                    "flush",
-                    "2026-02-17",
-                    1.0,
-                )
-                .with_id("LM-clear-test"),
+                nevoflux_storage::CreateLearningMetricParams::new("flush", "2026-02-17", 1.0)
+                    .with_id("LM-clear-test"),
             )
             .unwrap();
 
