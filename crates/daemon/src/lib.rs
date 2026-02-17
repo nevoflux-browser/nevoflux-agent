@@ -29,6 +29,7 @@ pub mod context;
 pub mod error;
 pub mod file_picker;
 pub mod health;
+pub mod learning;
 pub mod mcp_config;
 pub mod permission;
 pub mod registry;
