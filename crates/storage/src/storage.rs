@@ -6,8 +6,9 @@ use crate::connection::Database;
 use crate::error::Result;
 use crate::repositories::traces::TraceRepository;
 use crate::repositories::{
-    ArtifactRepository, ConfigRepository, KnowledgeRepository, MessageRepository,
-    PermissionRepository, SessionRepository,
+    ArtifactRepository, ConfigRepository, KnowledgeRepository, LearningMetricsRepository,
+    MessageRepository, PermissionRepository, SessionRepository, SiteAdaptationRepository,
+    ToolStatsRepository,
 };
 
 /// Main storage facade providing access to all repositories.
@@ -83,6 +84,27 @@ impl Storage {
     /// Use this to create, read, update, and delete knowledge entries.
     pub fn knowledge(&self) -> KnowledgeRepository<'_> {
         KnowledgeRepository::new(&self.db)
+    }
+
+    /// Get a site adaptation repository.
+    ///
+    /// Use this to create, read, update, and delete site adaptation records.
+    pub fn site_adaptations(&self) -> SiteAdaptationRepository<'_> {
+        SiteAdaptationRepository::new(&self.db)
+    }
+
+    /// Get a tool stats repository.
+    ///
+    /// Use this to create, read, and update tool effectiveness statistics.
+    pub fn tool_stats(&self) -> ToolStatsRepository<'_> {
+        ToolStatsRepository::new(&self.db)
+    }
+
+    /// Get a learning metrics repository.
+    ///
+    /// Use this to create, query, and delete learning system metrics.
+    pub fn learning_metrics(&self) -> LearningMetricsRepository<'_> {
+        LearningMetricsRepository::new(&self.db)
     }
 
     /// Get the underlying database (for advanced operations).
