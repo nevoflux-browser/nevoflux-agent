@@ -3,6 +3,7 @@
 //! that meet configurable thresholds, and promotes validated entries into
 //! the soul Markdown documents.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -85,12 +86,47 @@ pub struct PromotionResult {
 pub struct LearningPipeline {
     buffer: Arc<MemoryBuffer>,
     storage: Arc<Storage>,
+    enabled: Arc<AtomicBool>,
 }
 
 impl LearningPipeline {
     /// Create a new pipeline that reads from `buffer` and writes to `storage`.
     pub fn new(buffer: Arc<MemoryBuffer>, storage: Arc<Storage>) -> Self {
-        Self { buffer, storage }
+        Self {
+            buffer,
+            storage,
+            enabled: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Pause the learning pipeline. While paused, `flush()`, `validate()`,
+    /// and `promote()` will return early without processing.
+    pub fn pause(&self) {
+        self.enabled.store(false, Ordering::Relaxed);
+    }
+
+    /// Resume the learning pipeline after a pause.
+    pub fn resume(&self) {
+        self.enabled.store(true, Ordering::Relaxed);
+    }
+
+    /// Check whether the learning pipeline is currently enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Return a clone of the shared enabled flag for use by other components
+    /// (e.g., `LearningCollector`).
+    pub fn enabled_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.enabled)
+    }
+
+    /// Clear all learning data: buffer entries, knowledge entries, and metrics.
+    pub async fn clear_all(&self) -> Result<()> {
+        self.buffer.clear();
+        self.storage.knowledge().delete_all()?;
+        self.storage.learning_metrics().delete_all()?;
+        Ok(())
     }
 
     /// Record a learning metric for tracking pipeline operations.
@@ -113,8 +149,12 @@ impl LearningPipeline {
     /// Drain all entries from the buffer and insert them into the SQLite
     /// knowledge table.
     ///
-    /// Returns the number of entries that were flushed.
+    /// Returns the number of entries that were flushed. Returns `Ok(0)` if
+    /// the pipeline is paused.
     pub fn flush(&self) -> Result<usize> {
+        if !self.is_enabled() {
+            return Ok(0);
+        }
         let entries = self.buffer.drain_all();
         let count = entries.len();
         for entry in &entries {
@@ -147,8 +187,12 @@ impl LearningPipeline {
     /// against the configured thresholds, and promotes qualifying entries
     /// from "pending" to "validated" status.
     ///
-    /// Returns the number of entries that were validated.
+    /// Returns the number of entries that were validated. Returns `Ok(0)` if
+    /// the pipeline is paused.
     pub fn validate(&self, thresholds: &ValidationThresholds) -> Result<usize> {
+        if !self.is_enabled() {
+            return Ok(0);
+        }
         let pending = self.storage.knowledge().query_pending(1000)?;
         let now = Utc::now();
         let mut validated_count = 0;
@@ -203,6 +247,9 @@ impl LearningPipeline {
         thresholds: &PromotionThresholds,
         soul_manager: &mut SoulManager,
     ) -> Result<PromotionResult> {
+        if !self.is_enabled() {
+            return Ok(PromotionResult::default());
+        }
         let validated = self
             .storage
             .knowledge()
@@ -1459,5 +1506,198 @@ mod tests {
             .unwrap();
         assert_eq!(metrics.len(), 1);
         assert!((metrics[0].value - 0.0).abs() < f64::EPSILON);
+    }
+
+    // --- Pause / Resume / Clear controls tests ---
+
+    #[test]
+    fn pause_disables_pipeline() {
+        let (pipeline, _) = setup();
+        pipeline.pause();
+
+        // flush should return 0 without draining
+        pipeline.buffer().insert(LearningEntry::new(
+            LearningCategory::SiteInteraction,
+            "click",
+            "click failed",
+        ));
+        let count = pipeline.flush().unwrap();
+        assert_eq!(count, 0);
+
+        // validate should return 0
+        let thresholds = ValidationThresholds::default();
+        let count = pipeline.validate(&thresholds).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn resume_enables_pipeline() {
+        let (pipeline, storage) = setup();
+
+        // Pause then resume
+        pipeline.pause();
+        pipeline.resume();
+
+        // flush should work normally after resume
+        pipeline.buffer().insert(LearningEntry::new(
+            LearningCategory::SiteInteraction,
+            "click",
+            "click failed",
+        ));
+        let count = pipeline.flush().unwrap();
+        assert_eq!(count, 1);
+
+        // Verify entry made it to SQLite
+        let pending = storage.knowledge().query_pending(10).unwrap();
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn is_enabled_returns_correct_state() {
+        let (pipeline, _) = setup();
+
+        // Default: enabled
+        assert!(pipeline.is_enabled());
+
+        // After pause: disabled
+        pipeline.pause();
+        assert!(!pipeline.is_enabled());
+
+        // After resume: enabled again
+        pipeline.resume();
+        assert!(pipeline.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn clear_all_removes_everything() {
+        let (pipeline, storage) = setup();
+
+        // Insert buffer entries
+        pipeline.buffer().insert(LearningEntry::new(
+            LearningCategory::SiteInteraction,
+            "click",
+            "click failed",
+        ));
+
+        // Create knowledge entries
+        storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "test".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Create metrics
+        storage
+            .learning_metrics()
+            .create(
+                nevoflux_storage::CreateLearningMetricParams::new(
+                    "flush",
+                    "2026-02-17",
+                    1.0,
+                )
+                .with_id("LM-clear-test"),
+            )
+            .unwrap();
+
+        // Verify data exists
+        assert_eq!(pipeline.buffer().len(), 1);
+        assert_eq!(storage.knowledge().query_pending(10).unwrap().len(), 1);
+        assert_eq!(
+            storage
+                .learning_metrics()
+                .query_by_type("flush", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Clear all
+        pipeline.clear_all().await.unwrap();
+
+        // Verify everything is gone
+        assert_eq!(pipeline.buffer().len(), 0);
+        assert_eq!(storage.knowledge().query_pending(10).unwrap().len(), 0);
+        assert_eq!(
+            storage
+                .learning_metrics()
+                .query_by_type("flush", 10)
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn flush_skips_when_paused() {
+        let (pipeline, _) = setup();
+
+        // Insert entries
+        pipeline.buffer().insert(LearningEntry::new(
+            LearningCategory::SiteInteraction,
+            "click",
+            "click failed",
+        ));
+
+        // Pause the pipeline
+        pipeline.pause();
+
+        // Flush should skip
+        let count = pipeline.flush().unwrap();
+        assert_eq!(count, 0);
+
+        // Buffer entries should still be there
+        assert_eq!(pipeline.buffer().len(), 1);
+    }
+
+    #[test]
+    fn enabled_flag_returns_shared_arc() {
+        let (pipeline, _) = setup();
+
+        let flag = pipeline.enabled_flag();
+        assert!(flag.load(Ordering::Relaxed));
+
+        // Pausing pipeline should be visible through the shared flag
+        pipeline.pause();
+        assert!(!flag.load(Ordering::Relaxed));
+
+        // And resuming too
+        pipeline.resume();
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn promote_returns_default_when_paused() {
+        let (pipeline, storage) = setup();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        // Create a validated entry that would normally be promoted
+        create_validated_entry(
+            &storage,
+            "site_interaction",
+            None,
+            Some("example.com"),
+            "Should not be promoted",
+            0.85,
+        );
+
+        // Pause the pipeline
+        pipeline.pause();
+
+        let thresholds = PromotionThresholds::default();
+        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        assert_eq!(result.promoted, 0);
+        assert_eq!(result.skipped_protection, 0);
+        assert_eq!(result.skipped_threshold, 0);
+        assert_eq!(result.failed, 0);
+
+        // Entry should still be validated (not promoted)
+        let entries = storage.knowledge().query_validated(10).unwrap();
+        assert_eq!(entries.len(), 1);
     }
 }

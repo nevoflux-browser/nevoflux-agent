@@ -160,6 +160,16 @@ impl<'a> LearningMetricsRepository<'a> {
             Ok(rows > 0)
         })
     }
+
+    /// Delete all learning metrics.
+    ///
+    /// Returns the number of deleted rows.
+    pub fn delete_all(&self) -> Result<usize> {
+        self.db.with_connection(|conn| {
+            let count = conn.execute("DELETE FROM learning_metrics", [])?;
+            Ok(count)
+        })
+    }
 }
 
 /// Convert a database row to a LearningMetric.

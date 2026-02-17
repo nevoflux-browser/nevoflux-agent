@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use super::source::LearningSource;
 use super::types::{LearningEntry, PrivacyLevel};
 use tracing::{debug, info};
@@ -8,6 +11,7 @@ use tracing::{debug, info};
 pub struct LearningCollector {
     sources: Vec<Box<dyn LearningSource>>,
     domain_blacklist: Vec<String>,
+    enabled: Option<Arc<AtomicBool>>,
 }
 
 impl LearningCollector {
@@ -15,7 +19,16 @@ impl LearningCollector {
         Self {
             sources: Vec::new(),
             domain_blacklist: Vec::new(),
+            enabled: None,
         }
+    }
+
+    /// Set the shared enabled flag from the `LearningPipeline`.
+    ///
+    /// When set, `collect_all()` will check this flag and return an empty
+    /// `Vec` if the flag is `false`.
+    pub fn set_enabled(&mut self, flag: Arc<AtomicBool>) {
+        self.enabled = Some(flag);
     }
 
     pub fn register_source(&mut self, source: Box<dyn LearningSource>) {
@@ -27,7 +40,15 @@ impl LearningCollector {
     }
 
     /// Collect entries from all registered sources.
+    ///
+    /// Returns an empty `Vec` if the pipeline is disabled.
     pub fn collect_all(&mut self) -> Vec<LearningEntry> {
+        if let Some(ref enabled) = self.enabled {
+            if !enabled.load(Ordering::Relaxed) {
+                info!("Learning collection disabled, skipping cycle");
+                return Vec::new();
+            }
+        }
         let mut all_entries = Vec::new();
 
         for source in &self.sources {
@@ -249,5 +270,51 @@ mod tests {
         assert!(collected
             .iter()
             .all(|e| e.context.domain.as_deref() != Some("bank.com")));
+    }
+
+    #[test]
+    fn collector_skips_when_disabled() {
+        use std::sync::atomic::AtomicBool;
+
+        let entries = Arc::new(Mutex::new(vec![LearningEntry::new(
+            LearningCategory::SiteInteraction,
+            "click",
+            "click failed",
+        )]));
+
+        let source = FakeSource {
+            entries: entries.clone(),
+        };
+
+        let enabled = Arc::new(AtomicBool::new(false));
+        let mut collector = LearningCollector::new();
+        collector.register_source(Box::new(source));
+        collector.set_enabled(enabled);
+
+        let collected = collector.collect_all();
+        assert!(collected.is_empty(), "should return empty when disabled");
+    }
+
+    #[test]
+    fn collector_collects_when_enabled() {
+        use std::sync::atomic::AtomicBool;
+
+        let entries = Arc::new(Mutex::new(vec![LearningEntry::new(
+            LearningCategory::SiteInteraction,
+            "click",
+            "click failed",
+        )]));
+
+        let source = FakeSource {
+            entries: entries.clone(),
+        };
+
+        let enabled = Arc::new(AtomicBool::new(true));
+        let mut collector = LearningCollector::new();
+        collector.register_source(Box::new(source));
+        collector.set_enabled(enabled);
+
+        let collected = collector.collect_all();
+        assert_eq!(collected.len(), 1, "should collect normally when enabled");
     }
 }

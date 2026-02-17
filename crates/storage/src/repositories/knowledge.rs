@@ -242,6 +242,16 @@ impl<'a> KnowledgeRepository<'a> {
             Ok(rows_affected > 0)
         })
     }
+
+    /// Delete all knowledge entries.
+    ///
+    /// Returns the number of deleted rows.
+    pub fn delete_all(&self) -> Result<usize> {
+        self.db.with_connection(|conn| {
+            let count = conn.execute("DELETE FROM knowledge", [])?;
+            Ok(count)
+        })
+    }
 }
 
 /// Convert a database row to a Knowledge struct.

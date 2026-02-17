@@ -100,6 +100,11 @@ impl MemoryBuffer {
         result
     }
 
+    /// Remove all entries from the buffer without returning them.
+    pub fn clear(&self) {
+        self.entries.clear();
+    }
+
     /// Record that a flush just happened, resetting the interval timer.
     pub fn mark_flushed(&self) {
         let mut last = self.last_flush.lock().expect("last_flush lock poisoned");
