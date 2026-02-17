@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use nevoflux_storage::{CreateKnowledgeParams, CreateLearningMetricParams, Storage};
 
 use super::buffer::MemoryBuffer;
+use super::crypto::EncryptionService;
 use super::routing;
 use super::soul::manager::{SoulChange, SoulManager};
 use super::soul::protection::{self, ChangePermission};
@@ -83,10 +84,15 @@ pub struct PromotionResult {
 /// Pipeline that flushes `LearningEntry` items from a `MemoryBuffer` into the
 /// SQLite `knowledge` table, validates pending entries that meet thresholds,
 /// and promotes validated entries into soul documents.
+///
+/// When an [`EncryptionService`] is attached via [`with_encryption`](Self::with_encryption),
+/// the `details` and `summary` fields of entries whose `privacy_level` is
+/// `"sensitive"` are encrypted before being written to SQLite.
 pub struct LearningPipeline {
     buffer: Arc<MemoryBuffer>,
     storage: Arc<Storage>,
     enabled: Arc<AtomicBool>,
+    encryption: Option<Arc<EncryptionService>>,
 }
 
 impl LearningPipeline {
@@ -96,7 +102,15 @@ impl LearningPipeline {
             buffer,
             storage,
             enabled: Arc::new(AtomicBool::new(true)),
+            encryption: None,
         }
+    }
+
+    /// Attach an encryption service so that sensitive entries are encrypted
+    /// before being written to SQLite during [`flush`](Self::flush).
+    pub fn with_encryption(mut self, service: Arc<EncryptionService>) -> Self {
+        self.encryption = Some(service);
+        self
     }
 
     /// Pause the learning pipeline. While paused, `flush()`, `validate()`,
@@ -149,6 +163,10 @@ impl LearningPipeline {
     /// Drain all entries from the buffer and insert them into the SQLite
     /// knowledge table.
     ///
+    /// When an [`EncryptionService`] is attached, the `summary` and `details`
+    /// fields of entries whose `privacy_level` is `"sensitive"` are encrypted
+    /// before insertion.
+    ///
     /// Returns the number of entries that were flushed. Returns `Ok(0)` if
     /// the pipeline is paused.
     pub fn flush(&self) -> Result<usize> {
@@ -158,7 +176,20 @@ impl LearningPipeline {
         let entries = self.buffer.drain_all();
         let count = entries.len();
         for entry in &entries {
-            let params = Self::entry_to_knowledge_params(entry);
+            let mut params = Self::entry_to_knowledge_params(entry);
+
+            // Encrypt sensitive fields when an encryption service is available
+            if let Some(ref enc) = self.encryption {
+                let privacy = params
+                    .privacy_level
+                    .as_deref()
+                    .unwrap_or("internal");
+                if privacy == "sensitive" {
+                    params.summary = enc.encrypt_if_sensitive(&params.summary, privacy)?;
+                    params.details = enc.encrypt_if_sensitive(&params.details, privacy)?;
+                }
+            }
+
             self.storage.knowledge().create(params)?;
         }
         self.buffer.mark_flushed();
@@ -477,6 +508,94 @@ mod tests {
             .query_by_domain("example.com", 10)
             .unwrap();
         assert!(results.is_empty());
+    }
+
+    // --- Encryption-aware flush tests ---
+
+    fn setup_with_encryption() -> (LearningPipeline, Arc<Storage>, Arc<EncryptionService>) {
+        use crate::learning::crypto::InMemoryKeyProvider;
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let buffer = Arc::new(MemoryBuffer::new(20, Duration::from_secs(30)));
+        let provider = InMemoryKeyProvider::random();
+        let enc = Arc::new(EncryptionService::new(&provider).unwrap());
+        let pipeline =
+            LearningPipeline::new(buffer, storage.clone()).with_encryption(Arc::clone(&enc));
+        (pipeline, storage, enc)
+    }
+
+    #[test]
+    fn flush_encrypts_sensitive_entries() {
+        let (pipeline, storage, enc) = setup_with_encryption();
+
+        // Insert a sensitive entry
+        pipeline.buffer().insert(
+            LearningEntry::new(
+                LearningCategory::UserPreference,
+                "sensitive_pref",
+                "User SSN is 123-45-6789",
+            )
+            .with_details("Detailed sensitive info")
+            .with_privacy(PrivacyLevel::Sensitive)
+            .with_context(LearningContext {
+                domain: Some("bank.com".into()),
+                ..Default::default()
+            }),
+        );
+
+        let count = pipeline.flush().unwrap();
+        assert_eq!(count, 1);
+
+        // Retrieve from SQLite — summary and details should be encrypted
+        let results = storage
+            .knowledge()
+            .query_by_domain("bank.com", 10)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
+        let row = &results[0];
+        // The stored values should NOT be the plaintext
+        assert_ne!(row.summary, "User SSN is 123-45-6789");
+        assert_ne!(row.details, "Detailed sensitive info");
+
+        // They should be decryptable back to the original
+        let decrypted_summary = enc.decrypt(&row.summary).unwrap();
+        assert_eq!(decrypted_summary, "User SSN is 123-45-6789");
+
+        let decrypted_details = enc.decrypt(&row.details).unwrap();
+        assert_eq!(decrypted_details, "Detailed sensitive info");
+    }
+
+    #[test]
+    fn flush_does_not_encrypt_public_entries() {
+        let (pipeline, storage, _enc) = setup_with_encryption();
+
+        // Insert a public entry
+        pipeline.buffer().insert(
+            LearningEntry::new(
+                LearningCategory::SiteInteraction,
+                "selector_changed",
+                "GitHub uses data-testid",
+            )
+            .with_details("Publicly observable behavior")
+            .with_privacy(PrivacyLevel::Public)
+            .with_context(LearningContext {
+                domain: Some("github.com".into()),
+                ..Default::default()
+            }),
+        );
+
+        pipeline.flush().unwrap();
+
+        let results = storage
+            .knowledge()
+            .query_by_domain("github.com", 10)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
+        let row = &results[0];
+        // Public entries should be stored as plaintext
+        assert_eq!(row.summary, "GitHub uses data-testid");
+        assert_eq!(row.details, "Publicly observable behavior");
     }
 
     #[test]

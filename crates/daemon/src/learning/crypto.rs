@@ -233,6 +233,61 @@ pub fn decrypt_string(key: &[u8; KEY_LEN], encoded: &str) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
+// EncryptionService
+// ---------------------------------------------------------------------------
+
+/// High-level encryption service that manages a key and provides convenient
+/// encrypt/decrypt methods for the learning system.
+///
+/// Wraps the low-level `encrypt_string` / `decrypt_string` functions and adds
+/// privacy-level-aware logic: only "sensitive" data is encrypted, while
+/// "public", "internal", and "private" data passes through unchanged.
+pub struct EncryptionService {
+    key: [u8; KEY_LEN],
+}
+
+impl EncryptionService {
+    /// Create a new `EncryptionService` by retrieving (or creating) the key
+    /// from the given provider.
+    pub fn new(provider: &dyn KeyProvider) -> Result<Self> {
+        let key = provider.get_or_create_key()?;
+        Ok(Self { key })
+    }
+
+    /// Encrypt a string only if the privacy level is "sensitive".
+    ///
+    /// Returns the original string unchanged for non-sensitive data
+    /// (e.g., "public", "internal").
+    pub fn encrypt_if_sensitive(&self, value: &str, privacy_level: &str) -> Result<String> {
+        if privacy_level == "sensitive" {
+            encrypt_string(&self.key, value)
+        } else {
+            Ok(value.to_string())
+        }
+    }
+
+    /// Decrypt a string if it appears to be encrypted (base64-encoded with
+    /// valid AES-256-GCM structure). Returns the original string unchanged
+    /// if decryption fails (i.e., the value was stored as plaintext).
+    pub fn decrypt_if_encrypted(&self, value: &str) -> Result<String> {
+        match decrypt_string(&self.key, value) {
+            Ok(decrypted) => Ok(decrypted),
+            Err(_) => Ok(value.to_string()),
+        }
+    }
+
+    /// Always encrypt a string (for USER.md).
+    pub fn encrypt(&self, plaintext: &str) -> Result<String> {
+        encrypt_string(&self.key, plaintext)
+    }
+
+    /// Always decrypt a string (for USER.md).
+    pub fn decrypt(&self, encoded: &str) -> Result<String> {
+        decrypt_string(&self.key, encoded)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -391,5 +446,72 @@ mod tests {
         let key3 = provider.get_or_create_key().unwrap();
         // It is extremely unlikely (2^-256) that the new key equals the old one.
         assert_ne!(key1, key3);
+    }
+
+    // --- EncryptionService tests ---
+
+    #[test]
+    fn encryption_service_encrypt_if_sensitive_encrypts() {
+        let provider = InMemoryKeyProvider::random();
+        let svc = EncryptionService::new(&provider).unwrap();
+
+        let plaintext = "user prefers dark mode";
+        let encrypted = svc.encrypt_if_sensitive(plaintext, "sensitive").unwrap();
+
+        // Encrypted output should differ from the plaintext
+        assert_ne!(encrypted, plaintext);
+
+        // Should be valid base64 that decrypts back
+        let decrypted = svc.decrypt(&encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn encryption_service_encrypt_if_sensitive_passes_through_public() {
+        let provider = InMemoryKeyProvider::random();
+        let svc = EncryptionService::new(&provider).unwrap();
+
+        let plaintext = "site uses react";
+
+        // Public data should pass through unchanged
+        let result = svc.encrypt_if_sensitive(plaintext, "public").unwrap();
+        assert_eq!(result, plaintext);
+
+        // Internal data should also pass through unchanged
+        let result = svc.encrypt_if_sensitive(plaintext, "internal").unwrap();
+        assert_eq!(result, plaintext);
+
+        // Private data should also pass through unchanged (only "sensitive" triggers encryption)
+        let result = svc.encrypt_if_sensitive(plaintext, "private").unwrap();
+        assert_eq!(result, plaintext);
+    }
+
+    #[test]
+    fn encryption_service_decrypt_if_encrypted_roundtrip() {
+        let provider = InMemoryKeyProvider::random();
+        let svc = EncryptionService::new(&provider).unwrap();
+
+        let plaintext = "sensitive behavior pattern";
+        let encrypted = svc.encrypt(plaintext).unwrap();
+
+        // decrypt_if_encrypted should successfully decrypt
+        let decrypted = svc.decrypt_if_encrypted(&encrypted).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn encryption_service_decrypt_if_encrypted_plaintext_passthrough() {
+        let provider = InMemoryKeyProvider::random();
+        let svc = EncryptionService::new(&provider).unwrap();
+
+        // Plain text that is NOT encrypted should pass through unchanged
+        let plaintext = "just a normal string, not encrypted";
+        let result = svc.decrypt_if_encrypted(plaintext).unwrap();
+        assert_eq!(result, plaintext);
+
+        // Even something that looks vaguely like base64 but isn't valid ciphertext
+        let fake_base64 = "SGVsbG8gV29ybGQ="; // "Hello World" in base64, but not AES-GCM
+        let result = svc.decrypt_if_encrypted(fake_base64).unwrap();
+        assert_eq!(result, fake_base64);
     }
 }

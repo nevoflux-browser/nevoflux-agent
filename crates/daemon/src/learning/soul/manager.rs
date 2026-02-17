@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::Utc;
 
 use super::protection::{self, ChangePermission};
 use super::templates;
 use crate::error::{DaemonError, Result};
+use crate::learning::crypto::EncryptionService;
 
 /// Describes a change to be applied to a soul document.
 #[derive(Debug, Clone, Default)]
@@ -41,9 +43,13 @@ pub struct FiveDocCache {
 /// Responsible for initializing a new soul directory with default templates,
 /// loading existing documents into an in-memory cache, and providing
 /// access to the cached content.
+///
+/// When an [`EncryptionService`] is attached, USER.md is stored encrypted on
+/// disk and decrypted transparently into the in-memory cache.
 pub struct SoulManager {
     soul_dir: PathBuf,
     cache: FiveDocCache,
+    encryption: Option<Arc<EncryptionService>>,
 }
 
 impl SoulManager {
@@ -102,6 +108,7 @@ impl SoulManager {
         Ok(Self {
             soul_dir: soul_dir.to_path_buf(),
             cache,
+            encryption: None,
         })
     }
 
@@ -113,6 +120,43 @@ impl SoulManager {
     /// Returns the path to the soul directory.
     pub fn soul_dir(&self) -> &Path {
         &self.soul_dir
+    }
+
+    /// Attach an encryption service for USER.md at-rest encryption.
+    pub fn set_encryption(&mut self, encryption: Arc<EncryptionService>) {
+        self.encryption = Some(encryption);
+    }
+
+    /// Encrypt USER.md on disk while keeping the cache decrypted.
+    ///
+    /// Reads the current (decrypted) content from the cache, encrypts it,
+    /// and writes the ciphertext to the USER.md file. The cache remains
+    /// unchanged so that callers always see plaintext.
+    pub async fn encrypt_user_md(&self) -> Result<()> {
+        if let Some(ref enc) = self.encryption {
+            let decrypted = &self.cache.user_raw;
+            let encrypted = enc.encrypt(decrypted)?;
+            let path = self.soul_dir.join("USER.md");
+            let tmp_path = path.with_extension("md.tmp");
+            tokio::fs::write(&tmp_path, &encrypted).await?;
+            tokio::fs::rename(&tmp_path, &path).await?;
+        }
+        Ok(())
+    }
+
+    /// Decrypt USER.md from disk and reload into the cache.
+    ///
+    /// Reads the raw bytes of USER.md, attempts decryption, and updates
+    /// the in-memory cache with the plaintext. If the file is not
+    /// encrypted (or decryption fails), the raw content is used as-is.
+    pub async fn decrypt_user_md(&mut self) -> Result<()> {
+        if let Some(ref enc) = self.encryption {
+            let path = self.soul_dir.join("USER.md");
+            let raw = tokio::fs::read_to_string(&path).await?;
+            let decrypted = enc.decrypt_if_encrypted(&raw)?;
+            self.cache.user_raw = decrypted;
+        }
+        Ok(())
     }
 
     /// The five allowed soul document filenames.
@@ -588,5 +632,70 @@ mod tests {
 
         // The snapshot should still exist
         assert!(snapshot_path.exists());
+    }
+
+    // --- USER.md encryption tests ---
+
+    #[tokio::test]
+    async fn encrypt_user_md_and_decrypt_roundtrip() {
+        use crate::learning::crypto::{EncryptionService, InMemoryKeyProvider};
+
+        let tmp = TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        // Capture original USER.md content
+        let original_user = manager.cache().user_raw.clone();
+        assert!(!original_user.is_empty());
+
+        // Attach encryption
+        let provider = InMemoryKeyProvider::random();
+        let enc = Arc::new(EncryptionService::new(&provider).unwrap());
+        manager.set_encryption(Arc::clone(&enc));
+
+        // Encrypt USER.md on disk
+        manager.encrypt_user_md().await.unwrap();
+
+        // Verify the file on disk is now encrypted (different from original)
+        let raw_on_disk = tokio::fs::read_to_string(soul_dir.join("USER.md"))
+            .await
+            .unwrap();
+        assert_ne!(raw_on_disk, original_user, "on-disk content should be encrypted");
+
+        // The cache should still hold the decrypted version
+        assert_eq!(manager.cache().user_raw, original_user);
+
+        // Now simulate a fresh load without encryption — cache would have ciphertext
+        let manager2 = SoulManager::load(&soul_dir).await.unwrap();
+        assert_ne!(
+            manager2.cache().user_raw, original_user,
+            "loading without encryption should see ciphertext"
+        );
+
+        // Load again with encryption — decrypt_user_md should restore plaintext
+        let mut manager3 = SoulManager::load(&soul_dir).await.unwrap();
+        manager3.set_encryption(Arc::clone(&enc));
+        manager3.decrypt_user_md().await.unwrap();
+        assert_eq!(
+            manager3.cache().user_raw, original_user,
+            "decrypted cache should match original"
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypt_user_md_noop_without_encryption() {
+        let tmp = TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        let original = manager.cache().user_raw.clone();
+
+        // encrypt_user_md without setting encryption should be a no-op
+        manager.encrypt_user_md().await.unwrap();
+
+        let on_disk = tokio::fs::read_to_string(soul_dir.join("USER.md"))
+            .await
+            .unwrap();
+        assert_eq!(on_disk, original);
     }
 }
