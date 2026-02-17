@@ -164,6 +164,54 @@ impl<'a> KnowledgeRepository<'a> {
         })
     }
 
+    /// Query all validated knowledge entries, ordered by creation time (oldest first).
+    ///
+    /// Returns up to `limit` entries with status = 'validated'.
+    pub fn query_validated(&self, limit: usize) -> Result<Vec<Knowledge>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, category, subcategory, domain, summary, details,
+                        resolution, confidence, hit_count, success_count, fail_count,
+                        effectiveness, priority, status, source_ids, related_ids, tags,
+                        privacy_level, promotion_target, promoted_section,
+                        source_type, created_at, updated_at, last_hit_at, promoted_at
+                 FROM knowledge WHERE status = 'validated'
+                 ORDER BY created_at ASC
+                 LIMIT ?1",
+            )?;
+
+            let rows = stmt
+                .query_map(params![limit as i64], row_to_knowledge)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            Ok(rows)
+        })
+    }
+
+    /// Mark a knowledge entry as promoted.
+    ///
+    /// Sets the status to 'promoted', records the current time as `promoted_at`,
+    /// and stores the target section name in `promoted_section`.
+    pub fn mark_promoted(&self, id: &str, promoted_section: &str) -> Result<()> {
+        let now = rfc3339_now();
+
+        self.db.with_connection(|conn| {
+            let rows_affected = conn.execute(
+                "UPDATE knowledge SET status = 'promoted', promoted_at = ?1, promoted_section = ?2, updated_at = ?3 WHERE id = ?4",
+                params![now, promoted_section, now, id],
+            )?;
+
+            if rows_affected == 0 {
+                return Err(crate::error::StorageError::NotFound {
+                    entity: "knowledge".to_string(),
+                    id: id.to_string(),
+                });
+            }
+
+            Ok(())
+        })
+    }
+
     /// Delete a knowledge entry by ID.
     pub fn delete(&self, id: &str) -> Result<bool> {
         self.db.with_connection(|conn| {
@@ -390,5 +438,114 @@ mod tests {
 
         let updated = storage.knowledge().get(&created.id).unwrap().unwrap();
         assert!((updated.effectiveness - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_query_validated_returns_only_validated() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        // Create a pending entry
+        let _pending = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "pending entry".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Create and validate an entry
+        let validated = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "tool_optimization".into(),
+                summary: "validated entry".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        storage
+            .knowledge()
+            .update_status(&validated.id, "validated")
+            .unwrap();
+
+        let results = storage.knowledge().query_validated(10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, validated.id);
+        assert_eq!(results[0].status, "validated");
+    }
+
+    #[test]
+    fn test_query_validated_empty() {
+        let storage = Storage::open_in_memory().unwrap();
+        let results = storage.knowledge().query_validated(10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_query_validated_respects_limit() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        for i in 0..5 {
+            let entry = storage
+                .knowledge()
+                .create(CreateKnowledgeParams {
+                    category: "site_interaction".into(),
+                    summary: format!("entry {}", i),
+                    details: "details".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            storage
+                .knowledge()
+                .update_status(&entry.id, "validated")
+                .unwrap();
+        }
+
+        let results = storage.knowledge().query_validated(3).unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_mark_promoted_sets_status_and_timestamp() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        let created = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "to be promoted".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .knowledge()
+            .update_status(&created.id, "validated")
+            .unwrap();
+
+        storage
+            .knowledge()
+            .mark_promoted(&created.id, "Site Adaptation Graph")
+            .unwrap();
+
+        let entry = storage.knowledge().get(&created.id).unwrap().unwrap();
+        assert_eq!(entry.status, "promoted");
+        assert!(entry.promoted_at.is_some());
+        assert_eq!(
+            entry.promoted_section,
+            Some("Site Adaptation Graph".to_string())
+        );
+    }
+
+    #[test]
+    fn test_mark_promoted_not_found() {
+        let storage = Storage::open_in_memory().unwrap();
+        let result = storage
+            .knowledge()
+            .mark_promoted("K-00000000-000000", "Some Section");
+        assert!(result.is_err());
     }
 }

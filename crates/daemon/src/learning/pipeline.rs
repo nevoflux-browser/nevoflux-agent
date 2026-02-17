@@ -1,6 +1,7 @@
 //! Learning pipeline that drains entries from the in-memory buffer, persists
-//! them to SQLite via `KnowledgeRepository`, and validates pending entries
-//! that meet configurable thresholds.
+//! them to SQLite via `KnowledgeRepository`, validates pending entries
+//! that meet configurable thresholds, and promotes validated entries into
+//! the soul Markdown documents.
 
 use std::sync::Arc;
 
@@ -8,6 +9,9 @@ use chrono::{DateTime, Utc};
 use nevoflux_storage::{CreateKnowledgeParams, Storage};
 
 use super::buffer::MemoryBuffer;
+use super::routing;
+use super::soul::manager::{SoulChange, SoulManager};
+use super::soul::protection::{self, ChangePermission};
 use super::types::LearningEntry;
 use crate::error::Result;
 
@@ -38,8 +42,46 @@ impl Default for ValidationThresholds {
     }
 }
 
+/// Configurable thresholds for the promotion step.
+///
+/// Only validated entries whose confidence meets `min_confidence` are eligible
+/// for promotion. The batch size controls how many entries are processed per
+/// `promote()` call.
+#[derive(Debug, Clone)]
+pub struct PromotionThresholds {
+    /// Minimum confidence score for promotion (0.0 to 1.0).
+    pub min_confidence: f64,
+    /// Maximum number of entries to promote in a single batch.
+    pub batch_size: usize,
+}
+
+impl Default for PromotionThresholds {
+    fn default() -> Self {
+        Self {
+            min_confidence: 0.6,
+            batch_size: 50,
+        }
+    }
+}
+
+/// Result of a promotion run, reporting how many entries were promoted vs skipped.
+#[derive(Debug, Clone, Default)]
+pub struct PromotionResult {
+    /// Number of entries successfully promoted to soul documents.
+    pub promoted: usize,
+    /// Number of entries skipped because their protection level requires
+    /// user confirmation (RequireConfirm / RequireDoubleConfirm / Forbidden).
+    pub skipped_protection: usize,
+    /// Number of entries skipped because they did not meet the promotion
+    /// thresholds (e.g., confidence too low).
+    pub skipped_threshold: usize,
+    /// Number of entries that failed during the apply_change step.
+    pub failed: usize,
+}
+
 /// Pipeline that flushes `LearningEntry` items from a `MemoryBuffer` into the
-/// SQLite `knowledge` table, and validates pending entries that meet thresholds.
+/// SQLite `knowledge` table, validates pending entries that meet thresholds,
+/// and promotes validated entries into soul documents.
 pub struct LearningPipeline {
     buffer: Arc<MemoryBuffer>,
     storage: Arc<Storage>,
@@ -123,6 +165,98 @@ impl LearningPipeline {
         }
 
         Ok(validated_count)
+    }
+
+    /// Promote validated knowledge entries into soul Markdown documents.
+    ///
+    /// For each validated entry:
+    /// 1. Determines the target document and section via `route_knowledge()`.
+    ///    If the entry already has `promotion_target` set, it is preferred.
+    /// 2. Checks the protection level via `check_permission()`.
+    /// 3. Only auto-promotes entries with `AutoWithNotify` permission; entries
+    ///    with stricter protections are skipped.
+    /// 4. Builds a `SoulChange` and calls `SoulManager::apply_change()`.
+    /// 5. Marks the entry as "promoted" in SQLite with a `promoted_at` timestamp.
+    ///
+    /// Returns a `PromotionResult` with counts of promoted/skipped entries.
+    pub async fn promote(
+        &self,
+        thresholds: &PromotionThresholds,
+        soul_manager: &mut SoulManager,
+    ) -> Result<PromotionResult> {
+        let validated = self
+            .storage
+            .knowledge()
+            .query_validated(thresholds.batch_size)?;
+
+        let mut result = PromotionResult::default();
+
+        for entry in &validated {
+            // Check confidence threshold
+            if entry.confidence < thresholds.min_confidence {
+                result.skipped_threshold += 1;
+                continue;
+            }
+
+            // Determine target document and section
+            let route = routing::route_knowledge(entry);
+
+            // Check protection level — only auto-promote AutoWithNotify
+            let permission = protection::check_permission(&route.target_file, &route.section);
+            if permission != ChangePermission::AutoWithNotify {
+                result.skipped_protection += 1;
+                continue;
+            }
+
+            // Build the SoulChange
+            let content = if let Some(ref resolution) = entry.resolution {
+                format!(
+                    "- **{}** ({}): {} — {}",
+                    entry.summary,
+                    entry.domain.as_deref().unwrap_or("universal"),
+                    entry.details,
+                    resolution
+                )
+            } else {
+                format!(
+                    "- **{}** ({}): {}",
+                    entry.summary,
+                    entry.domain.as_deref().unwrap_or("universal"),
+                    entry.details
+                )
+            };
+
+            let change = SoulChange {
+                target_file: route.target_file.clone(),
+                section: route.section.clone(),
+                change_type: "add".to_string(),
+                new_content: content,
+                reason: format!("Auto-promoted from knowledge entry {}", entry.id),
+                source_type: "system".to_string(),
+                confidence: entry.confidence,
+            };
+
+            // Apply the change to the soul document
+            match soul_manager.apply_change(change).await {
+                Ok(()) => {
+                    // Mark as promoted in SQLite
+                    self.storage
+                        .knowledge()
+                        .mark_promoted(&entry.id, &route.section)?;
+                    result.promoted += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        entry_id = %entry.id,
+                        error = %e,
+                        "failed to promote knowledge entry"
+                    );
+                    result.failed += 1;
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Get a reference to the underlying buffer (for inserting entries).
@@ -620,5 +754,410 @@ mod tests {
         let thresholds = ValidationThresholds::default();
         let count = pipeline.validate(&thresholds).unwrap();
         assert_eq!(count, 0);
+    }
+
+    // --- Promotion pipeline tests ---
+
+    #[test]
+    fn promotion_thresholds_default_values() {
+        let thresholds = PromotionThresholds::default();
+        assert!((thresholds.min_confidence - 0.6).abs() < f64::EPSILON);
+        assert_eq!(thresholds.batch_size, 50);
+    }
+
+    #[test]
+    fn promotion_result_default_is_zero() {
+        let result = PromotionResult::default();
+        assert_eq!(result.promoted, 0);
+        assert_eq!(result.skipped_protection, 0);
+        assert_eq!(result.skipped_threshold, 0);
+        assert_eq!(result.failed, 0);
+    }
+
+    /// Helper to create a validated entry with high confidence in SQLite.
+    fn create_validated_entry(
+        storage: &Storage,
+        category: &str,
+        subcategory: Option<&str>,
+        domain: Option<&str>,
+        summary: &str,
+        confidence: f64,
+    ) -> nevoflux_storage::Knowledge {
+        let created = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: category.into(),
+                subcategory: subcategory.map(|s| s.to_string()),
+                domain: domain.map(|d| d.to_string()),
+                summary: summary.into(),
+                details: "test details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Set confidence and status to validated
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET confidence = ?1, status = 'validated' WHERE id = ?2",
+                    params![confidence, created.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        storage.knowledge().get(&created.id).unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn promote_writes_to_tools_md() {
+        let (pipeline, storage) = setup();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        // Create a validated site_interaction entry → TOOLS.md / Site Adaptation Graph
+        let entry = create_validated_entry(
+            &storage,
+            "site_interaction",
+            Some("selector"),
+            Some("github.com"),
+            "GitHub uses data-testid selectors",
+            0.85,
+        );
+
+        let thresholds = PromotionThresholds {
+            min_confidence: 0.6,
+            batch_size: 10,
+        };
+
+        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        assert_eq!(result.promoted, 1);
+        assert_eq!(result.skipped_protection, 0);
+        assert_eq!(result.skipped_threshold, 0);
+        assert_eq!(result.failed, 0);
+
+        // Verify the entry is now "promoted" in SQLite
+        let updated = storage.knowledge().get(&entry.id).unwrap().unwrap();
+        assert_eq!(updated.status, "promoted");
+        assert!(updated.promoted_at.is_some());
+        assert_eq!(
+            updated.promoted_section,
+            Some("Site Adaptation Graph".to_string())
+        );
+
+        // Verify content was written to TOOLS.md
+        let content = tokio::fs::read_to_string(soul_dir.join("TOOLS.md"))
+            .await
+            .unwrap();
+        assert!(content.contains("GitHub uses data-testid selectors"));
+        assert!(content.contains("github.com"));
+    }
+
+    #[tokio::test]
+    async fn promote_writes_user_preference_to_user_md() {
+        let (pipeline, storage) = setup();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        // user_preference / language → USER.md / Communication Overrides
+        create_validated_entry(
+            &storage,
+            "user_preference",
+            Some("language"),
+            None,
+            "User prefers concise replies",
+            0.9,
+        );
+
+        let thresholds = PromotionThresholds::default();
+        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        assert_eq!(result.promoted, 1);
+
+        let content = tokio::fs::read_to_string(soul_dir.join("USER.md"))
+            .await
+            .unwrap();
+        assert!(content.contains("User prefers concise replies"));
+    }
+
+    #[tokio::test]
+    async fn promote_skips_low_confidence_entries() {
+        let (pipeline, storage) = setup();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        // Entry with low confidence (0.3 < 0.6 threshold)
+        create_validated_entry(
+            &storage,
+            "site_interaction",
+            None,
+            None,
+            "Low confidence entry",
+            0.3,
+        );
+
+        let thresholds = PromotionThresholds {
+            min_confidence: 0.6,
+            batch_size: 10,
+        };
+
+        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        assert_eq!(result.promoted, 0);
+        assert_eq!(result.skipped_threshold, 1);
+    }
+
+    #[tokio::test]
+    async fn promote_skips_protected_sections() {
+        let (pipeline, storage) = setup();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        // Create a validated entry that routes to a protected file
+        // We'll set promotion_target to IDENTITY.md (RequireDoubleConfirm)
+        let created = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "should be skipped".into(),
+                details: "details".into(),
+                promotion_target: Some("IDENTITY".into()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET confidence = 0.9, status = 'validated' WHERE id = ?1",
+                    params![created.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let thresholds = PromotionThresholds::default();
+        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        assert_eq!(result.promoted, 0);
+        assert_eq!(result.skipped_protection, 1);
+
+        // Entry should still be validated, not promoted
+        let entry = storage.knowledge().get(&created.id).unwrap().unwrap();
+        assert_eq!(entry.status, "validated");
+    }
+
+    #[tokio::test]
+    async fn promote_no_validated_entries_returns_empty_result() {
+        let (pipeline, _storage) = setup();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        let thresholds = PromotionThresholds::default();
+        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        assert_eq!(result.promoted, 0);
+        assert_eq!(result.skipped_protection, 0);
+        assert_eq!(result.skipped_threshold, 0);
+        assert_eq!(result.failed, 0);
+    }
+
+    #[tokio::test]
+    async fn promote_multiple_entries_in_one_batch() {
+        let (pipeline, storage) = setup();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        // Create 3 validated entries with different categories
+        create_validated_entry(
+            &storage,
+            "site_interaction",
+            None,
+            Some("example.com"),
+            "Site uses react",
+            0.8,
+        );
+        create_validated_entry(
+            &storage,
+            "tool_optimization",
+            None,
+            None,
+            "Increase timeout to 60s",
+            0.75,
+        );
+        create_validated_entry(
+            &storage,
+            "user_preference",
+            Some("domain"),
+            None,
+            "User works in fintech",
+            0.9,
+        );
+
+        let thresholds = PromotionThresholds {
+            min_confidence: 0.6,
+            batch_size: 10,
+        };
+
+        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        assert_eq!(result.promoted, 3);
+
+        // Verify TOOLS.md got updated
+        let tools = tokio::fs::read_to_string(soul_dir.join("TOOLS.md"))
+            .await
+            .unwrap();
+        assert!(tools.contains("Site uses react"));
+        assert!(tools.contains("Increase timeout to 60s"));
+
+        // Verify USER.md got updated
+        let user = tokio::fs::read_to_string(soul_dir.join("USER.md"))
+            .await
+            .unwrap();
+        assert!(user.contains("User works in fintech"));
+    }
+
+    #[tokio::test]
+    async fn promote_respects_batch_size_limit() {
+        let (pipeline, storage) = setup();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        // Create 5 validated entries
+        for i in 0..5 {
+            create_validated_entry(
+                &storage,
+                "site_interaction",
+                None,
+                Some(&format!("site{}.com", i)),
+                &format!("Entry {}", i),
+                0.8,
+            );
+        }
+
+        // batch_size of 2 should only process 2
+        let thresholds = PromotionThresholds {
+            min_confidence: 0.6,
+            batch_size: 2,
+        };
+
+        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        assert_eq!(result.promoted, 2);
+
+        // 3 entries should still be validated
+        let remaining = storage.knowledge().query_validated(10).unwrap();
+        assert_eq!(remaining.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn promote_entry_with_existing_promotion_target_preferred() {
+        let (pipeline, storage) = setup();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        // Create an entry with promotion_target already set to TOOLS
+        let created = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "user_preference".into(),
+                subcategory: Some("language".into()),
+                summary: "Custom routed entry".into(),
+                details: "details".into(),
+                promotion_target: Some("TOOLS".into()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET confidence = 0.9, status = 'validated' WHERE id = ?1",
+                    params![created.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let thresholds = PromotionThresholds::default();
+        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        assert_eq!(result.promoted, 1);
+
+        // Should have been written to TOOLS.md, not USER.md
+        let tools = tokio::fs::read_to_string(soul_dir.join("TOOLS.md"))
+            .await
+            .unwrap();
+        assert!(tools.contains("Custom routed entry"));
+    }
+
+    #[tokio::test]
+    async fn promote_end_to_end_flush_validate_promote() {
+        let (pipeline, storage) = setup();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        // Step 1: Insert entry into buffer and flush to SQLite
+        pipeline.buffer().insert(
+            LearningEntry::new(
+                LearningCategory::SiteInteraction,
+                "selector",
+                "example.com uses semantic selectors",
+            )
+            .with_context(LearningContext {
+                domain: Some("example.com".into()),
+                ..Default::default()
+            })
+            .with_details("Verified across multiple pages"),
+        );
+
+        let flush_count = pipeline.flush().unwrap();
+        assert_eq!(flush_count, 1);
+
+        // Step 2: Update entry to meet validation thresholds, then validate
+        let pending = storage.knowledge().query_pending(10).unwrap();
+        assert_eq!(pending.len(), 1);
+
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET hit_count = 5, confidence = 0.85 WHERE id = ?1",
+                    params![pending[0].id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let val_thresholds = ValidationThresholds {
+            min_occurrences: 3,
+            min_confidence: 0.6,
+            min_alive_hours: 0,
+        };
+        let validated_count = pipeline.validate(&val_thresholds).unwrap();
+        assert_eq!(validated_count, 1);
+
+        // Step 3: Promote
+        let promo_thresholds = PromotionThresholds::default();
+        let result = pipeline
+            .promote(&promo_thresholds, &mut manager)
+            .await
+            .unwrap();
+        assert_eq!(result.promoted, 1);
+
+        // Verify the full pipeline result
+        let entry = storage.knowledge().get(&pending[0].id).unwrap().unwrap();
+        assert_eq!(entry.status, "promoted");
+        assert!(entry.promoted_at.is_some());
+
+        let tools = tokio::fs::read_to_string(soul_dir.join("TOOLS.md"))
+            .await
+            .unwrap();
+        assert!(tools.contains("example.com uses semantic selectors"));
     }
 }
