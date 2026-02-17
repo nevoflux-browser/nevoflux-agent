@@ -4756,6 +4756,9 @@ async fn handle_config_llm_set(params: &serde_json::Value) -> serde_json::Value 
     }
 }
 
+/// Allowlist of config filenames that can be read/written via the config.file commands.
+const CONFIG_FILE_ALLOWLIST: &[&str] = &["IDENTITY.md", "SOUL.md", "USER.md", "TOOLS.md", "AGENTS.md"];
+
 /// Handle config.file.read command.
 ///
 /// Reads a config file from the nevoflux config directory.
@@ -4772,9 +4775,7 @@ async fn handle_config_file_read(params: &serde_json::Value) -> serde_json::Valu
         .and_then(|f| f.as_str())
         .unwrap_or("");
 
-    const ALLOWED_FILES: &[&str] = &["IDENTITY.md", "SOUL.md", "USER.md", "TOOLS.md", "AGENTS.md"];
-
-    if filename.is_empty() || !ALLOWED_FILES.contains(&filename) {
+    if filename.is_empty() || !CONFIG_FILE_ALLOWLIST.contains(&filename) {
         return serde_json::json!({
             "type": "system_response",
             "payload": {
@@ -4783,7 +4784,7 @@ async fn handle_config_file_read(params: &serde_json::Value) -> serde_json::Valu
                 "success": false,
                 "error": {
                     "code": "INVALID_FILENAME",
-                    "message": format!("Invalid filename: '{}'. Allowed: {:?}", filename, ALLOWED_FILES)
+                    "message": format!("Invalid filename: '{}'. Allowed: {:?}", filename, CONFIG_FILE_ALLOWLIST)
                 }
             }
         });
@@ -4809,8 +4810,8 @@ async fn handle_config_file_read(params: &serde_json::Value) -> serde_json::Valu
 
     let file_path = config_dir.join(filename);
 
-    if file_path.exists() {
-        match std::fs::read_to_string(&file_path) {
+    if tokio::fs::metadata(&file_path).await.is_ok() {
+        match tokio::fs::read_to_string(&file_path).await {
             Ok(content) => {
                 serde_json::json!({
                     "type": "system_response",
@@ -4879,9 +4880,7 @@ async fn handle_config_file_write(params: &serde_json::Value) -> serde_json::Val
         .and_then(|c| c.as_str())
         .unwrap_or("");
 
-    const ALLOWED_FILES: &[&str] = &["IDENTITY.md", "SOUL.md", "USER.md", "TOOLS.md", "AGENTS.md"];
-
-    if filename.is_empty() || !ALLOWED_FILES.contains(&filename) {
+    if filename.is_empty() || !CONFIG_FILE_ALLOWLIST.contains(&filename) {
         return serde_json::json!({
             "type": "system_response",
             "payload": {
@@ -4890,7 +4889,7 @@ async fn handle_config_file_write(params: &serde_json::Value) -> serde_json::Val
                 "success": false,
                 "error": {
                     "code": "INVALID_FILENAME",
-                    "message": format!("Invalid filename: '{}'. Allowed: {:?}", filename, ALLOWED_FILES)
+                    "message": format!("Invalid filename: '{}'. Allowed: {:?}", filename, CONFIG_FILE_ALLOWLIST)
                 }
             }
         });
@@ -4915,7 +4914,7 @@ async fn handle_config_file_write(params: &serde_json::Value) -> serde_json::Val
     };
 
     // Ensure config directory exists
-    if let Err(e) = std::fs::create_dir_all(&config_dir) {
+    if let Err(e) = tokio::fs::create_dir_all(&config_dir).await {
         return serde_json::json!({
             "type": "system_response",
             "payload": {
@@ -4933,7 +4932,7 @@ async fn handle_config_file_write(params: &serde_json::Value) -> serde_json::Val
     let file_path = config_dir.join(filename);
     let bytes_written = content.len();
 
-    match std::fs::write(&file_path, content) {
+    match tokio::fs::write(&file_path, content).await {
         Ok(()) => {
             info!(
                 "config.file.write: wrote {} bytes to {}",
