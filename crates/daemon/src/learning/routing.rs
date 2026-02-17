@@ -33,12 +33,13 @@ pub fn route_knowledge(entry: &Knowledge) -> RouteTarget {
         .promotion_target
         .as_deref()
         .map(|t| {
-            // If it already ends with ".md", use as-is; otherwise append ".md"
-            if t.ends_with(".md") {
-                t.to_string()
-            } else {
-                format!("{}.md", t.to_uppercase())
-            }
+            // Strip a trailing ".md" (case-insensitive), uppercase the stem, add ".md"
+            let stem = t
+                .strip_suffix(".md")
+                .or_else(|| t.strip_suffix(".MD"))
+                .or_else(|| t.strip_suffix(".Md"))
+                .unwrap_or(t);
+            format!("{}.md", stem.to_uppercase())
         });
 
     let subcategory = entry.subcategory.as_deref().unwrap_or("");
@@ -193,10 +194,18 @@ mod tests {
     }
 
     #[test]
-    fn promotion_target_with_md_extension_used_as_is() {
+    fn promotion_target_with_md_extension_normalized() {
         let entry = knowledge_with("user_preference", Some("language"), Some("TOOLS.md"));
         let route = route_knowledge(&entry);
         assert_eq!(route.target_file, "TOOLS.md");
         assert_eq!(route.section, "Communication Overrides");
+    }
+
+    #[test]
+    fn promotion_target_with_lowercase_md_normalized_to_uppercase() {
+        let entry = knowledge_with("site_interaction", None, Some("tools.md"));
+        let route = route_knowledge(&entry);
+        assert_eq!(route.target_file, "TOOLS.md");
+        assert_eq!(route.section, "Site Adaptation Graph");
     }
 }

@@ -239,11 +239,22 @@ impl LearningPipeline {
             // Apply the change to the soul document
             match soul_manager.apply_change(change).await {
                 Ok(()) => {
-                    // Mark as promoted in SQLite
-                    self.storage
+                    // Mark as promoted in SQLite — don't abort the batch on failure
+                    match self
+                        .storage
                         .knowledge()
-                        .mark_promoted(&entry.id, &route.section)?;
-                    result.promoted += 1;
+                        .mark_promoted(&entry.id, &route.section)
+                    {
+                        Ok(()) => result.promoted += 1,
+                        Err(e) => {
+                            tracing::warn!(
+                                entry_id = %entry.id,
+                                error = %e,
+                                "soul write succeeded but failed to mark as promoted in SQLite"
+                            );
+                            result.failed += 1;
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
