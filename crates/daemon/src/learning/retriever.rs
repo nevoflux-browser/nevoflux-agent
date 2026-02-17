@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use nevoflux_storage::{Knowledge, SiteAdaptation, Storage};
 
 use super::soul::manager::FiveDocCache;
@@ -42,6 +43,56 @@ pub struct RetrievalResult {
 pub struct ScoredKnowledge {
     pub entry: Knowledge,
     pub relevance_score: f64,
+}
+
+/// Compute the composite relevance score for a knowledge entry.
+///
+/// Four factors:
+/// - `category_match`: 1.0 if exact match, 0.3 otherwise (no query category = 0.3)
+/// - `domain_match`: 1.0 if exact domain match, 0.5 if universal (entry domain is None)
+///   or no query domain filter, 0.1 if domain mismatch
+/// - `decay`: exponential decay based on age, category half-life, effectiveness, hit count
+/// - `confidence`: the entry's confidence score
+///
+/// Final score = category_match * domain_match * decay * confidence
+pub fn relevance_score(
+    entry: &Knowledge,
+    query_domain: Option<&str>,
+    query_category: Option<&str>,
+    now: DateTime<Utc>,
+) -> f64 {
+    // Category matching
+    let category_match = match query_category {
+        Some(qc) if entry.category == qc => 1.0,
+        Some(_) => 0.3,
+        None => 0.3, // No category filter = partial match
+    };
+
+    // Domain matching
+    let domain_match = match (entry.domain.as_deref(), query_domain) {
+        (Some(ed), Some(qd)) if ed == qd => 1.0, // Exact domain match
+        (None, _) => 0.5,                        // Universal knowledge
+        (Some(_), None) => 0.5,                  // No domain filter
+        _ => 0.1,                                // Domain mismatch
+    };
+
+    // Decay calculation: parse last_hit_at (or fall back to updated_at)
+    let last_hit = entry
+        .last_hit_at
+        .as_deref()
+        .or(Some(entry.updated_at.as_str()))
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+        .unwrap_or(now); // If unparseable, treat as fresh
+
+    let decay = super::decay::calculate_decay(
+        last_hit,
+        &entry.category,
+        entry.effectiveness,
+        entry.hit_count as u32,
+        now,
+    );
+
+    category_match * domain_match * decay * entry.confidence
 }
 
 /// Retrieves relevant knowledge for a given context.
@@ -93,15 +144,15 @@ impl KnowledgeRetriever {
     ///
     /// 1. Queries SQLite for knowledge entries matching the domain (if provided).
     ///    When no domain is given, queries validated entries instead.
-    /// 2. Computes a basic relevance score for each entry: `decay * confidence`.
-    ///    (The full composite formula is deferred to Task 23.)
+    /// 2. Computes a composite relevance score for each entry using four factors:
+    ///    `category_match * domain_match * decay * confidence`.
     /// 3. Filters out archived entries and those below `min_decay_score`.
     /// 4. Sorts by relevance descending and truncates to `top_k`.
     /// 5. Queries site adaptations for the domain (if provided).
     pub fn retrieve(
         &self,
         domain: Option<&str>,
-        _category: Option<&str>,
+        category: Option<&str>,
     ) -> crate::error::Result<RetrievalResult> {
         // 1. Query knowledge entries by domain (if provided)
         let candidates = if let Some(d) = domain {
@@ -117,7 +168,7 @@ impl KnowledgeRetriever {
             .into_iter()
             .filter(|e| e.status != "archived") // Exclude archived
             .map(|entry| {
-                let score = self.compute_relevance(&entry, now);
+                let score = self.compute_relevance(&entry, domain, category, now);
                 ScoredKnowledge {
                     entry,
                     relevance_score: score,
@@ -149,37 +200,18 @@ impl KnowledgeRetriever {
         })
     }
 
-    /// Compute a basic relevance score for an entry.
+    /// Compute the composite relevance score for an entry.
     ///
-    /// Uses the decay formula from `decay::calculate_decay` combined with the
-    /// entry's confidence. The full composite scoring (category_match *
-    /// domain_match * decay * confidence) will be added in Task 23.
+    /// Delegates to the module-level `relevance_score()` function which
+    /// combines four factors: category_match, domain_match, decay, and confidence.
     fn compute_relevance(
         &self,
         entry: &Knowledge,
-        now: chrono::DateTime<chrono::Utc>,
+        query_domain: Option<&str>,
+        query_category: Option<&str>,
+        now: DateTime<Utc>,
     ) -> f64 {
-        use super::decay::calculate_decay;
-        use chrono::DateTime;
-
-        // Parse last_hit_at (or fall back to updated_at)
-        let last_hit = entry
-            .last_hit_at
-            .as_deref()
-            .or(Some(entry.updated_at.as_str()))
-            .and_then(|s| s.parse::<DateTime<chrono::Utc>>().ok())
-            .unwrap_or(now); // If unparseable, treat as fresh
-
-        let decay = calculate_decay(
-            last_hit,
-            &entry.category,
-            entry.effectiveness,
-            entry.hit_count as u32,
-            now,
-        );
-
-        // Basic relevance = decay * confidence
-        decay * entry.confidence
+        relevance_score(entry, query_domain, query_category, now)
     }
 }
 
@@ -340,12 +372,7 @@ mod tests {
         create_test_entry(&storage, "site_interaction", None, "pending entry");
 
         // Create a validated entry
-        let validated = create_test_entry(
-            &storage,
-            "tool_optimization",
-            None,
-            "validated entry",
-        );
+        let validated = create_test_entry(&storage, "tool_optimization", None, "validated entry");
         storage
             .knowledge()
             .update_status(&validated.id, "validated")
@@ -400,8 +427,7 @@ mod tests {
             top_k: 2,
             min_decay_score: 0.05,
         };
-        let retriever =
-            KnowledgeRetriever::with_config(cache, Arc::clone(&storage), config);
+        let retriever = KnowledgeRetriever::with_config(cache, Arc::clone(&storage), config);
 
         let result = retriever.retrieve(Some("example.com"), None).unwrap();
         assert!(
@@ -489,6 +515,257 @@ mod tests {
             result.entries[0].relevance_score > 0.0,
             "fresh entry should have positive relevance, got {}",
             result.entries[0].relevance_score,
+        );
+    }
+
+    // --- Tests for the public relevance_score() function ---
+
+    /// Build a Knowledge entry in-memory without touching the database.
+    /// Uses the current time for timestamps so decay is ~1.0 for fresh entries.
+    fn make_knowledge(
+        category: &str,
+        domain: Option<&str>,
+        confidence: f64,
+        hit_count: i64,
+    ) -> Knowledge {
+        let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        Knowledge {
+            id: "K-test-000001".to_string(),
+            category: category.to_string(),
+            subcategory: None,
+            domain: domain.map(|d| d.to_string()),
+            summary: "test summary".to_string(),
+            details: "test details".to_string(),
+            resolution: None,
+            confidence,
+            hit_count,
+            success_count: 0,
+            fail_count: 0,
+            effectiveness: 0.5,
+            priority: "medium".to_string(),
+            status: "validated".to_string(),
+            source_ids: None,
+            related_ids: None,
+            tags: None,
+            privacy_level: "internal".to_string(),
+            promotion_target: None,
+            promoted_section: None,
+            source_type: "system".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            last_hit_at: Some(now),
+            promoted_at: None,
+        }
+    }
+
+    /// Build a Knowledge entry with a specific last_hit_at / updated_at timestamp.
+    fn make_knowledge_with_dates(
+        category: &str,
+        domain: Option<&str>,
+        confidence: f64,
+        hit_count: i64,
+        timestamp: String,
+    ) -> Knowledge {
+        Knowledge {
+            id: "K-test-000002".to_string(),
+            category: category.to_string(),
+            subcategory: None,
+            domain: domain.map(|d| d.to_string()),
+            summary: "test summary".to_string(),
+            details: "test details".to_string(),
+            resolution: None,
+            confidence,
+            hit_count,
+            success_count: 0,
+            fail_count: 0,
+            effectiveness: 0.5,
+            priority: "medium".to_string(),
+            status: "validated".to_string(),
+            source_ids: None,
+            related_ids: None,
+            tags: None,
+            privacy_level: "internal".to_string(),
+            promotion_target: None,
+            promoted_section: None,
+            source_type: "system".to_string(),
+            created_at: timestamp.clone(),
+            updated_at: timestamp.clone(),
+            last_hit_at: Some(timestamp),
+            promoted_at: None,
+        }
+    }
+
+    #[test]
+    fn exact_match_scores_highest() {
+        let entry = make_knowledge("site_interaction", Some("example.com"), 0.9, 10);
+        let score = relevance_score(
+            &entry,
+            Some("example.com"),
+            Some("site_interaction"),
+            Utc::now(),
+        );
+        // category_match=1.0, domain_match=1.0, decay~1.0, confidence=0.9
+        assert!(score > 0.8, "exact match should score > 0.8, got {score}");
+    }
+
+    #[test]
+    fn domain_mismatch_reduces_score() {
+        let entry = make_knowledge("site_interaction", Some("example.com"), 0.9, 10);
+        let now = Utc::now();
+        let exact = relevance_score(&entry, Some("example.com"), Some("site_interaction"), now);
+        let mismatch = relevance_score(&entry, Some("other.com"), Some("site_interaction"), now);
+        assert!(
+            exact > mismatch,
+            "exact domain should score higher: exact={exact}, mismatch={mismatch}"
+        );
+    }
+
+    #[test]
+    fn category_mismatch_reduces_score() {
+        let entry = make_knowledge("site_interaction", Some("example.com"), 0.9, 10);
+        let now = Utc::now();
+        let exact = relevance_score(&entry, Some("example.com"), Some("site_interaction"), now);
+        let mismatch = relevance_score(&entry, Some("example.com"), Some("tool_optimization"), now);
+        assert!(
+            exact > mismatch,
+            "exact category should score higher: exact={exact}, mismatch={mismatch}"
+        );
+    }
+
+    #[test]
+    fn universal_knowledge_gets_half_domain_match() {
+        let entry = make_knowledge("site_interaction", None, 0.9, 10);
+        let now = Utc::now();
+        let score = relevance_score(&entry, Some("example.com"), Some("site_interaction"), now);
+        // domain_match should be 0.5 for universal knowledge
+        let exact_entry = make_knowledge("site_interaction", Some("example.com"), 0.9, 10);
+        let exact_score = relevance_score(
+            &exact_entry,
+            Some("example.com"),
+            Some("site_interaction"),
+            now,
+        );
+        assert!(
+            exact_score > score,
+            "exact domain should beat universal: exact={exact_score}, universal={score}"
+        );
+        assert!(score > 0.0, "universal knowledge should still score > 0");
+    }
+
+    #[test]
+    fn old_entry_scores_lower_due_to_decay() {
+        let now = Utc::now();
+        let old_timestamp = (now - chrono::Duration::days(90))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let entry = make_knowledge_with_dates(
+            "site_interaction",
+            Some("example.com"),
+            0.9,
+            10,
+            old_timestamp,
+        );
+        let score = relevance_score(&entry, Some("example.com"), Some("site_interaction"), now);
+
+        let fresh = make_knowledge("site_interaction", Some("example.com"), 0.9, 10);
+        let fresh_score =
+            relevance_score(&fresh, Some("example.com"), Some("site_interaction"), now);
+
+        assert!(
+            fresh_score > score,
+            "fresh entry should score higher than 90-day-old: fresh={fresh_score}, old={score}"
+        );
+    }
+
+    #[test]
+    fn no_query_filters_gives_partial_match() {
+        let entry = make_knowledge("site_interaction", Some("example.com"), 0.9, 10);
+        let score = relevance_score(&entry, None, None, Utc::now());
+        // category_match=0.3 (no query category), domain_match=0.5 (no domain filter)
+        assert!(score > 0.0, "should be positive, got {score}");
+        assert!(
+            score < 0.5,
+            "partial match without filters should be < 0.5, got {score}"
+        );
+    }
+
+    #[test]
+    fn score_is_always_non_negative() {
+        let entry = make_knowledge("site_interaction", Some("example.com"), 0.0, 0);
+        let score = relevance_score(
+            &entry,
+            Some("other.com"),
+            Some("tool_optimization"),
+            Utc::now(),
+        );
+        assert!(score >= 0.0, "score should never be negative, got {score}");
+    }
+
+    #[test]
+    fn no_domain_filter_treats_domain_entry_as_half_match() {
+        let entry = make_knowledge("site_interaction", Some("example.com"), 0.9, 10);
+        let now = Utc::now();
+        // No domain filter => domain_match should be 0.5
+        let no_filter = relevance_score(&entry, None, Some("site_interaction"), now);
+        // Exact domain => domain_match should be 1.0
+        let exact = relevance_score(&entry, Some("example.com"), Some("site_interaction"), now);
+        assert!(
+            exact > no_filter,
+            "exact domain should beat no-filter: exact={exact}, no_filter={no_filter}"
+        );
+        // No filter should be approximately half of exact (both have same category/decay/conf)
+        let ratio = no_filter / exact;
+        assert!(
+            (ratio - 0.5).abs() < 0.01,
+            "no-domain-filter / exact-domain ratio should be ~0.5, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn domain_mismatch_is_worse_than_universal() {
+        let now = Utc::now();
+        // Entry with specific domain that does NOT match the query
+        let mismatched = make_knowledge("site_interaction", Some("example.com"), 0.9, 10);
+        let mismatch_score = relevance_score(
+            &mismatched,
+            Some("other.com"),
+            Some("site_interaction"),
+            now,
+        );
+
+        // Universal entry (domain = None)
+        let universal = make_knowledge("site_interaction", None, 0.9, 10);
+        let universal_score =
+            relevance_score(&universal, Some("other.com"), Some("site_interaction"), now);
+
+        assert!(
+            universal_score > mismatch_score,
+            "universal (0.5) should beat domain mismatch (0.1): universal={universal_score}, mismatch={mismatch_score}"
+        );
+    }
+
+    #[test]
+    fn low_confidence_reduces_score() {
+        let now = Utc::now();
+        let high_conf = make_knowledge("site_interaction", Some("example.com"), 0.9, 10);
+        let low_conf = make_knowledge("site_interaction", Some("example.com"), 0.1, 10);
+
+        let high_score = relevance_score(
+            &high_conf,
+            Some("example.com"),
+            Some("site_interaction"),
+            now,
+        );
+        let low_score = relevance_score(
+            &low_conf,
+            Some("example.com"),
+            Some("site_interaction"),
+            now,
+        );
+
+        assert!(
+            high_score > low_score,
+            "higher confidence should yield higher score: high={high_score}, low={low_score}"
         );
     }
 }
