@@ -526,6 +526,7 @@ impl DaemonHostFunctions {
             "deepseek" => self.config.llm.deepseek.api_key.as_deref(),
             "openrouter" => self.config.llm.openrouter.api_key.as_deref(),
             "claude-code" | "claude_code" => self.config.llm.claude_code.api_key.as_deref(),
+            "kimi-agent" | "kimi_agent" | "kimi" => self.config.llm.kimi_agent.api_key.as_deref(),
             _ => None,
         };
 
@@ -544,6 +545,10 @@ impl DaemonHostFunctions {
             Err(_) if pt == ProviderType::ClaudeCode => {
                 // Claude Code CLI manages its own auth; return a placeholder
                 Ok("claude-code-cli".to_string())
+            }
+            Err(_) if pt == ProviderType::KimiAgent => {
+                // Kimi Agent CLI manages its own auth; return a placeholder
+                Ok("kimi-agent-cli".to_string())
             }
             Err(_) => Err(HostError {
                 code: 2,
@@ -1767,11 +1772,7 @@ impl HostFunctions for DaemonHostFunctions {
             let expanded = expand_tilde(file_path);
             std::fs::read_to_string(&expanded).map_err(|e| HostError {
                 code: 6005,
-                message: format!(
-                    "Failed to read cache file '{}': {}",
-                    expanded.display(),
-                    e
-                ),
+                message: format!("Failed to read cache file '{}': {}", expanded.display(), e),
             })?
         } else {
             return Err(HostError {

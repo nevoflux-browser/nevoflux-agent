@@ -35,6 +35,8 @@ pub enum ProviderType {
     ClaudeCode,
     /// Gemini CLI (subprocess)
     GeminiCli,
+    /// Kimi Agent CLI (subprocess, wire mode)
+    KimiAgent,
 }
 
 impl FromStr for ProviderType {
@@ -57,6 +59,7 @@ impl FromStr for ProviderType {
             "together" => Ok(ProviderType::Together),
             "claude-code" | "claude_code" => Ok(ProviderType::ClaudeCode),
             "gemini-cli" | "gemini_cli" => Ok(ProviderType::GeminiCli),
+            "kimi-agent" | "kimi_agent" | "kimi" => Ok(ProviderType::KimiAgent),
             _ => Err(format!("Unknown provider: {}", s)),
         }
     }
@@ -133,6 +136,7 @@ pub fn default_model_for(provider: ProviderType) -> &'static str {
         ProviderType::Together => "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
         ProviderType::ClaudeCode => "sonnet",
         ProviderType::GeminiCli => "gemini-2.5-pro",
+        ProviderType::KimiAgent => "kimi-latest",
     }
 }
 
@@ -154,6 +158,7 @@ pub fn default_context_window_for(provider: ProviderType) -> u32 {
         ProviderType::Together => 8_000,
         ProviderType::ClaudeCode => 200_000,
         ProviderType::GeminiCli => 1_000_000,
+        ProviderType::KimiAgent => 128_000,
     }
 }
 
@@ -175,6 +180,7 @@ pub fn api_key_env_var(provider: ProviderType) -> &'static str {
         ProviderType::Together => "TOGETHER_API_KEY",
         ProviderType::ClaudeCode => "ANTHROPIC_API_KEY",
         ProviderType::GeminiCli => "GEMINI_API_KEY",
+        ProviderType::KimiAgent => "MOONSHOT_API_KEY",
     }
 }
 
@@ -376,6 +382,7 @@ mod tests {
             ProviderType::Together,
             ProviderType::ClaudeCode,
             ProviderType::GeminiCli,
+            ProviderType::KimiAgent,
         ];
 
         for provider in providers {
@@ -406,6 +413,7 @@ mod tests {
             ProviderType::Together,
             ProviderType::ClaudeCode,
             ProviderType::GeminiCli,
+            ProviderType::KimiAgent,
         ];
 
         for provider in providers {
@@ -484,6 +492,18 @@ mod tests {
         assert_eq!(
             ProviderType::from_str("gemini_cli").unwrap(),
             ProviderType::GeminiCli
+        );
+        assert_eq!(
+            ProviderType::from_str("kimi-agent").unwrap(),
+            ProviderType::KimiAgent
+        );
+        assert_eq!(
+            ProviderType::from_str("kimi_agent").unwrap(),
+            ProviderType::KimiAgent
+        );
+        assert_eq!(
+            ProviderType::from_str("kimi").unwrap(),
+            ProviderType::KimiAgent
         );
     }
 

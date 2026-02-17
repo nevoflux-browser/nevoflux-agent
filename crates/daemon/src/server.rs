@@ -200,10 +200,7 @@ pub async fn start_server(
                 let tool_defs: Vec<_> = server_tools.iter().map(|st| st.tool.clone()).collect();
                 if !tool_defs.is_empty() {
                     index.index(&tool_defs);
-                    info!(
-                        "Indexed {} MCP tools for tool_search",
-                        tool_defs.len()
-                    );
+                    info!("Indexed {} MCP tools for tool_search", tool_defs.len());
                 }
             }
             Err(e) => warn!("Failed to list MCP tools for indexing: {}", e),
@@ -977,7 +974,12 @@ async fn handle_chat_message_streaming(
     // Save user message to database
     let mut generated_title: Option<String> = None;
     match session_manager
-        .add_message_with_metadata(&session_id, MessageRole::User, message_content, attachment_metadata)
+        .add_message_with_metadata(
+            &session_id,
+            MessageRole::User,
+            message_content,
+            attachment_metadata,
+        )
         .await
     {
         Ok(msg) => {
@@ -1755,12 +1757,9 @@ async fn handle_chat_message_streaming(
                                     "code_mode": true
                                 }
                             });
-                            let response =
-                                DaemonEnvelope::new(&proxy_id, channel, chunk_payload)
-                                    .with_request_id(&request_id);
-                            if let Err(e) =
-                                response_tx.send((identity.clone(), response)).await
-                            {
+                            let response = DaemonEnvelope::new(&proxy_id, channel, chunk_payload)
+                                .with_request_id(&request_id);
+                            if let Err(e) = response_tx.send((identity.clone(), response)).await {
                                 error!("Failed to send code mode result: {}", e);
                             }
                         }
@@ -1971,7 +1970,11 @@ async fn send_artifact_stream(
     match session_manager.save_artifact(params) {
         Ok(_) => info!(
             "Persisted artifact {} (session={}, type={}, content_len={}, files_count={})",
-            artifact.id, session_id, artifact.content_type, effective_content.len(), files_count
+            artifact.id,
+            session_id,
+            artifact.content_type,
+            effective_content.len(),
+            files_count
         ),
         Err(e) => error!("Failed to persist artifact {}: {}", artifact.id, e),
     }
@@ -2336,7 +2339,12 @@ async fn handle_chat_message(
             // Save user message to database
             let mut generated_title: Option<String> = None;
             match session_manager
-                .add_message_with_metadata(&session_id, MessageRole::User, message_content, attachment_metadata)
+                .add_message_with_metadata(
+                    &session_id,
+                    MessageRole::User,
+                    message_content,
+                    attachment_metadata,
+                )
                 .await
             {
                 Ok(msg) => {
@@ -2800,13 +2808,12 @@ async fn handle_session_resolve(
             let messages = match session_manager.get_messages(&session.id).await {
                 Ok(msgs) => {
                     // Debug: log content_type distribution
-                    let type_counts: std::collections::HashMap<String, usize> = msgs.iter().fold(
-                        std::collections::HashMap::new(),
-                        |mut acc, m| {
-                            *acc.entry(m.content_type.as_str().to_string()).or_insert(0) += 1;
-                            acc
-                        },
-                    );
+                    let type_counts: std::collections::HashMap<String, usize> =
+                        msgs.iter()
+                            .fold(std::collections::HashMap::new(), |mut acc, m| {
+                                *acc.entry(m.content_type.as_str().to_string()).or_insert(0) += 1;
+                                acc
+                            });
                     info!(
                         "Found {} messages for session {} (content_types: {:?})",
                         msgs.len(),
@@ -2924,7 +2931,11 @@ async fn handle_session_list(
 
     match session_manager.list_sessions(list_params).await {
         Ok(sessions) => {
-            info!("session.list: returning {} sessions (exclude_empty={})", sessions.len(), exclude_empty);
+            info!(
+                "session.list: returning {} sessions (exclude_empty={})",
+                sessions.len(),
+                exclude_empty
+            );
             // Get message counts for each session
             let mut session_summaries = Vec::new();
             for session in &sessions {
@@ -3376,7 +3387,9 @@ async fn handle_artifact_get(
         Ok(Some(artifact)) => {
             info!(
                 "artifact.get: found artifact {} (title={}, content_len={})",
-                artifact.id, artifact.title, artifact.content.len()
+                artifact.id,
+                artifact.title,
+                artifact.content.len()
             );
             let files_json = artifact
                 .files
@@ -3541,33 +3554,72 @@ use crate::mcp_config::{McpServerConfigFile, McpServersConfig};
 
 /// Extract a McpServerConfigFile from a JSON value.
 fn extract_server_config(params: &serde_json::Value) -> McpServerConfigFile {
-    let name = params.get("name").and_then(|n| n.as_str()).unwrap_or_default();
-    let server_type = params.get("type").and_then(|t| t.as_str()).unwrap_or("stdio");
-    let enabled = params.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true);
-    let description = params.get("description").and_then(|d| d.as_str()).map(|s| s.to_string());
+    let name = params
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or_default();
+    let server_type = params
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("stdio");
+    let enabled = params
+        .get("enabled")
+        .and_then(|e| e.as_bool())
+        .unwrap_or(true);
+    let description = params
+        .get("description")
+        .and_then(|d| d.as_str())
+        .map(|s| s.to_string());
 
-    let command = params.get("command").and_then(|c| c.as_str()).map(|s| s.to_string());
+    let command = params
+        .get("command")
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string());
     let args: Vec<String> = params
         .get("args")
         .and_then(|a| a.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
     let env: HashMap<String, String> = params
         .get("env")
         .and_then(|e| e.as_object())
-        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect())
+        .map(|obj| {
+            obj.iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                .collect()
+        })
         .unwrap_or_default();
-    let work_dir = params.get("work_dir").and_then(|w| w.as_str()).map(|s| s.to_string());
+    let work_dir = params
+        .get("work_dir")
+        .and_then(|w| w.as_str())
+        .map(|s| s.to_string());
 
-    let url = params.get("url").and_then(|u| u.as_str()).map(|s| s.to_string());
+    let url = params
+        .get("url")
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string());
     let timeout = params.get("timeout").and_then(|t| t.as_u64());
     let headers: Option<HashMap<String, String>> = params
         .get("headers")
         .and_then(|h| h.as_object())
-        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect());
+        .map(|obj| {
+            obj.iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                .collect()
+        });
     let reconnect = params.get("reconnect").and_then(|r| r.as_u64());
-    let method = params.get("method").and_then(|m| m.as_str()).map(|s| s.to_string());
-    let api_key = params.get("api_key").and_then(|a| a.as_str()).map(|s| s.to_string());
+    let method = params
+        .get("method")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
+    let api_key = params
+        .get("api_key")
+        .and_then(|a| a.as_str())
+        .map(|s| s.to_string());
 
     McpServerConfigFile {
         name: name.to_string(),
@@ -3610,17 +3662,39 @@ async fn handle_mcp_list(params: &serde_json::Value) -> serde_json::Value {
                         "enabled": s.enabled,
                     });
                     let m = obj.as_object_mut().unwrap();
-                    if let Some(ref desc) = s.description { m.insert("description".into(), serde_json::json!(desc)); }
-                    if let Some(ref cmd) = s.command { m.insert("command".into(), serde_json::json!(cmd)); }
-                    if !s.args.is_empty() { m.insert("args".into(), serde_json::json!(s.args)); }
-                    if !s.env.is_empty() { m.insert("env".into(), serde_json::json!(s.env)); }
-                    if let Some(ref wd) = s.work_dir { m.insert("work_dir".into(), serde_json::json!(wd)); }
-                    if let Some(ref url) = s.url { m.insert("url".into(), serde_json::json!(url)); }
-                    if let Some(t) = s.timeout { m.insert("timeout".into(), serde_json::json!(t)); }
-                    if let Some(ref h) = s.headers { m.insert("headers".into(), serde_json::json!(h)); }
-                    if let Some(r) = s.reconnect { m.insert("reconnect".into(), serde_json::json!(r)); }
-                    if let Some(ref method) = s.method { m.insert("method".into(), serde_json::json!(method)); }
-                    if let Some(ref ak) = s.api_key { m.insert("api_key".into(), serde_json::json!(ak)); }
+                    if let Some(ref desc) = s.description {
+                        m.insert("description".into(), serde_json::json!(desc));
+                    }
+                    if let Some(ref cmd) = s.command {
+                        m.insert("command".into(), serde_json::json!(cmd));
+                    }
+                    if !s.args.is_empty() {
+                        m.insert("args".into(), serde_json::json!(s.args));
+                    }
+                    if !s.env.is_empty() {
+                        m.insert("env".into(), serde_json::json!(s.env));
+                    }
+                    if let Some(ref wd) = s.work_dir {
+                        m.insert("work_dir".into(), serde_json::json!(wd));
+                    }
+                    if let Some(ref url) = s.url {
+                        m.insert("url".into(), serde_json::json!(url));
+                    }
+                    if let Some(t) = s.timeout {
+                        m.insert("timeout".into(), serde_json::json!(t));
+                    }
+                    if let Some(ref h) = s.headers {
+                        m.insert("headers".into(), serde_json::json!(h));
+                    }
+                    if let Some(r) = s.reconnect {
+                        m.insert("reconnect".into(), serde_json::json!(r));
+                    }
+                    if let Some(ref method) = s.method {
+                        m.insert("method".into(), serde_json::json!(method));
+                    }
+                    if let Some(ref ak) = s.api_key {
+                        m.insert("api_key".into(), serde_json::json!(ak));
+                    }
                     obj
                 })
                 .collect();
@@ -4408,21 +4482,102 @@ fn icon_data_uri(bytes: &[u8]) -> String {
 }
 
 const PROVIDER_METAS: &[ProviderMeta] = &[
-    ProviderMeta { id: "anthropic", display_name: "Anthropic", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/anthropic.webp") },
-    ProviderMeta { id: "openai", display_name: "OpenAI", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/openai.webp") },
-    ProviderMeta { id: "deepseek", display_name: "DeepSeek", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/deepseek.webp") },
-    ProviderMeta { id: "qwen", display_name: "Qwen", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/qwen.webp") },
-    ProviderMeta { id: "gemini", display_name: "Google Gemini", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/gemini.webp") },
-    ProviderMeta { id: "groq", display_name: "Groq", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/groq.webp") },
-    ProviderMeta { id: "openrouter", display_name: "OpenRouter", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/openrouter.webp") },
-    ProviderMeta { id: "mistral", display_name: "Mistral", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/mistral.webp") },
-    ProviderMeta { id: "xai", display_name: "XAI (Grok)", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/xai.webp") },
-    ProviderMeta { id: "cohere", display_name: "Cohere", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/cohere.webp") },
-    ProviderMeta { id: "perplexity", display_name: "Perplexity", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/perplexity.webp") },
-    ProviderMeta { id: "together", display_name: "Together AI", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/together.webp") },
-    ProviderMeta { id: "ollama", display_name: "Ollama", provider_type: "local", icon_bytes: include_bytes!("../../../assets/icons/providers/ollama.webp") },
-    ProviderMeta { id: "claude-code", display_name: "Claude Code", provider_type: "cli", icon_bytes: include_bytes!("../../../assets/icons/providers/anthropic.webp") },
-    ProviderMeta { id: "gemini-cli", display_name: "Gemini CLI", provider_type: "cli", icon_bytes: include_bytes!("../../../assets/icons/providers/gemini.webp") },
+    ProviderMeta {
+        id: "anthropic",
+        display_name: "Anthropic",
+        provider_type: "service",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/anthropic.webp"),
+    },
+    ProviderMeta {
+        id: "openai",
+        display_name: "OpenAI",
+        provider_type: "service",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/openai.webp"),
+    },
+    ProviderMeta {
+        id: "deepseek",
+        display_name: "DeepSeek",
+        provider_type: "service",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/deepseek.webp"),
+    },
+    ProviderMeta {
+        id: "qwen",
+        display_name: "Qwen",
+        provider_type: "service",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/qwen.webp"),
+    },
+    ProviderMeta {
+        id: "gemini",
+        display_name: "Google Gemini",
+        provider_type: "service",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/gemini.webp"),
+    },
+    ProviderMeta {
+        id: "groq",
+        display_name: "Groq",
+        provider_type: "service",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/groq.webp"),
+    },
+    ProviderMeta {
+        id: "openrouter",
+        display_name: "OpenRouter",
+        provider_type: "service",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/openrouter.webp"),
+    },
+    ProviderMeta {
+        id: "mistral",
+        display_name: "Mistral",
+        provider_type: "service",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/mistral.webp"),
+    },
+    ProviderMeta {
+        id: "xai",
+        display_name: "XAI (Grok)",
+        provider_type: "service",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/xai.webp"),
+    },
+    ProviderMeta {
+        id: "cohere",
+        display_name: "Cohere",
+        provider_type: "service",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/cohere.webp"),
+    },
+    ProviderMeta {
+        id: "perplexity",
+        display_name: "Perplexity",
+        provider_type: "service",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/perplexity.webp"),
+    },
+    ProviderMeta {
+        id: "together",
+        display_name: "Together AI",
+        provider_type: "service",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/together.webp"),
+    },
+    ProviderMeta {
+        id: "ollama",
+        display_name: "Ollama",
+        provider_type: "local",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/ollama.webp"),
+    },
+    ProviderMeta {
+        id: "claude-code",
+        display_name: "Claude Code",
+        provider_type: "cli",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/anthropic.webp"),
+    },
+    ProviderMeta {
+        id: "gemini-cli",
+        display_name: "Gemini CLI",
+        provider_type: "cli",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/gemini.webp"),
+    },
+    ProviderMeta {
+        id: "kimi-agent",
+        display_name: "Kimi Agent",
+        provider_type: "cli",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/kimi.webp"),
+    },
 ];
 
 /// Get the ProviderConfig for a given provider id from the LlmConfig.
@@ -4446,6 +4601,7 @@ fn get_provider_config<'a>(
         "ollama" => Some(&llm.ollama),
         "claude-code" | "claude_code" => Some(&llm.claude_code),
         "gemini-cli" | "gemini_cli" => Some(&llm.gemini_cli),
+        "kimi-agent" | "kimi_agent" | "kimi" => Some(&llm.kimi_agent),
         _ => None,
     }
 }
@@ -4471,6 +4627,7 @@ fn get_provider_config_mut<'a>(
         "ollama" => Some(&mut llm.ollama),
         "claude-code" | "claude_code" => Some(&mut llm.claude_code),
         "gemini-cli" | "gemini_cli" => Some(&mut llm.gemini_cli),
+        "kimi-agent" | "kimi_agent" | "kimi" => Some(&mut llm.kimi_agent),
         _ => None,
     }
 }
@@ -4497,7 +4654,10 @@ async fn handle_config_llm_list(params: &serde_json::Value) -> serde_json::Value
                 .unwrap_or(false);
             let is_active = active.as_deref() == Some(meta.id)
                 || (meta.id == "claude-code" && active.as_deref() == Some("claude_code"))
-                || (meta.id == "gemini-cli" && active.as_deref() == Some("gemini_cli"));
+                || (meta.id == "gemini-cli" && active.as_deref() == Some("gemini_cli"))
+                || (meta.id == "kimi-agent"
+                    && (active.as_deref() == Some("kimi_agent")
+                        || active.as_deref() == Some("kimi")));
             let model = provider_config.and_then(|pc| pc.model.clone());
 
             let default_model = meta
@@ -4602,10 +4762,11 @@ async fn handle_config_llm_get(params: &serde_json::Value) -> serde_json::Value 
         .map(|pt| nevoflux_llm::default_context_window_for(pt));
 
     let is_active = config.llm.active_provider() == Some(provider_id)
-        || (provider_id == "claude-code"
-            && config.llm.active_provider() == Some("claude_code"))
-        || (provider_id == "gemini-cli"
-            && config.llm.active_provider() == Some("gemini_cli"));
+        || (provider_id == "claude-code" && config.llm.active_provider() == Some("claude_code"))
+        || (provider_id == "gemini-cli" && config.llm.active_provider() == Some("gemini_cli"))
+        || (provider_id == "kimi-agent"
+            && (config.llm.active_provider() == Some("kimi_agent")
+                || config.llm.active_provider() == Some("kimi")));
 
     serde_json::json!({
         "type": "system_response",
@@ -4757,7 +4918,8 @@ async fn handle_config_llm_set(params: &serde_json::Value) -> serde_json::Value 
 }
 
 /// Allowlist of config filenames that can be read/written via the config.file commands.
-const CONFIG_FILE_ALLOWLIST: &[&str] = &["IDENTITY.md", "SOUL.md", "USER.md", "TOOLS.md", "AGENTS.md"];
+const CONFIG_FILE_ALLOWLIST: &[&str] =
+    &["IDENTITY.md", "SOUL.md", "USER.md", "TOOLS.md", "AGENTS.md"];
 
 /// Handle config.file.read command.
 ///
@@ -4875,10 +5037,7 @@ async fn handle_config_file_write(params: &serde_json::Value) -> serde_json::Val
         .and_then(|f| f.as_str())
         .unwrap_or("");
 
-    let content = params
-        .get("content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
+    let content = params.get("content").and_then(|c| c.as_str()).unwrap_or("");
 
     if filename.is_empty() || !CONFIG_FILE_ALLOWLIST.contains(&filename) {
         return serde_json::json!({

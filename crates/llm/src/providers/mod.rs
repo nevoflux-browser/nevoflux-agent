@@ -7,6 +7,7 @@ use std::task::{Context, Poll};
 
 pub mod claude_code;
 pub mod gemini_cli;
+pub mod kimi_agent;
 pub mod qwen;
 
 /// A stream wrapper that holds a child process and kills it on drop.

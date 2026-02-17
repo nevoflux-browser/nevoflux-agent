@@ -7,6 +7,7 @@ use crate::error::{DaemonError, Result};
 use futures::StreamExt;
 use nevoflux_llm::providers::claude_code::ClaudeCodeClient;
 use nevoflux_llm::providers::gemini_cli::GeminiCliClient;
+use nevoflux_llm::providers::kimi_agent::KimiAgentClient;
 use nevoflux_llm::providers::qwen::QwenClient;
 use nevoflux_llm::ProviderType;
 use rig::client::CompletionClient;
@@ -320,6 +321,7 @@ pub async fn execute_llm_chat(
             execute_claude_code_chat(api_key, model, request, provider).await
         }
         ProviderType::GeminiCli => execute_gemini_cli_chat(api_key, model, request, provider).await,
+        ProviderType::KimiAgent => execute_kimi_agent_chat(api_key, model, request, provider).await,
     }
 }
 
@@ -444,6 +446,26 @@ async fn execute_gemini_cli_chat(
     let client = client
         .with_working_dir(workspace_dir)
         .with_add_dirs(resolve_skills_dirs());
+
+    let completion_model = client.completion_model(model);
+    execute_rig_completion(completion_model, request, provider).await
+}
+
+/// Execute a chat request using the Kimi Agent CLI provider.
+async fn execute_kimi_agent_chat(
+    api_key: &str,
+    model: &str,
+    request: LlmChatRequest,
+    provider: ProviderType,
+) -> Result<LlmChatResponse> {
+    let client = if api_key == "kimi-agent-cli" {
+        KimiAgentClient::new("kimi-agent")
+    } else {
+        KimiAgentClient::new("kimi-agent").with_api_key(api_key)
+    };
+
+    let workspace_dir = resolve_workspace_dir();
+    let client = client.with_working_dir(workspace_dir);
 
     let completion_model = client.completion_model(model);
     execute_rig_completion(completion_model, request, provider).await
@@ -660,7 +682,8 @@ where
                     Some(attachment) if provider == ProviderType::Anthropic => {
                         // Anthropic: image inside tool result (native multimodal tool results)
                         let clean_b64 = clean_base64_data(&attachment.data);
-                        let detected_media_type = detect_image_media_type_from_base64(&clean_b64, &attachment.mime_type);
+                        let detected_media_type =
+                            detect_image_media_type_from_base64(&clean_b64, &attachment.mime_type);
                         let tool_result = ToolResult {
                             id: tool_call_id.clone(),
                             call_id: Some(tool_call_id),
@@ -683,7 +706,8 @@ where
                     Some(attachment) => {
                         // OpenAI/others: text tool result + separate user image message
                         let clean_b64 = clean_base64_data(&attachment.data);
-                        let detected_media_type = detect_image_media_type_from_base64(&clean_b64, &attachment.mime_type);
+                        let detected_media_type =
+                            detect_image_media_type_from_base64(&clean_b64, &attachment.mime_type);
                         let tool_result = ToolResult {
                             id: tool_call_id.clone(),
                             call_id: Some(tool_call_id),
@@ -705,7 +729,10 @@ where
                         // No attachment — fallback to extract_screenshot_from_tool_result
                         match extract_screenshot_from_tool_result(&msg.content) {
                             Some(screenshot) if provider == ProviderType::Anthropic => {
-                                let detected_media_type = detect_image_media_type_from_base64(&screenshot.base64_data, "image/png");
+                                let detected_media_type = detect_image_media_type_from_base64(
+                                    &screenshot.base64_data,
+                                    "image/png",
+                                );
                                 let tool_result = ToolResult {
                                     id: tool_call_id.clone(),
                                     call_id: Some(tool_call_id),
@@ -728,7 +755,10 @@ where
                                 });
                             }
                             Some(screenshot) => {
-                                let detected_media_type = detect_image_media_type_from_base64(&screenshot.base64_data, "image/png");
+                                let detected_media_type = detect_image_media_type_from_base64(
+                                    &screenshot.base64_data,
+                                    "image/png",
+                                );
                                 let tool_result = ToolResult {
                                     id: tool_call_id.clone(),
                                     call_id: Some(tool_call_id),
@@ -864,7 +894,10 @@ where
                             base64_data.len(),
                             clean_base64.len()
                         );
-                        let detected_media_type = detect_image_media_type_from_base64(&clean_base64, &attachment.mime_type);
+                        let detected_media_type = detect_image_media_type_from_base64(
+                            &clean_base64,
+                            &attachment.mime_type,
+                        );
                         user_content.push(UserContent::Image(Image {
                             data: DocumentSourceKind::Base64(clean_base64),
                             media_type: Some(detected_media_type),
@@ -1318,11 +1351,13 @@ async fn execute_llm_stream_inner(
         ProviderType::Together => stream_together(api_key, model, request, tx, provider).await,
         ProviderType::ClaudeCode => stream_claude_code(api_key, model, request, tx, provider).await,
         ProviderType::GeminiCli => stream_gemini_cli(api_key, model, request, tx, provider).await,
-        // Qwen and Ollama don't support streaming in rig yet
-        ProviderType::Qwen | ProviderType::Ollama => Err(DaemonError::InternalError(format!(
-            "Streaming not supported for provider {:?}",
-            provider
-        ))),
+        // Kimi Agent, Qwen and Ollama don't support streaming in rig yet
+        ProviderType::KimiAgent | ProviderType::Qwen | ProviderType::Ollama => {
+            Err(DaemonError::InternalError(format!(
+                "Streaming not supported for provider {:?}",
+                provider
+            )))
+        }
     }
 }
 
@@ -1625,7 +1660,8 @@ where
                     Some(attachment) if provider == ProviderType::Anthropic => {
                         // Anthropic: image inside tool result
                         let clean_b64 = clean_base64_data(&attachment.data);
-                        let detected_media_type = detect_image_media_type_from_base64(&clean_b64, &attachment.mime_type);
+                        let detected_media_type =
+                            detect_image_media_type_from_base64(&clean_b64, &attachment.mime_type);
                         let tool_result = ToolResult {
                             id: tool_call_id.clone(),
                             call_id: Some(tool_call_id),
@@ -1648,7 +1684,8 @@ where
                     Some(attachment) => {
                         // OpenAI/others: text tool result + separate user image message
                         let clean_b64 = clean_base64_data(&attachment.data);
-                        let detected_media_type = detect_image_media_type_from_base64(&clean_b64, &attachment.mime_type);
+                        let detected_media_type =
+                            detect_image_media_type_from_base64(&clean_b64, &attachment.mime_type);
                         let tool_result = ToolResult {
                             id: tool_call_id.clone(),
                             call_id: Some(tool_call_id),
@@ -1670,7 +1707,10 @@ where
                         // No attachment — fallback to extract_screenshot_from_tool_result
                         match extract_screenshot_from_tool_result(&msg.content) {
                             Some(screenshot) if provider == ProviderType::Anthropic => {
-                                let detected_media_type = detect_image_media_type_from_base64(&screenshot.base64_data, "image/png");
+                                let detected_media_type = detect_image_media_type_from_base64(
+                                    &screenshot.base64_data,
+                                    "image/png",
+                                );
                                 let tool_result = ToolResult {
                                     id: tool_call_id.clone(),
                                     call_id: Some(tool_call_id),
@@ -1693,7 +1733,10 @@ where
                                 });
                             }
                             Some(screenshot) => {
-                                let detected_media_type = detect_image_media_type_from_base64(&screenshot.base64_data, "image/png");
+                                let detected_media_type = detect_image_media_type_from_base64(
+                                    &screenshot.base64_data,
+                                    "image/png",
+                                );
                                 let tool_result = ToolResult {
                                     id: tool_call_id.clone(),
                                     call_id: Some(tool_call_id),
@@ -1822,7 +1865,10 @@ where
                             base64_data.len(),
                             clean_base64.len()
                         );
-                        let detected_media_type = detect_image_media_type_from_base64(&clean_base64, &attachment.mime_type);
+                        let detected_media_type = detect_image_media_type_from_base64(
+                            &clean_base64,
+                            &attachment.mime_type,
+                        );
                         user_content.push(UserContent::Image(Image {
                             data: DocumentSourceKind::Base64(clean_base64),
                             media_type: Some(detected_media_type),
