@@ -10,6 +10,27 @@ use std::collections::HashMap;
 use std::path::Path;
 
 // ============================================================================
+// Tool Execution Record
+// ============================================================================
+
+/// Record of a tool execution, used by the learning system.
+#[derive(Debug, Clone)]
+pub struct ToolExecutionRecord {
+    /// Name of the tool that was executed.
+    pub tool_name: String,
+    /// Summary of the arguments passed to the tool.
+    pub arguments_summary: String,
+    /// Whether the execution succeeded.
+    pub success: bool,
+    /// Error message if the execution failed.
+    pub error_message: Option<String>,
+    /// Execution duration in milliseconds.
+    pub duration_ms: u64,
+    /// Session ID in which the tool was executed.
+    pub session_id: String,
+}
+
+// ============================================================================
 // Tool Executor Trait
 // ============================================================================
 
@@ -1025,6 +1046,21 @@ mod tests {
 
         let result = registry.execute(&call).await;
         assert!(result.error.is_some());
+    }
+
+    #[test]
+    fn tool_execution_record_captures_outcome() {
+        let record = ToolExecutionRecord {
+            tool_name: "web_fetch".into(),
+            arguments_summary: r#"{"url":"https://example.com"}"#.into(),
+            success: true,
+            error_message: None,
+            duration_ms: 1500,
+            session_id: "sess-123".into(),
+        };
+        assert!(record.success);
+        assert_eq!(record.duration_ms, 1500);
+        assert_eq!(record.tool_name, "web_fetch");
     }
 
     #[tokio::test]
