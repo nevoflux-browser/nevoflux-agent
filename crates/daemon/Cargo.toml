@@ -93,5 +93,6 @@ nix = { version = "0.29", features = ["signal", "process"] }
 tokio = { workspace = true, features = ["test-util"] }
 nevoflux-testing = { path = "../testing" }
 rusqlite = { workspace = true }
+proptest = { workspace = true }
 wat = "1"
 tempfile = "3"
