@@ -9,6 +9,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("002_memory", include_str!("migrations/002_memory.sql")),
     ("003_traces", include_str!("migrations/003_traces.sql")),
     ("004_artifacts", include_str!("migrations/004_artifacts.sql")),
+    ("005_learning", include_str!("migrations/005_learning.sql")),
 ];
 
 /// Run all pending migrations on the given connection.
@@ -61,7 +62,7 @@ mod tests {
         let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
     }
 
     #[test]
@@ -107,5 +108,41 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM trace_spans", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn migration_005_creates_learning_tables() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_all(&mut conn).unwrap();
+
+        // Verify tables exist
+        for table in &[
+            "knowledge",
+            "site_adaptations",
+            "tool_stats",
+            "learning_metrics",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{}'",
+                        table
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "Table {} should exist", table);
+        }
+
+        // Verify view exists
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='knowledge_health'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "View knowledge_health should exist");
     }
 }
