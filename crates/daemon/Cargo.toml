@@ -80,6 +80,10 @@ dashmap = "6"
 # Markdown section parsing
 pulldown-cmark = "0.12"
 
+# Encryption (AES-256-GCM for learning data at rest)
+aes-gcm = "0.10"
+base64 = "0.22"
+
 # Native file dialog
 rfd = "0.15"
 
