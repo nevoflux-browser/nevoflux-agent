@@ -243,6 +243,75 @@ impl SoulManager {
         Ok(result)
     }
 
+    /// Create a snapshot of all five soul documents.
+    ///
+    /// Copies every allowed file into `.snapshots/{YYYYMMDD-HHmmSS}/` and
+    /// returns the path to the snapshot directory.
+    pub async fn create_snapshot(&self) -> Result<PathBuf> {
+        let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+        let snapshot_dir = self.soul_dir.join(".snapshots").join(&timestamp);
+        tokio::fs::create_dir_all(&snapshot_dir).await?;
+
+        for name in &Self::ALLOWED_FILES {
+            let src = self.soul_dir.join(name);
+            let dst = snapshot_dir.join(name);
+            tokio::fs::copy(&src, &dst).await?;
+        }
+
+        Ok(snapshot_dir)
+    }
+
+    /// Rollback the soul directory to a previous snapshot.
+    ///
+    /// Restores all five document files from the given snapshot directory
+    /// back into the soul directory, then reloads the in-memory cache.
+    pub async fn rollback(&mut self, snapshot_path: &Path) -> Result<()> {
+        for name in &Self::ALLOWED_FILES {
+            let src = snapshot_path.join(name);
+            let dst = self.soul_dir.join(name);
+            tokio::fs::copy(&src, &dst).await?;
+        }
+
+        // Reload cache from the restored files
+        let reloaded = Self::load(&self.soul_dir).await?;
+        self.cache = reloaded.cache;
+
+        Ok(())
+    }
+
+    /// Clean up old snapshots, keeping only the most recent `keep` snapshots.
+    ///
+    /// Lists all entries in `.snapshots/`, sorts by name (which is a
+    /// timestamp and therefore in chronological order), and removes all
+    /// but the last `keep` entries.
+    pub async fn cleanup_snapshots(&self, keep: usize) -> Result<()> {
+        let snapshots_dir = self.soul_dir.join(".snapshots");
+        let mut entries: Vec<String> = Vec::new();
+
+        let mut read_dir = tokio::fs::read_dir(&snapshots_dir).await?;
+        while let Some(entry) = read_dir.next_entry().await? {
+            if entry.file_type().await?.is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    entries.push(name.to_string());
+                }
+            }
+        }
+
+        entries.sort();
+
+        if entries.len() <= keep {
+            return Ok(());
+        }
+
+        let to_remove = entries.len() - keep;
+        for name in &entries[..to_remove] {
+            let path = snapshots_dir.join(name);
+            tokio::fs::remove_dir_all(&path).await?;
+        }
+
+        Ok(())
+    }
+
     /// Append a changelog entry for a change to `.changelog/YYYY-MM-DD.md`.
     async fn append_changelog(&self, change: &SoulChange) -> Result<()> {
         let now = Utc::now();
@@ -409,5 +478,94 @@ mod tests {
         assert!(manager.cache().user_raw.contains("NevoFlux User Profile"));
         assert!(manager.cache().tools_raw.contains("NevoFlux Tools"));
         assert!(manager.cache().agents_raw.contains("NevoFlux Agents"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_rollback() {
+        let tmp = TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        // Create snapshot of initial state
+        let snapshot_path = manager.create_snapshot().await.unwrap();
+        assert!(snapshot_path.exists());
+
+        // Modify TOOLS.md
+        let change = SoulChange {
+            target_file: "TOOLS.md".into(),
+            section: "Site Adaptation Graph".into(),
+            change_type: "add".into(),
+            new_content: "### modified.com\n".into(),
+            reason: "test".into(),
+            source_type: "system".into(),
+            ..Default::default()
+        };
+        manager.apply_change(change).await.unwrap();
+        assert!(manager.cache().tools_raw.contains("modified.com"));
+
+        // Rollback
+        manager.rollback(&snapshot_path).await.unwrap();
+        assert!(!manager.cache().tools_raw.contains("modified.com"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_copies_all_five_files() {
+        let tmp = TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        let snapshot_path = manager.create_snapshot().await.unwrap();
+
+        // Verify all 5 files were copied
+        for name in &SoulManager::ALLOWED_FILES {
+            assert!(
+                snapshot_path.join(name).exists(),
+                "snapshot should contain {}",
+                name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_snapshots_keeps_n_newest() {
+        let tmp = TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        // Create 3 snapshots with distinct names (manually create to control names)
+        let snapshots_dir = soul_dir.join(".snapshots");
+        for name in &["20250101-120000", "20250102-120000", "20250103-120000"] {
+            let dir = snapshots_dir.join(name);
+            tokio::fs::create_dir_all(&dir).await.unwrap();
+            for file in &SoulManager::ALLOWED_FILES {
+                tokio::fs::copy(soul_dir.join(file), dir.join(file))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // Keep only 1
+        manager.cleanup_snapshots(1).await.unwrap();
+
+        // Only the newest should remain
+        assert!(!snapshots_dir.join("20250101-120000").exists());
+        assert!(!snapshots_dir.join("20250102-120000").exists());
+        assert!(snapshots_dir.join("20250103-120000").exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_snapshots_noop_when_fewer_than_keep() {
+        let tmp = TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+        let manager = SoulManager::init(&soul_dir).await.unwrap();
+
+        // Create 1 snapshot
+        let snapshot_path = manager.create_snapshot().await.unwrap();
+
+        // Cleanup keeping 5 should be a no-op
+        manager.cleanup_snapshots(5).await.unwrap();
+
+        // The snapshot should still exist
+        assert!(snapshot_path.exists());
     }
 }
