@@ -6,8 +6,8 @@ use crate::connection::Database;
 use crate::error::Result;
 use crate::repositories::traces::TraceRepository;
 use crate::repositories::{
-    ArtifactRepository, ConfigRepository, MessageRepository, PermissionRepository,
-    SessionRepository,
+    ArtifactRepository, ConfigRepository, KnowledgeRepository, MessageRepository,
+    PermissionRepository, SessionRepository,
 };
 
 /// Main storage facade providing access to all repositories.
@@ -76,6 +76,13 @@ impl Storage {
     /// Use this to create, read, and delete artifacts.
     pub fn artifacts(&self) -> ArtifactRepository<'_> {
         ArtifactRepository::new(&self.db)
+    }
+
+    /// Get a knowledge repository.
+    ///
+    /// Use this to create, read, update, and delete knowledge entries.
+    pub fn knowledge(&self) -> KnowledgeRepository<'_> {
+        KnowledgeRepository::new(&self.db)
     }
 
     /// Get the underlying database (for advanced operations).

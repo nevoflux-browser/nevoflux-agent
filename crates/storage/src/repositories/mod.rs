@@ -2,6 +2,7 @@
 
 mod artifact;
 mod config;
+mod knowledge;
 mod memory;
 mod message;
 mod permission;
@@ -10,6 +11,7 @@ pub mod traces;
 
 pub use artifact::ArtifactRepository;
 pub use config::ConfigRepository;
+pub use knowledge::KnowledgeRepository;
 pub use memory::MemoryRepository;
 pub use message::MessageRepository;
 pub use permission::PermissionRepository;
