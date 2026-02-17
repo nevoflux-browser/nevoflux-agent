@@ -137,7 +137,84 @@ pub async fn start_server(
     // Create tool auth registry for pending tool authorization requests
     let tool_auth_registry: ToolAuthRegistry = Arc::new(Mutex::new(HashMap::new()));
 
-    let services = HostServices::new(Arc::new(db)).with_browser_sender(browser_tx);
+    // Initialize MCP manager and tool search index from config
+    let mcp_manager = {
+        use nevoflux_mcp::{ManagerConfig, McpManager, ServerConfig as McpServerConfig};
+
+        let manager = Arc::new(McpManager::new(ManagerConfig::default()));
+
+        // Load MCP server configs and connect to enabled servers
+        if let Ok(mcp_config) = crate::mcp_config::McpServersConfig::load() {
+            for server in mcp_config.enabled_servers() {
+                let sc = match server.server_type.as_str() {
+                    "http" | "sse" => {
+                        if let Some(ref url) = server.url {
+                            let mut sc = McpServerConfig::new_http(&server.name, url);
+                            if let Some(ref key) = server.api_key {
+                                sc = sc.with_api_key(key);
+                            }
+                            sc
+                        } else {
+                            warn!(
+                                "MCP server {} (type={}) has no URL configured, skipping",
+                                server.name, server.server_type
+                            );
+                            continue;
+                        }
+                    }
+                    _ => {
+                        // stdio (default)
+                        if let Some(ref command) = server.command {
+                            let mut sc = McpServerConfig::new(&server.name, command)
+                                .with_args(server.args.iter().map(|s| s.as_str()).collect());
+                            for (k, v) in &server.env {
+                                sc = sc.with_env(k, v);
+                            }
+                            sc
+                        } else {
+                            warn!(
+                                "MCP server {} has no command configured, skipping",
+                                server.name
+                            );
+                            continue;
+                        }
+                    }
+                };
+                match manager.add_and_connect(sc).await {
+                    Ok(()) => info!("Connected MCP server: {}", server.name),
+                    Err(e) => warn!("Failed to connect MCP server {}: {}", server.name, e),
+                }
+            }
+        }
+
+        manager
+    };
+
+    // Build tool search index from connected MCP server tools
+    let tool_search_index = {
+        use nevoflux_mcp::ToolSearchIndex;
+
+        let mut index = ToolSearchIndex::new();
+        match mcp_manager.list_all_tools().await {
+            Ok(server_tools) => {
+                let tool_defs: Vec<_> = server_tools.iter().map(|st| st.tool.clone()).collect();
+                if !tool_defs.is_empty() {
+                    index.index(&tool_defs);
+                    info!(
+                        "Indexed {} MCP tools for tool_search",
+                        tool_defs.len()
+                    );
+                }
+            }
+            Err(e) => warn!("Failed to list MCP tools for indexing: {}", e),
+        }
+        index
+    };
+
+    let services = HostServices::new(Arc::new(db))
+        .with_browser_sender(browser_tx)
+        .with_mcp_manager(mcp_manager)
+        .with_tool_search(tool_search_index);
 
     let mut socket = zeromq::RouterSocket::new();
     socket
@@ -894,10 +971,13 @@ async fn handle_chat_message_streaming(
         }
     }
 
+    // Build attachment metadata for history display (no base64 data stored)
+    let attachment_metadata = build_attachment_metadata(&attachments, &local_files);
+
     // Save user message to database
     let mut generated_title: Option<String> = None;
     match session_manager
-        .add_message(&session_id, MessageRole::User, message_content)
+        .add_message_with_metadata(&session_id, MessageRole::User, message_content, attachment_metadata)
         .await
     {
         Ok(msg) => {
@@ -984,6 +1064,17 @@ async fn handle_chat_message_streaming(
     let tab_ids_for_rerun = tab_ids.clone();
 
     // Build agent input
+    // Load MCP server names for system prompt injection
+    let mcp_servers: Vec<String> = crate::mcp_config::McpServersConfig::load()
+        .map(|c| {
+            c.servers
+                .iter()
+                .filter(|s| s.enabled)
+                .map(|s| s.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
     let input = AgentInput {
         session_id: session_id.clone(),
         mode,
@@ -1001,6 +1092,7 @@ async fn handle_chat_message_streaming(
         tab_ids,
         skill_context,
         available_models: config.llm.configured_providers(),
+        mcp_servers: mcp_servers.clone(),
     };
 
     // Create cancellation token for this streaming session
@@ -1274,6 +1366,7 @@ async fn handle_chat_message_streaming(
                             tab_ids: tab_ids_for_rerun.clone(),
                             skill_context: None,
                             available_models: config.llm.configured_providers(),
+                            mcp_servers: mcp_servers.clone(),
                         };
 
                         // Spawn stream forwarder for re-run
@@ -1761,6 +1854,21 @@ async fn handle_chat_message_streaming(
         }
         Ok(Err(e)) => {
             error!("Agent run failed: {}", e);
+            // Send a stream_chunk with done:true first so the sidebar
+            // properly ends its streaming state, then send the error.
+            let done_payload = serde_json::json!({
+                "type": "stream_chunk",
+                "payload": {
+                    "content": format!("\n\nAgent error: {}", e),
+                    "tool_calls": [],
+                    "done": true
+                }
+            });
+            let done_response =
+                DaemonEnvelope::new(&proxy_id, channel, done_payload).with_request_id(&request_id);
+            if let Err(e) = response_tx.send((identity.clone(), done_response)).await {
+                error!("Failed to send error done response: {}", e);
+            }
             let error_payload = serde_json::json!({
                 "type": "error",
                 "payload": {
@@ -1776,6 +1884,21 @@ async fn handle_chat_message_streaming(
         }
         Err(e) => {
             error!("Agent task panicked: {}", e);
+            // Send a stream_chunk with done:true first so the sidebar
+            // properly ends its streaming state.
+            let done_payload = serde_json::json!({
+                "type": "stream_chunk",
+                "payload": {
+                    "content": format!("\n\nAgent task failed: {}", e),
+                    "tool_calls": [],
+                    "done": true
+                }
+            });
+            let done_response =
+                DaemonEnvelope::new(&proxy_id, channel, done_payload).with_request_id(&request_id);
+            if let Err(e) = response_tx.send((identity.clone(), done_response)).await {
+                error!("Failed to send error done response: {}", e);
+            }
             let error_payload = serde_json::json!({
                 "type": "error",
                 "payload": {
@@ -1811,14 +1934,30 @@ async fn send_artifact_stream(
 ) {
     const CHUNK_SIZE: usize = 4096;
 
-    // Persist artifact to storage
+    // For project-type artifacts with files but no content, use the entry file
+    // content as fallback so older sidebars that only read artifact_delta can
+    // still display something meaningful.
+    let effective_content = if artifact.content.is_empty() {
+        if let (Some(files), Some(entry)) = (&artifact.files, &artifact.entry) {
+            files.get(entry).cloned().unwrap_or_default()
+        } else if let Some(files) = &artifact.files {
+            // No entry specified — pick the first file
+            files.values().next().cloned().unwrap_or_default()
+        } else {
+            String::new()
+        }
+    } else {
+        artifact.content.clone()
+    };
+
+    // Persist artifact to storage (use effective_content so entry file is stored)
     let mut params = nevoflux_storage::CreateArtifactParams::new(
         &artifact.id,
         session_id,
         &artifact.title,
         &artifact.content_type,
     )
-    .with_content(&artifact.content);
+    .with_content(&effective_content);
     if let Some(desc) = &artifact.description {
         params = params.with_description(desc);
     }
@@ -1828,10 +1967,11 @@ async fn send_artifact_stream(
     if let Some(entry) = &artifact.entry {
         params = params.with_entry(entry);
     }
+    let files_count = artifact.files.as_ref().map(|f| f.len()).unwrap_or(0);
     match session_manager.save_artifact(params) {
         Ok(_) => info!(
-            "Persisted artifact {} (session={}, type={}, content_len={})",
-            artifact.id, session_id, artifact.content_type, artifact.content.len()
+            "Persisted artifact {} (session={}, type={}, content_len={}, files_count={})",
+            artifact.id, session_id, artifact.content_type, effective_content.len(), files_count
         ),
         Err(e) => error!("Failed to persist artifact {}: {}", artifact.id, e),
     }
@@ -1852,18 +1992,19 @@ async fn send_artifact_stream(
         return;
     }
 
-    // 2. Send artifact_delta chunks (for single-file artifacts with content)
-    let content = &artifact.content;
-    if !content.is_empty() {
-        let bytes = content.as_bytes();
+    // 2. Send artifact_delta chunks
+    // For project-type artifacts with empty content, send the entry file as
+    // fallback so sidebars that only handle delta can still render content.
+    if !effective_content.is_empty() {
+        let bytes = effective_content.as_bytes();
         let mut offset = 0;
         while offset < bytes.len() {
             let mut end = (offset + CHUNK_SIZE).min(bytes.len());
             // Ensure we don't split a multi-byte UTF-8 character
-            while end < bytes.len() && !content.is_char_boundary(end) {
+            while end < bytes.len() && !effective_content.is_char_boundary(end) {
                 end += 1;
             }
-            let chunk = &content[offset..end];
+            let chunk = &effective_content[offset..end];
 
             let delta_msg = AgentMessage::ArtifactDelta(ArtifactDelta {
                 id: artifact.id.clone(),
@@ -2189,10 +2330,13 @@ async fn handle_chat_message(
                 }
             }
 
+            // Build attachment metadata for history display (no base64 data stored)
+            let attachment_metadata = build_attachment_metadata(&attachments, &local_files);
+
             // Save user message to database
             let mut generated_title: Option<String> = None;
             match session_manager
-                .add_message(&session_id, MessageRole::User, message_content)
+                .add_message_with_metadata(&session_id, MessageRole::User, message_content, attachment_metadata)
                 .await
             {
                 Ok(msg) => {
@@ -2232,6 +2376,17 @@ async fn handle_chat_message(
             // Create agent with host functions
             let agent = Agent::new(host);
 
+            // Load MCP server names for system prompt injection
+            let mcp_servers: Vec<String> = crate::mcp_config::McpServersConfig::load()
+                .map(|c| {
+                    c.servers
+                        .iter()
+                        .filter(|s| s.enabled)
+                        .map(|s| s.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+
             // Build agent input with skill context injected into system prompt
             let input = AgentInput {
                 session_id: session_id.clone(),
@@ -2250,6 +2405,7 @@ async fn handle_chat_message(
                 tab_ids,
                 skill_context,
                 available_models: config.llm.configured_providers(),
+                mcp_servers,
             };
 
             // Run agent
@@ -2369,7 +2525,7 @@ async fn handle_chat_message(
                 }
             })
         }
-        "system_command" => {
+        "system_command" | "agent:command" => {
             let inner_payload = payload.get("payload");
 
             let command = inner_payload
@@ -2425,6 +2581,13 @@ async fn handle_chat_message(
                 "mcp.disconnect" => handle_mcp_disconnect(&params).await,
                 "file.pick" => handle_file_pick(&params).await,
                 "skill.list" => handle_skill_list(services, &params).await,
+                // LLM provider configuration commands
+                "config.llm.list" => handle_config_llm_list(&params).await,
+                "config.llm.get" => handle_config_llm_get(&params).await,
+                "config.llm.set" => handle_config_llm_set(&params).await,
+                // Agent config file commands
+                "config.file.read" => handle_config_file_read(&params).await,
+                "config.file.write" => handle_config_file_write(&params).await,
                 // Artifact persistence commands
                 "artifact.get" => handle_artifact_get(session_manager, &params).await,
                 "artifact.list" => handle_artifact_list(session_manager, &params).await,
@@ -3376,6 +3539,54 @@ async fn handle_mcp_message(payload: &serde_json::Value) -> serde_json::Value {
 
 use crate::mcp_config::{McpServerConfigFile, McpServersConfig};
 
+/// Extract a McpServerConfigFile from a JSON value.
+fn extract_server_config(params: &serde_json::Value) -> McpServerConfigFile {
+    let name = params.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+    let server_type = params.get("type").and_then(|t| t.as_str()).unwrap_or("stdio");
+    let enabled = params.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true);
+    let description = params.get("description").and_then(|d| d.as_str()).map(|s| s.to_string());
+
+    let command = params.get("command").and_then(|c| c.as_str()).map(|s| s.to_string());
+    let args: Vec<String> = params
+        .get("args")
+        .and_then(|a| a.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let env: HashMap<String, String> = params
+        .get("env")
+        .and_then(|e| e.as_object())
+        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect())
+        .unwrap_or_default();
+    let work_dir = params.get("work_dir").and_then(|w| w.as_str()).map(|s| s.to_string());
+
+    let url = params.get("url").and_then(|u| u.as_str()).map(|s| s.to_string());
+    let timeout = params.get("timeout").and_then(|t| t.as_u64());
+    let headers: Option<HashMap<String, String>> = params
+        .get("headers")
+        .and_then(|h| h.as_object())
+        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string())).collect());
+    let reconnect = params.get("reconnect").and_then(|r| r.as_u64());
+    let method = params.get("method").and_then(|m| m.as_str()).map(|s| s.to_string());
+    let api_key = params.get("api_key").and_then(|a| a.as_str()).map(|s| s.to_string());
+
+    McpServerConfigFile {
+        name: name.to_string(),
+        server_type: server_type.to_string(),
+        enabled,
+        description,
+        command,
+        args,
+        env,
+        work_dir,
+        url,
+        timeout,
+        headers,
+        reconnect,
+        method,
+        api_key,
+    }
+}
+
 /// Handle mcp.list command.
 ///
 /// Returns list of configured MCP servers and their connection status.
@@ -3393,14 +3604,24 @@ async fn handle_mcp_list(params: &serde_json::Value) -> serde_json::Value {
                 .servers
                 .iter()
                 .map(|s| {
-                    let env: HashMap<String, String> = s.env.clone();
-                    serde_json::json!({
+                    let mut obj = serde_json::json!({
                         "name": s.name,
-                        "command": s.command,
-                        "args": s.args,
+                        "type": s.server_type,
                         "enabled": s.enabled,
-                        "env": env
-                    })
+                    });
+                    let m = obj.as_object_mut().unwrap();
+                    if let Some(ref desc) = s.description { m.insert("description".into(), serde_json::json!(desc)); }
+                    if let Some(ref cmd) = s.command { m.insert("command".into(), serde_json::json!(cmd)); }
+                    if !s.args.is_empty() { m.insert("args".into(), serde_json::json!(s.args)); }
+                    if !s.env.is_empty() { m.insert("env".into(), serde_json::json!(s.env)); }
+                    if let Some(ref wd) = s.work_dir { m.insert("work_dir".into(), serde_json::json!(wd)); }
+                    if let Some(ref url) = s.url { m.insert("url".into(), serde_json::json!(url)); }
+                    if let Some(t) = s.timeout { m.insert("timeout".into(), serde_json::json!(t)); }
+                    if let Some(ref h) = s.headers { m.insert("headers".into(), serde_json::json!(h)); }
+                    if let Some(r) = s.reconnect { m.insert("reconnect".into(), serde_json::json!(r)); }
+                    if let Some(ref method) = s.method { m.insert("method".into(), serde_json::json!(method)); }
+                    if let Some(ref ak) = s.api_key { m.insert("api_key".into(), serde_json::json!(ak)); }
+                    obj
                 })
                 .collect();
 
@@ -3467,42 +3688,8 @@ async fn handle_mcp_add(params: &serde_json::Value) -> serde_json::Value {
         }
     };
 
-    let name = server_params
-        .get("name")
-        .and_then(|n| n.as_str())
-        .unwrap_or_default();
-    let command = server_params
-        .get("command")
-        .and_then(|c| c.as_str())
-        .unwrap_or_default();
-    let args: Vec<String> = server_params
-        .get("args")
-        .and_then(|a| a.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let enabled = server_params
-        .get("enabled")
-        .and_then(|e| e.as_bool())
-        .unwrap_or(true);
-    let env: HashMap<String, String> = server_params
-        .get("env")
-        .and_then(|e| e.as_object())
-        .map(|obj| {
-            obj.iter()
-                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Create server config
-    let server = McpServerConfigFile::new(name, command)
-        .with_args(args)
-        .with_enabled(enabled)
-        .with_env(env);
+    let server = extract_server_config(server_params);
+    let server_name = server.name.clone();
 
     // Load existing config, add server, and save
     let mut config = match McpServersConfig::load() {
@@ -3553,7 +3740,7 @@ async fn handle_mcp_add(params: &serde_json::Value) -> serde_json::Value {
         });
     }
 
-    info!("Added MCP server: {}", name);
+    info!("Added MCP server: {}", server_name);
     serde_json::json!({
         "type": "system_response",
         "payload": {
@@ -3561,7 +3748,7 @@ async fn handle_mcp_add(params: &serde_json::Value) -> serde_json::Value {
             "command": "mcp.add",
             "success": true,
             "data": {
-                "name": name
+                "name": server_name
             }
         }
     })
@@ -3613,37 +3800,7 @@ async fn handle_mcp_update(params: &serde_json::Value) -> serde_json::Value {
         }
     };
 
-    let command = server_params
-        .get("command")
-        .and_then(|c| c.as_str())
-        .unwrap_or_default();
-    let args: Vec<String> = server_params
-        .get("args")
-        .and_then(|a| a.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-    let enabled = server_params
-        .get("enabled")
-        .and_then(|e| e.as_bool())
-        .unwrap_or(true);
-    let env: HashMap<String, String> = server_params
-        .get("env")
-        .and_then(|e| e.as_object())
-        .map(|obj| {
-            obj.iter()
-                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let server = McpServerConfigFile::new(name, command)
-        .with_args(args)
-        .with_enabled(enabled)
-        .with_env(env);
+    let server = extract_server_config(server_params);
 
     let mut config = match McpServersConfig::load() {
         Ok(c) => c,
@@ -3862,8 +4019,24 @@ async fn handle_mcp_test(params: &serde_json::Value) -> serde_json::Value {
         }
     };
 
-    // Build the command line
-    let command = &server.command;
+    // Build the command line (only stdio servers can be tested this way)
+    let command = match &server.command {
+        Some(c) => c,
+        None => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "mcp.test",
+                    "success": false,
+                    "error": {
+                        "code": "UNSUPPORTED",
+                        "message": format!("Only stdio servers can be tested, server '{}' is type '{}'", name, server.server_type)
+                    }
+                }
+            });
+        }
+    };
     let args = &server.args;
 
     info!(
@@ -4215,6 +4388,589 @@ async fn handle_skill_list(
 }
 
 // ============================================
+// LLM Config Handlers
+// ============================================
+
+/// Provider metadata for the LLM provider list.
+struct ProviderMeta {
+    id: &'static str,
+    display_name: &'static str,
+    provider_type: &'static str,
+    /// Embedded icon bytes (WebP, 128x128)
+    icon_bytes: &'static [u8],
+}
+
+/// Encode icon bytes as a base64 data URI (image/webp).
+fn icon_data_uri(bytes: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    format!("data:image/webp;base64,{}", b64)
+}
+
+const PROVIDER_METAS: &[ProviderMeta] = &[
+    ProviderMeta { id: "anthropic", display_name: "Anthropic", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/anthropic.webp") },
+    ProviderMeta { id: "openai", display_name: "OpenAI", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/openai.webp") },
+    ProviderMeta { id: "deepseek", display_name: "DeepSeek", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/deepseek.webp") },
+    ProviderMeta { id: "qwen", display_name: "Qwen", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/qwen.webp") },
+    ProviderMeta { id: "gemini", display_name: "Google Gemini", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/gemini.webp") },
+    ProviderMeta { id: "groq", display_name: "Groq", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/groq.webp") },
+    ProviderMeta { id: "openrouter", display_name: "OpenRouter", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/openrouter.webp") },
+    ProviderMeta { id: "mistral", display_name: "Mistral", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/mistral.webp") },
+    ProviderMeta { id: "xai", display_name: "XAI (Grok)", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/xai.webp") },
+    ProviderMeta { id: "cohere", display_name: "Cohere", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/cohere.webp") },
+    ProviderMeta { id: "perplexity", display_name: "Perplexity", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/perplexity.webp") },
+    ProviderMeta { id: "together", display_name: "Together AI", provider_type: "service", icon_bytes: include_bytes!("../../../assets/icons/providers/together.webp") },
+    ProviderMeta { id: "ollama", display_name: "Ollama", provider_type: "local", icon_bytes: include_bytes!("../../../assets/icons/providers/ollama.webp") },
+    ProviderMeta { id: "claude-code", display_name: "Claude Code", provider_type: "cli", icon_bytes: include_bytes!("../../../assets/icons/providers/anthropic.webp") },
+    ProviderMeta { id: "gemini-cli", display_name: "Gemini CLI", provider_type: "cli", icon_bytes: include_bytes!("../../../assets/icons/providers/gemini.webp") },
+];
+
+/// Get the ProviderConfig for a given provider id from the LlmConfig.
+fn get_provider_config<'a>(
+    llm: &'a crate::config::LlmConfig,
+    provider_id: &str,
+) -> Option<&'a crate::config::ProviderConfig> {
+    match provider_id {
+        "anthropic" => Some(&llm.anthropic),
+        "openai" => Some(&llm.openai),
+        "deepseek" => Some(&llm.deepseek),
+        "qwen" => Some(&llm.qwen),
+        "gemini" => Some(&llm.gemini),
+        "groq" => Some(&llm.groq),
+        "openrouter" => Some(&llm.openrouter),
+        "mistral" => Some(&llm.mistral),
+        "xai" => Some(&llm.xai),
+        "cohere" => Some(&llm.cohere),
+        "perplexity" => Some(&llm.perplexity),
+        "together" => Some(&llm.together),
+        "ollama" => Some(&llm.ollama),
+        "claude-code" | "claude_code" => Some(&llm.claude_code),
+        "gemini-cli" | "gemini_cli" => Some(&llm.gemini_cli),
+        _ => None,
+    }
+}
+
+/// Get a mutable reference to the ProviderConfig for a given provider id.
+fn get_provider_config_mut<'a>(
+    llm: &'a mut crate::config::LlmConfig,
+    provider_id: &str,
+) -> Option<&'a mut crate::config::ProviderConfig> {
+    match provider_id {
+        "anthropic" => Some(&mut llm.anthropic),
+        "openai" => Some(&mut llm.openai),
+        "deepseek" => Some(&mut llm.deepseek),
+        "qwen" => Some(&mut llm.qwen),
+        "gemini" => Some(&mut llm.gemini),
+        "groq" => Some(&mut llm.groq),
+        "openrouter" => Some(&mut llm.openrouter),
+        "mistral" => Some(&mut llm.mistral),
+        "xai" => Some(&mut llm.xai),
+        "cohere" => Some(&mut llm.cohere),
+        "perplexity" => Some(&mut llm.perplexity),
+        "together" => Some(&mut llm.together),
+        "ollama" => Some(&mut llm.ollama),
+        "claude-code" | "claude_code" => Some(&mut llm.claude_code),
+        "gemini-cli" | "gemini_cli" => Some(&mut llm.gemini_cli),
+        _ => None,
+    }
+}
+
+/// Handle config.llm.list command.
+///
+/// Returns all supported providers with their metadata and configuration status.
+async fn handle_config_llm_list(params: &serde_json::Value) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let config = AgentConfig::load().unwrap_or_default();
+    let active = config.llm.active_provider().map(|s| s.to_string());
+
+    let providers: Vec<serde_json::Value> = PROVIDER_METAS
+        .iter()
+        .map(|meta| {
+            let provider_config = get_provider_config(&config.llm, meta.id);
+            let configured = provider_config
+                .map(|pc| pc.api_key.is_some())
+                .unwrap_or(false);
+            let is_active = active.as_deref() == Some(meta.id)
+                || (meta.id == "claude-code" && active.as_deref() == Some("claude_code"))
+                || (meta.id == "gemini-cli" && active.as_deref() == Some("gemini_cli"));
+            let model = provider_config.and_then(|pc| pc.model.clone());
+
+            let default_model = meta
+                .id
+                .parse::<nevoflux_llm::ProviderType>()
+                .ok()
+                .map(|pt| nevoflux_llm::default_model_for(pt).to_string());
+
+            serde_json::json!({
+                "id": meta.id,
+                "display_name": meta.display_name,
+                "type": meta.provider_type,
+                "icon": icon_data_uri(meta.icon_bytes),
+                "configured": configured,
+                "active": is_active,
+                "model": model,
+                "default_model": default_model,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "type": "system_response",
+        "payload": {
+            "request_id": request_id,
+            "command": "config.llm.list",
+            "success": true,
+            "data": {
+                "providers": providers,
+                "active_provider": active
+            }
+        }
+    })
+}
+
+/// Handle config.llm.get command.
+///
+/// Returns configuration for a specific provider, with masked API key.
+async fn handle_config_llm_get(params: &serde_json::Value) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let provider_id = params
+        .get("provider")
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
+
+    if provider_id.is_empty() {
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "config.llm.get",
+                "success": false,
+                "error": {
+                    "code": "MISSING_PARAM",
+                    "message": "Missing provider parameter"
+                }
+            }
+        });
+    }
+
+    let config = AgentConfig::load().unwrap_or_default();
+    let provider_config = match get_provider_config(&config.llm, provider_id) {
+        Some(pc) => pc,
+        None => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "config.llm.get",
+                    "success": false,
+                    "error": {
+                        "code": "UNKNOWN_PROVIDER",
+                        "message": format!("Unknown provider: {}", provider_id)
+                    }
+                }
+            });
+        }
+    };
+
+    // Mask API key: show only last 4 chars
+    let masked_key = provider_config.api_key.as_ref().map(|key| {
+        if key.len() > 4 {
+            format!("{}...{}", &key[..3], &key[key.len() - 4..])
+        } else {
+            "****".to_string()
+        }
+    });
+
+    let default_model = provider_id
+        .parse::<nevoflux_llm::ProviderType>()
+        .ok()
+        .map(|pt| nevoflux_llm::default_model_for(pt).to_string());
+
+    let default_context_window = provider_id
+        .parse::<nevoflux_llm::ProviderType>()
+        .ok()
+        .map(|pt| nevoflux_llm::default_context_window_for(pt));
+
+    let is_active = config.llm.active_provider() == Some(provider_id)
+        || (provider_id == "claude-code"
+            && config.llm.active_provider() == Some("claude_code"))
+        || (provider_id == "gemini-cli"
+            && config.llm.active_provider() == Some("gemini_cli"));
+
+    serde_json::json!({
+        "type": "system_response",
+        "payload": {
+            "request_id": request_id,
+            "command": "config.llm.get",
+            "success": true,
+            "data": {
+                "provider": provider_id,
+                "api_key": masked_key,
+                "has_api_key": provider_config.api_key.is_some(),
+                "model": provider_config.model,
+                "context_window": provider_config.context_window,
+                "default_model": default_model,
+                "default_context_window": default_context_window,
+                "active": is_active
+            }
+        }
+    })
+}
+
+/// Handle config.llm.set command.
+///
+/// Updates configuration for a specific provider and optionally sets it as active.
+async fn handle_config_llm_set(params: &serde_json::Value) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let provider_id = params
+        .get("provider")
+        .and_then(|p| p.as_str())
+        .unwrap_or("");
+
+    if provider_id.is_empty() {
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "config.llm.set",
+                "success": false,
+                "error": {
+                    "code": "MISSING_PARAM",
+                    "message": "Missing provider parameter"
+                }
+            }
+        });
+    }
+
+    let mut config = match AgentConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "config.llm.set",
+                    "success": false,
+                    "error": {
+                        "code": "CONFIG_ERROR",
+                        "message": format!("Failed to load config: {}", e)
+                    }
+                }
+            });
+        }
+    };
+
+    // Get mutable reference to the provider config
+    let provider_config = match get_provider_config_mut(&mut config.llm, provider_id) {
+        Some(pc) => pc,
+        None => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "config.llm.set",
+                    "success": false,
+                    "error": {
+                        "code": "UNKNOWN_PROVIDER",
+                        "message": format!("Unknown provider: {}", provider_id)
+                    }
+                }
+            });
+        }
+    };
+
+    // Update API key if provided
+    if let Some(api_key) = params.get("api_key").and_then(|k| k.as_str()) {
+        if api_key.is_empty() {
+            provider_config.api_key = None;
+        } else {
+            provider_config.api_key = Some(api_key.to_string());
+        }
+    }
+
+    // Update model if provided
+    if let Some(model) = params.get("model").and_then(|m| m.as_str()) {
+        if model.is_empty() {
+            provider_config.model = None;
+        } else {
+            provider_config.model = Some(model.to_string());
+        }
+    }
+
+    // Set as active provider if requested
+    if params
+        .get("set_active")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false)
+    {
+        config.llm.provider = Some(provider_id.to_string());
+    }
+
+    // Save config
+    match config.save() {
+        Ok(()) => {
+            info!("config.llm.set: updated provider {}", provider_id);
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "config.llm.set",
+                    "success": true,
+                    "data": {
+                        "provider": provider_id,
+                        "active": config.llm.provider.as_deref() == Some(provider_id)
+                    }
+                }
+            })
+        }
+        Err(e) => {
+            error!("Failed to save config: {}", e);
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "config.llm.set",
+                    "success": false,
+                    "error": {
+                        "code": "SAVE_ERROR",
+                        "message": format!("Failed to save config: {}", e)
+                    }
+                }
+            })
+        }
+    }
+}
+
+/// Handle config.file.read command.
+///
+/// Reads a config file from the nevoflux config directory.
+/// Only files in the allowlist can be read.
+async fn handle_config_file_read(params: &serde_json::Value) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let filename = params
+        .get("filename")
+        .and_then(|f| f.as_str())
+        .unwrap_or("");
+
+    const ALLOWED_FILES: &[&str] = &["IDENTITY.md", "SOUL.md", "USER.md", "TOOLS.md", "AGENTS.md"];
+
+    if filename.is_empty() || !ALLOWED_FILES.contains(&filename) {
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "config.file.read",
+                "success": false,
+                "error": {
+                    "code": "INVALID_FILENAME",
+                    "message": format!("Invalid filename: '{}'. Allowed: {:?}", filename, ALLOWED_FILES)
+                }
+            }
+        });
+    }
+
+    let config_dir = match dirs::config_dir() {
+        Some(dir) => dir.join("nevoflux"),
+        None => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "config.file.read",
+                    "success": false,
+                    "error": {
+                        "code": "CONFIG_ERROR",
+                        "message": "Could not determine config directory"
+                    }
+                }
+            });
+        }
+    };
+
+    let file_path = config_dir.join(filename);
+
+    if file_path.exists() {
+        match std::fs::read_to_string(&file_path) {
+            Ok(content) => {
+                serde_json::json!({
+                    "type": "system_response",
+                    "payload": {
+                        "request_id": request_id,
+                        "command": "config.file.read",
+                        "success": true,
+                        "data": {
+                            "filename": filename,
+                            "content": content,
+                            "exists": true
+                        }
+                    }
+                })
+            }
+            Err(e) => {
+                serde_json::json!({
+                    "type": "system_response",
+                    "payload": {
+                        "request_id": request_id,
+                        "command": "config.file.read",
+                        "success": false,
+                        "error": {
+                            "code": "READ_ERROR",
+                            "message": format!("Failed to read file: {}", e)
+                        }
+                    }
+                })
+            }
+        }
+    } else {
+        serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "config.file.read",
+                "success": true,
+                "data": {
+                    "filename": filename,
+                    "content": "",
+                    "exists": false
+                }
+            }
+        })
+    }
+}
+
+/// Handle config.file.write command.
+///
+/// Writes content to a config file in the nevoflux config directory.
+/// Only files in the allowlist can be written.
+async fn handle_config_file_write(params: &serde_json::Value) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let filename = params
+        .get("filename")
+        .and_then(|f| f.as_str())
+        .unwrap_or("");
+
+    let content = params
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+
+    const ALLOWED_FILES: &[&str] = &["IDENTITY.md", "SOUL.md", "USER.md", "TOOLS.md", "AGENTS.md"];
+
+    if filename.is_empty() || !ALLOWED_FILES.contains(&filename) {
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "config.file.write",
+                "success": false,
+                "error": {
+                    "code": "INVALID_FILENAME",
+                    "message": format!("Invalid filename: '{}'. Allowed: {:?}", filename, ALLOWED_FILES)
+                }
+            }
+        });
+    }
+
+    let config_dir = match dirs::config_dir() {
+        Some(dir) => dir.join("nevoflux"),
+        None => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "config.file.write",
+                    "success": false,
+                    "error": {
+                        "code": "CONFIG_ERROR",
+                        "message": "Could not determine config directory"
+                    }
+                }
+            });
+        }
+    };
+
+    // Ensure config directory exists
+    if let Err(e) = std::fs::create_dir_all(&config_dir) {
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "config.file.write",
+                "success": false,
+                "error": {
+                    "code": "DIR_ERROR",
+                    "message": format!("Failed to create config directory: {}", e)
+                }
+            }
+        });
+    }
+
+    let file_path = config_dir.join(filename);
+    let bytes_written = content.len();
+
+    match std::fs::write(&file_path, content) {
+        Ok(()) => {
+            info!(
+                "config.file.write: wrote {} bytes to {}",
+                bytes_written, filename
+            );
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "config.file.write",
+                    "success": true,
+                    "data": {
+                        "filename": filename,
+                        "bytes_written": bytes_written
+                    }
+                }
+            })
+        }
+        Err(e) => {
+            error!("Failed to write config file {}: {}", filename, e);
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "config.file.write",
+                    "success": false,
+                    "error": {
+                        "code": "WRITE_ERROR",
+                        "message": format!("Failed to write file: {}", e)
+                    }
+                }
+            })
+        }
+    }
+}
+
+// ============================================
 // Tool Availability Helpers
 // ============================================
 
@@ -4265,6 +5021,89 @@ async fn gather_available_tools(services: &HostServices) -> Vec<String> {
     }
 
     tools
+}
+
+/// Build attachment metadata from attachments and local files for persisting in message history.
+///
+/// Stores only name, mime_type, and path — no base64 data — to keep the database small.
+fn build_attachment_metadata(
+    attachments: &[Attachment],
+    local_files: &[nevoflux_protocol::FileInfo],
+) -> Option<HashMap<String, serde_json::Value>> {
+    let mut attachment_meta: Vec<serde_json::Value> = Vec::new();
+
+    for att in attachments {
+        attachment_meta.push(serde_json::json!({
+            "name": att.name,
+            "mime_type": att.mime_type,
+        }));
+    }
+
+    for f in local_files {
+        let name = std::path::Path::new(&f.path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| f.path.clone());
+        let mime_type = if f.is_directory {
+            "inode/directory"
+        } else {
+            guess_mime_type(&f.path)
+        };
+        attachment_meta.push(serde_json::json!({
+            "name": name,
+            "mime_type": mime_type,
+            "path": f.path,
+        }));
+    }
+
+    if attachment_meta.is_empty() {
+        None
+    } else {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "attachments".to_string(),
+            serde_json::json!(attachment_meta),
+        );
+        Some(metadata)
+    }
+}
+
+/// Simple MIME type guessing from file extension.
+fn guess_mime_type(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" => "application/javascript",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "zip" => "application/zip",
+        "gz" | "gzip" => "application/gzip",
+        "tar" => "application/x-tar",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        "wav" => "audio/wav",
+        "md" => "text/markdown",
+        "rs" => "text/x-rust",
+        "py" => "text/x-python",
+        "toml" => "application/toml",
+        "yaml" | "yml" => "application/yaml",
+        "csv" => "text/csv",
+        _ => "application/octet-stream",
+    }
 }
 
 #[cfg(test)]
