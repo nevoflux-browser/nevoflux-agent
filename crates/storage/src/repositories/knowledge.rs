@@ -212,6 +212,28 @@ impl<'a> KnowledgeRepository<'a> {
         })
     }
 
+    /// Resurrect an archived knowledge entry.
+    ///
+    /// Sets status back to 'validated', updates `last_hit_at` and `updated_at`
+    /// to the current time, and increments `hit_count` by 1.
+    /// Returns an error if the entry does not exist.
+    pub fn resurrect_entry(&self, id: &str) -> Result<()> {
+        let now = rfc3339_now();
+        self.db.with_connection(|conn| {
+            let rows_affected = conn.execute(
+                "UPDATE knowledge SET status = 'validated', last_hit_at = ?1, updated_at = ?2, hit_count = hit_count + 1 WHERE id = ?3",
+                params![now, now, id],
+            )?;
+            if rows_affected == 0 {
+                return Err(crate::error::StorageError::NotFound {
+                    entity: "knowledge".to_string(),
+                    id: id.to_string(),
+                });
+            }
+            Ok(())
+        })
+    }
+
     /// Delete a knowledge entry by ID.
     pub fn delete(&self, id: &str) -> Result<bool> {
         self.db.with_connection(|conn| {
@@ -546,6 +568,84 @@ mod tests {
         let result = storage
             .knowledge()
             .mark_promoted("K-00000000-000000", "Some Section");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resurrect_entry_changes_status_to_validated() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        // Create an entry and set it to archived
+        let created = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "archived entry".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .knowledge()
+            .update_status(&created.id, "archived")
+            .unwrap();
+
+        // Resurrect the entry
+        storage.knowledge().resurrect_entry(&created.id).unwrap();
+
+        // Verify status changed to "validated"
+        let entry = storage.knowledge().get(&created.id).unwrap().unwrap();
+        assert_eq!(entry.status, "validated");
+        assert!(entry.last_hit_at.is_some(), "last_hit_at should be set");
+    }
+
+    #[test]
+    fn test_resurrect_entry_increments_hit_count() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        let created = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "hit count test".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Default hit_count is 1
+        assert_eq!(created.hit_count, 1);
+
+        storage
+            .knowledge()
+            .update_status(&created.id, "archived")
+            .unwrap();
+
+        // Resurrect — should increment hit_count from 1 to 2
+        storage.knowledge().resurrect_entry(&created.id).unwrap();
+
+        let entry = storage.knowledge().get(&created.id).unwrap().unwrap();
+        assert_eq!(entry.hit_count, 2);
+
+        // Resurrect again — should go to 3
+        // (first set back to archived)
+        storage
+            .knowledge()
+            .update_status(&entry.id, "archived")
+            .unwrap();
+        storage.knowledge().resurrect_entry(&entry.id).unwrap();
+
+        let entry = storage.knowledge().get(&created.id).unwrap().unwrap();
+        assert_eq!(entry.hit_count, 3);
+    }
+
+    #[test]
+    fn test_resurrect_entry_not_found() {
+        let storage = Storage::open_in_memory().unwrap();
+        let result = storage
+            .knowledge()
+            .resurrect_entry("K-00000000-000000");
         assert!(result.is_err());
     }
 }

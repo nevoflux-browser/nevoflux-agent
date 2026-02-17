@@ -270,6 +270,27 @@ impl LearningPipeline {
         Ok(result)
     }
 
+    /// Resurrect an archived knowledge entry when it receives a new hit.
+    ///
+    /// Changes the entry's status from "archived" to "validated", updates
+    /// `last_hit_at`, and increments `hit_count`. The decay score will be
+    /// recalculated lazily on the next read.
+    ///
+    /// Returns `Ok(true)` if the entry was resurrected, `Ok(false)` if the
+    /// entry was not in "archived" status.
+    pub fn resurrect(&self, knowledge_id: &str) -> Result<bool> {
+        // Only resurrect if the entry is currently archived
+        let entry = self.storage.knowledge().get(knowledge_id)?;
+        match entry {
+            Some(e) if e.status == "archived" => {
+                self.storage.knowledge().resurrect_entry(knowledge_id)?;
+                Ok(true)
+            }
+            Some(_) => Ok(false), // Not archived, no resurrection needed
+            None => Ok(false),    // Entry doesn't exist
+        }
+    }
+
     /// Get a reference to the underlying buffer (for inserting entries).
     pub fn buffer(&self) -> &MemoryBuffer {
         &self.buffer
@@ -1170,5 +1191,97 @@ mod tests {
             .await
             .unwrap();
         assert!(tools.contains("example.com uses semantic selectors"));
+    }
+
+    // --- Resurrection pipeline tests ---
+
+    #[test]
+    fn test_resurrect_archived_entry_returns_true() {
+        let (pipeline, storage) = setup();
+
+        let created = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "archived entry".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Set to archived
+        storage
+            .knowledge()
+            .update_status(&created.id, "archived")
+            .unwrap();
+
+        let result = pipeline.resurrect(&created.id).unwrap();
+        assert!(result, "should return true for archived entry");
+
+        // Verify the entry is now validated
+        let entry = storage.knowledge().get(&created.id).unwrap().unwrap();
+        assert_eq!(entry.status, "validated");
+        assert_eq!(entry.hit_count, 2); // was 1, now incremented
+        assert!(entry.last_hit_at.is_some());
+    }
+
+    #[test]
+    fn test_resurrect_pending_entry_returns_false() {
+        let (pipeline, storage) = setup();
+
+        let created = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "pending entry".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Entry is pending by default
+        assert_eq!(created.status, "pending");
+
+        let result = pipeline.resurrect(&created.id).unwrap();
+        assert!(!result, "should return false for pending entry");
+
+        // Status should remain pending
+        let entry = storage.knowledge().get(&created.id).unwrap().unwrap();
+        assert_eq!(entry.status, "pending");
+    }
+
+    #[test]
+    fn test_resurrect_validated_entry_returns_false() {
+        let (pipeline, storage) = setup();
+
+        let created = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "validated entry".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .knowledge()
+            .update_status(&created.id, "validated")
+            .unwrap();
+
+        let result = pipeline.resurrect(&created.id).unwrap();
+        assert!(!result, "should return false for validated entry");
+
+        // Status should remain validated
+        let entry = storage.knowledge().get(&created.id).unwrap().unwrap();
+        assert_eq!(entry.status, "validated");
+    }
+
+    #[test]
+    fn test_resurrect_nonexistent_returns_false() {
+        let (pipeline, _storage) = setup();
+
+        let result = pipeline.resurrect("K-00000000-000000").unwrap();
+        assert!(!result, "should return false for nonexistent entry");
     }
 }
