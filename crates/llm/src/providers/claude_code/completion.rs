@@ -10,8 +10,8 @@ use rig::completion::{
     ToolDefinition, Usage,
 };
 use rig::message::{
-    DocumentSourceKind, Image, MimeType, Message, ToolCall, ToolFunction,
-    ToolResultContent, UserContent,
+    DocumentSourceKind, Image, Message, MimeType, ToolCall, ToolFunction, ToolResultContent,
+    UserContent,
 };
 use rig::streaming::{RawStreamingChoice, RawStreamingToolCall, StreamingCompletionResponse};
 use rig::OneOrMany;
@@ -185,9 +185,7 @@ fn build_stdin_input(messages: &[Message], documents: &[Document]) -> String {
 
         // Build content blocks: image blocks first, then conversation text
         let mut content_blocks = collect_image_blocks(messages);
-        content_blocks.push(CliContent::Text {
-            text: combined,
-        });
+        content_blocks.push(CliContent::Text { text: combined });
 
         let input = StreamJsonInput {
             msg_type: "user".to_string(),
@@ -216,10 +214,7 @@ fn build_stdin_input(messages: &[Message], documents: &[Document]) -> String {
                             .join("")
                     );
                     // Prepend document text block before existing content
-                    content_blocks.insert(
-                        0,
-                        CliContent::Text { text: doc_text },
-                    );
+                    content_blocks.insert(0, CliContent::Text { text: doc_text });
                 }
 
                 let input = StreamJsonInput {
@@ -472,9 +467,9 @@ fn process_stream_event(
                         .get("input")
                         .cloned()
                         .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                    items.push(Ok(RawStreamingChoice::ToolCall(
-                        RawStreamingToolCall::new(id, name, arguments),
-                    )));
+                    items.push(Ok(RawStreamingChoice::ToolCall(RawStreamingToolCall::new(
+                        id, name, arguments,
+                    ))));
                 }
             }
 
@@ -682,9 +677,7 @@ impl completion::CompletionModel for ClaudeCodeCompletionModel {
                     Ok(line) => {
                         if line.trim().is_empty() {
                             vec![]
-                        } else if let Ok(entry) =
-                            serde_json::from_str::<serde_json::Value>(&line)
-                        {
+                        } else if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) {
                             process_stream_event(entry, saw_native_tool_use)
                         } else if !line.starts_with('{') {
                             // Non-JSON line — pass through as text
@@ -1030,7 +1023,10 @@ mod tests {
             }
         });
         let items = process_stream_event(event, &mut saw_native);
-        assert!(!saw_native, "Flag should NOT be set without native tool_use");
+        assert!(
+            !saw_native,
+            "Flag should NOT be set without native tool_use"
+        );
         let tool_calls: Vec<_> = items
             .iter()
             .filter(|i| matches!(i, Ok(RawStreamingChoice::ToolCall(_))))

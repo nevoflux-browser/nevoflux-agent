@@ -8,7 +8,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("001_initial", include_str!("migrations/001_initial.sql")),
     ("002_memory", include_str!("migrations/002_memory.sql")),
     ("003_traces", include_str!("migrations/003_traces.sql")),
-    ("004_artifacts", include_str!("migrations/004_artifacts.sql")),
+    (
+        "004_artifacts",
+        include_str!("migrations/004_artifacts.sql"),
+    ),
     ("005_learning", include_str!("migrations/005_learning.sql")),
 ];
 

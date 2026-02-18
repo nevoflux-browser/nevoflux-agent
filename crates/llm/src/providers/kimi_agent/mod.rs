@@ -6,7 +6,7 @@
 mod client;
 mod completion;
 pub mod types;
-pub(crate) mod wire;
+pub mod wire;
 
 pub use client::KimiAgentClient;
 pub use completion::{KimiAgentCompletionModel, KimiAgentStreamingResponse};

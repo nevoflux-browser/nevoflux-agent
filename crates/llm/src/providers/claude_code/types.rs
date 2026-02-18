@@ -116,7 +116,9 @@ impl TryFrom<ClaudeCodeCompletionResponse> for CompletionResponse<ClaudeCodeComp
 ///
 /// Extracts text from assistant messages. The `result` entry's text field is only
 /// used as a fallback when no assistant text was found (it duplicates assistant content).
-fn collect_from_entries(values: &[serde_json::Value]) -> (String, Vec<ExtractedToolCall>, ClaudeUsage) {
+fn collect_from_entries(
+    values: &[serde_json::Value],
+) -> (String, Vec<ExtractedToolCall>, ClaudeUsage) {
     let mut assistant_text = Vec::new();
     let mut native_tool_calls = Vec::new();
     let mut result_text: Option<String> = None;
@@ -187,7 +189,11 @@ pub fn parse_claude_output(output: &str) -> Result<ClaudeCodeCompletionResponse,
     // We parse as Vec<Value> to tolerate unknown entry types like "system".
     if let Ok(values) = serde_json::from_str::<Vec<serde_json::Value>>(output) {
         let (content, tool_calls, usage) = collect_from_entries(&values);
-        return Ok(ClaudeCodeCompletionResponse { content, usage, tool_calls });
+        return Ok(ClaudeCodeCompletionResponse {
+            content,
+            usage,
+            tool_calls,
+        });
     }
 
     // Try newline-delimited JSON (stream-json output format)
@@ -200,7 +206,11 @@ pub fn parse_claude_output(output: &str) -> Result<ClaudeCodeCompletionResponse,
         if !values.is_empty() {
             let (content, tool_calls, usage) = collect_from_entries(&values);
             if !content.is_empty() || !tool_calls.is_empty() || values.len() > 1 {
-                return Ok(ClaudeCodeCompletionResponse { content, usage, tool_calls });
+                return Ok(ClaudeCodeCompletionResponse {
+                    content,
+                    usage,
+                    tool_calls,
+                });
             }
         }
     }
@@ -208,7 +218,11 @@ pub fn parse_claude_output(output: &str) -> Result<ClaudeCodeCompletionResponse,
     // Try parsing as a single JSON object (some CLI versions)
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(output) {
         let (content, tool_calls, usage) = collect_from_entries(&[value]);
-        return Ok(ClaudeCodeCompletionResponse { content, usage, tool_calls });
+        return Ok(ClaudeCodeCompletionResponse {
+            content,
+            usage,
+            tool_calls,
+        });
     }
 
     // Fall back to treating the entire output as plain text
@@ -287,11 +301,10 @@ pub fn extract_tool_calls_from_text(text: &str) -> (String, Vec<ExtractedToolCal
         // Use streaming deserializer to tolerate trailing garbage (e.g. extra `}`)
         // that LLMs sometimes produce. This parses the first complete JSON value
         // and ignores any trailing content.
-        let parsed_result = serde_json::from_str::<serde_json::Value>(json_str)
-            .or_else(|_| {
-                let mut de = serde_json::Deserializer::from_str(json_str);
-                serde_json::Value::deserialize(&mut de)
-            });
+        let parsed_result = serde_json::from_str::<serde_json::Value>(json_str).or_else(|_| {
+            let mut de = serde_json::Deserializer::from_str(json_str);
+            serde_json::Value::deserialize(&mut de)
+        });
 
         if let Ok(parsed) = parsed_result {
             let id = parsed
@@ -450,7 +463,10 @@ mod tests {
     fn test_native_tool_use_in_response() {
         let resp = ClaudeCodeCompletionResponse {
             content: "I'll create that for you.".to_string(),
-            usage: ClaudeUsage { input_tokens: 10, output_tokens: 20 },
+            usage: ClaudeUsage {
+                input_tokens: 10,
+                output_tokens: 20,
+            },
             tool_calls: vec![ExtractedToolCall {
                 id: "tool_1".to_string(),
                 name: "create_artifact".to_string(),
@@ -469,7 +485,10 @@ mod tests {
     fn test_tool_use_only_response() {
         let resp = ClaudeCodeCompletionResponse {
             content: String::new(),
-            usage: ClaudeUsage { input_tokens: 5, output_tokens: 10 },
+            usage: ClaudeUsage {
+                input_tokens: 5,
+                output_tokens: 10,
+            },
             tool_calls: vec![ExtractedToolCall {
                 id: "tool_1".to_string(),
                 name: "screenshot".to_string(),
@@ -718,7 +737,11 @@ Done!"#;
 {"id":"call_1","name":"screenshot","arguments":{}}}}
 </tool_call>"#;
         let (_cleaned, calls) = extract_tool_calls_from_text(text);
-        assert_eq!(calls.len(), 1, "Should parse despite multiple trailing braces");
+        assert_eq!(
+            calls.len(),
+            1,
+            "Should parse despite multiple trailing braces"
+        );
         assert_eq!(calls[0].name, "screenshot");
     }
 

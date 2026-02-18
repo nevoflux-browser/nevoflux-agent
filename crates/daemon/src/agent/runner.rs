@@ -294,7 +294,6 @@ impl AgentRunner {
 
             // Check if complete
             if output.complete {
-
                 return Ok(AgentOutput {
                     text: accumulated_text,
                     continue_loop: false,
@@ -595,7 +594,6 @@ impl AgentRunner {
 
             // Check if complete
             if output.complete {
-
                 // End the stream with metadata
                 let metadata = StreamMetadata {
                     total_tokens: None,
@@ -709,8 +707,16 @@ pub fn extract_python_block(text: &str) -> Option<String> {
         None => return None, // No newline after marker = no code body
     };
     // Find the closing fence: 3+ backticks at the start of a line
-    let end = remaining.find("\n```").map(|p| p + 1) // newline + ```
-        .or_else(|| if remaining.starts_with("```") { Some(0) } else { None })?;
+    let end = remaining
+        .find("\n```")
+        .map(|p| p + 1) // newline + ```
+        .or_else(|| {
+            if remaining.starts_with("```") {
+                Some(0)
+            } else {
+                None
+            }
+        })?;
     let code = remaining[..end].trim();
     if code.is_empty() {
         None

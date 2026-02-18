@@ -119,11 +119,10 @@ pub fn extract_tool_calls_from_text(text: &str) -> (String, Vec<ExtractedToolCal
 
         // Use streaming deserializer to tolerate trailing garbage (e.g. extra `}`)
         // that LLMs sometimes produce.
-        let parsed_result = serde_json::from_str::<serde_json::Value>(json_str)
-            .or_else(|_| {
-                let mut de = serde_json::Deserializer::from_str(json_str);
-                serde_json::Value::deserialize(&mut de)
-            });
+        let parsed_result = serde_json::from_str::<serde_json::Value>(json_str).or_else(|_| {
+            let mut de = serde_json::Deserializer::from_str(json_str);
+            serde_json::Value::deserialize(&mut de)
+        });
 
         if let Ok(parsed) = parsed_result {
             let id = parsed

@@ -471,6 +471,8 @@ impl SubagentExecutor {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
 
         // Check for kill before running

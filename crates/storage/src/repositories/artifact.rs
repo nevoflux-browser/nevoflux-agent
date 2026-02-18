@@ -158,9 +158,7 @@ mod tests {
         // Create a session first (artifacts reference sessions)
         storage
             .sessions()
-            .create(
-                crate::CreateSessionParams::new().with_id("sess-1"),
-            )
+            .create(crate::CreateSessionParams::new().with_id("sess-1"))
             .unwrap();
 
         let params = CreateArtifactParams::new("art-1", "sess-1", "My Page", "text/html")
@@ -196,14 +194,15 @@ mod tests {
 
         storage
             .sessions()
-            .create(
-                crate::CreateSessionParams::new().with_id("sess-1"),
-            )
+            .create(crate::CreateSessionParams::new().with_id("sess-1"))
             .unwrap();
 
         let mut files = HashMap::new();
         files.insert("src/App.jsx".to_string(), "export default App;".to_string());
-        files.insert("src/index.jsx".to_string(), "import App from './App';".to_string());
+        files.insert(
+            "src/index.jsx".to_string(),
+            "import App from './App';".to_string(),
+        );
 
         let params = CreateArtifactParams::new("art-2", "sess-1", "React App", "project")
             .with_files(files.clone())
@@ -227,15 +226,11 @@ mod tests {
 
         storage
             .sessions()
-            .create(
-                crate::CreateSessionParams::new().with_id("sess-1"),
-            )
+            .create(crate::CreateSessionParams::new().with_id("sess-1"))
             .unwrap();
         storage
             .sessions()
-            .create(
-                crate::CreateSessionParams::new().with_id("sess-2"),
-            )
+            .create(crate::CreateSessionParams::new().with_id("sess-2"))
             .unwrap();
 
         repo.create(
@@ -273,18 +268,22 @@ mod tests {
 
         storage
             .sessions()
-            .create(
-                crate::CreateSessionParams::new().with_id("sess-1"),
-            )
+            .create(crate::CreateSessionParams::new().with_id("sess-1"))
             .unwrap();
 
-        repo.create(
-            CreateArtifactParams::new("art-1", "sess-1", "Page 1", "text/html"),
-        )
+        repo.create(CreateArtifactParams::new(
+            "art-1",
+            "sess-1",
+            "Page 1",
+            "text/html",
+        ))
         .unwrap();
-        repo.create(
-            CreateArtifactParams::new("art-2", "sess-1", "Page 2", "text/html"),
-        )
+        repo.create(CreateArtifactParams::new(
+            "art-2",
+            "sess-1",
+            "Page 2",
+            "text/html",
+        ))
         .unwrap();
 
         let deleted = repo.delete_by_session("sess-1").unwrap();
@@ -301,9 +300,7 @@ mod tests {
 
         storage
             .sessions()
-            .create(
-                crate::CreateSessionParams::new().with_id("sess-1"),
-            )
+            .create(crate::CreateSessionParams::new().with_id("sess-1"))
             .unwrap();
 
         repo.create(

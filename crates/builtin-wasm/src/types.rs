@@ -267,6 +267,15 @@ pub struct AgentInput {
     /// Each entry is (provider_name, model_name).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_models: Vec<(String, String)>,
+    /// Names of enabled MCP servers for system prompt injection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<String>,
+    /// Soul document context for system prompt injection.
+    ///
+    /// Contains formatted content from IDENTITY.md, SOUL.md, USER.md,
+    /// TOOLS.md, and AGENTS.md for persona and knowledge injection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soul_context: Option<String>,
 }
 
 /// Skill context for injection into system prompt.
@@ -571,6 +580,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
         assert_eq!(input.mode, AgentMode::Agent);
         assert_eq!(input.history.len(), 1);
@@ -591,6 +602,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
         assert!(input.custom_system_prompt.is_some());
         assert!(input
@@ -614,6 +627,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         assert!(json.contains("custom_system_prompt"));
@@ -632,6 +647,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
         let json2 = serde_json::to_string(&input_no_prompt).unwrap();
         assert!(!json2.contains("custom_system_prompt"));
@@ -836,6 +853,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         assert!(json.contains("local_files"));
@@ -860,6 +879,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         // Empty vec should not be serialized
@@ -880,6 +901,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
         assert_eq!(input.tab_id, Some(42));
 
@@ -900,6 +923,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
         let json2 = serde_json::to_string(&input_no_tab).unwrap();
         assert!(!json2.contains("tab_id"));
@@ -938,6 +963,8 @@ mod tests {
             ],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
         assert_eq!(input.tab_ids.len(), 3);
         assert_eq!(input.tab_ids[0].space, "Work");
@@ -966,6 +993,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
         let json2 = serde_json::to_string(&input_no_tabs).unwrap();
         assert!(!json2.contains("tab_ids"));

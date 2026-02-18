@@ -168,6 +168,26 @@ impl SessionManager {
         Ok(message)
     }
 
+    /// Add a message to a session with optional metadata.
+    pub async fn add_message_with_metadata(
+        &self,
+        session_id: &str,
+        role: MessageRole,
+        content: &str,
+        metadata: Option<std::collections::HashMap<String, serde_json::Value>>,
+    ) -> Result<Message> {
+        let mut params = CreateMessageParams::new(session_id, role, content);
+        if let Some(meta) = metadata {
+            params = params.with_metadata(meta);
+        }
+        let message = self.storage.messages().create(params)?;
+
+        // Touch the session
+        self.touch_session(session_id).await.ok();
+
+        Ok(message)
+    }
+
     /// Add a tool use message to a session.
     ///
     /// Stores tool call details (id, name, arguments, result) in metadata.

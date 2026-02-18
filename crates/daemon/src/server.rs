@@ -17,6 +17,7 @@ use nevoflux_protocol::{
 use nevoflux_skills::{check_tool_availability, format_missing_tools_message, ToolCheckResult};
 use nevoflux_storage::{ContentType, ListSessionsParams, Message as StorageMessage, MessageRole};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -146,39 +147,25 @@ pub async fn start_server(
         // Load MCP server configs and connect to enabled servers
         if let Ok(mcp_config) = crate::mcp_config::McpServersConfig::load() {
             for server in mcp_config.enabled_servers() {
-                let sc = match server.server_type.as_str() {
-                    "http" | "sse" => {
-                        if let Some(ref url) = server.url {
-                            let mut sc = McpServerConfig::new_http(&server.name, url);
-                            if let Some(ref key) = server.api_key {
-                                sc = sc.with_api_key(key);
-                            }
-                            sc
-                        } else {
-                            warn!(
-                                "MCP server {} (type={}) has no URL configured, skipping",
-                                server.name, server.server_type
-                            );
-                            continue;
-                        }
+                let sc = if server.server_type == "http" || server.server_type == "sse" {
+                    warn!(
+                        "HTTP/SSE MCP servers not yet supported, skipping {}",
+                        server.name
+                    );
+                    continue;
+                } else if let Some(ref command) = server.command {
+                    let mut sc = McpServerConfig::new(&server.name, command)
+                        .with_args(server.args.iter().map(|s| s.as_str()).collect());
+                    for (k, v) in &server.env {
+                        sc = sc.with_env(k, v);
                     }
-                    _ => {
-                        // stdio (default)
-                        if let Some(ref command) = server.command {
-                            let mut sc = McpServerConfig::new(&server.name, command)
-                                .with_args(server.args.iter().map(|s| s.as_str()).collect());
-                            for (k, v) in &server.env {
-                                sc = sc.with_env(k, v);
-                            }
-                            sc
-                        } else {
-                            warn!(
-                                "MCP server {} has no command configured, skipping",
-                                server.name
-                            );
-                            continue;
-                        }
-                    }
+                    sc
+                } else {
+                    warn!(
+                        "MCP server {} has no command configured, skipping",
+                        server.name
+                    );
+                    continue;
                 };
                 match manager.add_and_connect(sc).await {
                     Ok(()) => info!("Connected MCP server: {}", server.name),
@@ -208,10 +195,43 @@ pub async fn start_server(
         index
     };
 
-    let services = HostServices::new(Arc::new(db))
+    // Load soul documents for system prompt injection
+    let knowledge_retriever = {
+        use crate::learning::retriever::KnowledgeRetriever;
+        use crate::learning::soul::manager::SoulManager;
+
+        let soul_dir = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("nevoflux");
+        match SoulManager::init(&soul_dir).await {
+            Ok(manager) => {
+                let cache = manager.cache();
+                info!(
+                    "Loaded soul documents: IDENTITY={}B, SOUL={}B, USER={}B, TOOLS={}B, AGENTS={}B",
+                    cache.identity_raw.len(),
+                    cache.soul_raw.len(),
+                    cache.user_raw.len(),
+                    cache.tools_raw.len(),
+                    cache.agents_raw.len(),
+                );
+                let cache = Arc::new(cache.clone());
+                let storage = session_manager.shared_storage();
+                Some(Arc::new(KnowledgeRetriever::new(cache, storage)))
+            }
+            Err(e) => {
+                warn!("Failed to load soul documents: {}, skipping", e);
+                None
+            }
+        }
+    };
+
+    let mut services = HostServices::new(Arc::new(db))
         .with_browser_sender(browser_tx)
         .with_mcp_manager(mcp_manager)
         .with_tool_search(tool_search_index);
+    if let Some(retriever) = knowledge_retriever {
+        services = services.with_knowledge_retriever(retriever);
+    }
 
     let mut socket = zeromq::RouterSocket::new();
     socket
@@ -602,6 +622,36 @@ pub async fn start_server(
         port,
         shutdown_tx: Some(shutdown_tx),
     })
+}
+
+/// Build soul context string from the knowledge retriever's soul cache.
+///
+/// Returns `None` if no retriever is available or all soul documents are empty.
+fn build_soul_context(services: &HostServices) -> Option<String> {
+    let retriever = services.knowledge_retriever.as_ref()?;
+    let cache = retriever.soul_cache();
+
+    let mut sections = Vec::new();
+    if !cache.identity_raw.trim().is_empty() {
+        sections.push(cache.identity_raw.trim().to_string());
+    }
+    if !cache.soul_raw.trim().is_empty() {
+        sections.push(cache.soul_raw.trim().to_string());
+    }
+    if !cache.user_raw.trim().is_empty() {
+        sections.push(cache.user_raw.trim().to_string());
+    }
+    if !cache.tools_raw.trim().is_empty() {
+        sections.push(cache.tools_raw.trim().to_string());
+    }
+    if !cache.agents_raw.trim().is_empty() {
+        sections.push(cache.agents_raw.trim().to_string());
+    }
+
+    if sections.is_empty() {
+        return None;
+    }
+    Some(sections.join("\n\n"))
 }
 
 /// Convert storage messages to wasm messages for the agent history.
@@ -1095,6 +1145,13 @@ async fn handle_chat_message_streaming(
         skill_context,
         available_models: config.llm.configured_providers(),
         mcp_servers: mcp_servers.clone(),
+        soul_context: {
+            let sc = build_soul_context(&services);
+            debug!("soul_context for AgentInput: has_retriever={}, len={:?}",
+                services.knowledge_retriever.is_some(),
+                sc.as_ref().map(|s| s.len()));
+            sc
+        },
     };
 
     // Create cancellation token for this streaming session
@@ -1369,6 +1426,7 @@ async fn handle_chat_message_streaming(
                             skill_context: None,
                             available_models: config.llm.configured_providers(),
                             mcp_servers: mcp_servers.clone(),
+                            soul_context: build_soul_context(&services),
                         };
 
                         // Spawn stream forwarder for re-run
@@ -2414,6 +2472,7 @@ async fn handle_chat_message(
                 skill_context,
                 available_models: config.llm.configured_providers(),
                 mcp_servers,
+                soul_context: build_soul_context(&services),
             };
 
             // Run agent

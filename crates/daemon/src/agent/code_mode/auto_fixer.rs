@@ -150,8 +150,10 @@ impl MontyAutoFixer {
         // Skip dict literals and slices: `{"key": val}`, `x = a[1:2]`
         // Only match annotations at the top level (before any `=`)
         let eq_pos = match trimmed.find('=') {
-            Some(p) if p > 0 && trimmed.as_bytes().get(p - 1) != Some(&b'!')
-                && trimmed.as_bytes().get(p + 1) != Some(&b'=') =>
+            Some(p)
+                if p > 0
+                    && trimmed.as_bytes().get(p - 1) != Some(&b'!')
+                    && trimmed.as_bytes().get(p + 1) != Some(&b'=') =>
             {
                 p
             }
@@ -167,9 +169,7 @@ impl MontyAutoFixer {
             let var_name = before_eq[..colon_pos].trim();
             // Validate it looks like a variable name (simple check)
             if !var_name.is_empty()
-                && var_name
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_')
+                && var_name.chars().all(|c| c.is_alphanumeric() || c == '_')
                 && !var_name.starts_with(|c: char| c.is_ascii_digit())
             {
                 // Preserve leading whitespace
@@ -204,8 +204,7 @@ impl MontyAutoFixer {
 
         // Check if any sorted() call uses keyword arguments
         let has_sorted_key = code.contains("sorted(") && code.contains("key=");
-        let has_sorted_reverse =
-            code.contains("sorted(") && code.contains("reverse=");
+        let has_sorted_reverse = code.contains("sorted(") && code.contains("reverse=");
 
         if !has_sorted_key && !has_sorted_reverse {
             return code.to_string();
@@ -459,10 +458,8 @@ impl MontyAutoFixer {
             if let Some((inner, end)) = Self::extract_balanced_parens(&result, paren_start) {
                 let parts = Self::split_top_level_commas(&inner);
                 if parts.len() == 2 {
-                    let replacement =
-                        format!("({}) ** ({})", parts[0].trim(), parts[1].trim());
-                    result =
-                        format!("{}{}{}", &result[..pos], replacement, &result[end + 1..]);
+                    let replacement = format!("({}) ** ({})", parts[0].trim(), parts[1].trim());
+                    result = format!("{}{}{}", &result[..pos], replacement, &result[end + 1..]);
                 } else {
                     break;
                 }
@@ -684,10 +681,8 @@ impl MontyAutoFixer {
         let has_loads = code.contains("json.loads(");
         // Also handle standalone calls after `from json import dumps, loads`
         let has_json_import = code.contains("import json") || code.contains("from json import");
-        let has_standalone_dumps =
-            has_json_import && Self::has_standalone_call(code, "dumps");
-        let has_standalone_loads =
-            has_json_import && Self::has_standalone_call(code, "loads");
+        let has_standalone_dumps = has_json_import && Self::has_standalone_call(code, "dumps");
+        let has_standalone_loads = has_json_import && Self::has_standalone_call(code, "loads");
 
         let need_dumps = has_dumps || has_standalone_dumps;
         let need_loads = has_loads || has_standalone_loads;
@@ -1113,11 +1108,10 @@ impl MontyAutoFixer {
             return code.to_string();
         }
 
-        let needs_now = code.contains("datetime.datetime.now(")
-            || code.contains("datetime.now(");
+        let needs_now = code.contains("datetime.datetime.now(") || code.contains("datetime.now(");
         let needs_today = code.contains("datetime.date.today(");
-        let needs_strptime = code.contains("datetime.datetime.strptime(")
-            || code.contains("datetime.strptime(");
+        let needs_strptime =
+            code.contains("datetime.datetime.strptime(") || code.contains("datetime.strptime(");
         let needs_fromisoformat = code.contains("datetime.datetime.fromisoformat(")
             || code.contains("datetime.fromisoformat(");
 
@@ -1172,7 +1166,10 @@ impl MontyAutoFixer {
                 "    out = run_command(cmd)\n",
                 "    return out.strip()\n",
             ));
-            result = result.replace("datetime.datetime.fromisoformat(", "_datetime_fromisoformat(");
+            result = result.replace(
+                "datetime.datetime.fromisoformat(",
+                "_datetime_fromisoformat(",
+            );
             result = result.replace("datetime.fromisoformat(", "_datetime_fromisoformat(");
         }
 

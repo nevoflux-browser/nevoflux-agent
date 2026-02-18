@@ -67,7 +67,21 @@ pub enum WireEvent {
         /// The thinking text.
         text: String,
     },
-    /// A tool call request from the agent.
+    /// A built-in tool call (notification, handled by agent internally).
+    ToolCall {
+        /// Tool call identifier.
+        id: String,
+        /// Function name.
+        name: String,
+        /// JSON-encoded arguments string.
+        arguments: String,
+    },
+    /// Streaming tool call arguments part.
+    ToolCallPart {
+        /// Partial arguments string.
+        arguments_part: String,
+    },
+    /// An external tool call request (requires response).
     ToolCallRequest {
         /// Unique identifier for this tool call.
         id: String,
@@ -76,6 +90,15 @@ pub enum WireEvent {
         /// Arguments as a JSON value.
         arguments: Value,
     },
+    /// A tool result (notification, for display purposes).
+    ToolResult {
+        /// Tool call identifier.
+        tool_call_id: String,
+        /// Whether the result is an error.
+        is_error: bool,
+        /// Output text.
+        output: String,
+    },
     /// A status update with token usage.
     StatusUpdate {
         /// Number of input tokens.
@@ -83,6 +106,12 @@ pub enum WireEvent {
         /// Number of output tokens.
         output_tokens: u64,
     },
+    /// Context compaction has begun.
+    CompactionBegin,
+    /// Context compaction has ended.
+    CompactionEnd,
+    /// A subagent event.
+    SubagentEvent,
     /// An unknown event type.
     Unknown(String),
 }
@@ -140,7 +169,7 @@ impl WireClient {
 
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::null());
 
         let mut child = cmd
             .spawn()
@@ -279,8 +308,14 @@ impl WireClient {
                                 }
                                 WireEvent::TurnBegin
                                 | WireEvent::StepBegin { .. }
-                                | WireEvent::StepInterrupted => {
-                                    // Informational events; no action needed
+                                | WireEvent::StepInterrupted
+                                | WireEvent::ToolCall { .. }
+                                | WireEvent::ToolCallPart { .. }
+                                | WireEvent::ToolResult { .. }
+                                | WireEvent::CompactionBegin
+                                | WireEvent::CompactionEnd
+                                | WireEvent::SubagentEvent => {
+                                    // Informational events; no action needed in batch mode
                                 }
                                 WireEvent::ToolCallRequest { .. } => {
                                     // ToolCallRequest should come as a Request, not Notification.
@@ -329,6 +364,50 @@ impl WireClient {
         }
 
         Ok((text, tool_calls, usage))
+    }
+
+    /// Read a single event from the wire protocol.
+    ///
+    /// Returns `None` if the stream is closed. Automatically updates internal
+    /// state for terminal events (TurnEnd, ToolCallRequest).
+    pub fn read_next_event(&mut self) -> Option<WireEvent> {
+        loop {
+            let msg = self.read_line()?;
+            match msg {
+                JsonRpcMessage::Notification { params, .. } => {
+                    if let Some(params) = params {
+                        if let Some(event) = parse_wire_event(&params) {
+                            if matches!(event, WireEvent::TurnEnd) {
+                                self.state = WireState::Finished;
+                            }
+                            return Some(event);
+                        }
+                    }
+                }
+                JsonRpcMessage::Request { id, params, .. } => {
+                    if let Some(params) = params {
+                        if let Some(event) = parse_wire_event(&params) {
+                            if matches!(event, WireEvent::ToolCallRequest { .. }) {
+                                self.state = WireState::WaitingForToolResults;
+                                self.last_request_id = Some(id);
+                            }
+                            return Some(event);
+                        }
+                    }
+                }
+                JsonRpcMessage::Error { error, .. } => {
+                    self.state = WireState::Finished;
+                    return Some(WireEvent::Unknown(format!(
+                        "error({}): {}",
+                        error.code, error.message
+                    )));
+                }
+                JsonRpcMessage::Response { .. } => {
+                    // Skip responses to our own requests
+                    continue;
+                }
+            }
+        }
     }
 
     /// Kill the subprocess.
@@ -484,18 +563,65 @@ pub fn parse_wire_event(params: &Value) -> Option<WireEvent> {
                 .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("text");
-            let text = envelope
+            match content_type {
+                "think" | "thinking" => {
+                    // Thinking parts store text in the "think" field
+                    let text = envelope
+                        .payload
+                        .get("think")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Some(WireEvent::ThinkingPart { text })
+                }
+                _ => {
+                    let text = envelope
+                        .payload
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Some(WireEvent::ContentPart { text })
+                }
+            }
+        }
+        "ToolCall" => {
+            // Built-in tool call (notification). Structure:
+            // { type: "function", id, function: { name, arguments } }
+            let id = envelope
                 .payload
-                .get("text")
+                .get("id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            match content_type {
-                "think" | "thinking" => Some(WireEvent::ThinkingPart { text }),
-                _ => Some(WireEvent::ContentPart { text }),
-            }
+            let func = envelope.payload.get("function");
+            let name = func
+                .and_then(|f| f.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let arguments = func
+                .and_then(|f| f.get("arguments"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(WireEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            })
+        }
+        "ToolCallPart" => {
+            let arguments_part = envelope
+                .payload
+                .get("arguments_part")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(WireEvent::ToolCallPart { arguments_part })
         }
         "ToolCallRequest" => {
+            // External tool call request. Arguments is a JSON-encoded string.
             let id = envelope
                 .payload
                 .get("id")
@@ -508,15 +634,41 @@ pub fn parse_wire_event(params: &Value) -> Option<WireEvent> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let arguments = envelope
-                .payload
-                .get("arguments")
-                .cloned()
-                .unwrap_or(Value::Object(serde_json::Map::new()));
+            // Arguments may be a JSON string or null; parse string into Value
+            let arguments = match envelope.payload.get("arguments") {
+                Some(Value::String(s)) => {
+                    serde_json::from_str(s).unwrap_or(Value::Object(serde_json::Map::new()))
+                }
+                Some(other) => other.clone(),
+                None => Value::Object(serde_json::Map::new()),
+            };
             Some(WireEvent::ToolCallRequest {
                 id,
                 name,
                 arguments,
+            })
+        }
+        "ToolResult" => {
+            let tool_call_id = envelope
+                .payload
+                .get("tool_call_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let rv = envelope.payload.get("return_value");
+            let is_error = rv
+                .and_then(|r| r.get("is_error"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let output = rv
+                .and_then(|r| r.get("output"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(WireEvent::ToolResult {
+                tool_call_id,
+                is_error,
+                output,
             })
         }
         "StatusUpdate" => {
@@ -534,6 +686,9 @@ pub fn parse_wire_event(params: &Value) -> Option<WireEvent> {
                 output_tokens,
             })
         }
+        "CompactionBegin" => Some(WireEvent::CompactionBegin),
+        "CompactionEnd" => Some(WireEvent::CompactionEnd),
+        "SubagentEvent" => Some(WireEvent::SubagentEvent),
         other => Some(WireEvent::Unknown(other.to_string())),
     }
 }
@@ -694,9 +849,10 @@ mod tests {
 
     #[test]
     fn test_parse_event_thinking_part() {
+        // Per wire protocol docs: think content is in the "think" field, not "text"
         let params = serde_json::json!({
             "type": "ContentPart",
-            "payload": { "type": "think", "text": "Let me think about this..." }
+            "payload": { "type": "think", "think": "Let me think about this..." }
         });
         let event = parse_wire_event(&params).unwrap();
         match event {
@@ -774,5 +930,123 @@ mod tests {
             result["payload"]["return_value"]["output"],
             "Line 1\nLine 2\tTabbed \"quoted\""
         );
+    }
+
+    #[test]
+    fn test_parse_event_tool_call() {
+        let params = serde_json::json!({
+            "type": "ToolCall",
+            "payload": {
+                "type": "function",
+                "id": "tc_10",
+                "function": {
+                    "name": "Read",
+                    "arguments": "{\"path\":\"/etc/hosts\"}"
+                }
+            }
+        });
+        let event = parse_wire_event(&params).unwrap();
+        match event {
+            WireEvent::ToolCall { id, name, arguments } => {
+                assert_eq!(id, "tc_10");
+                assert_eq!(name, "Read");
+                assert_eq!(arguments, "{\"path\":\"/etc/hosts\"}");
+            }
+            other => panic!("Expected ToolCall, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_event_tool_call_part() {
+        let params = serde_json::json!({
+            "type": "ToolCallPart",
+            "payload": { "arguments_part": "{\"path\":" }
+        });
+        let event = parse_wire_event(&params).unwrap();
+        match event {
+            WireEvent::ToolCallPart { arguments_part } => {
+                assert_eq!(arguments_part, "{\"path\":");
+            }
+            other => panic!("Expected ToolCallPart, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_event_tool_call_request_string_arguments() {
+        // Per wire protocol docs: arguments is a JSON-encoded string
+        let params = serde_json::json!({
+            "type": "ToolCallRequest",
+            "payload": {
+                "id": "tc_5",
+                "name": "read_file",
+                "arguments": "{\"path\":\"/etc/hosts\"}"
+            }
+        });
+        let event = parse_wire_event(&params).unwrap();
+        match event {
+            WireEvent::ToolCallRequest { id, name, arguments } => {
+                assert_eq!(id, "tc_5");
+                assert_eq!(name, "read_file");
+                assert_eq!(arguments["path"], "/etc/hosts");
+            }
+            other => panic!("Expected ToolCallRequest, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_event_tool_result() {
+        let params = serde_json::json!({
+            "type": "ToolResult",
+            "payload": {
+                "tool_call_id": "tc_10",
+                "return_value": {
+                    "is_error": false,
+                    "output": "file contents here",
+                    "message": ""
+                }
+            }
+        });
+        let event = parse_wire_event(&params).unwrap();
+        match event {
+            WireEvent::ToolResult { tool_call_id, is_error, output } => {
+                assert_eq!(tool_call_id, "tc_10");
+                assert!(!is_error);
+                assert_eq!(output, "file contents here");
+            }
+            other => panic!("Expected ToolResult, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_event_compaction_begin() {
+        let params = serde_json::json!({
+            "type": "CompactionBegin",
+            "payload": {}
+        });
+        let event = parse_wire_event(&params).unwrap();
+        assert!(matches!(event, WireEvent::CompactionBegin));
+    }
+
+    #[test]
+    fn test_parse_event_compaction_end() {
+        let params = serde_json::json!({
+            "type": "CompactionEnd",
+            "payload": {}
+        });
+        let event = parse_wire_event(&params).unwrap();
+        assert!(matches!(event, WireEvent::CompactionEnd));
+    }
+
+    #[test]
+    fn test_parse_event_subagent_event() {
+        let params = serde_json::json!({
+            "type": "SubagentEvent",
+            "payload": {
+                "task_tool_call_id": "tc_sub",
+                "event": { "type": "ContentPart", "payload": { "text": "sub output" } }
+            }
+        });
+        let event = parse_wire_event(&params).unwrap();
+        assert!(matches!(event, WireEvent::SubagentEvent));
     }
 }

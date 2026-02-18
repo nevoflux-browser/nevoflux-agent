@@ -2979,6 +2979,8 @@ impl DaemonHostFunctions {
                 tab_ids: vec![],
                 skill_context: None,
                 available_models: vec![],
+                mcp_servers: vec![],
+                soul_context: None,
             };
 
             // Run the appropriate builtin mode

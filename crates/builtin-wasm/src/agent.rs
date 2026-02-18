@@ -501,6 +501,13 @@ impl<H: HostFunctions> Agent<H> {
             }
         };
 
+        // Append soul document context if available
+        let base_prompt = if let Some(ref soul) = input.soul_context {
+            format!("{}\n\n{}", base_prompt, soul)
+        } else {
+            base_prompt
+        };
+
         // Prepend skill context with high priority if present
         let system_prompt = match &input.skill_context {
             Some(skill) => {
@@ -1211,11 +1218,13 @@ The following skill instructions MUST be followed exactly. These instructions ta
                                 .collect()
                         })
                     });
-                let entry = tool_call.arguments
+                let entry = tool_call
+                    .arguments
                     .get("entry")
                     .and_then(|e| e.as_str())
                     .map(|s| s.to_string());
-                let description = tool_call.arguments
+                let description = tool_call
+                    .arguments
                     .get("description")
                     .and_then(|d| d.as_str())
                     .map(|s| s.to_string());
@@ -2954,6 +2963,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
 
         // Should run successfully with custom prompt
@@ -3067,6 +3078,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -3090,6 +3103,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -3113,6 +3128,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -3157,6 +3174,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -3497,6 +3516,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
 
         // Should complete normally
@@ -3524,6 +3545,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
 
         // Should exit early due to interrupt

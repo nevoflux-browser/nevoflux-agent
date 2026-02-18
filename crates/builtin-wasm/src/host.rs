@@ -1133,6 +1133,8 @@ mod tests {
             tab_ids: vec![],
             skill_context: None,
             available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
         };
 
         let chat_output = mock.builtin_chat(&input).unwrap();

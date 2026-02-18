@@ -195,7 +195,9 @@ impl ToolRegistry {
     /// Generate the Code Mode system prompt with Monty constraints and tool info.
     pub fn code_mode_system_prompt(&self) -> String {
         let mut prompt = String::new();
-        prompt.push_str("You are in Code Mode. You MUST write a single Python script to accomplish the task.\n");
+        prompt.push_str(
+            "You are in Code Mode. You MUST write a single Python script to accomplish the task.\n",
+        );
         prompt.push_str("Do NOT make individual tool calls — write a ```python-exec script that orchestrates everything.\n\n");
         prompt.push_str("Supported constructs:\n");
         prompt.push_str("- Statements: variable, def, if/elif/else, for/while, break, continue, try/except/finally, return, pass, del, assert, raise\n");
@@ -390,9 +392,7 @@ impl ToolExecutor for RunCommandTool {
         let command = arguments
             .get("command")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                DaemonError::InternalError("Missing 'command' argument".to_string())
-            })?;
+            .ok_or_else(|| DaemonError::InternalError("Missing 'command' argument".to_string()))?;
 
         // Safety: reject obviously dangerous commands
         let trimmed = command.trim();
@@ -415,12 +415,8 @@ impl ToolExecutor for RunCommandTool {
             Command::new("sh").arg("-c").arg(command).output(),
         )
         .await
-        .map_err(|_| {
-            DaemonError::InternalError("Command timed out after 30 seconds".to_string())
-        })?
-        .map_err(|e| {
-            DaemonError::InternalError(format!("Failed to execute command: {}", e))
-        })?;
+        .map_err(|_| DaemonError::InternalError("Command timed out after 30 seconds".to_string()))?
+        .map_err(|e| DaemonError::InternalError(format!("Failed to execute command: {}", e)))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -437,7 +433,10 @@ impl ToolExecutor for RunCommandTool {
             Ok(result)
         } else {
             let err_msg = if stderr.is_empty() {
-                format!("Command exited with code {}", output.status.code().unwrap_or(-1))
+                format!(
+                    "Command exited with code {}",
+                    output.status.code().unwrap_or(-1)
+                )
             } else if stderr.len() > max_size {
                 format!("{}... (truncated)", &stderr[..max_size])
             } else {

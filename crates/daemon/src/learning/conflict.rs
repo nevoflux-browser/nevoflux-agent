@@ -244,8 +244,8 @@ mod tests {
             category: overrides
                 .category
                 .unwrap_or_else(|| "site_interaction".into()),
-            subcategory: overrides.subcategory,
-            domain: overrides.domain,
+            subcategory: overrides.subcategory.flatten(),
+            domain: overrides.domain.flatten(),
             summary: overrides.summary.unwrap_or_else(|| "test summary".into()),
             details: overrides.details.unwrap_or_else(|| "test details".into()),
             resolution: None,

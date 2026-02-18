@@ -46,8 +46,12 @@ pub struct McpServerConfigFile {
     /// Server name (unique identifier).
     pub name: String,
 
-    /// Command to run the server.
-    pub command: String,
+    /// Server type: "stdio", "http", or "sse".
+    #[serde(default = "default_stdio")]
+    pub server_type: String,
+
+    /// Command to run the server (required for stdio type).
+    pub command: Option<String>,
 
     /// Arguments to pass to the command.
     #[serde(default)]
@@ -60,6 +64,30 @@ pub struct McpServerConfigFile {
     /// Environment variables for the server process.
     #[serde(default)]
     pub env: HashMap<String, String>,
+
+    /// Human-readable description.
+    pub description: Option<String>,
+
+    /// Working directory for the server process.
+    pub work_dir: Option<String>,
+
+    /// URL for HTTP/SSE server types.
+    pub url: Option<String>,
+
+    /// Connection timeout in seconds.
+    pub timeout: Option<u64>,
+
+    /// HTTP headers for HTTP/SSE connections.
+    pub headers: Option<HashMap<String, String>>,
+
+    /// Reconnect interval in seconds for SSE.
+    pub reconnect: Option<u64>,
+
+    /// HTTP method override.
+    pub method: Option<String>,
+
+    /// API key for authenticated connections.
+    pub api_key: Option<String>,
 }
 
 impl McpServerConfigFile {
@@ -67,10 +95,19 @@ impl McpServerConfigFile {
     pub fn new(name: impl Into<String>, command: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            command: command.into(),
+            server_type: "stdio".to_string(),
+            command: Some(command.into()),
             args: Vec::new(),
             enabled: true,
             env: HashMap::new(),
+            description: None,
+            work_dir: None,
+            url: None,
+            timeout: None,
+            headers: None,
+            reconnect: None,
+            method: None,
+            api_key: None,
         }
     }
 
@@ -97,11 +134,6 @@ impl McpServerConfigFile {
         if self.name.is_empty() {
             return Err(McpConfigError::InvalidConfig("name cannot be empty".into()));
         }
-        if self.command.is_empty() {
-            return Err(McpConfigError::InvalidConfig(
-                "command cannot be empty".into(),
-            ));
-        }
         // Name should be alphanumeric with dashes/underscores
         if !self
             .name
@@ -112,12 +144,33 @@ impl McpServerConfigFile {
                 "name must be alphanumeric with dashes or underscores".into(),
             ));
         }
+        match self.server_type.as_str() {
+            "http" | "sse" => {
+                if self.url.is_none() {
+                    return Err(McpConfigError::InvalidConfig(
+                        "url is required for http/sse server type".into(),
+                    ));
+                }
+            }
+            _ => {
+                // stdio (default)
+                if self.command.as_ref().map_or(true, |c| c.is_empty()) {
+                    return Err(McpConfigError::InvalidConfig(
+                        "command cannot be empty for stdio server type".into(),
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_stdio() -> String {
+    "stdio".to_string()
 }
 
 /// Root configuration structure for MCP servers.
@@ -263,7 +316,8 @@ mod tests {
         let server = McpServerConfigFile::new("test-server", "npx");
 
         assert_eq!(server.name, "test-server");
-        assert_eq!(server.command, "npx");
+        assert_eq!(server.command.as_deref(), Some("npx"));
+        assert_eq!(server.server_type, "stdio");
         assert!(server.args.is_empty());
         assert!(server.enabled);
         assert!(server.env.is_empty());
@@ -327,7 +381,7 @@ mod tests {
         config.update_server("server1", updated).unwrap();
 
         let server = config.get_server("server1").unwrap();
-        assert_eq!(server.command, "cmd2");
+        assert_eq!(server.command.as_deref(), Some("cmd2"));
         assert!(!server.enabled);
 
         // Update non-existent should fail
@@ -408,7 +462,7 @@ mod tests {
         assert_eq!(loaded.len(), 1);
 
         let server = loaded.get_server("filesystem").unwrap();
-        assert_eq!(server.command, "npx");
+        assert_eq!(server.command.as_deref(), Some("npx"));
         assert_eq!(server.args.len(), 2);
         assert!(server.enabled);
     }

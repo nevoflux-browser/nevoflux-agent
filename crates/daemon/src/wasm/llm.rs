@@ -1351,8 +1351,11 @@ async fn execute_llm_stream_inner(
         ProviderType::Together => stream_together(api_key, model, request, tx, provider).await,
         ProviderType::ClaudeCode => stream_claude_code(api_key, model, request, tx, provider).await,
         ProviderType::GeminiCli => stream_gemini_cli(api_key, model, request, tx, provider).await,
-        // Kimi Agent, Qwen and Ollama don't support streaming in rig yet
-        ProviderType::KimiAgent | ProviderType::Qwen | ProviderType::Ollama => {
+        ProviderType::KimiAgent => {
+            stream_kimi_agent(api_key, model, request, tx, provider).await
+        }
+        // Qwen and Ollama don't support streaming in rig yet
+        ProviderType::Qwen | ProviderType::Ollama => {
             Err(DaemonError::InternalError(format!(
                 "Streaming not supported for provider {:?}",
                 provider
@@ -1603,6 +1606,197 @@ async fn stream_gemini_cli(
 
     let completion_model = client.completion_model(model);
     stream_rig_completion(completion_model, request, tx, provider).await
+}
+
+/// Stream from Kimi Agent CLI provider.
+///
+/// Uses the kimi-agent wire protocol's native streaming: spawns the subprocess,
+/// reads JSON-RPC events one at a time, and emits each ContentPart as a stream chunk.
+async fn stream_kimi_agent(
+    api_key: &str,
+    model: &str,
+    request: LlmChatRequest,
+    tx: mpsc::Sender<LlmStreamChunk>,
+    _provider: ProviderType,
+) -> Result<()> {
+    use nevoflux_llm::providers::kimi_agent::wire::{WireClient, WireEvent};
+
+    let client = if api_key == "kimi-agent-cli" {
+        KimiAgentClient::new("kimi-agent")
+    } else {
+        KimiAgentClient::new("kimi-agent").with_api_key(api_key)
+    };
+    let workspace_dir = resolve_workspace_dir();
+    let config = client.with_working_dir(workspace_dir);
+    let model_str = model.to_string();
+
+    // Build prompt from request messages
+    let prompt = build_kimi_prompt(&request);
+
+    // Convert tool definitions
+    let tools: Vec<ToolDefinition> = request
+        .tools
+        .map(|t| t.into_iter().map(Into::into).collect())
+        .unwrap_or_default();
+
+    // Channel to bridge blocking wire reads to async
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<WireEvent>(64);
+
+    tracing::info!(
+        "stream_kimi_agent: spawning wire client, model={}, prompt_len={}, tools={}",
+        model_str,
+        prompt.len(),
+        tools.len()
+    );
+
+    // Spawn blocking thread for wire protocol I/O
+    tokio::task::spawn_blocking(move || {
+        tracing::info!("stream_kimi_agent: spawn_blocking thread started");
+        let mut wc = match WireClient::spawn(&config, &model_str) {
+            Ok(wc) => {
+                tracing::info!("stream_kimi_agent: kimi-agent process spawned");
+                wc
+            }
+            Err(e) => {
+                tracing::error!("stream_kimi_agent: failed to spawn kimi-agent: {}", e);
+                let _ = event_tx.blocking_send(WireEvent::Unknown(format!("error: failed to spawn kimi-agent: {}", e)));
+                return;
+            }
+        };
+        if let Err(e) = wc.initialize(&tools) {
+            tracing::error!("stream_kimi_agent: failed to initialize: {}", e);
+            let _ = event_tx.blocking_send(WireEvent::Unknown(format!("error: failed to initialize kimi-agent: {}", e)));
+            return;
+        }
+        tracing::info!("stream_kimi_agent: initialized successfully");
+
+        if let Err(e) = wc.send_prompt(&prompt) {
+            tracing::error!("stream_kimi_agent: failed to send prompt: {}", e);
+            let _ = event_tx.blocking_send(WireEvent::Unknown(format!("error: failed to send prompt: {}", e)));
+            return;
+        }
+        tracing::info!("stream_kimi_agent: prompt sent, reading events...");
+
+        let mut event_count: u64 = 0;
+        loop {
+            match wc.read_next_event() {
+                Some(event) => {
+                    event_count += 1;
+                    let is_terminal = matches!(
+                        event,
+                        WireEvent::TurnEnd | WireEvent::ToolCallRequest { .. }
+                    );
+                    if event_count <= 10 || is_terminal {
+                        tracing::info!(
+                            "stream_kimi_agent: event #{}: {:?}",
+                            event_count,
+                            event
+                        );
+                    }
+                    if event_tx.blocking_send(event).is_err() {
+                        tracing::warn!("stream_kimi_agent: receiver dropped after {} events", event_count);
+                        break;
+                    }
+                    if is_terminal {
+                        tracing::info!("stream_kimi_agent: terminal event after {} events", event_count);
+                        break;
+                    }
+                }
+                None => {
+                    tracing::info!("stream_kimi_agent: wire stream ended after {} events", event_count);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Receive wire events and emit stream chunks
+    let mut tool_calls = Vec::new();
+    while let Some(event) = event_rx.recv().await {
+        match event {
+            WireEvent::ContentPart { text } => {
+                let _ = tx
+                    .send(LlmStreamChunk {
+                        text: Some(text),
+                        tool_calls: vec![],
+                        done: false,
+                    })
+                    .await;
+            }
+            WireEvent::ToolCallRequest {
+                id,
+                name,
+                arguments,
+            } => {
+                tool_calls.push(LlmToolCall {
+                    id,
+                    call_id: None,
+                    name,
+                    arguments,
+                    signature: None,
+                });
+            }
+            WireEvent::TurnEnd => break,
+            WireEvent::Unknown(ref msg) if msg.starts_with("error") => {
+                tracing::warn!("stream_kimi_agent: error event: {}", msg);
+                let _ = tx
+                    .send(LlmStreamChunk {
+                        text: Some(format!("\n\n[kimi-agent error] {}", msg)),
+                        tool_calls: vec![],
+                        done: false,
+                    })
+                    .await;
+                break;
+            }
+            // Skip informational events: TurnBegin, StepBegin, ThinkingPart,
+            // StatusUpdate, ToolCall (built-in), ToolCallPart, ToolResult,
+            // CompactionBegin/End, SubagentEvent, Unknown
+            _ => {}
+        }
+    }
+
+    // Send final done chunk with any tool calls
+    let _ = tx
+        .send(LlmStreamChunk {
+            text: None,
+            tool_calls,
+            done: true,
+        })
+        .await;
+
+    Ok(())
+}
+
+/// Build a kimi-agent prompt string from an LLM chat request.
+fn build_kimi_prompt(request: &LlmChatRequest) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(ref sys) = request.system {
+        if !sys.is_empty() {
+            parts.push(format!("<system>\n{}\n</system>", sys));
+        }
+    }
+
+    let has_assistant = request.messages.iter().any(|m| m.role == "assistant");
+
+    if has_assistant {
+        parts.push("<conversation_history>".to_string());
+        for msg in &request.messages {
+            if msg.role != "system" {
+                parts.push(format!("[{}]: {}", msg.role, msg.content));
+            }
+        }
+        parts.push("</conversation_history>".to_string());
+        parts.push("Continue the conversation based on the history above.".to_string());
+    } else {
+        for msg in &request.messages {
+            if msg.role != "system" && !msg.content.is_empty() {
+                parts.push(msg.content.clone());
+            }
+        }
+    }
+
+    parts.join("\n\n")
 }
 
 /// Generic streaming completion for any rig-compatible model.
