@@ -115,7 +115,19 @@ pub async fn start_server(
     info!("Starting daemon server on {}", addr);
 
     // Load agent config for LLM settings
-    let agent_config = AgentConfig::load().unwrap_or_default();
+    let agent_config = match AgentConfig::load() {
+        Ok(cfg) => {
+            info!(
+                "Loaded agent config: llm.provider={:?}",
+                cfg.llm.active_provider()
+            );
+            cfg
+        }
+        Err(e) => {
+            error!("Failed to load agent config: {}, using defaults", e);
+            AgentConfig::default()
+        }
+    };
     let agent_config = Arc::new(agent_config);
 
     // Create host services with database from session manager

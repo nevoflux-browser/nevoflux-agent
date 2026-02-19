@@ -11,8 +11,6 @@ use async_trait::async_trait;
 #[cfg(target_os = "macos")]
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 #[cfg(target_os = "macos")]
-use core_foundation::base::TCFType;
-#[cfg(target_os = "macos")]
 use core_graphics::display::{CGDisplay, CGDisplayBounds, CGMainDisplayID};
 #[cfg(target_os = "macos")]
 use core_graphics::event::{
@@ -36,6 +34,13 @@ pub struct MacOsComputer {
     /// Event source for creating CGEvents.
     event_source: CGEventSource,
 }
+
+// SAFETY: CGEventSource is a CoreFoundation type with thread-safe reference counting.
+// The CGEvent APIs we use are safe to call from any thread.
+#[cfg(target_os = "macos")]
+unsafe impl Send for MacOsComputer {}
+#[cfg(target_os = "macos")]
+unsafe impl Sync for MacOsComputer {}
 
 /// Stub MacOsComputer for non-macOS platforms.
 /// All operations return NotSupported errors.
@@ -238,16 +243,13 @@ impl ScreenshotProvider for MacOsComputer {
         let height = bounds.size.height as u32;
 
         // Capture the display
-        let image = CGDisplay::image(display_id)
+        let display = CGDisplay::new(display_id);
+        let image = display
+            .image()
             .ok_or_else(|| ComputerError::ScreenshotFailed("Failed to capture display".into()))?;
 
         // Get image data
-        let data_provider = image.data_provider();
-        let data = data_provider
-            .ok_or_else(|| {
-                ComputerError::ScreenshotFailed("Failed to get image data provider".into())
-            })?
-            .copy_data();
+        let data = image.data();
 
         let base64_data = self.encode_to_png_base64(&data, width, height)?;
 
@@ -265,15 +267,12 @@ impl ScreenshotProvider for MacOsComputer {
         let width = bounds.size.width as u32;
         let height = bounds.size.height as u32;
 
-        let image = CGDisplay::image(display_id)
+        let display = CGDisplay::new(display_id);
+        let image = display
+            .image()
             .ok_or_else(|| ComputerError::ScreenshotFailed("Failed to capture display".into()))?;
 
-        let data_provider = image.data_provider();
-        let data = data_provider
-            .ok_or_else(|| {
-                ComputerError::ScreenshotFailed("Failed to get image data provider".into())
-            })?
-            .copy_data();
+        let data = image.data();
 
         let base64_data = self.encode_to_png_base64(&data, width, height)?;
 
@@ -298,12 +297,7 @@ impl ScreenshotProvider for MacOsComputer {
         let image = CGDisplay::screenshot(cg_rect, 0, 0, display_id)
             .ok_or_else(|| ComputerError::ScreenshotFailed("Failed to capture region".into()))?;
 
-        let data_provider = image.data_provider();
-        let data = data_provider
-            .ok_or_else(|| {
-                ComputerError::ScreenshotFailed("Failed to get image data provider".into())
-            })?
-            .copy_data();
+        let data = image.data();
 
         let base64_data = self.encode_to_png_base64(&data, region.width, region.height)?;
 
@@ -358,7 +352,7 @@ impl ScreenshotProvider for MacOsComputer {
 impl MouseController for MacOsComputer {
     async fn get_position(&self) -> Result<Point> {
         // Get current mouse location using CGEvent
-        let event = CGEvent::new(self.event_source.clone()).ok_or_else(|| {
+        let event = CGEvent::new(self.event_source.clone()).map_err(|_| {
             ComputerError::MouseFailed("Failed to create CGEvent for position query".into())
         })?;
 

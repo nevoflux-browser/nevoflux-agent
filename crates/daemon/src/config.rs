@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
+use tracing::warn;
 
 /// Errors that can occur during configuration operations.
 #[derive(Debug, Error)]
@@ -65,7 +66,28 @@ impl AgentConfig {
     /// or %APPDATA%\nevoflux\config.toml on Windows.
     pub fn default_config_path() -> Result<PathBuf, ConfigError> {
         let config_dir = dirs::config_dir().ok_or(ConfigError::NoConfigDir)?;
-        Ok(config_dir.join("nevoflux").join("config.toml"))
+        let primary = config_dir.join("nevoflux").join("config.toml");
+
+        if primary.exists() {
+            return Ok(primary);
+        }
+
+        // Fallback: on macOS dirs::config_dir() returns ~/Library/Application Support,
+        // but users commonly place config at ~/.config/nevoflux/config.toml.
+        if let Some(home) = dirs::home_dir() {
+            let xdg_fallback = home.join(".config").join("nevoflux").join("config.toml");
+            if xdg_fallback.exists() {
+                warn!(
+                    "Config not found at {}, using fallback {}",
+                    primary.display(),
+                    xdg_fallback.display()
+                );
+                return Ok(xdg_fallback);
+            }
+        }
+
+        // Neither exists; return the primary path (load_from_path handles missing files).
+        Ok(primary)
     }
 
     /// Load configuration from the default path.
@@ -81,6 +103,10 @@ impl AgentConfig {
     /// Returns default configuration if the file doesn't exist.
     pub fn load_from_path(path: &PathBuf) -> Result<Self, ConfigError> {
         if !path.exists() {
+            warn!(
+                "Config file not found at {}, using defaults",
+                path.display()
+            );
             return Ok(Self::default());
         }
 
