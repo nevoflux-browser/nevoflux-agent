@@ -19,7 +19,7 @@ use nevoflux_storage::{ContentType, ListSessionsParams, Message as StorageMessag
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, warn};
 use zeromq::{Socket, SocketSend, ZmqMessage};
@@ -43,6 +43,9 @@ type InterruptRegistry = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 /// Registry for pending tool authorization requests.
 /// Maps tool_id to the response sender.
 type ToolAuthRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<ToolAuthResponse>>>>;
+
+/// Shared mutable agent config that can be updated at runtime (e.g. when changing active LLM provider).
+type SharedAgentConfig = Arc<RwLock<Arc<AgentConfig>>>;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -128,7 +131,7 @@ pub async fn start_server(
             AgentConfig::default()
         }
     };
-    let agent_config = Arc::new(agent_config);
+    let agent_config: SharedAgentConfig = Arc::new(RwLock::new(Arc::new(agent_config)));
 
     // Create host services with database from session manager
     let db = session_manager.storage().database().clone();
@@ -588,7 +591,8 @@ pub async fn start_server(
                     // This allows browser_tool_response messages to be processed while
                     // the agent is waiting for browser tool results.
                     let payload = envelope.payload.clone();
-                    let config = process_config.clone();
+                    let config = process_config.read().unwrap().clone();
+                    let shared_config = process_config.clone();
                     let session_manager = process_session_manager.clone();
                     let services = process_services.clone();
                     let runtime = process_runtime.clone();
@@ -601,6 +605,7 @@ pub async fn start_server(
                         handle_chat_message_streaming(
                             &payload,
                             &config,
+                            &shared_config,
                             &session_manager,
                             &services,
                             runtime,
@@ -724,6 +729,7 @@ async fn load_session_history(
 async fn handle_chat_message_streaming(
     payload: &serde_json::Value,
     config: &Arc<AgentConfig>,
+    shared_config: &SharedAgentConfig,
     session_manager: &Arc<SessionManager>,
     services: &HostServices,
     runtime: tokio::runtime::Handle,
@@ -753,7 +759,8 @@ async fn handle_chat_message_streaming(
     // For non-chat_message types, handle synchronously
     if msg_type != "chat_message" {
         let mut response_payload =
-            handle_chat_message(payload, config, session_manager, services, runtime).await;
+            handle_chat_message(payload, config, shared_config, session_manager, services, runtime)
+                .await;
         // Add done: true to signal this is a complete response (not streaming)
         if let Some(obj) = response_payload.as_object_mut() {
             if let Some(payload_obj) = obj.get_mut("payload").and_then(|p| p.as_object_mut()) {
@@ -2123,6 +2130,7 @@ fn format_plan_as_context(proposal: &PlanProposal) -> String {
 async fn handle_chat_message(
     payload: &serde_json::Value,
     config: &Arc<AgentConfig>,
+    shared_config: &SharedAgentConfig,
     session_manager: &Arc<SessionManager>,
     services: &HostServices,
     runtime: tokio::runtime::Handle,
@@ -2663,7 +2671,7 @@ async fn handle_chat_message(
                 // LLM provider configuration commands
                 "config.llm.list" => handle_config_llm_list(&params).await,
                 "config.llm.get" => handle_config_llm_get(&params).await,
-                "config.llm.set" => handle_config_llm_set(&params).await,
+                "config.llm.set" => handle_config_llm_set(&params, shared_config).await,
                 // Agent config file commands
                 "config.file.read" => handle_config_file_read(&params).await,
                 "config.file.write" => handle_config_file_write(&params).await,
@@ -4862,7 +4870,10 @@ async fn handle_config_llm_get(params: &serde_json::Value) -> serde_json::Value 
 /// Handle config.llm.set command.
 ///
 /// Updates configuration for a specific provider and optionally sets it as active.
-async fn handle_config_llm_set(params: &serde_json::Value) -> serde_json::Value {
+async fn handle_config_llm_set(
+    params: &serde_json::Value,
+    shared_config: &SharedAgentConfig,
+) -> serde_json::Value {
     let request_id = params
         .get("request_id")
         .and_then(|r| r.as_str())
@@ -4953,10 +4964,16 @@ async fn handle_config_llm_set(params: &serde_json::Value) -> serde_json::Value 
         config.llm.provider = Some(provider_id.to_string());
     }
 
-    // Save config
+    // Save config to disk and update runtime config
     match config.save() {
         Ok(()) => {
-            info!("config.llm.set: updated provider {}", provider_id);
+            let is_active = config.llm.provider.as_deref() == Some(provider_id);
+            // Update the in-memory runtime config so changes take effect immediately
+            *shared_config.write().unwrap() = Arc::new(config);
+            info!(
+                "config.llm.set: updated provider {} (active={}, runtime config updated)",
+                provider_id, is_active
+            );
             serde_json::json!({
                 "type": "system_response",
                 "payload": {
@@ -4965,7 +4982,7 @@ async fn handle_config_llm_set(params: &serde_json::Value) -> serde_json::Value 
                     "success": true,
                     "data": {
                         "provider": provider_id,
-                        "active": config.llm.provider.as_deref() == Some(provider_id)
+                        "active": is_active
                     }
                 }
             })

@@ -1209,14 +1209,25 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     .as_str()
                     .unwrap_or("")
                     .to_string();
-                // Extract optional multi-file project fields
+                // Extract optional multi-file project fields.
+                // Accept both object (Anthropic) and JSON string (OpenAI strict mode).
                 let files: Option<std::collections::HashMap<String, String>> =
                     tool_call.arguments.get("files").and_then(|f| {
-                        f.as_object().map(|obj| {
-                            obj.iter()
-                                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                                .collect()
-                        })
+                        // Try as object first (Anthropic/non-strict providers)
+                        if let Some(obj) = f.as_object() {
+                            Some(
+                                obj.iter()
+                                    .filter_map(|(k, v)| {
+                                        v.as_str().map(|s| (k.clone(), s.to_string()))
+                                    })
+                                    .collect(),
+                            )
+                        } else if let Some(s) = f.as_str() {
+                            // Try as JSON string (OpenAI strict mode)
+                            serde_json::from_str(s).ok()
+                        } else {
+                            None
+                        }
                     });
                 let entry = tool_call
                     .arguments
@@ -1729,6 +1740,10 @@ The following skill instructions MUST be followed exactly. These instructions ta
         let mut ctx = String::from("\n\n## Active Tabs\n");
 
         if !extra_tabs.is_empty() {
+            // When the user attaches specific tabs, those are the PRIMARY targets
+            // of their request (e.g. "summarize this page" refers to the attached
+            // tabs, not necessarily the sidebar's current_tab).
+            ctx.push_str("IMPORTANT: The tabs listed below were explicitly selected/attached by the user. When the user says \"this page\", \"this website\", \"the attachment\", or similar references, they are referring to these attached tabs. Use browse_tab to read their content. current_tab only indicates which tab the sidebar is open on.\n\n");
             let mut by_space: std::collections::BTreeMap<&str, Vec<&TabInfo>> =
                 std::collections::BTreeMap::new();
             for tab in extra_tabs {
@@ -1834,9 +1849,8 @@ The following skill instructions MUST be followed exactly. These instructions ta
                             "description": "The full artifact content (for single-file artifacts: HTML, Markdown, code). Optional when using 'files'."
                         },
                         "files": {
-                            "type": "object",
-                            "description": "Multi-file project: a map of file paths to file contents. Example: {\"src/App.jsx\": \"export default function App() {...}\", \"src/index.jsx\": \"import App from './App'; ...\"}. Use with content_type 'project'.",
-                            "additionalProperties": { "type": "string" }
+                            "type": "string",
+                            "description": "Multi-file project: a JSON-encoded map of file paths to file contents. Example: \"{\\\"src/App.jsx\\\": \\\"export default function App() {...}\\\", \\\"src/index.jsx\\\": \\\"import App from './App'; ...\\\"}\". Use with content_type 'project'."
                         },
                         "entry": {
                             "type": "string",
