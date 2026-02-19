@@ -2238,7 +2238,41 @@ where
     let mut total_text_chunks: usize = 0;
     let mut receiver_dropped = false;
 
-    while let Some(chunk_result) = stream_response.next().await {
+    // Timeout for waiting on the first chunk from CLI providers (2 minutes).
+    // Subsequent chunks use a shorter timeout (60 seconds between chunks).
+    let first_chunk_timeout = std::time::Duration::from_secs(120);
+    let inter_chunk_timeout = std::time::Duration::from_secs(60);
+    let mut got_first_chunk = false;
+
+    loop {
+        let timeout_dur = if got_first_chunk {
+            inter_chunk_timeout
+        } else {
+            first_chunk_timeout
+        };
+        let chunk_result = match tokio::time::timeout(timeout_dur, stream_response.next()).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break, // stream ended
+            Err(_) => {
+                tracing::warn!(
+                    "LLM stream timeout after {:?} (got_first_chunk={})",
+                    timeout_dur,
+                    got_first_chunk
+                );
+                let _ = tx
+                    .send(LlmStreamChunk {
+                        text: Some(format!(
+                            "\n\n[error] LLM provider timed out after {} seconds with no {}.",
+                            timeout_dur.as_secs(),
+                            if got_first_chunk { "new data" } else { "response" }
+                        )),
+                        tool_calls: vec![],
+                        done: false,
+                    })
+                    .await;
+                break;
+            }
+        };
         match chunk_result {
             Ok(choice) => {
                 let chunk = match choice {
@@ -2354,6 +2388,7 @@ where
                     receiver_dropped = true;
                     break;
                 }
+                got_first_chunk = true;
             }
             Err(e) => {
                 tracing::error!("Stream chunk error: {}", e);

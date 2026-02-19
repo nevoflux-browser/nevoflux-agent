@@ -660,6 +660,19 @@ impl completion::CompletionModel for ClaudeCodeCompletionModel {
             .take()
             .ok_or_else(|| CompletionError::ProviderError("No stdout from CLI".into()))?;
 
+        // Spawn a background task to read and log stderr so CLI errors are visible
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let reader = tokio::io::BufReader::new(stderr);
+                let mut lines = tokio::io::AsyncBufReadExt::lines(reader);
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if !line.trim().is_empty() {
+                        eprintln!("[claude-cli stderr] {}", line);
+                    }
+                }
+            });
+        }
+
         let reader = tokio::io::BufReader::new(stdout);
         let lines =
             tokio_stream::wrappers::LinesStream::new(tokio::io::AsyncBufReadExt::lines(reader));
