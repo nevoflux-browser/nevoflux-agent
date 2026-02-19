@@ -547,11 +547,42 @@ The following skill instructions MUST be followed exactly. These instructions ta
             None => base_prompt,
         };
 
-        let tools = if self.config.is_subagent {
+        let mut tools = if self.config.is_subagent {
             self.get_subagent_tools_for_mode(input.mode)
         } else {
             self.get_tools_for_mode(input.mode)
         };
+
+        // When user attached specific tabs, update browser tool tab_id descriptions
+        // to guide the LLM toward the attached tabs instead of defaulting to current_tab.
+        if !input.tab_ids.is_empty() {
+            let attached: Vec<String> = input
+                .tab_ids
+                .iter()
+                .map(|t| format!("{} (\"{}\")", t.tab_id, t.tab_title))
+                .collect();
+            let hint = format!(
+                "Tab ID. The user attached tabs: {}. Unless the user explicitly asks for the current tab, use the attached tab's ID.",
+                attached.join(", ")
+            );
+            for tool in &mut tools {
+                if matches!(
+                    tool.name.as_str(),
+                    "browser_get_markdown" | "browser_get_content" | "browser_screenshot"
+                ) {
+                    if let Some(props) = tool
+                        .input_schema
+                        .get_mut("properties")
+                        .and_then(|p| p.as_object_mut())
+                    {
+                        if let Some(tab_id_prop) = props.get_mut("tab_id") {
+                            tab_id_prop["description"] = serde_json::Value::String(hint.clone());
+                        }
+                    }
+                }
+            }
+        }
+
         self.run_loop(input, &system_prompt, &tools)
     }
 
@@ -1743,7 +1774,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             // When the user attaches specific tabs, those are the PRIMARY targets
             // of their request (e.g. "summarize this page" refers to the attached
             // tabs, not necessarily the sidebar's current_tab).
-            ctx.push_str("IMPORTANT: The tabs listed below were explicitly selected/attached by the user. When the user says \"this page\", \"this website\", \"the attachment\", or similar references, they are referring to these attached tabs. Use browse_tab to read their content. current_tab only indicates which tab the sidebar is open on.\n\n");
+            ctx.push_str("IMPORTANT: The user has explicitly attached the tabs listed below. Unless the user explicitly asks to read the \"current tab\", you should use browser_get_markdown with the attached tab's tab_id to read their content. current_tab only indicates which tab the sidebar panel is open on.\n\n");
             let mut by_space: std::collections::BTreeMap<&str, Vec<&TabInfo>> =
                 std::collections::BTreeMap::new();
             for tab in extra_tabs {
