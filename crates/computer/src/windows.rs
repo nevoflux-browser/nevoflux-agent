@@ -20,13 +20,14 @@ use std::mem::zeroed;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
 #[cfg(target_os = "windows")]
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+    EnumDisplayMonitors, GetDC, GetDIBits, GetMonitorInfoW, MONITORINFO, MONITORINFOEXW,
     ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC,
     SRCCOPY,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetCursorPos, SendInput, SetCursorPos, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
     KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
@@ -38,7 +39,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumDisplayMonitors, GetMonitorInfoW, GetSystemMetrics, MONITORINFO, MONITORINFOEXW,
+    GetCursorPos, GetSystemMetrics, SetCursorPos,
     SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN,
 };
@@ -120,8 +121,7 @@ impl WindowsComputer {
             let old_bitmap = SelectObject(mem_dc, bitmap);
 
             // BitBlt from screen to memory DC
-            let result = BitBlt(mem_dc, 0, 0, width, height, screen_dc, x, y, SRCCOPY);
-            if !result.as_bool() {
+            if BitBlt(mem_dc, 0, 0, width, height, screen_dc, x, y, SRCCOPY).is_err() {
                 SelectObject(mem_dc, old_bitmap);
                 DeleteObject(bitmap);
                 DeleteDC(mem_dc);
@@ -466,22 +466,18 @@ impl MouseController for WindowsComputer {
     async fn get_position(&self) -> Result<Point> {
         unsafe {
             let mut point: POINT = zeroed();
-            if !GetCursorPos(&mut point).as_bool() {
-                return Err(ComputerError::MouseFailed(
-                    "Failed to get cursor position".into(),
-                ));
-            }
+            GetCursorPos(&mut point).map_err(|_| {
+                ComputerError::MouseFailed("Failed to get cursor position".into())
+            })?;
             Ok(Point::new(point.x, point.y))
         }
     }
 
     async fn move_to(&self, point: Point) -> Result<()> {
         unsafe {
-            if !SetCursorPos(point.x, point.y).as_bool() {
-                return Err(ComputerError::MouseFailed(
-                    "Failed to set cursor position".into(),
-                ));
-            }
+            SetCursorPos(point.x, point.y).map_err(|_| {
+                ComputerError::MouseFailed("Failed to set cursor position".into())
+            })?;
             Ok(())
         }
     }
