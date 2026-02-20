@@ -79,20 +79,22 @@ pub fn format_tool_definitions_prompt(tools: &[ToolDefinition]) -> String {
         ));
     }
     out.push_str("</tools>\n\n");
-    out.push_str("When you need to use a tool, output EXACTLY this format:\n");
+    out.push_str("When you need to use a tool, output EXACTLY this XML format (do NOT execute the tool yourself):\n");
     out.push_str("<tool_call>\n");
     out.push_str("{\"id\":\"call_1\",\"name\":\"tool_name\",\"arguments\":{...}}\n");
     out.push_str("</tool_call>\n");
     out.push_str("After outputting a tool call, STOP and wait for the tool result.\n");
     out.push_str("Generate a unique id for each tool call (e.g., \"call_1\", \"call_2\").\n");
-    out.push_str("Do NOT wrap tool_call in markdown code blocks.");
+    out.push_str("Do NOT wrap tool_call in markdown code blocks.\n");
+    out.push_str("Do NOT use shell, read_file, write_file, web fetch, or any other built-in tools. ONLY use the <tool_call> XML protocol above.");
     out
 }
 
 /// Extract tool calls from text containing `<tool_call>...</tool_call>` markers.
 ///
 /// Returns `(cleaned_text, extracted_tool_calls)` where `cleaned_text` is the
-/// original text with all tool call markers removed.
+/// original text with all tool call markers removed. Also strips any hallucinated
+/// `<tool_result>` blocks from the content.
 pub fn extract_tool_calls_from_text(text: &str) -> (String, Vec<ExtractedToolCall>) {
     let mut tool_calls = Vec::new();
     let mut cleaned = String::new();
@@ -100,7 +102,13 @@ pub fn extract_tool_calls_from_text(text: &str) -> (String, Vec<ExtractedToolCal
 
     loop {
         let Some(start_idx) = remaining.find("<tool_call>") else {
-            cleaned.push_str(remaining);
+            // No more tool_call markers.
+            // If we already extracted tool calls, discard any trailing text —
+            // the model should have stopped after </tool_call> but may have
+            // hallucinated tool results, explanations, or other garbage.
+            if tool_calls.is_empty() {
+                cleaned.push_str(remaining);
+            }
             break;
         };
 
@@ -315,7 +323,8 @@ Done!"#;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "screenshot");
         assert!(cleaned.contains("Let me take a screenshot"));
-        assert!(cleaned.contains("Done!"));
+        // Text after </tool_call> is discarded (model should stop after tool call)
+        assert!(!cleaned.contains("Done!"));
         assert!(!cleaned.contains("<tool_call>"));
     }
 

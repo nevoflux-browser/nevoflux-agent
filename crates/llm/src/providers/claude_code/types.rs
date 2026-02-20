@@ -260,13 +260,14 @@ pub fn format_tool_definitions_prompt(tools: &[ToolDefinition]) -> String {
         ));
     }
     out.push_str("</tools>\n\n");
-    out.push_str("When you need to use a tool, output EXACTLY this format:\n");
+    out.push_str("When you need to use a tool, output EXACTLY this XML format (do NOT execute the tool yourself):\n");
     out.push_str("<tool_call>\n");
     out.push_str("{\"id\":\"call_1\",\"name\":\"tool_name\",\"arguments\":{...}}\n");
     out.push_str("</tool_call>\n");
     out.push_str("After outputting a tool call, STOP and wait for the tool result.\n");
     out.push_str("Generate a unique id for each tool call (e.g., \"call_1\", \"call_2\").\n");
-    out.push_str("Do NOT wrap tool_call in markdown code blocks.");
+    out.push_str("Do NOT wrap tool_call in markdown code blocks.\n");
+    out.push_str("Do NOT use bash, read, write, web fetch, or any other built-in tools. ONLY use the <tool_call> XML protocol above.");
     out
 }
 
@@ -274,6 +275,9 @@ pub fn format_tool_definitions_prompt(tools: &[ToolDefinition]) -> String {
 ///
 /// Returns `(cleaned_text, extracted_tool_calls)` where `cleaned_text` is the
 /// original text with all tool call markers removed.
+///
+/// Also strips any `<tool_result>...</tool_result>` markers that the model may
+/// have hallucinated (instead of waiting for actual tool results from the daemon).
 pub fn extract_tool_calls_from_text(text: &str) -> (String, Vec<ExtractedToolCall>) {
     let mut tool_calls = Vec::new();
     let mut cleaned = String::new();
@@ -281,7 +285,13 @@ pub fn extract_tool_calls_from_text(text: &str) -> (String, Vec<ExtractedToolCal
 
     loop {
         let Some(start_idx) = remaining.find("<tool_call>") else {
-            cleaned.push_str(remaining);
+            // No more tool_call markers.
+            // If we already extracted tool calls, discard any trailing text —
+            // the model should have stopped after </tool_call> but may have
+            // hallucinated tool results, explanations, or other garbage.
+            if tool_calls.is_empty() {
+                cleaned.push_str(remaining);
+            }
             break;
         };
 
@@ -693,7 +703,8 @@ Done!"#;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "screenshot");
         assert!(cleaned.contains("Let me take a screenshot"));
-        assert!(cleaned.contains("Done!"));
+        // Text after </tool_call> is discarded (model should stop after tool call)
+        assert!(!cleaned.contains("Done!"));
         assert!(!cleaned.contains("<tool_call>"));
     }
 
@@ -772,5 +783,99 @@ Done!"#;
         assert!(result.contains("\"name\":\"read\""));
         assert!(result.contains("\"id\":\"call_1\""));
         assert!(result.contains("config.toml"));
+    }
+
+    #[test]
+    fn test_extract_discards_all_content_after_tool_call() {
+        // Model outputs <tool_call> then hallucinates <tool_result> — all discarded
+        let text = r#"I'll get the page.
+<tool_call>
+{"id":"call_1","name":"browser_get_markdown","arguments":{"tab_id":2}}
+</tool_call><tool_result id="call_1">
+**Markdown content:**
+Some fake page content
+</tool_result>"#;
+        let (cleaned, calls) = extract_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "browser_get_markdown");
+        assert!(cleaned.contains("I'll get the page."));
+        assert!(!cleaned.contains("<tool_result"));
+        assert!(!cleaned.contains("fake page content"));
+    }
+
+    #[test]
+    fn test_extract_discards_hallucinated_tool_response_hyphen() {
+        // Model outputs <tool_call> then hallucinates <tool-response> (hyphen variant)
+        let text = r#"<tool_call>
+{"id":"call_1","name":"browser_get_markdown","arguments":{"tab_id":2}}
+</tool_call><tool-response name="browser_get_markdown">Page content is empty or not accessible.</tool-response>
+
+当前页面内容为空或无法访问。"#;
+        let (cleaned, calls) = extract_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "browser_get_markdown");
+        assert!(!cleaned.contains("<tool-response"));
+        assert!(!cleaned.contains("Page content is empty"));
+        assert!(!cleaned.contains("当前页面内容"));
+    }
+
+    #[test]
+    fn test_extract_discards_large_hallucinated_screenshot() {
+        // Simulate 32K token hallucination with base64 blob after tool_call
+        let fake_base64 = "iVBOR".to_string() + &"A".repeat(1000);
+        let text = format!(
+            "<tool_call>\n{{\"id\":\"call_1\",\"name\":\"screenshot\",\"arguments\":{{}}}}\n</tool_call>\
+<tool_result id=\"call_1\">\n**Screenshot:**\n![screenshot]({})\n</tool_result>\
+Error: exceeded limit",
+            fake_base64
+        );
+        let (cleaned, calls) = extract_tool_calls_from_text(&text);
+        assert_eq!(calls.len(), 1);
+        // Everything after </tool_call> is discarded
+        assert!(!cleaned.contains("iVBOR"));
+        assert!(!cleaned.contains("<tool_result"));
+        assert!(!cleaned.contains("Error: exceeded limit"));
+    }
+
+    #[test]
+    fn test_extract_discards_plain_text_hallucination_after_tool_call() {
+        // Model outputs tool_call then keeps talking without any XML tags
+        let text = r#"Let me check.
+<tool_call>
+{"id":"call_1","name":"browser_get_markdown","arguments":{"tab_id":5}}
+</tool_call>
+The page appears to be a login form with username and password fields."#;
+        let (cleaned, calls) = extract_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 1);
+        assert!(cleaned.contains("Let me check."));
+        assert!(!cleaned.contains("login form"));
+    }
+
+    #[test]
+    fn test_extract_keeps_text_between_multiple_tool_calls() {
+        // Text between tool calls is preserved, text after last is discarded
+        let text = r#"First action.
+<tool_call>
+{"id":"call_1","name":"read","arguments":{"path":"a.txt"}}
+</tool_call>
+Second action.
+<tool_call>
+{"id":"call_2","name":"read","arguments":{"path":"b.txt"}}
+</tool_call>
+This should be discarded."#;
+        let (cleaned, calls) = extract_tool_calls_from_text(text);
+        assert_eq!(calls.len(), 2);
+        assert!(cleaned.contains("First action."));
+        assert!(cleaned.contains("Second action."));
+        assert!(!cleaned.contains("This should be discarded"));
+    }
+
+    #[test]
+    fn test_extract_no_tool_calls_preserves_all_text() {
+        // When there are no tool calls, nothing is discarded
+        let text = "Just a regular response with <tool_result> and other XML-like tags.";
+        let (cleaned, calls) = extract_tool_calls_from_text(text);
+        assert!(calls.is_empty());
+        assert_eq!(cleaned, text);
     }
 }

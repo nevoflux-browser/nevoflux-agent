@@ -120,7 +120,11 @@ impl GeminiCliCompletionModel {
         }
 
         cmd.arg("-p").arg(&prompt);
-        cmd.arg("--yolo");
+        // Use plan (read-only) mode instead of yolo to prevent the CLI
+        // from executing tools internally.  Tool definitions are in the
+        // prompt text; the model outputs <tool_call> XML markers which
+        // the daemon parses and executes itself.
+        cmd.arg("--approval-mode").arg("plan");
 
         // Set CWD if configured
         if let Some(cwd) = self.client.working_dir() {

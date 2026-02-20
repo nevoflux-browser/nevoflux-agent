@@ -2238,7 +2238,7 @@ where
     let mut total_text_chunks: usize = 0;
     let mut receiver_dropped = false;
 
-    // Timeout for waiting on the first chunk from CLI providers (2 minutes).
+    // Timeout for waiting on the first chunk (2 minutes).
     // Subsequent chunks use a shorter timeout (60 seconds between chunks).
     let first_chunk_timeout = std::time::Duration::from_secs(120);
     let inter_chunk_timeout = std::time::Duration::from_secs(60);

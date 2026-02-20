@@ -54,6 +54,11 @@ impl ClaudeCodeCompletionModel {
     ///
     /// If `tools` is non-empty, tool definitions are appended to the system prompt
     /// as structured XML so the CLI can produce `<tool_call>` markers in its output.
+    ///
+    /// Tool definitions are injected as text in the system prompt; the model
+    /// outputs `<tool_call>` XML markers which the daemon extracts and executes.
+    /// The streaming code stops the CLI subprocess as soon as tool calls are
+    /// detected, preventing the model from hallucinating `<tool_result>` blocks.
     fn build_command(&self, system_prompt: Option<&str>, tools: &[ToolDefinition]) -> Command {
         let mut cmd = Command::new(self.client.command());
 
@@ -678,31 +683,56 @@ impl completion::CompletionModel for ClaudeCodeCompletionModel {
             tokio_stream::wrappers::LinesStream::new(tokio::io::AsyncBufReadExt::lines(reader));
 
         // Use scan + flat_map to emit multiple items (text + tool calls) from stream events.
-        // The `bool` state tracks whether native tool_use blocks have been seen in any
-        // assistant event. Once set, <tool_call> XML extraction from text/delta events
-        // is suppressed to avoid duplicate tool calls — Claude CLI may output the same
-        // calls as both native tool_use content blocks AND <tool_call> XML in text.
+        //
+        // State tuple: (saw_native_tool_use, tool_call_emitted)
+        //   - saw_native_tool_use: Once an `assistant` event with native `tool_use`
+        //     content blocks is seen, <tool_call> XML extraction from text/delta events
+        //     is suppressed to avoid duplicate tool calls.
+        //   - tool_call_emitted: Once a tool call is emitted (native or text-extracted),
+        //     the stream stops on the next iteration. This prevents the model from
+        //     wasting tokens on hallucinated <tool_result> blocks that it generates
+        //     instead of stopping and waiting for actual tool execution.
         type StreamItems =
             Vec<Result<RawStreamingChoice<ClaudeCodeStreamingResponse>, CompletionError>>;
         let stream = lines
-            .scan(false, |saw_native_tool_use, line_result| {
-                let items: StreamItems = match line_result {
-                    Ok(line) => {
-                        if line.trim().is_empty() {
-                            vec![]
-                        } else if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) {
-                            process_stream_event(entry, saw_native_tool_use)
-                        } else if !line.starts_with('{') {
-                            // Non-JSON line — pass through as text
-                            vec![Ok(RawStreamingChoice::Message(line))]
-                        } else {
-                            vec![]
-                        }
+            .scan(
+                (false, false),
+                |(saw_native_tool_use, tool_call_emitted), line_result| {
+                    // Stop the stream if a tool call was already emitted.
+                    // The ChildGuardStream will kill the CLI subprocess.
+                    if *tool_call_emitted {
+                        return futures::future::ready(None);
                     }
-                    Err(e) => vec![Err(CompletionError::ProviderError(e.to_string()))],
-                };
-                futures::future::ready(Some(items))
-            })
+
+                    let items: StreamItems = match line_result {
+                        Ok(line) => {
+                            if line.trim().is_empty() {
+                                vec![]
+                            } else if let Ok(entry) =
+                                serde_json::from_str::<serde_json::Value>(&line)
+                            {
+                                process_stream_event(entry, saw_native_tool_use)
+                            } else if !line.starts_with('{') {
+                                // Non-JSON line — pass through as text
+                                vec![Ok(RawStreamingChoice::Message(line))]
+                            } else {
+                                vec![]
+                            }
+                        }
+                        Err(e) => vec![Err(CompletionError::ProviderError(e.to_string()))],
+                    };
+
+                    // Check if any tool calls were emitted — stop on next iteration
+                    if items
+                        .iter()
+                        .any(|item| matches!(item, Ok(RawStreamingChoice::ToolCall(_))))
+                    {
+                        *tool_call_emitted = true;
+                    }
+
+                    futures::future::ready(Some(items))
+                },
+            )
             .flat_map(futures::stream::iter);
 
         // Wrap in ChildGuardStream to kill the CLI subprocess when the stream is dropped
