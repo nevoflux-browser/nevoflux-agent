@@ -4434,7 +4434,24 @@ async fn handle_file_pick(params: &serde_json::Value) -> serde_json::Value {
         req.mode, req.multiple
     );
 
-    match pick_files(req).await {
+    // Timeout after 120 seconds to prevent the file picker lock from being held forever
+    let pick_result = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        pick_files(req),
+    )
+    .await;
+
+    let pick_result = match pick_result {
+        Ok(result) => result,
+        Err(_) => {
+            warn!("File picker timed out after 120 seconds");
+            Err(nevoflux_protocol::PickFilesError::DialogFailed(
+                "File picker timed out after 120 seconds".to_string(),
+            ))
+        }
+    };
+
+    match pick_result {
         Ok(response) => {
             let files: Vec<serde_json::Value> = response
                 .files
