@@ -204,15 +204,27 @@ fn run_stop() {
 }
 
 /// Acquire the daemon lock file.
-fn acquire_daemon_lock() -> std::io::Result<File> {
+///
+/// - `managed=false`: uses `daemon.lock` (dev / manually-started daemon)
+/// - `managed=true`: uses `daemon-managed.lock` (proxy-spawned daemon)
+fn acquire_daemon_lock(managed: bool) -> std::io::Result<File> {
     let data_dir = ensure_data_dir()?;
-    let lock_path = data_dir.join("daemon.lock");
+    let lock_name = if managed {
+        "daemon-managed.lock"
+    } else {
+        "daemon.lock"
+    };
+    let lock_path = data_dir.join(lock_name);
 
     let file = File::create(&lock_path)?;
     file.try_lock_exclusive().map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
-            "Daemon is already running",
+            if managed {
+                "Managed daemon is already running"
+            } else {
+                "Daemon is already running"
+            },
         )
     })?;
 
@@ -220,11 +232,19 @@ fn acquire_daemon_lock() -> std::io::Result<File> {
 }
 
 /// Write daemon port and PID files.
-fn write_daemon_files(port: u16) -> std::io::Result<()> {
+///
+/// - `managed=false` (dev / manual start): writes `daemon.port` / `daemon.pid`
+/// - `managed=true` (proxy-spawned): writes `daemon-managed.port` / `daemon-managed.pid`
+fn write_daemon_files(port: u16, managed: bool) -> std::io::Result<()> {
     let data_dir = get_data_dir();
+    let (port_name, pid_name) = if managed {
+        ("daemon-managed.port", "daemon-managed.pid")
+    } else {
+        ("daemon.port", "daemon.pid")
+    };
 
-    std::fs::write(data_dir.join("daemon.port"), port.to_string())?;
-    std::fs::write(data_dir.join("daemon.pid"), std::process::id().to_string())?;
+    std::fs::write(data_dir.join(port_name), port.to_string())?;
+    std::fs::write(data_dir.join(pid_name), std::process::id().to_string())?;
 
     Ok(())
 }
@@ -234,22 +254,71 @@ fn write_daemon_files(port: u16) -> std::io::Result<()> {
 /// This bridges between the browser extension (via Native Messaging on stdin/stdout)
 /// and the daemon (via ZeroMQ). Uses full-duplex communication to allow receiving
 /// messages (like cancel requests or browser tool responses) while streaming.
-async fn run_proxy(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    use nevoflux_bridge::{run_async_proxy, AsyncProxyConfig, BridgeConfig};
+async fn run_proxy(verbose: bool, dev_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use nevoflux_bridge::{run_async_proxy, AsyncProxyConfig, BridgeConfig, ConnectionMode};
     use tokio::io::{stdin, stdout};
 
     // Initialize logging to file only (stdout/stderr must be silent for Native Messaging)
     let log_file = get_data_dir().join("proxy.log");
     logging::init_file_only_logging(log_file, verbose);
 
-    tracing::debug!("Starting async proxy mode (full-duplex)");
+    let mode = if dev_mode {
+        ConnectionMode::Dev
+    } else {
+        ConnectionMode::Prod
+    };
 
-    let bridge_config = BridgeConfig::new().with_data_dir(get_data_dir());
+    tracing::debug!("Starting async proxy mode (full-duplex, {:?})", mode);
+
+    let bridge_config = BridgeConfig::new()
+        .with_mode(mode)
+        .with_data_dir(get_data_dir());
     let config = AsyncProxyConfig::new().with_bridge(bridge_config);
 
-    run_async_proxy(stdin(), stdout(), config).await?;
+    let result = run_async_proxy(stdin(), stdout(), config).await?;
+
+    // In prod mode, clean up the spawned daemon
+    if let Some(pid) = result.spawned_daemon_pid {
+        tracing::info!("Proxy shutting down, killing spawned daemon PID {}", pid);
+        kill_process(pid);
+    }
 
     Ok(())
+}
+
+/// Kill a process by PID. Sends SIGTERM, waits, then SIGKILL if needed.
+#[cfg(unix)]
+fn kill_process(pid: u32) {
+    use std::process::Command;
+
+    // Send SIGTERM
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .output();
+
+    // Wait up to 3s for graceful shutdown
+    for _ in 0..30 {
+        if !is_process_running(pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Force kill if still running
+    if is_process_running(pid) {
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .output();
+    }
+}
+
+/// Kill a process by PID on Windows.
+#[cfg(windows)]
+fn kill_process(pid: u32) {
+    use std::process::Command;
+    let _ = Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .output();
 }
 
 /// Run the MCP server mode.
@@ -281,7 +350,13 @@ async fn run_mcp(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Run the daemon.
-async fn run_daemon(verbose: bool, trace: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_daemon(
+    verbose: bool,
+    trace: bool,
+    port_start: Option<u16>,
+    port_end: Option<u16>,
+    managed: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     logging::init_logging(verbose, None);
 
@@ -299,7 +374,7 @@ async fn run_daemon(verbose: bool, trace: bool) -> Result<(), Box<dyn std::error
     logging::log_startup(env!("CARGO_PKG_VERSION"));
 
     // Acquire lock
-    let _lock = match acquire_daemon_lock() {
+    let _lock = match acquire_daemon_lock(managed) {
         Ok(lock) => lock,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             eprintln!("Error: Daemon is already running");
@@ -319,29 +394,41 @@ async fn run_daemon(verbose: bool, trace: bool) -> Result<(), Box<dyn std::error
     );
 
     // Start server
-    let config = nevoflux_daemon::ServerConfig {
+    let mut config = nevoflux_daemon::ServerConfig {
         trace_enabled,
+        managed,
         ..Default::default()
     };
+    if let Some(ps) = port_start {
+        config.port_start = ps;
+    }
+    if let Some(pe) = port_end {
+        config.port_end = pe;
+    }
     let router = std::sync::Arc::new(nevoflux_daemon::Router::new());
 
     let server = nevoflux_daemon::start_server(config, router, session_manager).await?;
     let port = server.port();
 
-    // Write port/pid files
-    write_daemon_files(port)?;
+    // Write port/pid files (managed daemons use separate files)
+    write_daemon_files(port, managed)?;
 
-    tracing::info!("Daemon started on port {}", port);
+    tracing::info!("Daemon started on port {} (managed={})", port, managed);
 
     // Wait for shutdown signal
     tokio::signal::ctrl_c().await?;
 
     logging::log_shutdown();
 
-    // Cleanup
+    // Cleanup (remove the same files we wrote)
     let data_dir = get_data_dir();
-    let _ = std::fs::remove_file(data_dir.join("daemon.port"));
-    let _ = std::fs::remove_file(data_dir.join("daemon.pid"));
+    let (port_name, pid_name) = if managed {
+        ("daemon-managed.port", "daemon-managed.pid")
+    } else {
+        ("daemon.port", "daemon.pid")
+    };
+    let _ = std::fs::remove_file(data_dir.join(port_name));
+    let _ = std::fs::remove_file(data_dir.join(pid_name));
 
     Ok(())
 }
@@ -598,8 +685,21 @@ async fn main() {
     }
 
     // Handle flags
+    let dev_mode = cli.dev
+        || std::env::var("NEVOFLUX_DEV")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
     if cli.daemon {
-        if let Err(e) = run_daemon(cli.verbose, cli.trace).await {
+        if let Err(e) = run_daemon(
+            cli.verbose,
+            cli.trace,
+            cli.port_start,
+            cli.port_end,
+            cli.managed,
+        )
+        .await
+        {
             eprintln!("Daemon error: {}", e);
             std::process::exit(1);
         }
@@ -612,7 +712,7 @@ async fn main() {
         run_status();
     } else if cli.stop {
         run_stop();
-    } else if let Err(e) = run_proxy(cli.verbose).await {
+    } else if let Err(e) = run_proxy(cli.verbose, dev_mode).await {
         eprintln!("Proxy error: {}", e);
         std::process::exit(1);
     }
@@ -718,7 +818,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         std::env::set_var("NEVOFLUX_DATA_DIR", temp.path());
 
-        let lock = acquire_daemon_lock();
+        let lock = acquire_daemon_lock(false);
         assert!(lock.is_ok());
 
         std::env::remove_var("NEVOFLUX_DATA_DIR");

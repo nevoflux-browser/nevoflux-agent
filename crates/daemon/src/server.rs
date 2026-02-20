@@ -58,6 +58,10 @@ pub struct ServerConfig {
     pub bind_address: String,
     /// Whether trace collection is enabled.
     pub trace_enabled: bool,
+    /// Whether this daemon is managed by a proxy (self-terminates on idle).
+    pub managed: bool,
+    /// Idle timeout before self-termination (only used when `managed` is true).
+    pub idle_timeout: std::time::Duration,
 }
 
 impl Default for ServerConfig {
@@ -67,6 +71,8 @@ impl Default for ServerConfig {
             port_end: 19600,
             bind_address: "127.0.0.1".into(),
             trace_enabled: false,
+            managed: false,
+            idle_timeout: std::time::Duration::from_secs(30),
         }
     }
 }
@@ -279,8 +285,11 @@ pub async fn start_server(
     });
 
     // Main socket I/O task - alternates between send and receive
+    let config_managed = config.managed;
+    let config_idle_timeout = config.idle_timeout;
     let mut socket = socket;
     tokio::spawn(async move {
+        let mut last_message_time = std::time::Instant::now();
         loop {
             // Try to send one message if available (non-blocking check)
             match socket_send_rx.try_recv() {
@@ -319,6 +328,7 @@ pub async fn start_server(
                                 "Socket received: type={}, proxy_id={}",
                                 msg_type, envelope.proxy_id
                             );
+                            last_message_time = std::time::Instant::now();
                             let _ = msg_tx.send((identity, envelope)).await;
                         }
                     }
@@ -327,7 +337,14 @@ pub async fn start_server(
                     error!("Receive error: {}", e);
                 }
                 Err(_) => {
-                    // Timeout - no message, continue loop
+                    // Timeout - no message, check idle
+                    if config_managed && last_message_time.elapsed() > config_idle_timeout {
+                        info!(
+                            "Managed daemon: idle for {:?}, self-terminating",
+                            config_idle_timeout
+                        );
+                        break;
+                    }
                 }
             }
 

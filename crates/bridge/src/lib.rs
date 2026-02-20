@@ -66,8 +66,8 @@ pub mod proxy;
 pub mod streaming;
 
 // Re-export main types
-pub use async_proxy::{run_async_proxy, AsyncProxyConfig, StdinMessage, StdoutMessage};
-pub use config::BridgeConfig;
+pub use async_proxy::{run_async_proxy, AsyncProxyConfig, ProxyResult, StdinMessage, StdoutMessage};
+pub use config::{BridgeConfig, ConnectionMode};
 pub use daemon_client::{generate_proxy_id, DaemonClient, DaemonMessageStream};
 pub use error::{BridgeError, Result};
 pub use mcp_bridge::{error_codes, McpBridge, McpBridgeConfig, McpBridgeState};

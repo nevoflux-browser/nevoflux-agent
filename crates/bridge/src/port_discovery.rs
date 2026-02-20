@@ -173,8 +173,24 @@ pub async fn launch_daemon(executable: &Path, config: &BridgeConfig) -> Result<u
 
     info!("Launching daemon: {}", executable.display());
 
-    let child = Command::new(executable)
-        .arg("--daemon")
+    let mut cmd = Command::new(executable);
+    cmd.arg("--daemon");
+
+    // Pass port range so spawned daemon uses the correct ports
+    cmd.arg("--port-start")
+        .arg(config.port_range_start.to_string());
+    cmd.arg("--port-end")
+        .arg(config.port_range_end.to_string());
+
+    // Mark as managed so daemon self-terminates on idle
+    cmd.arg("--managed");
+
+    // CRITICAL: redirect stdout/stderr to null so daemon output does not
+    // pollute the proxy's Native Messaging channel (stdout = protocol wire).
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+
+    let child = cmd
         .spawn()
         .map_err(|e| BridgeError::DaemonLaunchFailed(e.to_string()))?;
 

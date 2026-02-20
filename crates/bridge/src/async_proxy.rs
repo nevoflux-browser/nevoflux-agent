@@ -22,7 +22,7 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
-use crate::config::BridgeConfig;
+use crate::config::{BridgeConfig, ConnectionMode};
 use crate::daemon_client::{generate_proxy_id, DaemonClient};
 use crate::error::{BridgeError, Result};
 use crate::native_messaging::{read_message, write_message};
@@ -96,13 +96,25 @@ impl AsyncProxyConfig {
     }
 }
 
+/// Result from running the async proxy, including lifecycle info.
+#[derive(Debug)]
+pub struct ProxyResult {
+    /// PID of a daemon that was spawned by the proxy (prod mode only).
+    /// `None` if the proxy connected to a pre-existing daemon (dev mode or already running).
+    pub spawned_daemon_pid: Option<u32>,
+}
+
 /// Run the async proxy with full-duplex communication.
 ///
 /// This spawns three tasks:
 /// - stdin_task: reads from stdin and sends to socket_task
 /// - stdout_task: receives from socket_task and writes to stdout
 /// - socket_task: handles bidirectional ZeroMQ communication using select!
-pub async fn run_async_proxy<R, W>(reader: R, writer: W, config: AsyncProxyConfig) -> Result<()>
+pub async fn run_async_proxy<R, W>(
+    reader: R,
+    writer: W,
+    config: AsyncProxyConfig,
+) -> Result<ProxyResult>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -118,8 +130,16 @@ where
     // Create daemon client
     let mut daemon_client = DaemonClient::new(&proxy_id, config.bridge.clone());
 
-    // Connect to daemon (with auto-launch if enabled)
-    connect_to_daemon(&mut daemon_client, &config.bridge).await?;
+    // Connect to daemon using mode-specific strategy
+    let spawned_pid = match config.bridge.mode {
+        ConnectionMode::Dev => {
+            connect_dev_mode(&mut daemon_client, &config.bridge).await?;
+            None
+        }
+        ConnectionMode::Prod => {
+            connect_prod_mode(&mut daemon_client, &config.bridge).await?
+        }
+    };
     info!("Proxy {} connected to daemon", proxy_id);
 
     // Send initial connected message
@@ -189,18 +209,59 @@ where
     let _ = shutdown_tx.send(());
 
     info!("Async proxy {} shutting down", proxy_id);
-    Ok(())
+    Ok(ProxyResult {
+        spawned_daemon_pid: spawned_pid,
+    })
 }
 
-/// Connect to daemon, optionally auto-launching if not running.
-async fn connect_to_daemon(client: &mut DaemonClient, config: &BridgeConfig) -> Result<()> {
+/// Dev mode: connect to a manually-started daemon on fixed port 19500.
+///
+/// Retries TCP connection at 500ms intervals for up to 10s.
+/// Does not auto-launch daemon.
+async fn connect_dev_mode(client: &mut DaemonClient, config: &BridgeConfig) -> Result<()> {
+    let port = config.port_range_start;
+    let addr = format!("127.0.0.1:{}", port);
+    let timeout = config.connect_timeout;
+    let start = std::time::Instant::now();
+
+    info!("Dev mode: connecting to daemon on port {}", port);
+
+    loop {
+        match tokio::net::TcpStream::connect(&addr).await {
+            Ok(_) => {
+                debug!("Dev mode: TCP probe succeeded on port {}", port);
+                break;
+            }
+            Err(_) => {
+                if start.elapsed() > timeout {
+                    return Err(BridgeError::ConnectionFailed(format!(
+                        "Dev mode: daemon not responding on port {}. Start with: nevoflux --daemon",
+                        port
+                    )));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+
+    // TCP probe succeeded, now do the ZMQ connect
+    client.connect().await
+}
+
+/// Prod mode: connect to daemon, auto-launching if not running.
+///
+/// Returns `Some(pid)` when daemon was spawned, `None` if a pre-existing daemon was found.
+async fn connect_prod_mode(
+    client: &mut DaemonClient,
+    config: &BridgeConfig,
+) -> Result<Option<u32>> {
     match client.connect().await {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(None),
         Err(e) => {
             debug!("Initial connection failed: {}", e);
 
             if config.auto_launch_daemon {
-                info!("Attempting to auto-launch daemon");
+                info!("Prod mode: attempting to auto-launch daemon");
 
                 let exe_path = std::env::current_exe().map_err(|e| {
                     BridgeError::DaemonLaunchFailed(format!("Failed to get executable path: {}", e))
@@ -209,9 +270,8 @@ async fn connect_to_daemon(client: &mut DaemonClient, config: &BridgeConfig) -> 
                 match launch_daemon(&exe_path, config).await {
                     Ok(pid) => {
                         info!("Daemon launched with PID {}", pid);
-
-                        // Retry connection
-                        client.connect().await
+                        client.connect().await?;
+                        Ok(Some(pid))
                     }
                     Err(e) => {
                         warn!("Failed to auto-launch daemon: {}", e);

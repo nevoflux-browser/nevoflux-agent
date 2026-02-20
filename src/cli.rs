@@ -45,6 +45,22 @@ pub struct Cli {
     #[arg(long)]
     pub trace: bool,
 
+    /// Run proxy in dev mode (connect to manually-started daemon on port 19500)
+    #[arg(long)]
+    pub dev: bool,
+
+    /// Override daemon port range start (used when proxy spawns a daemon)
+    #[arg(long, hide = true)]
+    pub port_start: Option<u16>,
+
+    /// Override daemon port range end (used when proxy spawns a daemon)
+    #[arg(long, hide = true)]
+    pub port_end: Option<u16>,
+
+    /// Daemon self-terminates on idle (set by proxy when spawning)
+    #[arg(long, hide = true)]
+    pub managed: bool,
+
     /// Subcommand to execute
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -117,6 +133,10 @@ mod tests {
         assert!(!cli.stop);
         assert!(cli.config.is_none());
         assert!(!cli.verbose);
+        assert!(!cli.dev);
+        assert!(cli.port_start.is_none());
+        assert!(cli.port_end.is_none());
+        assert!(!cli.managed);
         assert!(cli.command.is_none());
     }
 
@@ -289,6 +309,28 @@ mod tests {
         let cli = Cli::try_parse_from(["nevoflux", "--trace", "--daemon"]).unwrap();
         assert!(cli.trace);
         assert!(cli.daemon);
+    }
+
+    #[test]
+    fn test_cli_parse_dev_flag() {
+        let cli = Cli::try_parse_from(["nevoflux", "--dev"]).unwrap();
+        assert!(cli.dev);
+    }
+
+    #[test]
+    fn test_cli_parse_port_start_end() {
+        let cli =
+            Cli::try_parse_from(["nevoflux", "--port-start", "19501", "--port-end", "19600"])
+                .unwrap();
+        assert_eq!(cli.port_start, Some(19501));
+        assert_eq!(cli.port_end, Some(19600));
+    }
+
+    #[test]
+    fn test_cli_parse_managed_flag() {
+        let cli = Cli::try_parse_from(["nevoflux", "--daemon", "--managed"]).unwrap();
+        assert!(cli.daemon);
+        assert!(cli.managed);
     }
 
     #[test]

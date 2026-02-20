@@ -4,6 +4,15 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Connection mode for the proxy-daemon link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectionMode {
+    /// Dev mode: connect to a manually-started daemon on fixed port 19500.
+    Dev,
+    /// Prod mode: auto-spawn daemon on ports 19501-19600, manage its lifecycle.
+    Prod,
+}
+
 /// Bridge configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeConfig {
@@ -21,17 +30,20 @@ pub struct BridgeConfig {
     pub auto_launch_daemon: bool,
     /// Data directory for port files, etc.
     pub data_dir: Option<PathBuf>,
+    /// Connection mode (Dev or Prod).
+    pub mode: ConnectionMode,
 }
 
 impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
-            port_range_start: 19500,
+            port_range_start: 19501,
             port_range_end: 19600,
             connect_timeout: Duration::from_secs(10),
             heartbeat_interval: Duration::from_secs(10),
             auto_launch_daemon: true,
             data_dir: None,
+            mode: ConnectionMode::Prod,
         }
     }
 }
@@ -67,6 +79,27 @@ impl BridgeConfig {
         self
     }
 
+    /// Set the connection mode and apply mode-specific defaults.
+    ///
+    /// - **Dev**: port 19500 only, auto-launch disabled
+    /// - **Prod**: ports 19501-19600, auto-launch enabled
+    pub fn with_mode(mut self, mode: ConnectionMode) -> Self {
+        self.mode = mode;
+        match mode {
+            ConnectionMode::Dev => {
+                self.port_range_start = 19500;
+                self.port_range_end = 19500;
+                self.auto_launch_daemon = false;
+            }
+            ConnectionMode::Prod => {
+                self.port_range_start = 19501;
+                self.port_range_end = 19600;
+                self.auto_launch_daemon = true;
+            }
+        }
+        self
+    }
+
     /// Set the data directory.
     pub fn with_data_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.data_dir = Some(dir.into());
@@ -82,19 +115,34 @@ impl BridgeConfig {
         }
     }
 
-    /// Get the port file path.
+    /// Get the port file path (mode-aware).
+    ///
+    /// - Dev: `daemon.port` (shared with manually-started daemon)
+    /// - Prod: `daemon-managed.port` (isolated from dev daemon)
     pub fn port_file_path(&self) -> PathBuf {
-        self.data_directory().join("daemon.port")
+        let name = match self.mode {
+            ConnectionMode::Dev => "daemon.port",
+            ConnectionMode::Prod => "daemon-managed.port",
+        };
+        self.data_directory().join(name)
     }
 
-    /// Get the PID file path.
+    /// Get the PID file path (mode-aware).
     pub fn pid_file_path(&self) -> PathBuf {
-        self.data_directory().join("daemon.pid")
+        let name = match self.mode {
+            ConnectionMode::Dev => "daemon.pid",
+            ConnectionMode::Prod => "daemon-managed.pid",
+        };
+        self.data_directory().join(name)
     }
 
-    /// Get the lock file path.
+    /// Get the lock file path (mode-aware).
     pub fn lock_file_path(&self) -> PathBuf {
-        self.data_directory().join("daemon.lock")
+        let name = match self.mode {
+            ConnectionMode::Dev => "daemon.lock",
+            ConnectionMode::Prod => "daemon-managed.lock",
+        };
+        self.data_directory().join(name)
     }
 }
 
@@ -136,12 +184,13 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = BridgeConfig::default();
-        assert_eq!(config.port_range_start, 19500);
+        assert_eq!(config.port_range_start, 19501);
         assert_eq!(config.port_range_end, 19600);
         assert_eq!(config.connect_timeout, Duration::from_secs(10));
         assert_eq!(config.heartbeat_interval, Duration::from_secs(10));
         assert!(config.auto_launch_daemon);
         assert!(config.data_dir.is_none());
+        assert_eq!(config.mode, ConnectionMode::Prod);
     }
 
     #[test]
@@ -168,8 +217,28 @@ mod tests {
     }
 
     #[test]
-    fn test_config_file_paths() {
+    fn test_config_file_paths_prod() {
         let config = BridgeConfig::new().with_data_dir("/test/dir");
+
+        assert_eq!(
+            config.port_file_path(),
+            PathBuf::from("/test/dir/daemon-managed.port")
+        );
+        assert_eq!(
+            config.pid_file_path(),
+            PathBuf::from("/test/dir/daemon-managed.pid")
+        );
+        assert_eq!(
+            config.lock_file_path(),
+            PathBuf::from("/test/dir/daemon-managed.lock")
+        );
+    }
+
+    #[test]
+    fn test_config_file_paths_dev() {
+        let config = BridgeConfig::new()
+            .with_mode(ConnectionMode::Dev)
+            .with_data_dir("/test/dir");
 
         assert_eq!(
             config.port_file_path(),
@@ -188,14 +257,39 @@ mod tests {
     #[test]
     fn test_config_json_serialization() {
         let config = BridgeConfig::new()
-            .with_port_range(19500, 19600)
+            .with_port_range(19501, 19600)
             .with_connect_timeout(Duration::from_millis(5000));
 
         let json = serde_json::to_string(&config).unwrap();
         let decoded: BridgeConfig = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(decoded.port_range_start, 19500);
+        assert_eq!(decoded.port_range_start, 19501);
         assert_eq!(decoded.connect_timeout, Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn test_config_with_mode_dev() {
+        let config = BridgeConfig::new().with_mode(ConnectionMode::Dev);
+        assert_eq!(config.mode, ConnectionMode::Dev);
+        assert_eq!(config.port_range_start, 19500);
+        assert_eq!(config.port_range_end, 19500);
+        assert!(!config.auto_launch_daemon);
+    }
+
+    #[test]
+    fn test_config_with_mode_prod() {
+        let config = BridgeConfig::new().with_mode(ConnectionMode::Prod);
+        assert_eq!(config.mode, ConnectionMode::Prod);
+        assert_eq!(config.port_range_start, 19501);
+        assert_eq!(config.port_range_end, 19600);
+        assert!(config.auto_launch_daemon);
+    }
+
+    #[test]
+    fn test_connection_mode_eq() {
+        assert_eq!(ConnectionMode::Dev, ConnectionMode::Dev);
+        assert_eq!(ConnectionMode::Prod, ConnectionMode::Prod);
+        assert_ne!(ConnectionMode::Dev, ConnectionMode::Prod);
     }
 
     #[test]

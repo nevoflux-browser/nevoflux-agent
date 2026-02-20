@@ -221,11 +221,11 @@ async fn test_port_file_discovery() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Create temp directory with port/pid files
+    // Create temp directory with port/pid files (use managed names for Prod mode)
     let temp = tempfile::TempDir::new().unwrap();
-    std::fs::write(temp.path().join("daemon.port"), port.to_string()).unwrap();
+    std::fs::write(temp.path().join("daemon-managed.port"), port.to_string()).unwrap();
     std::fs::write(
-        temp.path().join("daemon.pid"),
+        temp.path().join("daemon-managed.pid"),
         std::process::id().to_string(),
     )
     .unwrap();
