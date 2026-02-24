@@ -63,7 +63,9 @@ jobs:
       # Linux aarch64: install cross tool for Docker-based cross-compilation
       - name: Install cross
         if: matrix.use_cross == true
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: |
+          curl -fsSL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-gnu.tar.gz \
+            | sudo tar xz -C /usr/local/bin
 
       - name: Build
         if: ${{ !matrix.use_cross }}
