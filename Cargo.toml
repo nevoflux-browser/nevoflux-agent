@@ -31,7 +31,7 @@ repository = "https://github.com/user/nevoflux-agent"
 
 [workspace.dependencies]
 # LLM Framework
-rig-core = "0.29"
+rig-core = { version = "0.29", default-features = false, features = ["reqwest-rustls"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
