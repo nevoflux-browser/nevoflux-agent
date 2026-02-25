@@ -2283,55 +2283,8 @@ The following skill instructions MUST be followed exactly. These instructions ta
             }),
         });
 
-        // Get content
-        tools.push(ToolDefinition {
-            name: "browser_get_content".into(),
-            description: "Get the current page content as text/HTML".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "tab_id": {
-                        "type": "integer",
-                        "description": "Optional tab ID"
-                    }
-                }
-            }),
-        });
-
-        // Get markdown
-        tools.push(ToolDefinition {
-            name: "browser_get_markdown".into(),
-            description: "Get the current page content as markdown".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "tab_id": {
-                        "type": "integer",
-                        "description": "Optional tab ID"
-                    }
-                }
-            }),
-        });
-
-        // Screenshot
-        tools.push(ToolDefinition {
-            name: "browser_screenshot".into(),
-            description: "Take a screenshot of the current page".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "full_page": {
-                        "type": "boolean",
-                        "description": "Whether to capture the full page (default: false)",
-                        "default": false
-                    },
-                    "tab_id": {
-                        "type": "integer",
-                        "description": "Optional tab ID"
-                    }
-                }
-            }),
-        });
+        // NOTE: browser_get_content, browser_get_markdown, and browser_screenshot
+        // are already included via get_chat_tools() above.
 
         // Eval JS
         tools.push(ToolDefinition {
@@ -3538,9 +3491,9 @@ mod tests {
 
         let browser_tools = agent.get_browser_tools();
         let chat_tools = agent.get_chat_tools();
-        // Browser tools = chat tools + 18 browser-specific tools
-        // (14 original + browser_find_elements + browser_element_info + browser_go_back + browser_go_forward)
-        assert_eq!(browser_tools.len(), chat_tools.len() + 18);
+        // Browser tools = chat tools + 15 browser-specific interaction tools
+        // (browser_get_content, browser_get_markdown, browser_screenshot are already in chat tools)
+        assert_eq!(browser_tools.len(), chat_tools.len() + 15);
     }
 
     #[test]
