@@ -103,11 +103,17 @@ impl AgentConfig {
     /// Returns default configuration if the file doesn't exist.
     pub fn load_from_path(path: &PathBuf) -> Result<Self, ConfigError> {
         if !path.exists() {
-            warn!(
-                "Config file not found at {}, using defaults",
-                path.display()
-            );
-            return Ok(Self::default());
+            let config = Self::default();
+            if let Err(e) = config.save_to_path(path) {
+                warn!(
+                    "Failed to auto-create config file at {}: {}",
+                    path.display(),
+                    e
+                );
+            } else {
+                tracing::info!("Auto-created config file at {}", path.display());
+            }
+            return Ok(config);
         }
 
         let content = std::fs::read_to_string(path)?;
