@@ -190,6 +190,17 @@ pub async fn launch_daemon(executable: &Path, config: &BridgeConfig) -> Result<u
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
 
+    // On Windows, detach the daemon so it survives proxy shutdown.
+    // CREATE_NEW_PROCESS_GROUP (0x0000_0200) detaches from parent's console group.
+    // CREATE_NO_WINDOW (0x0800_0000) prevents a console window from appearing.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+
     let child = cmd
         .spawn()
         .map_err(|e| BridgeError::DaemonLaunchFailed(e.to_string()))?;
