@@ -265,7 +265,7 @@ async fn run_proxy(verbose: bool, dev_mode: bool) -> Result<(), Box<dyn std::err
         use windows_sys::Win32::System::Console::GetConsoleWindow;
         use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
         let hwnd = unsafe { GetConsoleWindow() };
-        if hwnd != 0 {
+        if !hwnd.is_null() {
             unsafe { ShowWindow(hwnd, SW_HIDE) };
         }
     }
