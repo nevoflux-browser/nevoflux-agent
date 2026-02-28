@@ -4450,6 +4450,27 @@ async fn handle_file_pick(params: &serde_json::Value) -> serde_json::Value {
         .and_then(|p| p.as_str())
         .map(|s| s.to_string());
 
+    // On Linux, "both" mode is not natively supported in a single dialog.
+    // Ask the sidebar to let the user choose between files or directories,
+    // then re-send file.pick with the specific mode.
+    #[cfg(target_os = "linux")]
+    if mode == PickerMode::Both {
+        info!("File picker: Both mode on Linux, asking sidebar to choose mode");
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "file.pick",
+                "success": true,
+                "data": {
+                    "choose_mode": true,
+                    "options": ["files", "directories"],
+                    "message": "Select what to pick"
+                }
+            }
+        });
+    }
+
     let req = PickFilesRequest {
         mode,
         multiple,

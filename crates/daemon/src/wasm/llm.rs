@@ -1634,8 +1634,9 @@ async fn stream_kimi_agent(
     let config = client.with_working_dir(workspace_dir);
     let model_str = model.to_string();
 
-    // Build prompt from request messages
+    // Build prompt from request messages (may be string or ContentPart[])
     let prompt = build_kimi_prompt(&request);
+    let has_media = matches!(&prompt, serde_json::Value::Array(_));
 
     // Convert tool definitions
     let tools: Vec<ToolDefinition> = request
@@ -1647,9 +1648,10 @@ async fn stream_kimi_agent(
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<WireEvent>(64);
 
     tracing::info!(
-        "stream_kimi_agent: spawning wire client, model={}, prompt_len={}, tools={}",
+        "stream_kimi_agent: spawning wire client, model={}, prompt_len={}, has_media={}, tools={}",
         model_str,
-        prompt.len(),
+        prompt.to_string().len(),
+        has_media,
         tools.len()
     );
 
@@ -1674,7 +1676,11 @@ async fn stream_kimi_agent(
         }
         tracing::info!("stream_kimi_agent: initialized successfully");
 
-        if let Err(e) = wc.send_prompt(&prompt) {
+        let send_result = match &prompt {
+            serde_json::Value::String(text) => wc.send_prompt(text),
+            _ => wc.send_prompt_multimodal(prompt),
+        };
+        if let Err(e) = send_result {
             tracing::error!("stream_kimi_agent: failed to send prompt: {}", e);
             let _ = event_tx.blocking_send(WireEvent::Unknown(format!("error: failed to send prompt: {}", e)));
             return;
@@ -1789,63 +1795,115 @@ async fn stream_kimi_agent(
 ///
 /// Kimi Agent uses a text-based wire protocol and cannot handle multimodal `Image` content
 /// natively.  We embed each image attachment as a data-URI so the model can still "see" it.
-fn format_message_with_attachments(msg: &LlmMessage) -> String {
-    let mut buf = msg.content.clone();
-
-    for att in &msg.attachments {
-        if !att.mime_type.starts_with("image/") {
-            continue;
-        }
-        // Strip data-URL prefix if present, keep raw base64
-        let b64 = if att.data.starts_with("data:") {
-            att.data
-                .find(',')
-                .map(|i| &att.data[i + 1..])
-                .unwrap_or(&att.data)
-        } else {
-            &att.data
-        };
-        buf.push_str(&format!(
-            "\n\n<image name=\"{}\" mime_type=\"{}\">\ndata:{};base64,{}\n</image>",
-            att.name, att.mime_type, att.mime_type, b64
-        ));
-    }
-
-    buf
+/// Check if any message has media attachments (image, audio, video).
+fn has_media_attachments(request: &LlmChatRequest) -> bool {
+    request.messages.iter().any(|m| {
+        m.attachments
+            .iter()
+            .any(|a| is_media_attachment(a))
+    })
 }
 
-fn build_kimi_prompt(request: &LlmChatRequest) -> String {
-    let mut parts = Vec::new();
+/// Check if an attachment is a supported media type (image, audio, video).
+fn is_media_attachment(att: &LlmAttachment) -> bool {
+    att.mime_type.starts_with("image/")
+        || att.mime_type.starts_with("audio/")
+        || att.mime_type.starts_with("video/")
+}
+
+/// Build a data URI for a media attachment.
+fn attachment_to_data_uri(att: &LlmAttachment) -> String {
+    if att.data.starts_with("data:") {
+        att.data.clone()
+    } else {
+        format!("data:{};base64,{}", att.mime_type, att.data)
+    }
+}
+
+/// Convert a media attachment to a wire protocol ContentPart.
+///
+/// Maps to `ImageURLPart`, `AudioURLPart`, or `VideoURLPart` per wire protocol v1.4.
+fn attachment_to_content_part(att: &LlmAttachment) -> Option<serde_json::Value> {
+    let url = attachment_to_data_uri(att);
+    if att.mime_type.starts_with("image/") {
+        Some(serde_json::json!({
+            "type": "image_url",
+            "image_url": { "url": url }
+        }))
+    } else if att.mime_type.starts_with("audio/") {
+        Some(serde_json::json!({
+            "type": "audio_url",
+            "audio_url": { "url": url }
+        }))
+    } else if att.mime_type.starts_with("video/") {
+        Some(serde_json::json!({
+            "type": "video_url",
+            "video_url": { "url": url }
+        }))
+    } else {
+        None
+    }
+}
+
+/// Build the kimi-agent prompt as a `serde_json::Value`.
+///
+/// Returns either a plain string (when no media) or a `ContentPart[]` array
+/// (when image/audio/video attachments are present), matching wire protocol v1.4.
+fn build_kimi_prompt(request: &LlmChatRequest) -> serde_json::Value {
+    let mut text_parts = Vec::new();
 
     if let Some(ref sys) = request.system {
         if !sys.is_empty() {
-            parts.push(format!("<system>\n{}\n</system>", sys));
+            text_parts.push(format!("<system>\n{}\n</system>", sys));
         }
     }
 
     let has_assistant = request.messages.iter().any(|m| m.role == "assistant");
 
     if has_assistant {
-        parts.push("<conversation_history>".to_string());
+        text_parts.push("<conversation_history>".to_string());
         for msg in &request.messages {
             if msg.role != "system" {
-                parts.push(format!("[{}]: {}", msg.role, format_message_with_attachments(msg)));
+                text_parts.push(format!("[{}]: {}", msg.role, msg.content));
             }
         }
-        parts.push("</conversation_history>".to_string());
-        parts.push("Continue the conversation based on the history above.".to_string());
+        text_parts.push("</conversation_history>".to_string());
+        text_parts.push("Continue the conversation based on the history above.".to_string());
     } else {
         for msg in &request.messages {
-            if msg.role != "system" {
-                let text = format_message_with_attachments(msg);
-                if !text.is_empty() {
-                    parts.push(text);
-                }
+            if msg.role != "system" && !msg.content.is_empty() {
+                text_parts.push(msg.content.clone());
             }
         }
     }
 
-    parts.join("\n\n")
+    let prompt_text = text_parts.join("\n\n");
+
+    // If there are media attachments, use ContentPart[] format
+    if has_media_attachments(request) {
+        let mut content_parts: Vec<serde_json::Value> = Vec::new();
+
+        // Add text part
+        if !prompt_text.is_empty() {
+            content_parts.push(serde_json::json!({
+                "type": "text",
+                "text": prompt_text
+            }));
+        }
+
+        // Add media parts (image/audio/video) from all messages
+        for msg in &request.messages {
+            for att in &msg.attachments {
+                if let Some(part) = attachment_to_content_part(att) {
+                    content_parts.push(part);
+                }
+            }
+        }
+
+        serde_json::Value::Array(content_parts)
+    } else {
+        serde_json::Value::String(prompt_text)
+    }
 }
 
 /// Generic streaming completion for any rig-compatible model.

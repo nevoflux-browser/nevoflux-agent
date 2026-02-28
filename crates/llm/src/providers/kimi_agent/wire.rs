@@ -251,6 +251,18 @@ impl WireClient {
         Ok(())
     }
 
+    /// Send a multimodal prompt (text + images) to the agent.
+    ///
+    /// Uses the `ContentPart[]` format for `user_input` as defined in wire protocol v1.4.
+    pub fn send_prompt_multimodal(&mut self, user_input: Value) -> Result<(), String> {
+        let params = serde_json::json!({ "user_input": user_input });
+        let id = self.next_request_id();
+        let request = JsonRpcRequest::new(id, "prompt", Some(params));
+        self.send_message(&serde_json::to_value(&request).map_err(|e| e.to_string())?)?;
+        self.state = WireState::InTurn;
+        Ok(())
+    }
+
     /// Send a tool result back to the agent in response to a ToolCallRequest.
     ///
     /// `request_id` is the JSON-RPC id from the incoming Request message.

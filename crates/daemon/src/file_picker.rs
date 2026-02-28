@@ -282,6 +282,9 @@ if ($folder -ne $null) {{
 }
 
 /// Linux implementation using rfd.
+///
+/// Note: `Both` mode is handled at the server level by asking the sidebar
+/// to choose between files or directories before reaching this function.
 #[cfg(target_os = "linux")]
 async fn pick_files_impl(req: PickFilesRequest) -> Result<PickFilesResponse, PickFilesError> {
     pick_files_rfd(req).await
