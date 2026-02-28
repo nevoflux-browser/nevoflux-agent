@@ -100,6 +100,14 @@ impl ClaudeCodeCompletionModel {
             cmd.env("ANTHROPIC_API_KEY", api_key);
         }
 
+        // On Windows, hide the console window for the CLI subprocess
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
         cmd
     }
 }

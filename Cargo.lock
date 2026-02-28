@@ -2670,6 +2670,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wat",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

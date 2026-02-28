@@ -212,6 +212,14 @@ impl RmcpClient {
             .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true);
 
+        // On Windows, hide the console window for MCP server subprocesses
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
         let transport = TokioChildProcess::new(cmd)
             .map_err(|e| McpError::SpawnFailed(format!("{}: {:?}", command, e)))?;
 

@@ -14,7 +14,7 @@ use rig::client::CompletionClient;
 use rig::client::Nothing;
 use rig::completion::{CompletionModel, ToolDefinition};
 use rig::message::{
-    AssistantContent, DocumentSourceKind, Image, ImageMediaType, Message, Text,
+    AssistantContent, DocumentSourceKind, Image, ImageDetail, ImageMediaType, Message, Text,
     ToolCall as RigToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
 };
 use rig::providers::{
@@ -720,7 +720,7 @@ where
                             content: OneOrMany::one(UserContent::Image(Image {
                                 data: DocumentSourceKind::Base64(clean_b64),
                                 media_type: Some(detected_media_type),
-                                detail: None,
+                                detail: Some(ImageDetail::Auto),
                                 additional_params: None,
                             })),
                         });
@@ -773,7 +773,7 @@ where
                                     content: OneOrMany::one(UserContent::Image(Image {
                                         data: DocumentSourceKind::Base64(screenshot.base64_data),
                                         media_type: Some(detected_media_type),
-                                        detail: None,
+                                        detail: Some(ImageDetail::Auto),
                                         additional_params: None,
                                     })),
                                 });
@@ -901,7 +901,7 @@ where
                         user_content.push(UserContent::Image(Image {
                             data: DocumentSourceKind::Base64(clean_base64),
                             media_type: Some(detected_media_type),
-                            detail: None,
+                            detail: Some(ImageDetail::Auto),
                             additional_params: None,
                         }));
                     }
@@ -1201,6 +1201,9 @@ pub struct LlmStreamChunk {
     /// Whether this is the final chunk.
     #[serde(default)]
     pub done: bool,
+    /// Reasoning/thinking content from LLM (provider-agnostic).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// Stream entry for tracking active LLM streams.
@@ -1321,6 +1324,7 @@ pub async fn start_llm_stream(
                     text: Some(format!("[Error: {}]", e)),
                     tool_calls: vec![],
                     done: true,
+                    reasoning: None,
                 })
                 .await;
         }
@@ -1720,6 +1724,7 @@ async fn stream_kimi_agent(
                         text: Some(text),
                         tool_calls: vec![],
                         done: false,
+                        reasoning: None,
                     })
                     .await;
             }
@@ -1737,6 +1742,16 @@ async fn stream_kimi_agent(
                 });
             }
             WireEvent::TurnEnd => break,
+            WireEvent::ThinkingPart { text } => {
+                let _ = tx
+                    .send(LlmStreamChunk {
+                        text: None,
+                        tool_calls: vec![],
+                        done: false,
+                        reasoning: Some(text),
+                    })
+                    .await;
+            }
             WireEvent::Unknown(ref msg) if msg.starts_with("error") => {
                 tracing::warn!("stream_kimi_agent: error event: {}", msg);
                 let _ = tx
@@ -1744,11 +1759,12 @@ async fn stream_kimi_agent(
                         text: Some(format!("\n\n[kimi-agent error] {}", msg)),
                         tool_calls: vec![],
                         done: false,
+                        reasoning: None,
                     })
                     .await;
                 break;
             }
-            // Skip informational events: TurnBegin, StepBegin, ThinkingPart,
+            // Skip informational events: TurnBegin, StepBegin,
             // StatusUpdate, ToolCall (built-in), ToolCallPart, ToolResult,
             // CompactionBegin/End, SubagentEvent, Unknown
             _ => {}
@@ -1761,6 +1777,7 @@ async fn stream_kimi_agent(
             text: None,
             tool_calls,
             done: true,
+            reasoning: None,
         })
         .await;
 
@@ -1768,6 +1785,35 @@ async fn stream_kimi_agent(
 }
 
 /// Build a kimi-agent prompt string from an LLM chat request.
+/// Format a message's text content together with any image attachments as inline base64.
+///
+/// Kimi Agent uses a text-based wire protocol and cannot handle multimodal `Image` content
+/// natively.  We embed each image attachment as a data-URI so the model can still "see" it.
+fn format_message_with_attachments(msg: &LlmMessage) -> String {
+    let mut buf = msg.content.clone();
+
+    for att in &msg.attachments {
+        if !att.mime_type.starts_with("image/") {
+            continue;
+        }
+        // Strip data-URL prefix if present, keep raw base64
+        let b64 = if att.data.starts_with("data:") {
+            att.data
+                .find(',')
+                .map(|i| &att.data[i + 1..])
+                .unwrap_or(&att.data)
+        } else {
+            &att.data
+        };
+        buf.push_str(&format!(
+            "\n\n<image name=\"{}\" mime_type=\"{}\">\ndata:{};base64,{}\n</image>",
+            att.name, att.mime_type, att.mime_type, b64
+        ));
+    }
+
+    buf
+}
+
 fn build_kimi_prompt(request: &LlmChatRequest) -> String {
     let mut parts = Vec::new();
 
@@ -1783,15 +1829,18 @@ fn build_kimi_prompt(request: &LlmChatRequest) -> String {
         parts.push("<conversation_history>".to_string());
         for msg in &request.messages {
             if msg.role != "system" {
-                parts.push(format!("[{}]: {}", msg.role, msg.content));
+                parts.push(format!("[{}]: {}", msg.role, format_message_with_attachments(msg)));
             }
         }
         parts.push("</conversation_history>".to_string());
         parts.push("Continue the conversation based on the history above.".to_string());
     } else {
         for msg in &request.messages {
-            if msg.role != "system" && !msg.content.is_empty() {
-                parts.push(msg.content.clone());
+            if msg.role != "system" {
+                let text = format_message_with_attachments(msg);
+                if !text.is_empty() {
+                    parts.push(text);
+                }
             }
         }
     }
@@ -1892,7 +1941,7 @@ where
                             content: OneOrMany::one(UserContent::Image(Image {
                                 data: DocumentSourceKind::Base64(clean_b64),
                                 media_type: Some(detected_media_type),
-                                detail: None,
+                                detail: Some(ImageDetail::Auto),
                                 additional_params: None,
                             })),
                         });
@@ -1945,7 +1994,7 @@ where
                                     content: OneOrMany::one(UserContent::Image(Image {
                                         data: DocumentSourceKind::Base64(screenshot.base64_data),
                                         media_type: Some(detected_media_type),
-                                        detail: None,
+                                        detail: Some(ImageDetail::Auto),
                                         additional_params: None,
                                     })),
                                 });
@@ -2066,7 +2115,7 @@ where
                         user_content.push(UserContent::Image(Image {
                             data: DocumentSourceKind::Base64(clean_base64),
                             media_type: Some(detected_media_type),
-                            detail: None,
+                            detail: Some(ImageDetail::Auto),
                             additional_params: None,
                         }));
                     } else {
@@ -2268,6 +2317,7 @@ where
                         )),
                         tool_calls: vec![],
                         done: false,
+                        reasoning: None,
                     })
                     .await;
                 break;
@@ -2292,6 +2342,7 @@ where
                             text: Some(text.text),
                             tool_calls: vec![],
                             done: false,
+                            reasoning: None,
                         }
                     }
                     StreamedAssistantContent::ToolCall(tc) => {
@@ -2325,6 +2376,7 @@ where
                             text: None,
                             tool_calls: vec![tool_call],
                             done: false,
+                            reasoning: None,
                         }
                     }
                     StreamedAssistantContent::ToolCallDelta { id, content } => {
@@ -2356,17 +2408,19 @@ where
                     StreamedAssistantContent::Reasoning(reasoning) => {
                         tracing::debug!("Stream chunk: Reasoning");
                         LlmStreamChunk {
-                            text: Some(format!("[Reasoning]: {}", reasoning.reasoning.join(" "))),
+                            text: None,
                             tool_calls: vec![],
                             done: false,
+                            reasoning: Some(reasoning.reasoning.join(" ")),
                         }
                     }
                     StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
                         tracing::debug!("Stream chunk: ReasoningDelta({})", reasoning);
                         LlmStreamChunk {
-                            text: Some(reasoning),
+                            text: None,
                             tool_calls: vec![],
                             done: false,
+                            reasoning: Some(reasoning),
                         }
                     }
                     StreamedAssistantContent::Final(_) => {
@@ -2399,6 +2453,7 @@ where
                         text: Some(error_text),
                         tool_calls: vec![],
                         done: false,
+                        reasoning: None,
                     })
                     .await;
                 break;
@@ -2433,6 +2488,7 @@ where
             text: None,
             tool_calls: final_tool_calls,
             done: true,
+            reasoning: None,
         })
         .await;
 
@@ -2803,6 +2859,7 @@ mod tests {
             text: Some("Hello".into()),
             tool_calls: vec![],
             done: false,
+            reasoning: None,
         };
 
         let json = serde_json::to_string(&chunk).unwrap();
@@ -2826,6 +2883,7 @@ mod tests {
                 signature: None,
             }],
             done: false,
+            reasoning: None,
         };
 
         let json = serde_json::to_string(&chunk).unwrap();
@@ -2839,6 +2897,7 @@ mod tests {
             text: None,
             tool_calls: vec![],
             done: true,
+            reasoning: None,
         };
 
         assert!(chunk.done);
@@ -2875,6 +2934,7 @@ mod tests {
             text: Some("Hello".into()),
             tool_calls: vec![],
             done: false,
+            reasoning: None,
         })
         .await
         .unwrap();
@@ -2905,6 +2965,7 @@ mod tests {
             text: None,
             tool_calls: vec![],
             done: true,
+            reasoning: None,
         })
         .await
         .unwrap();

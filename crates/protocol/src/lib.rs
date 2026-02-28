@@ -41,7 +41,8 @@ pub use chat::{
     ArtifactStart, AuthOption, BrowserToolRequest, BrowserToolResponse, ChatMessage, ContentBlock,
     ErrorMessage, PermissionRequest, PermissionResponse, PlanProposal, PlanResponse, PlanStep,
     PluginCommand, SidebarMessage, SkillCommand, StopGeneration, StreamChunk, StreamEnd,
-    SystemCommand, SystemResponse, TabInfo, ToolAuthRequest, ToolAuthResponse, ToolEvent,
+    SystemCommand, SystemResponse, TabInfo, ThinkingEvent, ToolAuthRequest, ToolAuthResponse,
+    ToolEvent,
 };
 
 // Re-export MCP messages

@@ -125,6 +125,8 @@ pub struct SidebarStreamChunk {
     pub done: bool,
     /// Optional tool event to send alongside the text stream.
     pub event: Option<nevoflux_protocol::ToolEvent>,
+    /// Optional thinking event for reasoning content.
+    pub thinking_event: Option<nevoflux_protocol::ThinkingEvent>,
 }
 
 /// Daemon's implementation of HostFunctions for the Agent.
@@ -160,6 +162,8 @@ pub struct DaemonHostFunctions {
     /// Sandbox directory for subagent writes. When set, tool_write and tool_edit
     /// are restricted to paths within this directory.
     subagent_sandbox: Option<String>,
+    /// Current thinking block ID for reasoning→ThinkingEvent conversion.
+    current_thinking_id: Arc<Mutex<Option<String>>>,
 }
 
 impl DaemonHostFunctions {
@@ -180,6 +184,7 @@ impl DaemonHostFunctions {
             model_override_model: Arc::new(Mutex::new(None)),
             skill_base_path: None,
             subagent_sandbox: None,
+            current_thinking_id: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -802,6 +807,43 @@ impl HostFunctions for DaemonHostFunctions {
                     }
                 }
 
+                // Convert reasoning content to ThinkingEvent for sidebar display
+                if let Some(ref reasoning) = chunk.reasoning {
+                    let thinking_id = {
+                        let mut guard = self.current_thinking_id.lock().unwrap();
+                        match guard.as_ref() {
+                            Some(id) => id.clone(),
+                            None => {
+                                let id = uuid::Uuid::new_v4().to_string();
+                                *guard = Some(id.clone());
+                                let _ = self.stream_thinking_event(
+                                    nevoflux_protocol::ThinkingEvent::Start {
+                                        thinking_id: id.clone(),
+                                    },
+                                );
+                                id
+                            }
+                        }
+                    };
+                    let _ = self.stream_thinking_event(
+                        nevoflux_protocol::ThinkingEvent::Delta {
+                            thinking_id,
+                            content: reasoning.clone(),
+                        },
+                    );
+                } else if chunk.text.is_some() || chunk.done {
+                    // Reasoning ended — text chunk or done signal after reasoning
+                    let ended_id = self.current_thinking_id.lock().unwrap().take();
+                    if let Some(id) = ended_id {
+                        let _ = self.stream_thinking_event(
+                            nevoflux_protocol::ThinkingEvent::End {
+                                thinking_id: id,
+                                duration_ms: None,
+                            },
+                        );
+                    }
+                }
+
                 // Convert daemon chunk to builtin-wasm chunk, preserving call_id
                 let wasm_chunk = nevoflux_builtin_wasm::LlmChunk {
                     text: chunk.text,
@@ -830,6 +872,15 @@ impl HostFunctions for DaemonHostFunctions {
 
     fn llm_stream_close(&self, stream_id: u64) -> HostResult<()> {
         debug!("llm_stream_close: stream_id={}", stream_id);
+
+        // End any open thinking block before closing the stream
+        let ended_id = self.current_thinking_id.lock().unwrap().take();
+        if let Some(id) = ended_id {
+            let _ = self.stream_thinking_event(nevoflux_protocol::ThinkingEvent::End {
+                thinking_id: id,
+                duration_ms: None,
+            });
+        }
 
         // Record trace for this stream
         if let Some(tc) = &self.trace_collector {
@@ -1370,6 +1421,14 @@ impl HostFunctions for DaemonHostFunctions {
                     .map(|_| ())
                     .map_err(|e| std::io::Error::other(format!("setsid failed: {}", e)))
             });
+        }
+
+        // On Windows, hide the console window for shell subprocesses
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
         let child = cmd.spawn().map_err(|e| HostError {
@@ -2564,6 +2623,7 @@ impl HostFunctions for DaemonHostFunctions {
                 text: text.to_string(),
                 done: false,
                 event: None,
+                thinking_event: None,
             };
             tx.send(chunk).map_err(|_| HostError {
                 code: 500,
@@ -2583,6 +2643,7 @@ impl HostFunctions for DaemonHostFunctions {
                 text: String::new(),
                 done: true,
                 event: None,
+                thinking_event: None,
             };
             tx.send(chunk).map_err(|_| HostError {
                 code: 500,
@@ -2625,6 +2686,27 @@ impl DaemonHostFunctions {
                 text: String::new(),
                 done: false,
                 event: Some(event),
+                thinking_event: None,
+            };
+            tx.send(chunk).map_err(|_| HostError {
+                code: 500,
+                message: "stream closed".to_string(),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Send a thinking event to the sidebar without any text content.
+    pub fn stream_thinking_event(
+        &self,
+        event: nevoflux_protocol::ThinkingEvent,
+    ) -> HostResult<()> {
+        if let Some(tx) = &self.sidebar_stream_tx {
+            let chunk = SidebarStreamChunk {
+                text: String::new(),
+                done: false,
+                event: None,
+                thinking_event: Some(event),
             };
             tx.send(chunk).map_err(|_| HostError {
                 code: 500,
@@ -2651,6 +2733,7 @@ impl DaemonHostFunctions {
             model_override_model: self.model_override_model.clone(),
             skill_base_path: self.skill_base_path.clone(),
             subagent_sandbox: self.subagent_sandbox.clone(),
+            current_thinking_id: Arc::new(Mutex::new(None)),
         }
     }
 

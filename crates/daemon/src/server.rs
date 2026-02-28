@@ -1221,7 +1221,7 @@ async fn handle_chat_message_streaming(
 
         // Helper closure to build and send a chunk payload
         macro_rules! send_chunk {
-            ($text:expr, $done:expr, $event:expr, $first:expr) => {{
+            ($text:expr, $done:expr, $event:expr, $thinking:expr, $first:expr) => {{
                 let mut chunk_payload = serde_json::json!({
                     "type": "stream_chunk",
                     "payload": {
@@ -1232,6 +1232,11 @@ async fn handle_chat_message_streaming(
                 if let Some(event) = $event {
                     if let Some(p) = chunk_payload.get_mut("payload") {
                         p["event"] = serde_json::to_value(event).unwrap_or_default();
+                    }
+                }
+                if let Some(thinking) = $thinking {
+                    if let Some(p) = chunk_payload.get_mut("payload") {
+                        p["thinking_event"] = serde_json::to_value(thinking).unwrap_or_default();
                     }
                 }
                 if $first {
@@ -1265,7 +1270,7 @@ async fn handle_chat_message_streaming(
                         let text = std::mem::take(&mut buffer);
                         let is_first = accumulated_text.is_empty();
                         accumulated_text.push_str(&text);
-                        if let Err(e) = send_chunk!(text, false, None::<&serde_json::Value>, is_first) {
+                        if let Err(e) = send_chunk!(text, false, None::<&serde_json::Value>, None::<&nevoflux_protocol::ThinkingEvent>, is_first) {
                             error!("Failed to send stream chunk: {}", e);
                             break;
                         }
@@ -1276,13 +1281,13 @@ async fn handle_chat_message_streaming(
                 chunk = stream_rx.recv() => {
                     match chunk {
                         Some(chunk) => {
-                            if chunk.event.is_some() {
-                                // Tool event: flush text buffer first, then send event immediately
+                            if chunk.event.is_some() || chunk.thinking_event.is_some() {
+                                // Tool/thinking event: flush text buffer first, then send event immediately
                                 if !buffer.is_empty() {
                                     let text = std::mem::take(&mut buffer);
                                     let is_first = accumulated_text.is_empty();
                                     accumulated_text.push_str(&text);
-                                    if let Err(e) = send_chunk!(text, false, None::<&serde_json::Value>, is_first) {
+                                    if let Err(e) = send_chunk!(text, false, None::<&serde_json::Value>, None::<&nevoflux_protocol::ThinkingEvent>, is_first) {
                                         error!("Failed to send stream chunk: {}", e);
                                         break;
                                     }
@@ -1290,7 +1295,7 @@ async fn handle_chat_message_streaming(
                                 // Send event chunk with any accompanying text
                                 let is_first = accumulated_text.is_empty();
                                 accumulated_text.push_str(&chunk.text);
-                                if let Err(e) = send_chunk!(chunk.text, chunk.done, chunk.event.as_ref(), is_first) {
+                                if let Err(e) = send_chunk!(chunk.text, chunk.done, chunk.event.as_ref(), chunk.thinking_event.as_ref(), is_first) {
                                     error!("Failed to send stream chunk: {}", e);
                                     break;
                                 }
@@ -1307,7 +1312,7 @@ async fn handle_chat_message_streaming(
                                 let text = std::mem::take(&mut buffer);
                                 let is_first = accumulated_text.is_empty();
                                 accumulated_text.push_str(&text);
-                                if let Err(e) = send_chunk!(text, true, None::<&serde_json::Value>, is_first) {
+                                if let Err(e) = send_chunk!(text, true, None::<&serde_json::Value>, None::<&nevoflux_protocol::ThinkingEvent>, is_first) {
                                     error!("Failed to send stream chunk: {}", e);
                                 }
                                 debug!(
@@ -1326,7 +1331,7 @@ async fn handle_chat_message_streaming(
                                 let text = std::mem::take(&mut buffer);
                                 let is_first = accumulated_text.is_empty();
                                 accumulated_text.push_str(&text);
-                                let _ = send_chunk!(text, false, None::<&serde_json::Value>, is_first);
+                                let _ = send_chunk!(text, false, None::<&serde_json::Value>, None::<&nevoflux_protocol::ThinkingEvent>, is_first);
                             }
                             debug!("Stream channel closed");
                             break;
@@ -1515,8 +1520,8 @@ async fn handle_chat_message_streaming(
                                     chunk = rerun_stream_rx.recv() => {
                                         match chunk {
                                             Some(chunk) => {
-                                                if chunk.event.is_some() {
-                                                    // Flush buffer, then send event immediately
+                                                if chunk.event.is_some() || chunk.thinking_event.is_some() {
+                                                    // Tool/thinking event: flush buffer, then send event immediately
                                                     if !buffer.is_empty() {
                                                         let text = std::mem::take(&mut buffer);
                                                         rerun_accumulated.push_str(&text);
@@ -1553,6 +1558,12 @@ async fn handle_chat_message_streaming(
                                                         if let Some(p) = chunk_payload.get_mut("payload") {
                                                             p["event"] =
                                                                 serde_json::to_value(event).unwrap_or_default();
+                                                        }
+                                                    }
+                                                    if let Some(thinking) = &chunk.thinking_event {
+                                                        if let Some(p) = chunk_payload.get_mut("payload") {
+                                                            p["thinking_event"] =
+                                                                serde_json::to_value(thinking).unwrap_or_default();
                                                         }
                                                     }
                                                     let response = DaemonEnvelope::new(

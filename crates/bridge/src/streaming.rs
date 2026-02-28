@@ -232,6 +232,7 @@ mod tests {
             delta: delta.to_string(),
             format: StreamFormat::Markdown,
             event: None,
+            thinking_event: None,
         }
     }
 

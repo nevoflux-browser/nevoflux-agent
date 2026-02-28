@@ -84,6 +84,14 @@ impl StdioTransport {
             cmd.env(key, value);
         }
 
+        // On Windows, hide the console window for MCP server subprocesses
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
         let mut child = cmd
             .spawn()
             .map_err(|e| McpError::SpawnFailed(format!("{}: {}", command, e)))?;

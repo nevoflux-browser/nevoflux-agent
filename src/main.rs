@@ -258,6 +258,18 @@ async fn run_proxy(verbose: bool, dev_mode: bool) -> Result<(), Box<dyn std::err
     use nevoflux_bridge::{run_async_proxy, AsyncProxyConfig, BridgeConfig, ConnectionMode};
     use tokio::io::{stdin, stdout};
 
+    // On Windows, hide the console window so proxy runs silently in the background.
+    // Other modes (daemon, mcp, status, stop) keep the console for interactive use.
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::GetConsoleWindow;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+        let hwnd = unsafe { GetConsoleWindow() };
+        if hwnd != 0 {
+            unsafe { ShowWindow(hwnd, SW_HIDE) };
+        }
+    }
+
     // Initialize logging to file only (stdout/stderr must be silent for Native Messaging)
     let log_file = get_data_dir().join("proxy.log");
     logging::init_file_only_logging(log_file, verbose);

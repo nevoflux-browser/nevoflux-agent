@@ -124,6 +124,7 @@ async fn test_streaming_bridge_integration() {
             delta: format!("Part {} ", i),
             format: StreamFormat::Markdown,
             event: None,
+            thinking_event: None,
         };
         accumulator.process_chunk(chunk).await.unwrap();
     }
@@ -230,6 +231,7 @@ async fn test_e2e_concurrent_streams() {
                 delta: format!("S{}C{}", i, j),
                 format: StreamFormat::Plain,
                 event: None,
+                thinking_event: None,
             };
             accumulator.process_chunk(chunk).await.unwrap();
         }

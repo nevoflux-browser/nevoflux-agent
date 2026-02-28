@@ -128,6 +128,9 @@ pub struct StreamChunk {
     /// Optional tool event for real-time sidebar updates
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event: Option<ToolEvent>,
+    /// Optional thinking event for real-time reasoning display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_event: Option<ThinkingEvent>,
 }
 
 /// Streaming response end marker
@@ -393,6 +396,26 @@ pub enum ToolEvent {
     },
 }
 
+/// Thinking/reasoning event for real-time display in stream chunks.
+/// Parallel to `ToolEvent` but for LLM reasoning content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ThinkingEvent {
+    /// A new thinking block has started
+    #[serde(rename = "thinking_start")]
+    Start { thinking_id: String },
+    /// Incremental reasoning content
+    #[serde(rename = "thinking_delta")]
+    Delta { thinking_id: String, content: String },
+    /// Thinking block has completed
+    #[serde(rename = "thinking_end")]
+    End {
+        thinking_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
+}
+
 /// Authorization request sent to sidebar when a tool needs permission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolAuthRequest {
@@ -550,6 +573,7 @@ mod tests {
             delta: "Hello".into(),
             format: StreamFormat::Markdown,
             event: None,
+            thinking_event: None,
         });
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -939,6 +963,7 @@ mod tests {
             delta: "Hello".into(),
             format: StreamFormat::Markdown,
             event: None,
+            thinking_event: None,
         };
 
         let json = serde_json::to_string(&chunk).unwrap();
@@ -961,6 +986,7 @@ mod tests {
                 icon: "\u{1F50D}".into(),
                 summary: "Searching for pattern".into(),
             }),
+            thinking_event: None,
         };
 
         let json = serde_json::to_string(&chunk).unwrap();

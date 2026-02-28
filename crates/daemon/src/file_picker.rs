@@ -178,9 +178,118 @@ return posixPaths"#
     }
 }
 
-/// Linux implementation using rfd.
-#[cfg(not(target_os = "macos"))]
+/// Windows implementation using rfd for Files/Directories modes,
+/// and PowerShell with Shell.Application.BrowseForFolder for Both mode
+/// (which allows selecting either files or directories in a single dialog).
+#[cfg(target_os = "windows")]
 async fn pick_files_impl(req: PickFilesRequest) -> Result<PickFilesResponse, PickFilesError> {
+    if matches!(req.mode, PickerMode::Both) {
+        return pick_files_windows_both(req).await;
+    }
+
+    pick_files_rfd(req).await
+}
+
+/// Windows-specific: Use Shell.Application.BrowseForFolder with BIF_BROWSEINCLUDEFILES
+/// to show a single dialog where the user can select either a file or a directory.
+#[cfg(target_os = "windows")]
+async fn pick_files_windows_both(
+    req: PickFilesRequest,
+) -> Result<PickFilesResponse, PickFilesError> {
+    let title = req
+        .title
+        .as_deref()
+        .unwrap_or("Select a file or folder");
+
+    // BIF_BROWSEINCLUDEFILES (0x4000) | BIF_NEWDIALOGSTYLE (0x0040) | BIF_EDITBOX (0x0010)
+    let flags: u32 = 0x4000 | 0x0040 | 0x0010;
+
+    let root_folder = req
+        .default_path
+        .as_deref()
+        .filter(|p| Path::new(p).is_dir())
+        .unwrap_or("")
+        .replace('\\', "\\\\")
+        .replace('\'', "''");
+
+    let title_escaped = title.replace('\'', "''");
+
+    // PowerShell script that uses Shell.Application.BrowseForFolder
+    // Returns the selected path or empty string if cancelled.
+    let ps_script = format!(
+        r#"
+Add-Type -AssemblyName System.Windows.Forms
+$shell = New-Object -ComObject Shell.Application
+$startDir = '{root_folder}'
+$folder = $shell.BrowseForFolder(0, '{title_escaped}', {flags}, $startDir)
+if ($folder -ne $null) {{
+    $item = $folder.Self
+    if ($item -ne $null) {{
+        Write-Output $item.Path
+    }}
+}}
+"#
+    );
+
+    debug!("Running PowerShell BrowseForFolder dialog");
+
+    let mut cmd = tokio::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &ps_script]);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| PickFilesError::DialogFailed(format!("Failed to run PowerShell: {}", e)))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let selected_path = stdout.trim();
+
+    if selected_path.is_empty() {
+        debug!("File picker cancelled (BrowseForFolder)");
+        return Ok(PickFilesResponse {
+            files: vec![],
+            cancelled: true,
+        });
+    }
+
+    let path = Path::new(selected_path);
+    match file_info_from_path(path) {
+        Ok(info) => {
+            debug!("Selected via BrowseForFolder: {}", selected_path);
+            Ok(PickFilesResponse {
+                files: vec![info],
+                cancelled: false,
+            })
+        }
+        Err(e) => {
+            warn!(
+                "Failed to read metadata for {}: {}",
+                selected_path, e
+            );
+            Err(PickFilesError::DialogFailed(format!(
+                "Failed to read selected path: {}",
+                e
+            )))
+        }
+    }
+}
+
+/// Linux implementation using rfd.
+#[cfg(target_os = "linux")]
+async fn pick_files_impl(req: PickFilesRequest) -> Result<PickFilesResponse, PickFilesError> {
+    pick_files_rfd(req).await
+}
+
+/// Shared rfd-based file picker implementation for Linux and Windows (Files/Directories modes).
+#[cfg(not(target_os = "macos"))]
+async fn pick_files_rfd(req: PickFilesRequest) -> Result<PickFilesResponse, PickFilesError> {
     let mut dialog = rfd::AsyncFileDialog::new();
 
     if let Some(title) = &req.title {

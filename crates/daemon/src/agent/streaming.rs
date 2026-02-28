@@ -66,6 +66,7 @@ impl StreamHandle {
             delta,
             format,
             event: None,
+            thinking_event: None,
         };
 
         self.tx
@@ -323,6 +324,7 @@ mod tests {
             delta: "Hello".to_string(),
             format: StreamFormat::Markdown,
             event: None,
+            thinking_event: None,
         };
         let chunk_event = StreamEvent::Chunk(chunk);
 

@@ -22,6 +22,7 @@ fn make_chunk(stream_id: &str, session_id: &str, delta: &str) -> StreamChunk {
         delta: delta.to_string(),
         format: StreamFormat::Markdown,
         event: None,
+        thinking_event: None,
     }
 }
 
@@ -289,6 +290,7 @@ fn test_stream_event_methods() {
         delta: "Hello".to_string(),
         format: StreamFormat::Markdown,
         event: None,
+        thinking_event: None,
     };
     let chunk_event = StreamEvent::Chunk(chunk);
 
@@ -431,6 +433,7 @@ fn test_stream_message_type_extraction() {
         delta: "Hello".to_string(),
         format: StreamFormat::Markdown,
         event: None,
+        thinking_event: None,
     };
     let msg = AgentMessage::StreamChunk(chunk);
 

@@ -26,6 +26,7 @@ pub fn sample_stream_chunk(session_id: &str, delta: &str) -> StreamChunk {
         delta: delta.to_string(),
         format: StreamFormat::Markdown,
         event: None,
+        thinking_event: None,
     }
 }
 
