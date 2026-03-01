@@ -293,6 +293,13 @@ async fn run_proxy(verbose: bool, dev_mode: bool) -> Result<(), Box<dyn std::err
     if let Some(pid) = result.spawned_daemon_pid {
         tracing::info!("Proxy shutting down, killing spawned daemon PID {}", pid);
         kill_process(pid);
+
+        // Clean up managed daemon files so the next proxy can auto-launch a fresh daemon
+        // instead of connecting to a stale port.
+        let data_dir = get_data_dir();
+        let _ = std::fs::remove_file(data_dir.join("daemon-managed.port"));
+        let _ = std::fs::remove_file(data_dir.join("daemon-managed.pid"));
+        tracing::debug!("Cleaned up daemon-managed port/pid files");
     }
 
     Ok(())

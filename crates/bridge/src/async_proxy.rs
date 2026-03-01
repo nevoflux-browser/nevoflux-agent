@@ -26,7 +26,7 @@ use crate::config::{BridgeConfig, ConnectionMode};
 use crate::daemon_client::{generate_proxy_id, DaemonClient};
 use crate::error::{BridgeError, Result};
 use crate::native_messaging::{read_message, write_message};
-use crate::port_discovery::launch_daemon;
+use crate::port_discovery::{discover_daemon, launch_daemon};
 use crate::proxy::parse_native_message;
 use nevoflux_protocol::{Channel, DaemonEnvelope, ProxyEnvelope};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
@@ -251,36 +251,68 @@ async fn connect_dev_mode(client: &mut DaemonClient, config: &BridgeConfig) -> R
 /// Prod mode: connect to daemon, auto-launching if not running.
 ///
 /// Returns `Some(pid)` when daemon was spawned, `None` if a pre-existing daemon was found.
+///
+/// Unlike ZMQ connect (which succeeds even if the peer is not listening),
+/// this does a TCP probe first to verify the daemon is actually reachable.
+/// This prevents connecting to a stale port after the daemon has been killed.
 async fn connect_prod_mode(
     client: &mut DaemonClient,
     config: &BridgeConfig,
 ) -> Result<Option<u32>> {
-    match client.connect().await {
-        Ok(()) => Ok(None),
-        Err(e) => {
-            debug!("Initial connection failed: {}", e);
-
-            if config.auto_launch_daemon {
-                info!("Prod mode: attempting to auto-launch daemon");
-
-                let exe_path = std::env::current_exe().map_err(|e| {
-                    BridgeError::DaemonLaunchFailed(format!("Failed to get executable path: {}", e))
-                })?;
-
-                match launch_daemon(&exe_path, config).await {
-                    Ok(pid) => {
-                        info!("Daemon launched with PID {}", pid);
-                        client.connect().await?;
-                        Ok(Some(pid))
-                    }
-                    Err(e) => {
-                        warn!("Failed to auto-launch daemon: {}", e);
-                        Err(e)
-                    }
+    // First check if we can discover and actually reach the daemon via TCP probe.
+    // ZMQ connect is lazy and will "succeed" even if no one is listening,
+    // so we must verify reachability before trusting the port file.
+    let needs_launch = match discover_daemon(config).await {
+        Ok(info) => {
+            let addr = format!("127.0.0.1:{}", info.port);
+            match tokio::net::TcpStream::connect(&addr).await {
+                Ok(_) => {
+                    debug!("Prod mode: TCP probe succeeded on port {}", info.port);
+                    false
                 }
-            } else {
-                Err(e)
+                Err(_) => {
+                    warn!(
+                        "Prod mode: daemon port file exists (port {}) but TCP probe failed — stale",
+                        info.port
+                    );
+                    // Clean up stale files so discover_daemon won't find them again
+                    let _ = tokio::fs::remove_file(config.port_file_path()).await;
+                    let _ = tokio::fs::remove_file(config.pid_file_path()).await;
+                    true
+                }
             }
+        }
+        Err(_) => true,
+    };
+
+    if !needs_launch {
+        // Daemon is reachable, connect via ZMQ
+        client.connect().await?;
+        return Ok(None);
+    }
+
+    // Daemon not reachable, try to auto-launch
+    if !config.auto_launch_daemon {
+        return Err(BridgeError::ConnectionFailed(
+            "Daemon not running and auto-launch is disabled".to_string(),
+        ));
+    }
+
+    info!("Prod mode: attempting to auto-launch daemon");
+
+    let exe_path = std::env::current_exe().map_err(|e| {
+        BridgeError::DaemonLaunchFailed(format!("Failed to get executable path: {}", e))
+    })?;
+
+    match launch_daemon(&exe_path, config).await {
+        Ok(pid) => {
+            info!("Daemon launched with PID {}", pid);
+            client.connect().await?;
+            Ok(Some(pid))
+        }
+        Err(e) => {
+            warn!("Failed to auto-launch daemon: {}", e);
+            Err(e)
         }
     }
 }
