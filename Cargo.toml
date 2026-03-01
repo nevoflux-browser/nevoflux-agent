@@ -64,7 +64,7 @@ test-case = "3"
 mockall = "0.13"
 
 # ZeroMQ
-zeromq = "0.4"
+zeromq = "0.5"
 
 # UUID
 uuid = { version = "1", features = ["v4"] }

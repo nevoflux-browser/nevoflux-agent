@@ -299,7 +299,8 @@ async fn run_proxy(verbose: bool, dev_mode: bool) -> Result<(), Box<dyn std::err
         let data_dir = get_data_dir();
         let _ = std::fs::remove_file(data_dir.join("daemon-managed.port"));
         let _ = std::fs::remove_file(data_dir.join("daemon-managed.pid"));
-        tracing::debug!("Cleaned up daemon-managed port/pid files");
+        let _ = std::fs::remove_file(data_dir.join("daemon-managed.lock"));
+        tracing::debug!("Cleaned up daemon-managed port/pid/lock files");
     }
 
     Ok(())

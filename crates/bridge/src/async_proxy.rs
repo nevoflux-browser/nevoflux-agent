@@ -278,6 +278,7 @@ async fn connect_prod_mode(
                     // Clean up stale files so discover_daemon won't find them again
                     let _ = tokio::fs::remove_file(config.port_file_path()).await;
                     let _ = tokio::fs::remove_file(config.pid_file_path()).await;
+                    let _ = tokio::fs::remove_file(config.lock_file_path()).await;
                     true
                 }
             }
