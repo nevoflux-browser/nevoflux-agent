@@ -4450,12 +4450,15 @@ async fn handle_file_pick(params: &serde_json::Value) -> serde_json::Value {
         .and_then(|p| p.as_str())
         .map(|s| s.to_string());
 
-    // On Linux, "both" mode is not natively supported in a single dialog.
+    // On Linux and Windows, "both" mode is not reliably supported in a single dialog.
+    // On Linux, rfd cannot select both files and directories simultaneously.
+    // On Windows, the PowerShell BrowseForFolder fallback has compatibility issues.
     // Ask the sidebar to let the user choose between files or directories,
     // then re-send file.pick with the specific mode.
-    #[cfg(target_os = "linux")]
+    // macOS handles "both" natively via osascript.
+    #[cfg(not(target_os = "macos"))]
     if mode == PickerMode::Both {
-        info!("File picker: Both mode on Linux, asking sidebar to choose mode");
+        info!("File picker: Both mode not natively supported, asking sidebar to choose mode");
         return serde_json::json!({
             "type": "system_response",
             "payload": {
