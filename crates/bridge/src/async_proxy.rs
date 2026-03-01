@@ -485,15 +485,15 @@ async fn socket_task(
                             message: e.to_string(),
                         }).await;
 
-                        // For disconnection, try to reconnect
-                        if matches!(e, BridgeError::Disconnected) {
-                            info!("Attempting to reconnect to daemon...");
-                            if let Err(reconnect_err) = daemon_client.reconnect().await {
-                                error!("Reconnection failed: {}", reconnect_err);
-                                break;
-                            }
-                            info!("Reconnected to daemon");
+                        // Any receive error likely indicates a broken connection
+                        // (e.g. WSAECONNRESET on Windows). Attempt reconnection
+                        // to avoid a tight error loop.
+                        info!("Attempting to reconnect to daemon...");
+                        if let Err(reconnect_err) = daemon_client.reconnect().await {
+                            error!("Reconnection failed: {}", reconnect_err);
+                            break;
                         }
+                        info!("Reconnected to daemon");
                     }
                 }
             }

@@ -241,6 +241,9 @@ impl DaemonClient {
     }
 
     /// Check if an error indicates disconnection.
+    ///
+    /// On Windows, OS error messages are localized (e.g. Chinese), so we match
+    /// by numeric error code as well as English substrings.
     fn is_disconnection_error(error: &zeromq::ZmqError) -> bool {
         let msg = error.to_string().to_lowercase();
         msg.contains("not connected")
@@ -248,6 +251,9 @@ impl DaemonClient {
             || msg.contains("connection reset")
             || msg.contains("broken pipe")
             || msg.contains("unable to send")
+            || msg.contains("codec error")
+            || msg.contains("os error 10054") // WSAECONNRESET
+            || msg.contains("os error 10053") // WSAECONNABORTED
     }
 
     /// Send a message to the daemon with auto-reconnection.
