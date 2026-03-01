@@ -179,8 +179,7 @@ pub async fn launch_daemon(executable: &Path, config: &BridgeConfig) -> Result<u
     // Pass port range so spawned daemon uses the correct ports
     cmd.arg("--port-start")
         .arg(config.port_range_start.to_string());
-    cmd.arg("--port-end")
-        .arg(config.port_range_end.to_string());
+    cmd.arg("--port-end").arg(config.port_range_end.to_string());
 
     // Mark as managed so daemon self-terminates on idle
     cmd.arg("--managed");

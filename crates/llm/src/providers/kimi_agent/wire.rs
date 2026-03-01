@@ -967,7 +967,11 @@ mod tests {
         });
         let event = parse_wire_event(&params).unwrap();
         match event {
-            WireEvent::ToolCall { id, name, arguments } => {
+            WireEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
                 assert_eq!(id, "tc_10");
                 assert_eq!(name, "Read");
                 assert_eq!(arguments, "{\"path\":\"/etc/hosts\"}");
@@ -1004,7 +1008,11 @@ mod tests {
         });
         let event = parse_wire_event(&params).unwrap();
         match event {
-            WireEvent::ToolCallRequest { id, name, arguments } => {
+            WireEvent::ToolCallRequest {
+                id,
+                name,
+                arguments,
+            } => {
                 assert_eq!(id, "tc_5");
                 assert_eq!(name, "read_file");
                 assert_eq!(arguments["path"], "/etc/hosts");
@@ -1028,7 +1036,11 @@ mod tests {
         });
         let event = parse_wire_event(&params).unwrap();
         match event {
-            WireEvent::ToolResult { tool_call_id, is_error, output } => {
+            WireEvent::ToolResult {
+                tool_call_id,
+                is_error,
+                output,
+            } => {
                 assert_eq!(tool_call_id, "tc_10");
                 assert!(!is_error);
                 assert_eq!(output, "file contents here");

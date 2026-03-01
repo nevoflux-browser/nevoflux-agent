@@ -825,22 +825,18 @@ impl HostFunctions for DaemonHostFunctions {
                             }
                         }
                     };
-                    let _ = self.stream_thinking_event(
-                        nevoflux_protocol::ThinkingEvent::Delta {
-                            thinking_id,
-                            content: reasoning.clone(),
-                        },
-                    );
+                    let _ = self.stream_thinking_event(nevoflux_protocol::ThinkingEvent::Delta {
+                        thinking_id,
+                        content: reasoning.clone(),
+                    });
                 } else if chunk.text.is_some() || chunk.done {
                     // Reasoning ended — text chunk or done signal after reasoning
                     let ended_id = self.current_thinking_id.lock().unwrap().take();
                     if let Some(id) = ended_id {
-                        let _ = self.stream_thinking_event(
-                            nevoflux_protocol::ThinkingEvent::End {
-                                thinking_id: id,
-                                duration_ms: None,
-                            },
-                        );
+                        let _ = self.stream_thinking_event(nevoflux_protocol::ThinkingEvent::End {
+                            thinking_id: id,
+                            duration_ms: None,
+                        });
                     }
                 }
 
@@ -2697,10 +2693,7 @@ impl DaemonHostFunctions {
     }
 
     /// Send a thinking event to the sidebar without any text content.
-    pub fn stream_thinking_event(
-        &self,
-        event: nevoflux_protocol::ThinkingEvent,
-    ) -> HostResult<()> {
+    pub fn stream_thinking_event(&self, event: nevoflux_protocol::ThinkingEvent) -> HostResult<()> {
         if let Some(tx) = &self.sidebar_stream_tx {
             let chunk = SidebarStreamChunk {
                 text: String::new(),

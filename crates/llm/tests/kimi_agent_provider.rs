@@ -148,8 +148,7 @@ fn test_client_with_thinking_modes() {
 
 #[test]
 fn test_client_debug_never_leaks_api_key() {
-    let client =
-        KimiAgentClient::new("kimi-agent").with_api_key("super-secret-moonshot-key-12345");
+    let client = KimiAgentClient::new("kimi-agent").with_api_key("super-secret-moonshot-key-12345");
     let debug = format!("{:?}", client);
     assert!(
         !debug.contains("super-secret-moonshot-key-12345"),

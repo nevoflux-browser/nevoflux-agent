@@ -1355,16 +1355,12 @@ async fn execute_llm_stream_inner(
         ProviderType::Together => stream_together(api_key, model, request, tx, provider).await,
         ProviderType::ClaudeCode => stream_claude_code(api_key, model, request, tx, provider).await,
         ProviderType::GeminiCli => stream_gemini_cli(api_key, model, request, tx, provider).await,
-        ProviderType::KimiAgent => {
-            stream_kimi_agent(api_key, model, request, tx, provider).await
-        }
+        ProviderType::KimiAgent => stream_kimi_agent(api_key, model, request, tx, provider).await,
         // Qwen and Ollama don't support streaming in rig yet
-        ProviderType::Qwen | ProviderType::Ollama => {
-            Err(DaemonError::InternalError(format!(
-                "Streaming not supported for provider {:?}",
-                provider
-            )))
-        }
+        ProviderType::Qwen | ProviderType::Ollama => Err(DaemonError::InternalError(format!(
+            "Streaming not supported for provider {:?}",
+            provider
+        ))),
     }
 }
 
@@ -1665,13 +1661,19 @@ async fn stream_kimi_agent(
             }
             Err(e) => {
                 tracing::error!("stream_kimi_agent: failed to spawn kimi-agent: {}", e);
-                let _ = event_tx.blocking_send(WireEvent::Unknown(format!("error: failed to spawn kimi-agent: {}", e)));
+                let _ = event_tx.blocking_send(WireEvent::Unknown(format!(
+                    "error: failed to spawn kimi-agent: {}",
+                    e
+                )));
                 return;
             }
         };
         if let Err(e) = wc.initialize(&tools) {
             tracing::error!("stream_kimi_agent: failed to initialize: {}", e);
-            let _ = event_tx.blocking_send(WireEvent::Unknown(format!("error: failed to initialize kimi-agent: {}", e)));
+            let _ = event_tx.blocking_send(WireEvent::Unknown(format!(
+                "error: failed to initialize kimi-agent: {}",
+                e
+            )));
             return;
         }
         tracing::info!("stream_kimi_agent: initialized successfully");
@@ -1682,7 +1684,10 @@ async fn stream_kimi_agent(
         };
         if let Err(e) = send_result {
             tracing::error!("stream_kimi_agent: failed to send prompt: {}", e);
-            let _ = event_tx.blocking_send(WireEvent::Unknown(format!("error: failed to send prompt: {}", e)));
+            let _ = event_tx.blocking_send(WireEvent::Unknown(format!(
+                "error: failed to send prompt: {}",
+                e
+            )));
             return;
         }
         tracing::info!("stream_kimi_agent: prompt sent, reading events...");
@@ -1697,23 +1702,28 @@ async fn stream_kimi_agent(
                         WireEvent::TurnEnd | WireEvent::ToolCallRequest { .. }
                     );
                     if event_count <= 10 || is_terminal {
-                        tracing::info!(
-                            "stream_kimi_agent: event #{}: {:?}",
-                            event_count,
-                            event
-                        );
+                        tracing::info!("stream_kimi_agent: event #{}: {:?}", event_count, event);
                     }
                     if event_tx.blocking_send(event).is_err() {
-                        tracing::warn!("stream_kimi_agent: receiver dropped after {} events", event_count);
+                        tracing::warn!(
+                            "stream_kimi_agent: receiver dropped after {} events",
+                            event_count
+                        );
                         break;
                     }
                     if is_terminal {
-                        tracing::info!("stream_kimi_agent: terminal event after {} events", event_count);
+                        tracing::info!(
+                            "stream_kimi_agent: terminal event after {} events",
+                            event_count
+                        );
                         break;
                     }
                 }
                 None => {
-                    tracing::info!("stream_kimi_agent: wire stream ended after {} events", event_count);
+                    tracing::info!(
+                        "stream_kimi_agent: wire stream ended after {} events",
+                        event_count
+                    );
                     break;
                 }
             }
@@ -1797,11 +1807,10 @@ async fn stream_kimi_agent(
 /// natively.  We embed each image attachment as a data-URI so the model can still "see" it.
 /// Check if any message has media attachments (image, audio, video).
 fn has_media_attachments(request: &LlmChatRequest) -> bool {
-    request.messages.iter().any(|m| {
-        m.attachments
-            .iter()
-            .any(|a| is_media_attachment(a))
-    })
+    request
+        .messages
+        .iter()
+        .any(|m| m.attachments.iter().any(|a| is_media_attachment(a)))
 }
 
 /// Check if an attachment is a supported media type (image, audio, video).
@@ -2371,7 +2380,11 @@ where
                         text: Some(format!(
                             "\n\n[error] LLM provider timed out after {} seconds with no {}.",
                             timeout_dur.as_secs(),
-                            if got_first_chunk { "new data" } else { "response" }
+                            if got_first_chunk {
+                                "new data"
+                            } else {
+                                "response"
+                            }
                         )),
                         tool_calls: vec![],
                         done: false,

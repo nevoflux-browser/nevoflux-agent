@@ -102,7 +102,11 @@ async fn pick_files_impl(req: PickFilesRequest) -> Result<PickFilesResponse, Pic
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let paths: Vec<&str> = stdout.trim().split('\n').filter(|s| !s.is_empty()).collect();
+    let paths: Vec<&str> = stdout
+        .trim()
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .collect();
 
     let file_infos: Vec<FileInfo> = paths
         .into_iter()
@@ -126,10 +130,7 @@ async fn pick_files_impl(req: PickFilesRequest) -> Result<PickFilesResponse, Pic
 /// Build an AppleScript command for the file picker.
 #[cfg(target_os = "macos")]
 fn build_applescript(req: &PickFilesRequest) -> String {
-    let prompt = req
-        .title
-        .as_deref()
-        .unwrap_or("Select files");
+    let prompt = req.title.as_deref().unwrap_or("Select files");
 
     let default_location = req
         .default_path

@@ -319,9 +319,8 @@ mod tests {
 
     #[test]
     fn test_cli_parse_port_start_end() {
-        let cli =
-            Cli::try_parse_from(["nevoflux", "--port-start", "19501", "--port-end", "19600"])
-                .unwrap();
+        let cli = Cli::try_parse_from(["nevoflux", "--port-start", "19501", "--port-end", "19600"])
+            .unwrap();
         assert_eq!(cli.port_start, Some(19501));
         assert_eq!(cli.port_end, Some(19600));
     }

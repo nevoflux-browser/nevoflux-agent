@@ -406,7 +406,10 @@ pub enum ThinkingEvent {
     Start { thinking_id: String },
     /// Incremental reasoning content
     #[serde(rename = "thinking_delta")]
-    Delta { thinking_id: String, content: String },
+    Delta {
+        thinking_id: String,
+        content: String,
+    },
     /// Thinking block has completed
     #[serde(rename = "thinking_end")]
     End {
