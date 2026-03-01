@@ -479,21 +479,28 @@ async fn socket_task(
                         }
                     }
                     Err(e) => {
-                        error!("Daemon receive error: {}", e);
-                        let _ = stdout_tx.send(StdoutMessage::Error {
-                            code: "DAEMON_ERROR".into(),
-                            message: e.to_string(),
-                        }).await;
-
-                        // Any receive error likely indicates a broken connection
-                        // (e.g. WSAECONNRESET on Windows). Attempt reconnection
-                        // to avoid a tight error loop.
-                        info!("Attempting to reconnect to daemon...");
-                        if let Err(reconnect_err) = daemon_client.reconnect().await {
-                            error!("Reconnection failed: {}", reconnect_err);
-                            break;
+                        // Connection errors are internal — don't forward them
+                        // to the sidebar (it can't parse them and they just
+                        // spam the browser console).
+                        if matches!(e, BridgeError::Disconnected) {
+                            // recv() already reconnected successfully.
+                            // Just resume the loop — no double-reconnect needed.
+                            warn!("Connection lost and restored, resuming");
+                        } else {
+                            // recv() did not reconnect (unrecognized error).
+                            // Attempt reconnection ourselves.
+                            error!("Daemon receive error: {}", e);
+                            info!("Attempting to reconnect to daemon...");
+                            if let Err(reconnect_err) = daemon_client.reconnect().await {
+                                error!("Reconnection failed: {}", reconnect_err);
+                                let _ = stdout_tx.send(StdoutMessage::Error {
+                                    code: "DAEMON_DISCONNECTED".into(),
+                                    message: "Lost connection to daemon".into(),
+                                }).await;
+                                break;
+                            }
+                            info!("Reconnected to daemon");
                         }
-                        info!("Reconnected to daemon");
                     }
                 }
             }
