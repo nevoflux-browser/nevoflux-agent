@@ -9,12 +9,12 @@ description = "Proxy and MCP bridge for NevoFlux Agent"
 nevoflux-protocol = { path = "../protocol" }
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "io-util", "io-std", "fs", "process", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "io-util", "io-std", "fs", "process", "signal", "net"] }
 async-trait.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 tracing = "0.1"
-zeromq.workspace = true
+tokio-util = { version = "0.7", features = ["net"] }
 uuid.workspace = true
 directories.workspace = true
 

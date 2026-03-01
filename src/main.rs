@@ -252,7 +252,7 @@ fn write_daemon_files(port: u16, managed: bool) -> std::io::Result<()> {
 /// Run in proxy mode (Native Messaging bridge).
 ///
 /// This bridges between the browser extension (via Native Messaging on stdin/stdout)
-/// and the daemon (via ZeroMQ). Uses full-duplex communication to allow receiving
+/// and the daemon (via TCP). Uses full-duplex communication to allow receiving
 /// messages (like cancel requests or browser tool responses) while streaming.
 async fn run_proxy(verbose: bool, dev_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     use nevoflux_bridge::{run_async_proxy, AsyncProxyConfig, BridgeConfig, ConnectionMode};

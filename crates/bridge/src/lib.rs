@@ -3,10 +3,10 @@
 //! This crate provides two bridge modes:
 //!
 //! 1. **Proxy Mode** (`nevoflux`): Bridges between the browser extension
-//!    (via Native Messaging) and the daemon (via ZeroMQ).
+//!    (via Native Messaging) and the daemon (via TCP).
 //!
 //! 2. **MCP Mode** (`nevoflux --mcp`): Bridges between MCP clients like
-//!    Claude Code (via stdio) and the daemon (via ZeroMQ).
+//!    Claude Code (via stdio) and the daemon (via TCP).
 //!
 //! # Architecture
 //!
@@ -22,7 +22,7 @@
 //! │  (bridge)   │         │ (bridge)    │
 //! └──────┬──────┘         └──────┬──────┘
 //!        │                       │
-//!        │      ZeroMQ TCP       │
+//!        │    Length-prefix TCP   │
 //!        └───────────┬───────────┘
 //!                    ▼
 //!          ┌─────────────────┐
@@ -66,7 +66,9 @@ pub mod proxy;
 pub mod streaming;
 
 // Re-export main types
-pub use async_proxy::{run_async_proxy, AsyncProxyConfig, ProxyResult, StdinMessage, StdoutMessage};
+pub use async_proxy::{
+    run_async_proxy, AsyncProxyConfig, ProxyResult, StdinMessage, StdoutMessage,
+};
 pub use config::{BridgeConfig, ConnectionMode};
 pub use daemon_client::{generate_proxy_id, DaemonClient, DaemonMessageStream};
 pub use error::{BridgeError, Result};

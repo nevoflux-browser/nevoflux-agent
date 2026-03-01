@@ -1,10 +1,11 @@
-//! ZeroMQ client for communicating with the daemon.
+//! TCP client for communicating with the daemon.
 //!
-//! Uses DEALER socket to connect to daemon's ROUTER.
-//! Supports automatic reconnection when the daemon restarts.
+//! Uses a length-prefixed JSON framing protocol (same as native messaging)
+//! over a TCP connection. Supports automatic reconnection when the daemon restarts.
 
 use crate::config::BridgeConfig;
 use crate::error::{BridgeError, Result};
+use crate::native_messaging::{read_message, write_message};
 use crate::port_discovery::{discover_daemon, DaemonInfo};
 use futures::stream::Stream;
 use nevoflux_protocol::{Channel, DaemonEnvelope, ProxyEnvelope};
@@ -12,9 +13,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
-use zeromq::{Socket, SocketRecv, SocketSend, ZmqMessage};
 
 /// Message from daemon.
 pub type DaemonMessage = DaemonEnvelope;
@@ -54,13 +56,16 @@ impl Default for ReconnectConfig {
     }
 }
 
-/// Client for communicating with the daemon over ZeroMQ.
+/// Client for communicating with the daemon over TCP.
+/// Uses 4-byte little-endian length-prefixed JSON framing (same protocol as native messaging).
 /// Supports automatic reconnection when the daemon restarts.
 pub struct DaemonClient {
     /// The proxy ID for this client.
     proxy_id: String,
-    /// The ZeroMQ socket.
-    socket: zeromq::DealerSocket,
+    /// TCP reader half (wrapped in BufReader).
+    reader: Option<BufReader<tokio::net::tcp::OwnedReadHalf>>,
+    /// TCP writer half (wrapped in BufWriter).
+    writer: Option<BufWriter<tokio::net::tcp::OwnedWriteHalf>>,
     /// Configuration.
     config: Arc<BridgeConfig>,
     /// Connected daemon info.
@@ -76,7 +81,8 @@ impl DaemonClient {
     pub fn new(proxy_id: impl Into<String>, config: BridgeConfig) -> Self {
         Self {
             proxy_id: proxy_id.into(),
-            socket: zeromq::DealerSocket::new(),
+            reader: None,
+            writer: None,
             config: Arc::new(config),
             daemon_info: None,
             state: ConnectionState::Disconnected,
@@ -92,7 +98,8 @@ impl DaemonClient {
     ) -> Self {
         Self {
             proxy_id: proxy_id.into(),
-            socket: zeromq::DealerSocket::new(),
+            reader: None,
+            writer: None,
             config: Arc::new(config),
             daemon_info: None,
             state: ConnectionState::Disconnected,
@@ -125,24 +132,43 @@ impl DaemonClient {
         self.state == ConnectionState::Connected
     }
 
+    /// Establish TCP connection and send registration frame.
+    async fn establish_connection(&mut self, addr: &str) -> Result<()> {
+        let stream = TcpStream::connect(addr)
+            .await
+            .map_err(|e| BridgeError::ConnectionFailed(e.to_string()))?;
+
+        stream.set_nodelay(true).map_err(|e| {
+            BridgeError::ConnectionFailed(format!("Failed to set TCP_NODELAY: {}", e))
+        })?;
+
+        let (read_half, write_half) = stream.into_split();
+        let reader = BufReader::new(read_half);
+        let mut writer = BufWriter::new(write_half);
+
+        // Send registration frame with proxy_id
+        let registration = serde_json::json!({
+            "type": "register",
+            "proxy_id": self.proxy_id,
+        });
+        write_message(&mut writer, &registration).await?;
+
+        self.reader = Some(reader);
+        self.writer = Some(writer);
+        Ok(())
+    }
+
     /// Connect to the daemon.
     ///
-    /// Discovers the daemon port and establishes a ZeroMQ connection.
+    /// Discovers the daemon port and establishes a TCP connection.
     pub async fn connect(&mut self) -> Result<()> {
         // Discover daemon
         let info = discover_daemon(&self.config).await?;
 
-        let addr = format!("tcp://127.0.0.1:{}", info.port);
+        let addr = format!("127.0.0.1:{}", info.port);
         info!("Connecting to daemon at {}", addr);
 
-        // Set socket identity to proxy_id
-        // Note: zeromq crate doesn't support identity yet, so we'll include proxy_id in messages
-
-        // Connect
-        self.socket
-            .connect(&addr)
-            .await
-            .map_err(|e| BridgeError::ConnectionFailed(e.to_string()))?;
+        self.establish_connection(&addr).await?;
 
         self.daemon_info = Some(info);
         self.state = ConnectionState::Connected;
@@ -155,18 +181,17 @@ impl DaemonClient {
     pub async fn connect_to(&mut self, addr: &str) -> Result<()> {
         info!("Connecting to {}", addr);
 
-        self.socket
-            .connect(addr)
-            .await
-            .map_err(|e| BridgeError::ConnectionFailed(e.to_string()))?;
+        // addr may be "tcp://host:port" format; strip the prefix
+        let tcp_addr = addr.strip_prefix("tcp://").unwrap_or(addr);
 
+        self.establish_connection(tcp_addr).await?;
         self.state = ConnectionState::Connected;
         Ok(())
     }
 
     /// Reconnect to the daemon with exponential backoff.
     ///
-    /// Creates a new socket and attempts to reconnect to the daemon.
+    /// Drops the old connection and attempts to establish a new TCP connection.
     /// Will retry up to `max_retries` times with exponential backoff.
     pub async fn reconnect(&mut self) -> Result<()> {
         if self.state == ConnectionState::Reconnecting {
@@ -181,22 +206,23 @@ impl DaemonClient {
             self.proxy_id
         );
 
+        // Drop old connection
+        self.reader = None;
+        self.writer = None;
+
         let mut delay = self.reconnect_config.initial_delay;
         let mut attempts = 0;
 
         loop {
             attempts += 1;
 
-            // Create a new socket (old socket may be in bad state)
-            self.socket = zeromq::DealerSocket::new();
-
             // Try to discover and connect
             match discover_daemon(&self.config).await {
                 Ok(info) => {
-                    let addr = format!("tcp://127.0.0.1:{}", info.port);
+                    let addr = format!("127.0.0.1:{}", info.port);
                     debug!("Reconnect attempt {}: connecting to {}", attempts, addr);
 
-                    match self.socket.connect(&addr).await {
+                    match self.establish_connection(&addr).await {
                         Ok(()) => {
                             self.daemon_info = Some(info);
                             self.state = ConnectionState::Connected;
@@ -240,55 +266,45 @@ impl DaemonClient {
         }
     }
 
-    /// Check if an error indicates disconnection.
-    ///
-    /// On Windows, OS error messages are localized (e.g. Chinese), so we match
-    /// by numeric error code as well as English substrings.
-    fn is_disconnection_error(error: &zeromq::ZmqError) -> bool {
-        let msg = error.to_string().to_lowercase();
-        msg.contains("not connected")
-            || msg.contains("connection refused")
-            || msg.contains("connection reset")
-            || msg.contains("broken pipe")
-            || msg.contains("unable to send")
-            || msg.contains("codec error")
-            || msg.contains("os error 10054") // WSAECONNRESET
-            || msg.contains("os error 10053") // WSAECONNABORTED
-    }
-
     /// Send a message to the daemon with auto-reconnection.
     pub async fn send(&mut self, envelope: ProxyEnvelope) -> Result<()> {
         let data = serde_json::to_vec(&envelope)?;
-        let msg = ZmqMessage::from(data);
 
-        match self.socket.send(msg.clone()).await {
+        match self.try_send(&data).await {
             Ok(()) => {
                 debug!("Sent message to daemon: request_id={}", envelope.request_id);
                 Ok(())
             }
             Err(e) => {
-                if Self::is_disconnection_error(&e) {
-                    warn!(
-                        "Send failed due to disconnection, attempting reconnect: {}",
-                        e
-                    );
-                    self.state = ConnectionState::Disconnected;
+                warn!(
+                    "Send failed due to disconnection, attempting reconnect: {}",
+                    e
+                );
+                self.state = ConnectionState::Disconnected;
 
-                    // Attempt to reconnect
-                    self.reconnect().await?;
+                // Attempt to reconnect
+                self.reconnect().await?;
 
-                    // Retry send after reconnection
-                    self.socket.send(msg).await.map_err(BridgeError::from)?;
-                    debug!(
-                        "Sent message to daemon after reconnect: request_id={}",
-                        envelope.request_id
-                    );
-                    Ok(())
-                } else {
-                    Err(BridgeError::from(e))
-                }
+                // Retry send after reconnection
+                self.try_send(&data).await?;
+                debug!(
+                    "Sent message to daemon after reconnect: request_id={}",
+                    envelope.request_id
+                );
+                Ok(())
             }
         }
+    }
+
+    /// Try to send raw data over the TCP connection.
+    async fn try_send(&mut self, data: &[u8]) -> Result<()> {
+        let writer = self.writer.as_mut().ok_or(BridgeError::Disconnected)?;
+
+        let len = data.len() as u32;
+        writer.write_all(&len.to_le_bytes()).await?;
+        writer.write_all(data).await?;
+        writer.flush().await?;
+        Ok(())
     }
 
     /// Send a chat message to the daemon.
@@ -313,16 +329,8 @@ impl DaemonClient {
 
     /// Receive a message from the daemon with auto-reconnection.
     pub async fn recv(&mut self) -> Result<DaemonEnvelope> {
-        match self.socket.recv().await {
-            Ok(msg) => {
-                let data = msg.into_vec();
-                if data.is_empty() {
-                    return Err(BridgeError::NativeMessaging(
-                        "Empty message received".into(),
-                    ));
-                }
-
-                let envelope: DaemonEnvelope = serde_json::from_slice(&data[0])?;
+        match self.try_recv().await {
+            Ok(envelope) => {
                 debug!(
                     "Received message from daemon: request_id={:?}",
                     envelope.request_id
@@ -330,30 +338,39 @@ impl DaemonClient {
                 Ok(envelope)
             }
             Err(e) => {
-                if Self::is_disconnection_error(&e) {
-                    warn!(
-                        "Recv failed due to disconnection, attempting reconnect: {}",
-                        e
-                    );
-                    self.state = ConnectionState::Disconnected;
+                warn!(
+                    "Recv failed due to disconnection, attempting reconnect: {}",
+                    e
+                );
+                self.state = ConnectionState::Disconnected;
 
-                    // Attempt to reconnect
-                    self.reconnect().await?;
+                // Attempt to reconnect
+                self.reconnect().await?;
 
-                    // Return disconnected error - caller should retry
-                    // We don't retry recv automatically because the original message is lost
-                    Err(BridgeError::Disconnected)
-                } else {
-                    Err(BridgeError::from(e))
-                }
+                // Return disconnected error - caller should retry
+                // We don't retry recv automatically because the original message is lost
+                Err(BridgeError::Disconnected)
             }
         }
     }
 
+    /// Try to receive a message from the TCP connection.
+    async fn try_recv(&mut self) -> Result<DaemonEnvelope> {
+        let reader = self.reader.as_mut().ok_or(BridgeError::Disconnected)?;
+
+        let envelope: DaemonEnvelope = read_message(reader).await?;
+        Ok(envelope)
+    }
+
     /// Close the connection.
     pub async fn close(&mut self) -> Result<()> {
-        // ZeroMQ sockets are closed when dropped
         debug!("Closing daemon client connection");
+        // Shut down writer gracefully
+        if let Some(ref mut writer) = self.writer {
+            let _ = writer.shutdown().await;
+        }
+        self.reader = None;
+        self.writer = None;
         self.state = ConnectionState::Disconnected;
         self.daemon_info = None;
         Ok(())

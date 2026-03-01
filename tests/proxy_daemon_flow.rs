@@ -40,7 +40,7 @@ async fn test_proxy_connects_to_daemon() {
     let bridge_config = BridgeConfig::new();
     let mut client = DaemonClient::new(generate_proxy_id(), bridge_config);
 
-    let addr = format!("tcp://127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{}", port);
     let connect_result = client.connect_to(&addr).await;
     assert!(
         connect_result.is_ok(),
@@ -69,7 +69,7 @@ async fn test_proxy_sends_chat_message_to_daemon() {
     let proxy_id = generate_proxy_id();
     let mut client = DaemonClient::new(&proxy_id, bridge_config);
 
-    let addr = format!("tcp://127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{}", port);
     client.connect_to(&addr).await.unwrap();
 
     // Register proxy in the router (normally done by the daemon on handshake)
@@ -111,7 +111,7 @@ async fn test_proxy_sends_mcp_message_to_daemon() {
     let proxy_id = generate_proxy_id();
     let mut client = DaemonClient::new(&proxy_id, bridge_config);
 
-    let addr = format!("tcp://127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{}", port);
     client.connect_to(&addr).await.unwrap();
 
     // Register proxy
@@ -146,7 +146,7 @@ async fn test_multiple_proxies_connect() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let addr = format!("tcp://127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{}", port);
 
     // Connect multiple clients
     let proxy_id_1 = generate_proxy_id();
@@ -191,7 +191,7 @@ async fn test_router_tracks_proxy_requests() {
     let proxy_id = generate_proxy_id();
     let mut client = DaemonClient::new(&proxy_id, bridge_config);
 
-    let addr = format!("tcp://127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{}", port);
     client.connect_to(&addr).await.unwrap();
 
     // Register proxy and request
@@ -281,7 +281,7 @@ async fn test_proxy_close_connection() {
     let proxy_id = generate_proxy_id();
     let mut client = DaemonClient::new(&proxy_id, BridgeConfig::new());
 
-    let addr = format!("tcp://127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{}", port);
     client.connect_to(&addr).await.unwrap();
     router
         .proxy_registry()
@@ -317,7 +317,7 @@ async fn test_channel_types() {
     let proxy_id = generate_proxy_id();
     let mut client = DaemonClient::new(&proxy_id, BridgeConfig::new());
 
-    let addr = format!("tcp://127.0.0.1:{}", port);
+    let addr = format!("127.0.0.1:{}", port);
     client.connect_to(&addr).await.unwrap();
     router
         .proxy_registry()

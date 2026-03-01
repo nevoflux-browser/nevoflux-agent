@@ -14,7 +14,7 @@
 //! │                                             ▼                │
 //! │                                      ┌─────────────┐        │
 //! │                                      │ Socket Task │        │
-//! │                                      │  (select!)  │◀──────▶│ DEALER
+//! │                                      │  (select!)  │◀──────▶│ TCP
 //! │                                      └─────────────┘        │
 //! │                                             │                │
 //! │  stdout ◀── [Stdout Task] ◀── stdout_rx ◀──┘                │
@@ -26,7 +26,7 @@ use crate::config::{BridgeConfig, ConnectionMode};
 use crate::daemon_client::{generate_proxy_id, DaemonClient};
 use crate::error::{BridgeError, Result};
 use crate::native_messaging::{read_message, write_message};
-use crate::port_discovery::{discover_daemon, launch_daemon};
+use crate::port_discovery::launch_daemon;
 use crate::proxy::parse_native_message;
 use nevoflux_protocol::{Channel, DaemonEnvelope, ProxyEnvelope};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
@@ -109,7 +109,7 @@ pub struct ProxyResult {
 /// This spawns three tasks:
 /// - stdin_task: reads from stdin and sends to socket_task
 /// - stdout_task: receives from socket_task and writes to stdout
-/// - socket_task: handles bidirectional ZeroMQ communication using select!
+/// - socket_task: handles bidirectional TCP communication using select!
 pub async fn run_async_proxy<R, W>(
     reader: R,
     writer: W,
@@ -136,9 +136,7 @@ where
             connect_dev_mode(&mut daemon_client, &config.bridge).await?;
             None
         }
-        ConnectionMode::Prod => {
-            connect_prod_mode(&mut daemon_client, &config.bridge).await?
-        }
+        ConnectionMode::Prod => connect_prod_mode(&mut daemon_client, &config.bridge).await?,
     };
     info!("Proxy {} connected to daemon", proxy_id);
 
@@ -216,7 +214,7 @@ where
 
 /// Dev mode: connect to a manually-started daemon on fixed port 19500.
 ///
-/// Retries TCP connection at 500ms intervals for up to 10s.
+/// Retries connection at 500ms intervals for up to the configured timeout.
 /// Does not auto-launch daemon.
 async fn connect_dev_mode(client: &mut DaemonClient, config: &BridgeConfig) -> Result<()> {
     let port = config.port_range_start;
@@ -226,11 +224,13 @@ async fn connect_dev_mode(client: &mut DaemonClient, config: &BridgeConfig) -> R
 
     info!("Dev mode: connecting to daemon on port {}", port);
 
+    // Retry connect_to directly — TCP connect will fail immediately if daemon
+    // isn't listening, so no separate probe is needed.
     loop {
-        match tokio::net::TcpStream::connect(&addr).await {
-            Ok(_) => {
-                debug!("Dev mode: TCP probe succeeded on port {}", port);
-                break;
+        match client.connect_to(&addr).await {
+            Ok(()) => {
+                debug!("Dev mode: connected to daemon on port {}", port);
+                return Ok(());
             }
             Err(_) => {
                 if start.elapsed() > timeout {
@@ -243,52 +243,41 @@ async fn connect_dev_mode(client: &mut DaemonClient, config: &BridgeConfig) -> R
             }
         }
     }
-
-    // TCP probe succeeded, now do the ZMQ connect
-    client.connect().await
 }
 
 /// Prod mode: connect to daemon, auto-launching if not running.
 ///
 /// Returns `Some(pid)` when daemon was spawned, `None` if a pre-existing daemon was found.
 ///
-/// Unlike ZMQ connect (which succeeds even if the peer is not listening),
-/// this does a TCP probe first to verify the daemon is actually reachable.
-/// This prevents connecting to a stale port after the daemon has been killed.
+/// Attempts to connect directly via TCP. If the connection fails (e.g. stale
+/// port file from a killed daemon), cleans up and auto-launches a new daemon.
 async fn connect_prod_mode(
     client: &mut DaemonClient,
     config: &BridgeConfig,
 ) -> Result<Option<u32>> {
-    // First check if we can discover and actually reach the daemon via TCP probe.
-    // ZMQ connect is lazy and will "succeed" even if no one is listening,
-    // so we must verify reachability before trusting the port file.
-    let needs_launch = match discover_daemon(config).await {
-        Ok(info) => {
-            let addr = format!("127.0.0.1:{}", info.port);
-            match tokio::net::TcpStream::connect(&addr).await {
-                Ok(_) => {
-                    debug!("Prod mode: TCP probe succeeded on port {}", info.port);
-                    false
-                }
-                Err(_) => {
-                    warn!(
-                        "Prod mode: daemon port file exists (port {}) but TCP probe failed — stale",
-                        info.port
-                    );
-                    // Clean up stale files so discover_daemon won't find them again
-                    let _ = tokio::fs::remove_file(config.port_file_path()).await;
-                    let _ = tokio::fs::remove_file(config.pid_file_path()).await;
-                    let _ = tokio::fs::remove_file(config.lock_file_path()).await;
-                    true
-                }
-            }
+    // Try to connect directly. TCP connect will fail immediately if the daemon
+    // isn't listening, so no separate probe is needed.
+    let needs_launch = match client.connect().await {
+        Ok(()) => {
+            debug!("Prod mode: connected to daemon");
+            return Ok(None);
         }
-        Err(_) => true,
+        Err(BridgeError::PortFileNotFound(_)) | Err(BridgeError::DaemonNotRunning) => {
+            // No port file → daemon never started
+            true
+        }
+        Err(BridgeError::ConnectionFailed(_)) | Err(BridgeError::Io(_)) => {
+            // Port file exists but daemon is dead → stale port file
+            warn!("Prod mode: port file exists but connection failed — stale");
+            let _ = tokio::fs::remove_file(config.port_file_path()).await;
+            let _ = tokio::fs::remove_file(config.pid_file_path()).await;
+            let _ = tokio::fs::remove_file(config.lock_file_path()).await;
+            true
+        }
+        Err(e) => return Err(e),
     };
 
     if !needs_launch {
-        // Daemon is reachable, connect via ZMQ
-        client.connect().await?;
         return Ok(None);
     }
 
@@ -423,7 +412,7 @@ where
     Ok(())
 }
 
-/// Task that handles bidirectional ZeroMQ communication.
+/// Task that handles bidirectional TCP communication.
 ///
 /// Uses select! to simultaneously:
 /// - Forward messages from stdin to daemon

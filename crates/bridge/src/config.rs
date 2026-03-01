@@ -16,9 +16,9 @@ pub enum ConnectionMode {
 /// Bridge configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeConfig {
-    /// ZeroMQ port range start.
+    /// TCP port range start.
     pub port_range_start: u16,
-    /// ZeroMQ port range end.
+    /// TCP port range end.
     pub port_range_end: u16,
     /// Connection timeout.
     #[serde(with = "duration_serde")]

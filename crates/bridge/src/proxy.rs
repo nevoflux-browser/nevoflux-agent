@@ -1,7 +1,7 @@
 //! Proxy bridge for Native Messaging.
 //!
 //! The proxy bridges between the browser extension (via Native Messaging)
-//! and the daemon (via ZeroMQ).
+//! and the daemon (via TCP).
 
 use crate::config::BridgeConfig;
 use crate::daemon_client::{generate_proxy_id, DaemonClient};

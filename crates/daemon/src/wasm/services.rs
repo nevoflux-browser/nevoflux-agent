@@ -323,7 +323,7 @@ impl HostServices {
     ///
     /// # Arguments
     ///
-    /// * `identity` - The ZeroMQ identity of the client connection.
+    /// * `identity` - The identity bytes of the client connection (proxy_id as UTF-8).
     /// * `proxy_id` - The proxy ID for the response envelope.
     ///
     /// # Returns

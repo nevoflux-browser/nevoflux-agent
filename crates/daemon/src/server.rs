@@ -1,4 +1,4 @@
-//! ZeroMQ ROUTER server for the daemon.
+//! TCP server for the daemon.
 
 use crate::agent_host::{DaemonHostFunctions, SidebarStreamChunk};
 use crate::config::AgentConfig;
@@ -8,7 +8,6 @@ use crate::session::SessionManager;
 use crate::trace::collector::TraceCollector;
 use crate::trace::file_writer::TraceFileWriter;
 use crate::wasm::{BrowserRequest, BrowserResponse, HostServices};
-use bytes::Bytes;
 use nevoflux_builtin_wasm::{Agent, AgentInput, AgentMode, Attachment, Message as WasmMessage};
 use nevoflux_protocol::{
     AgentMessage, Artifact, ArtifactComplete, ArtifactDelta, ArtifactStart, Channel,
@@ -20,9 +19,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
+use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, warn};
-use zeromq::{Socket, SocketSend, ZmqMessage};
 
 /// Registry for pending browser tool requests.
 /// Maps request_id to the response sender.
@@ -77,7 +77,7 @@ impl Default for ServerConfig {
     }
 }
 
-/// The ZeroMQ server handle.
+/// The TCP server handle.
 pub struct Server {
     /// The bound port.
     port: u16,
@@ -112,14 +112,139 @@ pub async fn find_available_port(config: &ServerConfig) -> Result<u16> {
     Err(DaemonError::PortExhausted)
 }
 
-/// Start the ZeroMQ server.
+/// Maximum message size for length-prefixed TCP framing (1 MB).
+const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
+
+/// Handle a single proxy TCP connection.
+///
+/// Reads the registration frame to learn the proxy_id, then loops reading
+/// length-prefixed JSON frames and forwarding them to the message processing loop.
+async fn handle_proxy_connection(
+    stream: tokio::net::TcpStream,
+    msg_tx: mpsc::Sender<(Vec<u8>, ProxyEnvelope)>,
+    writers: Arc<Mutex<HashMap<String, BufWriter<tokio::net::tcp::OwnedWriteHalf>>>>,
+    last_message_time: Arc<Mutex<std::time::Instant>>,
+) {
+    let (read_half, write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    // Read registration frame: { "type": "register", "proxy_id": "proxy-xxx" }
+    let proxy_id = match read_length_prefixed_message(&mut reader).await {
+        Ok(data) => match serde_json::from_slice::<serde_json::Value>(&data) {
+            Ok(val) => {
+                if val.get("type").and_then(|t| t.as_str()) == Some("register") {
+                    if let Some(id) = val.get("proxy_id").and_then(|v| v.as_str()) {
+                        id.to_string()
+                    } else {
+                        error!("Registration frame missing proxy_id");
+                        return;
+                    }
+                } else {
+                    error!("First frame is not a registration frame");
+                    return;
+                }
+            }
+            Err(e) => {
+                error!("Failed to parse registration frame: {}", e);
+                return;
+            }
+        },
+        Err(e) => {
+            // Early EOF is normal for health-check / probe connections
+            debug!("Connection closed before registration: {}", e);
+            return;
+        }
+    };
+
+    info!("Proxy registered: {}", proxy_id);
+
+    // Register writer
+    {
+        let writer = BufWriter::new(write_half);
+        writers.lock().await.insert(proxy_id.clone(), writer);
+    }
+
+    // Identity bytes (proxy_id encoded as UTF-8) for compatibility with existing pipeline
+    let identity = proxy_id.as_bytes().to_vec();
+
+    // Read loop: read length-prefixed JSON frames
+    loop {
+        match read_length_prefixed_message(&mut reader).await {
+            Ok(data) => match serde_json::from_slice::<ProxyEnvelope>(&data) {
+                Ok(envelope) => {
+                    let msg_type = envelope
+                        .payload
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    info!(
+                        "Socket received: type={}, proxy_id={}",
+                        msg_type, envelope.proxy_id
+                    );
+                    *last_message_time.lock().await = std::time::Instant::now();
+                    if msg_tx.send((identity.clone(), envelope)).await.is_err() {
+                        debug!("Message channel closed, stopping reader for {}", proxy_id);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to parse ProxyEnvelope from {}: {}", proxy_id, e);
+                }
+            },
+            Err(e) => {
+                info!("Proxy {} disconnected: {}", proxy_id, e);
+                break;
+            }
+        }
+    }
+
+    // Clean up writer
+    writers.lock().await.remove(&proxy_id);
+    info!("Proxy {} cleaned up", proxy_id);
+}
+
+/// Read a single length-prefixed message from a TCP stream.
+///
+/// Format: 4-byte little-endian length + JSON payload.
+async fn read_length_prefixed_message(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> std::result::Result<Vec<u8>, std::io::Error> {
+    use tokio::io::AsyncReadExt;
+
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).await?;
+    let len = u32::from_le_bytes(len_buf);
+
+    if len > MAX_MESSAGE_SIZE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Message too large: {} bytes (max {})",
+                len, MAX_MESSAGE_SIZE
+            ),
+        ));
+    }
+
+    if len == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Empty message",
+        ));
+    }
+
+    let mut buf = vec![0u8; len as usize];
+    reader.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Start the TCP server.
 pub async fn start_server(
     config: ServerConfig,
     router: Arc<Router>,
     session_manager: Arc<SessionManager>,
 ) -> Result<Server> {
     let port = find_available_port(&config).await?;
-    let addr = format!("tcp://{}:{}", config.bind_address, port);
+    let addr = format!("{}:{}", config.bind_address, port);
 
     info!("Starting daemon server on {}", addr);
 
@@ -254,108 +379,117 @@ pub async fn start_server(
         services = services.with_knowledge_retriever(retriever);
     }
 
-    let mut socket = zeromq::RouterSocket::new();
-    socket
-        .bind(&addr)
+    let bind_addr = format!("{}:{}", config.bind_address, port);
+    let listener = TcpListener::bind(&bind_addr)
         .await
         .map_err(|e| DaemonError::InternalError(format!("Failed to bind: {}", e)))?;
+
+    info!("TCP listener bound on {}", bind_addr);
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let (msg_tx, mut msg_rx) = mpsc::channel::<(Vec<u8>, ProxyEnvelope)>(100);
     let (response_tx, mut response_rx) = mpsc::channel::<(Vec<u8>, DaemonEnvelope)>(100);
 
-    // Use internal channel for socket operations to avoid send blocking receive
-    // The socket task processes send/receive in round-robin fashion
-    let (socket_send_tx, mut socket_send_rx) = mpsc::channel::<(Vec<u8>, Vec<u8>, String)>(1000);
+    // Writer registry: maps proxy_id → writer half for routing responses
+    type WriterMap = Arc<Mutex<HashMap<String, BufWriter<tokio::net::tcp::OwnedWriteHalf>>>>;
+    let writers: WriterMap = Arc::new(Mutex::new(HashMap::new()));
 
-    // Task to forward responses to socket send channel
-    let forward_response_tx = socket_send_tx.clone();
+    // Response writer task: receives (identity, DaemonEnvelope) and writes to correct proxy
+    let writer_map = writers.clone();
     tokio::spawn(async move {
         while let Some((identity, response)) = response_rx.recv().await {
+            let proxy_id = String::from_utf8_lossy(&identity).to_string();
             let msg_type = response
                 .payload
                 .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .to_string();
+
             if let Ok(data) = serde_json::to_vec(&response) {
-                let _ = forward_response_tx.send((identity, data, msg_type)).await;
+                let len = data.len() as u32;
+                let mut map = writer_map.lock().await;
+                if let Some(writer) = map.get_mut(&proxy_id) {
+                    let result = async {
+                        writer.write_all(&len.to_le_bytes()).await?;
+                        writer.write_all(&data).await?;
+                        writer.flush().await?;
+                        Ok::<(), std::io::Error>(())
+                    }
+                    .await;
+
+                    match result {
+                        Ok(()) => {
+                            debug!("Sent to proxy {}: type={}", proxy_id, msg_type);
+                        }
+                        Err(e) => {
+                            error!("Failed to send to proxy {}: {}", proxy_id, e);
+                            // Remove disconnected writer
+                            map.remove(&proxy_id);
+                        }
+                    }
+                } else {
+                    warn!("No writer for proxy {}, dropping message", proxy_id);
+                }
             }
         }
     });
 
-    // Main socket I/O task - alternates between send and receive
+    // TCP accept loop: accepts connections and spawns per-connection reader tasks
+    let accept_writers = writers.clone();
     let config_managed = config.managed;
     let config_idle_timeout = config.idle_timeout;
-    let mut socket = socket;
+    let accept_shutdown_tx = shutdown_tx.clone();
     tokio::spawn(async move {
-        let mut last_message_time = std::time::Instant::now();
-        loop {
-            // Try to send one message if available (non-blocking check)
-            match socket_send_rx.try_recv() {
-                Ok((identity, data, msg_type)) => {
-                    let frames: Vec<Bytes> = vec![Bytes::from(identity), Bytes::from(data)];
-                    if let Ok(zmq_msg) = ZmqMessage::try_from(frames) {
-                        if let Err(e) = socket.send(zmq_msg).await {
-                            error!("Failed to send: {}", e);
-                        } else {
-                            debug!("Socket sent: type={}", msg_type);
-                        }
-                    }
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
-            }
+        let last_message_time = Arc::new(Mutex::new(std::time::Instant::now()));
 
-            // Try to receive one message with short timeout
-            match tokio::time::timeout(
-                tokio::time::Duration::from_millis(5),
-                zeromq::SocketRecv::recv(&mut socket),
-            )
-            .await
-            {
-                Ok(Ok(zmq_msg)) => {
-                    let frames = zmq_msg.into_vec();
-                    if frames.len() >= 2 {
-                        let identity = frames[0].to_vec();
-                        if let Ok(envelope) = serde_json::from_slice::<ProxyEnvelope>(&frames[1]) {
-                            let msg_type = envelope
-                                .payload
-                                .get("type")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown");
-                            info!(
-                                "Socket received: type={}, proxy_id={}",
-                                msg_type, envelope.proxy_id
-                            );
-                            last_message_time = std::time::Instant::now();
-                            let _ = msg_tx.send((identity, envelope)).await;
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    error!("Receive error: {}", e);
-                }
-                Err(_) => {
-                    // Timeout - no message, check idle
-                    if config_managed && last_message_time.elapsed() > config_idle_timeout {
+        // Idle check task for managed daemon
+        if config_managed {
+            let idle_last_message = last_message_time.clone();
+            let idle_shutdown = accept_shutdown_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    let elapsed = idle_last_message.lock().await.elapsed();
+                    if elapsed > config_idle_timeout {
                         info!(
                             "Managed daemon: idle for {:?}, self-terminating",
                             config_idle_timeout
                         );
+                        let _ = idle_shutdown.send(()).await;
                         break;
                     }
                 }
-            }
+            });
+        }
 
-            // Check shutdown
-            match shutdown_rx.try_recv() {
-                Ok(_) => {
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, peer_addr)) => {
+                            debug!("New TCP connection from {}", peer_addr);
+                            if let Err(e) = stream.set_nodelay(true) {
+                                warn!("Failed to set TCP_NODELAY: {}", e);
+                            }
+
+                            let msg_tx = msg_tx.clone();
+                            let conn_writers = accept_writers.clone();
+                            let last_msg = last_message_time.clone();
+
+                            tokio::spawn(async move {
+                                handle_proxy_connection(stream, msg_tx, conn_writers, last_msg).await;
+                            });
+                        }
+                        Err(e) => {
+                            error!("Failed to accept TCP connection: {}", e);
+                        }
+                    }
+                }
+                _ = shutdown_rx.recv() => {
                     info!("Server shutdown signal received");
                     break;
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
     });
@@ -775,9 +909,15 @@ async fn handle_chat_message_streaming(
 
     // For non-chat_message types, handle synchronously
     if msg_type != "chat_message" {
-        let mut response_payload =
-            handle_chat_message(payload, config, shared_config, session_manager, services, runtime)
-                .await;
+        let mut response_payload = handle_chat_message(
+            payload,
+            config,
+            shared_config,
+            session_manager,
+            services,
+            runtime,
+        )
+        .await;
         // Add done: true to signal this is a complete response (not streaming)
         if let Some(obj) = response_payload.as_object_mut() {
             if let Some(payload_obj) = obj.get_mut("payload").and_then(|p| p.as_object_mut()) {
@@ -1183,9 +1323,11 @@ async fn handle_chat_message_streaming(
         mcp_servers: mcp_servers.clone(),
         soul_context: {
             let sc = build_soul_context(&services);
-            debug!("soul_context for AgentInput: has_retriever={}, len={:?}",
+            debug!(
+                "soul_context for AgentInput: has_retriever={}, len={:?}",
                 services.knowledge_retriever.is_some(),
-                sc.as_ref().map(|s| s.len()));
+                sc.as_ref().map(|s| s.len())
+            );
             sc
         },
     };
@@ -4487,11 +4629,8 @@ async fn handle_file_pick(params: &serde_json::Value) -> serde_json::Value {
     );
 
     // Timeout after 120 seconds to prevent the file picker lock from being held forever
-    let pick_result = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
-        pick_files(req),
-    )
-    .await;
+    let pick_result =
+        tokio::time::timeout(std::time::Duration::from_secs(120), pick_files(req)).await;
 
     let pick_result = match pick_result {
         Ok(result) => result,

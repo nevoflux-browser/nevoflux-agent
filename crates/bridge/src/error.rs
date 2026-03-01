@@ -13,10 +13,6 @@ pub enum BridgeError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// ZeroMQ error.
-    #[error("ZeroMQ error: {0}")]
-    ZeroMq(#[from] zeromq::ZmqError),
-
     /// Daemon not running.
     #[error("Daemon not running")]
     DaemonNotRunning,
