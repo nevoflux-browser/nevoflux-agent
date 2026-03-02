@@ -56,18 +56,48 @@ pub struct SoulManager {
     manual_sections: HashSet<String>,
 }
 
+/// Discover bundled soul templates from the distribution directory.
+///
+/// Looks for `{exe_dir}/defaults/soul/` alongside the agent binary,
+/// matching the same pattern used by `resolve_cache_dir()` for embedding models.
+fn discover_bundled_templates() -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let bundled = exe_dir.join("defaults").join("soul");
+    if bundled.is_dir() {
+        Some(bundled)
+    } else {
+        None
+    }
+}
+
 impl SoulManager {
     /// Initialize a new soul directory with default templates.
     ///
     /// Creates the directory structure and writes default content for any
-    /// documents that do not already exist. After writing, loads all
-    /// documents into the cache.
+    /// documents that do not already exist. When a file is missing, the
+    /// method first checks for bundled templates in `{exe_dir}/defaults/soul/`
+    /// before falling back to hardcoded defaults in `templates.rs`.
+    /// After writing, loads all documents into the cache.
     pub async fn init(soul_dir: &Path) -> Result<Self> {
+        let bundled_dir = discover_bundled_templates();
+        Self::init_with_bundled(soul_dir, bundled_dir.as_deref()).await
+    }
+
+    /// Initialize with an explicit bundled template directory.
+    ///
+    /// This is the inner implementation used by [`init`]. If `bundled_dir` is
+    /// `Some`, template files found there take priority over the hardcoded
+    /// defaults in `templates.rs`. Files that already exist in `soul_dir` are
+    /// never overwritten.
+    pub async fn init_with_bundled(
+        soul_dir: &Path,
+        bundled_dir: Option<&Path>,
+    ) -> Result<Self> {
         tokio::fs::create_dir_all(soul_dir).await?;
         tokio::fs::create_dir_all(soul_dir.join(".changelog")).await?;
         tokio::fs::create_dir_all(soul_dir.join(".snapshots")).await?;
 
-        let files = [
+        let hardcoded_defaults = [
             ("IDENTITY.md", templates::default_identity()),
             ("SOUL.md", templates::default_soul()),
             ("USER.md", templates::default_user()),
@@ -75,11 +105,21 @@ impl SoulManager {
             ("AGENTS.md", templates::default_agents()),
         ];
 
-        for (name, content) in &files {
+        for (name, fallback_content) in &hardcoded_defaults {
             let path = soul_dir.join(name);
             match tokio::fs::metadata(&path).await {
                 Ok(_) => { /* file exists, skip */ }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Try bundled template first, fall back to hardcoded
+                    let content = if let Some(dir) = bundled_dir {
+                        let bundled_path = dir.join(name);
+                        match tokio::fs::read_to_string(&bundled_path).await {
+                            Ok(bundled) => bundled,
+                            Err(_) => fallback_content.clone(),
+                        }
+                    } else {
+                        fallback_content.clone()
+                    };
                     tokio::fs::write(&path, content).await?;
                 }
                 Err(e) => return Err(e.into()),
@@ -844,5 +884,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(on_disk, original);
+    }
+
+    // --- Bundled template tests ---
+
+    #[tokio::test]
+    async fn init_uses_bundled_templates_when_available() {
+        let tmp = TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+
+        // Create a fake bundled templates directory
+        let bundled_dir = tmp.path().join("bin").join("defaults").join("soul");
+        tokio::fs::create_dir_all(&bundled_dir).await.unwrap();
+
+        let custom_identity = "# Custom Bundled Identity\n\nFrom distribution package.\n";
+        tokio::fs::write(bundled_dir.join("IDENTITY.md"), custom_identity)
+            .await
+            .unwrap();
+        // Don't create other files — they should fall back to hardcoded
+
+        let manager = SoulManager::init_with_bundled(&soul_dir, Some(&bundled_dir))
+            .await
+            .unwrap();
+
+        // IDENTITY.md should have bundled content
+        assert_eq!(manager.cache().identity_raw, custom_identity);
+        // SOUL.md should have hardcoded fallback content
+        assert!(manager.cache().soul_raw.contains("NevoFlux Soul"));
+    }
+
+    #[tokio::test]
+    async fn init_with_bundled_falls_back_to_hardcoded_when_no_bundled_dir() {
+        let tmp = TempDir::new().unwrap();
+        let soul_dir = tmp.path().join("soul");
+
+        let manager = SoulManager::init_with_bundled(&soul_dir, None).await.unwrap();
+
+        assert!(manager.cache().identity_raw.contains("NevoFlux Identity"));
+        assert!(manager.cache().soul_raw.contains("NevoFlux Soul"));
+        assert!(manager.cache().user_raw.contains("NevoFlux User Profile"));
+        assert!(manager.cache().tools_raw.contains("NevoFlux Tools"));
+        assert!(manager.cache().agents_raw.contains("NevoFlux Agents"));
     }
 }
