@@ -89,7 +89,7 @@ impl SoulManager {
     /// `Some`, template files found there take priority over the hardcoded
     /// defaults in `templates.rs`. Files that already exist in `soul_dir` are
     /// never overwritten.
-    pub async fn init_with_bundled(
+    pub(crate) async fn init_with_bundled(
         soul_dir: &Path,
         bundled_dir: Option<&Path>,
     ) -> Result<Self> {
