@@ -1007,4 +1007,118 @@ mod tests {
             "exact domain should score higher in hybrid: exact={exact}, mismatch={mismatch}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // E2E: hot knowledge retrieval
+    // -----------------------------------------------------------------------
+
+    /// E2E test: promoted hot knowledge entries are retrievable and ranked
+    /// above non-hot entries, while archived entries are excluded.
+    #[tokio::test]
+    async fn e2e_hot_knowledge_appears_in_retrieval() {
+        use rusqlite::params;
+
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let cache = make_cache();
+
+        // Create a hot (promoted) entry for github.com
+        let hot_entry = create_test_entry(
+            &storage,
+            "site_interaction",
+            Some("github.com"),
+            "Use data-testid selectors on GitHub",
+        );
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET status = 'promoted', hot = 1, \
+                     confidence = 0.95, hit_count = 20, \
+                     hot_summary = '[github.com] Use data-testid selectors' \
+                     WHERE id = ?1",
+                    params![hot_entry.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Create a non-hot validated entry for github.com (lower confidence)
+        let normal_entry = create_test_entry(
+            &storage,
+            "site_interaction",
+            Some("github.com"),
+            "GitHub has a search bar",
+        );
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET status = 'validated', \
+                     confidence = 0.5, hit_count = 3 \
+                     WHERE id = ?1",
+                    params![normal_entry.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Create an archived entry (should NOT appear)
+        let archived_entry = create_test_entry(
+            &storage,
+            "site_interaction",
+            Some("github.com"),
+            "Outdated GitHub selector pattern",
+        );
+        storage
+            .knowledge()
+            .update_status(&archived_entry.id, "archived")
+            .unwrap();
+
+        // Retrieve
+        let retriever = KnowledgeRetriever::new(cache, Arc::clone(&storage));
+        let result = retriever
+            .retrieve("selectors", Some("github.com"), Some("site_interaction"))
+            .await
+            .unwrap();
+
+        // Should have at least 2 entries (hot + normal), but NOT the archived one
+        assert!(
+            result.entries.len() >= 2,
+            "Should retrieve hot and validated entries, got {}",
+            result.entries.len()
+        );
+
+        // Archived entry must not appear
+        let has_archived = result
+            .entries
+            .iter()
+            .any(|sk| sk.entry.id == archived_entry.id);
+        assert!(
+            !has_archived,
+            "Archived entries must be excluded from retrieval"
+        );
+
+        // Hot entry should be present
+        let has_hot = result
+            .entries
+            .iter()
+            .any(|sk| sk.entry.id == hot_entry.id);
+        assert!(has_hot, "Hot (promoted) entry should appear in results");
+
+        // The hot entry should rank higher (higher confidence → higher score)
+        let hot_pos = result
+            .entries
+            .iter()
+            .position(|sk| sk.entry.id == hot_entry.id);
+        let normal_pos = result
+            .entries
+            .iter()
+            .position(|sk| sk.entry.id == normal_entry.id);
+        if let (Some(hp), Some(np)) = (hot_pos, normal_pos) {
+            assert!(
+                hp < np,
+                "Hot entry (confidence=0.95) should rank above normal entry (confidence=0.5)"
+            );
+        }
+    }
 }

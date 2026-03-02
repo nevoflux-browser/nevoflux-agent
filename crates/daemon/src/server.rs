@@ -6077,4 +6077,167 @@ mod tests {
         // Shutdown
         server.shutdown().await;
     }
+
+    // -----------------------------------------------------------------------
+    // E2E: hot knowledge → system prompt injection
+    // -----------------------------------------------------------------------
+
+    /// Verify that promoted hot knowledge entries are rendered into the
+    /// correct markdown format by `build_hot_knowledge_section()`.
+    ///
+    /// Tests all three categories (site_interaction, tool_optimization,
+    /// user_preference) and verifies non-hot entries are excluded.
+    #[test]
+    fn e2e_hot_knowledge_section_rendering() {
+        use nevoflux_storage::{CreateKnowledgeParams, Storage};
+
+        let storage = Storage::open_in_memory().unwrap();
+
+        // Insert hot entries for all 3 categories
+        storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                domain: Some("github.com".into()),
+                summary: "Use data-testid for selectors on GitHub".into(),
+                details: "GitHub uses data-testid attributes extensively".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "tool_optimization".into(),
+                domain: None,
+                summary: "click_element times out on SPAs".into(),
+                details: "Single-page apps need wait_for_navigation after click".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "user_preference".into(),
+                domain: None,
+                summary: "User prefers concise responses".into(),
+                details: "Keep replies under 3 sentences when possible".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Also insert a non-hot entry (should NOT appear)
+        storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                domain: Some("hidden.com".into()),
+                summary: "This should not appear in hot section".into(),
+                details: "Not promoted".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Mark the first 3 entries as hot via SQL (simulating promotion)
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET status = 'promoted', hot = 1, \
+                     hot_summary = '[github.com] Use data-testid for selectors' \
+                     WHERE summary LIKE '%data-testid%'",
+                    [],
+                )?;
+                conn.execute(
+                    "UPDATE knowledge SET status = 'promoted', hot = 1, \
+                     hot_summary = 'click_element needs wait_for_navigation on SPAs' \
+                     WHERE summary LIKE '%click_element%'",
+                    [],
+                )?;
+                conn.execute(
+                    "UPDATE knowledge SET status = 'promoted', hot = 1, \
+                     hot_summary = 'User prefers concise responses' \
+                     WHERE summary LIKE '%concise responses%'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Call build_hot_knowledge_section
+        let section = build_hot_knowledge_section(storage.database())
+            .expect("Should produce a section when hot entries exist");
+
+        // Verify section header
+        assert!(
+            section.contains("## Learned Knowledge (auto-updated)"),
+            "Should have main header. Got:\n{}",
+            section
+        );
+
+        // Verify all 3 category subsections
+        assert!(
+            section.contains("### Site Interactions"),
+            "Should have Site Interactions section"
+        );
+        assert!(
+            section.contains("### Tool Optimizations"),
+            "Should have Tool Optimizations section"
+        );
+        assert!(
+            section.contains("### User Preferences"),
+            "Should have User Preferences section"
+        );
+
+        // Verify hot_summary content appears
+        assert!(
+            section.contains("[github.com] Use data-testid for selectors"),
+            "Should contain site interaction hot_summary"
+        );
+        assert!(
+            section.contains("click_element needs wait_for_navigation on SPAs"),
+            "Should contain tool optimization hot_summary"
+        );
+        assert!(
+            section.contains("User prefers concise responses"),
+            "Should contain user preference hot_summary"
+        );
+
+        // Verify non-hot entry does NOT appear
+        assert!(
+            !section.contains("hidden.com"),
+            "Non-hot entries must not appear in the section"
+        );
+        assert!(
+            !section.contains("This should not appear"),
+            "Non-hot entry summary must not appear"
+        );
+    }
+
+    /// Verify that `build_hot_knowledge_section()` returns `None` when
+    /// there are no hot entries.
+    #[test]
+    fn e2e_hot_knowledge_section_empty_when_no_hot() {
+        use nevoflux_storage::{CreateKnowledgeParams, Storage};
+
+        let storage = Storage::open_in_memory().unwrap();
+
+        // Insert a non-hot entry
+        storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "Some knowledge".into(),
+                details: "Details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let section = build_hot_knowledge_section(storage.database());
+        assert!(
+            section.is_none(),
+            "Should return None when no hot entries exist"
+        );
+    }
 }

@@ -2353,4 +2353,183 @@ mod tests {
         let old_entry = repo.get(&old.id).unwrap().unwrap();
         assert_eq!(old_entry.status, "validated");
     }
+
+    // -----------------------------------------------------------------------
+    // E2E tests: full pipeline chain
+    // -----------------------------------------------------------------------
+
+    /// Full chain E2E test covering the entire learning pipeline:
+    /// ToolTraceLearningSource → Collector → Buffer → Flush → Validate → Promote → hot=1
+    ///
+    /// This test uses real storage with trace span data (simulating a tool
+    /// with high failure rate) and verifies the complete data flow from
+    /// signal source through to hot knowledge promotion.
+    #[tokio::test]
+    async fn e2e_source_to_hot_full_pipeline() {
+        use crate::learning::collector::LearningCollector;
+        use crate::learning::sources::ToolTraceLearningSource;
+        use nevoflux_storage::CreateTraceSpanParams;
+        use std::sync::atomic::AtomicBool;
+
+        // 1. Setup: in-memory Storage + Pipeline
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let buffer = Arc::new(MemoryBuffer::new(20, Duration::from_secs(30)));
+        let pipeline = LearningPipeline::new(buffer.clone(), storage.clone(), None);
+
+        // 2. Insert tool execution spans (simulating a tool with 80% failure rate)
+        //    Need >= 3 calls to pass ToolTraceLearningSource.min_calls threshold
+        for i in 0..5u32 {
+            storage
+                .traces()
+                .create(CreateTraceSpanParams {
+                    session_id: "e2e-session".into(),
+                    iteration: i,
+                    span_type: "tool_exec".into(),
+                    tool_name: Some("flaky_tool".into()),
+                    tool_params: None,
+                    success: i == 0, // only first call succeeds → 80% failure rate
+                    error_code: if i > 0 {
+                        Some("TIMEOUT".into())
+                    } else {
+                        None
+                    },
+                    error_msg: if i > 0 {
+                        Some("connection timeout".into())
+                    } else {
+                        None
+                    },
+                    duration_ms: Some(100),
+                })
+                .unwrap();
+        }
+
+        // 3. Source → Collector → collect entries
+        let source = ToolTraceLearningSource::new(storage.clone());
+        let mut collector = LearningCollector::new();
+        collector.set_enabled(Arc::new(AtomicBool::new(true)));
+        collector.register_source(Box::new(source));
+
+        let entries = collector.collect_all();
+        assert!(
+            !entries.is_empty(),
+            "Source should produce entries for tool with 80% failure rate"
+        );
+
+        // Verify entries reference the flaky tool
+        let has_flaky = entries
+            .iter()
+            .any(|e| e.summary.contains("flaky_tool"));
+        assert!(has_flaky, "Should have entry about flaky_tool");
+
+        // 4. Insert collected entries into buffer
+        for entry in entries {
+            buffer.insert(entry);
+        }
+        assert!(!buffer.is_empty());
+
+        // 5. Flush → knowledge table (pending status)
+        let flushed = pipeline.flush().unwrap();
+        assert!(flushed > 0, "Should flush at least one entry to knowledge table");
+
+        let pending = storage.knowledge().query_pending(10).unwrap();
+        assert!(!pending.is_empty(), "Should have pending entries after flush");
+
+        // Verify the flushed entry references flaky_tool
+        let flaky_entry = pending
+            .iter()
+            .find(|e| e.summary.contains("flaky_tool"))
+            .expect("Should have a pending entry about flaky_tool");
+        assert_eq!(flaky_entry.status, "pending");
+
+        // 6. Adjust hit_count and confidence to meet validation thresholds
+        //    (simulating multiple observations over time)
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET hit_count = 5, confidence = 0.85",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // 7. Validate: pending → validated
+        let val_thresholds = ValidationThresholds {
+            min_occurrences: 3,
+            min_confidence: 0.6,
+            min_alive_hours: 0, // skip time constraint for test
+        };
+        let validated = pipeline.validate(&val_thresholds).unwrap();
+        assert!(validated > 0, "Should validate at least one entry");
+
+        // 8. Promote: validated → promoted (hot=1)
+        let promo_thresholds = test_promotion_thresholds(10);
+        let result = pipeline.promote(&promo_thresholds).await.unwrap();
+        assert!(result.promoted > 0, "Should promote at least one entry");
+
+        // 9. Verify final state: hot=1 with hot_summary containing tool name
+        let hot = storage.knowledge().list_hot().unwrap();
+        assert!(!hot.is_empty(), "Should have hot entries after promotion");
+
+        let hot_flaky = hot
+            .iter()
+            .find(|e| e.summary.contains("flaky_tool"))
+            .expect("Hot entries should include flaky_tool knowledge");
+        assert!(hot_flaky.hot);
+        assert_eq!(hot_flaky.status, "promoted");
+        assert!(hot_flaky.promoted_at.is_some());
+        assert!(
+            hot_flaky.hot_summary.is_some(),
+            "Promoted entry must have a hot_summary"
+        );
+        assert!(
+            hot_flaky
+                .hot_summary
+                .as_ref()
+                .unwrap()
+                .contains("flaky_tool"),
+            "hot_summary should reference the tool name"
+        );
+    }
+
+    /// E2E test: verify that promoted hot knowledge with capacity limits
+    /// correctly evicts low-confidence entries when the limit is exceeded.
+    #[tokio::test]
+    async fn e2e_hot_limit_evicts_low_confidence() {
+        let (pipeline, storage) = setup();
+
+        // Create 5 validated entries with varying confidence
+        for i in 0..5 {
+            create_validated_entry(
+                &storage,
+                "tool_optimization",
+                None,
+                Some(&format!("tool{}.io", i)),
+                &format!("Tool {} optimization tip", i),
+                0.5 + (i as f64) * 0.1, // 0.5, 0.6, 0.7, 0.8, 0.9
+            );
+        }
+
+        // Promote all with hot_limit_tool_optimization = 3
+        let mut thresholds = test_promotion_thresholds(10);
+        thresholds.hot_limit_tool_optimization = 3;
+
+        let result = pipeline.promote(&thresholds).await.unwrap();
+        assert_eq!(result.promoted, 5, "All 5 should be promoted initially");
+
+        // After enforcement, only 3 should remain hot (highest confidence)
+        let hot = storage
+            .knowledge()
+            .list_hot_by_category("tool_optimization")
+            .unwrap();
+        assert_eq!(hot.len(), 3, "Only 3 should remain hot after limit enforcement");
+
+        // Verify the kept entries have the highest confidence
+        let confidences: Vec<f64> = hot.iter().map(|e| e.confidence).collect();
+        assert!(
+            confidences.iter().all(|&c| c >= 0.7),
+            "Only entries with confidence >= 0.7 should remain hot"
+        );
+    }
 }
