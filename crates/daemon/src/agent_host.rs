@@ -35,6 +35,7 @@ use nevoflux_builtin_wasm::{
 use nevoflux_llm::ProviderType;
 use nevoflux_mcp::ToolResultContent;
 use nevoflux_protocol::BrowserToolAction;
+use nevoflux_storage::VectorSearchResult;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -919,26 +920,65 @@ impl HostFunctions for DaemonHostFunctions {
 
         debug!("memory_search: query='{}', limit={}", query, limit);
 
-        // Use FTS search from the storage crate
-        let results = services
+        let fetch_limit = limit * 3; // Fetch more candidates for merging
+
+        // Path 1: FTS5 keyword search
+        let fts_results = services
             .database
             .memory()
-            .search_fts(query, limit)
+            .search_fts(query, fetch_limit)
             .map_err(|e| HostError {
                 code: 100,
                 message: format!("Memory search failed: {}", e),
             })?;
 
-        // Convert storage::MemoryChunk to builtin_wasm::MemoryChunk
-        Ok(results
-            .into_iter()
-            .map(|chunk| MemoryChunk {
-                id: chunk.id,
-                content: chunk.content,
-                session_id: chunk.session_id,
-                score: 1.0, // FTS doesn't provide a score, use 1.0 as default
-            })
-            .collect())
+        // Path 2: Vector semantic search (if embedding provider is available)
+        let semantic_results = if let Some(ref provider) = services.embedding {
+            let runtime = self.runtime.clone();
+            let provider = Arc::clone(provider);
+            let query_owned = query.to_string();
+            let embed_result = tokio::task::block_in_place(|| {
+                runtime.block_on(async { provider.embed(&query_owned).await })
+            });
+            match embed_result {
+                Ok(query_emb) => {
+                    if let Ok(idx) = services.vector_index.read() {
+                        idx.search(&query_emb, fetch_limit)
+                    } else {
+                        vec![]
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to generate query embedding: {}", e);
+                    vec![]
+                }
+            }
+        } else {
+            vec![]
+        };
+
+        // If no semantic results, return FTS results directly (existing behavior)
+        if semantic_results.is_empty() {
+            return Ok(fts_results
+                .into_iter()
+                .take(limit)
+                .map(|chunk| MemoryChunk {
+                    id: chunk.id,
+                    content: chunk.content,
+                    session_id: chunk.session_id,
+                    score: 1.0,
+                })
+                .collect());
+        }
+
+        // Hybrid merge: combine FTS and semantic scores
+        let merged = merge_search_results(
+            &fts_results,
+            &semantic_results,
+            limit,
+            &services.database,
+        );
+        Ok(merged)
     }
 
     fn memory_create(&self, content: &str, metadata: &serde_json::Value) -> HostResult<String> {
@@ -965,6 +1005,35 @@ impl HostFunctions for DaemonHostFunctions {
                 code: 100,
                 message: format!("Memory create failed: {}", e),
             })?;
+
+        // Generate embedding and update vector index if provider is available
+        if let Some(ref provider) = services.embedding {
+            let runtime = self.runtime.clone();
+            let provider = Arc::clone(provider);
+            let content_owned = content.to_string();
+            let embed_result = tokio::task::block_in_place(|| {
+                runtime.block_on(async { provider.embed(&content_owned).await })
+            });
+            match embed_result {
+                Ok(embedding) => {
+                    // Persist embedding in storage
+                    if let Err(e) = services
+                        .database
+                        .memory()
+                        .update_embedding(&chunk_id, &embedding)
+                    {
+                        warn!("Failed to persist embedding for chunk {}: {}", chunk_id, e);
+                    }
+                    // Add to in-memory vector index
+                    if let Ok(mut idx) = services.vector_index.write() {
+                        idx.add(&chunk_id, embedding);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to generate embedding for chunk {}: {}", chunk_id, e);
+                }
+            }
+        }
 
         Ok(chunk_id)
     }
@@ -2123,6 +2192,294 @@ impl HostFunctions for DaemonHostFunctions {
         host_result
     }
 
+    fn computer_screenshot(&self, monitor: Option<i64>) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+        let controller = services
+            .computer_controller
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 2,
+                message: "Computer controller not configured".into(),
+            })?;
+
+        let controller = controller.clone();
+        let result = tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                if let Some(display_id) = monitor {
+                    controller.capture_display(display_id as u32).await
+                } else {
+                    controller.capture_screen().await
+                }
+            })
+        })
+        .map_err(|e| HostError {
+            code: 3,
+            message: format!("Screenshot failed: {}", e),
+        })?;
+
+        serde_json::to_string(&result).map_err(|e| HostError {
+            code: 4,
+            message: format!("Serialization failed: {}", e),
+        })
+    }
+
+    fn computer_mouse_move(&self, x: i64, y: i64, click: Option<&str>) -> HostResult<String> {
+        use nevoflux_computer::{ClickType, MouseButton, Point};
+
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+        let controller = services
+            .computer_controller
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 2,
+                message: "Computer controller not configured".into(),
+            })?;
+
+        let controller = controller.clone();
+        let point = Point::new(x as i32, y as i32);
+
+        tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                controller.move_to(point).await.map_err(|e| HostError {
+                    code: 3,
+                    message: format!("Mouse move failed: {}", e),
+                })?;
+
+                if let Some(click_action) = click {
+                    let (button, click_type) = match click_action {
+                        "right" => (MouseButton::Right, ClickType::Single),
+                        "middle" => (MouseButton::Middle, ClickType::Single),
+                        "double" => (MouseButton::Left, ClickType::Double),
+                        _ => (MouseButton::Left, ClickType::Single),
+                    };
+                    controller
+                        .click(button, click_type)
+                        .await
+                        .map_err(|e| HostError {
+                            code: 3,
+                            message: format!("Click failed: {}", e),
+                        })?;
+                }
+
+                Ok::<_, HostError>(())
+            })
+        })?;
+
+        Ok(format!(r#"{{"moved_to":{{"x":{},"y":{}}}}}"#, x, y))
+    }
+
+    fn computer_click(
+        &self,
+        x: i64,
+        y: i64,
+        button: Option<&str>,
+        click_type: Option<&str>,
+    ) -> HostResult<String> {
+        use nevoflux_computer::{ClickType, MouseButton, Point};
+
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+        let controller = services
+            .computer_controller
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 2,
+                message: "Computer controller not configured".into(),
+            })?;
+
+        let btn = match button {
+            Some("right") => MouseButton::Right,
+            Some("middle") => MouseButton::Middle,
+            _ => MouseButton::Left,
+        };
+        let ct = match click_type {
+            Some("double") => ClickType::Double,
+            Some("triple") => ClickType::Triple,
+            _ => ClickType::Single,
+        };
+        let point = Point::new(x as i32, y as i32);
+        let controller = controller.clone();
+
+        tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                controller
+                    .click_at(point, btn, ct)
+                    .await
+                    .map_err(|e| HostError {
+                        code: 3,
+                        message: format!("Click failed: {}", e),
+                    })
+            })
+        })?;
+
+        Ok(format!(
+            r#"{{"clicked":{{"x":{},"y":{},"button":"{}","click_type":"{}"}}}}"#,
+            x,
+            y,
+            button.unwrap_or("left"),
+            click_type.unwrap_or("single")
+        ))
+    }
+
+    fn computer_type_text(&self, text: &str, _delay_ms: Option<u64>) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+        let controller = services
+            .computer_controller
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 2,
+                message: "Computer controller not configured".into(),
+            })?;
+
+        let controller = controller.clone();
+        let text_owned = text.to_string();
+
+        tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                controller
+                    .type_text(&text_owned)
+                    .await
+                    .map_err(|e| HostError {
+                        code: 3,
+                        message: format!("Type text failed: {}", e),
+                    })
+            })
+        })?;
+
+        Ok(format!(r#"{{"typed_chars":{}}}"#, text.len()))
+    }
+
+    fn computer_key(
+        &self,
+        key: &str,
+        modifiers: &[String],
+        repeat: Option<u64>,
+    ) -> HostResult<String> {
+        use nevoflux_computer::KeyCombination;
+
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+        let controller = services
+            .computer_controller
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 2,
+                message: "Computer controller not configured".into(),
+            })?;
+
+        // Parse key
+        let key_or_char = parse_key_str(key).map_err(|msg| HostError {
+            code: 4,
+            message: msg,
+        })?;
+
+        let mut combination = KeyCombination {
+            key: key_or_char,
+            modifiers: Vec::new(),
+        };
+
+        for m in modifiers {
+            match m.to_lowercase().as_str() {
+                "shift" => combination = combination.with_shift(),
+                "ctrl" | "control" => combination = combination.with_ctrl(),
+                "alt" => combination = combination.with_alt(),
+                "meta" | "cmd" | "command" | "win" | "windows" | "super" => {
+                    combination = combination.with_meta()
+                }
+                _ => {}
+            }
+        }
+
+        let repeat_count = repeat.unwrap_or(1).max(1).min(100);
+        let controller = controller.clone();
+
+        tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                for _ in 0..repeat_count {
+                    controller
+                        .press_key(combination.clone())
+                        .await
+                        .map_err(|e| HostError {
+                            code: 3,
+                            message: format!("Key press failed: {}", e),
+                        })?;
+                }
+                Ok::<_, HostError>(())
+            })
+        })?;
+
+        Ok(format!(
+            r#"{{"pressed":"{}","repeat":{}}}"#,
+            key, repeat_count
+        ))
+    }
+
+    fn computer_scroll(
+        &self,
+        x: i64,
+        y: i64,
+        direction: &str,
+        amount: Option<u64>,
+    ) -> HostResult<String> {
+        use nevoflux_computer::{Point, ScrollDirection};
+
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+        let controller = services
+            .computer_controller
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 2,
+                message: "Computer controller not configured".into(),
+            })?;
+
+        let dir = match direction {
+            "up" => ScrollDirection::Up,
+            "left" => ScrollDirection::Left,
+            "right" => ScrollDirection::Right,
+            _ => ScrollDirection::Down,
+        };
+        let scroll_amount = amount.unwrap_or(3) as u32;
+        let point = Point::new(x as i32, y as i32);
+        let controller = controller.clone();
+
+        tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                controller.move_to(point).await.map_err(|e| HostError {
+                    code: 3,
+                    message: format!("Mouse move failed: {}", e),
+                })?;
+                controller
+                    .scroll(dir, scroll_amount)
+                    .await
+                    .map_err(|e| HostError {
+                        code: 3,
+                        message: format!("Scroll failed: {}", e),
+                    })
+            })
+        })?;
+
+        Ok(format!(
+            r#"{{"scrolled":"{}","amount":{},"at":{{"x":{},"y":{}}}}}"#,
+            direction, scroll_amount, x, y
+        ))
+    }
+
     fn builtin_chat(&self, input: &AgentInput) -> HostResult<AgentOutput> {
         // Create a new agent and run chat mode
         let agent = nevoflux_builtin_wasm::Agent::new(self.clone_for_builtin());
@@ -3151,6 +3508,145 @@ impl DaemonHostFunctions {
                 })
         }
     }
+}
+
+/// Parse a key string into a KeyOrChar for computer_key host function.
+fn parse_key_str(key_str: &str) -> Result<nevoflux_computer::KeyOrChar, String> {
+    use nevoflux_computer::{Key, KeyOrChar};
+
+    let key = match key_str.to_lowercase().as_str() {
+        "shift" => Key::Shift,
+        "ctrl" | "control" => Key::Control,
+        "alt" => Key::Alt,
+        "meta" | "cmd" | "command" | "win" | "windows" | "super" => Key::Meta,
+        "f1" => Key::F1,
+        "f2" => Key::F2,
+        "f3" => Key::F3,
+        "f4" => Key::F4,
+        "f5" => Key::F5,
+        "f6" => Key::F6,
+        "f7" => Key::F7,
+        "f8" => Key::F8,
+        "f9" => Key::F9,
+        "f10" => Key::F10,
+        "f11" => Key::F11,
+        "f12" => Key::F12,
+        "escape" | "esc" => Key::Escape,
+        "tab" => Key::Tab,
+        "capslock" | "caps_lock" => Key::CapsLock,
+        "space" => Key::Space,
+        "enter" | "return" => Key::Enter,
+        "backspace" => Key::Backspace,
+        "delete" | "del" => Key::Delete,
+        "insert" | "ins" => Key::Insert,
+        "home" => Key::Home,
+        "end" => Key::End,
+        "pageup" | "page_up" => Key::PageUp,
+        "pagedown" | "page_down" => Key::PageDown,
+        "up" | "arrowup" | "arrow_up" => Key::ArrowUp,
+        "down" | "arrowdown" | "arrow_down" => Key::ArrowDown,
+        "left" | "arrowleft" | "arrow_left" => Key::ArrowLeft,
+        "right" | "arrowright" | "arrow_right" => Key::ArrowRight,
+        "printscreen" | "print_screen" => Key::PrintScreen,
+        "scrolllock" | "scroll_lock" => Key::ScrollLock,
+        "pause" => Key::Pause,
+        "numlock" | "num_lock" => Key::NumLock,
+        s if s.len() == 1 => {
+            return Ok(KeyOrChar::Char(s.chars().next().unwrap()));
+        }
+        _ => {
+            return Err(format!("Unknown key: {}", key_str));
+        }
+    };
+
+    Ok(KeyOrChar::Key(key))
+}
+
+/// Merge FTS keyword results with vector semantic results into a single ranked list.
+///
+/// Uses weighted scoring: FTS results get position-based scores (1.0 for first, decreasing),
+/// semantic results use cosine similarity scores. The final score is a weighted combination.
+///
+/// For chunks that appear only in semantic results (not in FTS), the function looks them
+/// up from the database to build the full `MemoryChunk`.
+fn merge_search_results(
+    fts_chunks: &[nevoflux_storage::MemoryChunk],
+    semantic_results: &[VectorSearchResult],
+    limit: usize,
+    database: &nevoflux_storage::Database,
+) -> Vec<MemoryChunk> {
+    let fts_weight = 0.4;
+    let semantic_weight = 0.6;
+
+    // Normalize FTS scores: position-based (first result = 1.0, last ~ 0.1)
+    let fts_count = fts_chunks.len().max(1) as f64;
+    let fts_scores: HashMap<&str, f64> = fts_chunks
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let score = 1.0 - (i as f64 / fts_count) * 0.9;
+            (c.id.as_str(), score)
+        })
+        .collect();
+
+    // Semantic scores are already 0..1 from cosine similarity
+    let sem_scores: HashMap<&str, f64> = semantic_results
+        .iter()
+        .map(|r| (r.id.as_str(), r.score as f64))
+        .collect();
+
+    // Combine scores from both sources
+    let mut combined: HashMap<&str, f64> = HashMap::new();
+    for id in fts_scores.keys().chain(sem_scores.keys()) {
+        if combined.contains_key(id) {
+            continue;
+        }
+        let fts = fts_scores.get(id).copied().unwrap_or(0.0);
+        let sem = sem_scores.get(id).copied().unwrap_or(0.0);
+        combined.insert(id, fts_weight * fts + semantic_weight * sem);
+    }
+
+    // Sort by combined score descending
+    let mut sorted: Vec<_> = combined.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.truncate(limit);
+
+    // Build lookup from FTS results for fast access
+    let fts_by_id: HashMap<&str, &nevoflux_storage::MemoryChunk> =
+        fts_chunks.iter().map(|c| (c.id.as_str(), c)).collect();
+
+    // Assemble final results
+    sorted
+        .into_iter()
+        .filter_map(|(id, score)| {
+            // Try FTS results first (already loaded)
+            if let Some(chunk) = fts_by_id.get(id) {
+                return Some(MemoryChunk {
+                    id: chunk.id.clone(),
+                    content: chunk.content.clone(),
+                    session_id: chunk.session_id.clone(),
+                    score: score as f32,
+                });
+            }
+            // Semantic-only hit: look up from database
+            match database.memory().get(id) {
+                Ok(Some(chunk)) => Some(MemoryChunk {
+                    id: chunk.id,
+                    content: chunk.content,
+                    session_id: chunk.session_id,
+                    score: score as f32,
+                }),
+                Ok(None) => {
+                    warn!("Memory chunk {} found in vector index but not in database", id);
+                    None
+                }
+                Err(e) => {
+                    warn!("Failed to look up memory chunk {}: {}", id, e);
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

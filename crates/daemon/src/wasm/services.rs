@@ -6,11 +6,12 @@
 
 use crate::learning::retriever::KnowledgeRetriever;
 use crate::wasm::subagent::SubagentExecutor;
-use nevoflux_llm::ProviderType;
+use nevoflux_computer::ComputerController;
+use nevoflux_llm::{EmbeddingProvider, ProviderType};
 use nevoflux_mcp::{McpManager, ToolSearchIndex};
 use nevoflux_protocol::{BrowserToolAction, BrowserToolError};
 use nevoflux_skills::SkillRegistry;
-use nevoflux_storage::Database;
+use nevoflux_storage::{Database, SimpleVectorIndex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -138,6 +139,12 @@ pub struct HostServices {
     /// When set, enables the agent to retrieve relevant knowledge entries
     /// and site adaptations from the learning system.
     pub knowledge_retriever: Option<Arc<KnowledgeRetriever>>,
+    /// Computer controller for screenshot/mouse/keyboard operations.
+    pub computer_controller: Option<Arc<dyn ComputerController>>,
+    /// Embedding provider for generating vector embeddings.
+    pub embedding: Option<Arc<dyn EmbeddingProvider>>,
+    /// In-memory vector index for semantic similarity search.
+    pub vector_index: Arc<std::sync::RwLock<SimpleVectorIndex>>,
 }
 
 impl HostServices {
@@ -181,6 +188,9 @@ impl HostServices {
             client_identity: Vec::new(),
             proxy_id: String::new(),
             knowledge_retriever: None,
+            computer_controller: None,
+            embedding: None,
+            vector_index: Arc::new(std::sync::RwLock::new(SimpleVectorIndex::new())),
         }
     }
 
@@ -203,6 +213,9 @@ impl HostServices {
             client_identity: Vec::new(),
             proxy_id: String::new(),
             knowledge_retriever: None,
+            computer_controller: None,
+            embedding: None,
+            vector_index: Arc::new(std::sync::RwLock::new(SimpleVectorIndex::new())),
         }
     }
 
@@ -352,6 +365,48 @@ impl HostServices {
         self
     }
 
+    /// Add a computer controller to the services.
+    ///
+    /// This enables computer control host functions (screenshot, mouse, keyboard).
+    pub fn with_computer_controller(mut self, controller: Arc<dyn ComputerController>) -> Self {
+        self.computer_controller = Some(controller);
+        self
+    }
+
+    /// Add an embedding provider to the services.
+    ///
+    /// This enables generating vector embeddings for memory chunks,
+    /// allowing hybrid FTS5+vector semantic search.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` - The embedding provider to use.
+    ///
+    /// # Returns
+    ///
+    /// Returns self for method chaining.
+    pub fn with_embedding(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
+        self.embedding = Some(provider);
+        self
+    }
+
+    /// Add a pre-existing vector index to the services.
+    ///
+    /// This replaces the default empty vector index with one that may
+    /// already contain vectors (e.g., loaded from storage at startup).
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The vector index to use.
+    ///
+    /// # Returns
+    ///
+    /// Returns self for method chaining.
+    pub fn with_vector_index(mut self, index: Arc<std::sync::RwLock<SimpleVectorIndex>>) -> Self {
+        self.vector_index = index;
+        self
+    }
+
     /// Check if subagent execution is available.
     pub fn has_subagent_executor(&self) -> bool {
         self.subagent_executor.is_some()
@@ -411,6 +466,15 @@ impl std::fmt::Debug for HostServices {
                 "knowledge_retriever",
                 &self.knowledge_retriever.as_ref().map(|_| "Some(...)"),
             )
+            .field(
+                "computer_controller",
+                &self.computer_controller.as_ref().map(|_| "Some(...)"),
+            )
+            .field(
+                "embedding",
+                &self.embedding.as_ref().map(|_| "Some(...)"),
+            )
+            .field("vector_index", &"Arc<RwLock<SimpleVectorIndex>>")
             .finish()
     }
 }
