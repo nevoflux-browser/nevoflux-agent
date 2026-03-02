@@ -19,7 +19,7 @@ nevoflux-protocol = { path = "../protocol" }
 nevoflux-storage = { path = "../storage" }
 nevoflux-mcp = { path = "../mcp" }
 nevoflux-skills = { path = "../skills" }
-nevoflux-llm = { path = "../llm" }
+nevoflux-llm = { path = "../llm", default-features = false }
 nevoflux-computer = { path = "../computer" }
 nevoflux-builtin-wasm = { path = "../builtin-wasm" }
 

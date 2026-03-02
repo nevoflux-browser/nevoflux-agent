@@ -58,6 +58,8 @@ jobs:
             os: ubuntu-latest
             artifact: nevoflux-agent-linux-aarch64
             use_cross: true
+            # ort (ONNX Runtime) C++ linking fails in cross Docker container
+            no_embedding: true
           - target: x86_64-apple-darwin
             os: macos-latest
             artifact: nevoflux-agent-macos-x86_64
@@ -111,8 +113,12 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} --no-default-features
 
       - name: Build (cross)
-        if: matrix.use_cross == true
+        if: ${{ matrix.use_cross && !matrix.no_embedding }}
         run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (cross, no embedding)
+        if: ${{ matrix.use_cross && matrix.no_embedding }}
+        run: cross build --release --target ${{ matrix.target }} --no-default-features
 
       # Download pre-cached embedding model
       - name: Download embedding model
