@@ -140,7 +140,12 @@ download-model:
     import os
     cache_dir = 'models/fastembed'
     os.makedirs(cache_dir, exist_ok=True)
-    snapshot_download('intfloat/multilingual-e5-small', cache_dir=cache_dir, allow_patterns=['onnx/model.onnx', 'onnx/tokenizer.json', 'onnx/config.json', 'onnx/special_tokens_map.json', 'onnx/tokenizer_config.json', 'onnx/sentencepiece.bpe.model'])
+    snapshot_download('intfloat/multilingual-e5-small', cache_dir=cache_dir, allow_patterns=['onnx/model_O4.onnx', 'onnx/tokenizer.json', 'onnx/config.json', 'onnx/special_tokens_map.json', 'onnx/tokenizer_config.json', 'onnx/sentencepiece.bpe.model'])
+    import glob
+    for f in glob.glob(os.path.join(cache_dir, '**', 'model_O4.onnx'), recursive=True):
+        target = os.path.join(os.path.dirname(f), 'model.onnx')
+        os.rename(f, target)
+        print(f'Renamed {f} -> {target}')
     print(f'Model downloaded to {cache_dir}')
     "
 

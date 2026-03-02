@@ -29,14 +29,14 @@ jobs:
           pip install huggingface_hub
           python -c "
           from huggingface_hub import snapshot_download
-          import os
+          import os, glob
           cache_dir = 'models/fastembed'
           os.makedirs(cache_dir, exist_ok=True)
           snapshot_download(
               'intfloat/multilingual-e5-small',
               cache_dir=cache_dir,
               allow_patterns=[
-                  'onnx/model.onnx',
+                  'onnx/model_O4.onnx',
                   'onnx/tokenizer.json',
                   'onnx/config.json',
                   'onnx/special_tokens_map.json',
@@ -44,6 +44,11 @@ jobs:
                   'onnx/sentencepiece.bpe.model',
               ],
           )
+          # Rename optimized model to model.onnx (fastembed expects this name)
+          for f in glob.glob(os.path.join(cache_dir, '**', 'model_O4.onnx'), recursive=True):
+              target = os.path.join(os.path.dirname(f), 'model.onnx')
+              os.rename(f, target)
+              print(f'Renamed {f} -> {target}')
           "
 
       - name: Upload model artifact
