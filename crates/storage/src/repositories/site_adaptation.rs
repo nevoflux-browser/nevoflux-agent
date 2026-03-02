@@ -180,6 +180,32 @@ impl<'a> SiteAdaptationRepository<'a> {
         })
     }
 
+    /// Query site adaptations with success rate below a threshold that have
+    /// at least `min_samples` observations, ordered by success rate ascending
+    /// (worst first).
+    pub fn query_low_success_rate(
+        &self,
+        max_success_rate: f64,
+        min_samples: i64,
+        limit: u32,
+    ) -> Result<Vec<SiteAdaptation>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, domain, url_pattern, adaptation_type, content, verified, last_verified_at, success_rate, sample_count, created_at, updated_at
+                 FROM site_adaptations
+                 WHERE success_rate < ?1 AND sample_count >= ?2
+                 ORDER BY success_rate ASC
+                 LIMIT ?3",
+            )?;
+
+            let rows = stmt
+                .query_map(params![max_success_rate, min_samples, limit], row_to_site_adaptation)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            Ok(rows)
+        })
+    }
+
     /// Delete a site adaptation by ID.
     pub fn delete(&self, id: &str) -> Result<bool> {
         self.db.with_connection(|conn| {

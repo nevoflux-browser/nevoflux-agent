@@ -9,4 +9,5 @@ pub mod retriever;
 pub mod routing;
 pub mod soul;
 pub mod source;
+pub mod sources;
 pub mod types;

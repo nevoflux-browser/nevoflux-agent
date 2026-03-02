@@ -1,26 +1,44 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use super::source::LearningSource;
 use super::types::{LearningEntry, PrivacyLevel};
 use tracing::{debug, info};
 
 /// Collects learning entries from registered sources,
-/// deduplicates, filters, and outputs them.
-/// Phase 0: log-only output. Phase 2: writes to DashMap buffer.
+/// deduplicates, filters, rate-limits, and outputs them.
 pub struct LearningCollector {
     sources: Vec<Box<dyn LearningSource>>,
     domain_blacklist: Vec<String>,
     enabled: Option<Arc<AtomicBool>>,
+    /// Maximum entries per (domain, source_event) key per hour.
+    rate_limit_per_hour: u32,
+    /// Sliding window of entry timestamps, keyed by (domain, source_event).
+    rate_window: HashMap<(String, String), Vec<Instant>>,
 }
 
-impl LearningCollector {
-    pub fn new() -> Self {
+impl Default for LearningCollector {
+    fn default() -> Self {
         Self {
             sources: Vec::new(),
             domain_blacklist: Vec::new(),
             enabled: None,
+            rate_limit_per_hour: 5,
+            rate_window: HashMap::new(),
         }
+    }
+}
+
+impl LearningCollector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the maximum number of entries per (domain, trigger) key per hour.
+    pub fn set_rate_limit(&mut self, limit: u32) {
+        self.rate_limit_per_hour = limit;
     }
 
     /// Set the shared enabled flag from the `LearningPipeline`.
@@ -64,10 +82,14 @@ impl LearningCollector {
         let filtered = self.filter_privacy(all_entries);
         let filtered = self.filter_blacklisted_domains(filtered);
         let deduped = self.dedup(filtered);
+        let rate_limited = self.apply_rate_limit(deduped);
 
-        info!(count = deduped.len(), "Learning collector cycle complete");
+        info!(
+            count = rate_limited.len(),
+            "Learning collector cycle complete"
+        );
 
-        deduped
+        rate_limited
     }
 
     /// Filter out private entries -- they must never be persisted.
@@ -109,6 +131,47 @@ impl LearningCollector {
                 }
             } else {
                 result.push(entry);
+            }
+        }
+
+        result
+    }
+
+    /// Filter entries that exceed the per-(domain, trigger) hourly rate limit.
+    ///
+    /// Uses a sliding window: timestamps older than 1 hour are pruned, and any
+    /// entry whose key already has `rate_limit_per_hour` timestamps in the
+    /// window is dropped.
+    fn apply_rate_limit(&mut self, entries: Vec<LearningEntry>) -> Vec<LearningEntry> {
+        if self.rate_limit_per_hour == 0 {
+            return entries;
+        }
+        let now = Instant::now();
+        let one_hour = std::time::Duration::from_secs(3600);
+
+        // Prune expired timestamps from all keys
+        self.rate_window.retain(|_, timestamps| {
+            timestamps.retain(|t| now.duration_since(*t) < one_hour);
+            !timestamps.is_empty()
+        });
+
+        let limit = self.rate_limit_per_hour as usize;
+        let mut result = Vec::with_capacity(entries.len());
+
+        for entry in entries {
+            let domain = entry.context.domain.clone().unwrap_or_default();
+            let key = (domain, entry.source_event.clone());
+            let timestamps = self.rate_window.entry(key).or_default();
+
+            if timestamps.len() < limit {
+                timestamps.push(now);
+                result.push(entry);
+            } else {
+                debug!(
+                    domain = entry.context.domain.as_deref().unwrap_or("none"),
+                    source_event = entry.source_event,
+                    "Rate-limited learning entry"
+                );
             }
         }
 
@@ -293,6 +356,116 @@ mod tests {
 
         let collected = collector.collect_all();
         assert!(collected.is_empty(), "should return empty when disabled");
+    }
+
+    #[test]
+    fn collector_rate_limits_per_domain_trigger() {
+        let entries: Vec<LearningEntry> = (0..10)
+            .map(|_| {
+                LearningEntry::new(LearningCategory::SiteInteraction, "click", "click failed")
+                    .with_context(LearningContext {
+                        domain: Some("example.com".into()),
+                        ..Default::default()
+                    })
+            })
+            .collect();
+
+        let source = FakeSource {
+            entries: Arc::new(Mutex::new(entries)),
+        };
+
+        let mut collector = LearningCollector::new();
+        collector.set_rate_limit(5);
+        collector.register_source(Box::new(source));
+
+        let collected = collector.collect_all();
+        // After dedup: 10 identical entries collapse to 1 (occurrence_count=10),
+        // so the rate limit of 5 isn't hit in a single collect_all call.
+        // But let's test with entries that have different IDs (distinct entries).
+        assert!(collected.len() <= 5);
+    }
+
+    #[test]
+    fn collector_rate_limits_distinct_entries() {
+        // Create 10 entries with different contexts so they don't dedup
+        let entries: Vec<LearningEntry> = (0..10)
+            .map(|i| {
+                LearningEntry::new(
+                    LearningCategory::SiteInteraction,
+                    "click",
+                    &format!("click failed on element {}", i),
+                )
+                .with_context(LearningContext {
+                    domain: Some("example.com".into()),
+                    selector: Some(format!(".btn-{}", i)),
+                    ..Default::default()
+                })
+            })
+            .collect();
+
+        let source = FakeSource {
+            entries: Arc::new(Mutex::new(entries)),
+        };
+
+        let mut collector = LearningCollector::new();
+        collector.set_rate_limit(5);
+        collector.register_source(Box::new(source));
+
+        let collected = collector.collect_all();
+        assert_eq!(collected.len(), 5, "should be rate-limited to 5");
+    }
+
+    #[test]
+    fn collector_rate_limit_different_domains_independent() {
+        let mut entries = Vec::new();
+        for i in 0..4 {
+            entries.push(
+                LearningEntry::new(
+                    LearningCategory::SiteInteraction,
+                    "click",
+                    &format!("fail A{}", i),
+                )
+                .with_context(LearningContext {
+                    domain: Some("site-a.com".into()),
+                    selector: Some(format!(".a-{}", i)),
+                    ..Default::default()
+                }),
+            );
+        }
+        for i in 0..4 {
+            entries.push(
+                LearningEntry::new(
+                    LearningCategory::SiteInteraction,
+                    "click",
+                    &format!("fail B{}", i),
+                )
+                .with_context(LearningContext {
+                    domain: Some("site-b.com".into()),
+                    selector: Some(format!(".b-{}", i)),
+                    ..Default::default()
+                }),
+            );
+        }
+
+        let source = FakeSource {
+            entries: Arc::new(Mutex::new(entries)),
+        };
+
+        let mut collector = LearningCollector::new();
+        collector.set_rate_limit(3);
+        collector.register_source(Box::new(source));
+
+        let collected = collector.collect_all();
+        let a_count = collected
+            .iter()
+            .filter(|e| e.context.domain.as_deref() == Some("site-a.com"))
+            .count();
+        let b_count = collected
+            .iter()
+            .filter(|e| e.context.domain.as_deref() == Some("site-b.com"))
+            .count();
+        assert_eq!(a_count, 3, "site-a.com should be limited to 3");
+        assert_eq!(b_count, 3, "site-b.com should be limited to 3");
     }
 
     #[test]

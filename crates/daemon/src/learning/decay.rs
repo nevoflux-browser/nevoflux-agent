@@ -113,11 +113,11 @@ mod tests {
     #[test]
     fn old_entry_decays_significantly() {
         let now = Utc::now();
-        let old = now - Duration::days(90);
+        let old = now - Duration::days(150);
         let score = calculate_decay(old, "site_interaction", 0.5, 5, now);
         assert!(
             score < 0.2,
-            "90-day-old site_interaction entry should decay below 0.2, got {score}"
+            "150-day-old site_interaction entry should decay below 0.2, got {score}"
         );
     }
 

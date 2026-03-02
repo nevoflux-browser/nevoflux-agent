@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -50,6 +51,9 @@ pub struct SoulManager {
     soul_dir: PathBuf,
     cache: FiveDocCache,
     encryption: Option<Arc<EncryptionService>>,
+    /// Set of `"FILE.md/Section Name"` keys where the user has manually edited
+    /// the section. System promotions targeting these sections are skipped.
+    manual_sections: HashSet<String>,
 }
 
 impl SoulManager {
@@ -88,7 +92,8 @@ impl SoulManager {
     /// Load existing soul directory into cache.
     ///
     /// Reads all five documents from disk and stores their content
-    /// in the in-memory cache.
+    /// in the in-memory cache. Also loads the `.manual_sections` file
+    /// if it exists.
     pub async fn load(soul_dir: &Path) -> Result<Self> {
         let identity_raw = tokio::fs::read_to_string(soul_dir.join("IDENTITY.md")).await?;
         let soul_raw = tokio::fs::read_to_string(soul_dir.join("SOUL.md")).await?;
@@ -105,10 +110,13 @@ impl SoulManager {
             last_parsed_at: Utc::now(),
         };
 
+        let manual_sections = Self::load_manual_sections(soul_dir).await;
+
         Ok(Self {
             soul_dir: soul_dir.to_path_buf(),
             cache,
             encryption: None,
+            manual_sections,
         })
     }
 
@@ -163,6 +171,69 @@ impl SoulManager {
     const ALLOWED_FILES: [&'static str; 5] =
         ["IDENTITY.md", "SOUL.md", "USER.md", "TOOLS.md", "AGENTS.md"];
 
+    /// Check if a section is marked as manually edited (and thus protected
+    /// from system promotions).
+    pub fn is_manual_section(&self, file: &str, section: &str) -> bool {
+        let key = format!("{}/{}", file, section);
+        self.manual_sections.contains(&key)
+    }
+
+    /// Mark all sections of a file as manually edited.
+    ///
+    /// Called by the SoulWatcher when an external file edit is detected.
+    /// After this, system promotions to any section in this file will be
+    /// skipped until the section is updated by the system again.
+    pub async fn mark_file_manual(&mut self, filename: &str) {
+        let content = match filename {
+            "IDENTITY.md" => &self.cache.identity_raw,
+            "SOUL.md" => &self.cache.soul_raw,
+            "USER.md" => &self.cache.user_raw,
+            "TOOLS.md" => &self.cache.tools_raw,
+            "AGENTS.md" => &self.cache.agents_raw,
+            _ => return,
+        };
+
+        // Extract all ## headings from the document
+        for line in content.lines() {
+            if let Some(heading) = line.strip_prefix("## ") {
+                let key = format!("{}/{}", filename, heading.trim());
+                self.manual_sections.insert(key);
+            }
+        }
+
+        let _ = self.save_manual_sections().await;
+    }
+
+    /// Remove the manual-edit marker for a specific section.
+    ///
+    /// Called after a system promotion successfully writes to that section,
+    /// so that future system promotions are not blocked.
+    async fn clear_manual_section(&mut self, file: &str, section: &str) {
+        let key = format!("{}/{}", file, section);
+        if self.manual_sections.remove(&key) {
+            let _ = self.save_manual_sections().await;
+        }
+    }
+
+    /// Load the `.manual_sections` file (JSON set of keys).
+    async fn load_manual_sections(soul_dir: &Path) -> HashSet<String> {
+        let path = soul_dir.join(".manual_sections");
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
+    /// Persist the manual sections set to `.manual_sections`.
+    async fn save_manual_sections(&self) -> Result<()> {
+        let path = self.soul_dir.join(".manual_sections");
+        let json = serde_json::to_string_pretty(&self.manual_sections).map_err(|e| {
+            DaemonError::InvalidRequest(format!("serialize manual_sections: {}", e))
+        })?;
+        tokio::fs::write(&path, json).await?;
+        Ok(())
+    }
+
     /// Apply a change to one of the soul documents.
     ///
     /// 1. Checks permission via the protection module — rejects if `Forbidden`.
@@ -196,18 +267,8 @@ impl SoulManager {
         // 3. Apply the change based on change_type
         let updated = match change.change_type.as_str() {
             "add" => Self::apply_add(&content, &change.section, &change.new_content)?,
-            "modify" => {
-                // TODO: implement modify
-                return Err(DaemonError::InternalError(
-                    "change_type 'modify' is not yet implemented".into(),
-                ));
-            }
-            "remove" => {
-                // TODO: implement remove
-                return Err(DaemonError::InternalError(
-                    "change_type 'remove' is not yet implemented".into(),
-                ));
-            }
+            "modify" => Self::apply_modify(&content, &change.section, &change.new_content)?,
+            "remove" => Self::apply_remove(&content, &change.section)?,
             other => {
                 return Err(DaemonError::InvalidRequest(format!(
                     "unknown change_type: {}",
@@ -224,7 +285,13 @@ impl SoulManager {
         // 5. Append to changelog
         self.append_changelog(&change).await?;
 
-        // 6. Reload cache
+        // 6. If system wrote to a section, clear its manual-edit marker
+        if change.source_type == "system" {
+            self.clear_manual_section(&change.target_file, &change.section)
+                .await;
+        }
+
+        // 7. Reload cache
         let reloaded = Self::load(&self.soul_dir).await?;
         self.cache = reloaded.cache;
 
@@ -278,6 +345,86 @@ impl SoulManager {
             if !new_content.ends_with('\n') {
                 result.push('\n');
             }
+        }
+
+        Ok(result)
+    }
+
+    /// Replace the entire content of a section with new content.
+    ///
+    /// Keeps the `## heading` line and replaces everything between it and the
+    /// next `## ` heading (or end of file) with `new_content`.
+    fn apply_modify(content: &str, section: &str, new_content: &str) -> Result<String> {
+        let section_header = format!("## {}", section);
+        let lines: Vec<&str> = content.lines().collect();
+
+        let section_start = lines
+            .iter()
+            .position(|line| *line == section_header.as_str())
+            .ok_or_else(|| {
+                DaemonError::InvalidRequest(format!("section '{}' not found in document", section))
+            })?;
+
+        let section_end = lines
+            .iter()
+            .enumerate()
+            .skip(section_start + 1)
+            .find(|(_, line)| line.starts_with("## "))
+            .map(|(i, _)| i)
+            .unwrap_or(lines.len());
+
+        let mut result = String::new();
+        // Lines before and including the section header
+        for line in &lines[..=section_start] {
+            result.push_str(line);
+            result.push('\n');
+        }
+        // Blank line + new content
+        result.push('\n');
+        result.push_str(new_content);
+        if !new_content.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push('\n');
+        // Lines from the next section onward
+        for line in &lines[section_end..] {
+            result.push_str(line);
+            result.push('\n');
+        }
+
+        Ok(result)
+    }
+
+    /// Remove an entire section (heading + body) from the document.
+    ///
+    /// The section heading and all lines up to (but not including) the next
+    /// `## ` heading are removed.
+    fn apply_remove(content: &str, section: &str) -> Result<String> {
+        let section_header = format!("## {}", section);
+        let lines: Vec<&str> = content.lines().collect();
+
+        let section_start = lines
+            .iter()
+            .position(|line| *line == section_header.as_str())
+            .ok_or_else(|| {
+                DaemonError::InvalidRequest(format!("section '{}' not found in document", section))
+            })?;
+
+        let section_end = lines
+            .iter()
+            .enumerate()
+            .skip(section_start + 1)
+            .find(|(_, line)| line.starts_with("## "))
+            .map(|(i, _)| i)
+            .unwrap_or(lines.len());
+
+        let mut result = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            if i >= section_start && i < section_end {
+                continue;
+            }
+            result.push_str(line);
+            result.push('\n');
         }
 
         Ok(result)

@@ -1392,6 +1392,27 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let chunks = self.host.memory_search(query, limit)?;
                 serde_json::to_string_pretty(&chunks).unwrap_or_default()
             }
+            "memory_create" => {
+                let content = tool_call.arguments["content"].as_str().unwrap_or("");
+                let metadata = tool_call
+                    .arguments
+                    .get("metadata")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
+                let id = self.host.memory_create(content, &metadata)?;
+                serde_json::json!({"id": id, "status": "created"}).to_string()
+            }
+            "memory_update" => {
+                let id = tool_call.arguments["id"].as_str().unwrap_or("");
+                let content = tool_call.arguments["content"].as_str().unwrap_or("");
+                self.host.memory_update(id, content)?;
+                serde_json::json!({"id": id, "status": "updated"}).to_string()
+            }
+            "memory_delete" => {
+                let id = tool_call.arguments["id"].as_str().unwrap_or("");
+                self.host.memory_delete(id)?;
+                serde_json::json!({"id": id, "status": "deleted"}).to_string()
+            }
             "skill_load" => {
                 let name = tool_call.arguments["name"].as_str().unwrap_or("");
                 self.host.skill_load(name)?
@@ -1408,6 +1429,54 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let arguments: serde_json::Value =
                     serde_json::from_str(arguments_str).unwrap_or(serde_json::json!({}));
                 self.host.tool_call_dynamic(tool_name, &arguments)?
+            }
+            // Computer tools
+            "computer_screenshot" => {
+                let monitor = tool_call.arguments.get("monitor").and_then(|v| v.as_i64());
+                self.host.computer_screenshot(monitor)?
+            }
+            "computer_mouse_move" => {
+                let x = tool_call.arguments["x"].as_i64().unwrap_or(0);
+                let y = tool_call.arguments["y"].as_i64().unwrap_or(0);
+                let click = tool_call.arguments.get("click").and_then(|v| v.as_str());
+                self.host.computer_mouse_move(x, y, click)?
+            }
+            "computer_click" => {
+                let x = tool_call.arguments["x"].as_i64().unwrap_or(0);
+                let y = tool_call.arguments["y"].as_i64().unwrap_or(0);
+                let button = tool_call.arguments.get("button").and_then(|v| v.as_str());
+                let click_type = tool_call
+                    .arguments
+                    .get("click_type")
+                    .and_then(|v| v.as_str());
+                self.host.computer_click(x, y, button, click_type)?
+            }
+            "computer_type_text" => {
+                let text = tool_call.arguments["text"].as_str().unwrap_or("");
+                let delay_ms = tool_call.arguments.get("delay_ms").and_then(|v| v.as_u64());
+                self.host.computer_type_text(text, delay_ms)?
+            }
+            "computer_key" => {
+                let key = tool_call.arguments["key"].as_str().unwrap_or("");
+                let modifiers: Vec<String> = tool_call
+                    .arguments
+                    .get("modifiers")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let repeat = tool_call.arguments.get("repeat").and_then(|v| v.as_u64());
+                self.host.computer_key(key, &modifiers, repeat)?
+            }
+            "computer_scroll" => {
+                let x = tool_call.arguments["x"].as_i64().unwrap_or(0);
+                let y = tool_call.arguments["y"].as_i64().unwrap_or(0);
+                let direction = tool_call.arguments["direction"].as_str().unwrap_or("down");
+                let amount = tool_call.arguments.get("amount").and_then(|v| v.as_u64());
+                self.host.computer_scroll(x, y, direction, amount)?
             }
             // Browser tools
             "browser_navigate" => {
@@ -1976,6 +2045,56 @@ The following skill instructions MUST be followed exactly. These instructions ta
                         }
                     },
                     "required": ["query"]
+                }),
+            },
+            ToolDefinition {
+                name: "memory_create".into(),
+                description: "Save information to your long-term memory. Use this to remember important facts, user preferences, patterns, or anything you want to recall in future conversations.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "The information to remember"
+                        },
+                        "metadata": {
+                            "type": "object",
+                            "description": "Optional metadata (e.g., {\"category\": \"preference\", \"domain\": \"example.com\"})"
+                        }
+                    },
+                    "required": ["content"]
+                }),
+            },
+            ToolDefinition {
+                name: "memory_update".into(),
+                description: "Update an existing memory chunk with new content. Use the id from memory_search results.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "The memory chunk ID to update"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The new content to replace the existing content"
+                        }
+                    },
+                    "required": ["id", "content"]
+                }),
+            },
+            ToolDefinition {
+                name: "memory_delete".into(),
+                description: "Delete a memory chunk by ID. Use the id from memory_search results.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "description": "The memory chunk ID to delete"
+                        }
+                    },
+                    "required": ["id"]
                 }),
             },
             ToolDefinition {
@@ -2618,6 +2737,160 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 },
                 "required": ["tool_name", "arguments"],
                 "additionalProperties": false
+            }),
+        });
+
+        // Computer control tools
+        tools.push(ToolDefinition {
+            name: "computer_screenshot".into(),
+            description: "Take a screenshot of the entire screen or a specific monitor".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "monitor": {
+                        "type": "integer",
+                        "description": "Monitor index (0-based). If not specified, captures primary monitor.",
+                        "minimum": 0
+                    }
+                }
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "computer_mouse_move".into(),
+            description: "Move the mouse cursor to a specified position on screen".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "x": {
+                        "type": "integer",
+                        "description": "X coordinate in pixels"
+                    },
+                    "y": {
+                        "type": "integer",
+                        "description": "Y coordinate in pixels"
+                    },
+                    "click": {
+                        "type": "string",
+                        "description": "Optional click action after moving",
+                        "enum": ["left", "right", "middle", "double"]
+                    }
+                },
+                "required": ["x", "y"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "computer_click".into(),
+            description: "Click at a specific screen position".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "x": {
+                        "type": "integer",
+                        "description": "X coordinate in pixels"
+                    },
+                    "y": {
+                        "type": "integer",
+                        "description": "Y coordinate in pixels"
+                    },
+                    "button": {
+                        "type": "string",
+                        "description": "Mouse button to click",
+                        "enum": ["left", "right", "middle"],
+                        "default": "left"
+                    },
+                    "click_type": {
+                        "type": "string",
+                        "description": "Type of click to perform",
+                        "enum": ["single", "double", "triple"],
+                        "default": "single"
+                    }
+                },
+                "required": ["x", "y"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "computer_type_text".into(),
+            description: "Type text using the keyboard at the current cursor position".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The text to type"
+                    },
+                    "delay_ms": {
+                        "type": "integer",
+                        "description": "Delay between keystrokes in milliseconds",
+                        "default": 0,
+                        "minimum": 0
+                    }
+                },
+                "required": ["text"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "computer_key".into(),
+            description: "Press keyboard keys or key combinations".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "Key to press (e.g., 'Enter', 'Tab', 'Escape', 'a', 'F1')"
+                    },
+                    "modifiers": {
+                        "type": "array",
+                        "description": "Modifier keys to hold while pressing the key",
+                        "items": {
+                            "type": "string",
+                            "enum": ["ctrl", "alt", "shift", "meta", "super"]
+                        },
+                        "default": []
+                    },
+                    "repeat": {
+                        "type": "integer",
+                        "description": "Number of times to repeat the key press",
+                        "default": 1,
+                        "minimum": 1,
+                        "maximum": 100
+                    }
+                },
+                "required": ["key"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "computer_scroll".into(),
+            description: "Scroll at a specific screen position".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "x": {
+                        "type": "integer",
+                        "description": "X coordinate in pixels for scroll position"
+                    },
+                    "y": {
+                        "type": "integer",
+                        "description": "Y coordinate in pixels for scroll position"
+                    },
+                    "direction": {
+                        "type": "string",
+                        "description": "Direction to scroll",
+                        "enum": ["up", "down", "left", "right"]
+                    },
+                    "amount": {
+                        "type": "integer",
+                        "description": "Number of scroll units",
+                        "default": 3,
+                        "minimum": 1,
+                        "maximum": 100
+                    }
+                },
+                "required": ["x", "y", "direction"]
             }),
         });
 

@@ -125,6 +125,25 @@ impl<'a> TraceRepository<'a> {
         })
     }
 
+    /// Get tool execution spans across all sessions with id > `after_id`.
+    ///
+    /// Returns up to `limit` spans in ascending id order. Used by the
+    /// learning pipeline to process new traces incrementally.
+    pub fn tool_spans_since(&self, after_id: i64, limit: u32) -> Result<Vec<TraceSpanRecord>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, iteration, span_type, tool_name, tool_params, success, error_code, error_msg, duration_ms
+                 FROM trace_spans WHERE id > ?1 AND span_type = 'tool_exec' ORDER BY id ASC LIMIT ?2",
+            )?;
+
+            let rows: Vec<TraceSpanRecord> = stmt
+                .query_map(params![after_id, limit], row_to_trace_span)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            Ok(rows)
+        })
+    }
+
     /// Delete all trace spans for a session.
     ///
     /// Returns the number of deleted rows.

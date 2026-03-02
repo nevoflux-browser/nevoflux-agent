@@ -181,6 +181,45 @@ pub trait HostFunctions {
     fn builtin_agent(&self, input: &AgentInput) -> HostResult<AgentOutput>;
 
     // =========================================================================
+    // Computer Tools
+    // =========================================================================
+
+    /// Take a screenshot of the screen.
+    fn computer_screenshot(&self, monitor: Option<i64>) -> HostResult<String>;
+
+    /// Move mouse cursor to position, with optional click.
+    fn computer_mouse_move(&self, x: i64, y: i64, click: Option<&str>) -> HostResult<String>;
+
+    /// Click at screen position.
+    fn computer_click(
+        &self,
+        x: i64,
+        y: i64,
+        button: Option<&str>,
+        click_type: Option<&str>,
+    ) -> HostResult<String>;
+
+    /// Type text at current cursor position.
+    fn computer_type_text(&self, text: &str, delay_ms: Option<u64>) -> HostResult<String>;
+
+    /// Press keyboard key or combination.
+    fn computer_key(
+        &self,
+        key: &str,
+        modifiers: &[String],
+        repeat: Option<u64>,
+    ) -> HostResult<String>;
+
+    /// Scroll at screen position.
+    fn computer_scroll(
+        &self,
+        x: i64,
+        y: i64,
+        direction: &str,
+        amount: Option<u64>,
+    ) -> HostResult<String>;
+
+    // =========================================================================
     // Browser Tools
     // =========================================================================
 
@@ -647,6 +686,50 @@ impl HostFunctions for MockHostFunctions {
         _arguments: &serde_json::Value,
     ) -> HostResult<String> {
         Ok(format!("Mock result for tool: {}", tool_name))
+    }
+
+    fn computer_screenshot(&self, _monitor: Option<i64>) -> HostResult<String> {
+        Ok(r#"{"width":1920,"height":1080,"format":"png","data":"mock_base64"}"#.into())
+    }
+
+    fn computer_mouse_move(&self, x: i64, y: i64, _click: Option<&str>) -> HostResult<String> {
+        Ok(format!(r#"{{"moved_to":{{"x":{},"y":{}}}}}"#, x, y))
+    }
+
+    fn computer_click(
+        &self,
+        x: i64,
+        y: i64,
+        _button: Option<&str>,
+        _click_type: Option<&str>,
+    ) -> HostResult<String> {
+        Ok(format!(r#"{{"clicked":{{"x":{},"y":{}}}}}"#, x, y))
+    }
+
+    fn computer_type_text(&self, text: &str, _delay_ms: Option<u64>) -> HostResult<String> {
+        Ok(format!(r#"{{"typed_chars":{}}}"#, text.len()))
+    }
+
+    fn computer_key(
+        &self,
+        key: &str,
+        _modifiers: &[String],
+        _repeat: Option<u64>,
+    ) -> HostResult<String> {
+        Ok(format!(r#"{{"pressed":"{}"}}"#, key))
+    }
+
+    fn computer_scroll(
+        &self,
+        x: i64,
+        y: i64,
+        direction: &str,
+        _amount: Option<u64>,
+    ) -> HostResult<String> {
+        Ok(format!(
+            r#"{{"scrolled":"{}","at":{{"x":{},"y":{}}}}}"#,
+            direction, x, y
+        ))
     }
 
     fn builtin_chat(&self, input: &AgentInput) -> HostResult<AgentOutput> {
