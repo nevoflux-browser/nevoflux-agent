@@ -18,7 +18,9 @@
 //! # }
 //! ```
 
+#[cfg(feature = "embedding")]
 use std::path::PathBuf;
+#[cfg(feature = "embedding")]
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -103,6 +105,7 @@ pub trait EmbeddingProvider: Send + Sync {
 /// 2. `~/.cache/fastembed/` — standard user cache location
 ///
 /// Returns the first directory that exists, or the user cache dir as fallback.
+#[cfg(feature = "embedding")]
 pub fn resolve_cache_dir() -> PathBuf {
     // Priority 1: Next to the executable
     if let Ok(exe_path) = std::env::current_exe() {
@@ -128,11 +131,13 @@ pub fn resolve_cache_dir() -> PathBuf {
 /// Wraps `fastembed::TextEmbedding` in an `Arc` so the provider can be
 /// cloned and shared across async tasks. Embedding generation is offloaded
 /// to a blocking thread pool via `tokio::task::spawn_blocking`.
+#[cfg(feature = "embedding")]
 pub struct FastEmbedProvider {
     model: Arc<fastembed::TextEmbedding>,
     dims: usize,
 }
 
+#[cfg(feature = "embedding")]
 impl std::fmt::Debug for FastEmbedProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FastEmbedProvider")
@@ -141,6 +146,7 @@ impl std::fmt::Debug for FastEmbedProvider {
     }
 }
 
+#[cfg(feature = "embedding")]
 impl FastEmbedProvider {
     /// Create a new FastEmbedProvider with the given configuration.
     ///
@@ -175,6 +181,7 @@ impl FastEmbedProvider {
     }
 }
 
+#[cfg(feature = "embedding")]
 #[async_trait]
 impl EmbeddingProvider for FastEmbedProvider {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
@@ -218,6 +225,7 @@ mod tests {
         assert!(!config.show_download_progress);
     }
 
+    #[cfg(feature = "embedding")]
     #[test]
     fn test_custom_model_rejected() {
         let config = EmbeddingConfig {
@@ -234,6 +242,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "embedding")]
     #[test]
     fn test_resolve_cache_dir_returns_valid_path() {
         let cache_dir = resolve_cache_dir();
@@ -279,6 +288,7 @@ mod tests {
 
     /// This test requires the model to be downloaded (~100MB).
     /// Run with: cargo test -p nevoflux-llm test_embed_generates_vector -- --ignored
+    #[cfg(feature = "embedding")]
     #[tokio::test]
     #[ignore]
     async fn test_embed_generates_vector() {
@@ -310,6 +320,7 @@ mod tests {
 
     /// This test requires the model to be downloaded (~100MB).
     /// Run with: cargo test -p nevoflux-llm test_similar_texts_have_high_similarity -- --ignored
+    #[cfg(feature = "embedding")]
     #[tokio::test]
     #[ignore]
     async fn test_similar_texts_have_high_similarity() {

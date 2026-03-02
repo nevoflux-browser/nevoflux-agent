@@ -342,36 +342,46 @@ pub async fn start_server(
     };
 
     // Initialize embedding provider for semantic search and knowledge embeddings
-    let embedding_config = agent_config.read().unwrap().embedding.clone();
-    let embedding: Option<Arc<dyn nevoflux_llm::EmbeddingProvider>> = if embedding_config.enabled {
-        use nevoflux_llm::{
-            EmbeddingConfig as LlmEmbeddingConfig, EmbeddingModel, FastEmbedProvider,
-        };
+    let embedding: Option<Arc<dyn nevoflux_llm::EmbeddingProvider>> = {
+        #[cfg(feature = "embedding")]
+        {
+            let embedding_config = agent_config.read().unwrap().embedding.clone();
+            if embedding_config.enabled {
+                use nevoflux_llm::{
+                    EmbeddingConfig as LlmEmbeddingConfig, EmbeddingModel, FastEmbedProvider,
+                };
 
-        let model = match embedding_config.model.as_str() {
-            "multilingual-e5-small" => EmbeddingModel::MultilingualE5Small,
-            other => EmbeddingModel::Custom(other.to_string()),
-        };
-        let llm_config = LlmEmbeddingConfig {
-            model,
-            show_download_progress: true,
-        };
-        match FastEmbedProvider::new(llm_config) {
-            Ok(provider) => {
-                info!(
-                    model = embedding_config.model.as_str(),
-                    "Embedding provider initialized"
-                );
-                Some(Arc::new(provider) as Arc<dyn nevoflux_llm::EmbeddingProvider>)
-            }
-            Err(e) => {
-                warn!("Embedding provider unavailable: {e}, semantic search disabled");
+                let model = match embedding_config.model.as_str() {
+                    "multilingual-e5-small" => EmbeddingModel::MultilingualE5Small,
+                    other => EmbeddingModel::Custom(other.to_string()),
+                };
+                let llm_config = LlmEmbeddingConfig {
+                    model,
+                    show_download_progress: true,
+                };
+                match FastEmbedProvider::new(llm_config) {
+                    Ok(provider) => {
+                        info!(
+                            model = embedding_config.model.as_str(),
+                            "Embedding provider initialized"
+                        );
+                        Some(Arc::new(provider) as Arc<dyn nevoflux_llm::EmbeddingProvider>)
+                    }
+                    Err(e) => {
+                        warn!("Embedding provider unavailable: {e}, semantic search disabled");
+                        None
+                    }
+                }
+            } else {
+                info!("Embedding provider disabled in config");
                 None
             }
         }
-    } else {
-        info!("Embedding provider disabled in config");
-        None
+        #[cfg(not(feature = "embedding"))]
+        {
+            info!("Embedding support not compiled in, semantic search disabled");
+            None
+        }
     };
 
     // Build vector index from existing memory embeddings
@@ -1197,10 +1207,7 @@ fn build_hot_knowledge_section(database: &nevoflux_storage::Database) -> Option<
     let mut pref_lines = Vec::new();
 
     for entry in &hot_entries {
-        let line = entry
-            .hot_summary
-            .as_deref()
-            .unwrap_or(&entry.summary);
+        let line = entry.hot_summary.as_deref().unwrap_or(&entry.summary);
         match entry.category.as_str() {
             "site_interaction" | "siteinteraction" => site_lines.push(format!("- {}", line)),
             "tool_optimization" | "tooloptimization" => tool_lines.push(format!("- {}", line)),

@@ -70,6 +70,8 @@ jobs:
           - target: aarch64-pc-windows-msvc
             os: windows-latest
             artifact: nevoflux-agent-windows-aarch64
+            # ort (ONNX Runtime) doesn't link on Windows ARM64 yet
+            no_embedding: true
 
     runs-on: ${{ matrix.os }}
 
@@ -101,8 +103,12 @@ jobs:
             | sudo tar xz -C /usr/local/bin
 
       - name: Build
-        if: ${{ !matrix.use_cross }}
+        if: ${{ !matrix.use_cross && !matrix.no_embedding }}
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (no embedding)
+        if: ${{ !matrix.use_cross && matrix.no_embedding }}
+        run: cargo build --release --target ${{ matrix.target }} --no-default-features
 
       - name: Build (cross)
         if: matrix.use_cross == true

@@ -86,12 +86,16 @@ fs2 = "0.4"
 wasmtime = "27"
 wasmtime-wasi = "27"
 
+[features]
+default = ["embedding"]
+embedding = ["nevoflux-daemon/embedding"]
+
 [[bin]]
 name = "nevoflux-agent"
 path = "src/main.rs"
 
 [dependencies]
-nevoflux-daemon = { path = "crates/daemon" }
+nevoflux-daemon = { path = "crates/daemon", default-features = false }
 nevoflux-bridge = { path = "crates/bridge" }
 nevoflux-mcp = { path = "crates/mcp" }
 nevoflux-protocol = { path = "crates/protocol" }
