@@ -341,6 +341,60 @@ pub async fn start_server(
         index
     };
 
+    // Initialize embedding provider for semantic search and knowledge embeddings
+    let embedding_config = agent_config.read().unwrap().embedding.clone();
+    let embedding: Option<Arc<dyn nevoflux_llm::EmbeddingProvider>> = if embedding_config.enabled {
+        use nevoflux_llm::{
+            EmbeddingConfig as LlmEmbeddingConfig, EmbeddingModel, FastEmbedProvider,
+        };
+
+        let model = match embedding_config.model.as_str() {
+            "multilingual-e5-small" => EmbeddingModel::MultilingualE5Small,
+            other => EmbeddingModel::Custom(other.to_string()),
+        };
+        let llm_config = LlmEmbeddingConfig {
+            model,
+            show_download_progress: true,
+        };
+        match FastEmbedProvider::new(llm_config) {
+            Ok(provider) => {
+                info!(
+                    model = embedding_config.model.as_str(),
+                    "Embedding provider initialized"
+                );
+                Some(Arc::new(provider) as Arc<dyn nevoflux_llm::EmbeddingProvider>)
+            }
+            Err(e) => {
+                warn!("Embedding provider unavailable: {e}, semantic search disabled");
+                None
+            }
+        }
+    } else {
+        info!("Embedding provider disabled in config");
+        None
+    };
+
+    // Build vector index from existing memory embeddings
+    let vector_index = Arc::new(std::sync::RwLock::new(
+        nevoflux_storage::SimpleVectorIndex::new(),
+    ));
+    if embedding.is_some() {
+        let db_ref = session_manager.storage().database();
+        match db_ref.memory().list_with_embeddings(10_000) {
+            Ok(chunks) => {
+                if let Ok(mut idx) = vector_index.write() {
+                    for chunk in &chunks {
+                        if let Some(ref emb) = chunk.embedding {
+                            idx.add(&chunk.id, emb.clone());
+                        }
+                    }
+                    info!(count = chunks.len(), "Loaded memory embeddings into vector index");
+                }
+            }
+            Err(e) => warn!("Failed to load memory embeddings: {e}"),
+        }
+    }
+
     // Load soul documents for system prompt injection
     let knowledge_retriever = {
         use crate::learning::retriever::KnowledgeRetriever;
@@ -362,7 +416,11 @@ pub async fn start_server(
                 );
                 let cache = Arc::new(cache.clone());
                 let storage = session_manager.shared_storage();
-                Some(Arc::new(KnowledgeRetriever::new(cache, storage)))
+                let mut retriever = KnowledgeRetriever::new(cache, storage);
+                if let Some(ref emb) = embedding {
+                    retriever = retriever.with_embedding(Arc::clone(emb));
+                }
+                Some(Arc::new(retriever))
             }
             Err(e) => {
                 warn!("Failed to load soul documents: {}, skipping", e);
@@ -371,12 +429,223 @@ pub async fn start_server(
         }
     };
 
+    // Start soul document file watcher for detecting external edits
+    {
+        use crate::learning::soul::watcher::SoulWatcher;
+
+        let soul_dir = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("nevoflux");
+        match SoulWatcher::start(&soul_dir) {
+            Ok(mut watcher) => {
+                let retriever_for_watcher = knowledge_retriever.clone();
+                tokio::spawn(async move {
+                    while let Some(changed_path) = watcher.next_change().await {
+                        let filename = changed_path
+                            .file_name()
+                            .and_then(|f| f.to_str())
+                            .unwrap_or("unknown");
+                        info!("Soul document changed externally: {}", filename);
+
+                        // Reload the soul manager and update the retriever's cache
+                        if let Some(ref retriever) = retriever_for_watcher {
+                            match crate::learning::soul::manager::SoulManager::load(
+                                watcher.soul_dir(),
+                            )
+                            .await
+                            {
+                                Ok(mut manager) => {
+                                    retriever.update_soul_cache(manager.cache().clone());
+
+                                    // Mark all sections in the changed file as manually
+                                    // edited so that system promotions don't overwrite
+                                    // user changes.
+                                    manager.mark_file_manual(filename).await;
+
+                                    info!(
+                                        "Soul cache reloaded after external edit to {}",
+                                        filename
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("Failed to reload soul documents after edit: {}", e);
+                                }
+                            }
+                        }
+                    }
+                });
+                info!("Soul file watcher started");
+            }
+            Err(e) => {
+                warn!("Failed to start soul file watcher: {}", e);
+            }
+        }
+    }
+
+    // Initialize learning pipeline if enabled
+    let learning_config = agent_config.read().unwrap().learning.clone();
+    if learning_config.enabled {
+        use crate::learning::buffer::MemoryBuffer;
+        use crate::learning::collector::LearningCollector;
+        use crate::learning::pipeline::{
+            CategoryPromotionThresholds, LearningPipeline, PromotionThresholds,
+            ValidationThresholds,
+        };
+        use crate::learning::soul::manager::SoulManager as PipelineSoulManager;
+        use crate::learning::sources::{
+            MemoryChunkPreferenceSource, SiteAdaptationSource, ToolTraceLearningSource,
+        };
+
+        let shared_storage = session_manager.shared_storage();
+        let buffer = Arc::new(MemoryBuffer::new(
+            learning_config.flush_threshold,
+            std::time::Duration::from_secs(learning_config.flush_interval_secs),
+        ));
+        let pipeline = Arc::new(LearningPipeline::new(
+            Arc::clone(&buffer),
+            Arc::clone(&shared_storage),
+            embedding.clone(),
+        ));
+
+        // Create collector with ToolTraceLearningSource and link to pipeline
+        let mut collector = LearningCollector::new();
+        collector.set_enabled(pipeline.enabled_flag());
+        collector.set_rate_limit(learning_config.rate_limit_per_hour);
+        collector.register_source(Box::new(ToolTraceLearningSource::new(Arc::clone(
+            &shared_storage,
+        ))));
+        collector.register_source(Box::new(SiteAdaptationSource::new(Arc::clone(
+            &shared_storage,
+        ))));
+        collector.register_source(Box::new(MemoryChunkPreferenceSource::new(Arc::clone(
+            &shared_storage,
+        ))));
+        let collector = Arc::new(std::sync::Mutex::new(collector));
+
+        let validation_thresholds = ValidationThresholds {
+            min_occurrences: learning_config.validation.min_occurrences,
+            min_confidence: learning_config.validation.min_confidence,
+            min_alive_hours: learning_config.validation.min_alive_hours,
+        };
+        let promotion_thresholds = PromotionThresholds {
+            batch_size: 50,
+            min_alive_days: learning_config.promotion.min_alive_days,
+            site_interaction: CategoryPromotionThresholds {
+                min_hits: learning_config.promotion.site_interaction_min_hits,
+                min_effectiveness: learning_config.promotion.site_interaction_min_effectiveness,
+            },
+            tool_optimization: CategoryPromotionThresholds {
+                min_hits: learning_config.promotion.tool_optimization_min_hits,
+                min_effectiveness: learning_config
+                    .promotion
+                    .tool_optimization_min_effectiveness,
+            },
+            user_preference: CategoryPromotionThresholds {
+                min_hits: learning_config.promotion.user_preference_min_hits,
+                min_effectiveness: 0.5,
+            },
+        };
+
+        let soul_dir = learning_config
+            .soul_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::config_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("nevoflux")
+            });
+
+        let flush_interval = learning_config.flush_interval_secs;
+
+        // Spawn periodic collect → flush → validate → promote background task
+        let pipeline_clone = Arc::clone(&pipeline);
+        let buffer_clone = Arc::clone(&buffer);
+        let collector_clone = Arc::clone(&collector);
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(flush_interval));
+            loop {
+                interval.tick().await;
+
+                if !pipeline_clone.is_enabled() {
+                    continue;
+                }
+
+                // Collect entries from registered sources → buffer
+                {
+                    let entries = collector_clone.lock().unwrap().collect_all();
+                    for entry in entries {
+                        buffer_clone.insert(entry);
+                    }
+                }
+
+                // Flush buffer to SQLite
+                match pipeline_clone.flush() {
+                    Ok(n) if n > 0 => info!("Learning pipeline flushed {} entries", n),
+                    Err(e) => warn!("Learning pipeline flush error: {}", e),
+                    _ => {}
+                }
+
+                // Validate pending entries
+                match pipeline_clone.validate(&validation_thresholds) {
+                    Ok(n) if n > 0 => info!("Learning pipeline validated {} entries", n),
+                    Err(e) => warn!("Learning pipeline validate error: {}", e),
+                    _ => {}
+                }
+
+                // Promote validated entries (less frequently - every 10th cycle)
+                static PROMOTE_COUNTER: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let count = PROMOTE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if count.is_multiple_of(10) {
+                    match PipelineSoulManager::load(&soul_dir).await {
+                        Ok(mut sm) => {
+                            match pipeline_clone.promote(&promotion_thresholds, &mut sm).await {
+                                Ok(result) if result.promoted > 0 => {
+                                    info!(
+                                        "Learning pipeline promoted {} entries (skipped: protection={}, threshold={})",
+                                        result.promoted, result.skipped_protection, result.skipped_threshold
+                                    );
+                                }
+                                Err(e) => warn!("Learning pipeline promote error: {}", e),
+                                _ => {}
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Learning pipeline: failed to load soul manager for promotion: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
+        info!(
+            "Learning pipeline started (flush_interval={}s, flush_threshold={})",
+            flush_interval, learning_config.flush_threshold
+        );
+    } else {
+        info!("Learning system disabled by config");
+    }
+
     let mut services = HostServices::new(Arc::new(db))
         .with_browser_sender(browser_tx)
         .with_mcp_manager(mcp_manager)
-        .with_tool_search(tool_search_index);
+        .with_tool_search(tool_search_index)
+        .with_vector_index(vector_index);
+    if let Some(ref emb) = embedding {
+        services = services.with_embedding(Arc::clone(emb));
+    }
     if let Some(retriever) = knowledge_retriever {
         services = services.with_knowledge_retriever(retriever);
+    }
+    if let Some(computer) = crate::agent::computer_tools::create_computer() {
+        services = services.with_computer_controller(Arc::new(computer));
+        info!("Computer controller initialized");
+    } else {
+        warn!("Computer controller not available on this platform");
     }
 
     let bind_addr = format!("{}:{}", config.bind_address, port);

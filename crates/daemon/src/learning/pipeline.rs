@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use nevoflux_llm::EmbeddingProvider;
 use nevoflux_storage::{CreateKnowledgeParams, CreateLearningMetricParams, Storage};
 
 use super::buffer::MemoryBuffer;
@@ -133,16 +134,25 @@ pub struct LearningPipeline {
     storage: Arc<Storage>,
     enabled: Arc<AtomicBool>,
     encryption: Option<Arc<EncryptionService>>,
+    embedding: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl LearningPipeline {
     /// Create a new pipeline that reads from `buffer` and writes to `storage`.
-    pub fn new(buffer: Arc<MemoryBuffer>, storage: Arc<Storage>) -> Self {
+    ///
+    /// An optional [`EmbeddingProvider`] can be supplied to generate vector
+    /// embeddings for new knowledge entries during [`flush`](Self::flush).
+    pub fn new(
+        buffer: Arc<MemoryBuffer>,
+        storage: Arc<Storage>,
+        embedding: Option<Arc<dyn EmbeddingProvider>>,
+    ) -> Self {
         Self {
             buffer,
             storage,
             enabled: Arc::new(AtomicBool::new(true)),
             encryption: None,
+            embedding,
         }
     }
 
@@ -243,6 +253,28 @@ impl LearningPipeline {
             } else {
                 // New entry: create as before
                 let mut params = Self::entry_to_knowledge_params(entry);
+
+                // Generate embedding for the new entry when a provider is available
+                if let Some(ref provider) = self.embedding {
+                    let text = format!(
+                        "{} {}",
+                        entry.summary,
+                        entry.details.as_deref().unwrap_or("")
+                    );
+                    // Bridge from sync flush() into the async embedding provider
+                    let emb_result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(provider.embed(&text))
+                    });
+                    match emb_result {
+                        Ok(vec) => params.embedding = Some(vec),
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "Embedding generation failed for new knowledge entry, skipping"
+                            );
+                        }
+                    }
+                }
 
                 // Encrypt sensitive fields when an encryption service is available
                 if let Some(ref enc) = self.encryption {
@@ -592,7 +624,7 @@ mod tests {
     fn setup() -> (LearningPipeline, Arc<Storage>) {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let buffer = Arc::new(MemoryBuffer::new(20, Duration::from_secs(30)));
-        let pipeline = LearningPipeline::new(buffer, storage.clone());
+        let pipeline = LearningPipeline::new(buffer, storage.clone(), None);
         (pipeline, storage)
     }
 
@@ -717,7 +749,7 @@ mod tests {
         let provider = InMemoryKeyProvider::random();
         let enc = Arc::new(EncryptionService::new(&provider).unwrap());
         let pipeline =
-            LearningPipeline::new(buffer, storage.clone()).with_encryption(Arc::clone(&enc));
+            LearningPipeline::new(buffer, storage.clone(), None).with_encryption(Arc::clone(&enc));
         (pipeline, storage, enc)
     }
 
