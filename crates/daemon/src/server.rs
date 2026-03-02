@@ -395,6 +395,16 @@ pub async fn start_server(
         }
     }
 
+    // Spawn background backfill task for entries that lack embeddings
+    if let Some(ref provider) = embedding {
+        let backfill_provider = Arc::clone(provider);
+        let backfill_storage = session_manager.shared_storage();
+        let backfill_index = Arc::clone(&vector_index);
+        tokio::spawn(async move {
+            backfill_embeddings(backfill_provider, backfill_storage, backfill_index).await;
+        });
+    }
+
     // Load soul documents for system prompt injection
     let knowledge_retriever = {
         use crate::learning::retriever::KnowledgeRetriever;
@@ -1059,6 +1069,84 @@ pub async fn start_server(
         port,
         shutdown_tx: Some(shutdown_tx),
     })
+}
+
+/// Background task to generate embeddings for existing entries that lack them.
+///
+/// Runs at startup with a small delay, backfilling MemoryChunks and Knowledge entries
+/// that were created before embedding was enabled. Stops on the first embedding error
+/// (the provider may be unavailable) and yields between items to avoid blocking the runtime.
+async fn backfill_embeddings(
+    provider: Arc<dyn nevoflux_llm::EmbeddingProvider>,
+    storage: Arc<nevoflux_storage::Storage>,
+    vector_index: Arc<std::sync::RwLock<nevoflux_storage::SimpleVectorIndex>>,
+) {
+    // Small delay to let startup complete
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    // Backfill MemoryChunks
+    match storage.database().memory().list_without_embeddings(1000) {
+        Ok(chunks) => {
+            let mut count = 0;
+            for chunk in chunks {
+                match provider.embed(&chunk.content).await {
+                    Ok(emb) => {
+                        if storage
+                            .database()
+                            .memory()
+                            .update_embedding(&chunk.id, &emb)
+                            .is_ok()
+                        {
+                            if let Ok(mut idx) = vector_index.write() {
+                                idx.add(&chunk.id, emb);
+                            }
+                            count += 1;
+                        }
+                    }
+                    Err(e) => {
+                        debug!(chunk_id = %chunk.id, error = %e, "Memory backfill embedding failed");
+                        break; // Provider may be unavailable
+                    }
+                }
+                // Small yield to avoid blocking
+                tokio::task::yield_now().await;
+            }
+            if count > 0 {
+                info!(count, "Backfilled memory chunk embeddings");
+            }
+        }
+        Err(e) => warn!(error = %e, "Failed to query chunks for backfill"),
+    }
+
+    // Backfill Knowledge entries
+    match storage.knowledge().list_without_embeddings(1000) {
+        Ok(entries) => {
+            let mut count = 0;
+            for entry in entries {
+                let text = format!("{} {}", entry.summary, entry.details);
+                match provider.embed(&text).await {
+                    Ok(emb) => {
+                        if storage
+                            .knowledge()
+                            .update_embedding(&entry.id, &emb)
+                            .is_ok()
+                        {
+                            count += 1;
+                        }
+                    }
+                    Err(e) => {
+                        debug!(entry_id = %entry.id, error = %e, "Knowledge backfill embedding failed");
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+            if count > 0 {
+                info!(count, "Backfilled knowledge embeddings");
+            }
+        }
+        Err(e) => warn!(error = %e, "Failed to query knowledge for backfill"),
+    }
 }
 
 /// Build soul context string from the knowledge retriever's soul cache.
