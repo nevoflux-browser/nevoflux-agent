@@ -179,6 +179,58 @@ impl<'a> MemoryRepository<'a> {
             Ok(count as u32)
         })
     }
+
+    /// List memory chunks that have embeddings.
+    pub fn list_with_embeddings(&self, limit: usize) -> Result<Vec<MemoryChunk>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, content, embedding, metadata, created_at, updated_at, session_id
+                 FROM memory_chunks WHERE embedding IS NOT NULL ORDER BY created_at DESC LIMIT ?1",
+            )?;
+
+            let chunks = stmt
+                .query_map(params![limit as i64], row_to_memory_chunk)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+
+            Ok(chunks)
+        })
+    }
+
+    /// List memory chunks that do not have embeddings.
+    pub fn list_without_embeddings(&self, limit: usize) -> Result<Vec<MemoryChunk>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, content, embedding, metadata, created_at, updated_at, session_id
+                 FROM memory_chunks WHERE embedding IS NULL ORDER BY created_at DESC LIMIT ?1",
+            )?;
+
+            let chunks = stmt
+                .query_map(params![limit as i64], row_to_memory_chunk)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+
+            Ok(chunks)
+        })
+    }
+
+    /// Update the embedding of a memory chunk.
+    ///
+    /// Returns `true` if the row was found and updated.
+    pub fn update_embedding(&self, id: &str, embedding: &[f32]) -> Result<bool> {
+        let now = current_timestamp();
+        let embedding_blob = embedding_to_blob(embedding);
+
+        self.db.with_connection(|conn| {
+            let rows_affected = conn.execute(
+                "UPDATE memory_chunks SET embedding = ?1, updated_at = ?2 WHERE id = ?3",
+                params![embedding_blob, now, id],
+            )?;
+            Ok(rows_affected > 0)
+        })
+    }
 }
 
 /// Convert embedding vector to blob bytes (little-endian f32).
@@ -548,5 +600,65 @@ mod tests {
 
         let results = repo.search_fts("deletable", 10).unwrap();
         assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_list_with_embeddings() {
+        let db = setup_db();
+        let repo = MemoryRepository::new(&db);
+
+        let chunk1 = MemoryChunk::new("no embedding");
+        repo.create(&chunk1).unwrap();
+
+        let chunk2 = MemoryChunk::new("has embedding").with_embedding(vec![0.1, 0.2, 0.3]);
+        repo.create(&chunk2).unwrap();
+
+        let results = repo.list_with_embeddings(100).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].embedding.is_some());
+    }
+
+    #[test]
+    fn test_list_without_embeddings() {
+        let db = setup_db();
+        let repo = MemoryRepository::new(&db);
+
+        let chunk1 = MemoryChunk::new("no embedding");
+        repo.create(&chunk1).unwrap();
+
+        let chunk2 = MemoryChunk::new("has embedding").with_embedding(vec![0.1, 0.2, 0.3]);
+        repo.create(&chunk2).unwrap();
+
+        let results = repo.list_without_embeddings(100).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].embedding.is_none());
+    }
+
+    #[test]
+    fn test_update_embedding() {
+        let db = setup_db();
+        let repo = MemoryRepository::new(&db);
+
+        let chunk = MemoryChunk::new("test content");
+        repo.create(&chunk).unwrap();
+
+        let retrieved = repo.get(&chunk.id).unwrap().unwrap();
+        assert!(retrieved.embedding.is_none());
+
+        let emb = vec![0.5_f32, 0.6, 0.7];
+        let updated = repo.update_embedding(&chunk.id, &emb).unwrap();
+        assert!(updated);
+
+        let result = repo.get(&chunk.id).unwrap().unwrap();
+        assert_eq!(result.embedding.unwrap(), vec![0.5, 0.6, 0.7]);
+    }
+
+    #[test]
+    fn test_update_embedding_not_found() {
+        let db = setup_db();
+        let repo = MemoryRepository::new(&db);
+
+        let result = repo.update_embedding("nonexistent", &[0.1, 0.2]).unwrap();
+        assert!(!result);
     }
 }

@@ -13,6 +13,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("migrations/004_artifacts.sql"),
     ),
     ("005_learning", include_str!("migrations/005_learning.sql")),
+    (
+        "006_knowledge_embedding",
+        include_str!("migrations/006_knowledge_embedding.sql"),
+    ),
 ];
 
 /// Run all pending migrations on the given connection.
@@ -65,7 +69,7 @@ mod tests {
         let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 5);
+        assert_eq!(count, 6);
     }
 
     #[test]
