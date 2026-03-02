@@ -166,6 +166,19 @@ pub fn detect_conflict(existing: &Knowledge, incoming: &Knowledge) -> Option<Con
     None
 }
 
+/// Check an incoming entry against a list of existing entries.
+/// Returns the first conflict found, skipping entries that share the same ID
+/// as the incoming entry and entries with "archived" status.
+pub fn detect_conflict_against(
+    incoming: &Knowledge,
+    existing: &[Knowledge],
+) -> Option<Conflict> {
+    existing
+        .iter()
+        .filter(|e| e.id != incoming.id && e.status != "archived")
+        .find_map(|e| detect_conflict(e, incoming))
+}
+
 // ---------------------------------------------------------------------------
 // Resolution
 // ---------------------------------------------------------------------------
@@ -628,5 +641,141 @@ mod tests {
 
         // Same subject, same subcategory, same details, 1-day gap: no conflict.
         assert!(detect_conflict(&a, &b).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // 13. detect_conflict_against finds first conflict
+    // ------------------------------------------------------------------
+    #[test]
+    fn detect_conflict_against_finds_first_conflict() {
+        let incoming = make_knowledge(KnowledgeOverrides {
+            id: Some("K-incoming".into()),
+            category: Some("tooloptimization".into()),
+            subcategory: Some(Some("timeout".into())),
+            domain: Some(Some("example.com".into())),
+            details: Some("Use approach B".into()),
+            ..Default::default()
+        });
+
+        let existing = vec![
+            make_knowledge(KnowledgeOverrides {
+                id: Some("K-existing-1".into()),
+                category: Some("tooloptimization".into()),
+                subcategory: Some(Some("timeout".into())),
+                domain: Some(Some("example.com".into())),
+                details: Some("Use approach A".into()),
+                ..Default::default()
+            }),
+            make_knowledge(KnowledgeOverrides {
+                id: Some("K-existing-2".into()),
+                category: Some("tooloptimization".into()),
+                subcategory: Some(Some("timeout".into())),
+                domain: Some(Some("example.com".into())),
+                details: Some("Use approach C".into()),
+                ..Default::default()
+            }),
+        ];
+
+        let conflict = detect_conflict_against(&incoming, &existing);
+        assert!(conflict.is_some(), "Should detect a conflict");
+        let c = conflict.unwrap();
+        assert_eq!(c.existing_id, "K-existing-1");
+        assert_eq!(c.incoming_id, "K-incoming");
+    }
+
+    // ------------------------------------------------------------------
+    // 14. detect_conflict_against returns None when no conflict
+    // ------------------------------------------------------------------
+    #[test]
+    fn detect_conflict_against_returns_none_when_no_conflict() {
+        let incoming = make_knowledge(KnowledgeOverrides {
+            id: Some("K-incoming".into()),
+            category: Some("tooloptimization".into()),
+            domain: Some(Some("example.com".into())),
+            ..Default::default()
+        });
+
+        let existing = vec![
+            make_knowledge(KnowledgeOverrides {
+                id: Some("K-existing-1".into()),
+                category: Some("siteinteraction".into()),
+                domain: Some(Some("other.com".into())),
+                ..Default::default()
+            }),
+            make_knowledge(KnowledgeOverrides {
+                id: Some("K-existing-2".into()),
+                category: Some("userpreference".into()),
+                domain: Some(Some("another.com".into())),
+                ..Default::default()
+            }),
+        ];
+
+        let conflict = detect_conflict_against(&incoming, &existing);
+        assert!(conflict.is_none(), "Should not detect a conflict");
+    }
+
+    // ------------------------------------------------------------------
+    // 15. detect_conflict_against skips archived entries
+    // ------------------------------------------------------------------
+    #[test]
+    fn detect_conflict_against_skips_archived() {
+        let incoming = make_knowledge(KnowledgeOverrides {
+            id: Some("K-incoming".into()),
+            category: Some("tooloptimization".into()),
+            subcategory: Some(Some("timeout".into())),
+            domain: Some(Some("example.com".into())),
+            details: Some("Use approach B".into()),
+            ..Default::default()
+        });
+
+        // The only existing entry has the same subject but is archived
+        let mut archived_entry = make_knowledge(KnowledgeOverrides {
+            id: Some("K-existing-archived".into()),
+            category: Some("tooloptimization".into()),
+            subcategory: Some(Some("timeout".into())),
+            domain: Some(Some("example.com".into())),
+            details: Some("Use approach A".into()),
+            ..Default::default()
+        });
+        archived_entry.status = "archived".into();
+
+        let existing = vec![archived_entry];
+
+        let conflict = detect_conflict_against(&incoming, &existing);
+        assert!(
+            conflict.is_none(),
+            "Should skip archived entries and find no conflict"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 16. detect_conflict_against skips entries with same ID
+    // ------------------------------------------------------------------
+    #[test]
+    fn detect_conflict_against_skips_same_id() {
+        let incoming = make_knowledge(KnowledgeOverrides {
+            id: Some("K-same".into()),
+            category: Some("tooloptimization".into()),
+            subcategory: Some(Some("timeout".into())),
+            domain: Some(Some("example.com".into())),
+            details: Some("Use approach B".into()),
+            ..Default::default()
+        });
+
+        // The existing entry has the same ID as the incoming entry
+        let existing = vec![make_knowledge(KnowledgeOverrides {
+            id: Some("K-same".into()),
+            category: Some("tooloptimization".into()),
+            subcategory: Some(Some("timeout".into())),
+            domain: Some(Some("example.com".into())),
+            details: Some("Use approach A".into()),
+            ..Default::default()
+        })];
+
+        let conflict = detect_conflict_against(&incoming, &existing);
+        assert!(
+            conflict.is_none(),
+            "Should skip entries with the same ID"
+        );
     }
 }

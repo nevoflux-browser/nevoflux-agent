@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use nevoflux_storage::{CreateKnowledgeParams, CreateLearningMetricParams, Storage};
 
 use super::buffer::MemoryBuffer;
+use super::conflict::{detect_conflict_against, resolve_conflict, ConflictAction};
 use super::crypto::EncryptionService;
 use super::routing;
 use super::soul::manager::{SoulChange, SoulManager};
@@ -316,11 +317,55 @@ impl LearningPipeline {
                 }
             }
 
-            // Entry meets all thresholds — promote to validated
-            self.storage
-                .knowledge()
-                .update_status(&entry.id, "validated")?;
-            validated_count += 1;
+            // Entry meets all thresholds — check for conflicts before validating
+            let existing_entries = self.storage.knowledge().query_by_subject(
+                &entry.category,
+                entry.domain.as_deref(),
+                10,
+            )?;
+
+            let conflict = detect_conflict_against(entry, &existing_entries);
+
+            match conflict {
+                None => {
+                    // No conflict, proceed with validation
+                    self.storage
+                        .knowledge()
+                        .update_status(&entry.id, "validated")?;
+                    validated_count += 1;
+                }
+                Some(conflict) => {
+                    let action = resolve_conflict(&conflict);
+                    match action {
+                        ConflictAction::Archive(old_id) => {
+                            self.storage
+                                .knowledge()
+                                .update_status(&old_id, "archived")?;
+                            self.storage
+                                .knowledge()
+                                .update_status(&entry.id, "validated")?;
+                            validated_count += 1;
+                        }
+                        ConflictAction::Keep => {
+                            self.storage
+                                .knowledge()
+                                .update_status(&entry.id, "validated")?;
+                            validated_count += 1;
+                        }
+                        ConflictAction::RejectIncoming(id) => {
+                            self.storage.knowledge().update_status(&id, "archived")?;
+                        }
+                        ConflictAction::FlagForUser(ref c) => {
+                            tracing::info!(
+                                conflict_type = ?c.conflict_type,
+                                entry_id = &entry.id,
+                                "Knowledge conflict requires user arbitration, skipping"
+                            );
+                            // Leave as pending — no UI confirmation flow yet
+                        }
+                    }
+                }
+            }
         }
 
         self.record_metric("validation", validated_count as f64, None);
@@ -2079,5 +2124,344 @@ mod tests {
         // Entry should still be validated (not promoted)
         let entries = storage.knowledge().query_validated(10).unwrap();
         assert_eq!(entries.len(), 1);
+    }
+
+    // --- Conflict resolution in validate() tests ---
+
+    #[test]
+    fn validate_archives_old_entry_on_direct_contradiction() {
+        let (pipeline, storage) = setup();
+        let repo = storage.knowledge();
+
+        // Create an existing validated entry
+        let old = repo
+            .create(CreateKnowledgeParams {
+                category: "tooloptimization".into(),
+                domain: Some("example.com".into()),
+                summary: "Use approach A".into(),
+                details: "Strategy A works".into(),
+                source_type: Some("system".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        repo.update_status(&old.id, "validated").unwrap();
+
+        // Set subcategory on the old entry so it shares subcategory with the new
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET subcategory = 'timeout' WHERE id = ?1",
+                    params![old.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Create a pending entry with same category+domain+subcategory
+        // but different details (direct contradiction)
+        let new_entry = repo
+            .create(CreateKnowledgeParams {
+                category: "tooloptimization".into(),
+                domain: Some("example.com".into()),
+                summary: "Use approach B".into(),
+                details: "Strategy B works better".into(),
+                source_type: Some("system".into()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Set subcategory and qualifying stats on the new entry
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET subcategory = 'timeout', hit_count = 5, confidence = 0.8 WHERE id = ?1",
+                    params![new_entry.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let thresholds = ValidationThresholds {
+            min_occurrences: 1,
+            min_confidence: 0.0,
+            min_alive_hours: 0,
+        };
+
+        let count = pipeline.validate(&thresholds).unwrap();
+        assert_eq!(count, 1, "New entry should be validated");
+
+        // Old entry should be archived
+        let old_entry = repo.get(&old.id).unwrap().unwrap();
+        assert_eq!(old_entry.status, "archived");
+
+        // New entry should be validated
+        let new_entry = repo.get(&new_entry.id).unwrap().unwrap();
+        assert_eq!(new_entry.status, "validated");
+    }
+
+    #[test]
+    fn validate_keeps_both_on_strategy_conflict() {
+        let (pipeline, storage) = setup();
+        let repo = storage.knowledge();
+
+        // Create an existing validated entry
+        let old = repo
+            .create(CreateKnowledgeParams {
+                category: "tooloptimization".into(),
+                domain: Some("example.com".into()),
+                summary: "Approach A".into(),
+                details: "Strategy A".into(),
+                source_type: Some("system".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        repo.update_status(&old.id, "validated").unwrap();
+
+        // Set subcategory=login on old
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET subcategory = 'login' WHERE id = ?1",
+                    params![old.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Create a pending entry with same category+domain but different
+        // subcategory and details (strategy conflict: same subject, different
+        // approach, different subcategory -> not contradicting)
+        let new_entry = repo
+            .create(CreateKnowledgeParams {
+                category: "tooloptimization".into(),
+                domain: Some("example.com".into()),
+                summary: "Approach B".into(),
+                details: "Strategy B".into(),
+                source_type: Some("system".into()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Different subcategory triggers strategy conflict (not direct contradiction)
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET subcategory = 'checkout', hit_count = 5, confidence = 0.8 WHERE id = ?1",
+                    params![new_entry.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let thresholds = ValidationThresholds {
+            min_occurrences: 1,
+            min_confidence: 0.0,
+            min_alive_hours: 0,
+        };
+
+        let count = pipeline.validate(&thresholds).unwrap();
+        assert_eq!(count, 1, "New entry should be validated (keep both)");
+
+        // Old entry should still be validated (not archived)
+        let old_entry = repo.get(&old.id).unwrap().unwrap();
+        assert_eq!(old_entry.status, "validated");
+
+        // New entry should also be validated
+        let new_entry = repo.get(&new_entry.id).unwrap().unwrap();
+        assert_eq!(new_entry.status, "validated");
+    }
+
+    #[test]
+    fn validate_rejects_incoming_when_manual_edit_protected() {
+        let (pipeline, storage) = setup();
+        let repo = storage.knowledge();
+
+        // Create a manually-edited, validated entry
+        let manual = repo
+            .create(CreateKnowledgeParams {
+                category: "tooloptimization".into(),
+                domain: Some("example.com".into()),
+                summary: "Manual approach".into(),
+                details: "Manually curated".into(),
+                source_type: Some("manual".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        repo.update_status(&manual.id, "validated").unwrap();
+
+        // Create a pending system entry with the same subject
+        let system_entry = repo
+            .create(CreateKnowledgeParams {
+                category: "tooloptimization".into(),
+                domain: Some("example.com".into()),
+                summary: "System approach".into(),
+                details: "System generated".into(),
+                source_type: Some("system".into()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Make it meet thresholds
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET hit_count = 5, confidence = 0.8 WHERE id = ?1",
+                    params![system_entry.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let thresholds = ValidationThresholds {
+            min_occurrences: 1,
+            min_confidence: 0.0,
+            min_alive_hours: 0,
+        };
+
+        let count = pipeline.validate(&thresholds).unwrap();
+        assert_eq!(count, 0, "System entry should be rejected (manual edit protected)");
+
+        // System entry should be archived (rejected)
+        let sys = repo.get(&system_entry.id).unwrap().unwrap();
+        assert_eq!(sys.status, "archived");
+
+        // Manual entry should still be validated
+        let man = repo.get(&manual.id).unwrap().unwrap();
+        assert_eq!(man.status, "validated");
+    }
+
+    #[test]
+    fn validate_no_conflict_when_categories_differ() {
+        let (pipeline, storage) = setup();
+        let repo = storage.knowledge();
+
+        // Create an existing validated entry in a different category
+        let old = repo
+            .create(CreateKnowledgeParams {
+                category: "siteinteraction".into(),
+                domain: Some("example.com".into()),
+                summary: "Site entry".into(),
+                details: "Site details".into(),
+                source_type: Some("system".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        repo.update_status(&old.id, "validated").unwrap();
+
+        // Create a pending entry in a different category
+        let new_entry = repo
+            .create(CreateKnowledgeParams {
+                category: "tooloptimization".into(),
+                domain: Some("example.com".into()),
+                summary: "Tool entry".into(),
+                details: "Tool details".into(),
+                source_type: Some("system".into()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET hit_count = 5, confidence = 0.8 WHERE id = ?1",
+                    params![new_entry.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let thresholds = ValidationThresholds {
+            min_occurrences: 1,
+            min_confidence: 0.0,
+            min_alive_hours: 0,
+        };
+
+        let count = pipeline.validate(&thresholds).unwrap();
+        assert_eq!(count, 1, "No conflict across different categories");
+
+        // New entry should be validated
+        let entry = repo.get(&new_entry.id).unwrap().unwrap();
+        assert_eq!(entry.status, "validated");
+
+        // Old entry should still be validated (untouched)
+        let old_entry = repo.get(&old.id).unwrap().unwrap();
+        assert_eq!(old_entry.status, "validated");
+    }
+
+    #[test]
+    fn validate_flags_high_value_conflict_for_user() {
+        let (pipeline, storage) = setup();
+        let repo = storage.knowledge();
+
+        // Create a high-confidence, high-hit existing entry
+        let old = repo
+            .create(CreateKnowledgeParams {
+                category: "tooloptimization".into(),
+                domain: Some("example.com".into()),
+                summary: "High value approach".into(),
+                details: "Well-tested strategy".into(),
+                source_type: Some("system".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        repo.update_status(&old.id, "validated").unwrap();
+
+        // Give the old entry very high confidence and hit count
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET subcategory = 'timeout', hit_count = 100, confidence = 0.95 WHERE id = ?1",
+                    params![old.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Create a low-confidence pending entry that contradicts
+        let new_entry = repo
+            .create(CreateKnowledgeParams {
+                category: "tooloptimization".into(),
+                domain: Some("example.com".into()),
+                summary: "Low value approach".into(),
+                details: "New untested strategy".into(),
+                source_type: Some("system".into()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET subcategory = 'timeout', hit_count = 1, confidence = 0.5 WHERE id = ?1",
+                    params![new_entry.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let thresholds = ValidationThresholds {
+            min_occurrences: 1,
+            min_confidence: 0.0,
+            min_alive_hours: 0,
+        };
+
+        let count = pipeline.validate(&thresholds).unwrap();
+        assert_eq!(count, 0, "Should be flagged for user, not validated");
+
+        // New entry should still be pending (flagged for user arbitration)
+        let entry = repo.get(&new_entry.id).unwrap().unwrap();
+        assert_eq!(entry.status, "pending");
+
+        // Old entry should be untouched
+        let old_entry = repo.get(&old.id).unwrap().unwrap();
+        assert_eq!(old_entry.status, "validated");
     }
 }
