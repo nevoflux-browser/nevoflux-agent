@@ -1122,8 +1122,7 @@ impl HostFunctions for DaemonHostFunctions {
             ..Default::default()
         };
 
-        let knowledge_repo =
-            nevoflux_storage::KnowledgeRepository::new(&services.database);
+        let knowledge_repo = nevoflux_storage::KnowledgeRepository::new(&services.database);
 
         let entry = knowledge_repo.create(params).map_err(|e| HostError {
             code: 100,

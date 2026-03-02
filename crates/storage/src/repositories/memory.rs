@@ -7,6 +7,26 @@ use crate::connection::Database;
 use crate::error::{Result, StorageError};
 use crate::models::MemoryChunk;
 
+/// Sanitize a query string for FTS5 MATCH.
+///
+/// FTS5 treats certain characters as operators (`*`, `-`, `OR`, `AND`, `NOT`,
+/// `NEAR`, `"`, `(`, `)`). Wrapping each token in double-quotes turns it into
+/// an exact-match phrase token, preventing parse errors on user-supplied input.
+/// Returns an empty string when the query contains no searchable terms.
+fn sanitize_fts5_query(raw: &str) -> String {
+    let tokens: Vec<String> = raw
+        .split_whitespace()
+        .map(|t| {
+            // Strip characters that break FTS5 even inside quotes
+            let cleaned: String = t.chars().filter(|c| *c != '"').collect();
+            cleaned
+        })
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{}\"", t))
+        .collect();
+    tokens.join(" ")
+}
+
 /// Get the current Unix timestamp.
 fn current_timestamp() -> i64 {
     SystemTime::now()
@@ -70,6 +90,11 @@ impl<'a> MemoryRepository<'a> {
 
     /// Search memory chunks using FTS5 full-text search.
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<MemoryChunk>> {
+        let sanitized = sanitize_fts5_query(query);
+        if sanitized.is_empty() {
+            return Ok(vec![]);
+        }
+
         self.db.with_connection(|conn| {
             // Use FTS5 to find matching rowids, then join with memory_chunks
             let mut stmt = conn.prepare(
@@ -82,7 +107,7 @@ impl<'a> MemoryRepository<'a> {
             )?;
 
             let chunks = stmt
-                .query_map(params![query, limit as i64], row_to_memory_chunk)?
+                .query_map(params![sanitized, limit as i64], row_to_memory_chunk)?
                 .collect::<std::result::Result<Vec<_>, _>>()?
                 .into_iter()
                 .collect::<Result<Vec<_>>>()?;
@@ -660,5 +685,40 @@ mod tests {
 
         let result = repo.update_embedding("nonexistent", &[0.1, 0.2]).unwrap();
         assert!(!result);
+    }
+
+    #[test]
+    fn test_sanitize_fts5_query_empty() {
+        assert_eq!(sanitize_fts5_query(""), "");
+        assert_eq!(sanitize_fts5_query("   "), "");
+    }
+
+    #[test]
+    fn test_sanitize_fts5_query_normal() {
+        assert_eq!(sanitize_fts5_query("hello world"), "\"hello\" \"world\"");
+        assert_eq!(sanitize_fts5_query("rust"), "\"rust\"");
+    }
+
+    #[test]
+    fn test_sanitize_fts5_query_special_chars() {
+        // Quotes are stripped, other chars preserved inside quotes
+        assert_eq!(sanitize_fts5_query("he\"llo"), "\"hello\"");
+        assert_eq!(sanitize_fts5_query("NOT -bad"), "\"NOT\" \"-bad\"");
+        assert_eq!(sanitize_fts5_query("foo*"), "\"foo*\"");
+    }
+
+    #[test]
+    fn test_search_fts_empty_query() {
+        let db = setup_db();
+        let repo = MemoryRepository::new(&db);
+
+        let chunk = MemoryChunk::new("some content").with_id("empty-q");
+        repo.create(&chunk).unwrap();
+
+        let results = repo.search_fts("", 10).unwrap();
+        assert!(results.is_empty());
+
+        let results = repo.search_fts("   ", 10).unwrap();
+        assert!(results.is_empty());
     }
 }

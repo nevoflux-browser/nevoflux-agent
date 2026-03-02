@@ -472,10 +472,7 @@ impl LearningPipeline {
             // Build hot_summary: a concise one-liner for system prompt injection
             let domain_tag = entry.domain.as_deref().unwrap_or("universal");
             let hot_summary = if let Some(ref resolution) = entry.resolution {
-                format!(
-                    "[{}] {} — {}",
-                    domain_tag, entry.summary, resolution
-                )
+                format!("[{}] {} — {}", domain_tag, entry.summary, resolution)
             } else {
                 format!("[{}] {}", domain_tag, entry.summary)
             };
@@ -1275,7 +1272,11 @@ mod tests {
         // Verify hot entry exists
         let hot = storage.knowledge().list_hot().unwrap();
         assert_eq!(hot.len(), 1);
-        assert!(hot[0].hot_summary.as_ref().unwrap().contains("User prefers concise replies"));
+        assert!(hot[0]
+            .hot_summary
+            .as_ref()
+            .unwrap()
+            .contains("User prefers concise replies"));
     }
 
     #[tokio::test]
