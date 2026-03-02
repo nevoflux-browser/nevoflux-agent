@@ -35,6 +35,7 @@ jobs:
           snapshot_download(
               'intfloat/multilingual-e5-small',
               cache_dir=cache_dir,
+              allow_patterns=['onnx/*'],
           )
           "
 
