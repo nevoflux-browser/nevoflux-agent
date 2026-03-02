@@ -165,6 +165,8 @@ pub struct DaemonHostFunctions {
     subagent_sandbox: Option<String>,
     /// Current thinking block ID for reasoning→ThinkingEvent conversion.
     current_thinking_id: Arc<Mutex<Option<String>>>,
+    /// Domain from the most recent successful browser_navigate.
+    last_navigated_domain: Arc<Mutex<Option<String>>>,
 }
 
 impl DaemonHostFunctions {
@@ -186,6 +188,7 @@ impl DaemonHostFunctions {
             skill_base_path: None,
             subagent_sandbox: None,
             current_thinking_id: Arc::new(Mutex::new(None)),
+            last_navigated_domain: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -345,6 +348,128 @@ impl DaemonHostFunctions {
                 full_result,
             );
         }
+    }
+
+    /// Record a site adaptation entry for a browser tool action.
+    ///
+    /// Spawns a background task to upsert the adaptation record so the
+    /// caller is never blocked. Errors are logged at debug level and
+    /// silently discarded.
+    fn record_site_adaptation(
+        &self,
+        action: BrowserToolAction,
+        params: &serde_json::Value,
+        success: bool,
+        error_msg: &Option<String>,
+    ) {
+        // Determine identifier key and value based on action type
+        let (identifier_key, identifier_value) = match action {
+            BrowserToolAction::Click
+            | BrowserToolAction::Type
+            | BrowserToolAction::Fill
+            | BrowserToolAction::WaitFor => {
+                if let Some(sel) = params.get("selector").and_then(|v| v.as_str()) {
+                    ("selector", sel.to_string())
+                } else {
+                    return;
+                }
+            }
+            BrowserToolAction::ClickById
+            | BrowserToolAction::TypeById
+            | BrowserToolAction::FillById => {
+                if let Some(eid) = params.get("element_id").and_then(|v| v.as_str()) {
+                    ("element_id", eid.to_string())
+                } else {
+                    return;
+                }
+            }
+            _ => return,
+        };
+
+        if identifier_value.is_empty() {
+            return;
+        }
+
+        // Read the current domain
+        let domain = match self.last_navigated_domain.lock() {
+            Ok(guard) => match guard.as_ref() {
+                Some(d) => d.clone(),
+                None => return,
+            },
+            Err(_) => return,
+        };
+
+        // Collect data for the spawned task
+        let database = match self.services.as_ref() {
+            Some(s) => s.database.clone(),
+            None => return,
+        };
+        let action_name = serde_json::to_value(action)
+            .ok()
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| format!("{:?}", action).to_lowercase());
+        let error_msg_clone = error_msg.clone();
+        let id_key = identifier_key.to_string();
+        let id_val = identifier_value;
+
+        self.runtime.spawn(async move {
+            let repo = nevoflux_storage::SiteAdaptationRepository::new(&database);
+
+            // Build content JSON
+            let content = serde_json::json!({
+                id_key.as_str(): id_val,
+                "action": action_name,
+                "last_success": success,
+                "last_error": error_msg_clone,
+            });
+            let content_str = content.to_string();
+
+            // Look up existing record
+            let is_selector = id_key == "selector";
+            let existing = if is_selector {
+                repo.find_by_domain_and_selector(&domain, &id_val)
+            } else {
+                repo.find_by_domain_and_element_id(&domain, &id_val)
+            };
+
+            match existing {
+                Ok(Some(record)) => {
+                    // Incremental update
+                    let old_rate = record.success_rate;
+                    let old_count = record.sample_count;
+                    let new_count = old_count + 1;
+                    let new_rate = (old_rate * old_count as f64
+                        + if success { 1.0 } else { 0.0 })
+                        / new_count as f64;
+                    if let Err(e) = repo.update_stats(&record.id, new_rate, new_count) {
+                        debug!("Failed to update site adaptation stats: {}", e);
+                    }
+                }
+                Ok(None) => {
+                    // Create new record, then set initial stats
+                    let create_params =
+                        nevoflux_storage::CreateSiteAdaptationParams::new(
+                            &domain,
+                            "selector_result",
+                            &content_str,
+                        );
+                    match repo.create(create_params) {
+                        Ok(record) => {
+                            let rate = if success { 1.0 } else { 0.0 };
+                            if let Err(e) = repo.update_stats(&record.id, rate, 1) {
+                                debug!("Failed to set initial site adaptation stats: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Failed to create site adaptation record: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!("Failed to query site adaptation: {}", e);
+                }
+            }
+        });
     }
 
     /// Convert agent LlmRequest to daemon LlmChatRequest with custom messages.
@@ -3165,6 +3290,7 @@ impl DaemonHostFunctions {
             skill_base_path: self.skill_base_path.clone(),
             subagent_sandbox: self.subagent_sandbox.clone(),
             current_thinking_id: Arc::new(Mutex::new(None)),
+            last_navigated_domain: self.last_navigated_domain.clone(),
         }
     }
 
@@ -3313,6 +3439,9 @@ impl DaemonHostFunctions {
             .clone()
             .unwrap_or_else(|| "default".to_string());
 
+        // Clone params before they are moved into the request (needed for adaptation recording)
+        let params_for_adaptation = params.clone();
+
         let request = BrowserRequest {
             request_id: request_id.clone(),
             session_id,
@@ -3415,11 +3544,35 @@ impl DaemonHostFunctions {
             } else {
                 Some("BROWSER_ERROR".to_string())
             },
-            error_msg,
+            error_msg.clone(),
             duration_ms,
             None,
             None,
         );
+
+        // Track domain from Navigate; clear on GoBack/GoForward
+        if success {
+            match action {
+                BrowserToolAction::Navigate => {
+                    if let Some(url) = params_for_adaptation.get("url").and_then(|v| v.as_str()) {
+                        if let Some(domain) = extract_domain_from_url(url) {
+                            if let Ok(mut g) = self.last_navigated_domain.lock() {
+                                *g = Some(domain);
+                            }
+                        }
+                    }
+                }
+                BrowserToolAction::GoBack | BrowserToolAction::GoForward => {
+                    if let Ok(mut g) = self.last_navigated_domain.lock() {
+                        *g = None;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Record site adaptation (spawns background task, never blocks)
+        self.record_site_adaptation(action, &params_for_adaptation, success, &error_msg);
 
         host_result
     }
@@ -3731,6 +3884,23 @@ fn merge_search_results(
             }
         })
         .collect()
+}
+
+/// Extract the domain (host) from a URL string.
+///
+/// Supports `https://` and `http://` schemes. Strips port numbers and
+/// returns the lowercase hostname.
+fn extract_domain_from_url(url: &str) -> Option<String> {
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let host_port = after_scheme.split('/').next()?;
+    let host = host_port.split(':').next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_lowercase())
+    }
 }
 
 #[cfg(test)]
@@ -4929,5 +5099,154 @@ mod tests {
         let host = DaemonHostFunctions::new(config, rt.handle().clone());
         // No sandbox set — should allow any path
         assert!(host.validate_sandbox_path("/any/path/file.txt").is_ok());
+    }
+
+    // ==================== extract_domain_from_url Tests ====================
+
+    #[test]
+    fn test_extract_domain_https() {
+        assert_eq!(
+            extract_domain_from_url("https://example.com/path"),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_domain_http() {
+        assert_eq!(
+            extract_domain_from_url("http://example.com/path"),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_domain_with_port() {
+        assert_eq!(
+            extract_domain_from_url("https://example.com:8080/path"),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_domain_uppercase() {
+        assert_eq!(
+            extract_domain_from_url("https://Example.COM/path"),
+            Some("example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_domain_invalid_url() {
+        assert_eq!(extract_domain_from_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn test_extract_domain_empty() {
+        assert_eq!(extract_domain_from_url(""), None);
+    }
+
+    #[test]
+    fn test_extract_domain_empty_host() {
+        assert_eq!(extract_domain_from_url("https:///path"), None);
+    }
+
+    // ==================== Site Adaptation Recording Tests ====================
+
+    #[test]
+    fn test_record_site_adaptation_creates_and_updates() {
+        let (host, rt) = setup_host_with_services();
+
+        // Set domain
+        *host.last_navigated_domain.lock().unwrap() = Some("example.com".to_string());
+
+        let params = serde_json::json!({"selector": "#submit-btn"});
+
+        // First call — creates new record
+        host.record_site_adaptation(BrowserToolAction::Click, &params, true, &None);
+
+        // Give the spawned task time to complete
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Verify via repository
+        let db = &host.services.as_ref().unwrap().database;
+        let repo = nevoflux_storage::SiteAdaptationRepository::new(db);
+        let found = repo
+            .find_by_domain_and_selector("example.com", "#submit-btn")
+            .unwrap();
+        assert!(found.is_some());
+        let record = found.unwrap();
+        assert!((record.success_rate - 1.0).abs() < f64::EPSILON);
+        assert_eq!(record.sample_count, 1);
+
+        // Second call — updates existing record (failure)
+        host.record_site_adaptation(
+            BrowserToolAction::Click,
+            &params,
+            false,
+            &Some("Element not found".to_string()),
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let found = repo
+            .find_by_domain_and_selector("example.com", "#submit-btn")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.sample_count, 2);
+        // rate = (1.0 * 1 + 0.0) / 2 = 0.5
+        assert!((found.success_rate - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_record_site_adaptation_skips_without_domain() {
+        let (host, _rt) = setup_host_with_services();
+
+        // No domain set — should not create any records
+        let params = serde_json::json!({"selector": "#btn"});
+        host.record_site_adaptation(BrowserToolAction::Click, &params, true, &None);
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let db = &host.services.as_ref().unwrap().database;
+        let repo = nevoflux_storage::SiteAdaptationRepository::new(db);
+        let results = repo.query_by_domain("example.com", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_record_site_adaptation_skips_non_selector_action() {
+        let (host, _rt) = setup_host_with_services();
+
+        *host.last_navigated_domain.lock().unwrap() = Some("example.com".to_string());
+
+        let params = serde_json::json!({"url": "https://example.com"});
+        host.record_site_adaptation(BrowserToolAction::Screenshot, &params, true, &None);
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let db = &host.services.as_ref().unwrap().database;
+        let repo = nevoflux_storage::SiteAdaptationRepository::new(db);
+        let results = repo.query_by_domain("example.com", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_record_site_adaptation_by_element_id() {
+        let (host, _rt) = setup_host_with_services();
+
+        *host.last_navigated_domain.lock().unwrap() = Some("app.test".to_string());
+
+        let params = serde_json::json!({"element_id": "login-btn", "value": "click"});
+        host.record_site_adaptation(BrowserToolAction::ClickById, &params, true, &None);
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let db = &host.services.as_ref().unwrap().database;
+        let repo = nevoflux_storage::SiteAdaptationRepository::new(db);
+        let found = repo
+            .find_by_domain_and_element_id("app.test", "login-btn")
+            .unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().sample_count, 1);
     }
 }

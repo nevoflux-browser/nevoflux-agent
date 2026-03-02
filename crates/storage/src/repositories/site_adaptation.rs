@@ -206,6 +206,61 @@ impl<'a> SiteAdaptationRepository<'a> {
         })
     }
 
+    /// Find a site adaptation by domain and CSS selector.
+    ///
+    /// Looks for records where `adaptation_type = 'selector_result'` and
+    /// `json_extract(content, '$.selector')` matches the given selector.
+    pub fn find_by_domain_and_selector(
+        &self,
+        domain: &str,
+        selector: &str,
+    ) -> Result<Option<SiteAdaptation>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, domain, url_pattern, adaptation_type, content, verified, last_verified_at, success_rate, sample_count, created_at, updated_at
+                 FROM site_adaptations
+                 WHERE domain = ?1 AND adaptation_type = 'selector_result'
+                   AND json_extract(content, '$.selector') = ?2
+                 LIMIT 1",
+            )?;
+
+            let mut rows = stmt.query_map(params![domain, selector], row_to_site_adaptation)?;
+
+            match rows.next() {
+                Some(row) => Ok(Some(row?)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    /// Find a site adaptation by domain and element ID.
+    ///
+    /// Looks for records where `adaptation_type = 'selector_result'` and
+    /// `json_extract(content, '$.element_id')` matches the given element ID.
+    pub fn find_by_domain_and_element_id(
+        &self,
+        domain: &str,
+        element_id: &str,
+    ) -> Result<Option<SiteAdaptation>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, domain, url_pattern, adaptation_type, content, verified, last_verified_at, success_rate, sample_count, created_at, updated_at
+                 FROM site_adaptations
+                 WHERE domain = ?1 AND adaptation_type = 'selector_result'
+                   AND json_extract(content, '$.element_id') = ?2
+                 LIMIT 1",
+            )?;
+
+            let mut rows =
+                stmt.query_map(params![domain, element_id], row_to_site_adaptation)?;
+
+            match rows.next() {
+                Some(row) => Ok(Some(row?)),
+                None => Ok(None),
+            }
+        })
+    }
+
     /// Delete a site adaptation by ID.
     pub fn delete(&self, id: &str) -> Result<bool> {
         self.db.with_connection(|conn| {
@@ -408,5 +463,96 @@ mod tests {
 
         assert!(record.id.starts_with("SA-"));
         assert!(record.id.len() > 3);
+    }
+
+    #[test]
+    fn test_find_by_domain_and_selector_found() {
+        let storage = Storage::open_in_memory().unwrap();
+        let repo = SiteAdaptationRepository::new(storage.database());
+
+        repo.create(
+            CreateSiteAdaptationParams::new(
+                "example.com",
+                "selector_result",
+                r##"{"selector": "#submit-btn", "action": "click"}"##,
+            )
+            .with_id("SA-sel01"),
+        )
+        .unwrap();
+        repo.update_stats("SA-sel01", 0.8, 5).unwrap();
+
+        let found = repo
+            .find_by_domain_and_selector("example.com", "#submit-btn")
+            .unwrap();
+        assert!(found.is_some());
+        let record = found.unwrap();
+        assert_eq!(record.id, "SA-sel01");
+        assert!((record.success_rate - 0.8).abs() < f64::EPSILON);
+        assert_eq!(record.sample_count, 5);
+    }
+
+    #[test]
+    fn test_find_by_domain_and_selector_not_found() {
+        let storage = Storage::open_in_memory().unwrap();
+        let repo = SiteAdaptationRepository::new(storage.database());
+
+        repo.create(
+            CreateSiteAdaptationParams::new(
+                "example.com",
+                "selector_result",
+                r##"{"selector": "#submit-btn", "action": "click"}"##,
+            )
+            .with_id("SA-sel02"),
+        )
+        .unwrap();
+
+        let found = repo
+            .find_by_domain_and_selector("example.com", "#login-btn")
+            .unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_by_domain_and_element_id_found() {
+        let storage = Storage::open_in_memory().unwrap();
+        let repo = SiteAdaptationRepository::new(storage.database());
+
+        repo.create(
+            CreateSiteAdaptationParams::new(
+                "example.com",
+                "selector_result",
+                r#"{"element_id": "login-form", "action": "fill_by_id"}"#,
+            )
+            .with_id("SA-eid01"),
+        )
+        .unwrap();
+        repo.update_stats("SA-eid01", 0.9, 10).unwrap();
+
+        let found = repo
+            .find_by_domain_and_element_id("example.com", "login-form")
+            .unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, "SA-eid01");
+    }
+
+    #[test]
+    fn test_find_by_domain_and_selector_wrong_domain() {
+        let storage = Storage::open_in_memory().unwrap();
+        let repo = SiteAdaptationRepository::new(storage.database());
+
+        repo.create(
+            CreateSiteAdaptationParams::new(
+                "example.com",
+                "selector_result",
+                r##"{"selector": "#submit-btn", "action": "click"}"##,
+            )
+            .with_id("SA-sel03"),
+        )
+        .unwrap();
+
+        let found = repo
+            .find_by_domain_and_selector("other.com", "#submit-btn")
+            .unwrap();
+        assert!(found.is_none());
     }
 }
