@@ -13,7 +13,40 @@ env:
   BINARY_NAME: nevoflux-agent
 
 jobs:
+  # Download embedding model once, share across all platform builds
+  download-model:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download embedding model
+        run: |
+          pip install huggingface_hub
+          python -c "
+          from huggingface_hub import snapshot_download
+          import os
+          cache_dir = 'models/fastembed'
+          os.makedirs(cache_dir, exist_ok=True)
+          snapshot_download(
+              'intfloat/multilingual-e5-small',
+              cache_dir=cache_dir,
+          )
+          "
+
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: embedding-model
+          path: models/
+          retention-days: 1
+
   build:
+    needs: download-model
     strategy:
       fail-fast: false
       matrix:
@@ -75,18 +108,29 @@ jobs:
         if: matrix.use_cross == true
         run: cross build --release --target ${{ matrix.target }}
 
-      # Package: tar.gz for Unix, zip for Windows
+      # Download pre-cached embedding model
+      - name: Download embedding model
+        uses: actions/download-artifact@v4
+        with:
+          name: embedding-model
+          path: staging/models
+
+      # Package: binary + embedding model
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.artifact }}.tar.gz ${{ env.BINARY_NAME }}
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} staging/
+          cd staging
+          tar czf ../${{ matrix.artifact }}.tar.gz ${{ env.BINARY_NAME }} models/
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" -DestinationPath "${{ matrix.artifact }}.zip"
+          New-Item -ItemType Directory -Force -Path staging
+          Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" staging/
+          Compress-Archive -Path "staging/${{ env.BINARY_NAME }}.exe", "staging/models" -DestinationPath "${{ matrix.artifact }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -98,7 +142,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [download-model, build]
     runs-on: ubuntu-latest
 
     steps:

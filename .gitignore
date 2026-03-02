@@ -29,3 +29,6 @@ docs/plans/
 # Git worktrees
 .worktrees/
 
+# Downloaded embedding models (use `just download-model` to fetch)
+models/
+

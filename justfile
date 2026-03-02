@@ -129,6 +129,21 @@ coverage:
 run *ARGS:
     cargo run -- {{ARGS}}
 
+# Download embedding model for bundled deployment
+download-model:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Downloading multilingual-e5-small embedding model..."
+    pip install -q huggingface_hub
+    python3 -c "
+    from huggingface_hub import snapshot_download
+    import os
+    cache_dir = 'models/fastembed'
+    os.makedirs(cache_dir, exist_ok=True)
+    snapshot_download('intfloat/multilingual-e5-small', cache_dir=cache_dir)
+    print(f'Model downloaded to {cache_dir}')
+    "
+
 # Build and install locally
 install:
     cargo install --path .
