@@ -29,7 +29,7 @@ jobs:
           pip install huggingface_hub
           python -c "
           from huggingface_hub import snapshot_download
-          import os, glob
+          import os, glob, shutil
           cache_dir = 'models/fastembed'
           os.makedirs(cache_dir, exist_ok=True)
           snapshot_download(
@@ -49,6 +49,23 @@ jobs:
               target = os.path.join(os.path.dirname(f), 'model.onnx')
               os.rename(f, target)
               print(f'Renamed {f} -> {target}')
+
+          # Deduplicate HF cache: resolve symlinks in snapshots/, remove blobs/
+          # HF cache stores data in blobs/ and symlinks in snapshots/ - artifact
+          # upload follows symlinks causing data to be stored twice.
+          model_dir = os.path.join(cache_dir, 'models--intfloat--multilingual-e5-small')
+          snapshots = os.path.join(model_dir, 'snapshots')
+          for root, dirs, files in os.walk(snapshots):
+              for fname in files:
+                  fpath = os.path.join(root, fname)
+                  if os.path.islink(fpath):
+                      real = os.path.realpath(fpath)
+                      os.remove(fpath)
+                      shutil.copy2(real, fpath)
+          blobs = os.path.join(model_dir, 'blobs')
+          if os.path.isdir(blobs):
+              shutil.rmtree(blobs)
+              print(f'Removed {blobs}, kept resolved files in snapshots/')
           "
 
       - name: Upload model artifact

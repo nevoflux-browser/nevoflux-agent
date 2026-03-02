@@ -141,11 +141,23 @@ download-model:
     cache_dir = 'models/fastembed'
     os.makedirs(cache_dir, exist_ok=True)
     snapshot_download('intfloat/multilingual-e5-small', cache_dir=cache_dir, allow_patterns=['onnx/model_O4.onnx', 'onnx/tokenizer.json', 'onnx/config.json', 'onnx/special_tokens_map.json', 'onnx/tokenizer_config.json', 'onnx/sentencepiece.bpe.model'])
-    import glob
+    import glob, shutil
     for f in glob.glob(os.path.join(cache_dir, '**', 'model_O4.onnx'), recursive=True):
         target = os.path.join(os.path.dirname(f), 'model.onnx')
         os.rename(f, target)
         print(f'Renamed {f} -> {target}')
+    # Resolve symlinks and remove blobs to avoid duplicate data
+    model_dir = os.path.join(cache_dir, 'models--intfloat--multilingual-e5-small')
+    for root, dirs, files in os.walk(os.path.join(model_dir, 'snapshots')):
+        for fname in files:
+            fpath = os.path.join(root, fname)
+            if os.path.islink(fpath):
+                real = os.path.realpath(fpath)
+                os.remove(fpath)
+                shutil.copy2(real, fpath)
+    blobs = os.path.join(model_dir, 'blobs')
+    if os.path.isdir(blobs):
+        shutil.rmtree(blobs)
     print(f'Model downloaded to {cache_dir}')
     "
 
