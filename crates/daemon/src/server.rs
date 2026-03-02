@@ -249,9 +249,18 @@ pub async fn start_server(
     session_manager: Arc<SessionManager>,
 ) -> Result<Server> {
     let port = find_available_port(&config).await?;
+    let bind_addr = format!("{}:{}", config.bind_address, port);
 
-    // Write port/pid files early so the bridge can discover us while we
-    // continue initializing MCP servers, embedding models, etc.
+    // Bind TCP listener immediately so the port is actually open before we
+    // advertise it via the port file. This prevents the bridge from getting
+    // "connection refused" while we do slow initialization.
+    let listener = TcpListener::bind(&bind_addr)
+        .await
+        .map_err(|e| DaemonError::InternalError(format!("Failed to bind: {}", e)))?;
+    info!("TCP listener bound on {}", bind_addr);
+
+    // Now write port/pid files — the port is genuinely listening, so the
+    // bridge can connect while we continue initializing below.
     if let Some(ref data_dir) = config.data_dir {
         let (port_name, pid_name) = if config.managed {
             ("daemon-managed.port", "daemon-managed.pid")
@@ -271,9 +280,7 @@ pub async fn start_server(
         );
     }
 
-    let addr = format!("{}:{}", config.bind_address, port);
-
-    info!("Starting daemon server on {}", addr);
+    info!("Starting daemon server on {}", bind_addr);
 
     // Load agent config for LLM settings
     let agent_config = match AgentConfig::load() {
@@ -689,13 +696,6 @@ pub async fn start_server(
     } else {
         warn!("Computer controller not available on this platform");
     }
-
-    let bind_addr = format!("{}:{}", config.bind_address, port);
-    let listener = TcpListener::bind(&bind_addr)
-        .await
-        .map_err(|e| DaemonError::InternalError(format!("Failed to bind: {}", e)))?;
-
-    info!("TCP listener bound on {}", bind_addr);
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let (msg_tx, mut msg_rx) = mpsc::channel::<(Vec<u8>, ProxyEnvelope)>(100);
