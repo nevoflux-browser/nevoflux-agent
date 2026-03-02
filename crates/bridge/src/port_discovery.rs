@@ -210,14 +210,16 @@ pub async fn launch_daemon(executable: &Path, config: &BridgeConfig) -> Result<u
 
     info!("Daemon launched with PID: {}", pid);
 
-    // Wait a bit for the daemon to start
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Wait for the daemon to start — it writes the port file early (right after
+    // port discovery), but on cold starts with model downloads this can still
+    // take several seconds.
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
-    // Verify port file was created
+    // Poll for port file
     let port_file = config.port_file_path();
     let mut attempts = 0;
-    while !port_file.exists() && attempts < 20 {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    while !port_file.exists() && attempts < 50 {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         attempts += 1;
     }
 

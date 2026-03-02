@@ -231,24 +231,6 @@ fn acquire_daemon_lock(managed: bool) -> std::io::Result<File> {
     Ok(file)
 }
 
-/// Write daemon port and PID files.
-///
-/// - `managed=false` (dev / manual start): writes `daemon.port` / `daemon.pid`
-/// - `managed=true` (proxy-spawned): writes `daemon-managed.port` / `daemon-managed.pid`
-fn write_daemon_files(port: u16, managed: bool) -> std::io::Result<()> {
-    let data_dir = get_data_dir();
-    let (port_name, pid_name) = if managed {
-        ("daemon-managed.port", "daemon-managed.pid")
-    } else {
-        ("daemon.port", "daemon.pid")
-    };
-
-    std::fs::write(data_dir.join(port_name), port.to_string())?;
-    std::fs::write(data_dir.join(pid_name), std::process::id().to_string())?;
-
-    Ok(())
-}
-
 /// Run in proxy mode (Native Messaging bridge).
 ///
 /// This bridges between the browser extension (via Native Messaging on stdin/stdout)
@@ -377,8 +359,14 @@ async fn run_daemon(
     port_end: Option<u16>,
     managed: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
-    logging::init_logging(verbose, None);
+    // Initialize logging — managed daemons write to a log file since the
+    // bridge launches them with stderr redirected to null.
+    let log_file = if managed {
+        Some(get_data_dir().join("daemon.log"))
+    } else {
+        None
+    };
+    logging::init_logging(verbose, log_file);
 
     let trace_enabled = trace
         || std::env::var("NEVOFLUX_TRACE")
@@ -413,10 +401,13 @@ async fn run_daemon(
             .expect("Failed to create session manager"),
     );
 
-    // Start server
+    // Start server — pass data_dir so port/pid files are written early
+    // (right after port discovery, before MCP/embedding init).
+    let data_dir = ensure_data_dir()?;
     let mut config = nevoflux_daemon::ServerConfig {
         trace_enabled,
         managed,
+        data_dir: Some(data_dir),
         ..Default::default()
     };
     if let Some(ps) = port_start {
@@ -429,9 +420,6 @@ async fn run_daemon(
 
     let server = nevoflux_daemon::start_server(config, router, session_manager).await?;
     let port = server.port();
-
-    // Write port/pid files (managed daemons use separate files)
-    write_daemon_files(port, managed)?;
 
     tracing::info!("Daemon started on port {} (managed={})", port, managed);
 

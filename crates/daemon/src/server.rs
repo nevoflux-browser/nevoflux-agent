@@ -62,6 +62,10 @@ pub struct ServerConfig {
     pub managed: bool,
     /// Idle timeout before self-termination (only used when `managed` is true).
     pub idle_timeout: std::time::Duration,
+    /// Data directory for writing port/pid files early during startup.
+    /// When set, port and pid files are written immediately after the port
+    /// is found, before MCP/embedding initialization completes.
+    pub data_dir: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -73,6 +77,7 @@ impl Default for ServerConfig {
             trace_enabled: false,
             managed: false,
             idle_timeout: std::time::Duration::from_secs(30),
+            data_dir: None,
         }
     }
 }
@@ -244,6 +249,28 @@ pub async fn start_server(
     session_manager: Arc<SessionManager>,
 ) -> Result<Server> {
     let port = find_available_port(&config).await?;
+
+    // Write port/pid files early so the bridge can discover us while we
+    // continue initializing MCP servers, embedding models, etc.
+    if let Some(ref data_dir) = config.data_dir {
+        let (port_name, pid_name) = if config.managed {
+            ("daemon-managed.port", "daemon-managed.pid")
+        } else {
+            ("daemon.port", "daemon.pid")
+        };
+        if let Err(e) = std::fs::write(data_dir.join(port_name), port.to_string()) {
+            error!("Failed to write port file: {}", e);
+        }
+        if let Err(e) = std::fs::write(data_dir.join(pid_name), std::process::id().to_string()) {
+            error!("Failed to write pid file: {}", e);
+        }
+        info!(
+            "Port file written early: {}/{}",
+            data_dir.display(),
+            port_name
+        );
+    }
+
     let addr = format!("{}:{}", config.bind_address, port);
 
     info!("Starting daemon server on {}", addr);
