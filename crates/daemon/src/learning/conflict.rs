@@ -280,6 +280,8 @@ mod tests {
             last_hit_at: None,
             promoted_at: None,
             embedding: None,
+            hot: false,
+            hot_summary: None,
         }
     }
 

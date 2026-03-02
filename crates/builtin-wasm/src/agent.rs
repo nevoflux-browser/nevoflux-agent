@@ -1413,6 +1413,18 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 self.host.memory_delete(id)?;
                 serde_json::json!({"id": id, "status": "deleted"}).to_string()
             }
+            "knowledge_teach" => {
+                let category = tool_call.arguments["category"]
+                    .as_str()
+                    .unwrap_or("user_preference");
+                let summary = tool_call.arguments["summary"].as_str().unwrap_or("");
+                let details = tool_call.arguments["details"].as_str().unwrap_or("");
+                let domain = tool_call.arguments.get("domain").and_then(|v| v.as_str());
+                let id = self
+                    .host
+                    .knowledge_teach(category, summary, details, domain)?;
+                serde_json::json!({"id": id, "status": "taught"}).to_string()
+            }
             "skill_load" => {
                 let name = tool_call.arguments["name"].as_str().unwrap_or("");
                 self.host.skill_load(name)?
@@ -2095,6 +2107,33 @@ The following skill instructions MUST be followed exactly. These instructions ta
                         }
                     },
                     "required": ["id"]
+                }),
+            },
+            ToolDefinition {
+                name: "knowledge_teach".into(),
+                description: "Store knowledge explicitly taught by the user. Use when the user asks you to remember, learn, or always do something a certain way.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "category": {
+                            "type": "string",
+                            "enum": ["user_preference", "site_interaction", "tool_optimization"],
+                            "description": "Knowledge category"
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "One-line summary of the knowledge"
+                        },
+                        "details": {
+                            "type": "string",
+                            "description": "Full details of the knowledge"
+                        },
+                        "domain": {
+                            "type": "string",
+                            "description": "Site domain if applicable (e.g., github.com)"
+                        }
+                    },
+                    "required": ["category", "summary", "details"]
                 }),
             },
             ToolDefinition {

@@ -664,6 +664,8 @@ mod tests {
             last_hit_at: Some(now),
             promoted_at: None,
             embedding: None,
+            hot: false,
+            hot_summary: None,
         }
     }
 
@@ -702,6 +704,8 @@ mod tests {
             last_hit_at: Some(timestamp),
             promoted_at: None,
             embedding: None,
+            hot: false,
+            hot_summary: None,
         }
     }
 

@@ -58,6 +58,12 @@ pub struct Knowledge {
     /// Optional embedding vector for semantic search.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f32>>,
+    /// Whether this entry is "hot" (included in system prompt Layer 1).
+    #[serde(default)]
+    pub hot: bool,
+    /// One-line summary used when injecting hot knowledge into system prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hot_summary: Option<String>,
 }
 
 /// Parameters for creating a new knowledge entry.

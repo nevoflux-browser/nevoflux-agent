@@ -13,9 +13,6 @@ use nevoflux_storage::{CreateKnowledgeParams, CreateLearningMetricParams, Storag
 use super::buffer::MemoryBuffer;
 use super::conflict::{detect_conflict_against, resolve_conflict, ConflictAction};
 use super::crypto::EncryptionService;
-use super::routing;
-use super::soul::manager::{SoulChange, SoulManager};
-use super::soul::protection::{self, ChangePermission};
 use super::types::LearningEntry;
 use crate::error::Result;
 
@@ -72,6 +69,12 @@ pub struct PromotionThresholds {
     pub tool_optimization: CategoryPromotionThresholds,
     /// Thresholds for `user_preference` entries.
     pub user_preference: CategoryPromotionThresholds,
+    /// Maximum number of hot entries per category (capacity limits).
+    pub hot_limit_site_interaction: usize,
+    /// Maximum number of hot entries for tool_optimization.
+    pub hot_limit_tool_optimization: usize,
+    /// Maximum number of hot entries for user_preference.
+    pub hot_limit_user_preference: usize,
 }
 
 impl Default for PromotionThresholds {
@@ -91,6 +94,9 @@ impl Default for PromotionThresholds {
                 min_hits: 5,
                 min_effectiveness: 0.5,
             },
+            hot_limit_site_interaction: 15,
+            hot_limit_tool_optimization: 10,
+            hot_limit_user_preference: 10,
         }
     }
 }
@@ -105,20 +111,27 @@ impl PromotionThresholds {
             _ => &self.site_interaction, // default fallback
         }
     }
+
+    /// Look up the hot-entry capacity limit for a given category.
+    fn hot_limit_for_category(&self, category: &str) -> usize {
+        match category {
+            "site_interaction" | "siteinteraction" => self.hot_limit_site_interaction,
+            "tool_optimization" | "tooloptimization" => self.hot_limit_tool_optimization,
+            "user_preference" | "userpreference" => self.hot_limit_user_preference,
+            _ => self.hot_limit_site_interaction,
+        }
+    }
 }
 
 /// Result of a promotion run, reporting how many entries were promoted vs skipped.
 #[derive(Debug, Clone, Default)]
 pub struct PromotionResult {
-    /// Number of entries successfully promoted to soul documents.
+    /// Number of entries successfully marked as hot.
     pub promoted: usize,
-    /// Number of entries skipped because their protection level requires
-    /// user confirmation (RequireConfirm / RequireDoubleConfirm / Forbidden).
-    pub skipped_protection: usize,
     /// Number of entries skipped because they did not meet the promotion
     /// thresholds (e.g., confidence too low).
     pub skipped_threshold: usize,
-    /// Number of entries that failed during the apply_change step.
+    /// Number of entries that failed during the mark_hot step.
     pub failed: usize,
 }
 
@@ -404,23 +417,16 @@ impl LearningPipeline {
         Ok(validated_count)
     }
 
-    /// Promote validated knowledge entries into soul Markdown documents.
+    /// Promote validated knowledge entries by marking them as "hot".
     ///
-    /// For each validated entry:
-    /// 1. Determines the target document and section via `route_knowledge()`.
-    ///    If the entry already has `promotion_target` set, it is preferred.
-    /// 2. Checks the protection level via `check_permission()`.
-    /// 3. Only auto-promotes entries with `AutoWithNotify` permission; entries
-    ///    with stricter protections are skipped.
-    /// 4. Builds a `SoulChange` and calls `SoulManager::apply_change()`.
-    /// 5. Marks the entry as "promoted" in SQLite with a `promoted_at` timestamp.
+    /// For each validated entry that meets category-specific thresholds:
+    /// 1. Checks confidence, hit count, and age thresholds.
+    /// 2. Generates a one-line hot_summary.
+    /// 3. Calls `mark_hot()` in SQLite (sets hot=1, status='promoted').
+    /// 4. Enforces per-category capacity limits by unmarking excess entries.
     ///
     /// Returns a `PromotionResult` with counts of promoted/skipped entries.
-    pub async fn promote(
-        &self,
-        thresholds: &PromotionThresholds,
-        soul_manager: &mut SoulManager,
-    ) -> Result<PromotionResult> {
+    pub async fn promote(&self, thresholds: &PromotionThresholds) -> Result<PromotionResult> {
         if !self.is_enabled() {
             return Ok(PromotionResult::default());
         }
@@ -432,6 +438,11 @@ impl LearningPipeline {
         let mut result = PromotionResult::default();
 
         for entry in &validated {
+            // Skip entries that are already hot (idempotent)
+            if entry.hot {
+                continue;
+            }
+
             // Look up category-specific thresholds
             let cat_thresholds = thresholds.for_category(&entry.category);
 
@@ -458,131 +469,77 @@ impl LearningPipeline {
                 }
             }
 
-            // Determine target document and section
-            let route = routing::route_knowledge(entry);
-
-            // Idempotency: skip if this entry's ID is already referenced in the
-            // target section (prevents duplicate content if mark_promoted failed
-            // on a previous run).
-            if Self::is_already_promoted(soul_manager, &entry.id, &route) {
-                // Silently mark as promoted so it won't be re-processed.
-                let _ = self
-                    .storage
-                    .knowledge()
-                    .mark_promoted(&entry.id, &route.section);
-                continue;
-            }
-
-            // Manual-edit priority: skip system promotion to sections that
-            // have been manually edited by the user.
-            if soul_manager.is_manual_section(&route.target_file, &route.section) {
-                tracing::info!(
-                    entry_id = %entry.id,
-                    target = %route.target_file,
-                    section = %route.section,
-                    "Skipping promotion: section has manual edits (manual always wins)"
-                );
-                result.skipped_protection += 1;
-                continue;
-            }
-
-            // Check protection level — only auto-promote AutoWithNotify
-            let permission = protection::check_permission(&route.target_file, &route.section);
-            if permission != ChangePermission::AutoWithNotify {
-                result.skipped_protection += 1;
-                continue;
-            }
-
-            // Build the SoulChange — include entry ID for idempotency tracking
-            let content = if let Some(ref resolution) = entry.resolution {
+            // Build hot_summary: a concise one-liner for system prompt injection
+            let domain_tag = entry.domain.as_deref().unwrap_or("universal");
+            let hot_summary = if let Some(ref resolution) = entry.resolution {
                 format!(
-                    "- **{}** ({}): {} — {} <!-- {} -->",
-                    entry.summary,
-                    entry.domain.as_deref().unwrap_or("universal"),
-                    entry.details,
-                    resolution,
-                    entry.id,
+                    "[{}] {} — {}",
+                    domain_tag, entry.summary, resolution
                 )
             } else {
-                format!(
-                    "- **{}** ({}): {} <!-- {} -->",
-                    entry.summary,
-                    entry.domain.as_deref().unwrap_or("universal"),
-                    entry.details,
-                    entry.id,
-                )
+                format!("[{}] {}", domain_tag, entry.summary)
             };
 
-            let change = SoulChange {
-                target_file: route.target_file.clone(),
-                section: route.section.clone(),
-                change_type: "add".to_string(),
-                new_content: content,
-                reason: format!("Auto-promoted from knowledge entry {}", entry.id),
-                source_type: "system".to_string(),
-                confidence: entry.confidence,
-            };
-
-            // Apply the change to the soul document
-            match soul_manager.apply_change(change).await {
-                Ok(()) => {
-                    // Mark as promoted in SQLite — don't abort the batch on failure
-                    match self
-                        .storage
-                        .knowledge()
-                        .mark_promoted(&entry.id, &route.section)
-                    {
-                        Ok(()) => result.promoted += 1,
-                        Err(e) => {
-                            tracing::warn!(
-                                entry_id = %entry.id,
-                                error = %e,
-                                "soul write succeeded but failed to mark as promoted in SQLite"
-                            );
-                            result.failed += 1;
-                        }
-                    }
-                }
+            // Mark as hot in SQLite
+            match self.storage.knowledge().mark_hot(&entry.id, &hot_summary) {
+                Ok(()) => result.promoted += 1,
                 Err(e) => {
                     tracing::warn!(
                         entry_id = %entry.id,
                         error = %e,
-                        "failed to promote knowledge entry"
+                        "failed to mark knowledge entry as hot"
                     );
                     result.failed += 1;
                 }
             }
         }
 
+        // Enforce per-category hot limits
+        for category in &["site_interaction", "tool_optimization", "user_preference"] {
+            if let Err(e) = self.enforce_hot_limits(category, thresholds) {
+                tracing::warn!(
+                    category = category,
+                    error = %e,
+                    "failed to enforce hot limits for category"
+                );
+            }
+        }
+
         let metadata = format!(
-            "promoted={},skipped_protection={},skipped_threshold={},failed={}",
-            result.promoted, result.skipped_protection, result.skipped_threshold, result.failed
+            "promoted={},skipped_threshold={},failed={}",
+            result.promoted, result.skipped_threshold, result.failed
         );
         self.record_metric("promotion", result.promoted as f64, Some(&metadata));
 
         Ok(result)
     }
 
-    /// Check if a knowledge entry has already been promoted to the target
-    /// soul document section.
+    /// Enforce the maximum number of hot entries for a category.
     ///
-    /// Looks for the entry's ID in the raw document content of the target
-    /// file's section. This prevents duplicate content when `mark_promoted`
-    /// fails after a successful `apply_change`.
-    fn is_already_promoted(
-        soul_manager: &SoulManager,
-        entry_id: &str,
-        route: &routing::RouteTarget,
-    ) -> bool {
-        let doc_content = match route.target_file.as_str() {
-            "IDENTITY.md" => &soul_manager.cache().identity_raw,
-            "SOUL.md" => &soul_manager.cache().soul_raw,
-            "USER.md" => &soul_manager.cache().user_raw,
-            "TOOLS.md" => &soul_manager.cache().tools_raw,
-            "AGENTS.md" => &soul_manager.cache().agents_raw,
-            _ => return false,
-        };
-        doc_content.contains(entry_id)
+    /// When the number of hot entries exceeds the limit, the entries with the
+    /// lowest `confidence` are unmarked (hot=0). This keeps the system prompt
+    /// from growing unboundedly.
+    fn enforce_hot_limits(&self, category: &str, thresholds: &PromotionThresholds) -> Result<()> {
+        let limit = thresholds.hot_limit_for_category(category);
+        let hot_entries = self.storage.knowledge().list_hot_by_category(category)?;
+
+        if hot_entries.len() <= limit {
+            return Ok(());
+        }
+
+        // hot_entries are already sorted by confidence DESC from the query.
+        // Unmark entries beyond the limit (i.e., the lowest-confidence ones).
+        for entry in &hot_entries[limit..] {
+            tracing::debug!(
+                entry_id = %entry.id,
+                category = category,
+                confidence = entry.confidence,
+                "Unmarking hot entry (over capacity limit)"
+            );
+            self.storage.knowledge().unmark_hot(&entry.id)?;
+        }
+
+        Ok(())
     }
 
     /// Resurrect an archived knowledge entry when it receives a new hit.
@@ -643,6 +600,9 @@ mod tests {
             site_interaction: relaxed.clone(),
             tool_optimization: relaxed.clone(),
             user_preference: relaxed,
+            hot_limit_site_interaction: 15,
+            hot_limit_tool_optimization: 10,
+            hot_limit_user_preference: 10,
         }
     }
 
@@ -1225,7 +1185,6 @@ mod tests {
     fn promotion_result_default_is_zero() {
         let result = PromotionResult::default();
         assert_eq!(result.promoted, 0);
-        assert_eq!(result.skipped_protection, 0);
         assert_eq!(result.skipped_threshold, 0);
         assert_eq!(result.failed, 0);
     }
@@ -1267,13 +1226,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn promote_writes_to_tools_md() {
+    async fn promote_marks_entry_as_hot() {
         let (pipeline, storage) = setup();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let soul_dir = tmp.path().join("soul");
-        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
 
-        // Create a validated site_interaction entry → TOOLS.md / Site Adaptation Graph
+        // Create a validated site_interaction entry
         let entry = create_validated_entry(
             &storage,
             "site_interaction",
@@ -1285,37 +1241,24 @@ mod tests {
 
         let thresholds = test_promotion_thresholds(10);
 
-        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        let result = pipeline.promote(&thresholds).await.unwrap();
         assert_eq!(result.promoted, 1);
-        assert_eq!(result.skipped_protection, 0);
         assert_eq!(result.skipped_threshold, 0);
         assert_eq!(result.failed, 0);
 
-        // Verify the entry is now "promoted" in SQLite
+        // Verify the entry is now "promoted" and hot in SQLite
         let updated = storage.knowledge().get(&entry.id).unwrap().unwrap();
         assert_eq!(updated.status, "promoted");
         assert!(updated.promoted_at.is_some());
-        assert_eq!(
-            updated.promoted_section,
-            Some("Site Adaptation Graph".to_string())
-        );
-
-        // Verify content was written to TOOLS.md
-        let content = tokio::fs::read_to_string(soul_dir.join("TOOLS.md"))
-            .await
-            .unwrap();
-        assert!(content.contains("GitHub uses data-testid selectors"));
-        assert!(content.contains("github.com"));
+        assert!(updated.hot);
+        assert!(updated.hot_summary.is_some());
+        assert!(updated.hot_summary.unwrap().contains("github.com"));
     }
 
     #[tokio::test]
-    async fn promote_writes_user_preference_to_user_md() {
+    async fn promote_marks_user_preference_as_hot() {
         let (pipeline, storage) = setup();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let soul_dir = tmp.path().join("soul");
-        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
 
-        // user_preference / language → USER.md / Communication Overrides
         create_validated_entry(
             &storage,
             "user_preference",
@@ -1326,21 +1269,18 @@ mod tests {
         );
 
         let thresholds = test_promotion_thresholds(10);
-        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        let result = pipeline.promote(&thresholds).await.unwrap();
         assert_eq!(result.promoted, 1);
 
-        let content = tokio::fs::read_to_string(soul_dir.join("USER.md"))
-            .await
-            .unwrap();
-        assert!(content.contains("User prefers concise replies"));
+        // Verify hot entry exists
+        let hot = storage.knowledge().list_hot().unwrap();
+        assert_eq!(hot.len(), 1);
+        assert!(hot[0].hot_summary.as_ref().unwrap().contains("User prefers concise replies"));
     }
 
     #[tokio::test]
     async fn promote_skips_low_confidence_entries() {
         let (pipeline, storage) = setup();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let soul_dir = tmp.path().join("soul");
-        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
 
         // Entry with low confidence (0.3 < 0.6 threshold)
         create_validated_entry(
@@ -1356,63 +1296,18 @@ mod tests {
         let mut thresholds = test_promotion_thresholds(10);
         thresholds.site_interaction.min_effectiveness = 0.6;
 
-        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        let result = pipeline.promote(&thresholds).await.unwrap();
         assert_eq!(result.promoted, 0);
         assert_eq!(result.skipped_threshold, 1);
     }
 
     #[tokio::test]
-    async fn promote_skips_protected_sections() {
-        let (pipeline, storage) = setup();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let soul_dir = tmp.path().join("soul");
-        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
-
-        // Create a validated entry that routes to a protected file
-        // We'll set promotion_target to IDENTITY.md (RequireDoubleConfirm)
-        let created = storage
-            .knowledge()
-            .create(CreateKnowledgeParams {
-                category: "site_interaction".into(),
-                summary: "should be skipped".into(),
-                details: "details".into(),
-                promotion_target: Some("IDENTITY".into()),
-                ..Default::default()
-            })
-            .unwrap();
-
-        storage
-            .database()
-            .with_connection(|conn| {
-                conn.execute(
-                    "UPDATE knowledge SET confidence = 0.9, status = 'validated' WHERE id = ?1",
-                    params![created.id],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-
-        let thresholds = test_promotion_thresholds(10);
-        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
-        assert_eq!(result.promoted, 0);
-        assert_eq!(result.skipped_protection, 1);
-
-        // Entry should still be validated, not promoted
-        let entry = storage.knowledge().get(&created.id).unwrap().unwrap();
-        assert_eq!(entry.status, "validated");
-    }
-
-    #[tokio::test]
     async fn promote_no_validated_entries_returns_empty_result() {
         let (pipeline, _storage) = setup();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let soul_dir = tmp.path().join("soul");
-        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
 
         let thresholds = PromotionThresholds::default();
-        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        let result = pipeline.promote(&thresholds).await.unwrap();
         assert_eq!(result.promoted, 0);
-        assert_eq!(result.skipped_protection, 0);
         assert_eq!(result.skipped_threshold, 0);
         assert_eq!(result.failed, 0);
     }
@@ -1420,9 +1315,6 @@ mod tests {
     #[tokio::test]
     async fn promote_multiple_entries_in_one_batch() {
         let (pipeline, storage) = setup();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let soul_dir = tmp.path().join("soul");
-        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
 
         // Create 3 validated entries with different categories
         create_validated_entry(
@@ -1452,29 +1344,17 @@ mod tests {
 
         let thresholds = test_promotion_thresholds(10);
 
-        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        let result = pipeline.promote(&thresholds).await.unwrap();
         assert_eq!(result.promoted, 3);
 
-        // Verify TOOLS.md got updated
-        let tools = tokio::fs::read_to_string(soul_dir.join("TOOLS.md"))
-            .await
-            .unwrap();
-        assert!(tools.contains("Site uses react"));
-        assert!(tools.contains("Increase timeout to 60s"));
-
-        // Verify USER.md got updated
-        let user = tokio::fs::read_to_string(soul_dir.join("USER.md"))
-            .await
-            .unwrap();
-        assert!(user.contains("User works in fintech"));
+        // All 3 should be hot
+        let hot = storage.knowledge().list_hot().unwrap();
+        assert_eq!(hot.len(), 3);
     }
 
     #[tokio::test]
     async fn promote_respects_batch_size_limit() {
         let (pipeline, storage) = setup();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let soul_dir = tmp.path().join("soul");
-        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
 
         // Create 5 validated entries
         for i in 0..5 {
@@ -1491,7 +1371,7 @@ mod tests {
         // batch_size of 2 should only process 2
         let thresholds = test_promotion_thresholds(2);
 
-        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        let result = pipeline.promote(&thresholds).await.unwrap();
         assert_eq!(result.promoted, 2);
 
         // 3 entries should still be validated
@@ -1500,53 +1380,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn promote_entry_with_existing_promotion_target_preferred() {
-        let (pipeline, storage) = setup();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let soul_dir = tmp.path().join("soul");
-        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
-
-        // Create an entry with promotion_target already set to TOOLS
-        let created = storage
-            .knowledge()
-            .create(CreateKnowledgeParams {
-                category: "tool_optimization".into(),
-                subcategory: Some("timeout".into()),
-                summary: "Custom routed entry".into(),
-                details: "details".into(),
-                promotion_target: Some("TOOLS".into()),
-                ..Default::default()
-            })
-            .unwrap();
-
-        storage
-            .database()
-            .with_connection(|conn| {
-                conn.execute(
-                    "UPDATE knowledge SET confidence = 0.9, status = 'validated' WHERE id = ?1",
-                    params![created.id],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-
-        let thresholds = test_promotion_thresholds(10);
-        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
-        assert_eq!(result.promoted, 1);
-
-        // Should have been written to TOOLS.md, not USER.md
-        let tools = tokio::fs::read_to_string(soul_dir.join("TOOLS.md"))
-            .await
-            .unwrap();
-        assert!(tools.contains("Custom routed entry"));
-    }
-
-    #[tokio::test]
     async fn promote_end_to_end_flush_validate_promote() {
         let (pipeline, storage) = setup();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let soul_dir = tmp.path().join("soul");
-        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
 
         // Step 1: Insert entry into buffer and flush to SQLite
         pipeline.buffer().insert(
@@ -1588,23 +1423,51 @@ mod tests {
         let validated_count = pipeline.validate(&val_thresholds).unwrap();
         assert_eq!(validated_count, 1);
 
-        // Step 3: Promote
+        // Step 3: Promote (mark as hot)
         let promo_thresholds = test_promotion_thresholds(10);
-        let result = pipeline
-            .promote(&promo_thresholds, &mut manager)
-            .await
-            .unwrap();
+        let result = pipeline.promote(&promo_thresholds).await.unwrap();
         assert_eq!(result.promoted, 1);
 
         // Verify the full pipeline result
         let entry = storage.knowledge().get(&pending[0].id).unwrap().unwrap();
         assert_eq!(entry.status, "promoted");
         assert!(entry.promoted_at.is_some());
+        assert!(entry.hot);
+    }
 
-        let tools = tokio::fs::read_to_string(soul_dir.join("TOOLS.md"))
-            .await
+    #[tokio::test]
+    async fn promote_enforces_hot_limits() {
+        let (pipeline, storage) = setup();
+
+        // Create 5 validated entries in site_interaction
+        for i in 0..5 {
+            create_validated_entry(
+                &storage,
+                "site_interaction",
+                None,
+                Some(&format!("site{}.com", i)),
+                &format!("Entry {}", i),
+                0.5 + (i as f64) * 0.1, // 0.5, 0.6, 0.7, 0.8, 0.9
+            );
+        }
+
+        // Set hot limit to 3 for site_interaction
+        let mut thresholds = test_promotion_thresholds(10);
+        thresholds.hot_limit_site_interaction = 3;
+
+        let result = pipeline.promote(&thresholds).await.unwrap();
+        assert_eq!(result.promoted, 5);
+
+        // After enforcement, only 3 should remain hot (highest confidence)
+        let hot = storage
+            .knowledge()
+            .list_hot_by_category("site_interaction")
             .unwrap();
-        assert!(tools.contains("example.com uses semantic selectors"));
+        assert_eq!(hot.len(), 3);
+
+        // The top 3 by confidence should be kept
+        let confidences: Vec<f64> = hot.iter().map(|e| e.confidence).collect();
+        assert!(confidences.iter().all(|&c| c >= 0.7));
     }
 
     // --- Flush deduplication tests ---
@@ -1912,9 +1775,6 @@ mod tests {
     #[tokio::test]
     async fn promote_records_metric() {
         let (pipeline, storage) = setup();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let soul_dir = tmp.path().join("soul");
-        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
 
         create_validated_entry(
             &storage,
@@ -1927,7 +1787,7 @@ mod tests {
 
         let thresholds = test_promotion_thresholds(10);
 
-        pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        pipeline.promote(&thresholds).await.unwrap();
 
         let metrics = storage
             .learning_metrics()
@@ -1940,9 +1800,6 @@ mod tests {
     #[tokio::test]
     async fn promote_records_metric_with_skipped_counts() {
         let (pipeline, storage) = setup();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let soul_dir = tmp.path().join("soul");
-        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
 
         // One entry that will be skipped due to low confidence
         create_validated_entry(
@@ -1958,7 +1815,7 @@ mod tests {
         let mut thresholds = test_promotion_thresholds(10);
         thresholds.site_interaction.min_effectiveness = 0.6;
 
-        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        let result = pipeline.promote(&thresholds).await.unwrap();
         assert_eq!(result.skipped_threshold, 1);
 
         let metrics = storage
@@ -2129,9 +1986,6 @@ mod tests {
     #[tokio::test]
     async fn promote_returns_default_when_paused() {
         let (pipeline, storage) = setup();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let soul_dir = tmp.path().join("soul");
-        let mut manager = SoulManager::init(&soul_dir).await.unwrap();
 
         // Create a validated entry that would normally be promoted
         create_validated_entry(
@@ -2147,9 +2001,8 @@ mod tests {
         pipeline.pause();
 
         let thresholds = PromotionThresholds::default();
-        let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
+        let result = pipeline.promote(&thresholds).await.unwrap();
         assert_eq!(result.promoted, 0);
-        assert_eq!(result.skipped_protection, 0);
         assert_eq!(result.skipped_threshold, 0);
         assert_eq!(result.failed, 0);
 

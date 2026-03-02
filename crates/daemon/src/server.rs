@@ -504,7 +504,6 @@ pub async fn start_server(
             CategoryPromotionThresholds, LearningPipeline, PromotionThresholds,
             ValidationThresholds,
         };
-        use crate::learning::soul::manager::SoulManager as PipelineSoulManager;
         use crate::learning::sources::{
             MemoryChunkPreferenceSource, SiteAdaptationSource, ToolTraceLearningSource,
         };
@@ -557,9 +556,12 @@ pub async fn start_server(
                 min_hits: learning_config.promotion.user_preference_min_hits,
                 min_effectiveness: 0.5,
             },
+            hot_limit_site_interaction: 15,
+            hot_limit_tool_optimization: 10,
+            hot_limit_user_preference: 10,
         };
 
-        let soul_dir = learning_config
+        let _soul_dir = learning_config
             .soul_dir
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -611,25 +613,15 @@ pub async fn start_server(
                     std::sync::atomic::AtomicU64::new(0);
                 let count = PROMOTE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if count.is_multiple_of(10) {
-                    match PipelineSoulManager::load(&soul_dir).await {
-                        Ok(mut sm) => {
-                            match pipeline_clone.promote(&promotion_thresholds, &mut sm).await {
-                                Ok(result) if result.promoted > 0 => {
-                                    info!(
-                                        "Learning pipeline promoted {} entries (skipped: protection={}, threshold={})",
-                                        result.promoted, result.skipped_protection, result.skipped_threshold
-                                    );
-                                }
-                                Err(e) => warn!("Learning pipeline promote error: {}", e),
-                                _ => {}
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Learning pipeline: failed to load soul manager for promotion: {}",
-                                e
+                    match pipeline_clone.promote(&promotion_thresholds).await {
+                        Ok(result) if result.promoted > 0 => {
+                            info!(
+                                "Learning pipeline promoted {} entries (skipped: threshold={})",
+                                result.promoted, result.skipped_threshold
                             );
                         }
+                        Err(e) => warn!("Learning pipeline promote error: {}", e),
+                        _ => {}
                     }
                 }
             }
@@ -1152,7 +1144,8 @@ async fn backfill_embeddings(
     }
 }
 
-/// Build soul context string from the knowledge retriever's soul cache.
+/// Build soul context string from the knowledge retriever's soul cache,
+/// plus hot knowledge entries from SQLite (Layer 1).
 ///
 /// Returns `None` if no retriever is available or all soul documents are empty.
 fn build_soul_context(services: &HostServices) -> Option<String> {
@@ -1176,10 +1169,63 @@ fn build_soul_context(services: &HostServices) -> Option<String> {
         sections.push(cache.agents_raw.trim().to_string());
     }
 
+    // Layer 1: inject hot knowledge entries from SQLite
+    let hot_section = build_hot_knowledge_section(&services.database);
+    if let Some(hot) = hot_section {
+        sections.push(hot);
+    }
+
     if sections.is_empty() {
         return None;
     }
     Some(sections.join("\n\n"))
+}
+
+/// Build a markdown section from hot knowledge entries, grouped by category.
+///
+/// Returns `None` if there are no hot entries.
+fn build_hot_knowledge_section(database: &nevoflux_storage::Database) -> Option<String> {
+    let repo = nevoflux_storage::KnowledgeRepository::new(database);
+    let hot_entries = repo.list_hot().ok()?;
+
+    if hot_entries.is_empty() {
+        return None;
+    }
+
+    let mut site_lines = Vec::new();
+    let mut tool_lines = Vec::new();
+    let mut pref_lines = Vec::new();
+
+    for entry in &hot_entries {
+        let line = entry
+            .hot_summary
+            .as_deref()
+            .unwrap_or(&entry.summary);
+        match entry.category.as_str() {
+            "site_interaction" | "siteinteraction" => site_lines.push(format!("- {}", line)),
+            "tool_optimization" | "tooloptimization" => tool_lines.push(format!("- {}", line)),
+            "user_preference" | "userpreference" => pref_lines.push(format!("- {}", line)),
+            _ => site_lines.push(format!("- {}", line)),
+        }
+    }
+
+    let mut parts = Vec::new();
+    parts.push("## Learned Knowledge (auto-updated)".to_string());
+
+    if !site_lines.is_empty() {
+        parts.push("### Site Interactions".to_string());
+        parts.extend(site_lines);
+    }
+    if !tool_lines.is_empty() {
+        parts.push("### Tool Optimizations".to_string());
+        parts.extend(tool_lines);
+    }
+    if !pref_lines.is_empty() {
+        parts.push("### User Preferences".to_string());
+        parts.extend(pref_lines);
+    }
+
+    Some(parts.join("\n"))
 }
 
 /// Convert storage messages to wasm messages for the agent history.

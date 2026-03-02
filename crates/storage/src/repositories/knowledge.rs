@@ -73,7 +73,7 @@ impl<'a> KnowledgeRepository<'a> {
                         effectiveness, priority, status, source_ids, related_ids, tags,
                         privacy_level, promotion_target, promoted_section,
                         source_type, created_at, updated_at, last_hit_at, promoted_at,
-                        embedding
+                        embedding, hot, hot_summary
                  FROM knowledge WHERE id = ?1",
                 params![id],
                 row_to_knowledge,
@@ -91,7 +91,7 @@ impl<'a> KnowledgeRepository<'a> {
                             effectiveness, priority, status, source_ids, related_ids, tags,
                             privacy_level, promotion_target, promoted_section,
                             source_type, created_at, updated_at, last_hit_at, promoted_at,
-                            embedding
+                            embedding, hot, hot_summary
                      FROM knowledge WHERE id = ?1",
                     params![id],
                     row_to_knowledge,
@@ -135,7 +135,7 @@ impl<'a> KnowledgeRepository<'a> {
                         effectiveness, priority, status, source_ids, related_ids, tags,
                         privacy_level, promotion_target, promoted_section,
                         source_type, created_at, updated_at, last_hit_at, promoted_at,
-                        embedding
+                        embedding, hot, hot_summary
                  FROM knowledge WHERE domain = ?1
                  ORDER BY confidence DESC, updated_at DESC
                  LIMIT ?2",
@@ -160,7 +160,7 @@ impl<'a> KnowledgeRepository<'a> {
                         effectiveness, priority, status, source_ids, related_ids, tags,
                         privacy_level, promotion_target, promoted_section,
                         source_type, created_at, updated_at, last_hit_at, promoted_at,
-                        embedding
+                        embedding, hot, hot_summary
                  FROM knowledge WHERE status = 'pending'
                  ORDER BY created_at ASC
                  LIMIT ?1",
@@ -185,7 +185,7 @@ impl<'a> KnowledgeRepository<'a> {
                         effectiveness, priority, status, source_ids, related_ids, tags,
                         privacy_level, promotion_target, promoted_section,
                         source_type, created_at, updated_at, last_hit_at, promoted_at,
-                        embedding
+                        embedding, hot, hot_summary
                  FROM knowledge WHERE status = 'validated'
                  ORDER BY created_at ASC
                  LIMIT ?1",
@@ -264,7 +264,7 @@ impl<'a> KnowledgeRepository<'a> {
                         effectiveness, priority, status, source_ids, related_ids, tags,
                         privacy_level, promotion_target, promoted_section,
                         source_type, created_at, updated_at, last_hit_at, promoted_at,
-                        embedding
+                        embedding, hot, hot_summary
                  FROM knowledge
                  ORDER BY created_at DESC
                  LIMIT ?1",
@@ -294,7 +294,7 @@ impl<'a> KnowledgeRepository<'a> {
                                 effectiveness, priority, status, source_ids, related_ids, tags,
                                 privacy_level, promotion_target, promoted_section,
                                 source_type, created_at, updated_at, last_hit_at, promoted_at,
-                                embedding
+                                embedding, hot, hot_summary
                          FROM knowledge
                          WHERE category = ?1 AND domain = ?2 AND summary = ?3
                          LIMIT 1",
@@ -309,7 +309,7 @@ impl<'a> KnowledgeRepository<'a> {
                                 effectiveness, priority, status, source_ids, related_ids, tags,
                                 privacy_level, promotion_target, promoted_section,
                                 source_type, created_at, updated_at, last_hit_at, promoted_at,
-                                embedding
+                                embedding, hot, hot_summary
                          FROM knowledge
                          WHERE category = ?1 AND domain IS NULL AND summary = ?2
                          LIMIT 1",
@@ -371,7 +371,7 @@ impl<'a> KnowledgeRepository<'a> {
                             effectiveness, priority, status, source_ids, related_ids, tags,
                             privacy_level, promotion_target, promoted_section,
                             source_type, created_at, updated_at, last_hit_at, promoted_at,
-                            embedding
+                            embedding, hot, hot_summary
                      FROM knowledge
                      WHERE category = ?1 AND (domain = ?2 OR domain IS NULL)
                      ORDER BY confidence DESC
@@ -389,7 +389,7 @@ impl<'a> KnowledgeRepository<'a> {
                             effectiveness, priority, status, source_ids, related_ids, tags,
                             privacy_level, promotion_target, promoted_section,
                             source_type, created_at, updated_at, last_hit_at, promoted_at,
-                            embedding
+                            embedding, hot, hot_summary
                      FROM knowledge
                      WHERE category = ?1 AND domain IS NULL
                      ORDER BY confidence DESC
@@ -413,7 +413,7 @@ impl<'a> KnowledgeRepository<'a> {
                         effectiveness, priority, status, source_ids, related_ids, tags,
                         privacy_level, promotion_target, promoted_section,
                         source_type, created_at, updated_at, last_hit_at, promoted_at,
-                        embedding
+                        embedding, hot, hot_summary
                  FROM knowledge WHERE embedding IS NULL
                  ORDER BY created_at ASC
                  LIMIT ?1",
@@ -449,6 +449,109 @@ impl<'a> KnowledgeRepository<'a> {
         })
     }
 
+    /// Mark a knowledge entry as hot (included in system prompt Layer 1).
+    ///
+    /// Sets `hot = 1`, stores the one-line `hot_summary`, and updates the
+    /// status to "promoted".
+    pub fn mark_hot(&self, id: &str, hot_summary: &str) -> Result<()> {
+        let now = rfc3339_now();
+
+        self.db.with_connection(|conn| {
+            let rows_affected = conn.execute(
+                "UPDATE knowledge SET hot = 1, hot_summary = ?1, status = 'promoted', promoted_at = ?2, updated_at = ?3 WHERE id = ?4",
+                params![hot_summary, now, now, id],
+            )?;
+
+            if rows_affected == 0 {
+                return Err(crate::error::StorageError::NotFound {
+                    entity: "knowledge".to_string(),
+                    id: id.to_string(),
+                });
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Remove the hot flag from a knowledge entry.
+    ///
+    /// Sets `hot = 0` and clears `hot_summary`.
+    pub fn unmark_hot(&self, id: &str) -> Result<()> {
+        let now = rfc3339_now();
+
+        self.db.with_connection(|conn| {
+            let rows_affected = conn.execute(
+                "UPDATE knowledge SET hot = 0, hot_summary = NULL, updated_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+
+            if rows_affected == 0 {
+                return Err(crate::error::StorageError::NotFound {
+                    entity: "knowledge".to_string(),
+                    id: id.to_string(),
+                });
+            }
+
+            Ok(())
+        })
+    }
+
+    /// List all hot knowledge entries, ordered by confidence descending.
+    pub fn list_hot(&self) -> Result<Vec<Knowledge>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, category, subcategory, domain, summary, details,
+                        resolution, confidence, hit_count, success_count, fail_count,
+                        effectiveness, priority, status, source_ids, related_ids, tags,
+                        privacy_level, promotion_target, promoted_section,
+                        source_type, created_at, updated_at, last_hit_at, promoted_at,
+                        embedding, hot, hot_summary
+                 FROM knowledge WHERE hot = 1
+                 ORDER BY confidence DESC",
+            )?;
+
+            let rows = stmt
+                .query_map([], row_to_knowledge)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            Ok(rows)
+        })
+    }
+
+    /// List hot knowledge entries filtered by category.
+    pub fn list_hot_by_category(&self, category: &str) -> Result<Vec<Knowledge>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, category, subcategory, domain, summary, details,
+                        resolution, confidence, hit_count, success_count, fail_count,
+                        effectiveness, priority, status, source_ids, related_ids, tags,
+                        privacy_level, promotion_target, promoted_section,
+                        source_type, created_at, updated_at, last_hit_at, promoted_at,
+                        embedding, hot, hot_summary
+                 FROM knowledge WHERE hot = 1 AND category = ?1
+                 ORDER BY confidence DESC",
+            )?;
+
+            let rows = stmt
+                .query_map(params![category], row_to_knowledge)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            Ok(rows)
+        })
+    }
+
+    /// Count hot knowledge entries for a given category.
+    pub fn count_hot_by_category(&self, category: &str) -> Result<usize> {
+        self.db.with_connection(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM knowledge WHERE hot = 1 AND category = ?1",
+                params![category],
+                |row| row.get(0),
+            )?;
+            Ok(count as usize)
+        })
+    }
+
     /// Delete all knowledge entries.
     ///
     /// Returns the number of deleted rows.
@@ -476,6 +579,7 @@ fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
 fn row_to_knowledge(row: &Row<'_>) -> rusqlite::Result<Knowledge> {
     let embedding_blob: Option<Vec<u8>> = row.get(25)?;
     let embedding = embedding_blob.map(|blob| blob_to_embedding(&blob));
+    let hot_int: i64 = row.get(26)?;
 
     Ok(Knowledge {
         id: row.get(0)?,
@@ -504,6 +608,8 @@ fn row_to_knowledge(row: &Row<'_>) -> rusqlite::Result<Knowledge> {
         last_hit_at: row.get(23)?,
         promoted_at: row.get(24)?,
         embedding,
+        hot: hot_int != 0,
+        hot_summary: row.get(27)?,
     })
 }
 

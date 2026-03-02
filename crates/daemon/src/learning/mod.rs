@@ -6,7 +6,6 @@ pub mod decay;
 pub mod export;
 pub mod pipeline;
 pub mod retriever;
-pub mod routing;
 pub mod soul;
 pub mod source;
 pub mod sources;

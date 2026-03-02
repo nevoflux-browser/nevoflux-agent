@@ -64,6 +64,22 @@ pub trait HostFunctions {
     fn memory_delete(&self, id: &str) -> HostResult<()>;
 
     // =========================================================================
+    // Knowledge Functions
+    // =========================================================================
+
+    /// Teach/record knowledge explicitly provided by the user.
+    ///
+    /// Creates a validated, hot knowledge entry that is immediately included
+    /// in the system prompt's Layer 1 (learned knowledge).
+    fn knowledge_teach(
+        &self,
+        category: &str,
+        summary: &str,
+        details: &str,
+        domain: Option<&str>,
+    ) -> HostResult<String>;
+
+    // =========================================================================
     // Skills Functions
     // =========================================================================
 
@@ -554,6 +570,16 @@ impl HostFunctions for MockHostFunctions {
 
     fn memory_delete(&self, _id: &str) -> HostResult<()> {
         Ok(())
+    }
+
+    fn knowledge_teach(
+        &self,
+        _category: &str,
+        _summary: &str,
+        _details: &str,
+        _domain: Option<&str>,
+    ) -> HostResult<String> {
+        Ok("K-test01".into())
     }
 
     fn skill_list(&self) -> HostResult<Vec<SkillSummary>> {

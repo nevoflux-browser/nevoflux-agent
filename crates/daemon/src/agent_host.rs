@@ -1088,6 +1088,92 @@ impl HostFunctions for DaemonHostFunctions {
         Ok(())
     }
 
+    fn knowledge_teach(
+        &self,
+        category: &str,
+        summary: &str,
+        details: &str,
+        domain: Option<&str>,
+    ) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+
+        debug!(
+            "knowledge_teach: category={}, summary_len={}, domain={:?}",
+            category,
+            summary.len(),
+            domain
+        );
+
+        let start = std::time::Instant::now();
+
+        // 1. Create the knowledge entry
+        let params = nevoflux_storage::CreateKnowledgeParams {
+            category: category.to_string(),
+            domain: domain.map(|d| d.to_string()),
+            summary: summary.to_string(),
+            details: details.to_string(),
+            source_type: Some("manual".to_string()),
+            priority: Some("high".to_string()),
+            tags: Some("[\"user_taught\"]".to_string()),
+            privacy_level: Some("internal".to_string()),
+            ..Default::default()
+        };
+
+        let knowledge_repo =
+            nevoflux_storage::KnowledgeRepository::new(&services.database);
+
+        let entry = knowledge_repo.create(params).map_err(|e| HostError {
+            code: 100,
+            message: format!("Knowledge create failed: {}", e),
+        })?;
+
+        let id = entry.id.clone();
+
+        // 2. Skip pending → validated
+        knowledge_repo
+            .update_status(&id, "validated")
+            .map_err(|e| HostError {
+                code: 100,
+                message: format!("Knowledge status update failed: {}", e),
+            })?;
+
+        // 3. Mark as hot immediately
+        let hot_summary = if summary.len() > 120 {
+            format!("{}...", &summary[..117])
+        } else {
+            summary.to_string()
+        };
+        knowledge_repo
+            .mark_hot(&id, &hot_summary)
+            .map_err(|e| HostError {
+                code: 100,
+                message: format!("Knowledge mark_hot failed: {}", e),
+            })?;
+
+        let duration = start.elapsed().as_millis() as u64;
+        self.record_tool(
+            "knowledge_teach",
+            Some(format!("category={},domain={:?}", category, domain)),
+            true,
+            None,
+            None,
+            duration,
+            None,
+            Some(serde_json::json!({"id": id})),
+        );
+
+        info!(
+            id = %id,
+            category = category,
+            "Knowledge taught and marked hot"
+        );
+
+        Ok(id)
+    }
+
     fn skill_list(&self) -> HostResult<Vec<SkillSummary>> {
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,

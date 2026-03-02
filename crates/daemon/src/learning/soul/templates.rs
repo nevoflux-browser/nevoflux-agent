@@ -94,6 +94,16 @@ pub fn default_soul() -> String {
 - When uncertain, ask the user rather than guess
 - Optimize for correctness first, speed second
 - Respect user preferences learned from past interactions
+
+## Memory Management
+
+When the user explicitly asks you to remember, learn, or always do something:
+- Use the `knowledge_teach` tool to store structured knowledge
+- Choose the appropriate category:
+  - `user_preference`: personal preferences, habits, style choices
+  - `site_interaction`: how to interact with specific websites
+  - `tool_optimization`: better ways to use tools
+- Write a clear one-line summary and detailed description
 "#
     .to_string()
 }
@@ -267,6 +277,8 @@ mod tests {
         assert!(content.contains("## Safety Boundaries"));
         assert!(content.contains("## Core Values"));
         assert!(content.contains("## Default Communication Style"));
+        assert!(content.contains("## Memory Management"));
+        assert!(content.contains("knowledge_teach"));
     }
 
     #[test]
