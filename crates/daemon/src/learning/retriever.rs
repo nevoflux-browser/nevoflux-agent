@@ -7,7 +7,8 @@
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
-use nevoflux_storage::{Knowledge, SiteAdaptation, Storage};
+use nevoflux_llm::EmbeddingProvider;
+use nevoflux_storage::{cosine_similarity, Knowledge, SiteAdaptation, Storage};
 
 use super::soul::manager::FiveDocCache;
 
@@ -95,6 +96,67 @@ pub fn relevance_score(
     category_match * domain_match * decay * entry.confidence
 }
 
+/// Compute relevance score with optional semantic similarity.
+///
+/// When both a query embedding and entry embedding are available, uses a
+/// semantic-weighted formula (40% semantic, 20% category, 15% domain,
+/// 15% decay, 10% confidence). Otherwise falls back to a structural-only
+/// additive formula (30% category, 30% domain, 25% decay, 15% confidence).
+pub fn relevance_score_hybrid(
+    entry: &Knowledge,
+    query_domain: Option<&str>,
+    query_category: Option<&str>,
+    query_embedding: Option<&[f32]>,
+    now: DateTime<Utc>,
+) -> f64 {
+    // Category matching
+    let category_match = match query_category {
+        Some(qc) if qc == entry.category => 1.0,
+        Some(_) => 0.3,
+        None => 0.3,
+    };
+
+    // Domain matching
+    let domain_match = match (query_domain, &entry.domain) {
+        (Some(qd), Some(ed)) if qd == ed => 1.0,
+        (None, Some(_)) | (Some(_), None) => 0.5,
+        (None, None) => 0.5,
+        _ => 0.1,
+    };
+
+    // Decay calculation
+    let decay = super::decay::calculate_decay(
+        entry
+            .last_hit_at
+            .as_deref()
+            .or(Some(entry.updated_at.as_str()))
+            .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+            .unwrap_or(now),
+        &entry.category,
+        entry.effectiveness,
+        entry.hit_count as u32,
+        now,
+    );
+
+    let confidence = entry.confidence;
+
+    // Semantic similarity
+    let semantic = match (query_embedding, &entry.embedding) {
+        (Some(q), Some(e)) => cosine_similarity(q, e) as f64,
+        _ => 0.0,
+    };
+    let has_semantic = query_embedding.is_some() && entry.embedding.is_some();
+
+    if has_semantic {
+        // Semantic-weighted formula
+        0.40 * semantic + 0.20 * category_match + 0.15 * domain_match + 0.15 * decay
+            + 0.10 * confidence
+    } else {
+        // Structural-only formula (normalized)
+        0.30 * category_match + 0.30 * domain_match + 0.25 * decay + 0.15 * confidence
+    }
+}
+
 /// Retrieves relevant knowledge for a given context.
 ///
 /// Holds a session-scoped cache of the five soul documents (loaded at session
@@ -105,6 +167,7 @@ pub struct KnowledgeRetriever {
     soul_cache: RwLock<Arc<FiveDocCache>>,
     storage: Arc<Storage>,
     config: RetrievalConfig,
+    embedding: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl KnowledgeRetriever {
@@ -114,6 +177,7 @@ impl KnowledgeRetriever {
             soul_cache: RwLock::new(soul_cache),
             storage,
             config: RetrievalConfig::default(),
+            embedding: None,
         }
     }
 
@@ -127,7 +191,14 @@ impl KnowledgeRetriever {
             soul_cache: RwLock::new(soul_cache),
             storage,
             config,
+            embedding: None,
         }
+    }
+
+    /// Attach an embedding provider for semantic scoring in `retrieve()`.
+    pub fn with_embedding(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
+        self.embedding = Some(provider);
+        self
     }
 
     /// Replace the cached soul documents with a fresh snapshot.
@@ -150,20 +221,33 @@ impl KnowledgeRetriever {
         self.soul_cache.read().unwrap().clone()
     }
 
-    /// Retrieve relevant knowledge for a given domain and category.
+    /// Retrieve relevant knowledge for a given query, domain, and category.
     ///
-    /// 1. Queries SQLite for knowledge entries matching the domain (if provided).
+    /// 1. Optionally generates a query embedding for semantic scoring.
+    /// 2. Queries SQLite for knowledge entries matching the domain (if provided).
     ///    When no domain is given, queries validated entries instead.
-    /// 2. Computes a composite relevance score for each entry using four factors:
-    ///    `category_match * domain_match * decay * confidence`.
-    /// 3. Filters out archived entries and those below `min_decay_score`.
-    /// 4. Sorts by relevance descending and truncates to `top_k`.
-    /// 5. Queries site adaptations for the domain (if provided).
-    pub fn retrieve(
+    /// 3. Computes a hybrid relevance score combining semantic similarity with
+    ///    structural features (category, domain, decay, confidence).
+    /// 4. Filters out archived entries and those below `min_decay_score`.
+    /// 5. Sorts by relevance descending and truncates to `top_k`.
+    /// 6. Queries site adaptations for the domain (if provided).
+    pub async fn retrieve(
         &self,
+        query: &str,
         domain: Option<&str>,
         category: Option<&str>,
     ) -> crate::error::Result<RetrievalResult> {
+        // Generate query embedding (failure = None, graceful degradation)
+        let query_emb = if !query.is_empty() {
+            if let Some(ref provider) = self.embedding {
+                provider.embed(query).await.ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // 1. Query knowledge entries by domain (if provided)
         let candidates = if let Some(d) = domain {
             self.storage.knowledge().query_by_domain(d, 100)?
@@ -178,7 +262,13 @@ impl KnowledgeRetriever {
             .into_iter()
             .filter(|e| e.status != "archived") // Exclude archived
             .map(|entry| {
-                let score = self.compute_relevance(&entry, domain, category, now);
+                let score = relevance_score_hybrid(
+                    &entry,
+                    domain,
+                    category,
+                    query_emb.as_deref(),
+                    now,
+                );
                 ScoredKnowledge {
                     entry,
                     relevance_score: score,
@@ -208,20 +298,6 @@ impl KnowledgeRetriever {
             entries: scored,
             site_adaptations,
         })
-    }
-
-    /// Compute the composite relevance score for an entry.
-    ///
-    /// Delegates to the module-level `relevance_score()` function which
-    /// combines four factors: category_match, domain_match, decay, and confidence.
-    fn compute_relevance(
-        &self,
-        entry: &Knowledge,
-        query_domain: Option<&str>,
-        query_category: Option<&str>,
-        now: DateTime<Utc>,
-    ) -> f64 {
-        relevance_score(entry, query_domain, query_category, now)
     }
 }
 
@@ -262,19 +338,19 @@ mod tests {
         entry
     }
 
-    #[test]
-    fn retriever_empty_database_returns_empty() {
+    #[tokio::test]
+    async fn retriever_empty_database_returns_empty() {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let cache = make_cache();
         let retriever = KnowledgeRetriever::new(cache, storage);
 
-        let result = retriever.retrieve(Some("example.com"), None).unwrap();
+        let result = retriever.retrieve("", Some("example.com"), None).await.unwrap();
         assert!(result.entries.is_empty());
         assert!(result.site_adaptations.is_empty());
     }
 
-    #[test]
-    fn retriever_returns_matching_entries() {
+    #[tokio::test]
+    async fn retriever_returns_matching_entries() {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let cache = make_cache();
 
@@ -288,13 +364,13 @@ mod tests {
         // query_by_domain returns entries regardless of status, so this should work
         let retriever = KnowledgeRetriever::new(cache, Arc::clone(&storage));
 
-        let result = retriever.retrieve(Some("github.com"), None).unwrap();
+        let result = retriever.retrieve("", Some("github.com"), None).await.unwrap();
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].entry.id, entry.id);
     }
 
-    #[test]
-    fn retriever_filters_archived_entries() {
+    #[tokio::test]
+    async fn retriever_filters_archived_entries() {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let cache = make_cache();
 
@@ -311,15 +387,15 @@ mod tests {
             .unwrap();
 
         let retriever = KnowledgeRetriever::new(cache, Arc::clone(&storage));
-        let result = retriever.retrieve(Some("example.com"), None).unwrap();
+        let result = retriever.retrieve("", Some("example.com"), None).await.unwrap();
         assert!(
             result.entries.is_empty(),
             "archived entries should be excluded"
         );
     }
 
-    #[test]
-    fn retriever_respects_top_k_limit() {
+    #[tokio::test]
+    async fn retriever_respects_top_k_limit() {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let cache = make_cache();
 
@@ -334,7 +410,7 @@ mod tests {
         }
 
         let retriever = KnowledgeRetriever::new(cache, Arc::clone(&storage));
-        let result = retriever.retrieve(Some("example.com"), None).unwrap();
+        let result = retriever.retrieve("", Some("example.com"), None).await.unwrap();
         assert!(
             result.entries.len() <= 5,
             "should respect top_k=5, got {}",
@@ -342,8 +418,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn retriever_sorts_by_relevance_descending() {
+    #[tokio::test]
+    async fn retriever_sorts_by_relevance_descending() {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let cache = make_cache();
 
@@ -360,7 +436,7 @@ mod tests {
         }
 
         let retriever = KnowledgeRetriever::new(cache, Arc::clone(&storage));
-        let result = retriever.retrieve(Some("example.com"), None).unwrap();
+        let result = retriever.retrieve("", Some("example.com"), None).await.unwrap();
 
         // Verify descending order
         for window in result.entries.windows(2) {
@@ -373,8 +449,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn retriever_no_domain_queries_validated() {
+    #[tokio::test]
+    async fn retriever_no_domain_queries_validated() {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let cache = make_cache();
 
@@ -389,7 +465,7 @@ mod tests {
             .unwrap();
 
         let retriever = KnowledgeRetriever::new(cache, Arc::clone(&storage));
-        let result = retriever.retrieve(None, None).unwrap();
+        let result = retriever.retrieve("", None, None).await.unwrap();
 
         // Only the validated entry should be returned
         assert_eq!(result.entries.len(), 1);
@@ -418,8 +494,8 @@ mod tests {
         assert_eq!(retriever.soul_cache().identity_raw, "# New Identity");
     }
 
-    #[test]
-    fn retriever_with_custom_config() {
+    #[tokio::test]
+    async fn retriever_with_custom_config() {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let cache = make_cache();
 
@@ -439,7 +515,7 @@ mod tests {
         };
         let retriever = KnowledgeRetriever::with_config(cache, Arc::clone(&storage), config);
 
-        let result = retriever.retrieve(Some("example.com"), None).unwrap();
+        let result = retriever.retrieve("", Some("example.com"), None).await.unwrap();
         assert!(
             result.entries.len() <= 2,
             "custom top_k=2 should limit results, got {}",
@@ -447,8 +523,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn retriever_includes_site_adaptations() {
+    #[tokio::test]
+    async fn retriever_includes_site_adaptations() {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let cache = make_cache();
 
@@ -467,14 +543,14 @@ mod tests {
             .unwrap();
 
         let retriever = KnowledgeRetriever::new(cache, Arc::clone(&storage));
-        let result = retriever.retrieve(Some("example.com"), None).unwrap();
+        let result = retriever.retrieve("", Some("example.com"), None).await.unwrap();
 
         assert_eq!(result.site_adaptations.len(), 1);
         assert_eq!(result.site_adaptations[0].id, "SA-test01");
     }
 
-    #[test]
-    fn retriever_no_domain_returns_no_site_adaptations() {
+    #[tokio::test]
+    async fn retriever_no_domain_returns_no_site_adaptations() {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let cache = make_cache();
 
@@ -490,7 +566,7 @@ mod tests {
             .unwrap();
 
         let retriever = KnowledgeRetriever::new(cache, Arc::clone(&storage));
-        let result = retriever.retrieve(None, None).unwrap();
+        let result = retriever.retrieve("", None, None).await.unwrap();
 
         assert!(
             result.site_adaptations.is_empty(),
@@ -505,8 +581,8 @@ mod tests {
         assert!((config.min_decay_score - 0.05).abs() < f64::EPSILON);
     }
 
-    #[test]
-    fn relevance_score_is_positive_for_fresh_entries() {
+    #[tokio::test]
+    async fn relevance_score_is_positive_for_fresh_entries() {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let cache = make_cache();
 
@@ -518,7 +594,7 @@ mod tests {
         );
 
         let retriever = KnowledgeRetriever::new(cache, Arc::clone(&storage));
-        let result = retriever.retrieve(Some("example.com"), None).unwrap();
+        let result = retriever.retrieve("", Some("example.com"), None).await.unwrap();
 
         assert_eq!(result.entries.len(), 1);
         assert!(
@@ -778,6 +854,131 @@ mod tests {
         assert!(
             high_score > low_score,
             "higher confidence should yield higher score: high={high_score}, low={low_score}"
+        );
+    }
+
+    // --- Tests for relevance_score_hybrid() ---
+
+    #[test]
+    fn relevance_score_hybrid_with_semantic_boost() {
+        let mut entry = make_knowledge("tool_optimization", Some("example.com"), 0.9, 10);
+        entry.embedding = Some(vec![1.0, 0.0, 0.0]);
+
+        let query_emb = vec![1.0, 0.0, 0.0]; // identical = cosine 1.0
+
+        let score_semantic = relevance_score_hybrid(
+            &entry,
+            Some("example.com"),
+            Some("tool_optimization"),
+            Some(&query_emb),
+            Utc::now(),
+        );
+
+        let score_no_semantic = relevance_score_hybrid(
+            &entry,
+            Some("example.com"),
+            Some("tool_optimization"),
+            None,
+            Utc::now(),
+        );
+
+        assert!(
+            score_semantic > score_no_semantic,
+            "Semantic match should boost score: {} vs {}",
+            score_semantic,
+            score_no_semantic
+        );
+    }
+
+    #[test]
+    fn relevance_score_hybrid_low_similarity_reduces_score() {
+        let mut entry = make_knowledge("tool_optimization", Some("example.com"), 0.9, 10);
+        entry.embedding = Some(vec![1.0, 0.0, 0.0]);
+
+        // Orthogonal vector = 0 similarity
+        let query_emb = vec![0.0, 1.0, 0.0];
+
+        let score = relevance_score_hybrid(
+            &entry,
+            Some("example.com"),
+            Some("tool_optimization"),
+            Some(&query_emb),
+            Utc::now(),
+        );
+
+        // With 0 semantic similarity, the 0.40*0 drags score down
+        assert!(
+            score < 0.7,
+            "Low semantic match should reduce score: {}",
+            score
+        );
+    }
+
+    #[test]
+    fn relevance_score_hybrid_degrades_to_structural() {
+        let entry = make_knowledge("tool_optimization", Some("example.com"), 0.9, 10);
+        // No embedding on entry
+
+        let score_with_query = relevance_score_hybrid(
+            &entry,
+            Some("example.com"),
+            Some("tool_optimization"),
+            Some(&[1.0, 0.0, 0.0]),
+            Utc::now(),
+        );
+        let score_without = relevance_score_hybrid(
+            &entry,
+            Some("example.com"),
+            Some("tool_optimization"),
+            None,
+            Utc::now(),
+        );
+
+        assert!(
+            (score_with_query - score_without).abs() < 0.01,
+            "Without entry embedding, should use structural formula regardless of query embedding: {} vs {}",
+            score_with_query,
+            score_without
+        );
+    }
+
+    #[test]
+    fn relevance_score_hybrid_structural_only_is_positive() {
+        let entry = make_knowledge("site_interaction", Some("example.com"), 0.9, 10);
+        let score = relevance_score_hybrid(
+            &entry,
+            Some("example.com"),
+            Some("site_interaction"),
+            None,
+            Utc::now(),
+        );
+        assert!(
+            score > 0.5,
+            "structural-only exact match should score > 0.5, got {score}"
+        );
+    }
+
+    #[test]
+    fn relevance_score_hybrid_domain_mismatch() {
+        let entry = make_knowledge("site_interaction", Some("example.com"), 0.9, 10);
+        let now = Utc::now();
+        let exact = relevance_score_hybrid(
+            &entry,
+            Some("example.com"),
+            Some("site_interaction"),
+            None,
+            now,
+        );
+        let mismatch = relevance_score_hybrid(
+            &entry,
+            Some("other.com"),
+            Some("site_interaction"),
+            None,
+            now,
+        );
+        assert!(
+            exact > mismatch,
+            "exact domain should score higher in hybrid: exact={exact}, mismatch={mismatch}"
         );
     }
 }
