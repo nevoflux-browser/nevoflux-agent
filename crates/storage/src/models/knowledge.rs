@@ -55,6 +55,9 @@ pub struct Knowledge {
     pub last_hit_at: Option<String>,
     /// RFC3339 timestamp when promoted.
     pub promoted_at: Option<String>,
+    /// Optional embedding vector for semantic search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// Parameters for creating a new knowledge entry.
@@ -84,4 +87,7 @@ pub struct CreateKnowledgeParams {
     pub promotion_target: Option<String>,
     /// Source type (defaults to "system").
     pub source_type: Option<String>,
+    /// Optional embedding vector for semantic search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
 }

@@ -27,6 +27,7 @@ impl<'a> KnowledgeRepository<'a> {
             .privacy_level
             .unwrap_or_else(|| "internal".to_string());
         let source_type = params.source_type.unwrap_or_else(|| "system".to_string());
+        let embedding_blob = params.embedding.as_ref().map(|e| embedding_to_blob(e));
 
         self.db.with_connection(|conn| {
             conn.execute(
@@ -35,13 +36,15 @@ impl<'a> KnowledgeRepository<'a> {
                     resolution, confidence, hit_count, success_count, fail_count,
                     priority, status, source_ids, related_ids, tags,
                     privacy_level, promotion_target, promoted_section,
-                    source_type, created_at, updated_at, last_hit_at, promoted_at
+                    source_type, created_at, updated_at, last_hit_at, promoted_at,
+                    embedding
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6,
                     ?7, 0.5, 1, 0, 0,
                     ?8, 'pending', ?9, NULL, ?10,
                     ?11, ?12, NULL,
-                    ?13, ?14, ?15, NULL, NULL
+                    ?13, ?14, ?15, NULL, NULL,
+                    ?16
                 )",
                 params![
                     id,
@@ -59,6 +62,7 @@ impl<'a> KnowledgeRepository<'a> {
                     source_type,
                     now,
                     now,
+                    embedding_blob,
                 ],
             )?;
 
@@ -68,7 +72,8 @@ impl<'a> KnowledgeRepository<'a> {
                         resolution, confidence, hit_count, success_count, fail_count,
                         effectiveness, priority, status, source_ids, related_ids, tags,
                         privacy_level, promotion_target, promoted_section,
-                        source_type, created_at, updated_at, last_hit_at, promoted_at
+                        source_type, created_at, updated_at, last_hit_at, promoted_at,
+                        embedding
                  FROM knowledge WHERE id = ?1",
                 params![id],
                 row_to_knowledge,
@@ -85,7 +90,8 @@ impl<'a> KnowledgeRepository<'a> {
                             resolution, confidence, hit_count, success_count, fail_count,
                             effectiveness, priority, status, source_ids, related_ids, tags,
                             privacy_level, promotion_target, promoted_section,
-                            source_type, created_at, updated_at, last_hit_at, promoted_at
+                            source_type, created_at, updated_at, last_hit_at, promoted_at,
+                            embedding
                      FROM knowledge WHERE id = ?1",
                     params![id],
                     row_to_knowledge,
@@ -128,7 +134,8 @@ impl<'a> KnowledgeRepository<'a> {
                         resolution, confidence, hit_count, success_count, fail_count,
                         effectiveness, priority, status, source_ids, related_ids, tags,
                         privacy_level, promotion_target, promoted_section,
-                        source_type, created_at, updated_at, last_hit_at, promoted_at
+                        source_type, created_at, updated_at, last_hit_at, promoted_at,
+                        embedding
                  FROM knowledge WHERE domain = ?1
                  ORDER BY confidence DESC, updated_at DESC
                  LIMIT ?2",
@@ -152,7 +159,8 @@ impl<'a> KnowledgeRepository<'a> {
                         resolution, confidence, hit_count, success_count, fail_count,
                         effectiveness, priority, status, source_ids, related_ids, tags,
                         privacy_level, promotion_target, promoted_section,
-                        source_type, created_at, updated_at, last_hit_at, promoted_at
+                        source_type, created_at, updated_at, last_hit_at, promoted_at,
+                        embedding
                  FROM knowledge WHERE status = 'pending'
                  ORDER BY created_at ASC
                  LIMIT ?1",
@@ -176,7 +184,8 @@ impl<'a> KnowledgeRepository<'a> {
                         resolution, confidence, hit_count, success_count, fail_count,
                         effectiveness, priority, status, source_ids, related_ids, tags,
                         privacy_level, promotion_target, promoted_section,
-                        source_type, created_at, updated_at, last_hit_at, promoted_at
+                        source_type, created_at, updated_at, last_hit_at, promoted_at,
+                        embedding
                  FROM knowledge WHERE status = 'validated'
                  ORDER BY created_at ASC
                  LIMIT ?1",
@@ -254,7 +263,8 @@ impl<'a> KnowledgeRepository<'a> {
                         resolution, confidence, hit_count, success_count, fail_count,
                         effectiveness, priority, status, source_ids, related_ids, tags,
                         privacy_level, promotion_target, promoted_section,
-                        source_type, created_at, updated_at, last_hit_at, promoted_at
+                        source_type, created_at, updated_at, last_hit_at, promoted_at,
+                        embedding
                  FROM knowledge
                  ORDER BY created_at DESC
                  LIMIT ?1",
@@ -265,6 +275,177 @@ impl<'a> KnowledgeRepository<'a> {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
             Ok(rows)
+        })
+    }
+
+    /// Find a duplicate entry by category + domain + summary (exact match).
+    pub fn find_duplicate(
+        &self,
+        category: &str,
+        domain: Option<&str>,
+        summary: &str,
+    ) -> Result<Option<Knowledge>> {
+        self.db.with_connection(|conn| {
+            let result = match domain {
+                Some(d) => conn
+                    .query_row(
+                        "SELECT id, category, subcategory, domain, summary, details,
+                                resolution, confidence, hit_count, success_count, fail_count,
+                                effectiveness, priority, status, source_ids, related_ids, tags,
+                                privacy_level, promotion_target, promoted_section,
+                                source_type, created_at, updated_at, last_hit_at, promoted_at,
+                                embedding
+                         FROM knowledge
+                         WHERE category = ?1 AND domain = ?2 AND summary = ?3
+                         LIMIT 1",
+                        params![category, d, summary],
+                        row_to_knowledge,
+                    )
+                    .optional()?,
+                None => conn
+                    .query_row(
+                        "SELECT id, category, subcategory, domain, summary, details,
+                                resolution, confidence, hit_count, success_count, fail_count,
+                                effectiveness, priority, status, source_ids, related_ids, tags,
+                                privacy_level, promotion_target, promoted_section,
+                                source_type, created_at, updated_at, last_hit_at, promoted_at,
+                                embedding
+                         FROM knowledge
+                         WHERE category = ?1 AND domain IS NULL AND summary = ?2
+                         LIMIT 1",
+                        params![category, summary],
+                        row_to_knowledge,
+                    )
+                    .optional()?,
+            };
+
+            match result {
+                Some(k) => Ok(Some(k)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    /// Merge into existing entry: add hits, take max confidence, update timestamps.
+    pub fn merge_entry(&self, id: &str, add_hits: u32, new_confidence: f64) -> Result<()> {
+        let now = rfc3339_now();
+
+        self.db.with_connection(|conn| {
+            let rows_affected = conn.execute(
+                "UPDATE knowledge
+                 SET hit_count = hit_count + ?1,
+                     confidence = MAX(confidence, ?2),
+                     last_hit_at = ?3,
+                     updated_at = ?4
+                 WHERE id = ?5",
+                params![add_hits, new_confidence, now, now, id],
+            )?;
+
+            if rows_affected == 0 {
+                return Err(crate::error::StorageError::NotFound {
+                    entity: "knowledge".to_string(),
+                    id: id.to_string(),
+                });
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Query entries with same category and domain (for conflict detection).
+    ///
+    /// When `domain` is `Some`, returns entries matching both the given domain
+    /// and universal entries (domain IS NULL). When `domain` is `None`, returns
+    /// only universal entries.
+    pub fn query_by_subject(
+        &self,
+        category: &str,
+        domain: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Knowledge>> {
+        self.db.with_connection(|conn| {
+            if let Some(d) = domain {
+                let mut stmt = conn.prepare(
+                    "SELECT id, category, subcategory, domain, summary, details,
+                            resolution, confidence, hit_count, success_count, fail_count,
+                            effectiveness, priority, status, source_ids, related_ids, tags,
+                            privacy_level, promotion_target, promoted_section,
+                            source_type, created_at, updated_at, last_hit_at, promoted_at,
+                            embedding
+                     FROM knowledge
+                     WHERE category = ?1 AND (domain = ?2 OR domain IS NULL)
+                     ORDER BY confidence DESC
+                     LIMIT ?3",
+                )?;
+
+                let rows = stmt
+                    .query_map(params![category, d, limit as i64], row_to_knowledge)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT id, category, subcategory, domain, summary, details,
+                            resolution, confidence, hit_count, success_count, fail_count,
+                            effectiveness, priority, status, source_ids, related_ids, tags,
+                            privacy_level, promotion_target, promoted_section,
+                            source_type, created_at, updated_at, last_hit_at, promoted_at,
+                            embedding
+                     FROM knowledge
+                     WHERE category = ?1 AND domain IS NULL
+                     ORDER BY confidence DESC
+                     LIMIT ?2",
+                )?;
+
+                let rows = stmt
+                    .query_map(params![category, limit as i64], row_to_knowledge)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            }
+        })
+    }
+
+    /// Query entries with no embedding (for backfill).
+    pub fn list_without_embeddings(&self, limit: usize) -> Result<Vec<Knowledge>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, category, subcategory, domain, summary, details,
+                        resolution, confidence, hit_count, success_count, fail_count,
+                        effectiveness, priority, status, source_ids, related_ids, tags,
+                        privacy_level, promotion_target, promoted_section,
+                        source_type, created_at, updated_at, last_hit_at, promoted_at,
+                        embedding
+                 FROM knowledge WHERE embedding IS NULL
+                 ORDER BY created_at ASC
+                 LIMIT ?1",
+            )?;
+
+            let rows = stmt
+                .query_map(params![limit as i64], row_to_knowledge)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            Ok(rows)
+        })
+    }
+
+    /// Update only the embedding field.
+    pub fn update_embedding(&self, id: &str, embedding: &[f32]) -> Result<()> {
+        let now = rfc3339_now();
+        let embedding_blob = embedding_to_blob(embedding);
+
+        self.db.with_connection(|conn| {
+            let rows_affected = conn.execute(
+                "UPDATE knowledge SET embedding = ?1, updated_at = ?2 WHERE id = ?3",
+                params![embedding_blob, now, id],
+            )?;
+
+            if rows_affected == 0 {
+                return Err(crate::error::StorageError::NotFound {
+                    entity: "knowledge".to_string(),
+                    id: id.to_string(),
+                });
+            }
+
+            Ok(())
         })
     }
 
@@ -279,8 +460,23 @@ impl<'a> KnowledgeRepository<'a> {
     }
 }
 
+/// Convert embedding vector to blob bytes (little-endian f32).
+fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
+    embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// Convert blob bytes back to embedding vector.
+fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
 /// Convert a database row to a Knowledge struct.
 fn row_to_knowledge(row: &Row<'_>) -> rusqlite::Result<Knowledge> {
+    let embedding_blob: Option<Vec<u8>> = row.get(25)?;
+    let embedding = embedding_blob.map(|blob| blob_to_embedding(&blob));
+
     Ok(Knowledge {
         id: row.get(0)?,
         category: row.get(1)?,
@@ -307,6 +503,7 @@ fn row_to_knowledge(row: &Row<'_>) -> rusqlite::Result<Knowledge> {
         updated_at: row.get(22)?,
         last_hit_at: row.get(23)?,
         promoted_at: row.get(24)?,
+        embedding,
     })
 }
 
@@ -686,5 +883,364 @@ mod tests {
         let storage = Storage::open_in_memory().unwrap();
         let result = storage.knowledge().resurrect_entry("K-00000000-000000");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_find_duplicate_returns_match() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        let created = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                domain: Some("example.com".into()),
+                summary: "uses data-testid selectors".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let found = storage
+            .knowledge()
+            .find_duplicate(
+                "site_interaction",
+                Some("example.com"),
+                "uses data-testid selectors",
+            )
+            .unwrap();
+
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, created.id);
+    }
+
+    #[test]
+    fn test_find_duplicate_returns_none_for_no_match() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                domain: Some("example.com".into()),
+                summary: "uses data-testid selectors".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Different category
+        let result = storage
+            .knowledge()
+            .find_duplicate(
+                "tool_optimization",
+                Some("example.com"),
+                "uses data-testid selectors",
+            )
+            .unwrap();
+        assert!(result.is_none());
+
+        // Different domain
+        let result = storage
+            .knowledge()
+            .find_duplicate(
+                "site_interaction",
+                Some("other.com"),
+                "uses data-testid selectors",
+            )
+            .unwrap();
+        assert!(result.is_none());
+
+        // Different summary
+        let result = storage
+            .knowledge()
+            .find_duplicate("site_interaction", Some("example.com"), "different summary")
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_duplicate_with_none_domain() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        // Create a universal entry (domain = NULL)
+        let created = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "tool_optimization".into(),
+                domain: None,
+                summary: "universal knowledge".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Find with domain=None should match domain IS NULL
+        let found = storage
+            .knowledge()
+            .find_duplicate("tool_optimization", None, "universal knowledge")
+            .unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, created.id);
+
+        // Find with domain=Some should NOT match domain IS NULL
+        let not_found = storage
+            .knowledge()
+            .find_duplicate(
+                "tool_optimization",
+                Some("example.com"),
+                "universal knowledge",
+            )
+            .unwrap();
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_merge_entry_increments_hit_count() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        let created = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "merge test".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Default hit_count is 1
+        assert_eq!(created.hit_count, 1);
+
+        // Merge with add_hits=3
+        storage
+            .knowledge()
+            .merge_entry(&created.id, 3, 0.3)
+            .unwrap();
+
+        let entry = storage.knowledge().get(&created.id).unwrap().unwrap();
+        assert_eq!(entry.hit_count, 4);
+        assert!(entry.last_hit_at.is_some());
+    }
+
+    #[test]
+    fn test_merge_entry_takes_max_confidence() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        let created = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "confidence test".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Default confidence is 0.5
+        assert_eq!(created.confidence, 0.5);
+
+        // Merge with higher confidence
+        storage
+            .knowledge()
+            .merge_entry(&created.id, 1, 0.8)
+            .unwrap();
+
+        let entry = storage.knowledge().get(&created.id).unwrap().unwrap();
+        assert!((entry.confidence - 0.8).abs() < 0.001);
+
+        // Merge with lower confidence should NOT downgrade
+        storage
+            .knowledge()
+            .merge_entry(&entry.id, 1, 0.3)
+            .unwrap();
+
+        let entry = storage.knowledge().get(&created.id).unwrap().unwrap();
+        assert!((entry.confidence - 0.8).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_query_by_subject_returns_matching() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        // Create entries with different categories and domains
+        storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                domain: Some("example.com".into()),
+                summary: "entry 1".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "tool_optimization".into(),
+                domain: Some("example.com".into()),
+                summary: "entry 2".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                domain: Some("other.com".into()),
+                summary: "entry 3".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Query by category=site_interaction, domain=example.com
+        let results = storage
+            .knowledge()
+            .query_by_subject("site_interaction", Some("example.com"), 10)
+            .unwrap();
+
+        // Should find entry 1 (matching category+domain) but NOT entry 2 (wrong category) or entry 3 (wrong domain)
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].summary, "entry 1");
+    }
+
+    #[test]
+    fn test_query_by_subject_includes_universal() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        // Create a domain-specific entry
+        storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                domain: Some("example.com".into()),
+                summary: "domain specific".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Create a universal entry (domain = NULL)
+        storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                domain: None,
+                summary: "universal".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Query with domain=Some("example.com") should return both
+        let results = storage
+            .knowledge()
+            .query_by_subject("site_interaction", Some("example.com"), 10)
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        let summaries: Vec<&str> = results.iter().map(|k| k.summary.as_str()).collect();
+        assert!(summaries.contains(&"domain specific"));
+        assert!(summaries.contains(&"universal"));
+    }
+
+    #[test]
+    fn test_list_without_embeddings() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        // Create entry without embedding
+        storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "no embedding".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Create entry with embedding
+        storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "has embedding".into(),
+                details: "details".into(),
+                embedding: Some(vec![0.1, 0.2, 0.3]),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let results = storage.knowledge().list_without_embeddings(10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].summary, "no embedding");
+        assert!(results[0].embedding.is_none());
+    }
+
+    #[test]
+    fn test_update_embedding() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        let created = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "embedding update test".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(created.embedding.is_none());
+
+        let embedding = vec![0.1_f32, 0.2, 0.3, 0.4, 0.5];
+        storage
+            .knowledge()
+            .update_embedding(&created.id, &embedding)
+            .unwrap();
+
+        let entry = storage.knowledge().get(&created.id).unwrap().unwrap();
+        assert!(entry.embedding.is_some());
+        let stored = entry.embedding.unwrap();
+        assert_eq!(stored.len(), 5);
+        for (a, b) in stored.iter().zip(embedding.iter()) {
+            assert!((a - b).abs() < f32::EPSILON);
+        }
+    }
+
+    #[test]
+    fn test_create_with_embedding() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        let embedding = vec![1.0_f32, -2.5, 3.14159, 0.0, -0.00001];
+        let created = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "site_interaction".into(),
+                summary: "created with embedding".into(),
+                details: "details".into(),
+                embedding: Some(embedding.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(created.embedding.is_some());
+        let stored = created.embedding.unwrap();
+        assert_eq!(stored.len(), embedding.len());
+        for (a, b) in stored.iter().zip(embedding.iter()) {
+            assert!((a - b).abs() < f32::EPSILON);
+        }
+
+        // Also verify via get()
+        let fetched = storage.knowledge().get(&created.id).unwrap().unwrap();
+        assert!(fetched.embedding.is_some());
+        let fetched_emb = fetched.embedding.unwrap();
+        assert_eq!(fetched_emb.len(), embedding.len());
+        for (a, b) in fetched_emb.iter().zip(embedding.iter()) {
+            assert!((a - b).abs() < f32::EPSILON);
+        }
     }
 }
