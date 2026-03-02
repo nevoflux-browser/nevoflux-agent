@@ -57,6 +57,10 @@ pub struct AgentConfig {
     /// Learning system configuration.
     #[serde(default)]
     pub learning: LearningConfig,
+
+    /// Embedding provider configuration.
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
 }
 
 impl AgentConfig {
@@ -218,6 +222,17 @@ impl AgentConfig {
         }
         if !other.auth.denied_commands.is_empty() {
             self.auth.denied_commands = other.auth.denied_commands.clone();
+        }
+
+        // Merge embedding config
+        if other.embedding.provider != default_embedding_provider() {
+            self.embedding.provider = other.embedding.provider.clone();
+        }
+        if other.embedding.model != default_embedding_model() {
+            self.embedding.model = other.embedding.model.clone();
+        }
+        if other.embedding.enabled != default_embedding_enabled() {
+            self.embedding.enabled = other.embedding.enabled;
         }
     }
 }
@@ -958,6 +973,46 @@ impl Default for PromotionConfig {
             tool_optimization_min_effectiveness: 0.7,
             user_preference_min_hits: 5,
             min_alive_days: 7,
+        }
+    }
+}
+
+// ==================== EmbeddingConfig ====================
+
+/// Configuration for the embedding provider.
+///
+/// Controls which embedding provider and model the daemon uses for
+/// generating vector embeddings (e.g., for semantic search in the
+/// learning system).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingConfig {
+    /// The embedding provider to use (e.g. "fastembed").
+    #[serde(default = "default_embedding_provider")]
+    pub provider: String,
+    /// The embedding model name.
+    #[serde(default = "default_embedding_model")]
+    pub model: String,
+    /// Whether embedding generation is enabled.
+    #[serde(default = "default_embedding_enabled")]
+    pub enabled: bool,
+}
+
+fn default_embedding_provider() -> String {
+    "fastembed".into()
+}
+fn default_embedding_model() -> String {
+    "multilingual-e5-small".into()
+}
+fn default_embedding_enabled() -> bool {
+    true
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_embedding_provider(),
+            model: default_embedding_model(),
+            enabled: default_embedding_enabled(),
         }
     }
 }
