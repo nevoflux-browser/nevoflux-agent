@@ -238,10 +238,10 @@ impl LearningPipeline {
             let domain = entry.context.domain.as_deref();
 
             // Check for an existing entry with the same category+domain+summary
-            let existing = self
-                .storage
-                .knowledge()
-                .find_duplicate(&category_str, domain, &entry.summary)?;
+            let existing =
+                self.storage
+                    .knowledge()
+                    .find_duplicate(&category_str, domain, &entry.summary)?;
 
             if let Some(existing) = existing {
                 // Merge: accumulate hits, take max confidence
@@ -2356,7 +2356,10 @@ mod tests {
         };
 
         let count = pipeline.validate(&thresholds).unwrap();
-        assert_eq!(count, 0, "System entry should be rejected (manual edit protected)");
+        assert_eq!(
+            count, 0,
+            "System entry should be rejected (manual edit protected)"
+        );
 
         // System entry should be archived (rejected)
         let sys = repo.get(&system_entry.id).unwrap().unwrap();

@@ -470,10 +470,7 @@ impl std::fmt::Debug for HostServices {
                 "computer_controller",
                 &self.computer_controller.as_ref().map(|_| "Some(...)"),
             )
-            .field(
-                "embedding",
-                &self.embedding.as_ref().map(|_| "Some(...)"),
-            )
+            .field("embedding", &self.embedding.as_ref().map(|_| "Some(...)"))
             .field("vector_index", &"Arc<RwLock<SimpleVectorIndex>>")
             .finish()
     }

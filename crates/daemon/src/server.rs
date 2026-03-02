@@ -388,7 +388,10 @@ pub async fn start_server(
                             idx.add(&chunk.id, emb.clone());
                         }
                     }
-                    info!(count = chunks.len(), "Loaded memory embeddings into vector index");
+                    info!(
+                        count = chunks.len(),
+                        "Loaded memory embeddings into vector index"
+                    );
                 }
             }
             Err(e) => warn!("Failed to load memory embeddings: {e}"),

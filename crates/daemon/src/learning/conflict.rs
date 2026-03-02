@@ -169,10 +169,7 @@ pub fn detect_conflict(existing: &Knowledge, incoming: &Knowledge) -> Option<Con
 /// Check an incoming entry against a list of existing entries.
 /// Returns the first conflict found, skipping entries that share the same ID
 /// as the incoming entry and entries with "archived" status.
-pub fn detect_conflict_against(
-    incoming: &Knowledge,
-    existing: &[Knowledge],
-) -> Option<Conflict> {
+pub fn detect_conflict_against(incoming: &Knowledge, existing: &[Knowledge]) -> Option<Conflict> {
     existing
         .iter()
         .filter(|e| e.id != incoming.id && e.status != "archived")
@@ -773,9 +770,6 @@ mod tests {
         })];
 
         let conflict = detect_conflict_against(&incoming, &existing);
-        assert!(
-            conflict.is_none(),
-            "Should skip entries with the same ID"
-        );
+        assert!(conflict.is_none(), "Should skip entries with the same ID");
     }
 }

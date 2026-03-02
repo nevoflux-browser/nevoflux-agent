@@ -972,12 +972,8 @@ impl HostFunctions for DaemonHostFunctions {
         }
 
         // Hybrid merge: combine FTS and semantic scores
-        let merged = merge_search_results(
-            &fts_results,
-            &semantic_results,
-            limit,
-            &services.database,
-        );
+        let merged =
+            merge_search_results(&fts_results, &semantic_results, limit, &services.database);
         Ok(merged)
     }
 
@@ -3637,7 +3633,10 @@ fn merge_search_results(
                     score: score as f32,
                 }),
                 Ok(None) => {
-                    warn!("Memory chunk {} found in vector index but not in database", id);
+                    warn!(
+                        "Memory chunk {} found in vector index but not in database",
+                        id
+                    );
                     None
                 }
                 Err(e) => {

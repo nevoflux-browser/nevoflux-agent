@@ -149,9 +149,7 @@ impl FastEmbedProvider {
     /// (see [`resolve_cache_dir`]).
     pub fn new(config: EmbeddingConfig) -> Result<Self, EmbeddingError> {
         let fastembed_model = match &config.model {
-            EmbeddingModel::MultilingualE5Small => {
-                fastembed::EmbeddingModel::MultilingualE5Small
-            }
+            EmbeddingModel::MultilingualE5Small => fastembed::EmbeddingModel::MultilingualE5Small,
             EmbeddingModel::Custom(name) => {
                 return Err(EmbeddingError::InitError(format!(
                     "Custom embedding model '{}' is not yet supported",
@@ -183,12 +181,10 @@ impl EmbeddingProvider for FastEmbedProvider {
         let model = Arc::clone(&self.model);
         let text = text.to_string();
 
-        let result = tokio::task::spawn_blocking(move || {
-            model.embed(vec![text], None)
-        })
-        .await
-        .map_err(|e| EmbeddingError::GenerationError(format!("Task join error: {}", e)))?
-        .map_err(|e| EmbeddingError::GenerationError(e.to_string()))?;
+        let result = tokio::task::spawn_blocking(move || model.embed(vec![text], None))
+            .await
+            .map_err(|e| EmbeddingError::GenerationError(format!("Task join error: {}", e)))?
+            .map_err(|e| EmbeddingError::GenerationError(e.to_string()))?;
 
         result
             .into_iter()
@@ -200,12 +196,10 @@ impl EmbeddingProvider for FastEmbedProvider {
         let model = Arc::clone(&self.model);
         let texts = texts.to_vec();
 
-        tokio::task::spawn_blocking(move || {
-            model.embed(texts, None)
-        })
-        .await
-        .map_err(|e| EmbeddingError::GenerationError(format!("Task join error: {}", e)))?
-        .map_err(|e| EmbeddingError::GenerationError(e.to_string()))
+        tokio::task::spawn_blocking(move || model.embed(texts, None))
+            .await
+            .map_err(|e| EmbeddingError::GenerationError(format!("Task join error: {}", e)))?
+            .map_err(|e| EmbeddingError::GenerationError(e.to_string()))
     }
 
     fn dimensions(&self) -> usize {
@@ -279,8 +273,7 @@ mod tests {
     fn test_embedding_config_serialization() {
         let config = EmbeddingConfig::default();
         let json = serde_json::to_string(&config).expect("serialize");
-        let deserialized: EmbeddingConfig =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: EmbeddingConfig = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(deserialized.model, EmbeddingModel::MultilingualE5Small);
     }
 

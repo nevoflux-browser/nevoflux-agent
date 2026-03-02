@@ -1049,10 +1049,7 @@ mod tests {
         assert!((entry.confidence - 0.8).abs() < 0.001);
 
         // Merge with lower confidence should NOT downgrade
-        storage
-            .knowledge()
-            .merge_entry(&entry.id, 1, 0.3)
-            .unwrap();
+        storage.knowledge().merge_entry(&entry.id, 1, 0.3).unwrap();
 
         let entry = storage.knowledge().get(&created.id).unwrap().unwrap();
         assert!((entry.confidence - 0.8).abs() < 0.001);

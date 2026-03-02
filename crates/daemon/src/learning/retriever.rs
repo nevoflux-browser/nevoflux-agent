@@ -149,7 +149,10 @@ pub fn relevance_score_hybrid(
 
     if has_semantic {
         // Semantic-weighted formula
-        0.40 * semantic + 0.20 * category_match + 0.15 * domain_match + 0.15 * decay
+        0.40 * semantic
+            + 0.20 * category_match
+            + 0.15 * domain_match
+            + 0.15 * decay
             + 0.10 * confidence
     } else {
         // Structural-only formula (normalized)
@@ -262,13 +265,8 @@ impl KnowledgeRetriever {
             .into_iter()
             .filter(|e| e.status != "archived") // Exclude archived
             .map(|entry| {
-                let score = relevance_score_hybrid(
-                    &entry,
-                    domain,
-                    category,
-                    query_emb.as_deref(),
-                    now,
-                );
+                let score =
+                    relevance_score_hybrid(&entry, domain, category, query_emb.as_deref(), now);
                 ScoredKnowledge {
                     entry,
                     relevance_score: score,
@@ -344,7 +342,10 @@ mod tests {
         let cache = make_cache();
         let retriever = KnowledgeRetriever::new(cache, storage);
 
-        let result = retriever.retrieve("", Some("example.com"), None).await.unwrap();
+        let result = retriever
+            .retrieve("", Some("example.com"), None)
+            .await
+            .unwrap();
         assert!(result.entries.is_empty());
         assert!(result.site_adaptations.is_empty());
     }
@@ -364,7 +365,10 @@ mod tests {
         // query_by_domain returns entries regardless of status, so this should work
         let retriever = KnowledgeRetriever::new(cache, Arc::clone(&storage));
 
-        let result = retriever.retrieve("", Some("github.com"), None).await.unwrap();
+        let result = retriever
+            .retrieve("", Some("github.com"), None)
+            .await
+            .unwrap();
         assert_eq!(result.entries.len(), 1);
         assert_eq!(result.entries[0].entry.id, entry.id);
     }
@@ -387,7 +391,10 @@ mod tests {
             .unwrap();
 
         let retriever = KnowledgeRetriever::new(cache, Arc::clone(&storage));
-        let result = retriever.retrieve("", Some("example.com"), None).await.unwrap();
+        let result = retriever
+            .retrieve("", Some("example.com"), None)
+            .await
+            .unwrap();
         assert!(
             result.entries.is_empty(),
             "archived entries should be excluded"
@@ -410,7 +417,10 @@ mod tests {
         }
 
         let retriever = KnowledgeRetriever::new(cache, Arc::clone(&storage));
-        let result = retriever.retrieve("", Some("example.com"), None).await.unwrap();
+        let result = retriever
+            .retrieve("", Some("example.com"), None)
+            .await
+            .unwrap();
         assert!(
             result.entries.len() <= 5,
             "should respect top_k=5, got {}",
@@ -436,7 +446,10 @@ mod tests {
         }
 
         let retriever = KnowledgeRetriever::new(cache, Arc::clone(&storage));
-        let result = retriever.retrieve("", Some("example.com"), None).await.unwrap();
+        let result = retriever
+            .retrieve("", Some("example.com"), None)
+            .await
+            .unwrap();
 
         // Verify descending order
         for window in result.entries.windows(2) {
@@ -515,7 +528,10 @@ mod tests {
         };
         let retriever = KnowledgeRetriever::with_config(cache, Arc::clone(&storage), config);
 
-        let result = retriever.retrieve("", Some("example.com"), None).await.unwrap();
+        let result = retriever
+            .retrieve("", Some("example.com"), None)
+            .await
+            .unwrap();
         assert!(
             result.entries.len() <= 2,
             "custom top_k=2 should limit results, got {}",
@@ -543,7 +559,10 @@ mod tests {
             .unwrap();
 
         let retriever = KnowledgeRetriever::new(cache, Arc::clone(&storage));
-        let result = retriever.retrieve("", Some("example.com"), None).await.unwrap();
+        let result = retriever
+            .retrieve("", Some("example.com"), None)
+            .await
+            .unwrap();
 
         assert_eq!(result.site_adaptations.len(), 1);
         assert_eq!(result.site_adaptations[0].id, "SA-test01");
@@ -594,7 +613,10 @@ mod tests {
         );
 
         let retriever = KnowledgeRetriever::new(cache, Arc::clone(&storage));
-        let result = retriever.retrieve("", Some("example.com"), None).await.unwrap();
+        let result = retriever
+            .retrieve("", Some("example.com"), None)
+            .await
+            .unwrap();
 
         assert_eq!(result.entries.len(), 1);
         assert!(
