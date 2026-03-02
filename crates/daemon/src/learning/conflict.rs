@@ -269,6 +269,7 @@ mod tests {
             updated_at: "2026-01-15T12:00:00Z".into(),
             last_hit_at: None,
             promoted_at: None,
+            embedding: None,
         }
     }
 

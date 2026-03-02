@@ -4,7 +4,7 @@
 // learning system by caching the five soul documents and querying SQLite for
 // relevant knowledge entries filtered by domain and category.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
 use nevoflux_storage::{Knowledge, SiteAdaptation, Storage};
@@ -102,7 +102,7 @@ pub fn relevance_score(
 /// filters. Entries are scored using lazy decay and confidence, then filtered
 /// and truncated to the configured top-K.
 pub struct KnowledgeRetriever {
-    soul_cache: Arc<FiveDocCache>,
+    soul_cache: RwLock<Arc<FiveDocCache>>,
     storage: Arc<Storage>,
     config: RetrievalConfig,
 }
@@ -111,7 +111,7 @@ impl KnowledgeRetriever {
     /// Create a new retriever initialized from a soul cache and storage handle.
     pub fn new(soul_cache: Arc<FiveDocCache>, storage: Arc<Storage>) -> Self {
         Self {
-            soul_cache,
+            soul_cache: RwLock::new(soul_cache),
             storage,
             config: RetrievalConfig::default(),
         }
@@ -124,20 +124,30 @@ impl KnowledgeRetriever {
         config: RetrievalConfig,
     ) -> Self {
         Self {
-            soul_cache,
+            soul_cache: RwLock::new(soul_cache),
             storage,
             config,
         }
     }
 
     /// Replace the cached soul documents with a fresh snapshot.
-    pub fn invalidate_cache(&mut self, new_cache: Arc<FiveDocCache>) {
-        self.soul_cache = new_cache;
+    ///
+    /// This method is safe to call through a shared `&self` reference
+    /// thanks to interior mutability.
+    pub fn invalidate_cache(&self, new_cache: Arc<FiveDocCache>) {
+        *self.soul_cache.write().unwrap() = new_cache;
     }
 
-    /// Get a reference to the cached soul documents.
-    pub fn soul_cache(&self) -> &FiveDocCache {
-        &self.soul_cache
+    /// Update the soul cache from a new `FiveDocCache` value.
+    ///
+    /// Thread-safe; can be called through `Arc<KnowledgeRetriever>`.
+    pub fn update_soul_cache(&self, cache: FiveDocCache) {
+        *self.soul_cache.write().unwrap() = Arc::new(cache);
+    }
+
+    /// Get a snapshot of the cached soul documents.
+    pub fn soul_cache(&self) -> Arc<FiveDocCache> {
+        self.soul_cache.read().unwrap().clone()
     }
 
     /// Retrieve relevant knowledge for a given domain and category.
@@ -390,7 +400,7 @@ mod tests {
     fn invalidate_cache_updates_cache() {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let cache = make_cache();
-        let mut retriever = KnowledgeRetriever::new(cache, storage);
+        let retriever = KnowledgeRetriever::new(cache, storage);
 
         assert_eq!(retriever.soul_cache().identity_raw, "# Identity");
 
@@ -555,6 +565,7 @@ mod tests {
             updated_at: now.clone(),
             last_hit_at: Some(now),
             promoted_at: None,
+            embedding: None,
         }
     }
 
@@ -592,6 +603,7 @@ mod tests {
             updated_at: timestamp.clone(),
             last_hit_at: Some(timestamp),
             promoted_at: None,
+            embedding: None,
         }
     }
 

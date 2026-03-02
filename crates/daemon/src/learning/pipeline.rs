@@ -44,24 +44,63 @@ impl Default for ValidationThresholds {
     }
 }
 
+/// Per-category thresholds for the promotion step.
+#[derive(Debug, Clone)]
+pub struct CategoryPromotionThresholds {
+    /// Minimum hit count before an entry can be promoted.
+    pub min_hits: u32,
+    /// Minimum effectiveness / confidence score for promotion.
+    pub min_effectiveness: f64,
+}
+
 /// Configurable thresholds for the promotion step.
 ///
-/// Only validated entries whose confidence meets `min_confidence` are eligible
-/// for promotion. The batch size controls how many entries are processed per
-/// `promote()` call.
+/// Each knowledge category has its own minimum hits and effectiveness.
+/// An entry must also survive at least `min_alive_days` days before
+/// it is eligible for promotion.
 #[derive(Debug, Clone)]
 pub struct PromotionThresholds {
-    /// Minimum confidence score for promotion (0.0 to 1.0).
-    pub min_confidence: f64,
     /// Maximum number of entries to promote in a single batch.
     pub batch_size: usize,
+    /// Minimum age in days since the entry was created.
+    pub min_alive_days: u64,
+    /// Thresholds for `site_interaction` entries.
+    pub site_interaction: CategoryPromotionThresholds,
+    /// Thresholds for `tool_optimization` entries.
+    pub tool_optimization: CategoryPromotionThresholds,
+    /// Thresholds for `user_preference` entries.
+    pub user_preference: CategoryPromotionThresholds,
 }
 
 impl Default for PromotionThresholds {
     fn default() -> Self {
         Self {
-            min_confidence: 0.6,
             batch_size: 50,
+            min_alive_days: 7,
+            site_interaction: CategoryPromotionThresholds {
+                min_hits: 10,
+                min_effectiveness: 0.6,
+            },
+            tool_optimization: CategoryPromotionThresholds {
+                min_hits: 10,
+                min_effectiveness: 0.7,
+            },
+            user_preference: CategoryPromotionThresholds {
+                min_hits: 5,
+                min_effectiveness: 0.5,
+            },
+        }
+    }
+}
+
+impl PromotionThresholds {
+    /// Look up the category-specific thresholds for a given category string.
+    fn for_category(&self, category: &str) -> &CategoryPromotionThresholds {
+        match category {
+            "site_interaction" | "siteinteraction" => &self.site_interaction,
+            "tool_optimization" | "tooloptimization" => &self.tool_optimization,
+            "user_preference" | "userpreference" => &self.user_preference,
+            _ => &self.site_interaction, // default fallback
         }
     }
 }
@@ -163,35 +202,63 @@ impl LearningPipeline {
     /// Drain all entries from the buffer and insert them into the SQLite
     /// knowledge table.
     ///
+    /// Before creating a new knowledge row, the method checks whether an
+    /// existing entry with the same `category`, `domain`, and `summary`
+    /// already exists.  When a duplicate is found the existing row is
+    /// *merged* (hit-count is accumulated, confidence is promoted to the
+    /// maximum of the two values) instead of inserting a new row.
+    ///
     /// When an [`EncryptionService`] is attached, the `summary` and `details`
     /// fields of entries whose `privacy_level` is `"sensitive"` are encrypted
     /// before insertion.
     ///
-    /// Returns the number of entries that were flushed. Returns `Ok(0)` if
-    /// the pipeline is paused.
+    /// Returns the number of **new** entries that were created (merged
+    /// duplicates are not counted). Returns `Ok(0)` if the pipeline is paused.
     pub fn flush(&self) -> Result<usize> {
         if !self.is_enabled() {
             return Ok(0);
         }
         let entries = self.buffer.drain_all();
-        let count = entries.len();
+        let total = entries.len();
+        let mut written = 0;
+
         for entry in &entries {
-            let mut params = Self::entry_to_knowledge_params(entry);
+            let category_str = format!("{:?}", entry.category).to_lowercase();
+            let domain = entry.context.domain.as_deref();
 
-            // Encrypt sensitive fields when an encryption service is available
-            if let Some(ref enc) = self.encryption {
-                let privacy = params.privacy_level.as_deref().unwrap_or("internal");
-                if privacy == "sensitive" {
-                    params.summary = enc.encrypt_if_sensitive(&params.summary, privacy)?;
-                    params.details = enc.encrypt_if_sensitive(&params.details, privacy)?;
+            // Check for an existing entry with the same category+domain+summary
+            let existing = self
+                .storage
+                .knowledge()
+                .find_duplicate(&category_str, domain, &entry.summary)?;
+
+            if let Some(existing) = existing {
+                // Merge: accumulate hits, take max confidence
+                self.storage.knowledge().merge_entry(
+                    &existing.id,
+                    entry.occurrence_count,
+                    entry.confidence,
+                )?;
+            } else {
+                // New entry: create as before
+                let mut params = Self::entry_to_knowledge_params(entry);
+
+                // Encrypt sensitive fields when an encryption service is available
+                if let Some(ref enc) = self.encryption {
+                    let privacy = params.privacy_level.as_deref().unwrap_or("internal");
+                    if privacy == "sensitive" {
+                        params.summary = enc.encrypt_if_sensitive(&params.summary, privacy)?;
+                        params.details = enc.encrypt_if_sensitive(&params.details, privacy)?;
+                    }
                 }
-            }
 
-            self.storage.knowledge().create(params)?;
+                self.storage.knowledge().create(params)?;
+                written += 1;
+            }
         }
         self.buffer.mark_flushed();
-        self.record_metric("flush", count as f64, None);
-        Ok(count)
+        self.record_metric("flush", total as f64, None);
+        Ok(written)
     }
 
     /// Convert a `LearningEntry` to `CreateKnowledgeParams` for SQLite
@@ -288,14 +355,59 @@ impl LearningPipeline {
         let mut result = PromotionResult::default();
 
         for entry in &validated {
-            // Check confidence threshold
-            if entry.confidence < thresholds.min_confidence {
+            // Look up category-specific thresholds
+            let cat_thresholds = thresholds.for_category(&entry.category);
+
+            // Check confidence / effectiveness threshold
+            if entry.confidence < cat_thresholds.min_effectiveness {
                 result.skipped_threshold += 1;
                 continue;
             }
 
+            // Check minimum hit count
+            if (entry.hit_count as u32) < cat_thresholds.min_hits {
+                result.skipped_threshold += 1;
+                continue;
+            }
+
+            // Check minimum age (days since created_at)
+            if thresholds.min_alive_days > 0 {
+                if let Ok(created) = entry.created_at.parse::<DateTime<Utc>>() {
+                    let age_days = (Utc::now() - created).num_days();
+                    if age_days < 0 || (age_days as u64) < thresholds.min_alive_days {
+                        result.skipped_threshold += 1;
+                        continue;
+                    }
+                }
+            }
+
             // Determine target document and section
             let route = routing::route_knowledge(entry);
+
+            // Idempotency: skip if this entry's ID is already referenced in the
+            // target section (prevents duplicate content if mark_promoted failed
+            // on a previous run).
+            if Self::is_already_promoted(soul_manager, &entry.id, &route) {
+                // Silently mark as promoted so it won't be re-processed.
+                let _ = self
+                    .storage
+                    .knowledge()
+                    .mark_promoted(&entry.id, &route.section);
+                continue;
+            }
+
+            // Manual-edit priority: skip system promotion to sections that
+            // have been manually edited by the user.
+            if soul_manager.is_manual_section(&route.target_file, &route.section) {
+                tracing::info!(
+                    entry_id = %entry.id,
+                    target = %route.target_file,
+                    section = %route.section,
+                    "Skipping promotion: section has manual edits (manual always wins)"
+                );
+                result.skipped_protection += 1;
+                continue;
+            }
 
             // Check protection level — only auto-promote AutoWithNotify
             let permission = protection::check_permission(&route.target_file, &route.section);
@@ -304,21 +416,23 @@ impl LearningPipeline {
                 continue;
             }
 
-            // Build the SoulChange
+            // Build the SoulChange — include entry ID for idempotency tracking
             let content = if let Some(ref resolution) = entry.resolution {
                 format!(
-                    "- **{}** ({}): {} — {}",
+                    "- **{}** ({}): {} — {} <!-- {} -->",
                     entry.summary,
                     entry.domain.as_deref().unwrap_or("universal"),
                     entry.details,
-                    resolution
+                    resolution,
+                    entry.id,
                 )
             } else {
                 format!(
-                    "- **{}** ({}): {}",
+                    "- **{}** ({}): {} <!-- {} -->",
                     entry.summary,
                     entry.domain.as_deref().unwrap_or("universal"),
-                    entry.details
+                    entry.details,
+                    entry.id,
                 )
             };
 
@@ -372,6 +486,28 @@ impl LearningPipeline {
         Ok(result)
     }
 
+    /// Check if a knowledge entry has already been promoted to the target
+    /// soul document section.
+    ///
+    /// Looks for the entry's ID in the raw document content of the target
+    /// file's section. This prevents duplicate content when `mark_promoted`
+    /// fails after a successful `apply_change`.
+    fn is_already_promoted(
+        soul_manager: &SoulManager,
+        entry_id: &str,
+        route: &routing::RouteTarget,
+    ) -> bool {
+        let doc_content = match route.target_file.as_str() {
+            "IDENTITY.md" => &soul_manager.cache().identity_raw,
+            "SOUL.md" => &soul_manager.cache().soul_raw,
+            "USER.md" => &soul_manager.cache().user_raw,
+            "TOOLS.md" => &soul_manager.cache().tools_raw,
+            "AGENTS.md" => &soul_manager.cache().agents_raw,
+            _ => return false,
+        };
+        doc_content.contains(entry_id)
+    }
+
     /// Resurrect an archived knowledge entry when it receives a new hit.
     ///
     /// Changes the entry's status from "archived" to "validated", updates
@@ -413,6 +549,24 @@ mod tests {
         let buffer = Arc::new(MemoryBuffer::new(20, Duration::from_secs(30)));
         let pipeline = LearningPipeline::new(buffer, storage.clone());
         (pipeline, storage)
+    }
+
+    /// Create relaxed promotion thresholds suitable for unit tests.
+    ///
+    /// Uses min_hits=1, min_effectiveness=0.0, min_alive_days=0 so that
+    /// freshly-created entries qualify immediately.
+    fn test_promotion_thresholds(batch_size: usize) -> PromotionThresholds {
+        let relaxed = CategoryPromotionThresholds {
+            min_hits: 1,
+            min_effectiveness: 0.0,
+        };
+        PromotionThresholds {
+            batch_size,
+            min_alive_days: 0,
+            site_interaction: relaxed.clone(),
+            tool_optimization: relaxed.clone(),
+            user_preference: relaxed,
+        }
     }
 
     #[test]
@@ -980,8 +1134,14 @@ mod tests {
     #[test]
     fn promotion_thresholds_default_values() {
         let thresholds = PromotionThresholds::default();
-        assert!((thresholds.min_confidence - 0.6).abs() < f64::EPSILON);
         assert_eq!(thresholds.batch_size, 50);
+        assert_eq!(thresholds.min_alive_days, 7);
+        assert!((thresholds.site_interaction.min_effectiveness - 0.6).abs() < f64::EPSILON);
+        assert_eq!(thresholds.site_interaction.min_hits, 10);
+        assert!((thresholds.tool_optimization.min_effectiveness - 0.7).abs() < f64::EPSILON);
+        assert_eq!(thresholds.tool_optimization.min_hits, 10);
+        assert!((thresholds.user_preference.min_effectiveness - 0.5).abs() < f64::EPSILON);
+        assert_eq!(thresholds.user_preference.min_hits, 5);
     }
 
     #[test]
@@ -1046,10 +1206,7 @@ mod tests {
             0.85,
         );
 
-        let thresholds = PromotionThresholds {
-            min_confidence: 0.6,
-            batch_size: 10,
-        };
+        let thresholds = test_promotion_thresholds(10);
 
         let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
         assert_eq!(result.promoted, 1);
@@ -1091,7 +1248,7 @@ mod tests {
             0.9,
         );
 
-        let thresholds = PromotionThresholds::default();
+        let thresholds = test_promotion_thresholds(10);
         let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
         assert_eq!(result.promoted, 1);
 
@@ -1118,10 +1275,9 @@ mod tests {
             0.3,
         );
 
-        let thresholds = PromotionThresholds {
-            min_confidence: 0.6,
-            batch_size: 10,
-        };
+        // Use strict effectiveness threshold so 0.3 confidence is below it
+        let mut thresholds = test_promotion_thresholds(10);
+        thresholds.site_interaction.min_effectiveness = 0.6;
 
         let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
         assert_eq!(result.promoted, 0);
@@ -1159,7 +1315,7 @@ mod tests {
             })
             .unwrap();
 
-        let thresholds = PromotionThresholds::default();
+        let thresholds = test_promotion_thresholds(10);
         let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
         assert_eq!(result.promoted, 0);
         assert_eq!(result.skipped_protection, 1);
@@ -1217,10 +1373,7 @@ mod tests {
             0.9,
         );
 
-        let thresholds = PromotionThresholds {
-            min_confidence: 0.6,
-            batch_size: 10,
-        };
+        let thresholds = test_promotion_thresholds(10);
 
         let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
         assert_eq!(result.promoted, 3);
@@ -1259,10 +1412,7 @@ mod tests {
         }
 
         // batch_size of 2 should only process 2
-        let thresholds = PromotionThresholds {
-            min_confidence: 0.6,
-            batch_size: 2,
-        };
+        let thresholds = test_promotion_thresholds(2);
 
         let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
         assert_eq!(result.promoted, 2);
@@ -1283,8 +1433,8 @@ mod tests {
         let created = storage
             .knowledge()
             .create(CreateKnowledgeParams {
-                category: "user_preference".into(),
-                subcategory: Some("language".into()),
+                category: "tool_optimization".into(),
+                subcategory: Some("timeout".into()),
                 summary: "Custom routed entry".into(),
                 details: "details".into(),
                 promotion_target: Some("TOOLS".into()),
@@ -1303,7 +1453,7 @@ mod tests {
             })
             .unwrap();
 
-        let thresholds = PromotionThresholds::default();
+        let thresholds = test_promotion_thresholds(10);
         let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
         assert_eq!(result.promoted, 1);
 
@@ -1362,7 +1512,7 @@ mod tests {
         assert_eq!(validated_count, 1);
 
         // Step 3: Promote
-        let promo_thresholds = PromotionThresholds::default();
+        let promo_thresholds = test_promotion_thresholds(10);
         let result = pipeline
             .promote(&promo_thresholds, &mut manager)
             .await
@@ -1378,6 +1528,123 @@ mod tests {
             .await
             .unwrap();
         assert!(tools.contains("example.com uses semantic selectors"));
+    }
+
+    // --- Flush deduplication tests ---
+
+    #[test]
+    fn flush_deduplicates_against_existing_entries() {
+        let (pipeline, storage) = setup();
+
+        // First flush: create entry
+        let mut entry1 = LearningEntry::new(
+            LearningCategory::ToolOptimization,
+            "tool_slow",
+            "Tool X is slow",
+        );
+        entry1.details = Some("avg 15s".into());
+        entry1.context.domain = Some("example.com".into());
+        entry1.confidence = 0.6;
+        entry1.occurrence_count = 1;
+
+        pipeline.buffer().insert(entry1);
+        let count1 = pipeline.flush().unwrap();
+        assert_eq!(count1, 1);
+
+        // Second flush: same category+domain+summary → should merge
+        let mut entry2 = LearningEntry::new(
+            LearningCategory::ToolOptimization,
+            "tool_slow",
+            "Tool X is slow",
+        );
+        entry2.details = Some("avg 20s".into());
+        entry2.context.domain = Some("example.com".into());
+        entry2.confidence = 0.8;
+        entry2.occurrence_count = 2;
+
+        pipeline.buffer().insert(entry2);
+        let count2 = pipeline.flush().unwrap();
+        assert_eq!(count2, 0); // 0 new entries (merged into existing)
+
+        // Verify only 1 entry, with merged values
+        let all = storage.knowledge().query_all(100).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].hit_count, 3); // 1 + 2
+        assert!((all[0].confidence - 0.8).abs() < 0.01); // max(0.6, 0.8)
+    }
+
+    #[test]
+    fn flush_creates_new_entry_when_summary_differs() {
+        let (pipeline, storage) = setup();
+
+        // First entry
+        pipeline.buffer().insert(
+            LearningEntry::new(
+                LearningCategory::ToolOptimization,
+                "tool_slow",
+                "Tool X is slow",
+            )
+            .with_context(LearningContext {
+                domain: Some("example.com".into()),
+                ..Default::default()
+            }),
+        );
+        pipeline.flush().unwrap();
+
+        // Second entry: same category+domain but different summary
+        pipeline.buffer().insert(
+            LearningEntry::new(
+                LearningCategory::ToolOptimization,
+                "tool_slow",
+                "Tool Y is slow",
+            )
+            .with_context(LearningContext {
+                domain: Some("example.com".into()),
+                ..Default::default()
+            }),
+        );
+        let count = pipeline.flush().unwrap();
+        assert_eq!(count, 1); // new entry, not merged
+
+        let all = storage.knowledge().query_all(100).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn flush_creates_new_entry_when_domain_differs() {
+        let (pipeline, storage) = setup();
+
+        // First entry on example.com
+        pipeline.buffer().insert(
+            LearningEntry::new(
+                LearningCategory::SiteInteraction,
+                "click_failed",
+                "Button click failed",
+            )
+            .with_context(LearningContext {
+                domain: Some("example.com".into()),
+                ..Default::default()
+            }),
+        );
+        pipeline.flush().unwrap();
+
+        // Second entry: same category+summary but different domain
+        pipeline.buffer().insert(
+            LearningEntry::new(
+                LearningCategory::SiteInteraction,
+                "click_failed",
+                "Button click failed",
+            )
+            .with_context(LearningContext {
+                domain: Some("other.com".into()),
+                ..Default::default()
+            }),
+        );
+        let count = pipeline.flush().unwrap();
+        assert_eq!(count, 1); // new entry, not merged
+
+        let all = storage.knowledge().query_all(100).unwrap();
+        assert_eq!(all.len(), 2);
     }
 
     // --- Resurrection pipeline tests ---
@@ -1581,10 +1848,7 @@ mod tests {
             0.85,
         );
 
-        let thresholds = PromotionThresholds {
-            min_confidence: 0.6,
-            batch_size: 10,
-        };
+        let thresholds = test_promotion_thresholds(10);
 
         pipeline.promote(&thresholds, &mut manager).await.unwrap();
 
@@ -1613,10 +1877,9 @@ mod tests {
             0.3,
         );
 
-        let thresholds = PromotionThresholds {
-            min_confidence: 0.6,
-            batch_size: 10,
-        };
+        // Use strict effectiveness threshold so 0.3 confidence is below it
+        let mut thresholds = test_promotion_thresholds(10);
+        thresholds.site_interaction.min_effectiveness = 0.6;
 
         let result = pipeline.promote(&thresholds, &mut manager).await.unwrap();
         assert_eq!(result.skipped_threshold, 1);
