@@ -140,7 +140,7 @@ download-model:
     import os
     cache_dir = 'models/fastembed'
     os.makedirs(cache_dir, exist_ok=True)
-    snapshot_download('intfloat/multilingual-e5-small', cache_dir=cache_dir, allow_patterns=['onnx/*'])
+    snapshot_download('intfloat/multilingual-e5-small', cache_dir=cache_dir, allow_patterns=['onnx/model.onnx', 'onnx/tokenizer.json', 'onnx/config.json', 'onnx/special_tokens_map.json', 'onnx/tokenizer_config.json', 'onnx/sentencepiece.bpe.model'])
     print(f'Model downloaded to {cache_dir}')
     "
 
