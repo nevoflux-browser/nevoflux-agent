@@ -202,11 +202,17 @@ nevoflux setup
 | Tool | Description | Parameters |
 |------|-------------|------------|
 | `computer_screenshot` | Capture screen | `monitor?` |
-| `computer_mouse_move` | Move cursor | `x`, `y`, `click?` |
-| `computer_click` | Click at position | `x`, `y`, `button?` |
+| `computer_mouse_move` | Move cursor (no click) | `x`, `y` |
+| `computer_click` | Click at position | `x`, `y`, `button?`, `click_type?` |
 | `computer_type_text` | Type text | `text`, `delay_ms?` |
-| `computer_key` | Press keyboard keys | `keys` |
+| `computer_key` | Press keyboard keys | `key`, `modifiers?`, `repeat?` |
 | `computer_scroll` | Scroll at position | `x`, `y`, `direction`, `amount?` |
+| `computer_drag` | Drag between positions | `start_x`, `start_y`, `end_x`, `end_y`, `button?` |
+| `computer_cursor_position` | Get cursor position | - |
+| `computer_mouse_down` | Press and hold button | `x`, `y`, `button?` |
+| `computer_mouse_up` | Release button | `x`, `y`, `button?` |
+| `computer_hold_key` | Hold key for duration | `key`, `duration_ms`, `modifiers?` |
+| `computer_wait` | Wait for duration | `ms` |
 
 ### Agent Tools
 
