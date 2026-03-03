@@ -13,8 +13,8 @@ use nevoflux_mcp::{create_tools, JsonRpcRequest, McpServer, McpServerConfig, PRO
 fn test_mcp_tools_complete() {
     let tools = create_tools();
 
-    // Should have 23 tools (16 browser + 1 agent + 6 computer)
-    assert_eq!(tools.len(), 23, "Expected 23 tools, got {}", tools.len());
+    // Should have 29 tools (16 browser + 1 agent + 12 computer)
+    assert_eq!(tools.len(), 29, "Expected 29 tools, got {}", tools.len());
 
     let names: Vec<_> = tools.iter().map(|t| t.name.as_str()).collect();
 
@@ -71,7 +71,7 @@ fn test_mcp_tools_complete() {
     // Agent tools (1)
     assert!(names.contains(&"agent_chat"), "Missing agent_chat");
 
-    // Computer tools (6)
+    // Computer tools (12)
     assert!(
         names.contains(&"computer_screenshot"),
         "Missing computer_screenshot"
@@ -90,6 +90,24 @@ fn test_mcp_tools_complete() {
         names.contains(&"computer_scroll"),
         "Missing computer_scroll"
     );
+    assert!(names.contains(&"computer_drag"), "Missing computer_drag");
+    assert!(
+        names.contains(&"computer_cursor_position"),
+        "Missing computer_cursor_position"
+    );
+    assert!(
+        names.contains(&"computer_mouse_down"),
+        "Missing computer_mouse_down"
+    );
+    assert!(
+        names.contains(&"computer_mouse_up"),
+        "Missing computer_mouse_up"
+    );
+    assert!(
+        names.contains(&"computer_hold_key"),
+        "Missing computer_hold_key"
+    );
+    assert!(names.contains(&"computer_wait"), "Missing computer_wait");
 }
 
 #[test]
@@ -253,20 +271,8 @@ fn test_computer_mouse_move_schema() {
     assert_eq!(schema["properties"]["x"]["type"], "integer");
     assert_eq!(schema["properties"]["y"]["type"], "integer");
 
-    // Optional click action
-    assert!(schema["properties"]["click"].is_object());
-    let click_enum = &schema["properties"]["click"]["enum"];
-    assert!(click_enum.is_array());
-    let click_options: Vec<&str> = click_enum
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap())
-        .collect();
-    assert!(click_options.contains(&"left"));
-    assert!(click_options.contains(&"right"));
-    assert!(click_options.contains(&"middle"));
-    assert!(click_options.contains(&"double"));
+    // click parameter has been removed (pure movement only)
+    assert!(schema["properties"]["click"].is_null());
 
     let required = schema["required"].as_array().unwrap();
     assert!(required.contains(&serde_json::json!("x")));
@@ -309,8 +315,8 @@ fn test_mcp_server_with_all_tools() {
         server.register_tool(tool);
     }
 
-    // Verify all tools are registered (23 total: 16 browser + 1 agent + 6 computer)
-    assert_eq!(server.tools().len(), 23);
+    // Verify all tools are registered (29 total: 16 browser + 1 agent + 12 computer)
+    assert_eq!(server.tools().len(), 29);
 
     // List tools via JSON-RPC
     let request = JsonRpcRequest::with_id(1, "tools/list", None);
@@ -319,7 +325,7 @@ fn test_mcp_server_with_all_tools() {
     assert!(response.is_success());
     let result = response.result.unwrap();
     let listed_tools = result["tools"].as_array().unwrap();
-    assert_eq!(listed_tools.len(), 23);
+    assert_eq!(listed_tools.len(), 29);
 }
 
 #[test]
@@ -341,7 +347,7 @@ fn test_mcp_server_tool_categories() {
 
     assert_eq!(browser_tools.len(), 16, "Expected 16 browser tools");
     assert_eq!(agent_tools.len(), 1, "Expected 1 agent tool");
-    assert_eq!(computer_tools.len(), 6, "Expected 6 computer tools");
+    assert_eq!(computer_tools.len(), 12, "Expected 12 computer tools");
 }
 
 #[test]
@@ -531,7 +537,7 @@ fn test_full_mcp_workflow() {
 
     let result = list_response.result.unwrap();
     let tools = result["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 23);
+    assert_eq!(tools.len(), 29);
 
     // Step 3: Verify each tool is callable (though not implemented)
     let tool_names = [
@@ -554,13 +560,19 @@ fn test_full_mcp_workflow() {
         "browser_get_markdown",
         // Agent tools (1)
         "agent_chat",
-        // Computer tools (6)
+        // Computer tools (12)
         "computer_screenshot",
         "computer_mouse_move",
         "computer_type_text",
         "computer_click",
         "computer_key",
         "computer_scroll",
+        "computer_drag",
+        "computer_cursor_position",
+        "computer_mouse_down",
+        "computer_mouse_up",
+        "computer_hold_key",
+        "computer_wait",
     ];
 
     for (id, name) in tool_names.iter().enumerate() {

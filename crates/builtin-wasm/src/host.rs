@@ -203,8 +203,38 @@ pub trait HostFunctions {
     /// Take a screenshot of the screen.
     fn computer_screenshot(&self, monitor: Option<i64>) -> HostResult<String>;
 
-    /// Move mouse cursor to position, with optional click.
-    fn computer_mouse_move(&self, x: i64, y: i64, click: Option<&str>) -> HostResult<String>;
+    /// Move mouse cursor to position (pure movement, no click).
+    fn computer_mouse_move(&self, x: i64, y: i64) -> HostResult<String>;
+
+    /// Drag from one position to another.
+    fn computer_drag(
+        &self,
+        start_x: i64,
+        start_y: i64,
+        end_x: i64,
+        end_y: i64,
+        button: Option<&str>,
+    ) -> HostResult<String>;
+
+    /// Get the current mouse cursor position.
+    fn computer_cursor_position(&self) -> HostResult<String>;
+
+    /// Press and hold a mouse button at a position.
+    fn computer_mouse_down(&self, x: i64, y: i64, button: Option<&str>) -> HostResult<String>;
+
+    /// Release a mouse button at a position.
+    fn computer_mouse_up(&self, x: i64, y: i64, button: Option<&str>) -> HostResult<String>;
+
+    /// Hold a key down for a specified duration.
+    fn computer_hold_key(
+        &self,
+        key: &str,
+        duration_ms: u64,
+        modifiers: &[String],
+    ) -> HostResult<String>;
+
+    /// Wait for a specified duration (100-10000ms).
+    fn computer_wait(&self, ms: u64) -> HostResult<String>;
 
     /// Click at screen position.
     fn computer_click(
@@ -323,7 +353,11 @@ pub trait HostFunctions {
     ) -> HostResult<BrowserToolResult>;
 
     /// Get accessibility tree with element IDs for interaction.
-    fn browser_get_elements(&self, tab_id: Option<i64>, keywords: Option<Vec<String>>) -> HostResult<BrowserToolResult>;
+    fn browser_get_elements(
+        &self,
+        tab_id: Option<i64>,
+        keywords: Option<Vec<String>>,
+    ) -> HostResult<BrowserToolResult>;
 
     /// List all open browser tabs.
     fn browser_list_tabs(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
@@ -718,8 +752,50 @@ impl HostFunctions for MockHostFunctions {
         Ok(r#"{"width":1920,"height":1080,"format":"png","data":"mock_base64"}"#.into())
     }
 
-    fn computer_mouse_move(&self, x: i64, y: i64, _click: Option<&str>) -> HostResult<String> {
+    fn computer_mouse_move(&self, x: i64, y: i64) -> HostResult<String> {
         Ok(format!(r#"{{"moved_to":{{"x":{},"y":{}}}}}"#, x, y))
+    }
+
+    fn computer_drag(
+        &self,
+        start_x: i64,
+        start_y: i64,
+        end_x: i64,
+        end_y: i64,
+        _button: Option<&str>,
+    ) -> HostResult<String> {
+        Ok(format!(
+            r#"{{"dragged":{{"from":{{"x":{},"y":{}}},"to":{{"x":{},"y":{}}}}}}}"#,
+            start_x, start_y, end_x, end_y
+        ))
+    }
+
+    fn computer_cursor_position(&self) -> HostResult<String> {
+        Ok(r#"{"x":960,"y":540}"#.into())
+    }
+
+    fn computer_mouse_down(&self, x: i64, y: i64, _button: Option<&str>) -> HostResult<String> {
+        Ok(format!(r#"{{"mouse_down":{{"x":{},"y":{}}}}}"#, x, y))
+    }
+
+    fn computer_mouse_up(&self, x: i64, y: i64, _button: Option<&str>) -> HostResult<String> {
+        Ok(format!(r#"{{"mouse_up":{{"x":{},"y":{}}}}}"#, x, y))
+    }
+
+    fn computer_hold_key(
+        &self,
+        key: &str,
+        duration_ms: u64,
+        _modifiers: &[String],
+    ) -> HostResult<String> {
+        Ok(format!(
+            r#"{{"held":"{}","duration_ms":{}}}"#,
+            key, duration_ms
+        ))
+    }
+
+    fn computer_wait(&self, ms: u64) -> HostResult<String> {
+        Ok(format!(r#"{{"waited_ms":{}}}"#, ms))
     }
 
     fn computer_click(
@@ -916,7 +992,11 @@ impl HostFunctions for MockHostFunctions {
         })))
     }
 
-    fn browser_get_elements(&self, _tab_id: Option<i64>, _keywords: Option<Vec<String>>) -> HostResult<BrowserToolResult> {
+    fn browser_get_elements(
+        &self,
+        _tab_id: Option<i64>,
+        _keywords: Option<Vec<String>>,
+    ) -> HostResult<BrowserToolResult> {
         Ok(BrowserToolResult::success(serde_json::json!({
             "refs": {
                 "e1": {"role": "button", "name": "Submit", "selectors": [{"type": "css", "strategy": "id", "value": "#submit"}]},

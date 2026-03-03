@@ -350,6 +350,53 @@ impl DaemonHostFunctions {
         }
     }
 
+    /// Get the computer controller from services, returning a descriptive error if unavailable.
+    fn get_computer_controller(
+        &self,
+    ) -> HostResult<&Arc<dyn nevoflux_computer::ComputerController>> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+        services
+            .computer_controller
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 2,
+                message: "Computer controller not configured".into(),
+            })
+    }
+
+    /// Parse a mouse button string into a `MouseButton` enum value.
+    fn parse_mouse_button(button: Option<&str>) -> nevoflux_computer::MouseButton {
+        use nevoflux_computer::MouseButton;
+        match button {
+            Some("right") => MouseButton::Right,
+            Some("middle") => MouseButton::Middle,
+            _ => MouseButton::Left,
+        }
+    }
+
+    /// Apply modifier strings to a `KeyCombination`.
+    fn apply_modifiers(
+        combination: nevoflux_computer::KeyCombination,
+        modifiers: &[String],
+    ) -> nevoflux_computer::KeyCombination {
+        let mut combination = combination;
+        for m in modifiers {
+            match m.to_lowercase().as_str() {
+                "shift" => combination = combination.with_shift(),
+                "ctrl" | "control" => combination = combination.with_ctrl(),
+                "alt" => combination = combination.with_alt(),
+                "meta" | "cmd" | "command" | "win" | "windows" | "super" => {
+                    combination = combination.with_meta()
+                }
+                _ => {}
+            }
+        }
+        combination
+    }
+
     /// Record a site adaptation entry for a browser tool action.
     ///
     /// Spawns a background task to upsert the adaptation record so the
@@ -438,8 +485,7 @@ impl DaemonHostFunctions {
                     let old_rate = record.success_rate;
                     let old_count = record.sample_count;
                     let new_count = old_count + 1;
-                    let new_rate = (old_rate * old_count as f64
-                        + if success { 1.0 } else { 0.0 })
+                    let new_rate = (old_rate * old_count as f64 + if success { 1.0 } else { 0.0 })
                         / new_count as f64;
                     if let Err(e) = repo.update_stats(&record.id, new_rate, new_count) {
                         debug!("Failed to update site adaptation stats: {}", e);
@@ -447,12 +493,11 @@ impl DaemonHostFunctions {
                 }
                 Ok(None) => {
                     // Create new record, then set initial stats
-                    let create_params =
-                        nevoflux_storage::CreateSiteAdaptationParams::new(
-                            &domain,
-                            "selector_result",
-                            &content_str,
-                        );
+                    let create_params = nevoflux_storage::CreateSiteAdaptationParams::new(
+                        &domain,
+                        "selector_result",
+                        &content_str,
+                    );
                     match repo.create(create_params) {
                         Ok(record) => {
                             let rate = if success { 1.0 } else { 0.0 };
@@ -2399,19 +2444,7 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn computer_screenshot(&self, monitor: Option<i64>) -> HostResult<String> {
-        let services = self.services.as_ref().ok_or_else(|| HostError {
-            code: 1,
-            message: "Services not available".into(),
-        })?;
-        let controller = services
-            .computer_controller
-            .as_ref()
-            .ok_or_else(|| HostError {
-                code: 2,
-                message: "Computer controller not configured".into(),
-            })?;
-
-        let controller = controller.clone();
+        let controller = self.get_computer_controller()?.clone();
         let result = tokio::task::block_in_place(|| {
             self.runtime.block_on(async {
                 if let Some(display_id) = monitor {
@@ -2432,22 +2465,74 @@ impl HostFunctions for DaemonHostFunctions {
         })
     }
 
-    fn computer_mouse_move(&self, x: i64, y: i64, click: Option<&str>) -> HostResult<String> {
-        use nevoflux_computer::{ClickType, MouseButton, Point};
+    fn computer_mouse_move(&self, x: i64, y: i64) -> HostResult<String> {
+        use nevoflux_computer::Point;
 
-        let services = self.services.as_ref().ok_or_else(|| HostError {
-            code: 1,
-            message: "Services not available".into(),
+        let controller = self.get_computer_controller()?.clone();
+        let point = Point::new(x as i32, y as i32);
+
+        tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                controller.move_to(point).await.map_err(|e| HostError {
+                    code: 3,
+                    message: format!("Mouse move failed: {}", e),
+                })
+            })
         })?;
-        let controller = services
-            .computer_controller
-            .as_ref()
-            .ok_or_else(|| HostError {
-                code: 2,
-                message: "Computer controller not configured".into(),
-            })?;
 
-        let controller = controller.clone();
+        Ok(format!(r#"{{"moved_to":{{"x":{},"y":{}}}}}"#, x, y))
+    }
+
+    fn computer_drag(
+        &self,
+        start_x: i64,
+        start_y: i64,
+        end_x: i64,
+        end_y: i64,
+        button: Option<&str>,
+    ) -> HostResult<String> {
+        use nevoflux_computer::Point;
+
+        let controller = self.get_computer_controller()?.clone();
+        let btn = Self::parse_mouse_button(button);
+        let from = Point::new(start_x as i32, start_y as i32);
+        let to = Point::new(end_x as i32, end_y as i32);
+
+        tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                controller.drag(from, to, btn).await.map_err(|e| HostError {
+                    code: 3,
+                    message: format!("Drag failed: {}", e),
+                })
+            })
+        })?;
+
+        Ok(format!(
+            r#"{{"dragged":{{"from":{{"x":{},"y":{}}},"to":{{"x":{},"y":{}}}}}}}"#,
+            start_x, start_y, end_x, end_y
+        ))
+    }
+
+    fn computer_cursor_position(&self) -> HostResult<String> {
+        let controller = self.get_computer_controller()?.clone();
+
+        let pos = tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                controller.get_position().await.map_err(|e| HostError {
+                    code: 3,
+                    message: format!("Get cursor position failed: {}", e),
+                })
+            })
+        })?;
+
+        Ok(format!(r#"{{"x":{},"y":{}}}"#, pos.x, pos.y))
+    }
+
+    fn computer_mouse_down(&self, x: i64, y: i64, button: Option<&str>) -> HostResult<String> {
+        use nevoflux_computer::Point;
+
+        let controller = self.get_computer_controller()?.clone();
+        let btn = Self::parse_mouse_button(button);
         let point = Point::new(x as i32, y as i32);
 
         tokio::task::block_in_place(|| {
@@ -2456,28 +2541,99 @@ impl HostFunctions for DaemonHostFunctions {
                     code: 3,
                     message: format!("Mouse move failed: {}", e),
                 })?;
-
-                if let Some(click_action) = click {
-                    let (button, click_type) = match click_action {
-                        "right" => (MouseButton::Right, ClickType::Single),
-                        "middle" => (MouseButton::Middle, ClickType::Single),
-                        "double" => (MouseButton::Left, ClickType::Double),
-                        _ => (MouseButton::Left, ClickType::Single),
-                    };
-                    controller
-                        .click(button, click_type)
-                        .await
-                        .map_err(|e| HostError {
-                            code: 3,
-                            message: format!("Click failed: {}", e),
-                        })?;
-                }
-
-                Ok::<_, HostError>(())
+                controller.press(btn).await.map_err(|e| HostError {
+                    code: 3,
+                    message: format!("Mouse down failed: {}", e),
+                })
             })
         })?;
 
-        Ok(format!(r#"{{"moved_to":{{"x":{},"y":{}}}}}"#, x, y))
+        Ok(format!(
+            r#"{{"mouse_down":{{"x":{},"y":{},"button":"{}"}}}}"#,
+            x,
+            y,
+            button.unwrap_or("left")
+        ))
+    }
+
+    fn computer_mouse_up(&self, x: i64, y: i64, button: Option<&str>) -> HostResult<String> {
+        use nevoflux_computer::Point;
+
+        let controller = self.get_computer_controller()?.clone();
+        let btn = Self::parse_mouse_button(button);
+        let point = Point::new(x as i32, y as i32);
+
+        tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                controller.move_to(point).await.map_err(|e| HostError {
+                    code: 3,
+                    message: format!("Mouse move failed: {}", e),
+                })?;
+                controller.release(btn).await.map_err(|e| HostError {
+                    code: 3,
+                    message: format!("Mouse up failed: {}", e),
+                })
+            })
+        })?;
+
+        Ok(format!(
+            r#"{{"mouse_up":{{"x":{},"y":{},"button":"{}"}}}}"#,
+            x,
+            y,
+            button.unwrap_or("left")
+        ))
+    }
+
+    fn computer_hold_key(
+        &self,
+        key: &str,
+        duration_ms: u64,
+        modifiers: &[String],
+    ) -> HostResult<String> {
+        use nevoflux_computer::KeyCombination;
+
+        let controller = self.get_computer_controller()?.clone();
+
+        let key_or_char = parse_key_str(key).map_err(|msg| HostError {
+            code: 4,
+            message: msg,
+        })?;
+
+        let combination = KeyCombination {
+            key: key_or_char,
+            modifiers: Vec::new(),
+        };
+        let combination = Self::apply_modifiers(combination, modifiers);
+
+        let clamped_ms = duration_ms.clamp(100, 10000);
+
+        tokio::task::block_in_place(|| {
+            self.runtime.block_on(async {
+                controller
+                    .key_down(combination.clone())
+                    .await
+                    .map_err(|e| HostError {
+                        code: 3,
+                        message: format!("Key down failed: {}", e),
+                    })?;
+                tokio::time::sleep(std::time::Duration::from_millis(clamped_ms)).await;
+                controller.key_up(combination).await.map_err(|e| HostError {
+                    code: 3,
+                    message: format!("Key up failed: {}", e),
+                })
+            })
+        })?;
+
+        Ok(format!(
+            r#"{{"held":"{}","duration_ms":{}}}"#,
+            key, clamped_ms
+        ))
+    }
+
+    fn computer_wait(&self, ms: u64) -> HostResult<String> {
+        let clamped_ms = ms.clamp(100, 10000);
+        std::thread::sleep(std::time::Duration::from_millis(clamped_ms));
+        Ok(format!(r#"{{"waited_ms":{}}}"#, clamped_ms))
     }
 
     fn computer_click(
@@ -2487,32 +2643,16 @@ impl HostFunctions for DaemonHostFunctions {
         button: Option<&str>,
         click_type: Option<&str>,
     ) -> HostResult<String> {
-        use nevoflux_computer::{ClickType, MouseButton, Point};
+        use nevoflux_computer::{ClickType, Point};
 
-        let services = self.services.as_ref().ok_or_else(|| HostError {
-            code: 1,
-            message: "Services not available".into(),
-        })?;
-        let controller = services
-            .computer_controller
-            .as_ref()
-            .ok_or_else(|| HostError {
-                code: 2,
-                message: "Computer controller not configured".into(),
-            })?;
-
-        let btn = match button {
-            Some("right") => MouseButton::Right,
-            Some("middle") => MouseButton::Middle,
-            _ => MouseButton::Left,
-        };
+        let controller = self.get_computer_controller()?.clone();
+        let btn = Self::parse_mouse_button(button);
         let ct = match click_type {
             Some("double") => ClickType::Double,
             Some("triple") => ClickType::Triple,
             _ => ClickType::Single,
         };
         let point = Point::new(x as i32, y as i32);
-        let controller = controller.clone();
 
         tokio::task::block_in_place(|| {
             self.runtime.block_on(async {
@@ -2536,19 +2676,7 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn computer_type_text(&self, text: &str, _delay_ms: Option<u64>) -> HostResult<String> {
-        let services = self.services.as_ref().ok_or_else(|| HostError {
-            code: 1,
-            message: "Services not available".into(),
-        })?;
-        let controller = services
-            .computer_controller
-            .as_ref()
-            .ok_or_else(|| HostError {
-                code: 2,
-                message: "Computer controller not configured".into(),
-            })?;
-
-        let controller = controller.clone();
+        let controller = self.get_computer_controller()?.clone();
         let text_owned = text.to_string();
 
         tokio::task::block_in_place(|| {
@@ -2574,43 +2702,20 @@ impl HostFunctions for DaemonHostFunctions {
     ) -> HostResult<String> {
         use nevoflux_computer::KeyCombination;
 
-        let services = self.services.as_ref().ok_or_else(|| HostError {
-            code: 1,
-            message: "Services not available".into(),
-        })?;
-        let controller = services
-            .computer_controller
-            .as_ref()
-            .ok_or_else(|| HostError {
-                code: 2,
-                message: "Computer controller not configured".into(),
-            })?;
+        let controller = self.get_computer_controller()?.clone();
 
-        // Parse key
         let key_or_char = parse_key_str(key).map_err(|msg| HostError {
             code: 4,
             message: msg,
         })?;
 
-        let mut combination = KeyCombination {
+        let combination = KeyCombination {
             key: key_or_char,
             modifiers: Vec::new(),
         };
-
-        for m in modifiers {
-            match m.to_lowercase().as_str() {
-                "shift" => combination = combination.with_shift(),
-                "ctrl" | "control" => combination = combination.with_ctrl(),
-                "alt" => combination = combination.with_alt(),
-                "meta" | "cmd" | "command" | "win" | "windows" | "super" => {
-                    combination = combination.with_meta()
-                }
-                _ => {}
-            }
-        }
+        let combination = Self::apply_modifiers(combination, modifiers);
 
         let repeat_count = repeat.unwrap_or(1).max(1).min(100);
-        let controller = controller.clone();
 
         tokio::task::block_in_place(|| {
             self.runtime.block_on(async {
@@ -2642,18 +2747,7 @@ impl HostFunctions for DaemonHostFunctions {
     ) -> HostResult<String> {
         use nevoflux_computer::{Point, ScrollDirection};
 
-        let services = self.services.as_ref().ok_or_else(|| HostError {
-            code: 1,
-            message: "Services not available".into(),
-        })?;
-        let controller = services
-            .computer_controller
-            .as_ref()
-            .ok_or_else(|| HostError {
-                code: 2,
-                message: "Computer controller not configured".into(),
-            })?;
-
+        let controller = self.get_computer_controller()?.clone();
         let dir = match direction {
             "up" => ScrollDirection::Up,
             "left" => ScrollDirection::Left,
@@ -2662,7 +2756,6 @@ impl HostFunctions for DaemonHostFunctions {
         };
         let scroll_amount = amount.unwrap_or(3) as u32;
         let point = Point::new(x as i32, y as i32);
-        let controller = controller.clone();
 
         tokio::task::block_in_place(|| {
             self.runtime.block_on(async {
@@ -2881,7 +2974,11 @@ impl HostFunctions for DaemonHostFunctions {
         )
     }
 
-    fn browser_get_elements(&self, tab_id: Option<i64>, keywords: Option<Vec<String>>) -> HostResult<BrowserToolResult> {
+    fn browser_get_elements(
+        &self,
+        tab_id: Option<i64>,
+        keywords: Option<Vec<String>>,
+    ) -> HostResult<BrowserToolResult> {
         debug!("browser_get_elements: getting accessibility tree");
         let params = match keywords {
             Some(kw) if !kw.is_empty() => serde_json::json!({ "keywords": kw }),

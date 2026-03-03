@@ -423,7 +423,8 @@ fn create_computer_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "computer_mouse_move".to_string(),
-            description: "Move the mouse cursor to a specified position on screen".to_string(),
+            description: "Move the mouse cursor to a specified position on screen without clicking"
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -434,11 +435,6 @@ fn create_computer_tools() -> Vec<ToolDefinition> {
                     "y": {
                         "type": "integer",
                         "description": "Y coordinate in pixels"
-                    },
-                    "click": {
-                        "type": "string",
-                        "description": "Optional click action after moving",
-                        "enum": ["left", "right", "middle", "double"]
                     }
                 },
                 "required": ["x", "y"]
@@ -554,6 +550,145 @@ fn create_computer_tools() -> Vec<ToolDefinition> {
                 "required": ["x", "y", "direction"]
             }),
         },
+        ToolDefinition {
+            name: "computer_drag".to_string(),
+            description: "Drag from one screen position to another (press, move, release)"
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "start_x": {
+                        "type": "integer",
+                        "description": "Starting X coordinate in pixels"
+                    },
+                    "start_y": {
+                        "type": "integer",
+                        "description": "Starting Y coordinate in pixels"
+                    },
+                    "end_x": {
+                        "type": "integer",
+                        "description": "Ending X coordinate in pixels"
+                    },
+                    "end_y": {
+                        "type": "integer",
+                        "description": "Ending Y coordinate in pixels"
+                    },
+                    "button": {
+                        "type": "string",
+                        "description": "Mouse button to use for dragging",
+                        "enum": ["left", "right", "middle"],
+                        "default": "left"
+                    }
+                },
+                "required": ["start_x", "start_y", "end_x", "end_y"]
+            }),
+        },
+        ToolDefinition {
+            name: "computer_cursor_position".to_string(),
+            description: "Get the current mouse cursor position on screen".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolDefinition {
+            name: "computer_mouse_down".to_string(),
+            description:
+                "Press and hold a mouse button at a position (use computer_mouse_up to release)"
+                    .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "x": {
+                        "type": "integer",
+                        "description": "X coordinate in pixels"
+                    },
+                    "y": {
+                        "type": "integer",
+                        "description": "Y coordinate in pixels"
+                    },
+                    "button": {
+                        "type": "string",
+                        "description": "Mouse button to press",
+                        "enum": ["left", "right", "middle"],
+                        "default": "left"
+                    }
+                },
+                "required": ["x", "y"]
+            }),
+        },
+        ToolDefinition {
+            name: "computer_mouse_up".to_string(),
+            description:
+                "Release a mouse button at a position (use after computer_mouse_down)".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "x": {
+                        "type": "integer",
+                        "description": "X coordinate in pixels"
+                    },
+                    "y": {
+                        "type": "integer",
+                        "description": "Y coordinate in pixels"
+                    },
+                    "button": {
+                        "type": "string",
+                        "description": "Mouse button to release",
+                        "enum": ["left", "right", "middle"],
+                        "default": "left"
+                    }
+                },
+                "required": ["x", "y"]
+            }),
+        },
+        ToolDefinition {
+            name: "computer_hold_key".to_string(),
+            description: "Hold a key down for a specified duration, then release".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "Key to hold (e.g., 'Shift', 'Control', 'Alt', 'a')"
+                    },
+                    "duration_ms": {
+                        "type": "integer",
+                        "description": "Duration to hold the key in milliseconds",
+                        "minimum": 100,
+                        "maximum": 10000,
+                        "default": 500
+                    },
+                    "modifiers": {
+                        "type": "array",
+                        "description": "Modifier keys to hold simultaneously",
+                        "items": {
+                            "type": "string",
+                            "enum": ["ctrl", "alt", "shift", "meta", "super"]
+                        },
+                        "default": []
+                    }
+                },
+                "required": ["key", "duration_ms"]
+            }),
+        },
+        ToolDefinition {
+            name: "computer_wait".to_string(),
+            description: "Wait for a specified duration before continuing. Use to wait for animations, loading, or transitions.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "ms": {
+                        "type": "integer",
+                        "description": "Duration to wait in milliseconds",
+                        "minimum": 100,
+                        "maximum": 10000,
+                        "default": 1000
+                    }
+                },
+                "required": ["ms"]
+            }),
+        },
     ]
 }
 
@@ -565,8 +700,8 @@ mod tests {
     fn test_create_tools_returns_all_tools() {
         let tools = create_tools();
 
-        // Should have 23 tools total (16 browser + 1 agent + 6 computer)
-        assert_eq!(tools.len(), 23);
+        // Should have 29 tools total (16 browser + 1 agent + 12 computer)
+        assert_eq!(tools.len(), 29);
 
         // Verify all expected tools are present
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -592,13 +727,19 @@ mod tests {
         // Agent tools (1 total)
         assert!(tool_names.contains(&"agent_chat"));
 
-        // Computer tools (6 total)
+        // Computer tools (12 total)
         assert!(tool_names.contains(&"computer_screenshot"));
         assert!(tool_names.contains(&"computer_mouse_move"));
         assert!(tool_names.contains(&"computer_type_text"));
         assert!(tool_names.contains(&"computer_click"));
         assert!(tool_names.contains(&"computer_key"));
         assert!(tool_names.contains(&"computer_scroll"));
+        assert!(tool_names.contains(&"computer_drag"));
+        assert!(tool_names.contains(&"computer_cursor_position"));
+        assert!(tool_names.contains(&"computer_mouse_down"));
+        assert!(tool_names.contains(&"computer_mouse_up"));
+        assert!(tool_names.contains(&"computer_hold_key"));
+        assert!(tool_names.contains(&"computer_wait"));
     }
 
     #[test]
@@ -699,20 +840,8 @@ mod tests {
         assert_eq!(schema["properties"]["y"]["type"], "integer");
         assert_eq!(schema["required"], serde_json::json!(["x", "y"]));
 
-        // Verify click enum options
-        let click_enum = &schema["properties"]["click"]["enum"];
-        assert!(click_enum
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("left")));
-        assert!(click_enum
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("right")));
-        assert!(click_enum
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("double")));
+        // click parameter has been removed (pure movement only)
+        assert!(schema["properties"]["click"].is_null());
     }
 
     #[test]
@@ -960,7 +1089,7 @@ mod tests {
     #[test]
     fn test_computer_tools_count() {
         let tools = create_computer_tools();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 12);
     }
 
     #[test]
