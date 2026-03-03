@@ -3036,11 +3036,17 @@ impl HostFunctions for DaemonHostFunctions {
         )
     }
 
-    fn browser_viewport_snapshot(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
-        debug!("browser_viewport_snapshot: taking viewport-only snapshot");
+    fn browser_viewport_snapshot(&self, tab_id: Option<i64>, keywords: Option<Vec<String>>) -> HostResult<BrowserToolResult> {
+        debug!("browser_viewport_snapshot: taking viewport-only snapshot, keywords={:?}", keywords);
+        let mut params = serde_json::json!({"viewport_only": true});
+        if let Some(kws) = keywords {
+            if !kws.is_empty() {
+                params["keywords"] = serde_json::json!(kws);
+            }
+        }
         self.execute_browser_action(
             BrowserToolAction::Snapshot,
-            serde_json::json!({"viewport_only": true}),
+            params,
             tab_id,
         )
     }

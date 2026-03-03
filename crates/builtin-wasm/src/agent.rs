@@ -465,6 +465,8 @@ pub struct Agent<H: HostFunctions> {
     artifact_counter: Cell<u32>,
     /// Whether computer use has been triggered (for progressive prompt injection).
     computer_use_triggered: Cell<bool>,
+    /// Current keywords extracted from user message and LLM context, used for auto-snapshots.
+    current_keywords: RefCell<Vec<String>>,
 }
 
 // Static base prompts, compiled into the binary
@@ -500,6 +502,7 @@ impl<H: HostFunctions> Agent<H> {
             pending_artifact: RefCell::new(None),
             artifact_counter: Cell::new(0),
             computer_use_triggered: Cell::new(false),
+            current_keywords: RefCell::new(Vec::new()),
         }
     }
 
@@ -514,6 +517,7 @@ impl<H: HostFunctions> Agent<H> {
             pending_artifact: RefCell::new(None),
             artifact_counter: Cell::new(0),
             computer_use_triggered: Cell::new(false),
+            current_keywords: RefCell::new(Vec::new()),
         }
     }
 
@@ -919,9 +923,15 @@ The following skill instructions MUST be followed exactly. These instructions ta
         });
         let tab_context_prefix = Self::format_tab_context(active_tab_info.as_ref(), &input.tab_ids);
 
-        // For browser/agent mode: take initial viewport snapshot and append to user message
+        // For browser/agent mode: extract keywords from user message and take initial viewport snapshot
         let initial_snapshot = if matches!(input.mode, AgentMode::Browser | AgentMode::Agent) {
-            let snapshot_text = self.get_viewport_snapshot_text(input.tab_id);
+            let keywords = Self::extract_keywords_from_text(&input.user_message);
+            if !keywords.is_empty() {
+                eprintln!("[AGENT] Initial keywords from user message: {:?}", keywords);
+            }
+            let kw_arg = if keywords.is_empty() { None } else { Some(keywords.clone()) };
+            *self.current_keywords.borrow_mut() = keywords;
+            let snapshot_text = self.get_viewport_snapshot_text(input.tab_id, kw_arg);
             if !snapshot_text.is_empty() {
                 format!("\n\nCurrent page state:\n{}", snapshot_text)
             } else {
@@ -995,7 +1005,13 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 tool_calls.clone(),
             ));
 
+            // Extract keywords from LLM reasoning text once (invariant across tool calls)
+            let llm_kws = Self::extract_keywords_from_text(&response.text);
+
             for tool_call in &tool_calls {
+                // Update keywords from pre-extracted LLM keywords + tool args
+                self.update_keywords_from_tool_context(&llm_kws, tool_call);
+
                 eprintln!(
                     "[AGENT] Executing tool: name={}, id={}, call_id={:?}, args={}",
                     tool_call.name, tool_call.id, tool_call.call_id, tool_call.arguments
@@ -1992,8 +2008,10 @@ The following skill instructions MUST be followed exactly. These instructions ta
             .host
             .browser_wait_for_stable(wait_strategy, 3000, tab_id);
 
-        // 2. Take viewport snapshot
-        let snapshot_text = self.get_viewport_snapshot_text(tab_id);
+        // 2. Take viewport snapshot with current keywords
+        let kws = self.current_keywords.borrow().clone();
+        let kw_arg = if kws.is_empty() { None } else { Some(kws) };
+        let snapshot_text = self.get_viewport_snapshot_text(tab_id, kw_arg);
 
         if snapshot_text.is_empty() {
             action_result.to_string()
@@ -2005,9 +2023,145 @@ The following skill instructions MUST be followed exactly. These instructions ta
         }
     }
 
+    /// Extract keywords from text using rule-based heuristics.
+    ///
+    /// Extracts: CJK sequences, quoted strings, capitalized words, known action verbs.
+    /// Deduplicates and limits to 10 keywords.
+    fn extract_keywords_from_text(text: &str) -> Vec<String> {
+        let mut keywords = Vec::new();
+
+        // CJK stop words to filter out (2+ chars only — single-char sequences
+        // are already excluded by the >= 2 character threshold below)
+        const CJK_STOPS: &[&str] = &[
+            "一个", "没有", "自己", "这个", "那个", "什么", "怎么", "可以",
+            "已经", "因为", "所以", "但是", "如果", "虽然", "还是", "就是",
+        ];
+
+        // Known action verbs (Chinese + English)
+        const ACTION_VERBS: &[&str] = &[
+            "登录", "login", "sign in", "signin", "search", "click", "submit",
+            "注册", "搜索", "点击", "提交", "打开", "关闭", "输入", "选择",
+            "register", "signup", "sign up", "open", "close", "enter", "select",
+        ];
+
+        // 1. Extract quoted strings
+        let mut in_quote = false;
+        let mut quote_char = ' ';
+        let mut current_quoted = String::new();
+        for ch in text.chars() {
+            if !in_quote && (ch == '"' || ch == '\'' || ch == '\u{201C}' || ch == '\u{300C}') {
+                in_quote = true;
+                quote_char = ch;
+                current_quoted.clear();
+            } else if in_quote
+                && ((quote_char == '"' && ch == '"')
+                    || (quote_char == '\'' && ch == '\'')
+                    || (quote_char == '\u{201C}' && ch == '\u{201D}')
+                    || (quote_char == '\u{300C}' && ch == '\u{300D}'))
+            {
+                in_quote = false;
+                let trimmed = current_quoted.trim().to_string();
+                if !trimmed.is_empty() && trimmed.len() <= 50 {
+                    keywords.push(trimmed);
+                }
+            } else if in_quote {
+                current_quoted.push(ch);
+            }
+        }
+
+        // 2. Extract CJK sequences (2+ consecutive CJK chars, minus stop words)
+        let mut cjk_buf = String::new();
+        for ch in text.chars() {
+            if ('\u{4E00}'..='\u{9FFF}').contains(&ch)
+                || ('\u{3400}'..='\u{4DBF}').contains(&ch)
+                || ('\u{F900}'..='\u{FAFF}').contains(&ch)
+            {
+                cjk_buf.push(ch);
+            } else {
+                if cjk_buf.chars().count() >= 2
+                    && !CJK_STOPS.contains(&cjk_buf.as_str())
+                {
+                    keywords.push(cjk_buf.clone());
+                }
+                cjk_buf.clear();
+            }
+        }
+        if cjk_buf.chars().count() >= 2 && !CJK_STOPS.contains(&cjk_buf.as_str()) {
+            keywords.push(cjk_buf);
+        }
+
+        // 3. Extract capitalized words / proper nouns (2+ chars starting with uppercase)
+        for word in text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
+            let trimmed = word.trim();
+            if trimmed.len() >= 2
+                && trimmed.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+                && !["The", "This", "That", "What", "When", "Where", "How", "Why",
+                     "And", "But", "For", "Not", "You", "Are", "Was", "Were",
+                     "Can", "Could", "Will", "Would", "Should", "May", "Might",
+                     "Has", "Have", "Had", "Does", "Did", "Its", "All"]
+                    .contains(&trimmed)
+            {
+                keywords.push(trimmed.to_string());
+            }
+        }
+
+        // 4. Extract known action verbs found in the text
+        let lower = text.to_lowercase();
+        for verb in ACTION_VERBS {
+            if lower.contains(verb) {
+                keywords.push(verb.to_string());
+            }
+        }
+
+        // Deduplicate (case-insensitive) and limit to 10
+        let mut seen = std::collections::HashSet::new();
+        keywords.retain(|kw| {
+            let key = kw.to_lowercase();
+            if seen.contains(&key) {
+                false
+            } else {
+                seen.insert(key);
+                true
+            }
+        });
+        keywords.truncate(10);
+        keywords
+    }
+
+    /// Update stored keywords from pre-extracted LLM keywords and tool call arguments.
+    fn update_keywords_from_tool_context(&self, llm_kws: &[String], tool_call: &ToolCall) {
+        let mut kws = self.current_keywords.borrow_mut();
+
+        // Merge pre-extracted LLM reasoning keywords
+        for kw in llm_kws {
+            if !kws.iter().any(|existing| existing.eq_ignore_ascii_case(kw)) {
+                kws.push(kw.clone());
+            }
+        }
+
+        // Extract from tool call arguments (element_id, text, value, selector, query, url)
+        let args = &tool_call.arguments;
+        for key in &["text", "value", "selector", "query", "url", "element_id"] {
+            if let Some(val) = args.get(key).and_then(|v| v.as_str()) {
+                let arg_kws = Self::extract_keywords_from_text(val);
+                for kw in arg_kws {
+                    if !kws.iter().any(|existing| existing.eq_ignore_ascii_case(&kw)) {
+                        kws.push(kw);
+                    }
+                }
+            }
+        }
+
+        // Keep latest 10
+        if kws.len() > 10 {
+            let excess = kws.len() - 10;
+            kws.drain(..excess);
+        }
+    }
+
     /// Get viewport snapshot text for initial context.
-    fn get_viewport_snapshot_text(&self, tab_id: Option<i64>) -> String {
-        match self.host.browser_viewport_snapshot(tab_id) {
+    fn get_viewport_snapshot_text(&self, tab_id: Option<i64>, keywords: Option<Vec<String>>) -> String {
+        match self.host.browser_viewport_snapshot(tab_id, keywords) {
             Ok(result) => {
                 if let Some(data) = &result.data {
                     if let Some(result_obj) = data.get("result") {
