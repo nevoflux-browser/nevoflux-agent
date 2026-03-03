@@ -1601,7 +1601,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             }
             "browser_get_elements" => {
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
-                let result = self.host.browser_get_elements(tab_id)?;
+                let result = self.host.browser_get_elements(tab_id, None)?;
                 // Parse and cache elements, return compact summary
                 if let Some(data) = &result.data {
                     if let Some(cache) = parse_elements_from_data(data) {

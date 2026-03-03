@@ -323,7 +323,7 @@ pub trait HostFunctions {
     ) -> HostResult<BrowserToolResult>;
 
     /// Get accessibility tree with element IDs for interaction.
-    fn browser_get_elements(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
+    fn browser_get_elements(&self, tab_id: Option<i64>, keywords: Option<Vec<String>>) -> HostResult<BrowserToolResult>;
 
     /// List all open browser tabs.
     fn browser_list_tabs(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
@@ -916,7 +916,7 @@ impl HostFunctions for MockHostFunctions {
         })))
     }
 
-    fn browser_get_elements(&self, _tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+    fn browser_get_elements(&self, _tab_id: Option<i64>, _keywords: Option<Vec<String>>) -> HostResult<BrowserToolResult> {
         Ok(BrowserToolResult::success(serde_json::json!({
             "refs": {
                 "e1": {"role": "button", "name": "Submit", "selectors": [{"type": "css", "strategy": "id", "value": "#submit"}]},

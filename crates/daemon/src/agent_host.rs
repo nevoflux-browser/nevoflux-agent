@@ -2881,9 +2881,13 @@ impl HostFunctions for DaemonHostFunctions {
         )
     }
 
-    fn browser_get_elements(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+    fn browser_get_elements(&self, tab_id: Option<i64>, keywords: Option<Vec<String>>) -> HostResult<BrowserToolResult> {
         debug!("browser_get_elements: getting accessibility tree");
-        self.execute_browser_action(BrowserToolAction::Snapshot, serde_json::json!({}), tab_id)
+        let params = match keywords {
+            Some(kw) if !kw.is_empty() => serde_json::json!({ "keywords": kw }),
+            _ => serde_json::json!({}),
+        };
+        self.execute_browser_action(BrowserToolAction::Snapshot, params, tab_id)
     }
 
     fn browser_list_tabs(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
