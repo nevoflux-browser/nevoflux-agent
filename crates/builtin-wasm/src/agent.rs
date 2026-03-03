@@ -1601,7 +1601,10 @@ The following skill instructions MUST be followed exactly. These instructions ta
             }
             "browser_get_elements" => {
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
-                let result = self.host.browser_get_elements(tab_id, None)?;
+                let keywords: Option<Vec<String>> = tool_call.arguments.get("keywords")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+                let result = self.host.browser_get_elements(tab_id, keywords)?;
                 // Parse and cache elements, return compact summary
                 if let Some(data) = &result.data {
                     if let Some(cache) = parse_elements_from_data(data) {
@@ -2517,13 +2520,18 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // Get elements (usually not needed — page state is auto-injected)
         tools.push(ToolDefinition {
             name: "browser_get_elements".into(),
-            description: "Get full accessibility tree (usually not needed — page state is auto-injected). Use browser_find_elements to search and browser_element_info(id) for full details.".into(),
+            description: "Get interactive elements on the page. Use keywords to locate specific elements by visible text (e.g. button labels, input placeholders). Keywords work across all frameworks including React, Vue, Shadow DOM.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "tab_id": {
                         "type": "integer",
                         "description": "Optional tab ID"
+                    },
+                    "keywords": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Keywords to locate target elements by visible text. Supports multiple languages. Example: [\"Log in\", \"username\", \"Next\"]"
                     }
                 }
             }),
