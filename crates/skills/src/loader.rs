@@ -90,9 +90,24 @@ impl LoaderConfig {
 pub fn default_user_skills_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
-    // NevoFlux native directory
+    // NevoFlux native directory (via ProjectDirs)
+    // On Windows this resolves to %APPDATA%\nevoflux\nevoflux\config\skills
     if let Some(project_dirs) = directories::ProjectDirs::from("com", "nevoflux", "nevoflux") {
         dirs.push(project_dirs.config_dir().join("skills"));
+    }
+
+    // Direct {data}/nevoflux/skills — the intuitive path users expect.
+    // On Windows: %APPDATA%\nevoflux\skills
+    // On Linux: ~/.config/nevoflux/skills (same as ProjectDirs, deduped below)
+    if let Some(base) = directories::BaseDirs::new() {
+        let direct = if cfg!(windows) {
+            base.data_dir().join("nevoflux").join("skills")
+        } else {
+            base.config_dir().join("nevoflux").join("skills")
+        };
+        if !dirs.contains(&direct) {
+            dirs.push(direct);
+        }
     }
 
     // Home directory based paths
@@ -163,9 +178,13 @@ impl SkillLoader {
         // Later directories take precedence over earlier ones
         for dir in &self.config.user_dirs {
             if dir.exists() {
+                debug!("Scanning skill directory: {}", dir.display());
                 for skill in self.load_from_directory(dir, SkillSource::User)? {
+                    debug!("  Loaded skill: {}", skill.name());
                     skills_map.insert(skill.name().to_string(), skill);
                 }
+            } else {
+                debug!("Skill directory not found, skipping: {}", dir.display());
             }
         }
 
@@ -190,24 +209,27 @@ impl SkillLoader {
         }
 
         let mut skills = Vec::new();
+        let ext = &self.config.extension;
 
-        // Pattern 1: Direct files (*.md)
-        let direct_pattern = dir.join(format!("*.{}", self.config.extension));
-        let direct_pattern_str = direct_pattern.to_string_lossy();
+        let entries = std::fs::read_dir(dir).map_err(|e| {
+            SkillsError::Io(std::io::Error::new(
+                e.kind(),
+                format!("{}: {}", dir.display(), e),
+            ))
+        })?;
 
-        if let Ok(entries) = glob::glob(&direct_pattern_str) {
-            for entry in entries.flatten() {
-                self.try_load_skill_file(&entry, source.clone(), &mut skills);
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Pattern 1: Direct files (*.md)
+            if path.is_file() && path.extension().is_some_and(|e| e == ext.as_str()) {
+                self.try_load_skill_file(&path, source.clone(), &mut skills);
             }
-        }
-
-        // Pattern 2: Subdirectory with SKILL.md (*/SKILL.md)
-        let subdir_pattern = dir.join(format!("*/SKILL.{}", self.config.extension));
-        let subdir_pattern_str = subdir_pattern.to_string_lossy();
-
-        if let Ok(entries) = glob::glob(&subdir_pattern_str) {
-            for entry in entries.flatten() {
-                self.try_load_skill_file(&entry, source.clone(), &mut skills);
+            // Pattern 2: Subdirectory with SKILL.md
+            if path.is_dir() {
+                let skill_file = path.join(format!("SKILL.{}", ext));
+                if skill_file.exists() {
+                    self.try_load_skill_file(&skill_file, source.clone(), &mut skills);
+                }
             }
         }
 
@@ -333,35 +355,37 @@ impl SkillLoader {
         }
         dirs.extend(self.config.user_dirs.iter());
 
+        let ext = &self.config.extension;
+
         for dir in dirs {
             if !dir.exists() {
                 continue;
             }
 
-            // Pattern 1: Direct files (*.md)
-            let direct_pattern = dir.join(format!("*.{}", self.config.extension));
-            let direct_pattern_str = direct_pattern.to_string_lossy();
+            let entries = match std::fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    warn!("Failed to read skill directory {}: {}", dir.display(), e);
+                    continue;
+                }
+            };
 
-            if let Ok(entries) = glob::glob(&direct_pattern_str) {
-                for entry in entries.flatten() {
-                    if let Some(stem) = entry.file_stem() {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                // Pattern 1: Direct files (*.md)
+                if path.is_file() && path.extension().is_some_and(|e| e == ext.as_str()) {
+                    if let Some(stem) = path.file_stem() {
                         let name = stem.to_string_lossy().to_string();
                         if !names.contains(&name) {
                             names.push(name);
                         }
                     }
                 }
-            }
-
-            // Pattern 2: Subdirectories with SKILL.md (*/SKILL.md)
-            let subdir_pattern = dir.join(format!("*/SKILL.{}", self.config.extension));
-            let subdir_pattern_str = subdir_pattern.to_string_lossy();
-
-            if let Ok(entries) = glob::glob(&subdir_pattern_str) {
-                for entry in entries.flatten() {
-                    // Get the parent directory name as the skill name
-                    if let Some(parent) = entry.parent() {
-                        if let Some(dir_name) = parent.file_name() {
+                // Pattern 2: Subdirectories with SKILL.md
+                if path.is_dir() {
+                    let skill_file = path.join(format!("SKILL.{}", ext));
+                    if skill_file.exists() {
+                        if let Some(dir_name) = path.file_name() {
                             let name = dir_name.to_string_lossy().to_string();
                             if !names.contains(&name) {
                                 names.push(name);
@@ -740,11 +764,33 @@ Disabled content."#,
             assert!(dir.to_string_lossy().contains("skills"));
         }
 
-        // At least check that we have multiple directories (claude, gemini, opencode, goose)
+        // nevoflux native + direct nevoflux + claude + gemini + opencode + goose
+        // (on Linux the direct path dedupes with ProjectDirs, so >= 5)
         assert!(
-            dirs.len() >= 4,
-            "Expected at least 4 directories, got {}",
+            dirs.len() >= 5,
+            "Expected at least 5 directories, got {}",
             dirs.len()
+        );
+    }
+
+    #[test]
+    fn test_default_dirs_include_direct_nevoflux_path() {
+        let dirs = default_user_skills_dirs();
+        // At least one path should be a simple .../nevoflux/skills
+        // (not deeply nested like .../nevoflux/nevoflux/config/skills)
+        let has_simple = dirs.iter().any(|d| {
+            let components: Vec<_> = d.components().collect();
+            let len = components.len();
+            // Last two components: "nevoflux" / "skills", and grandparent != "nevoflux"
+            len >= 2
+                && components[len - 1].as_os_str() == "skills"
+                && components[len - 2].as_os_str() == "nevoflux"
+                && (len < 3 || components[len - 3].as_os_str() != "nevoflux")
+        });
+        assert!(
+            has_simple,
+            "Should include a simple nevoflux/skills path (not doubled), got: {:?}",
+            dirs
         );
     }
 

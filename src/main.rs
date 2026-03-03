@@ -22,10 +22,10 @@ use std::path::PathBuf;
 
 /// Get the data directory for NevoFlux.
 ///
-/// Platform-specific locations:
+/// Platform-specific locations (via `directories` crate):
 /// - Linux: ~/.local/share/nevoflux/
-/// - macOS: ~/Library/Application Support/nevoflux/
-/// - Windows: %APPDATA%\nevoflux\
+/// - macOS: ~/Library/Application Support/com.nevoflux.nevoflux/
+/// - Windows: %APPDATA%\nevoflux\nevoflux\data\
 fn get_data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("NEVOFLUX_DATA_DIR") {
         return PathBuf::from(dir);
