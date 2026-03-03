@@ -1099,10 +1099,7 @@ mod tests {
         );
 
         // Hot entry should be present
-        let has_hot = result
-            .entries
-            .iter()
-            .any(|sk| sk.entry.id == hot_entry.id);
+        let has_hot = result.entries.iter().any(|sk| sk.entry.id == hot_entry.id);
         assert!(has_hot, "Hot (promoted) entry should appear in results");
 
         // The hot entry should rank higher (higher confidence → higher score)

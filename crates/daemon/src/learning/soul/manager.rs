@@ -918,7 +918,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let soul_dir = tmp.path().join("soul");
 
-        let manager = SoulManager::init_with_bundled(&soul_dir, None).await.unwrap();
+        let manager = SoulManager::init_with_bundled(&soul_dir, None)
+            .await
+            .unwrap();
 
         assert!(manager.cache().identity_raw.contains("NevoFlux Identity"));
         assert!(manager.cache().soul_raw.contains("NevoFlux Soul"));

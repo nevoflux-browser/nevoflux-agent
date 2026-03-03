@@ -2388,11 +2388,7 @@ mod tests {
                     tool_name: Some("flaky_tool".into()),
                     tool_params: None,
                     success: i == 0, // only first call succeeds → 80% failure rate
-                    error_code: if i > 0 {
-                        Some("TIMEOUT".into())
-                    } else {
-                        None
-                    },
+                    error_code: if i > 0 { Some("TIMEOUT".into()) } else { None },
                     error_msg: if i > 0 {
                         Some("connection timeout".into())
                     } else {
@@ -2416,9 +2412,7 @@ mod tests {
         );
 
         // Verify entries reference the flaky tool
-        let has_flaky = entries
-            .iter()
-            .any(|e| e.summary.contains("flaky_tool"));
+        let has_flaky = entries.iter().any(|e| e.summary.contains("flaky_tool"));
         assert!(has_flaky, "Should have entry about flaky_tool");
 
         // 4. Insert collected entries into buffer
@@ -2429,10 +2423,16 @@ mod tests {
 
         // 5. Flush → knowledge table (pending status)
         let flushed = pipeline.flush().unwrap();
-        assert!(flushed > 0, "Should flush at least one entry to knowledge table");
+        assert!(
+            flushed > 0,
+            "Should flush at least one entry to knowledge table"
+        );
 
         let pending = storage.knowledge().query_pending(10).unwrap();
-        assert!(!pending.is_empty(), "Should have pending entries after flush");
+        assert!(
+            !pending.is_empty(),
+            "Should have pending entries after flush"
+        );
 
         // Verify the flushed entry references flaky_tool
         let flaky_entry = pending
@@ -2446,10 +2446,7 @@ mod tests {
         storage
             .database()
             .with_connection(|conn| {
-                conn.execute(
-                    "UPDATE knowledge SET hit_count = 5, confidence = 0.85",
-                    [],
-                )?;
+                conn.execute("UPDATE knowledge SET hit_count = 5, confidence = 0.85", [])?;
                 Ok(())
             })
             .unwrap();
@@ -2523,7 +2520,11 @@ mod tests {
             .knowledge()
             .list_hot_by_category("tool_optimization")
             .unwrap();
-        assert_eq!(hot.len(), 3, "Only 3 should remain hot after limit enforcement");
+        assert_eq!(
+            hot.len(),
+            3,
+            "Only 3 should remain hot after limit enforcement"
+        );
 
         // Verify the kept entries have the highest confidence
         let confidences: Vec<f64> = hot.iter().map(|e| e.confidence).collect();
