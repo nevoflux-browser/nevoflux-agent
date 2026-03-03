@@ -222,6 +222,16 @@ struct ElementRect {
     height: f64,
 }
 
+/// Screen-absolute bounding rectangle from the browser extension.
+/// Used for `computer_click` fallback when JS clicks fail.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct ScreenBounds {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
 /// A cached element from browser_get_elements.
 #[derive(Debug, Clone)]
 struct CachedElement {
@@ -453,6 +463,8 @@ pub struct Agent<H: HostFunctions> {
     pending_artifact: RefCell<Option<Artifact>>,
     /// Monotonic counter for generating unique artifact IDs.
     artifact_counter: Cell<u32>,
+    /// Whether computer use has been triggered (for progressive prompt injection).
+    computer_use_triggered: Cell<bool>,
 }
 
 // Static base prompts, compiled into the binary
@@ -461,6 +473,19 @@ const BROWSER_PROMPT: &str = include_str!("../prompts/browser.md");
 const AGENT_PROMPT: &str = include_str!("../prompts/agent.md");
 const SUBAGENT_BROWSER_PROMPT: &str = include_str!("../prompts/subagent_browser.md");
 const SUBAGENT_AGENT_PROMPT: &str = include_str!("../prompts/subagent_agent.md");
+
+// Computer use prompt layers
+const COMPUTER_USE_OVERVIEW: &str = include_str!("../prompts/computer_use_overview.md");
+const COMPUTER_USE_GUIDE: &str = include_str!("../prompts/computer_use_guide.md");
+const COMPUTER_USE_EXAMPLES: &str = include_str!("../prompts/computer_use_examples.md");
+
+/// Controls which layers of the computer use prompt are injected.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ComputerUseFlags {
+    pub inject_overview: bool,
+    pub inject_guide: bool,
+    pub inject_examples: bool,
+}
 const CODE_MODE_PROMPT: &str = "You are in Code Mode. You MUST write a Python script to accomplish the task. Do NOT make individual tool calls — write a single ```python-exec script that orchestrates everything.\n\nThe code runs in a sandboxed Python interpreter (Monty).\n\nSupported syntax: variables, def, if/elif/else, for/while, try/except, comprehensions, f-strings, lambda, slicing.\nDO NOT use: class, match/case, import, with, async/await, yield, decorators.\n\nPre-injected functions (call directly, no import):\n- read_file(path) → str\n- write_file(path, content) → str\n- list_files(path) → list[str]\n- web_search(query) → list[dict] with keys: title, url, snippet\n- fetch_page(url) → str (markdown content)\n- canvas_render(files, entry, title) → dict (renders React/Vue/Svelte app in browser canvas)\n\nReturn code in a ```python-exec block. Use ```python (without -exec) ONLY for display-only code examples shown to the user.";
 
 impl<H: HostFunctions> Agent<H> {
@@ -474,6 +499,7 @@ impl<H: HostFunctions> Agent<H> {
             pending_plan: RefCell::new(None),
             pending_artifact: RefCell::new(None),
             artifact_counter: Cell::new(0),
+            computer_use_triggered: Cell::new(false),
         }
     }
 
@@ -487,17 +513,24 @@ impl<H: HostFunctions> Agent<H> {
             pending_plan: RefCell::new(None),
             pending_artifact: RefCell::new(None),
             artifact_counter: Cell::new(0),
+            computer_use_triggered: Cell::new(false),
         }
     }
 
     /// Run the agent for a single turn.
     pub fn run(&self, input: &AgentInput) -> HostResult<AgentOutput> {
+        // Check for keyword triggers in user message before building prompt
+        if !self.computer_use_triggered.get() && should_trigger_computer_use(&input.user_message) {
+            self.computer_use_triggered.set(true);
+        }
+
         // Use custom system prompt if provided, otherwise use mode-based prompt
         let base_prompt = match &input.custom_system_prompt {
             Some(custom) => custom.clone(),
             None => {
                 let skills = self.host.skill_list().unwrap_or_default();
-                Self::build_system_prompt(input.mode, &skills, &input.available_models)
+                let cu_flags = self.computer_use_flags(input.mode);
+                Self::build_system_prompt(input.mode, &skills, &input.available_models, cu_flags)
             }
         };
 
@@ -624,8 +657,23 @@ The following skill instructions MUST be followed exactly. These instructions ta
         mode: AgentMode,
         skills: &[SkillSummary],
         models: &[(String, String)],
+        computer_use: ComputerUseFlags,
     ) -> String {
         let mut prompt = Self::base_prompt_for_mode(mode).to_string();
+
+        // Append computer use prompt layers based on flags
+        if computer_use.inject_overview {
+            prompt.push_str("\n\n");
+            prompt.push_str(COMPUTER_USE_OVERVIEW);
+        }
+        if computer_use.inject_guide {
+            prompt.push_str("\n\n");
+            prompt.push_str(COMPUTER_USE_GUIDE);
+        }
+        if computer_use.inject_examples {
+            prompt.push_str("\n\n");
+            prompt.push_str(COMPUTER_USE_EXAMPLES);
+        }
 
         if !models.is_empty() {
             prompt.push_str("\n\n# Available models\n\n");
@@ -641,6 +689,44 @@ The following skill instructions MUST be followed exactly. These instructions ta
         }
 
         prompt
+    }
+
+    /// Determine computer use flags based on mode and trigger state.
+    fn computer_use_flags(&self, mode: AgentMode) -> ComputerUseFlags {
+        let triggered = self.computer_use_triggered.get();
+        match mode {
+            AgentMode::Chat => ComputerUseFlags::default(),
+            AgentMode::Browser => {
+                if triggered {
+                    ComputerUseFlags {
+                        inject_overview: true,
+                        inject_guide: true,
+                        inject_examples: true,
+                    }
+                } else {
+                    ComputerUseFlags {
+                        inject_overview: true,
+                        inject_guide: false,
+                        inject_examples: false,
+                    }
+                }
+            }
+            AgentMode::Agent | AgentMode::Code => {
+                if triggered {
+                    ComputerUseFlags {
+                        inject_overview: true,
+                        inject_guide: true,
+                        inject_examples: true,
+                    }
+                } else {
+                    ComputerUseFlags {
+                        inject_overview: true,
+                        inject_guide: true,
+                        inject_examples: false,
+                    }
+                }
+            }
+        }
     }
 
     /// Get tools for a subagent based on mode (read-only browser access).
@@ -903,13 +989,13 @@ The following skill instructions MUST be followed exactly. These instructions ta
             }
 
             // Execute tool calls - must include tool_calls in the assistant message
+            let tool_calls = response.tool_calls;
             messages.push(Message::assistant_with_tool_calls(
                 &response.text,
-                response.tool_calls.clone(),
+                tool_calls.clone(),
             ));
-            all_tool_calls.extend(response.tool_calls.clone());
 
-            for tool_call in &response.tool_calls {
+            for tool_call in &tool_calls {
                 eprintln!(
                     "[AGENT] Executing tool: name={}, id={}, call_id={:?}, args={}",
                     tool_call.name, tool_call.id, tool_call.call_id, tool_call.arguments
@@ -970,6 +1056,9 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     break;
                 }
             }
+
+            // Move tool calls into the accumulator (avoids a second clone)
+            all_tool_calls.extend(tool_calls);
 
             // Check if we should exit the outer loop due to interrupt
             if self.host.is_interrupted()? {
@@ -1450,8 +1539,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             "computer_mouse_move" => {
                 let x = tool_call.arguments["x"].as_i64().unwrap_or(0);
                 let y = tool_call.arguments["y"].as_i64().unwrap_or(0);
-                let click = tool_call.arguments.get("click").and_then(|v| v.as_str());
-                self.host.computer_mouse_move(x, y, click)?
+                self.host.computer_mouse_move(x, y)?
             }
             "computer_click" => {
                 let x = tool_call.arguments["x"].as_i64().unwrap_or(0);
@@ -1470,16 +1558,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             }
             "computer_key" => {
                 let key = tool_call.arguments["key"].as_str().unwrap_or("");
-                let modifiers: Vec<String> = tool_call
-                    .arguments
-                    .get("modifiers")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let modifiers = parse_modifiers_arg(&tool_call.arguments);
                 let repeat = tool_call.arguments.get("repeat").and_then(|v| v.as_u64());
                 self.host.computer_key(key, &modifiers, repeat)?
             }
@@ -1489,6 +1568,38 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let direction = tool_call.arguments["direction"].as_str().unwrap_or("down");
                 let amount = tool_call.arguments.get("amount").and_then(|v| v.as_u64());
                 self.host.computer_scroll(x, y, direction, amount)?
+            }
+            "computer_drag" => {
+                let start_x = tool_call.arguments["start_x"].as_i64().unwrap_or(0);
+                let start_y = tool_call.arguments["start_y"].as_i64().unwrap_or(0);
+                let end_x = tool_call.arguments["end_x"].as_i64().unwrap_or(0);
+                let end_y = tool_call.arguments["end_y"].as_i64().unwrap_or(0);
+                let button = tool_call.arguments.get("button").and_then(|v| v.as_str());
+                self.host
+                    .computer_drag(start_x, start_y, end_x, end_y, button)?
+            }
+            "computer_cursor_position" => self.host.computer_cursor_position()?,
+            "computer_mouse_down" => {
+                let x = tool_call.arguments["x"].as_i64().unwrap_or(0);
+                let y = tool_call.arguments["y"].as_i64().unwrap_or(0);
+                let button = tool_call.arguments.get("button").and_then(|v| v.as_str());
+                self.host.computer_mouse_down(x, y, button)?
+            }
+            "computer_mouse_up" => {
+                let x = tool_call.arguments["x"].as_i64().unwrap_or(0);
+                let y = tool_call.arguments["y"].as_i64().unwrap_or(0);
+                let button = tool_call.arguments.get("button").and_then(|v| v.as_str());
+                self.host.computer_mouse_up(x, y, button)?
+            }
+            "computer_hold_key" => {
+                let key = tool_call.arguments["key"].as_str().unwrap_or("");
+                let duration_ms = tool_call.arguments["duration_ms"].as_u64().unwrap_or(500);
+                let modifiers = parse_modifiers_arg(&tool_call.arguments);
+                self.host.computer_hold_key(key, duration_ms, &modifiers)?
+            }
+            "computer_wait" => {
+                let ms = tool_call.arguments["ms"].as_u64().unwrap_or(1000);
+                self.host.computer_wait(ms)?
             }
             // Browser tools
             "browser_navigate" => {
@@ -1514,15 +1625,13 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let selector = tool_call.arguments["selector"].as_str().unwrap_or("");
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_click(selector, tab_id)?;
-                let result_str = serde_json::to_string(&result).unwrap_or_default();
-                self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
+                self.click_result_with_fallback(&result, tab_id)
             }
             "browser_click_by_id" => {
                 let element_id = tool_call.arguments["element_id"].as_str().unwrap_or("");
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_click_by_id(element_id, tab_id)?;
-                let result_str = serde_json::to_string(&result).unwrap_or_default();
-                self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
+                self.click_result_with_fallback(&result, tab_id)
             }
             "browser_type" => {
                 let selector = tool_call.arguments["selector"].as_str().unwrap_or("");
@@ -1601,9 +1710,15 @@ The following skill instructions MUST be followed exactly. These instructions ta
             }
             "browser_get_elements" => {
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
-                let keywords: Option<Vec<String>> = tool_call.arguments.get("keywords")
+                let keywords: Option<Vec<String>> = tool_call
+                    .arguments
+                    .get("keywords")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    });
                 let result = self.host.browser_get_elements(tab_id, keywords)?;
                 // Parse and cache elements, return compact summary
                 if let Some(data) = &result.data {
@@ -1719,6 +1834,11 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     }
                 }
             }
+            // Meta-tool: load computer use tools and trigger full prompt injection
+            "load_computer_use_tools" => {
+                self.computer_use_triggered.set(true);
+                r#"{"success":true,"message":"Computer use tools are now available. On the next turn, you will receive the full computer use guide. Available tools: computer_screenshot, computer_mouse_move, computer_click, computer_type_text, computer_key, computer_scroll, computer_drag, computer_cursor_position, computer_mouse_down, computer_mouse_up, computer_hold_key, computer_wait."}"#.to_string()
+            }
             // Artifact editing tools
             "browser_read_artifact" => {
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
@@ -1784,6 +1904,14 @@ The following skill instructions MUST be followed exactly. These instructions ta
             }
         };
 
+        // Auto-trigger computer use if a browser tool result suggests native interaction needed
+        if !self.computer_use_triggered.get()
+            && tool_call.name.starts_with("browser_")
+            && is_browser_failure_suggesting_computer_use(&content)
+        {
+            self.computer_use_triggered.set(true);
+        }
+
         // Use call_id if available, otherwise fall back to id
         // OpenAI Responses API requires call_id to match tool results
         let tool_call_id = tool_call
@@ -1795,6 +1923,61 @@ The following skill instructions MUST be followed exactly. These instructions ta
             content,
             success: true,
         })
+    }
+
+    /// Attempt a native OS-level click fallback when all JS click tiers failed.
+    ///
+    /// Returns a replacement JSON result string if the fallback fired successfully,
+    /// or `None` to let the original result flow through.
+    fn try_computer_click_fallback(&self, result: &BrowserToolResult) -> Option<String> {
+        let data = result.data.as_ref()?;
+
+        // Only fire when every programmatic click tier was attempted and none was effective
+        let click_method = data.get("clickMethod").and_then(|v| v.as_str())?;
+        if click_method != "all_tiers_exhausted" {
+            return None;
+        }
+        let effective = data.get("effective").and_then(|v| v.as_bool()).unwrap_or(true);
+        if effective {
+            return None;
+        }
+
+        // Extension must provide screen-absolute bounds for the element
+        let bounds: ScreenBounds = serde_json::from_value(data.get("screenBounds")?.clone()).ok()?;
+        if bounds.width <= 0.0 || bounds.height <= 0.0 {
+            return None;
+        }
+
+        let cx = (bounds.x + bounds.width / 2.0).round() as i64;
+        let cy = (bounds.y + bounds.height / 2.0).round() as i64;
+
+        match self.host.computer_click(cx, cy, None, None) {
+            Ok(click_result) => {
+                self.computer_use_triggered.set(true);
+                let click_value = serde_json::from_str::<serde_json::Value>(&click_result)
+                    .unwrap_or(serde_json::Value::String(click_result));
+                Some(
+                    serde_json::json!({
+                        "clickMethod": "computer_click_fallback",
+                        "originalMethod": "all_tiers_exhausted",
+                        "fallbackCoordinates": { "x": cx, "y": cy },
+                        "computerClickResult": click_value,
+                    })
+                    .to_string(),
+                )
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Serialize a browser click result, applying the computer_click fallback if needed.
+    fn click_result_with_fallback(&self, result: &BrowserToolResult, tab_id: Option<i64>) -> String {
+        let result_str = if let Some(fallback) = self.try_computer_click_fallback(result) {
+            fallback
+        } else {
+            serde_json::to_string(result).unwrap_or_default()
+        };
+        self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
     }
 
     /// Execute wait-for-stable + viewport snapshot and append to action result.
@@ -2520,7 +2703,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // Get elements (usually not needed — page state is auto-injected)
         tools.push(ToolDefinition {
             name: "browser_get_elements".into(),
-            description: "Get interactive elements on the page. Use keywords to locate specific elements by visible text (e.g. button labels, input placeholders). Keywords work across all frameworks including React, Vue, Shadow DOM.".into(),
+            description: "Get interactive elements on the page. Use keywords to locate specific elements by visible text (e.g. button labels, input placeholders). Keywords must match the page's actual language — check the 'lang:' field in page output. Keywords work across all frameworks including React, Vue, Shadow DOM.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2531,7 +2714,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     "keywords": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Keywords to locate target elements by visible text. Supports multiple languages. Example: [\"Log in\", \"username\", \"Next\"]"
+                        "description": "Keywords to locate target elements by visible text. IMPORTANT: keywords must be in the page's language (see 'lang:' in snapshot output). Example: [\"Log in\", \"username\"] for English pages, [\"登录\", \"用户名\"] for Chinese pages."
                     }
                 }
             }),
@@ -2596,6 +2779,18 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     }
                 },
                 "required": ["id"]
+            }),
+        });
+
+        // Meta-tool to load computer use tools (Browser mode only).
+        // Calling this signals that computer use is needed and triggers
+        // full prompt injection on the next turn.
+        tools.push(ToolDefinition {
+            name: "load_computer_use_tools".into(),
+            description: "Load native computer control tools (mouse, keyboard, screenshot) for interacting with OS dialogs, desktop apps, or other elements outside the browser DOM. Call this when browser tools cannot reach the target.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
             }),
         });
 
@@ -2805,7 +3000,8 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
         tools.push(ToolDefinition {
             name: "computer_mouse_move".into(),
-            description: "Move the mouse cursor to a specified position on screen".into(),
+            description: "Move the mouse cursor to a specified position on screen without clicking"
+                .into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2816,11 +3012,6 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     "y": {
                         "type": "integer",
                         "description": "Y coordinate in pixels"
-                    },
-                    "click": {
-                        "type": "string",
-                        "description": "Optional click action after moving",
-                        "enum": ["left", "right", "middle", "double"]
                     }
                 },
                 "required": ["x", "y"]
@@ -2938,6 +3129,150 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     }
                 },
                 "required": ["x", "y", "direction"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "computer_drag".into(),
+            description: "Drag from one screen position to another (press, move, release)".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "start_x": {
+                        "type": "integer",
+                        "description": "Starting X coordinate in pixels"
+                    },
+                    "start_y": {
+                        "type": "integer",
+                        "description": "Starting Y coordinate in pixels"
+                    },
+                    "end_x": {
+                        "type": "integer",
+                        "description": "Ending X coordinate in pixels"
+                    },
+                    "end_y": {
+                        "type": "integer",
+                        "description": "Ending Y coordinate in pixels"
+                    },
+                    "button": {
+                        "type": "string",
+                        "description": "Mouse button to use for dragging",
+                        "enum": ["left", "right", "middle"],
+                        "default": "left"
+                    }
+                },
+                "required": ["start_x", "start_y", "end_x", "end_y"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "computer_cursor_position".into(),
+            description: "Get the current mouse cursor position on screen".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "computer_mouse_down".into(),
+            description:
+                "Press and hold a mouse button at a position (use computer_mouse_up to release)"
+                    .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "x": {
+                        "type": "integer",
+                        "description": "X coordinate in pixels"
+                    },
+                    "y": {
+                        "type": "integer",
+                        "description": "Y coordinate in pixels"
+                    },
+                    "button": {
+                        "type": "string",
+                        "description": "Mouse button to press",
+                        "enum": ["left", "right", "middle"],
+                        "default": "left"
+                    }
+                },
+                "required": ["x", "y"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "computer_mouse_up".into(),
+            description: "Release a mouse button at a position (use after computer_mouse_down)"
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "x": {
+                        "type": "integer",
+                        "description": "X coordinate in pixels"
+                    },
+                    "y": {
+                        "type": "integer",
+                        "description": "Y coordinate in pixels"
+                    },
+                    "button": {
+                        "type": "string",
+                        "description": "Mouse button to release",
+                        "enum": ["left", "right", "middle"],
+                        "default": "left"
+                    }
+                },
+                "required": ["x", "y"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "computer_hold_key".into(),
+            description: "Hold a key down for a specified duration, then release".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "Key to hold (e.g., 'Shift', 'Control', 'Alt', 'a')"
+                    },
+                    "duration_ms": {
+                        "type": "integer",
+                        "description": "Duration to hold the key in milliseconds",
+                        "minimum": 100,
+                        "maximum": 10000,
+                        "default": 500
+                    },
+                    "modifiers": {
+                        "type": "array",
+                        "description": "Modifier keys to hold simultaneously",
+                        "items": {
+                            "type": "string",
+                            "enum": ["ctrl", "alt", "shift", "meta", "super"]
+                        },
+                        "default": []
+                    }
+                },
+                "required": ["key", "duration_ms"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "computer_wait".into(),
+            description: "Wait for a specified duration before continuing. Use to wait for animations, loading, or transitions.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "ms": {
+                        "type": "integer",
+                        "description": "Duration to wait in milliseconds",
+                        "minimum": 100,
+                        "maximum": 10000,
+                        "default": 1000
+                    }
+                },
+                "required": ["ms"]
             }),
         });
 
@@ -3135,6 +3470,120 @@ fn format_skill_summaries(skills: &[SkillSummary]) -> String {
         .join("\n")
 }
 
+/// Check if a user message contains keywords that suggest computer use is needed.
+/// Extract a `modifiers` string array from a JSON arguments object.
+fn parse_modifiers_arg(args: &serde_json::Value) -> Vec<String> {
+    args.get("modifiers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn should_trigger_computer_use(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    // English keywords
+    const EN_KEYWORDS: &[&str] = &[
+        "desktop",
+        "screenshot",
+        "system settings",
+        "system preferences",
+        "file manager",
+        "file explorer",
+        "dialog",
+        "file picker",
+        "file upload",
+        "drag and drop",
+        "drag",
+        "captcha",
+        "native app",
+        "native window",
+        "taskbar",
+        "dock",
+        "start menu",
+        "notification",
+        "popup",
+        "right-click menu",
+        "context menu",
+        "terminal",
+        "command prompt",
+    ];
+    for kw in EN_KEYWORDS {
+        if lower.contains(kw) {
+            return true;
+        }
+    }
+    // Chinese keywords
+    const ZH_KEYWORDS: &[&str] = &[
+        "桌面",
+        "截屏",
+        "截图",
+        "系统设置",
+        "文件管理器",
+        "弹窗",
+        "对话框",
+        "上传文件",
+        "拖拽",
+        "拖放",
+        "验证码",
+        "原生应用",
+        "任务栏",
+        "右键菜单",
+        "通知",
+        "终端",
+        "命令行",
+    ];
+    for kw in ZH_KEYWORDS {
+        if message.contains(kw) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if a browser tool result indicates a failure that suggests computer use is needed.
+/// Detects native file pickers, OS dialogs, permission prompts, etc.
+fn is_browser_failure_suggesting_computer_use(result: &str) -> bool {
+    // Quick check on the original string for error indicators before allocating.
+    // These keywords are ASCII-lowercase in JSON output, so no case conversion needed.
+    let has_error =
+        result.contains("error") || result.contains("failed") || result.contains("false");
+    if !has_error {
+        return false;
+    }
+
+    let lower = result.to_lowercase();
+    const PATTERNS: &[&str] = &[
+        "file picker",
+        "file chooser",
+        "file dialog",
+        "upload dialog",
+        "native dialog",
+        "os dialog",
+        "system dialog",
+        "permission prompt",
+        "permission dialog",
+        "not interactable",
+        "element not found",
+        "element is not clickable",
+        "intercepted",
+        "obscured",
+        // all_tiers_exhausted + effective:false means every programmatic click
+        // method was tried and none worked — strong signal that the element
+        // requires a trusted user gesture (e.g. OAuth popups, file inputs).
+        "all_tiers_exhausted",
+    ];
+    for pattern in PATTERNS {
+        if lower.contains(pattern) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Safely truncate a string to at most `max_bytes` bytes at a valid UTF-8 char boundary.
 fn truncate_string_safe(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
@@ -3292,14 +3741,18 @@ mod tests {
 
     #[test]
     fn test_build_system_prompt() {
-        let prompt = Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Chat, &[], &[]);
+        let no_cu = ComputerUseFlags::default();
+        let prompt =
+            Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Chat, &[], &[], no_cu);
         assert!(!prompt.is_empty());
         assert_eq!(prompt, CHAT_PROMPT);
 
-        let prompt = Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Browser, &[], &[]);
+        let prompt =
+            Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Browser, &[], &[], no_cu);
         assert_eq!(prompt, BROWSER_PROMPT);
 
-        let prompt = Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Agent, &[], &[]);
+        let prompt =
+            Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Agent, &[], &[], no_cu);
         assert_eq!(prompt, AGENT_PROMPT);
     }
 
@@ -3555,7 +4008,12 @@ mod tests {
             description: "Web automation tools".into(),
             tags: vec![],
         }];
-        let prompt = Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Chat, &skills, &[]);
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
+            AgentMode::Chat,
+            &skills,
+            &[],
+            ComputerUseFlags::default(),
+        );
         assert!(prompt.contains("web-tools"));
         assert!(prompt.contains("# Skills"));
     }
@@ -3563,18 +4021,211 @@ mod tests {
     #[test]
     fn test_build_system_prompt_with_models() {
         let models = vec![("anthropic".into(), "claude-sonnet".into())];
-        let prompt = Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Chat, &[], &models);
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
+            AgentMode::Chat,
+            &[],
+            &models,
+            ComputerUseFlags::default(),
+        );
         assert!(prompt.contains("claude-sonnet"));
         assert!(prompt.contains("# Available models"));
     }
 
     #[test]
     fn test_build_system_prompt_no_extras() {
-        let prompt = Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Chat, &[], &[]);
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
+            AgentMode::Chat,
+            &[],
+            &[],
+            ComputerUseFlags::default(),
+        );
         // Should be exactly the static prompt, no extras
         assert_eq!(prompt, CHAT_PROMPT);
         assert!(!prompt.contains("# Skills"));
         assert!(!prompt.contains("# Available models"));
+    }
+
+    // =========================================================================
+    // Computer Use Tests
+    // =========================================================================
+
+    #[test]
+    fn test_should_trigger_computer_use_english_keywords() {
+        assert!(should_trigger_computer_use("Open the desktop app"));
+        assert!(should_trigger_computer_use(
+            "Take a screenshot of the screen"
+        ));
+        assert!(should_trigger_computer_use("Handle the file picker dialog"));
+        assert!(should_trigger_computer_use("Click on the taskbar icon"));
+        assert!(should_trigger_computer_use("Drag the file to the folder"));
+        assert!(should_trigger_computer_use("Solve the captcha"));
+    }
+
+    #[test]
+    fn test_should_trigger_computer_use_chinese_keywords() {
+        assert!(should_trigger_computer_use("请在桌面上找到文件"));
+        assert!(should_trigger_computer_use("处理上传文件的弹窗"));
+        assert!(should_trigger_computer_use("拖拽这个图标"));
+        assert!(should_trigger_computer_use("点击系统设置"));
+        assert!(should_trigger_computer_use("解决验证码"));
+    }
+
+    #[test]
+    fn test_should_not_trigger_computer_use_normal_messages() {
+        assert!(!should_trigger_computer_use("Search for rust tutorials"));
+        assert!(!should_trigger_computer_use("Fill in the login form"));
+        assert!(!should_trigger_computer_use("Click the submit button"));
+        assert!(!should_trigger_computer_use("Navigate to google.com"));
+    }
+
+    #[test]
+    fn test_computer_use_flags_chat_mode() {
+        let agent = Agent::new(MockHostFunctions::new());
+        let flags = agent.computer_use_flags(AgentMode::Chat);
+        assert!(!flags.inject_overview);
+        assert!(!flags.inject_guide);
+        assert!(!flags.inject_examples);
+    }
+
+    #[test]
+    fn test_computer_use_flags_browser_default() {
+        let agent = Agent::new(MockHostFunctions::new());
+        let flags = agent.computer_use_flags(AgentMode::Browser);
+        assert!(flags.inject_overview);
+        assert!(!flags.inject_guide);
+        assert!(!flags.inject_examples);
+    }
+
+    #[test]
+    fn test_computer_use_flags_browser_triggered() {
+        let agent = Agent::new(MockHostFunctions::new());
+        agent.computer_use_triggered.set(true);
+        let flags = agent.computer_use_flags(AgentMode::Browser);
+        assert!(flags.inject_overview);
+        assert!(flags.inject_guide);
+        assert!(flags.inject_examples);
+    }
+
+    #[test]
+    fn test_computer_use_flags_agent_default() {
+        let agent = Agent::new(MockHostFunctions::new());
+        let flags = agent.computer_use_flags(AgentMode::Agent);
+        assert!(flags.inject_overview);
+        assert!(flags.inject_guide);
+        assert!(!flags.inject_examples);
+    }
+
+    #[test]
+    fn test_computer_use_flags_agent_triggered() {
+        let agent = Agent::new(MockHostFunctions::new());
+        agent.computer_use_triggered.set(true);
+        let flags = agent.computer_use_flags(AgentMode::Agent);
+        assert!(flags.inject_overview);
+        assert!(flags.inject_guide);
+        assert!(flags.inject_examples);
+    }
+
+    #[test]
+    fn test_build_system_prompt_with_computer_use_overview() {
+        let flags = ComputerUseFlags {
+            inject_overview: true,
+            inject_guide: false,
+            inject_examples: false,
+        };
+        let prompt =
+            Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Browser, &[], &[], flags);
+        assert!(prompt.contains("# Computer Use"));
+        assert!(prompt.contains("Browser Use"));
+        assert!(!prompt.contains("# Computer Use Guide"));
+        assert!(!prompt.contains("# Computer Use Examples"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_with_all_computer_use_layers() {
+        let flags = ComputerUseFlags {
+            inject_overview: true,
+            inject_guide: true,
+            inject_examples: true,
+        };
+        let prompt =
+            Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Agent, &[], &[], flags);
+        assert!(prompt.contains("# Computer Use"));
+        assert!(prompt.contains("# Computer Use Guide"));
+        assert!(prompt.contains("# Computer Use Examples"));
+        assert!(prompt.contains("computer_drag"));
+        assert!(prompt.contains("Observe Before Acting"));
+    }
+
+    #[test]
+    fn test_is_browser_failure_suggesting_computer_use() {
+        // Should trigger
+        assert!(is_browser_failure_suggesting_computer_use(
+            r#"{"success":false,"error":"Element not found - native file picker dialog detected"}"#
+        ));
+        assert!(is_browser_failure_suggesting_computer_use(
+            r#"{"success":false,"error":"Cannot interact with file dialog"}"#
+        ));
+        assert!(is_browser_failure_suggesting_computer_use(
+            r#"{"success":false,"error":"Element is not clickable - obscured by permission prompt"}"#
+        ));
+        // Should trigger: all click methods exhausted (OAuth/trusted gesture required)
+        assert!(is_browser_failure_suggesting_computer_use(
+            r#"{"success":true,"data":{"clickMethod":"all_tiers_exhausted","clicked":true,"domChanged":false,"effective":false,"element_id":"e4","networkRequestMade":false}}"#
+        ));
+        // Should NOT trigger (no error indicator)
+        assert!(!is_browser_failure_suggesting_computer_use(
+            r#"{"success":true,"data":"file picker button"}"#
+        ));
+        // Should NOT trigger (error but no matching pattern)
+        assert!(!is_browser_failure_suggesting_computer_use(
+            r#"{"success":false,"error":"Network timeout"}"#
+        ));
+    }
+
+    #[test]
+    fn test_agent_tools_include_new_computer_tools() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        let tools = agent.get_agent_tools();
+        let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        // Verify all 12 computer tools are present in agent mode
+        assert!(tool_names.contains(&"computer_screenshot"));
+        assert!(tool_names.contains(&"computer_mouse_move"));
+        assert!(tool_names.contains(&"computer_click"));
+        assert!(tool_names.contains(&"computer_type_text"));
+        assert!(tool_names.contains(&"computer_key"));
+        assert!(tool_names.contains(&"computer_scroll"));
+        assert!(tool_names.contains(&"computer_drag"));
+        assert!(tool_names.contains(&"computer_cursor_position"));
+        assert!(tool_names.contains(&"computer_mouse_down"));
+        assert!(tool_names.contains(&"computer_mouse_up"));
+        assert!(tool_names.contains(&"computer_hold_key"));
+        assert!(tool_names.contains(&"computer_wait"));
+    }
+
+    #[test]
+    fn test_browser_tools_include_load_computer_use_tools() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        let tools = agent.get_browser_tools();
+        let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(tool_names.contains(&"load_computer_use_tools"));
+    }
+
+    #[test]
+    fn test_computer_mouse_move_no_click_param() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        let tools = agent.get_agent_tools();
+        let mouse_move = tools
+            .iter()
+            .find(|t| t.name == "computer_mouse_move")
+            .unwrap();
+        let schema = &mouse_move.input_schema;
+        // Verify click parameter has been removed
+        assert!(schema["properties"]["click"].is_null());
+        assert!(mouse_move.description.contains("without clicking"));
     }
 
     #[test]
@@ -3736,6 +4387,87 @@ mod tests {
     }
 
     #[test]
+    fn test_computer_click_fallback_triggers() {
+        let agent = Agent::new(MockHostFunctions::new());
+        let result = BrowserToolResult::success(serde_json::json!({
+            "clickMethod": "all_tiers_exhausted",
+            "effective": false,
+            "element_id": "e4",
+            "screenBounds": { "x": 100.0, "y": 200.0, "width": 80.0, "height": 30.0 }
+        }));
+        let fallback = agent.try_computer_click_fallback(&result);
+        assert!(fallback.is_some());
+        let json: serde_json::Value = serde_json::from_str(&fallback.unwrap()).unwrap();
+        assert_eq!(json["clickMethod"], "computer_click_fallback");
+        assert_eq!(json["originalMethod"], "all_tiers_exhausted");
+        // computerClickResult should be a parsed object, not a double-serialized string
+        assert!(json["computerClickResult"].is_object());
+        assert!(agent.computer_use_triggered.get());
+    }
+
+    #[test]
+    fn test_computer_click_fallback_no_screen_bounds() {
+        let agent = Agent::new(MockHostFunctions::new());
+        let result = BrowserToolResult::success(serde_json::json!({
+            "clickMethod": "all_tiers_exhausted",
+            "effective": false,
+            "element_id": "e4"
+        }));
+        assert!(agent.try_computer_click_fallback(&result).is_none());
+        assert!(!agent.computer_use_triggered.get());
+    }
+
+    #[test]
+    fn test_computer_click_fallback_effective_true() {
+        let agent = Agent::new(MockHostFunctions::new());
+        let result = BrowserToolResult::success(serde_json::json!({
+            "clickMethod": "all_tiers_exhausted",
+            "effective": true,
+            "element_id": "e4",
+            "screenBounds": { "x": 100.0, "y": 200.0, "width": 80.0, "height": 30.0 }
+        }));
+        assert!(agent.try_computer_click_fallback(&result).is_none());
+    }
+
+    #[test]
+    fn test_computer_click_fallback_normal_click() {
+        let agent = Agent::new(MockHostFunctions::new());
+        let result = BrowserToolResult::success(serde_json::json!({
+            "clickMethod": "dispatchEvent",
+            "effective": true,
+            "element_id": "e4",
+            "screenBounds": { "x": 100.0, "y": 200.0, "width": 80.0, "height": 30.0 }
+        }));
+        assert!(agent.try_computer_click_fallback(&result).is_none());
+    }
+
+    #[test]
+    fn test_computer_click_fallback_coordinates() {
+        let agent = Agent::new(MockHostFunctions::new());
+        let result = BrowserToolResult::success(serde_json::json!({
+            "clickMethod": "all_tiers_exhausted",
+            "effective": false,
+            "screenBounds": { "x": 100.0, "y": 200.0, "width": 80.0, "height": 30.0 }
+        }));
+        let fallback = agent.try_computer_click_fallback(&result).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&fallback).unwrap();
+        // Center: (100 + 80/2).round() = 140, (200 + 30/2).round() = 215
+        assert_eq!(json["fallbackCoordinates"]["x"], 140);
+        assert_eq!(json["fallbackCoordinates"]["y"], 215);
+    }
+
+    #[test]
+    fn test_computer_click_fallback_zero_size_bounds() {
+        let agent = Agent::new(MockHostFunctions::new());
+        let result = BrowserToolResult::success(serde_json::json!({
+            "clickMethod": "all_tiers_exhausted",
+            "effective": false,
+            "screenBounds": { "x": 100.0, "y": 200.0, "width": 0.0, "height": 0.0 }
+        }));
+        assert!(agent.try_computer_click_fallback(&result).is_none());
+    }
+
+    #[test]
     fn test_execute_tool_browser_type() {
         let mock = MockHostFunctions::new();
         let agent = Agent::new(mock);
@@ -3811,9 +4543,10 @@ mod tests {
 
         let browser_tools = agent.get_browser_tools();
         let chat_tools = agent.get_chat_tools();
-        // Browser tools = chat tools + 15 browser-specific interaction tools
+        // Browser tools = chat tools + 16 browser-specific tools
+        // (15 browser interaction tools + 1 load_computer_use_tools meta-tool)
         // (browser_get_content, browser_get_markdown, browser_screenshot are already in chat tools)
-        assert_eq!(browser_tools.len(), chat_tools.len() + 15);
+        assert_eq!(browser_tools.len(), chat_tools.len() + 16);
     }
 
     #[test]
