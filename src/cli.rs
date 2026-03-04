@@ -57,6 +57,10 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub port_end: Option<u16>,
 
+    /// Bind to this exact port (used by proxy in managed mode)
+    #[arg(long, hide = true)]
+    pub port: Option<u16>,
+
     /// Daemon self-terminates on idle (set by proxy when spawning)
     #[arg(long, hide = true)]
     pub managed: bool,
@@ -330,6 +334,15 @@ mod tests {
         let cli = Cli::try_parse_from(["nevoflux", "--daemon", "--managed"]).unwrap();
         assert!(cli.daemon);
         assert!(cli.managed);
+    }
+
+    #[test]
+    fn test_cli_parse_port_flag() {
+        let cli =
+            Cli::try_parse_from(["nevoflux", "--daemon", "--managed", "--port", "19523"]).unwrap();
+        assert!(cli.daemon);
+        assert!(cli.managed);
+        assert_eq!(cli.port, Some(19523));
     }
 
     #[test]

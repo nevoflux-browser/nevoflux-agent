@@ -6,7 +6,9 @@
 use crate::config::BridgeConfig;
 use crate::error::{BridgeError, Result};
 use std::path::Path;
+use std::time::Duration;
 use tokio::fs;
+use tokio::net::TcpStream;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
@@ -230,6 +232,95 @@ pub async fn launch_daemon(executable: &Path, config: &BridgeConfig) -> Result<u
     Ok(pid)
 }
 
+/// Launch the daemon process with an explicit port (zero-file managed mode).
+///
+/// The proxy has already allocated the port, so the daemon binds to it directly
+/// without writing any port/pid/lock files.
+pub async fn launch_daemon_with_port(
+    executable: &Path,
+    config: &BridgeConfig,
+    port: u16,
+) -> Result<u32> {
+    if !executable.exists() {
+        return Err(BridgeError::DaemonLaunchFailed(format!(
+            "Executable not found: {}",
+            executable.display()
+        )));
+    }
+
+    info!(
+        "Launching daemon with explicit port {}: {}",
+        port,
+        executable.display()
+    );
+
+    let mut cmd = Command::new(executable);
+    cmd.arg("--daemon")
+        .arg("--managed")
+        .arg("--port")
+        .arg(port.to_string());
+
+    // Pass port range so daemon config is consistent
+    cmd.arg("--port-start")
+        .arg(config.port_range_start.to_string());
+    cmd.arg("--port-end").arg(config.port_range_end.to_string());
+
+    // Redirect stdout/stderr to null so daemon output does not
+    // pollute the proxy's Native Messaging channel.
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+
+    // On Windows, detach the daemon so it survives proxy shutdown.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| BridgeError::DaemonLaunchFailed(e.to_string()))?;
+
+    let pid = child
+        .id()
+        .ok_or_else(|| BridgeError::DaemonLaunchFailed("Failed to get daemon PID".into()))?;
+
+    info!("Daemon launched with PID {} on port {}", pid, port);
+    Ok(pid)
+}
+
+/// Wait for a daemon to become ready by polling TCP connectivity.
+///
+/// Replaces file-polling in zero-file managed mode. Returns `Ok(())` once a
+/// TCP connection to the given port succeeds, or an error if the timeout is
+/// exceeded.
+pub async fn wait_for_daemon_ready(port: u16, timeout: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let addr = format!("127.0.0.1:{}", port);
+
+    debug!("Waiting for daemon on port {} (timeout {:?})", port, timeout);
+
+    loop {
+        if tokio::time::Instant::now() > deadline {
+            return Err(BridgeError::ConnectionFailed(format!(
+                "Daemon did not start in time on port {}",
+                port
+            )));
+        }
+        match TcpStream::connect(&addr).await {
+            Ok(_) => {
+                debug!("Daemon ready on port {}", port);
+                return Ok(());
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +511,32 @@ mod tests {
         let config = BridgeConfig::new();
         let result = launch_daemon(Path::new("/nonexistent/binary"), &config).await;
         assert!(matches!(result, Err(BridgeError::DaemonLaunchFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn test_launch_daemon_with_port_not_found() {
+        let config = BridgeConfig::new();
+        let result =
+            launch_daemon_with_port(Path::new("/nonexistent/binary"), &config, 19523).await;
+        assert!(matches!(result, Err(BridgeError::DaemonLaunchFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_daemon_ready_timeout() {
+        // Use a port that nothing is listening on
+        let result =
+            wait_for_daemon_ready(19999, std::time::Duration::from_millis(200)).await;
+        assert!(matches!(result, Err(BridgeError::ConnectionFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_daemon_ready_success() {
+        // Start a TCP listener, then wait_for_daemon_ready should succeed
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let result =
+            wait_for_daemon_ready(port, std::time::Duration::from_secs(2)).await;
+        assert!(result.is_ok());
     }
 }

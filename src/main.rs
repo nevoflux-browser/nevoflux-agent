@@ -271,18 +271,12 @@ async fn run_proxy(verbose: bool, dev_mode: bool) -> Result<(), Box<dyn std::err
 
     let result = run_async_proxy(stdin(), stdout(), config).await?;
 
-    // In prod mode, clean up the spawned daemon
+    // In prod mode, clean up the spawned daemon.
+    // Zero-file mode: only kill the process. No port/pid/lock files to remove.
     if let Some(pid) = result.spawned_daemon_pid {
         tracing::info!("Proxy shutting down, killing spawned daemon PID {}", pid);
         kill_process(pid);
-
-        // Clean up managed daemon files so the next proxy can auto-launch a fresh daemon
-        // instead of connecting to a stale port.
-        let data_dir = get_data_dir();
-        let _ = std::fs::remove_file(data_dir.join("daemon-managed.port"));
-        let _ = std::fs::remove_file(data_dir.join("daemon-managed.pid"));
-        let _ = std::fs::remove_file(data_dir.join("daemon-managed.lock"));
-        tracing::debug!("Cleaned up daemon-managed port/pid/lock files");
+        // No files to clean up — daemon was launched with --port (zero-file mode)
     }
 
     Ok(())
@@ -357,6 +351,7 @@ async fn run_daemon(
     trace: bool,
     port_start: Option<u16>,
     port_end: Option<u16>,
+    port: Option<u16>,
     managed: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging — managed daemons write to a log file since the
@@ -381,16 +376,20 @@ async fn run_daemon(
 
     logging::log_startup(env!("CARGO_PKG_VERSION"));
 
-    // Acquire lock
-    let _lock = match acquire_daemon_lock(managed) {
-        Ok(lock) => lock,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            eprintln!("Error: Daemon is already running");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Error acquiring lock: {}", e);
-            std::process::exit(1);
+    // In managed+port mode the proxy is the lifecycle manager — skip file lock.
+    let _lock = if managed && port.is_some() {
+        None
+    } else {
+        match acquire_daemon_lock(managed) {
+            Ok(lock) => Some(lock),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                eprintln!("Error: Daemon is already running");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Error acquiring lock: {}", e);
+                std::process::exit(1);
+            }
         }
     };
 
@@ -401,6 +400,10 @@ async fn run_daemon(
             .expect("Failed to create session manager"),
     );
 
+    // Remember whether we're in zero-file mode before `port` gets shadowed
+    // by `server.port()`.
+    let zero_file_mode = managed && port.is_some();
+
     // Start server — pass data_dir so port/pid files are written early
     // (right after port discovery, before MCP/embedding init).
     let data_dir = ensure_data_dir()?;
@@ -408,6 +411,7 @@ async fn run_daemon(
         trace_enabled,
         managed,
         data_dir: Some(data_dir),
+        explicit_port: port,
         ..Default::default()
     };
     if let Some(ps) = port_start {
@@ -428,15 +432,18 @@ async fn run_daemon(
 
     logging::log_shutdown();
 
-    // Cleanup (remove the same files we wrote)
-    let data_dir = get_data_dir();
-    let (port_name, pid_name) = if managed {
-        ("daemon-managed.port", "daemon-managed.pid")
-    } else {
-        ("daemon.port", "daemon.pid")
-    };
-    let _ = std::fs::remove_file(data_dir.join(port_name));
-    let _ = std::fs::remove_file(data_dir.join(pid_name));
+    // Cleanup — only remove files we actually wrote.
+    // In managed+port mode no files were written, so nothing to clean up.
+    if !zero_file_mode {
+        let data_dir = get_data_dir();
+        let (port_name, pid_name) = if managed {
+            ("daemon-managed.port", "daemon-managed.pid")
+        } else {
+            ("daemon.port", "daemon.pid")
+        };
+        let _ = std::fs::remove_file(data_dir.join(port_name));
+        let _ = std::fs::remove_file(data_dir.join(pid_name));
+    }
 
     Ok(())
 }
@@ -704,6 +711,7 @@ async fn main() {
             cli.trace,
             cli.port_start,
             cli.port_end,
+            cli.port,
             cli.managed,
         )
         .await

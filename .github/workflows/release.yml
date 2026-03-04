@@ -120,6 +120,18 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # Stamp the version from the git tag into Cargo.toml so that
+      # `nevoflux-agent --version` prints the release version, not the
+      # development placeholder.
+      - name: Set version from tag
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Setting workspace version to ${VERSION}"
+          sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          rm -f Cargo.toml.bak
+          grep '^version' Cargo.toml
+
       # Linux x86_64: install X11 development libraries
       - name: Install Linux dependencies
         if: matrix.target == 'x86_64-unknown-linux-gnu'

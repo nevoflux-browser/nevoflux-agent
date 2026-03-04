@@ -66,6 +66,9 @@ pub struct ServerConfig {
     /// When set, port and pid files are written immediately after the port
     /// is found, before MCP/embedding initialization completes.
     pub data_dir: Option<PathBuf>,
+    /// Explicit port to bind to (set by proxy in managed mode).
+    /// When set, skips port scanning and port/pid file writes.
+    pub explicit_port: Option<u16>,
 }
 
 impl Default for ServerConfig {
@@ -78,6 +81,7 @@ impl Default for ServerConfig {
             managed: false,
             idle_timeout: std::time::Duration::from_secs(30),
             data_dir: None,
+            explicit_port: None,
         }
     }
 }
@@ -248,7 +252,12 @@ pub async fn start_server(
     router: Arc<Router>,
     session_manager: Arc<SessionManager>,
 ) -> Result<Server> {
-    let port = find_available_port(&config).await?;
+    let port = if let Some(p) = config.explicit_port {
+        info!("Using explicit port {}", p);
+        p
+    } else {
+        find_available_port(&config).await?
+    };
     let bind_addr = format!("{}:{}", config.bind_address, port);
 
     // Bind TCP listener immediately so the port is actually open before we
@@ -259,25 +268,31 @@ pub async fn start_server(
         .map_err(|e| DaemonError::InternalError(format!("Failed to bind: {}", e)))?;
     info!("TCP listener bound on {}", bind_addr);
 
-    // Now write port/pid files — the port is genuinely listening, so the
-    // bridge can connect while we continue initializing below.
-    if let Some(ref data_dir) = config.data_dir {
-        let (port_name, pid_name) = if config.managed {
-            ("daemon-managed.port", "daemon-managed.pid")
-        } else {
-            ("daemon.port", "daemon.pid")
-        };
-        if let Err(e) = std::fs::write(data_dir.join(port_name), port.to_string()) {
-            error!("Failed to write port file: {}", e);
+    // Write port/pid files only when needed (dev mode or managed without
+    // explicit port). In managed+explicit_port mode the proxy already knows
+    // port and PID, so no files are written — zero disk artifacts.
+    let skip_files = config.managed && config.explicit_port.is_some();
+    if !skip_files {
+        if let Some(ref data_dir) = config.data_dir {
+            let (port_name, pid_name) = if config.managed {
+                ("daemon-managed.port", "daemon-managed.pid")
+            } else {
+                ("daemon.port", "daemon.pid")
+            };
+            if let Err(e) = std::fs::write(data_dir.join(port_name), port.to_string()) {
+                error!("Failed to write port file: {}", e);
+            }
+            if let Err(e) =
+                std::fs::write(data_dir.join(pid_name), std::process::id().to_string())
+            {
+                error!("Failed to write pid file: {}", e);
+            }
+            info!(
+                "Port file written early: {}/{}",
+                data_dir.display(),
+                port_name
+            );
         }
-        if let Err(e) = std::fs::write(data_dir.join(pid_name), std::process::id().to_string()) {
-            error!("Failed to write pid file: {}", e);
-        }
-        info!(
-            "Port file written early: {}/{}",
-            data_dir.display(),
-            port_name
-        );
     }
 
     info!("Starting daemon server on {}", bind_addr);

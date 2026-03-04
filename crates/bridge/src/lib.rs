@@ -76,7 +76,8 @@ pub use mcp_bridge::{error_codes, McpBridge, McpBridgeConfig, McpBridgeState};
 pub use native_messaging::{decode_message, encode_message, read_message, write_message};
 pub use port_discovery::{
     cleanup_files, discover_daemon, find_available_port, is_process_running, launch_daemon,
-    read_pid_file, read_port_file, write_pid_file, write_port_file, DaemonInfo,
+    launch_daemon_with_port, read_pid_file, read_port_file, wait_for_daemon_ready,
+    write_pid_file, write_port_file, DaemonInfo,
 };
 pub use proxy::{parse_native_message, Proxy, ProxyConfig, ProxyState};
 pub use streaming::{

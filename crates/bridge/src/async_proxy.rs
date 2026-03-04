@@ -26,7 +26,9 @@ use crate::config::{BridgeConfig, ConnectionMode};
 use crate::daemon_client::{generate_proxy_id, DaemonClient};
 use crate::error::{BridgeError, Result};
 use crate::native_messaging::{read_message, write_message};
-use crate::port_discovery::launch_daemon;
+use crate::port_discovery::{
+    find_available_port, launch_daemon_with_port, wait_for_daemon_ready,
+};
 use crate::proxy::parse_native_message;
 use nevoflux_protocol::{Channel, DaemonEnvelope, ProxyEnvelope};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
@@ -249,62 +251,58 @@ async fn connect_dev_mode(client: &mut DaemonClient, config: &BridgeConfig) -> R
 ///
 /// Returns `Some(pid)` when daemon was spawned, `None` if a pre-existing daemon was found.
 ///
-/// Attempts to connect directly via TCP. If the connection fails (e.g. stale
-/// port file from a killed daemon), cleans up and auto-launches a new daemon.
+/// Zero-file managed mode: the proxy allocates a port, passes it to the daemon
+/// via `--port`, and holds the PID from `spawn()`. No port/pid/lock files are
+/// written, eliminating stale-file issues on Windows.
 async fn connect_prod_mode(
     client: &mut DaemonClient,
     config: &BridgeConfig,
 ) -> Result<Option<u32>> {
-    // Try to connect directly. TCP connect will fail immediately if the daemon
-    // isn't listening, so no separate probe is needed.
-    let needs_launch = match client.connect().await {
+    // 1. Try connecting to a running daemon (dev-mode files or previously launched)
+    match client.connect().await {
         Ok(()) => {
-            debug!("Prod mode: connected to daemon");
+            debug!("Prod mode: connected to existing daemon");
             return Ok(None);
         }
         Err(BridgeError::PortFileNotFound(_)) | Err(BridgeError::DaemonNotRunning) => {
             // No port file → daemon never started
-            true
         }
         Err(BridgeError::ConnectionFailed(_)) | Err(BridgeError::Io(_)) => {
-            // Port file exists but daemon is dead → stale port file
-            warn!("Prod mode: port file exists but connection failed — stale");
+            // Port file exists but daemon is dead → stale state
+            warn!("Prod mode: stale port file detected, cleaning up");
             let _ = tokio::fs::remove_file(config.port_file_path()).await;
             let _ = tokio::fs::remove_file(config.pid_file_path()).await;
             let _ = tokio::fs::remove_file(config.lock_file_path()).await;
-            true
         }
         Err(e) => return Err(e),
-    };
-
-    if !needs_launch {
-        return Ok(None);
     }
 
-    // Daemon not reachable, try to auto-launch
+    // 2. Daemon not reachable — auto-launch with zero-file mode
     if !config.auto_launch_daemon {
         return Err(BridgeError::ConnectionFailed(
             "Daemon not running and auto-launch is disabled".to_string(),
         ));
     }
 
-    info!("Prod mode: attempting to auto-launch daemon");
+    info!("Prod mode: allocating port and launching daemon");
+
+    let port = find_available_port(config).await?;
 
     let exe_path = std::env::current_exe().map_err(|e| {
         BridgeError::DaemonLaunchFailed(format!("Failed to get executable path: {}", e))
     })?;
 
-    match launch_daemon(&exe_path, config).await {
-        Ok(pid) => {
-            info!("Daemon launched with PID {}", pid);
-            client.connect().await?;
-            Ok(Some(pid))
-        }
-        Err(e) => {
-            warn!("Failed to auto-launch daemon: {}", e);
-            Err(e)
-        }
-    }
+    let pid = launch_daemon_with_port(&exe_path, config, port).await?;
+    info!("Daemon launched with PID {} on port {}", pid, port);
+
+    // 3. Wait for daemon to be ready (TCP health check, not file polling)
+    wait_for_daemon_ready(port, config.connect_timeout).await?;
+
+    // 4. Connect directly to the known port
+    let addr = format!("127.0.0.1:{}", port);
+    client.connect_to(&addr).await?;
+
+    Ok(Some(pid))
 }
 
 /// Task that reads from stdin and sends to the socket task.
