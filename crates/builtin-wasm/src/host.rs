@@ -392,7 +392,11 @@ pub trait HostFunctions {
     ) -> HostResult<BrowserToolResult>;
 
     /// Take a viewport-only snapshot (returns flat list of visible interactive elements).
-    fn browser_viewport_snapshot(&self, tab_id: Option<i64>, keywords: Option<Vec<String>>) -> HostResult<BrowserToolResult>;
+    fn browser_viewport_snapshot(
+        &self,
+        tab_id: Option<i64>,
+        keywords: Option<Vec<String>>,
+    ) -> HostResult<BrowserToolResult>;
 
     /// Press a keyboard key.
     fn browser_key_press(
@@ -1063,7 +1067,11 @@ impl HostFunctions for MockHostFunctions {
         })))
     }
 
-    fn browser_viewport_snapshot(&self, _tab_id: Option<i64>, _keywords: Option<Vec<String>>) -> HostResult<BrowserToolResult> {
+    fn browser_viewport_snapshot(
+        &self,
+        _tab_id: Option<i64>,
+        _keywords: Option<Vec<String>>,
+    ) -> HostResult<BrowserToolResult> {
         Ok(BrowserToolResult::success(serde_json::json!({
             "tree": "Page: \"Test\" | URL: https://example.com\nViewport: 1920x1080 | Scroll: 0/2000 (top)\n\n[e1] button \"Submit\"\n[e2] textbox \"Email\"",
             "refs": {"e1": {"selectors": [{"type": "css", "strategy": "id", "value": "#submit"}], "role": "button", "name": "Submit"}, "e2": {"selectors": [{"type": "css", "strategy": "id", "value": "#email"}], "role": "textbox", "name": "Email"}},

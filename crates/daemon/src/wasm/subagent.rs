@@ -301,6 +301,17 @@ impl SubagentExecutor {
         custom_prompt: Option<String>,
         tab_id: Option<i64>,
     ) -> Result<SubagentHandle, String> {
+        // Prune completed handles when the map grows too large to prevent
+        // unbounded memory growth. We keep a generous threshold so callers
+        // have time to wait()/get() results before they're removed.
+        const PRUNE_THRESHOLD: usize = 64;
+        {
+            let mut handles = self.handles.write().unwrap();
+            if handles.len() > PRUNE_THRESHOLD {
+                handles.retain(|_, h| h.is_running());
+            }
+        }
+
         // Check concurrency limit
         if !self.can_spawn() {
             return Err(format!(
@@ -480,8 +491,14 @@ impl SubagentExecutor {
             return Err("Subagent was killed before execution".to_string());
         }
 
-        // Run the agent
-        agent.run(&input).map_err(|e| format!("Agent error: {}", e))
+        // Run the agent in spawn_blocking so that Handle::block_on() calls
+        // inside agent.run() don't panic with "Cannot start a runtime from
+        // within a runtime".
+        tokio::task::spawn_blocking(move || {
+            agent.run(&input).map_err(|e| format!("Agent error: {}", e))
+        })
+        .await
+        .map_err(|e| format!("Subagent task panicked: {}", e))?
     }
 
     /// Get a handle to a subagent by ID.

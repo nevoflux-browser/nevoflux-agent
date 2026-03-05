@@ -282,8 +282,7 @@ pub async fn start_server(
             if let Err(e) = std::fs::write(data_dir.join(port_name), port.to_string()) {
                 error!("Failed to write port file: {}", e);
             }
-            if let Err(e) =
-                std::fs::write(data_dir.join(pid_name), std::process::id().to_string())
+            if let Err(e) = std::fs::write(data_dir.join(pid_name), std::process::id().to_string())
             {
                 error!("Failed to write pid file: {}", e);
             }
@@ -997,22 +996,28 @@ pub async fn start_server(
             if msg_type == "plan_response" {
                 info!("Processing plan_response message");
                 if let Some(payload) = envelope.payload.get("payload") {
-                    // PlanResponse serializes as a bare string ("confirmed"/"cancelled"),
-                    // so session_id must be extracted from the envelope payload level,
-                    // not from within the PlanResponse value itself.
-                    let session_id = envelope
-                        .payload
+                    // The sidebar sends PlanResponsePayload (object with session_id + response),
+                    // not a bare PlanResponse string. Extract fields from the inner payload.
+                    let session_id = payload
                         .get("session_id")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
 
-                    if let Ok(response) = serde_json::from_value::<PlanResponse>(payload.clone()) {
+                    // Try parsing the "response" field as PlanResponse enum
+                    let response = payload
+                        .get("response")
+                        .and_then(|v| serde_json::from_value::<PlanResponse>(v.clone()).ok());
+
+                    if let Some(response) = response {
+                        info!("Plan response: {:?} for session: {}", response, session_id);
                         if let Some(tx) = process_plan_registry.lock().await.remove(&session_id) {
                             let _ = tx.send(response);
                         } else {
                             warn!("No pending plan request for session: {}", session_id);
                         }
+                    } else {
+                        warn!("Failed to parse plan response from payload: {:?}", payload);
                     }
                 }
                 continue;
@@ -1371,6 +1376,8 @@ async fn handle_chat_message_streaming(
             session_manager,
             services,
             runtime,
+            proxy_id.clone(),
+            identity.clone(),
         )
         .await;
         // Add done: true to signal this is a complete response (not streaming)
@@ -1811,6 +1818,11 @@ async fn handle_chat_message_streaming(
         let mut accumulated_text = String::new();
         let mut cancelled = false;
         let mut buffer = String::new();
+        // Tracks how many bytes of accumulated_text have been sent to sidebar.
+        // Used to suppress the ```python-exec block from being displayed.
+        #[allow(unused_assignments)]
+        let mut sent_bytes: usize = 0;
+        let mut code_fence_detected = false;
         let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(300));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Skip the immediate first tick
@@ -1850,6 +1862,49 @@ async fn handle_chat_message_streaming(
             }};
         }
 
+        // Flush buffered text to sidebar, suppressing ```python-exec blocks.
+        // Returns true if text was sent (or nothing to send), false on send error.
+        macro_rules! flush_buffer {
+            ($done:expr) => {{
+                let text = std::mem::take(&mut buffer);
+                let is_first = accumulated_text.is_empty();
+                accumulated_text.push_str(&text);
+
+                if code_fence_detected {
+                    // Already inside code fence — don't send anything
+                    true
+                } else if let Some(rel) = accumulated_text[sent_bytes..].find(crate::agent::runner::PYTHON_EXEC_FENCE) {
+                    // Code fence found — send only text before it
+                    code_fence_detected = true;
+                    let sendable_end = sent_bytes + rel;
+                    if sendable_end > sent_bytes {
+                        let to_send = accumulated_text[sent_bytes..sendable_end].trim_end().to_string();
+                        sent_bytes = sendable_end;
+                        if !to_send.is_empty() {
+                            // Don't send done=true — Code Mode will handle it
+                            send_chunk!(to_send, false, None::<&serde_json::Value>, None::<&nevoflux_protocol::ThinkingEvent>, is_first).is_ok()
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    }
+                } else {
+                    // No code fence — send normally
+                    let to_send = &accumulated_text[sent_bytes..];
+                    if !to_send.is_empty() {
+                        let to_send = to_send.to_string();
+                        sent_bytes = accumulated_text.len();
+                        send_chunk!(to_send, $done, None::<&serde_json::Value>, None::<&nevoflux_protocol::ThinkingEvent>, is_first).is_ok()
+                    } else if $done {
+                        send_chunk!("", true, None::<&serde_json::Value>, None::<&nevoflux_protocol::ThinkingEvent>, is_first).is_ok()
+                    } else {
+                        true
+                    }
+                }
+            }};
+        }
+
         loop {
             tokio::select! {
                 biased;
@@ -1864,11 +1919,8 @@ async fn handle_chat_message_streaming(
                 // Flush buffer on 300ms tick
                 _ = interval.tick() => {
                     if !buffer.is_empty() {
-                        let text = std::mem::take(&mut buffer);
-                        let is_first = accumulated_text.is_empty();
-                        accumulated_text.push_str(&text);
-                        if let Err(e) = send_chunk!(text, false, None::<&serde_json::Value>, None::<&nevoflux_protocol::ThinkingEvent>, is_first) {
-                            error!("Failed to send stream chunk: {}", e);
+                        if !flush_buffer!(false) {
+                            error!("Failed to send stream chunk");
                             break;
                         }
                     }
@@ -1881,11 +1933,8 @@ async fn handle_chat_message_streaming(
                             if chunk.event.is_some() || chunk.thinking_event.is_some() {
                                 // Tool/thinking event: flush text buffer first, then send event immediately
                                 if !buffer.is_empty() {
-                                    let text = std::mem::take(&mut buffer);
-                                    let is_first = accumulated_text.is_empty();
-                                    accumulated_text.push_str(&text);
-                                    if let Err(e) = send_chunk!(text, false, None::<&serde_json::Value>, None::<&nevoflux_protocol::ThinkingEvent>, is_first) {
-                                        error!("Failed to send stream chunk: {}", e);
+                                    if !flush_buffer!(false) {
+                                        error!("Failed to send stream chunk");
                                         break;
                                     }
                                 }
@@ -1906,16 +1955,22 @@ async fn handle_chat_message_streaming(
                             } else if chunk.done {
                                 // Done: flush remaining buffer + final text
                                 buffer.push_str(&chunk.text);
-                                let text = std::mem::take(&mut buffer);
-                                let is_first = accumulated_text.is_empty();
-                                accumulated_text.push_str(&text);
-                                if let Err(e) = send_chunk!(text, true, None::<&serde_json::Value>, None::<&nevoflux_protocol::ThinkingEvent>, is_first) {
-                                    error!("Failed to send stream chunk: {}", e);
+                                if !flush_buffer!(true) {
+                                    error!("Failed to send final stream chunk");
                                 }
-                                debug!(
-                                    "Stream completed, total accumulated: {} bytes",
-                                    accumulated_text.len()
-                                );
+                                // If code fence detected, don't send done=true here —
+                                // the Code Mode path will send it after execution.
+                                if code_fence_detected {
+                                    debug!(
+                                        "Stream completed (code fence detected, done deferred), total accumulated: {} bytes",
+                                        accumulated_text.len()
+                                    );
+                                } else {
+                                    debug!(
+                                        "Stream completed, total accumulated: {} bytes",
+                                        accumulated_text.len()
+                                    );
+                                }
                                 break;
                             } else {
                                 // Normal text: just buffer it
@@ -1925,10 +1980,7 @@ async fn handle_chat_message_streaming(
                         None => {
                             // Channel closed, flush remaining
                             if !buffer.is_empty() {
-                                let text = std::mem::take(&mut buffer);
-                                let is_first = accumulated_text.is_empty();
-                                accumulated_text.push_str(&text);
-                                let _ = send_chunk!(text, false, None::<&serde_json::Value>, None::<&nevoflux_protocol::ThinkingEvent>, is_first);
+                                let _ = flush_buffer!(false);
                             }
                             debug!("Stream channel closed");
                             break;
@@ -1938,18 +1990,18 @@ async fn handle_chat_message_streaming(
             }
         }
 
-        (accumulated_text, cancelled)
+        (accumulated_text, cancelled, code_fence_detected)
     });
 
     // Run agent (this will call stream_emit() for each chunk)
     let agent_result = tokio::task::spawn_blocking(move || agent.run(&input)).await;
 
     // Wait for the forwarder to complete
-    let (accumulated_text, was_cancelled) = match forwarder_handle.await {
+    let (accumulated_text, was_cancelled, code_fence_deferred) = match forwarder_handle.await {
         Ok(result) => result,
         Err(e) => {
             error!("Stream forwarder task failed: {}", e);
-            (String::new(), false)
+            (String::new(), false, false)
         }
     };
 
@@ -2390,7 +2442,11 @@ async fn handle_chat_message_streaming(
             // This works across all modes (Chat, Browser, Agent) — the LLM decides
             // whether to use direct tool calls or emit Python for complex tasks.
             let (final_text, code_mode_tool_calls) =
-                match crate::agent::code_mode::execute_code_mode(raw_text, &config).await {
+                match crate::agent::code_mode::execute_code_mode(
+                    raw_text,
+                    &config,
+                    browser_context(&services, &proxy_id, &identity),
+                ).await {
                     Some(code_result) => {
                         let mut summary = String::new();
 
@@ -2449,13 +2505,19 @@ async fn handle_chat_message_streaming(
                             summary = format!("Code execution failed: {}", err);
                         }
 
-                        // Stream the Code Mode result to sidebar
+                        // Strip the ```python-exec block from the text shown to the user.
+                        // The code was executed — the user should see the result, not the raw code.
+                        let display_text = crate::agent::runner::strip_python_exec_block(raw_text);
+
+                        // Send the Code Mode result to sidebar.
+                        // The forwarder already suppressed the code block from streaming,
+                        // so this chunk appends the execution result and finalizes the message.
                         if !summary.is_empty() {
                             let chunk_payload = serde_json::json!({
                                 "type": "stream_chunk",
                                 "payload": {
                                     "content": summary,
-                                    "done": false,
+                                    "done": true,
                                     "code_mode": true
                                 }
                             });
@@ -2464,23 +2526,49 @@ async fn handle_chat_message_streaming(
                             if let Err(e) = response_tx.send((identity.clone(), response)).await {
                                 error!("Failed to send code mode result: {}", e);
                             }
+                        } else if code_fence_deferred {
+                            // No output but we deferred done — send empty done=true
+                            let chunk_payload = serde_json::json!({
+                                "type": "stream_chunk",
+                                "payload": {
+                                    "content": "",
+                                    "done": true,
+                                    "code_mode": true
+                                }
+                            });
+                            let response = DaemonEnvelope::new(&proxy_id, channel, chunk_payload)
+                                .with_request_id(&request_id);
+                            if let Err(e) = response_tx.send((identity.clone(), response)).await {
+                                error!("Failed to send code mode done: {}", e);
+                            }
                         }
 
-                        let final_text = if summary.is_empty() {
-                            raw_text.to_string()
-                        } else {
-                            format!(
-                                "{}\n\n---\n**Code execution result:**\n{}",
-                                raw_text, summary
-                            )
-                        };
+                        // Save clean text (without code block) + result to DB
+                        let final_text = format_code_mode_result(display_text, &summary);
 
                         let cm_tool_calls: Vec<crate::agent::code_mode::ToolCallResult> =
                             code_result.tool_results;
 
                         (final_text, cm_tool_calls)
                     }
-                    None => (raw_text.to_string(), vec![]),
+                    None => {
+                        // No python-exec block found by Code Mode.
+                        // If forwarder deferred done (detected fence in text but extract
+                        // didn't match), send the deferred done=true now.
+                        if code_fence_deferred {
+                            let chunk_payload = serde_json::json!({
+                                "type": "stream_chunk",
+                                "payload": {
+                                    "content": "",
+                                    "done": true
+                                }
+                            });
+                            let response = DaemonEnvelope::new(&proxy_id, channel, chunk_payload)
+                                .with_request_id(&request_id);
+                            let _ = response_tx.send((identity.clone(), response)).await;
+                        }
+                        (raw_text.to_string(), vec![])
+                    }
                 };
 
             // Save assistant response to database
@@ -2737,7 +2825,32 @@ async fn send_artifact_stream(
     }
 }
 
-/// Format a plan proposal as context text for the agent.
+/// Format Code Mode display text + execution summary for DB storage.
+fn format_code_mode_result(display_text: String, summary: &str) -> String {
+    if summary.is_empty() {
+        display_text
+    } else {
+        let sep = if display_text.is_empty() { "" } else { "\n\n---\n" };
+        format!("{}{}**Code execution result:**\n{}", display_text, sep, summary)
+    }
+}
+
+/// Build a `BrowserContext` from services + routing info, if browser_sender is available.
+fn browser_context(
+    services: &HostServices,
+    proxy_id: &str,
+    client_identity: &[u8],
+) -> Option<crate::wasm::services::BrowserContext> {
+    services
+        .browser_sender
+        .clone()
+        .map(|sender| crate::wasm::services::BrowserContext {
+            sender,
+            proxy_id: proxy_id.to_string(),
+            client_identity: client_identity.to_vec(),
+        })
+}
+
 fn format_plan_as_context(proposal: &PlanProposal) -> String {
     let mut text = format!("Approved plan: {}\n\n", proposal.summary);
     for (i, step) in proposal.steps.iter().enumerate() {
@@ -2759,6 +2872,8 @@ async fn handle_chat_message(
     session_manager: &Arc<SessionManager>,
     services: &HostServices,
     runtime: tokio::runtime::Handle,
+    proxy_id: String,
+    client_identity: Vec<u8>,
 ) -> serde_json::Value {
     let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -3125,8 +3240,11 @@ async fn handle_chat_message(
                 Ok(output) => {
                     // Try Code Mode: if LLM returned a ```python block, extract and execute it.
                     let (final_text, code_mode_tool_results) =
-                        match crate::agent::code_mode::execute_code_mode(&output.text, &config)
-                            .await
+                        match crate::agent::code_mode::execute_code_mode(
+                            &output.text,
+                            &config,
+                            browser_context(services, &proxy_id, &client_identity),
+                        ).await
                         {
                             Some(code_result) => {
                                 let summary = if code_result.success {
@@ -3137,14 +3255,9 @@ async fn handle_chat_message(
                                         .clone()
                                         .unwrap_or_else(|| "Unknown error".to_string())
                                 };
-                                let final_text = if summary.is_empty() {
-                                    output.text.clone()
-                                } else {
-                                    format!(
-                                        "{}\n\n---\n**Code execution result:**\n{}",
-                                        output.text, summary
-                                    )
-                                };
+                                // Strip the python-exec block from displayed/saved text
+                                let display_text = crate::agent::runner::strip_python_exec_block(&output.text);
+                                let final_text = format_code_mode_result(display_text, &summary);
                                 (final_text, code_result.tool_results)
                             }
                             None => (output.text.clone(), vec![]),

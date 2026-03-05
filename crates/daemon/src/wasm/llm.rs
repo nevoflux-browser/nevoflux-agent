@@ -6,6 +6,7 @@
 use crate::error::{DaemonError, Result};
 use futures::StreamExt;
 use nevoflux_llm::providers::claude_code::ClaudeCodeClient;
+use nevoflux_protocol::json_repair::parse_tool_arguments_json;
 use nevoflux_llm::providers::gemini_cli::GeminiCliClient;
 use nevoflux_llm::providers::kimi_agent::KimiAgentClient;
 use nevoflux_llm::providers::qwen::QwenClient;
@@ -1872,12 +1873,19 @@ fn build_kimi_prompt(request: &LlmChatRequest) -> serde_json::Value {
     if has_assistant {
         text_parts.push("<conversation_history>".to_string());
         for msg in &request.messages {
-            if msg.role != "system" {
+            if msg.role == "system" {
+                continue;
+            }
+            if msg.role == "tool" {
+                // Wrap tool results in XML tags so the model treats them as internal data
+                // rather than conversational text to echo back to the user.
+                text_parts.push(format!("<tool_result>\n{}\n</tool_result>", msg.content));
+            } else {
                 text_parts.push(format!("[{}]: {}", msg.role, msg.content));
             }
         }
         text_parts.push("</conversation_history>".to_string());
-        text_parts.push("Continue the conversation based on the history above.".to_string());
+        text_parts.push("Continue the conversation based on the history above. Do not repeat or quote raw tool results or JSON in your response to the user.".to_string());
     } else {
         for msg in &request.messages {
             if msg.role != "system" && !msg.content.is_empty() {
@@ -2354,10 +2362,10 @@ where
     let mut total_text_chunks: usize = 0;
     let mut receiver_dropped = false;
 
-    // Timeout for waiting on the first chunk (2 minutes).
-    // Subsequent chunks use a shorter timeout (60 seconds between chunks).
-    let first_chunk_timeout = std::time::Duration::from_secs(120);
-    let inter_chunk_timeout = std::time::Duration::from_secs(60);
+    // First chunk timeout: 5 minutes (provider queue delays, cold starts).
+    // Inter-chunk timeout: 2 minutes (healthy streams shouldn't gap longer).
+    let first_chunk_timeout = std::time::Duration::from_secs(300);
+    let inter_chunk_timeout = std::time::Duration::from_secs(120);
     let mut got_first_chunk = false;
 
     loop {
@@ -2532,10 +2540,18 @@ where
         }
     }
 
-    // Send final chunk with only tool calls that were built from deltas (not already sent)
+    // Send final chunk with only tool calls that were built from deltas (not already sent).
+    // Delta-accumulated arguments are Value::String (raw JSON text); parse them into
+    // Value::Object so that downstream tool dispatch can index fields directly.
     let final_tool_calls: Vec<LlmToolCall> = accumulated_tool_calls
         .into_values()
         .filter(|tc| !sent_tool_call_ids.contains(&tc.id))
+        .map(|mut tc| {
+            if let serde_json::Value::String(ref s) = tc.arguments {
+                tc.arguments = parse_tool_arguments_json(s);
+            }
+            tc
+        })
         .collect();
 
     if !final_tool_calls.is_empty() {
@@ -3167,5 +3183,27 @@ mod tests {
             result.is_none(),
             "Compact screenshot result should not have extractable screenshot"
         );
+    }
+
+    #[test]
+    fn test_parse_tool_arguments_json_valid() {
+        let result = parse_tool_arguments_json(r#"{"code": "print(1)"}"#);
+        assert_eq!(result["code"].as_str().unwrap(), "print(1)");
+    }
+
+    #[test]
+    fn test_parse_tool_arguments_json_invalid_escapes() {
+        // \d is not a valid JSON escape but appears in regex
+        let result = parse_tool_arguments_json(r#"{"code": "re.match(\\d+, s)"}"#);
+        assert!(result["code"].as_str().is_some());
+    }
+
+    #[test]
+    fn test_parse_tool_arguments_json_unescaped_quotes() {
+        // LLM produces unescaped quotes: print("=" * 80)
+        // In the raw JSON string: {"code": "print(\"=" * 80)"}
+        let malformed = r#"{"code": "print(\"=" * 80)"}"#;
+        let result = parse_tool_arguments_json(malformed);
+        assert_eq!(result["code"].as_str().unwrap(), r#"print("=" * 80)"#);
     }
 }

@@ -300,7 +300,10 @@ pub async fn wait_for_daemon_ready(port: u16, timeout: Duration) -> Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     let addr = format!("127.0.0.1:{}", port);
 
-    debug!("Waiting for daemon on port {} (timeout {:?})", port, timeout);
+    debug!(
+        "Waiting for daemon on port {} (timeout {:?})",
+        port, timeout
+    );
 
     loop {
         if tokio::time::Instant::now() > deadline {
@@ -524,8 +527,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_for_daemon_ready_timeout() {
         // Use a port that nothing is listening on
-        let result =
-            wait_for_daemon_ready(19999, std::time::Duration::from_millis(200)).await;
+        let result = wait_for_daemon_ready(19999, std::time::Duration::from_millis(200)).await;
         assert!(matches!(result, Err(BridgeError::ConnectionFailed(_))));
     }
 
@@ -535,8 +537,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        let result =
-            wait_for_daemon_ready(port, std::time::Duration::from_secs(2)).await;
+        let result = wait_for_daemon_ready(port, std::time::Duration::from_secs(2)).await;
         assert!(result.is_ok());
     }
 }

@@ -28,6 +28,7 @@ pub mod chat;
 pub mod common;
 pub mod envelope;
 mod error;
+pub mod json_repair;
 pub mod mcp;
 
 // Re-export main types at crate root

@@ -144,16 +144,11 @@ Use Code Mode when ANY of these apply:
 - Simple two-step operations (search → answer)
 - Showing code examples to the user (use ` ```python `, not ` ```python-exec `)
 
-### Important: Do NOT mix ToolCalls with Code Mode
+### Important: Prefer Code Mode from the start
 
-When you decide to use Code Mode, use it **from the start**. Do NOT first call tools (glob, read, web_search) via ToolCall and then write a `python-exec` script to process the results. Instead, write the `python-exec` script that does everything: reading, processing, and outputting.
+When possible, use Code Mode **from the start** rather than calling tools individually then switching to python-exec. Write a single `python-exec` script that does everything: reading, processing, and outputting.
 
-**Wrong** (reads files via ToolCall, then processes in python-exec):
-1. ToolCall: glob → get file list
-2. ToolCall: read x N → read all files
-3. python-exec: process the data already in context
-
-**Correct** (does everything in python-exec):
+**Prefer** (does everything in python-exec):
 ```python-exec
 files = list_files("/project/src")
 for f in files:
@@ -172,7 +167,11 @@ for f in files:
   - **Pure Python helpers** (zero overhead): `json.loads`, `json.dumps`, `math.sqrt`, `math.floor`, `math.ceil`, `math.log`, `math.pi`, `os.path.join`, `os.path.basename`, `functools.reduce`, `collections.Counter`
   - **Bash-bridged helpers** (uses `run_command` + python3): `re.findall`, `re.search`, `re.sub`, `re.split`, `re.match`, `datetime.datetime.now`, `datetime.date.today`, `datetime.datetime.strptime`, `random.randint`, `random.choice`, `random.shuffle`, `random.sample`, `random.random`
 - **Truly unavailable**: `itertools`, `subprocess`, `requests`, `asyncio`. Do NOT use these — there are no replacements.
-- **Pre-injected functions**: `read_file(path)`, `write_file(path, content)`, `list_files(path)`, `canvas_render(files, entry, title)`, `web_search(query)`, `fetch_page(url)`. Call them directly — no import needed.
+- **Pre-injected functions** (call directly, no import needed):
+  - Files: `read_file(path)`, `write_file(path, content)`, `list_files(path)`, `run_command(command)`
+  - Browser: `browser_get_markdown(tab_id=None)`, `browser_snapshot(tab_id=None)`, `browser_click_by_id(element_id, tab_id=None)`, `browser_type_by_id(element_id, text, tab_id=None)`, `browser_navigate(url, tab_id=None)`, `browser_scroll(direction, amount=3, tab_id=None)`, `browser_get_tabs()`
+  - Search & Web: `web_search(query)`, `fetch_page(url)`
+  - Canvas: `canvas_render(files, entry, title)`
 
 ### Examples
 
@@ -185,6 +184,16 @@ for r in results[:3]:
     sites.append({"title": r["title"], "url": r["url"], "summary": page[:500]})
 for s in sites:
     print(f"## {s['title']}\n{s['url']}\n{s['summary']}\n")
+```
+
+**Browser data analysis** (read page + process):
+```python-exec
+md = browser_get_markdown()
+lines = md.split("\n")
+headings = [l for l in lines if l.startswith("# ") or l.startswith("## ")]
+print(f"Page has {len(lines)} lines, {len(headings)} headings:")
+for h in headings:
+    print(h)
 ```
 
 **Batch file processing**:

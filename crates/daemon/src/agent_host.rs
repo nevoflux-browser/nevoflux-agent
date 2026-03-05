@@ -933,15 +933,16 @@ impl HostFunctions for DaemonHostFunctions {
         // Start the stream
         let registry = Arc::clone(&self.stream_registry);
 
-        let stream_id = self
-            .runtime
-            .block_on(async {
+        let runtime = self.runtime.clone();
+        let stream_id = tokio::task::block_in_place(|| {
+            runtime.block_on(async {
                 start_llm_stream(provider, &api_key, &model, daemon_request, registry).await
             })
-            .map_err(|e| HostError {
-                code: 100,
-                message: format!("Failed to start stream: {}", e),
-            })?;
+        })
+        .map_err(|e| HostError {
+            code: 100,
+            message: format!("Failed to start stream: {}", e),
+        })?;
 
         // Store trace data for this stream
         if self.trace_collector.is_some() {
@@ -2349,6 +2350,44 @@ impl HostFunctions for DaemonHostFunctions {
         arguments: &serde_json::Value,
     ) -> HostResult<String> {
         let start = std::time::Instant::now();
+
+        debug!(
+            "tool_call_dynamic: tool='{}', arguments={}",
+            tool_name, arguments
+        );
+
+        // Intercept "python-exec" early (before MCP services check):
+        // LLM sometimes calls tool_call_dynamic with tool_name="python-exec"
+        // instead of writing ```python-exec code blocks.
+        // Execute via the Monty interpreter (same engine as Code Mode).
+        if tool_name == "python-exec" {
+            let code = arguments.get("code").and_then(|v| v.as_str()).unwrap_or("");
+            if code.is_empty() {
+                return Err(HostError {
+                    code: 100,
+                    message: "python-exec: no code provided".into(),
+                });
+            }
+            debug!(
+                "tool_call_dynamic: intercepting python-exec via Monty, code_len={}",
+                code.len()
+            );
+            let browser_ctx = self.services.as_ref().and_then(|s| s.browser_context());
+            let result = crate::agent::code_mode::execute_python_simple(code, browser_ctx);
+            if result.success {
+                return Ok(result.output);
+            } else {
+                return Err(HostError {
+                    code: 100,
+                    message: format!(
+                        "python-exec failed: {}",
+                        result.error.unwrap_or_else(|| "unknown error".into())
+                    ),
+                });
+            }
+        }
+
+        // Services and MCP manager required for dynamic tool dispatch
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
             message: "Services not available".into(),
@@ -2359,18 +2398,15 @@ impl HostFunctions for DaemonHostFunctions {
             message: "MCP manager not configured".into(),
         })?;
 
-        debug!(
-            "tool_call_dynamic: tool='{}', arguments={}",
-            tool_name, arguments
-        );
-
-        // Capture params for trace before arguments is consumed
-        let trace_params = if self.trace_collector.is_some() {
-            Some(arguments.clone())
+        // Capture params for trace before arguments is consumed (only if tracing)
+        let (trace_params, params_summary) = if self.trace_collector.is_some() {
+            (
+                Some(arguments.clone()),
+                serde_json::to_string(arguments).ok(),
+            )
         } else {
-            None
+            (None, None)
         };
-        let params_summary = serde_json::to_string(arguments).ok();
 
         // Execute MCP call using block_in_place + block_on pattern
         let runtime = self.runtime.clone();
@@ -3036,19 +3072,22 @@ impl HostFunctions for DaemonHostFunctions {
         )
     }
 
-    fn browser_viewport_snapshot(&self, tab_id: Option<i64>, keywords: Option<Vec<String>>) -> HostResult<BrowserToolResult> {
-        debug!("browser_viewport_snapshot: taking viewport-only snapshot, keywords={:?}", keywords);
+    fn browser_viewport_snapshot(
+        &self,
+        tab_id: Option<i64>,
+        keywords: Option<Vec<String>>,
+    ) -> HostResult<BrowserToolResult> {
+        debug!(
+            "browser_viewport_snapshot: taking viewport-only snapshot, keywords={:?}",
+            keywords
+        );
         let mut params = serde_json::json!({"viewport_only": true});
         if let Some(kws) = keywords {
             if !kws.is_empty() {
                 params["keywords"] = serde_json::json!(kws);
             }
         }
-        self.execute_browser_action(
-            BrowserToolAction::Snapshot,
-            params,
-            tab_id,
-        )
+        self.execute_browser_action(BrowserToolAction::Snapshot, params, tab_id)
     }
 
     fn browser_key_press(
@@ -3732,36 +3771,53 @@ impl DaemonHostFunctions {
         let registry = subagent_registry.clone();
 
         runtime.spawn(async move {
-            // Create a new host functions instance for the subagent
-            let mut host = DaemonHostFunctions::new(config, runtime_clone.clone());
-            if let Some(svc) = services {
-                host = host.with_services(svc);
-            }
+            // Run the subagent in spawn_blocking so that Handle::block_on() calls
+            // inside agent.run() don't panic with "Cannot start a runtime from
+            // within a runtime". The parent agent runs in spawn_blocking for the
+            // same reason (see server.rs stream_chat_message).
+            let result = tokio::task::spawn_blocking(move || {
+                // Create a new host functions instance for the subagent
+                let mut host = DaemonHostFunctions::new(config, runtime_clone.clone());
+                if let Some(svc) = services {
+                    host = host.with_services(svc);
+                }
 
-            // Create agent input with custom prompt for sub-agent
-            let input = AgentInput {
-                session_id: format!("subagent-{}", id),
-                mode: agent_mode,
-                user_message: task_str.clone(),
-                history: vec![],
-                attachments: vec![],
-                local_files: vec![],
-                custom_system_prompt: Some(
-                    Agent::<DaemonHostFunctions>::subagent_prompt_for_mode(agent_mode).to_string(),
-                ),
-                tab_id,
-                tab_ids: vec![],
-                skill_context: None,
-                available_models: vec![],
-                mcp_servers: vec![],
-                soul_context: None,
-            };
+                // Create agent input with custom prompt for sub-agent
+                let input = AgentInput {
+                    session_id: format!("subagent-{}", id),
+                    mode: agent_mode,
+                    user_message: task_str.clone(),
+                    history: vec![],
+                    attachments: vec![],
+                    local_files: vec![],
+                    custom_system_prompt: Some(
+                        Agent::<DaemonHostFunctions>::subagent_prompt_for_mode(agent_mode)
+                            .to_string(),
+                    ),
+                    tab_id,
+                    tab_ids: vec![],
+                    skill_context: None,
+                    available_models: vec![],
+                    mcp_servers: vec![],
+                    soul_context: None,
+                };
 
-            // Run the appropriate builtin mode
-            let result = match agent_mode {
-                AgentMode::Chat => host.builtin_chat(&input),
-                AgentMode::Browser => host.builtin_browser(&input),
-                AgentMode::Agent | AgentMode::Code => host.builtin_agent(&input),
+                // Run the appropriate builtin mode
+                match agent_mode {
+                    AgentMode::Chat => host.builtin_chat(&input),
+                    AgentMode::Browser => host.builtin_browser(&input),
+                    AgentMode::Agent | AgentMode::Code => host.builtin_agent(&input),
+                }
+            })
+            .await;
+
+            // Unwrap JoinHandle result (catches panics from spawn_blocking)
+            let result = match result {
+                Ok(r) => r,
+                Err(e) => Err(HostError {
+                    code: 500,
+                    message: format!("Subagent task panicked: {}", e),
+                }),
             };
 
             // Update the registry with the result

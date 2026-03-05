@@ -31,6 +31,64 @@ pub struct CodeModeResult {
     pub retries: u32,
 }
 
+impl CodeModeResult {
+    /// Create a successful result.
+    pub fn success(output: String) -> Self {
+        Self {
+            output,
+            tool_results: Vec::new(),
+            success: true,
+            error: None,
+            retries: 0,
+        }
+    }
+
+    /// Create a failed result with an error message.
+    pub fn fail(error: impl Into<String>) -> Self {
+        Self {
+            output: String::new(),
+            tool_results: Vec::new(),
+            success: false,
+            error: Some(error.into()),
+            retries: 0,
+        }
+    }
+
+    /// Create a failed result that includes partial output.
+    pub fn fail_with_output(output: String, error: impl Into<String>) -> Self {
+        Self {
+            output,
+            tool_results: Vec::new(),
+            success: false,
+            error: Some(error.into()),
+            retries: 0,
+        }
+    }
+
+    /// Set the retry count.
+    pub fn with_retries(mut self, retries: u32) -> Self {
+        self.retries = retries;
+        self
+    }
+
+    /// Set tool call results.
+    pub fn with_tool_results(mut self, tool_results: Vec<ToolCallResult>) -> Self {
+        self.tool_results = tool_results;
+        self
+    }
+}
+
+/// Default resource limits for Monty execution.
+fn default_resource_limits() -> ResourceLimits {
+    ResourceLimits {
+        max_allocations: Some(100_000),
+        max_duration: Some(Duration::from_secs(30)),
+        max_memory: Some(64 * 1024 * 1024), // 64MB
+        gc_interval: Some(10_000),
+        max_recursion_depth: Some(100),
+    }
+}
+
 /// A tool call made during Python execution.
 #[derive(Debug, Clone)]
 pub struct ToolCallResult {
@@ -176,17 +234,12 @@ impl CodeModeExecutor {
                         .iter()
                         .map(|v| format!("Line {}: `{}` - {}", v.line, v.construct, v.suggestion))
                         .collect();
-                    return CodeModeResult {
-                        output: String::new(),
-                        tool_results: Vec::new(),
-                        success: false,
-                        error: Some(format!(
-                            "Code has unsupported constructs after {} retries: {}",
-                            retries,
-                            violation_msgs.join("; ")
-                        )),
+                    return CodeModeResult::fail(format!(
+                        "Code has unsupported constructs after {} retries: {}",
                         retries,
-                    };
+                        violation_msgs.join("; ")
+                    ))
+                    .with_retries(retries);
                 }
 
                 let repair_prompt = RepairPrompt::from_violations(&auto_fixed, &violations);
@@ -197,13 +250,10 @@ impl CodeModeExecutor {
                         continue;
                     }
                     Err(e) => {
-                        return CodeModeResult {
-                            output: String::new(),
-                            tool_results: Vec::new(),
-                            success: false,
-                            error: Some(format!("LLM rewrite failed for lint violations: {e}")),
-                            retries,
-                        };
+                        return CodeModeResult::fail(format!(
+                            "LLM rewrite failed for lint violations: {e}"
+                        ))
+                        .with_retries(retries);
                     }
                 }
             }
@@ -220,11 +270,12 @@ impl CodeModeExecutor {
                     let error_msg = exc.message().unwrap_or("parse error").to_string();
                     let error_type = format!("{}", exc.exc_type());
                     tracing::warn!(
-                        "Code Mode: parse error (retry {}/{}): {}: {}",
+                        "Code Mode: parse error (retry {}/{}): {}: {}, first 200 chars: {:?}",
                         retries,
                         MAX_RETRIES,
                         error_type,
-                        error_msg
+                        error_msg,
+                        &auto_fixed[..auto_fixed.len().min(200)]
                     );
 
                     if retries < MAX_RETRIES {
@@ -249,37 +300,20 @@ impl CodeModeExecutor {
                             }
                             Err(e) => {
                                 tracing::error!("Code Mode: LLM rewrite failed: {}", e);
-                                return CodeModeResult {
-                                    output: String::new(),
-                                    tool_results: Vec::new(),
-                                    success: false,
-                                    error: Some(format!(
-                                        "Parse error and LLM rewrite failed: {error_type}: {error_msg} (rewrite error: {e})"
-                                    )),
-                                    retries,
-                                };
+                                return CodeModeResult::fail(format!(
+                                    "Parse error and LLM rewrite failed: {error_type}: {error_msg} (rewrite error: {e})"
+                                ))
+                                .with_retries(retries);
                             }
                         }
                     }
 
-                    return CodeModeResult {
-                        output: String::new(),
-                        tool_results: Vec::new(),
-                        success: false,
-                        error: Some(format!("{error_type}: {error_msg}")),
-                        retries,
-                    };
+                    return CodeModeResult::fail(format!("{error_type}: {error_msg}"))
+                        .with_retries(retries);
                 }
             };
 
-            let limits = ResourceLimits {
-                max_allocations: Some(100_000),
-                max_duration: Some(Duration::from_secs(30)),
-                max_memory: Some(64 * 1024 * 1024), // 64MB
-                gc_interval: Some(10_000),
-                max_recursion_depth: Some(100),
-            };
-            let resource_tracker = LimitedTracker::new(limits);
+            let resource_tracker = LimitedTracker::new(default_resource_limits());
             let mut print_writer = CollectStringPrint::new();
             let mut tool_results: Vec<ToolCallResult> = Vec::new();
 
@@ -306,26 +340,22 @@ impl CodeModeExecutor {
                                 continue;
                             }
                             Err(e) => {
-                                return CodeModeResult {
-                                    output: print_writer.into_output(),
-                                    tool_results,
-                                    success: false,
-                                    error: Some(format!(
-                                        "Runtime error and LLM rewrite failed: {error_type}: {error_msg} (rewrite error: {e})"
-                                    )),
-                                    retries,
-                                };
+                                return CodeModeResult::fail_with_output(
+                                    print_writer.into_output(),
+                                    format!("Runtime error and LLM rewrite failed: {error_type}: {error_msg} (rewrite error: {e})"),
+                                )
+                                .with_tool_results(tool_results)
+                                .with_retries(retries);
                             }
                         }
                     }
 
-                    return CodeModeResult {
-                        output: print_writer.into_output(),
-                        tool_results,
-                        success: false,
-                        error: Some(format!("{error_type}: {error_msg}")),
-                        retries,
-                    };
+                    return CodeModeResult::fail_with_output(
+                        print_writer.into_output(),
+                        format!("{error_type}: {error_msg}"),
+                    )
+                    .with_tool_results(tool_results)
+                    .with_retries(retries);
                 }
             };
 
@@ -393,57 +423,45 @@ impl CodeModeExecutor {
                                             break; // break inner loop to restart outer loop
                                         }
                                         Err(e) => {
-                                            return CodeModeResult {
-                                                output: print_writer.into_output(),
-                                                tool_results,
-                                                success: false,
-                                                error: Some(format!(
-                                                    "Runtime error after tool call and LLM rewrite failed: {error_type}: {error_msg} (rewrite error: {e})"
-                                                )),
-                                                retries,
-                                            };
+                                            return CodeModeResult::fail_with_output(
+                                                print_writer.into_output(),
+                                                format!("Runtime error after tool call and LLM rewrite failed: {error_type}: {error_msg} (rewrite error: {e})"),
+                                            )
+                                            .with_tool_results(tool_results)
+                                            .with_retries(retries);
                                         }
                                     }
                                 }
 
-                                return CodeModeResult {
-                                    output: print_writer.into_output(),
-                                    tool_results,
-                                    success: false,
-                                    error: Some(format!("{error_type}: {error_msg}")),
-                                    retries,
-                                };
+                                return CodeModeResult::fail_with_output(
+                                    print_writer.into_output(),
+                                    format!("{error_type}: {error_msg}"),
+                                )
+                                .with_tool_results(tool_results)
+                                .with_retries(retries);
                             }
                         }
                     }
                     RunProgress::Complete(_value) => {
-                        return CodeModeResult {
-                            output: print_writer.into_output(),
-                            tool_results,
-                            success: true,
-                            error: None,
-                            retries,
-                        };
+                        return CodeModeResult::success(print_writer.into_output())
+                            .with_tool_results(tool_results)
+                            .with_retries(retries);
                     }
                     RunProgress::OsCall { .. } => {
-                        return CodeModeResult {
-                            output: print_writer.into_output(),
-                            tool_results,
-                            success: false,
-                            error: Some(
-                                "OS calls are not permitted in sandboxed execution".to_string(),
-                            ),
-                            retries,
-                        };
+                        return CodeModeResult::fail_with_output(
+                            print_writer.into_output(),
+                            "OS calls are not permitted in sandboxed execution",
+                        )
+                        .with_tool_results(tool_results)
+                        .with_retries(retries);
                     }
                     RunProgress::ResolveFutures(_) => {
-                        return CodeModeResult {
-                            output: print_writer.into_output(),
-                            tool_results,
-                            success: false,
-                            error: Some("Async futures are not supported in Code Mode".to_string()),
-                            retries,
-                        };
+                        return CodeModeResult::fail_with_output(
+                            print_writer.into_output(),
+                            "Async futures are not supported in Code Mode",
+                        )
+                        .with_tool_results(tool_results)
+                        .with_retries(retries);
                     }
                 }
             }
@@ -453,49 +471,42 @@ impl CodeModeExecutor {
     }
 }
 
-// ============================================================================
-// Integration function: wires CodeModeExecutor into the daemon response path
-// ============================================================================
-
 use crate::agent::tools::ToolRegistry;
 use crate::wasm::llm::{execute_llm_chat, LlmChatRequest, LlmMessage};
+use crate::wasm::services::BrowserContext;
 use nevoflux_llm::ProviderType;
 use std::str::FromStr;
+use std::sync::Arc;
 
-/// Execute Code Mode: extract Python from text, run through 4-layer pipeline.
+/// Create a shared ToolRegistry and tool executor callback.
 ///
-/// Returns `Some(CodeModeResult)` if a Python block was found and executed,
-/// or `None` if no Python block was found in the text.
-pub async fn execute_code_mode(
-    text: &str,
-    config: &crate::config::AgentConfig,
-) -> Option<CodeModeResult> {
-    // Extract Python block from LLM response
-    let python_code = crate::agent::runner::extract_python_block(text)?;
-    tracing::info!(
-        "Code Mode: extracted python block ({} bytes), first 200 chars: {:?}",
-        python_code.len(),
-        &python_code[..python_code.len().min(200)]
-    );
-
-    let registry = ToolRegistry::new();
-    let external_names: Vec<String> = registry
+/// Deduplicates the registry+executor setup shared by `execute_python_simple`
+/// and `execute_code_mode`.
+fn build_registry_and_executor(
+    browser_ctx: Option<BrowserContext>,
+) -> (
+    Vec<String>,
+    impl Fn(
+        &str,
+        serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send>>,
+) {
+    let shared_registry = Arc::new(match browser_ctx {
+        Some(ctx) => ToolRegistry::with_browser(ctx),
+        None => ToolRegistry::new(),
+    });
+    let external_names: Vec<String> = shared_registry
         .tool_names()
         .iter()
         .map(|s| s.to_string())
         .collect();
 
-    let executor = CodeModeExecutor::new();
-
-    // Tool executor callback: dispatches to ToolRegistry
-    let tool_executor =
-        |name: &str,
-         args: serde_json::Value|
-         -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send>> {
-            let name = name.to_string();
-            let args = args.clone();
+    let tool_executor = move |name: &str, args: serde_json::Value| {
+        let name = name.to_string();
+        let args = args.clone();
+        let registry = shared_registry.clone();
+        let fut: Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send>> =
             Box::pin(async move {
-                let registry = ToolRegistry::new();
                 let named_args = positional_to_named(&name, &args);
                 let call = crate::agent::abi::PendingToolCall {
                     id: format!("code-mode-{}", uuid_simple()),
@@ -512,8 +523,68 @@ pub async fn execute_code_mode(
                         Err(_) => Ok(serde_json::Value::String(content)),
                     }
                 }
-            })
+            });
+        fut
+    };
+
+    (external_names, tool_executor)
+}
+
+/// Execute Python code through Monty with optional tool support.
+///
+/// When `browser_ctx` is provided, browser and web tools are available.
+/// This is the entry point for when LLMs call `python-exec` as a tool
+/// instead of writing ```python-exec code blocks.
+///
+/// Delegates to `CodeModeExecutor::execute()` with a no-op LLM rewrite callback.
+pub fn execute_python_simple(
+    code: &str,
+    browser_ctx: Option<BrowserContext>,
+) -> CodeModeResult {
+    let runtime = tokio::runtime::Handle::current();
+    let (external_names, tool_executor) = build_registry_and_executor(browser_ctx);
+    let executor = CodeModeExecutor::new();
+
+    let llm_rewrite =
+        |_prompt: &str| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+            Box::pin(async { Err("No LLM retry in python-exec tool mode".to_string()) })
         };
+
+    tokio::task::block_in_place(|| {
+        runtime.block_on(async {
+            executor
+                .execute(code, &external_names, tool_executor, llm_rewrite)
+                .await
+        })
+    })
+}
+
+// ============================================================================
+// Integration function: wires CodeModeExecutor into the daemon response path
+// ============================================================================
+
+/// Execute Code Mode: extract Python from text, run through 4-layer pipeline.
+///
+/// When `browser_ctx` is provided, browser tools (browser_get_markdown, etc.)
+/// and web tools (web_search, fetch_page) are available to the Python code.
+///
+/// Returns `Some(CodeModeResult)` if a Python block was found and executed,
+/// or `None` if no Python block was found in the text.
+pub async fn execute_code_mode(
+    text: &str,
+    config: &crate::config::AgentConfig,
+    browser_ctx: Option<BrowserContext>,
+) -> Option<CodeModeResult> {
+    // Extract Python block from LLM response
+    let python_code = crate::agent::runner::extract_python_block(text)?;
+    tracing::info!(
+        "Code Mode: extracted python block ({} bytes), first 200 chars: {:?}",
+        python_code.len(),
+        &python_code[..python_code.len().min(200)]
+    );
+
+    let (external_names, tool_executor) = build_registry_and_executor(browser_ctx);
+    let executor = CodeModeExecutor::new();
 
     // LLM rewrite callback: sends repair prompt to the LLM
     let provider_name = config
@@ -550,8 +621,10 @@ pub async fn execute_code_mode(
                 let response = execute_llm_chat(provider, &api_key, &model, request)
                     .await
                     .map_err(|e| format!("LLM rewrite failed: {e}"))?;
-                // Extract Python code from the rewrite response, or use raw content
-                let code = crate::agent::runner::extract_python_block(&response.content)
+                // Extract Python code from the rewrite response, or use raw content.
+                // Use extract_any_python_block to handle ```python, ```py, etc.
+                // (LLMs often wrap rewrites in ```python instead of ```python-exec)
+                let code = crate::agent::runner::extract_any_python_block(&response.content)
                     .unwrap_or(response.content);
                 Ok(code)
             })
@@ -588,6 +661,13 @@ fn positional_to_named(tool_name: &str, args: &serde_json::Value) -> serde_json:
         "fetch_page" => &["url"],
         "run_command" => &["command"],
         "get_code_mode_context" => &[],
+        "browser_get_markdown" => &["tab_id"],
+        "browser_snapshot" => &["tab_id"],
+        "browser_click_by_id" => &["element_id", "tab_id"],
+        "browser_type_by_id" => &["element_id", "text", "tab_id"],
+        "browser_navigate" => &["url", "tab_id"],
+        "browser_scroll" => &["direction", "amount", "tab_id"],
+        "browser_get_tabs" => &[],
         _ => &[],
     };
     let mut obj = serde_json::Map::new();

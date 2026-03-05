@@ -488,7 +488,7 @@ pub struct ComputerUseFlags {
     pub inject_guide: bool,
     pub inject_examples: bool,
 }
-const CODE_MODE_PROMPT: &str = "You are in Code Mode. You MUST write a Python script to accomplish the task. Do NOT make individual tool calls — write a single ```python-exec script that orchestrates everything.\n\nThe code runs in a sandboxed Python interpreter (Monty).\n\nSupported syntax: variables, def, if/elif/else, for/while, try/except, comprehensions, f-strings, lambda, slicing.\nDO NOT use: class, match/case, import, with, async/await, yield, decorators.\n\nPre-injected functions (call directly, no import):\n- read_file(path) → str\n- write_file(path, content) → str\n- list_files(path) → list[str]\n- web_search(query) → list[dict] with keys: title, url, snippet\n- fetch_page(url) → str (markdown content)\n- canvas_render(files, entry, title) → dict (renders React/Vue/Svelte app in browser canvas)\n\nReturn code in a ```python-exec block. Use ```python (without -exec) ONLY for display-only code examples shown to the user.";
+const CODE_MODE_PROMPT: &str = "You are in Code Mode. You MUST write a Python script to accomplish the task. Do NOT make individual tool calls — write a single ```python-exec script that orchestrates everything.\n\nThe code runs in a sandboxed Python interpreter (Monty).\n\nSupported syntax: variables, def, if/elif/else, for/while, try/except, comprehensions, f-strings, lambda, slicing.\nDO NOT use: class, match/case, import, with, async/await, yield, decorators.\n\nPre-injected functions (call directly, no import):\n\nFiles:\n- read_file(path) → str\n- write_file(path, content) → str\n- list_files(path) → list[str]\n- run_command(command) → str\n\nBrowser:\n- browser_get_markdown(tab_id=None) → str (page content as markdown)\n- browser_snapshot(tab_id=None) → str (element structure/accessibility tree)\n- browser_click_by_id(element_id, tab_id=None) → str\n- browser_type_by_id(element_id, text, tab_id=None) → str\n- browser_navigate(url, tab_id=None) → str\n- browser_scroll(direction, amount=3, tab_id=None) → str\n- browser_get_tabs() → list[dict] with keys: id, url, title, active\n\nSearch & Web:\n- web_search(query) → list[dict] with keys: title, url, snippet\n- fetch_page(url) → str (markdown content)\n\nCanvas:\n- canvas_render(files, entry, title) → dict (renders app in browser canvas)\n\nReturn code in a ```python-exec block. Use ```python (without -exec) ONLY for display-only code examples shown to the user.";
 
 impl<H: HostFunctions> Agent<H> {
     /// Create a new agent with the given host functions.
@@ -528,13 +528,22 @@ impl<H: HostFunctions> Agent<H> {
             self.computer_use_triggered.set(true);
         }
 
+        // Override mode to Code when user explicitly requests python-exec (Agent mode only)
+        let mode = if input.mode == AgentMode::Agent
+            && should_override_to_code_mode(&input.user_message)
+        {
+            AgentMode::Code
+        } else {
+            input.mode
+        };
+
         // Use custom system prompt if provided, otherwise use mode-based prompt
         let base_prompt = match &input.custom_system_prompt {
             Some(custom) => custom.clone(),
             None => {
                 let skills = self.host.skill_list().unwrap_or_default();
-                let cu_flags = self.computer_use_flags(input.mode);
-                Self::build_system_prompt(input.mode, &skills, &input.available_models, cu_flags)
+                let cu_flags = self.computer_use_flags(mode);
+                Self::build_system_prompt(mode, &skills, &input.available_models, cu_flags)
             }
         };
 
@@ -585,9 +594,9 @@ The following skill instructions MUST be followed exactly. These instructions ta
         };
 
         let mut tools = if self.config.is_subagent {
-            self.get_subagent_tools_for_mode(input.mode)
+            self.get_subagent_tools_for_mode(mode)
         } else {
-            self.get_tools_for_mode(input.mode)
+            self.get_tools_for_mode(mode)
         };
 
         // When user attached specific tabs, update browser tool tab_id descriptions
@@ -929,7 +938,11 @@ The following skill instructions MUST be followed exactly. These instructions ta
             if !keywords.is_empty() {
                 eprintln!("[AGENT] Initial keywords from user message: {:?}", keywords);
             }
-            let kw_arg = if keywords.is_empty() { None } else { Some(keywords.clone()) };
+            let kw_arg = if keywords.is_empty() {
+                None
+            } else {
+                Some(keywords.clone())
+            };
             *self.current_keywords.borrow_mut() = keywords;
             let snapshot_text = self.get_viewport_snapshot_text(input.tab_id, kw_arg);
             if !snapshot_text.is_empty() {
@@ -1542,9 +1555,25 @@ The following skill instructions MUST be followed exactly. These instructions ta
             }
             "tool_call_dynamic" => {
                 let tool_name = tool_call.arguments["tool_name"].as_str().unwrap_or("");
-                let arguments_str = tool_call.arguments["arguments"].as_str().unwrap_or("{}");
-                let arguments: serde_json::Value =
-                    serde_json::from_str(arguments_str).unwrap_or(serde_json::json!({}));
+                let arguments = match &tool_call.arguments["arguments"] {
+                    serde_json::Value::Object(_) => tool_call.arguments["arguments"].clone(),
+                    serde_json::Value::String(s) => {
+                        nevoflux_protocol::json_repair::parse_tool_arguments_json(s)
+                    }
+                    _ => serde_json::json!({}),
+                };
+                // If LLM routes a built-in tool through tool_call_dynamic,
+                // redirect to execute_tool instead of MCP dispatch.
+                if tool_name != "tool_call_dynamic" && self.is_builtin_tool(tool_name) {
+                    let inner = ToolCall {
+                        id: tool_call.id.clone(),
+                        call_id: tool_call.call_id.clone(),
+                        name: tool_name.to_string(),
+                        arguments,
+                        signature: None,
+                    };
+                    return self.execute_tool(&inner);
+                }
                 self.host.tool_call_dynamic(tool_name, &arguments)?
             }
             // Computer tools
@@ -1915,6 +1944,17 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let list = self.host.subagent_list()?;
                 serde_json::to_string_pretty(&list).unwrap_or_default()
             }
+            // python-exec: LLM may call this directly instead of writing ```python-exec blocks.
+            // Route through tool_call_dynamic which intercepts and executes via Monty interpreter.
+            "python-exec" => {
+                match self
+                    .host
+                    .tool_call_dynamic("python-exec", &tool_call.arguments)
+                {
+                    Ok(output) => output,
+                    Err(e) => format!("python-exec error: {}", e.message),
+                }
+            }
             _ => {
                 format!("Unknown tool: {}", tool_call.name)
             }
@@ -1941,6 +1981,43 @@ The following skill instructions MUST be followed exactly. These instructions ta
         })
     }
 
+    /// Check if a tool name is handled by execute_tool (not an MCP tool).
+    fn is_builtin_tool(&self, name: &str) -> bool {
+        matches!(
+            name,
+            "think"
+                | "plan"
+                | "create_artifact"
+                | "switch_model"
+                | "web_search"
+                | "web_fetch"
+                | "ask_user"
+                | "read"
+                | "write"
+                | "edit"
+                | "bash"
+                | "glob"
+                | "grep"
+                | "memory_search"
+                | "memory_create"
+                | "memory_update"
+                | "memory_delete"
+                | "knowledge_teach"
+                | "skill_load"
+                | "tool_search"
+                | "tool_call_dynamic"
+                | "python-exec"
+                | "load_computer_use_tools"
+                | "subagent_spawn"
+                | "subagent_wait_all"
+                | "subagent_status"
+                | "subagent_wait"
+                | "subagent_kill"
+                | "subagent_list"
+        ) || name.starts_with("computer_")
+            || name.starts_with("browser_")
+    }
+
     /// Attempt a native OS-level click fallback when all JS click tiers failed.
     ///
     /// Returns a replacement JSON result string if the fallback fired successfully,
@@ -1953,13 +2030,17 @@ The following skill instructions MUST be followed exactly. These instructions ta
         if click_method != "all_tiers_exhausted" {
             return None;
         }
-        let effective = data.get("effective").and_then(|v| v.as_bool()).unwrap_or(true);
+        let effective = data
+            .get("effective")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         if effective {
             return None;
         }
 
         // Extension must provide screen-absolute bounds for the element
-        let bounds: ScreenBounds = serde_json::from_value(data.get("screenBounds")?.clone()).ok()?;
+        let bounds: ScreenBounds =
+            serde_json::from_value(data.get("screenBounds")?.clone()).ok()?;
         if bounds.width <= 0.0 || bounds.height <= 0.0 {
             return None;
         }
@@ -1987,7 +2068,11 @@ The following skill instructions MUST be followed exactly. These instructions ta
     }
 
     /// Serialize a browser click result, applying the computer_click fallback if needed.
-    fn click_result_with_fallback(&self, result: &BrowserToolResult, tab_id: Option<i64>) -> String {
+    fn click_result_with_fallback(
+        &self,
+        result: &BrowserToolResult,
+        tab_id: Option<i64>,
+    ) -> String {
         let result_str = if let Some(fallback) = self.try_computer_click_fallback(result) {
             fallback
         } else {
@@ -2033,15 +2118,15 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // CJK stop words to filter out (2+ chars only — single-char sequences
         // are already excluded by the >= 2 character threshold below)
         const CJK_STOPS: &[&str] = &[
-            "一个", "没有", "自己", "这个", "那个", "什么", "怎么", "可以",
-            "已经", "因为", "所以", "但是", "如果", "虽然", "还是", "就是",
+            "一个", "没有", "自己", "这个", "那个", "什么", "怎么", "可以", "已经", "因为", "所以",
+            "但是", "如果", "虽然", "还是", "就是",
         ];
 
         // Known action verbs (Chinese + English)
         const ACTION_VERBS: &[&str] = &[
-            "登录", "login", "sign in", "signin", "search", "click", "submit",
-            "注册", "搜索", "点击", "提交", "打开", "关闭", "输入", "选择",
-            "register", "signup", "sign up", "open", "close", "enter", "select",
+            "登录", "login", "sign in", "signin", "search", "click", "submit", "注册", "搜索",
+            "点击", "提交", "打开", "关闭", "输入", "选择", "register", "signup", "sign up",
+            "open", "close", "enter", "select",
         ];
 
         // 1. Extract quoted strings
@@ -2078,9 +2163,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             {
                 cjk_buf.push(ch);
             } else {
-                if cjk_buf.chars().count() >= 2
-                    && !CJK_STOPS.contains(&cjk_buf.as_str())
-                {
+                if cjk_buf.chars().count() >= 2 && !CJK_STOPS.contains(&cjk_buf.as_str()) {
                     keywords.push(cjk_buf.clone());
                 }
                 cjk_buf.clear();
@@ -2094,12 +2177,16 @@ The following skill instructions MUST be followed exactly. These instructions ta
         for word in text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-') {
             let trimmed = word.trim();
             if trimmed.len() >= 2
-                && trimmed.chars().next().map_or(false, |c| c.is_ascii_uppercase())
-                && !["The", "This", "That", "What", "When", "Where", "How", "Why",
-                     "And", "But", "For", "Not", "You", "Are", "Was", "Were",
-                     "Can", "Could", "Will", "Would", "Should", "May", "Might",
-                     "Has", "Have", "Had", "Does", "Did", "Its", "All"]
-                    .contains(&trimmed)
+                && trimmed
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.is_ascii_uppercase())
+                && ![
+                    "The", "This", "That", "What", "When", "Where", "How", "Why", "And", "But",
+                    "For", "Not", "You", "Are", "Was", "Were", "Can", "Could", "Will", "Would",
+                    "Should", "May", "Might", "Has", "Have", "Had", "Does", "Did", "Its", "All",
+                ]
+                .contains(&trimmed)
             {
                 keywords.push(trimmed.to_string());
             }
@@ -2145,7 +2232,10 @@ The following skill instructions MUST be followed exactly. These instructions ta
             if let Some(val) = args.get(key).and_then(|v| v.as_str()) {
                 let arg_kws = Self::extract_keywords_from_text(val);
                 for kw in arg_kws {
-                    if !kws.iter().any(|existing| existing.eq_ignore_ascii_case(&kw)) {
+                    if !kws
+                        .iter()
+                        .any(|existing| existing.eq_ignore_ascii_case(&kw))
+                    {
                         kws.push(kw);
                     }
                 }
@@ -2160,7 +2250,11 @@ The following skill instructions MUST be followed exactly. These instructions ta
     }
 
     /// Get viewport snapshot text for initial context.
-    fn get_viewport_snapshot_text(&self, tab_id: Option<i64>, keywords: Option<Vec<String>>) -> String {
+    fn get_viewport_snapshot_text(
+        &self,
+        tab_id: Option<i64>,
+        keywords: Option<Vec<String>>,
+    ) -> String {
         match self.host.browser_viewport_snapshot(tab_id, keywords) {
             Ok(result) => {
                 if let Some(data) = &result.data {
@@ -3698,6 +3792,25 @@ fn should_trigger_computer_use(message: &str) -> bool {
     false
 }
 
+/// Check if user message explicitly requests python-exec / Code Mode.
+/// When detected, override the current mode to AgentMode::Code so the LLM
+/// receives CODE_MODE_PROMPT and is forced to generate python-exec scripts.
+fn should_override_to_code_mode(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    const KEYWORDS: &[&str] = &[
+        "python-exec",
+        "python exec",
+        "code mode",
+        "代码模式",
+    ];
+    for kw in KEYWORDS {
+        if lower.contains(kw) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Check if a browser tool result indicates a failure that suggests computer use is needed.
 /// Detects native file pickers, OS dialogs, permission prompts, etc.
 fn is_browser_failure_suggesting_computer_use(result: &str) -> bool {
@@ -4230,6 +4343,27 @@ mod tests {
         assert!(!should_trigger_computer_use("Fill in the login form"));
         assert!(!should_trigger_computer_use("Click the submit button"));
         assert!(!should_trigger_computer_use("Navigate to google.com"));
+    }
+
+    // =========================================================================
+    // Code Mode Override Tests
+    // =========================================================================
+
+    #[test]
+    fn test_should_override_to_code_mode() {
+        assert!(should_override_to_code_mode("请用 python-exec 分析页面"));
+        assert!(should_override_to_code_mode("Use python exec to process data"));
+        assert!(should_override_to_code_mode("Switch to code mode"));
+        assert!(should_override_to_code_mode("请切换到代码模式"));
+        assert!(should_override_to_code_mode("用Python-Exec处理"));
+    }
+
+    #[test]
+    fn test_should_not_override_to_code_mode() {
+        assert!(!should_override_to_code_mode("Search for python tutorials"));
+        assert!(!should_override_to_code_mode("Write a python script"));
+        assert!(!should_override_to_code_mode("Execute this command"));
+        assert!(!should_override_to_code_mode("帮我写代码"));
     }
 
     #[test]

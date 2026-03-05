@@ -5,9 +5,14 @@
 
 use crate::agent::abi::{PendingToolCall, ToolResult};
 use crate::error::{DaemonError, Result};
+use crate::wasm::services::{BrowserContext, BrowserRequest, BrowserResponse};
 use async_trait::async_trait;
+use nevoflux_protocol::BrowserToolAction;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::oneshot;
 
 // ============================================================================
 // Tool Execution Record
@@ -78,6 +83,39 @@ impl ToolRegistry {
         registry
     }
 
+    /// Create a tool registry with browser tools registered.
+    ///
+    /// Includes all built-in tools plus browser interaction tools and
+    /// web_search/fetch_page (which go through the browser sender).
+    pub fn with_browser(ctx: BrowserContext) -> Self {
+        let mut registry = Self::new();
+        let ctx = Arc::new(ctx);
+
+        let browser_tools = [
+            ("browser_get_markdown", BrowserToolAction::GetMarkdown),
+            ("browser_snapshot", BrowserToolAction::Snapshot),
+            ("browser_click_by_id", BrowserToolAction::ClickById),
+            ("browser_type_by_id", BrowserToolAction::TypeById),
+            ("browser_navigate", BrowserToolAction::Navigate),
+            ("browser_scroll", BrowserToolAction::Scroll),
+            ("browser_get_tabs", BrowserToolAction::ListTabs),
+            ("web_search", BrowserToolAction::WebSearch),
+            ("fetch_page", BrowserToolAction::WebFetch),
+        ];
+
+        for (name, action) in browser_tools {
+            registry.register(
+                name,
+                Box::new(BrowserTool {
+                    ctx: ctx.clone(),
+                    action,
+                }),
+            );
+        }
+
+        registry
+    }
+
     /// Create an empty tool registry without built-in tools.
     pub fn empty() -> Self {
         Self {
@@ -127,8 +165,14 @@ impl ToolRegistry {
                 "path: str",
                 "List directory contents. Returns newline-separated entries.",
             ),
-            "web_search" => ("query: str", "Search the web. Returns search results."),
-            "fetch_page" => ("url: str", "Fetch a web page. Returns the page content."),
+            "web_search" => (
+                "query: str",
+                "Search the web. Returns list of dicts with keys: title, url, snippet.",
+            ),
+            "fetch_page" => (
+                "url: str",
+                "Fetch a web page. Returns the page content as markdown.",
+            ),
             "canvas_render" => (
                 "files: dict, entry: str",
                 "Render a multi-file project in the canvas.",
@@ -140,6 +184,34 @@ impl ToolRegistry {
             "get_code_mode_context" => (
                 "",
                 "Get Code Mode context with available tool function signatures.",
+            ),
+            "browser_get_markdown" => (
+                "tab_id: int = None",
+                "Get the current page content as markdown. Returns markdown string.",
+            ),
+            "browser_snapshot" => (
+                "tab_id: int = None",
+                "Get page element structure (accessibility snapshot). Returns element tree.",
+            ),
+            "browser_click_by_id" => (
+                "element_id: str, tab_id: int = None",
+                "Click an element by its snapshot ID.",
+            ),
+            "browser_type_by_id" => (
+                "element_id: str, text: str, tab_id: int = None",
+                "Type text into an element by its snapshot ID.",
+            ),
+            "browser_navigate" => (
+                "url: str, tab_id: int = None",
+                "Navigate the browser to a URL.",
+            ),
+            "browser_scroll" => (
+                "direction: str, amount: int = 3, tab_id: int = None",
+                "Scroll the page. direction: 'up' or 'down'.",
+            ),
+            "browser_get_tabs" => (
+                "",
+                "List all open browser tabs. Returns list of dicts with keys: id, url, title, active.",
             ),
             _ => ("**kwargs", "Execute this tool with keyword arguments."),
         }
@@ -504,6 +576,179 @@ impl ToolExecutor for CanvasRenderTool {
 }
 
 // ============================================================================
+// Browser Tool (generic for all browser actions)
+// ============================================================================
+
+/// Generic browser tool that dispatches actions via the BrowserSender channel.
+///
+/// Each instance is configured with a specific `BrowserToolAction` and maps
+/// positional/named arguments to the appropriate `BrowserRequest` params.
+pub struct BrowserTool {
+    ctx: Arc<BrowserContext>,
+    action: BrowserToolAction,
+}
+
+impl BrowserTool {
+
+    /// Build the params JSON from tool arguments based on the action type.
+    fn build_params(
+        action: BrowserToolAction,
+        arguments: &serde_json::Value,
+    ) -> (serde_json::Value, Option<i64>) {
+        let tab_id = arguments
+            .get("tab_id")
+            .and_then(|v| v.as_i64())
+            .or_else(|| {
+                // Support positional: last arg may be tab_id
+                arguments
+                    .as_array()
+                    .and_then(|arr| arr.last())
+                    .and_then(|v| v.as_i64())
+            });
+
+        let params = match action {
+            BrowserToolAction::GetMarkdown | BrowserToolAction::Snapshot => {
+                serde_json::json!({})
+            }
+            BrowserToolAction::ListTabs => {
+                serde_json::json!({})
+            }
+            BrowserToolAction::ClickById => {
+                let element_id = arguments
+                    .get("element_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                serde_json::json!({ "element_id": element_id })
+            }
+            BrowserToolAction::TypeById => {
+                let element_id = arguments
+                    .get("element_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let text = arguments
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                serde_json::json!({ "element_id": element_id, "text": text })
+            }
+            BrowserToolAction::Navigate => {
+                let url = arguments
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                serde_json::json!({ "url": url })
+            }
+            BrowserToolAction::Scroll => {
+                let direction = arguments
+                    .get("direction")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("down");
+                let amount = arguments
+                    .get("amount")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(3);
+                serde_json::json!({ "direction": direction, "amount": amount })
+            }
+            BrowserToolAction::WebSearch => {
+                let query = arguments
+                    .get("query")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                serde_json::json!({ "query": query, "max_results": 10, "timeout_ms": 30000 })
+            }
+            BrowserToolAction::WebFetch => {
+                let url = arguments
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                serde_json::json!({
+                    "url": url,
+                    "timeout_ms": 30000,
+                    "include_images": false,
+                    "max_length": 100000
+                })
+            }
+            _ => {
+                // Pass through all arguments as params
+                arguments.clone()
+            }
+        };
+
+        (params, tab_id)
+    }
+
+    /// Extract the user-facing value from a browser tool response.
+    ///
+    /// The raw browser response is a JSON object with metadata fields
+    /// (success, title, url, etc.). For Code Mode, tools should return
+    /// just the relevant content — e.g. `browser_get_markdown` returns
+    /// the markdown string, not `{"markdown":"...","title":"..."}`.
+    fn extract_result(action: BrowserToolAction, val: &serde_json::Value) -> String {
+        match action {
+            BrowserToolAction::GetMarkdown => {
+                // Extract just the markdown text
+                val.get("markdown")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| val.to_string())
+            }
+            BrowserToolAction::Snapshot => {
+                // Extract the snapshot/elements data
+                val.get("snapshot")
+                    .or_else(|| val.get("elements"))
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| val.to_string())
+            }
+            _ => val.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for BrowserTool {
+    async fn execute(&self, _name: &str, arguments: &serde_json::Value) -> Result<String> {
+        let (params, tab_id) = Self::build_params(self.action, arguments);
+
+        let request = BrowserRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            session_id: "code-mode".to_string(),
+            tab_id,
+            action: self.action,
+            params,
+            timeout_ms: 30000,
+            client_identity: self.ctx.client_identity.clone(),
+            proxy_id: self.ctx.proxy_id.clone(),
+        };
+
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.ctx.sender
+            .send((request, response_tx))
+            .await
+            .map_err(|_| DaemonError::InternalError("Failed to send browser request".into()))?;
+
+        let response: BrowserResponse =
+            tokio::time::timeout(Duration::from_secs(30), response_rx)
+                .await
+                .map_err(|_| DaemonError::InternalError("Browser request timed out".into()))?
+                .map_err(|_| DaemonError::InternalError("Response channel closed".into()))?;
+
+        if response.success {
+            match response.result {
+                Some(val) => Ok(Self::extract_result(self.action, &val)),
+                None => Ok("OK".to_string()),
+            }
+        } else {
+            let error_msg = response
+                .error
+                .map(|e| e.message)
+                .unwrap_or_else(|| "Browser action failed".to_string());
+            Err(DaemonError::InternalError(error_msg))
+        }
+    }
+}
+
+// ============================================================================
 // Code Mode Context Tool
 // ============================================================================
 
@@ -561,6 +806,69 @@ mod tests {
         assert!(names.contains(&"canvas_render"));
         // 5 built-in tools: read_file, write_file, list_files, canvas_render, run_command
         assert_eq!(names.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_with_browser_registry() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let registry = ToolRegistry::with_browser(BrowserContext {
+            sender: tx,
+            proxy_id: String::new(),
+            client_identity: vec![],
+        });
+        let names = registry.tool_names();
+
+        // Should have base tools + browser tools + web tools
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"list_files"));
+        assert!(names.contains(&"canvas_render"));
+        assert!(names.contains(&"run_command"));
+
+        // Browser tools
+        assert!(names.contains(&"browser_get_markdown"));
+        assert!(names.contains(&"browser_snapshot"));
+        assert!(names.contains(&"browser_click_by_id"));
+        assert!(names.contains(&"browser_type_by_id"));
+        assert!(names.contains(&"browser_navigate"));
+        assert!(names.contains(&"browser_scroll"));
+        assert!(names.contains(&"browser_get_tabs"));
+
+        // Web tools (previously stub-only)
+        assert!(names.contains(&"web_search"));
+        assert!(names.contains(&"fetch_page"));
+    }
+
+    #[tokio::test]
+    async fn test_with_browser_python_stubs() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let registry = ToolRegistry::with_browser(BrowserContext {
+            sender: tx,
+            proxy_id: String::new(),
+            client_identity: vec![],
+        });
+        let stubs = registry.to_python_stubs();
+
+        assert!(stubs.contains("def browser_get_markdown("));
+        assert!(stubs.contains("def browser_navigate("));
+        assert!(stubs.contains("def web_search("));
+        assert!(stubs.contains("def fetch_page("));
+    }
+
+    #[tokio::test]
+    async fn test_with_browser_categories() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let registry = ToolRegistry::with_browser(BrowserContext {
+            sender: tx,
+            proxy_id: String::new(),
+            client_identity: vec![],
+        });
+        let summary = registry.tool_categories_summary();
+
+        assert!(summary.contains("Browser & Canvas"));
+        assert!(summary.contains("browser_get_markdown"));
+        assert!(summary.contains("Search & Web"));
+        assert!(summary.contains("web_search"));
     }
 
     #[test]

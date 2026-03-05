@@ -26,9 +26,7 @@ use crate::config::{BridgeConfig, ConnectionMode};
 use crate::daemon_client::{generate_proxy_id, DaemonClient};
 use crate::error::{BridgeError, Result};
 use crate::native_messaging::{read_message, write_message};
-use crate::port_discovery::{
-    find_available_port, launch_daemon_with_port, wait_for_daemon_ready,
-};
+use crate::port_discovery::{find_available_port, launch_daemon_with_port, wait_for_daemon_ready};
 use crate::proxy::parse_native_message;
 use nevoflux_protocol::{Channel, DaemonEnvelope, ProxyEnvelope};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};

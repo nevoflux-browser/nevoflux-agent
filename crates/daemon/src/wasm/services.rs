@@ -64,6 +64,21 @@ impl LlmConfig {
     }
 }
 
+/// Shared context for browser tool execution in Code Mode.
+///
+/// Bundles the sender channel with routing information needed to deliver
+/// browser requests back to the correct proxy/sidebar. Shared via `Arc`
+/// among all BrowserTool instances in a ToolRegistry.
+#[derive(Debug, Clone)]
+pub struct BrowserContext {
+    /// Channel to send browser requests.
+    pub sender: BrowserSender,
+    /// Proxy ID for routing responses.
+    pub proxy_id: String,
+    /// Client identity bytes for routing responses.
+    pub client_identity: Vec<u8>,
+}
+
 /// Browser tool request for the browser sender channel.
 #[derive(Debug, Clone)]
 pub struct BrowserRequest {
@@ -217,6 +232,17 @@ impl HostServices {
             embedding: None,
             vector_index: Arc::new(std::sync::RwLock::new(SimpleVectorIndex::new())),
         }
+    }
+
+    /// Build a `BrowserContext` from this service's browser_sender and routing info.
+    ///
+    /// Returns `None` if no browser_sender is configured.
+    pub fn browser_context(&self) -> Option<BrowserContext> {
+        self.browser_sender.clone().map(|sender| BrowserContext {
+            sender,
+            proxy_id: self.proxy_id.clone(),
+            client_identity: self.client_identity.clone(),
+        })
     }
 
     /// Add tool search index to the services.

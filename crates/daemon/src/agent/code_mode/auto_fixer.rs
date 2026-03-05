@@ -202,11 +202,12 @@ impl MontyAutoFixer {
         // `sorted(X, key=Y, reverse=True)` with `_keysort(X, Y, True)`
         // `sorted(X, reverse=True)` with `_keysort(X, None, True)`
 
-        // Check if any sorted() call uses keyword arguments
+        // Check if any sorted() or .sort() call uses keyword arguments
         let has_sorted_key = code.contains("sorted(") && code.contains("key=");
         let has_sorted_reverse = code.contains("sorted(") && code.contains("reverse=");
+        let has_sort_method = code.contains(".sort(") && (code.contains("key=") || code.contains("reverse="));
 
-        if !has_sorted_key && !has_sorted_reverse {
+        if !has_sorted_key && !has_sorted_reverse && !has_sort_method {
             return code.to_string();
         }
 
@@ -244,6 +245,10 @@ impl MontyAutoFixer {
         // This is a simplified regex-free approach that handles common patterns.
         result = Self::replace_sorted_calls(&result);
 
+        // Replace .sort(key=...) and .sort(reverse=...) method calls
+        // e.g. `data.sort(key=lambda x: x[0], reverse=True)` → `data = _keysort(data, lambda x: x[0], True)`
+        result = Self::replace_sort_method_calls(&result);
+
         format!("{}\n{}", helper.trim(), result)
     }
 
@@ -252,11 +257,10 @@ impl MontyAutoFixer {
         let mut result = String::new();
         let mut chars = code.chars().peekable();
         let mut i = 0;
-        let bytes = code.as_bytes();
 
-        while i < bytes.len() {
-            // Look for "sorted("
-            if i + 7 <= bytes.len() && &code[i..i + 7] == "sorted(" {
+        while i < code.len() {
+            // Look for "sorted(" — use starts_with to avoid slicing at non-char-boundary
+            if code[i..].starts_with("sorted(") {
                 // Find the matching closing parenthesis
                 if let Some((args_str, end_pos)) = Self::extract_balanced_parens(code, i + 6) {
                     // Check if args contain key= or reverse=
@@ -280,6 +284,103 @@ impl MontyAutoFixer {
         }
 
         result
+    }
+
+    /// Replace `.sort(key=..., reverse=...)` method calls with `_keysort()`.
+    ///
+    /// Rewrites `var.sort(key=fn)` → `var = _keysort(var, fn)`
+    /// and `var.sort(key=fn, reverse=True)` → `var = _keysort(var, fn, True)`
+    /// and `var.sort(reverse=True)` → `var = _keysort(var, None, True)`
+    ///
+    /// Works line-by-line since `.sort()` is always a statement (no return value).
+    fn replace_sort_method_calls(code: &str) -> String {
+        let mut result_lines: Vec<String> = Vec::new();
+
+        for line in code.lines() {
+            let trimmed = line.trim();
+            // Find `.sort(` in the line
+            if let Some(sort_dot_pos) = trimmed.find(".sort(") {
+                let before_dot = trimmed[..sort_dot_pos].trim();
+                // The variable name is the identifier before `.sort(`
+                // Must be a simple identifier (no operators, no complex expressions)
+                if !before_dot.is_empty() && Self::is_simple_identifier(before_dot) {
+                    let paren_start_in_trimmed = sort_dot_pos + ".sort".len();
+                    if let Some((args_str, end_pos)) =
+                        Self::extract_balanced_parens(trimmed, paren_start_in_trimmed)
+                    {
+                        if args_str.contains("key=") || args_str.contains("reverse=") {
+                            // Check nothing follows the closing paren (it's a statement)
+                            let after = trimmed[end_pos + 1..].trim();
+                            if after.is_empty() || after.starts_with('#') {
+                                let rewritten =
+                                    Self::rewrite_single_sorted_for_method(before_dot, &args_str);
+                                // Preserve leading whitespace
+                                let indent = &line[..line.len() - line.trim_start().len()];
+                                result_lines.push(format!("{}{}", indent, rewritten));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            result_lines.push(line.to_string());
+        }
+
+        result_lines.join("\n")
+    }
+
+    /// Check if a string is a simple Python identifier (variable name, possibly with
+    /// subscript or attribute access like `data`, `self.items`, `results[0]`).
+    fn is_simple_identifier(s: &str) -> bool {
+        if s.is_empty() {
+            return false;
+        }
+        let bytes = s.as_bytes();
+        // Must start with letter or underscore
+        if !bytes[0].is_ascii_alphabetic() && bytes[0] != b'_' {
+            return false;
+        }
+        // Allow alphanumeric, underscore, dot, brackets
+        let mut bracket_depth = 0i32;
+        for &b in bytes {
+            match b {
+                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'.' | b'\'' | b'"' => {}
+                b'[' => bracket_depth += 1,
+                b']' => bracket_depth -= 1,
+                _ if bracket_depth > 0 => {} // allow anything inside brackets
+                _ => return false,
+            }
+        }
+        bracket_depth == 0
+    }
+
+    /// Rewrite args for a .sort() method call to a _keysort() assignment.
+    /// `var.sort(key=fn, reverse=True)` → `var = _keysort(var, fn, True)`
+    fn rewrite_single_sorted_for_method(var_name: &str, args: &str) -> String {
+        let parts = Self::split_top_level_commas(args);
+
+        let mut key_fn = String::new();
+        let mut reverse = String::new();
+
+        for part in &parts {
+            let trimmed = part.trim();
+            if let Some(rest) = trimmed.strip_prefix("key=") {
+                key_fn = rest.trim().to_string();
+            } else if let Some(rest) = trimmed.strip_prefix("reverse=") {
+                reverse = rest.trim().to_string();
+            }
+        }
+
+        if !key_fn.is_empty() && !reverse.is_empty() {
+            format!("{} = _keysort({}, {}, {})", var_name, var_name, key_fn, reverse)
+        } else if !key_fn.is_empty() {
+            format!("{} = _keysort({}, {})", var_name, var_name, key_fn)
+        } else if !reverse.is_empty() {
+            format!("{} = _keysort({}, None, {})", var_name, var_name, reverse)
+        } else {
+            // No keyword args, keep original
+            format!("{}.sort({})", var_name, args)
+        }
     }
 
     /// Extract content inside balanced parentheses starting at `open_pos`.
@@ -361,36 +462,36 @@ impl MontyAutoFixer {
         let mut current = String::new();
         let mut depth = 0;
         let mut in_string = false;
-        let mut string_char: u8 = 0;
+        let mut string_char = '"';
 
-        for &b in s.as_bytes() {
+        for ch in s.chars() {
             if in_string {
-                current.push(b as char);
-                if b == string_char {
+                current.push(ch);
+                if ch == string_char {
                     in_string = false;
                 }
                 continue;
             }
-            match b {
-                b'"' | b'\'' => {
+            match ch {
+                '"' | '\'' => {
                     in_string = true;
-                    string_char = b;
-                    current.push(b as char);
+                    string_char = ch;
+                    current.push(ch);
                 }
-                b'(' | b'[' | b'{' => {
+                '(' | '[' | '{' => {
                     depth += 1;
-                    current.push(b as char);
+                    current.push(ch);
                 }
-                b')' | b']' | b'}' => {
+                ')' | ']' | '}' => {
                     depth -= 1;
-                    current.push(b as char);
+                    current.push(ch);
                 }
-                b',' if depth == 0 => {
+                ',' if depth == 0 => {
                     parts.push(current.clone());
                     current.clear();
                 }
                 _ => {
-                    current.push(b as char);
+                    current.push(ch);
                 }
             }
         }
@@ -1342,8 +1443,10 @@ impl MontyAutoFixer {
                     continue;
                 }
             }
-            result.push(bytes[i] as char);
-            i += 1;
+            // Use char iteration to preserve multi-byte UTF-8 characters
+            let ch = code[i..].chars().next().unwrap();
+            result.push(ch);
+            i += ch.len_utf8();
         }
 
         result
@@ -1573,6 +1676,53 @@ mod tests {
         let code = "for item in sorted(data, key=lambda x: x['count']):\n    print(item)";
         let fixed = MontyAutoFixer::fix(code);
         assert!(fixed.contains("_keysort(data, lambda x: x['count'])"));
+    }
+
+    // === .sort() method rewriting tests ===
+
+    #[test]
+    fn test_sort_method_with_key() {
+        let code = "items.sort(key=lambda x: x['name'])";
+        let fixed = MontyAutoFixer::fix(code);
+        assert!(fixed.contains("items = _keysort(items, lambda x: x['name'])"));
+        assert!(fixed.contains("def _keysort("));
+        assert!(!fixed.contains(".sort("));
+    }
+
+    #[test]
+    fn test_sort_method_with_key_and_reverse() {
+        let code = "jobs_data.sort(key=lambda x: x['match_score'], reverse=True)";
+        let fixed = MontyAutoFixer::fix(code);
+        assert!(fixed.contains("jobs_data = _keysort(jobs_data, lambda x: x['match_score'], True)"));
+    }
+
+    #[test]
+    fn test_sort_method_with_reverse_only() {
+        let code = "nums.sort(reverse=True)";
+        let fixed = MontyAutoFixer::fix(code);
+        assert!(fixed.contains("nums = _keysort(nums, None, True)"));
+    }
+
+    #[test]
+    fn test_sort_method_without_key_unchanged() {
+        let code = "items.sort()";
+        let fixed = MontyAutoFixer::fix(code);
+        assert!(fixed.contains("items.sort()"));
+        assert!(!fixed.contains("_keysort"));
+    }
+
+    #[test]
+    fn test_sort_method_preserves_indent() {
+        let code = "    data.sort(key=lambda x: x[0])";
+        let fixed = MontyAutoFixer::fix(code);
+        assert!(fixed.contains("    data = _keysort(data, lambda x: x[0])"));
+    }
+
+    #[test]
+    fn test_sort_method_with_attribute_access() {
+        let code = "self.items.sort(key=lambda x: x.name)";
+        let fixed = MontyAutoFixer::fix(code);
+        assert!(fixed.contains("self.items = _keysort(self.items, lambda x: x.name)"));
     }
 
     // === map() rewriting tests ===
@@ -2082,5 +2232,31 @@ mod tests {
         let code = "x = randint(1, 10)";
         let fixed = MontyAutoFixer::fix(code);
         assert!(!fixed.contains("_random"));
+    }
+
+    #[test]
+    fn test_fix_with_chinese_comments() {
+        // This previously panicked: "byte index 7 is not a char boundary"
+        let code = "# 基于当前页面收集的职位数据进行分析\njobs = []\nprint(len(jobs))";
+        let fixed = MontyAutoFixer::fix(code);
+        assert!(fixed.contains("# 基于当前页面"));
+        assert!(fixed.contains("print(len(jobs))"));
+    }
+
+    #[test]
+    fn test_fix_with_multibyte_in_sorted() {
+        // sorted() with Chinese comments should not panic
+        let code = "# 排序数据\nresult = sorted(items, key=lambda x: x['名前'])";
+        let fixed = MontyAutoFixer::fix(code);
+        assert!(fixed.contains("_keysort"));
+        assert!(fixed.contains("名前"));
+    }
+
+    #[test]
+    fn test_replace_standalone_call_with_multibyte() {
+        // Ensure multi-byte chars are preserved, not corrupted via bytes[i] as char
+        let code = "# 使用map处理\nresult = map(func, items)";
+        let fixed = MontyAutoFixer::fix(code);
+        assert!(fixed.contains("# 使用map处理"));
     }
 }
