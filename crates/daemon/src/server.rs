@@ -2129,6 +2129,8 @@ async fn handle_chat_message_streaming(
                         let rerun_forwarder = tokio::spawn(async move {
                             let mut rerun_accumulated = String::new();
                             let mut buffer = String::new();
+                            let mut sent_bytes: usize = 0;
+                            let mut code_fence_detected = false;
                             let mut interval =
                                 tokio::time::interval(tokio::time::Duration::from_millis(300));
                             interval
@@ -2140,7 +2142,9 @@ async fn handle_chat_message_streaming(
                                     biased;
 
                                     _ = interval.tick() => {
-                                        if !buffer.is_empty() {
+                                        if code_fence_detected {
+                                            // Suppress output while inside code fence
+                                        } else if !buffer.is_empty() {
                                             let text = std::mem::take(&mut buffer);
                                             rerun_accumulated.push_str(&text);
                                             let chunk_payload = serde_json::json!({
@@ -2233,30 +2237,75 @@ async fn handle_chat_message_streaming(
                                                     }
                                                 } else if chunk.done {
                                                     buffer.push_str(&chunk.text);
-                                                    let text = std::mem::take(&mut buffer);
-                                                    rerun_accumulated.push_str(&text);
-                                                    let chunk_payload = serde_json::json!({
-                                                        "type": "stream_chunk",
-                                                        "payload": {
-                                                            "content": text,
-                                                            "done": true
+                                                    rerun_accumulated.push_str(&std::mem::take(&mut buffer));
+                                                    if code_fence_detected {
+                                                        // Code fence detected — defer done to Code Mode path
+                                                        debug!(
+                                                            "Rerun stream completed (code fence detected, done deferred), total: {} bytes",
+                                                            rerun_accumulated.len()
+                                                        );
+                                                    } else {
+                                                        let to_send = rerun_accumulated[sent_bytes..].to_string();
+                                                        let chunk_payload = serde_json::json!({
+                                                            "type": "stream_chunk",
+                                                            "payload": {
+                                                                "content": to_send,
+                                                                "done": true
+                                                            }
+                                                        });
+                                                        let response = DaemonEnvelope::new(
+                                                            &rerun_proxy_id,
+                                                            rerun_channel,
+                                                            chunk_payload,
+                                                        )
+                                                        .with_request_id(&rerun_request_id);
+                                                        if let Err(e) = rerun_response_tx
+                                                            .send((rerun_identity.clone(), response))
+                                                            .await
+                                                        {
+                                                            error!("Failed to send rerun stream chunk: {}", e);
                                                         }
-                                                    });
-                                                    let response = DaemonEnvelope::new(
-                                                        &rerun_proxy_id,
-                                                        rerun_channel,
-                                                        chunk_payload,
-                                                    )
-                                                    .with_request_id(&rerun_request_id);
-                                                    if let Err(e) = rerun_response_tx
-                                                        .send((rerun_identity.clone(), response))
-                                                        .await
-                                                    {
-                                                        error!("Failed to send rerun stream chunk: {}", e);
                                                     }
                                                     break;
                                                 } else {
+                                                    // Buffer text, check for code fence
                                                     buffer.push_str(&chunk.text);
+                                                    if !code_fence_detected {
+                                                        // Check accumulated + buffer for fence
+                                                        let check_text = format!("{}{}", &rerun_accumulated, &buffer);
+                                                        if let Some(rel) = check_text[sent_bytes..].find(crate::agent::runner::PYTHON_EXEC_FENCE) {
+                                                            code_fence_detected = true;
+                                                            let sendable_end = sent_bytes + rel;
+                                                            // Flush text before the fence
+                                                            rerun_accumulated.push_str(&std::mem::take(&mut buffer));
+                                                            if sendable_end > sent_bytes {
+                                                                let to_send = rerun_accumulated[sent_bytes..sendable_end].trim_end().to_string();
+                                                                if !to_send.is_empty() {
+                                                                    let chunk_payload = serde_json::json!({
+                                                                        "type": "stream_chunk",
+                                                                        "payload": {
+                                                                            "content": to_send,
+                                                                            "done": false
+                                                                        }
+                                                                    });
+                                                                    let response = DaemonEnvelope::new(
+                                                                        &rerun_proxy_id,
+                                                                        rerun_channel,
+                                                                        chunk_payload,
+                                                                    )
+                                                                    .with_request_id(&rerun_request_id);
+                                                                    if let Err(e) = rerun_response_tx
+                                                                        .send((rerun_identity.clone(), response))
+                                                                        .await
+                                                                    {
+                                                                        error!("Failed to send rerun stream chunk: {}", e);
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                            sent_bytes = rerun_accumulated.len();
+                                                        }
+                                                    }
                                                 }
                                             }
                                             None => {
@@ -2286,7 +2335,7 @@ async fn handle_chat_message_streaming(
                                     }
                                 }
                             }
-                            rerun_accumulated
+                            (rerun_accumulated, code_fence_detected)
                         });
 
                         // Run agent with plan context
@@ -2295,22 +2344,113 @@ async fn handle_chat_message_streaming(
                                 .await;
 
                         // Wait for forwarder
-                        let rerun_text = match rerun_forwarder.await {
-                            Ok(text) => text,
+                        let (rerun_text, rerun_code_fence) = match rerun_forwarder.await {
+                            Ok(result) => result,
                             Err(e) => {
                                 error!("Rerun forwarder failed: {}", e);
-                                String::new()
+                                (String::new(), false)
                             }
                         };
+                        let _ = rerun_code_fence;
 
                         // Handle rerun result
                         match rerun_result {
                             Ok(Ok(output)) => {
-                                let final_text = if output.text.is_empty() {
-                                    rerun_text
+                                let raw_text = if output.text.is_empty() {
+                                    &rerun_text
                                 } else {
-                                    output.text.clone()
+                                    &output.text
                                 };
+
+                                // Try Code Mode: if LLM returned a ```python-exec block, execute it
+                                let (final_text, _code_mode_tool_calls) =
+                                    match crate::agent::code_mode::execute_code_mode(
+                                        raw_text,
+                                        &config,
+                                        browser_context(&services, &proxy_id, &identity),
+                                    ).await {
+                                        Some(code_result) => {
+                                            let mut summary = String::new();
+                                            if code_result.success {
+                                                if !code_result.output.is_empty() {
+                                                    summary.push_str(&code_result.output);
+                                                }
+                                                for tr in &code_result.tool_results {
+                                                    if tr.tool_name == "canvas_render" {
+                                                        if let Ok(artifact_data) =
+                                                            serde_json::from_str::<serde_json::Value>(
+                                                                tr.result.as_str().unwrap_or(""),
+                                                            )
+                                                            .or_else(|_| Ok::<_, serde_json::Error>(tr.result.clone()))
+                                                        {
+                                                            if artifact_data
+                                                                .get("success")
+                                                                .and_then(|s| s.as_bool())
+                                                                .unwrap_or(false)
+                                                            {
+                                                                let artifact = nevoflux_protocol::Artifact {
+                                                                    id: artifact_data
+                                                                        .get("artifact_id")
+                                                                        .and_then(|a| a.as_str())
+                                                                        .unwrap_or("unknown")
+                                                                        .to_string(),
+                                                                    title: artifact_data
+                                                                        .get("title")
+                                                                        .and_then(|t| t.as_str())
+                                                                        .unwrap_or("Generated App")
+                                                                        .to_string(),
+                                                                    content_type: "application/project+json"
+                                                                        .to_string(),
+                                                                    description: None,
+                                                                    content: serde_json::to_string(&artifact_data)
+                                                                        .unwrap_or_default(),
+                                                                    files: None,
+                                                                    entry: None,
+                                                                };
+                                                                send_artifact_stream(
+                                                                    &artifact,
+                                                                    &session_id,
+                                                                    session_manager,
+                                                                    &proxy_id,
+                                                                    channel,
+                                                                    &request_id,
+                                                                    &identity,
+                                                                    &response_tx,
+                                                                )
+                                                                .await;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            } else if let Some(err) = &code_result.error {
+                                                summary = format!("Code execution failed: {}", err);
+                                            }
+
+                                            let display_text = crate::agent::runner::strip_python_exec_block(raw_text);
+                                            if !summary.is_empty() {
+                                                let chunk_payload = serde_json::json!({
+                                                    "type": "stream_chunk",
+                                                    "payload": {
+                                                        "content": summary,
+                                                        "done": true,
+                                                        "code_mode": true
+                                                    }
+                                                });
+                                                let response = DaemonEnvelope::new(&proxy_id, channel, chunk_payload)
+                                                    .with_request_id(&request_id);
+                                                if let Err(e) = response_tx.send((identity.clone(), response)).await {
+                                                    error!("Failed to send rerun code mode result: {}", e);
+                                                }
+                                            }
+
+                                            let cm_tool_calls: Vec<crate::agent::code_mode::ToolCallResult> =
+                                                code_result.tool_results;
+                                            (format_code_mode_result(display_text, &summary), cm_tool_calls)
+                                        }
+                                        None => {
+                                            (raw_text.to_string(), vec![])
+                                        }
+                                    };
 
                                 if !final_text.is_empty() {
                                     if let Err(e) = session_manager

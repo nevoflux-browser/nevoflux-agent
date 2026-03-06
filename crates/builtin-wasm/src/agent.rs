@@ -1318,7 +1318,16 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
     /// Execute a single tool call.
     fn execute_tool(&self, tool_call: &ToolCall) -> HostResult<ToolResult> {
-        let content = match tool_call.name.as_str() {
+        // Normalize PascalCase tool names from Claude Code conventions to snake_case.
+        // e.g. "ToolSearch" → "tool_search", "WebSearch" → "web_search"
+        let normalized_name = match tool_call.name.as_str() {
+            "ToolSearch" => "tool_search",
+            "WebSearch" => "web_search",
+            "WebFetch" => "web_fetch",
+            "Skill" => "skill_load",
+            other => other,
+        };
+        let content = match normalized_name {
             "think" => {
                 // Think tool: no side effects, just returns acknowledgment.
                 // The thought content is recorded in trace via the tool_call arguments.
@@ -1992,6 +2001,11 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 | "web_search"
                 | "web_fetch"
                 | "ask_user"
+                // PascalCase aliases (Claude Code conventions)
+                | "ToolSearch"
+                | "WebSearch"
+                | "WebFetch"
+                | "Skill"
                 | "read"
                 | "write"
                 | "edit"
