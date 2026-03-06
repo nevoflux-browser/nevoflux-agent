@@ -67,6 +67,7 @@ impl RepairPrompt {
         error_type: &str,
         error_message: &str,
         line: Option<usize>,
+        available_tools: &[String],
     ) -> String {
         let mut prompt = String::new();
 
@@ -84,6 +85,12 @@ impl RepairPrompt {
             None => {
                 prompt.push_str(&format!("Error: {}: {}\n", error_type, error_message));
             }
+        }
+
+        if !available_tools.is_empty() {
+            prompt.push_str("\nAvailable pre-injected tool functions (ONLY these exist, do NOT call any other functions as tools): ");
+            prompt.push_str(&available_tools.join(", "));
+            prompt.push_str(".\nIf your code calls a function that is not in this list, replace it with equivalent logic using the available functions.\n");
         }
 
         prompt.push('\n');
@@ -122,6 +129,7 @@ mod tests {
             "ZeroDivisionError",
             "division by zero",
             Some(1),
+            &[],
         );
         assert!(prompt.contains("x = 1 / 0"));
         assert!(prompt.contains("ZeroDivisionError"));
@@ -131,15 +139,19 @@ mod tests {
 
     #[test]
     fn test_runtime_error_no_line() {
+        let tools = vec!["read_file".to_string(), "browser_get_markdown".to_string()];
         let prompt = RepairPrompt::from_runtime_error(
             "x = foo()",
             "NameError",
             "name 'foo' is not defined",
             None,
+            &tools,
         );
         assert!(prompt.contains("NameError"));
         assert!(prompt.contains("name 'foo' is not defined"));
         assert!(!prompt.contains("at line"));
+        assert!(prompt.contains("read_file, browser_get_markdown"));
+        assert!(prompt.contains("ONLY these exist"));
     }
 
     #[test]

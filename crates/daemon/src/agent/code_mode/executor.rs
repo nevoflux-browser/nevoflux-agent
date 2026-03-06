@@ -286,6 +286,7 @@ impl CodeModeExecutor {
                             &error_type,
                             &error_msg,
                             line,
+                            external_function_names,
                         );
                         tracing::info!("Code Mode: requesting LLM rewrite for parse error");
                         match llm_rewrite(&repair_prompt).await {
@@ -332,6 +333,7 @@ impl CodeModeExecutor {
                             &error_type,
                             &error_msg,
                             line,
+                            external_function_names,
                         );
                         match llm_rewrite(&repair_prompt).await {
                             Ok(rewritten) => {
@@ -415,6 +417,7 @@ impl CodeModeExecutor {
                                         &error_type,
                                         &error_msg,
                                         line,
+                                        external_function_names,
                                     );
                                     match llm_rewrite(&repair_prompt).await {
                                         Ok(rewritten) => {
