@@ -1316,17 +1316,21 @@ The following skill instructions MUST be followed exactly. These instructions ta
         })
     }
 
-    /// Execute a single tool call.
-    fn execute_tool(&self, tool_call: &ToolCall) -> HostResult<ToolResult> {
-        // Normalize PascalCase tool names from Claude Code conventions to snake_case.
-        // e.g. "ToolSearch" → "tool_search", "WebSearch" → "web_search"
-        let normalized_name = match tool_call.name.as_str() {
+    /// Normalize PascalCase tool names from Claude Code conventions to snake_case.
+    /// e.g. "ToolSearch" → "tool_search", "WebSearch" → "web_search"
+    fn normalize_tool_name(name: &str) -> &str {
+        match name {
             "ToolSearch" => "tool_search",
             "WebSearch" => "web_search",
             "WebFetch" => "web_fetch",
             "Skill" => "skill_load",
-            other => other,
-        };
+            _ => name,
+        }
+    }
+
+    /// Execute a single tool call.
+    fn execute_tool(&self, tool_call: &ToolCall) -> HostResult<ToolResult> {
+        let normalized_name = Self::normalize_tool_name(&tool_call.name);
         let content = match normalized_name {
             "think" => {
                 // Think tool: no side effects, just returns acknowledgment.
@@ -1992,6 +1996,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
     /// Check if a tool name is handled by execute_tool (not an MCP tool).
     fn is_builtin_tool(&self, name: &str) -> bool {
+        let name = Self::normalize_tool_name(name);
         matches!(
             name,
             "think"
@@ -2001,11 +2006,6 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 | "web_search"
                 | "web_fetch"
                 | "ask_user"
-                // PascalCase aliases (Claude Code conventions)
-                | "ToolSearch"
-                | "WebSearch"
-                | "WebFetch"
-                | "Skill"
                 | "read"
                 | "write"
                 | "edit"

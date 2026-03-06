@@ -2271,13 +2271,11 @@ async fn handle_chat_message_streaming(
                                                     // Buffer text, check for code fence
                                                     buffer.push_str(&chunk.text);
                                                     if !code_fence_detected {
-                                                        // Check accumulated + buffer for fence
-                                                        let check_text = format!("{}{}", &rerun_accumulated, &buffer);
-                                                        if let Some(rel) = check_text[sent_bytes..].find(crate::agent::runner::PYTHON_EXEC_FENCE) {
+                                                        // Merge buffer into accumulated, then search directly (avoids O(n²) temp allocations)
+                                                        rerun_accumulated.push_str(&std::mem::take(&mut buffer));
+                                                        if let Some(rel) = rerun_accumulated[sent_bytes..].find(crate::agent::runner::PYTHON_EXEC_FENCE) {
                                                             code_fence_detected = true;
                                                             let sendable_end = sent_bytes + rel;
-                                                            // Flush text before the fence
-                                                            rerun_accumulated.push_str(&std::mem::take(&mut buffer));
                                                             if sendable_end > sent_bytes {
                                                                 let to_send = rerun_accumulated[sent_bytes..sendable_end].trim_end().to_string();
                                                                 if !to_send.is_empty() {
@@ -2344,14 +2342,13 @@ async fn handle_chat_message_streaming(
                                 .await;
 
                         // Wait for forwarder
-                        let (rerun_text, rerun_code_fence) = match rerun_forwarder.await {
+                        let (rerun_text, _rerun_code_fence) = match rerun_forwarder.await {
                             Ok(result) => result,
                             Err(e) => {
                                 error!("Rerun forwarder failed: {}", e);
                                 (String::new(), false)
                             }
                         };
-                        let _ = rerun_code_fence;
 
                         // Handle rerun result
                         match rerun_result {
@@ -2370,63 +2367,12 @@ async fn handle_chat_message_streaming(
                                         browser_context(&services, &proxy_id, &identity),
                                     ).await {
                                         Some(code_result) => {
-                                            let mut summary = String::new();
-                                            if code_result.success {
-                                                if !code_result.output.is_empty() {
-                                                    summary.push_str(&code_result.output);
-                                                }
-                                                for tr in &code_result.tool_results {
-                                                    if tr.tool_name == "canvas_render" {
-                                                        if let Ok(artifact_data) =
-                                                            serde_json::from_str::<serde_json::Value>(
-                                                                tr.result.as_str().unwrap_or(""),
-                                                            )
-                                                            .or_else(|_| Ok::<_, serde_json::Error>(tr.result.clone()))
-                                                        {
-                                                            if artifact_data
-                                                                .get("success")
-                                                                .and_then(|s| s.as_bool())
-                                                                .unwrap_or(false)
-                                                            {
-                                                                let artifact = nevoflux_protocol::Artifact {
-                                                                    id: artifact_data
-                                                                        .get("artifact_id")
-                                                                        .and_then(|a| a.as_str())
-                                                                        .unwrap_or("unknown")
-                                                                        .to_string(),
-                                                                    title: artifact_data
-                                                                        .get("title")
-                                                                        .and_then(|t| t.as_str())
-                                                                        .unwrap_or("Generated App")
-                                                                        .to_string(),
-                                                                    content_type: "application/project+json"
-                                                                        .to_string(),
-                                                                    description: None,
-                                                                    content: serde_json::to_string(&artifact_data)
-                                                                        .unwrap_or_default(),
-                                                                    files: None,
-                                                                    entry: None,
-                                                                };
-                                                                send_artifact_stream(
-                                                                    &artifact,
-                                                                    &session_id,
-                                                                    session_manager,
-                                                                    &proxy_id,
-                                                                    channel,
-                                                                    &request_id,
-                                                                    &identity,
-                                                                    &response_tx,
-                                                                )
-                                                                .await;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            } else if let Some(err) = &code_result.error {
-                                                summary = format!("Code execution failed: {}", err);
-                                            }
-
-                                            let display_text = crate::agent::runner::strip_python_exec_block(raw_text);
+                                            let (final_text, summary, tool_results) =
+                                                process_code_mode_result(
+                                                    raw_text, code_result,
+                                                    &session_id, session_manager, &proxy_id, channel,
+                                                    &request_id, &identity, &response_tx,
+                                                ).await;
                                             if !summary.is_empty() {
                                                 let chunk_payload = serde_json::json!({
                                                     "type": "stream_chunk",
@@ -2442,10 +2388,7 @@ async fn handle_chat_message_streaming(
                                                     error!("Failed to send rerun code mode result: {}", e);
                                                 }
                                             }
-
-                                            let cm_tool_calls: Vec<crate::agent::code_mode::ToolCallResult> =
-                                                code_result.tool_results;
-                                            (format_code_mode_result(display_text, &summary), cm_tool_calls)
+                                            (final_text, tool_results)
                                         }
                                         None => {
                                             (raw_text.to_string(), vec![])
@@ -2588,66 +2531,12 @@ async fn handle_chat_message_streaming(
                     browser_context(&services, &proxy_id, &identity),
                 ).await {
                     Some(code_result) => {
-                        let mut summary = String::new();
-
-                        if code_result.success {
-                            if !code_result.output.is_empty() {
-                                summary.push_str(&code_result.output);
-                            }
-                            for tr in &code_result.tool_results {
-                                if tr.tool_name == "canvas_render" {
-                                    if let Ok(artifact_data) =
-                                        serde_json::from_str::<serde_json::Value>(
-                                            tr.result.as_str().unwrap_or(""),
-                                        )
-                                        .or_else(|_| Ok::<_, serde_json::Error>(tr.result.clone()))
-                                    {
-                                        if artifact_data
-                                            .get("success")
-                                            .and_then(|s| s.as_bool())
-                                            .unwrap_or(false)
-                                        {
-                                            let artifact = nevoflux_protocol::Artifact {
-                                                id: artifact_data
-                                                    .get("artifact_id")
-                                                    .and_then(|a| a.as_str())
-                                                    .unwrap_or("unknown")
-                                                    .to_string(),
-                                                title: artifact_data
-                                                    .get("title")
-                                                    .and_then(|t| t.as_str())
-                                                    .unwrap_or("Generated App")
-                                                    .to_string(),
-                                                content_type: "application/project+json"
-                                                    .to_string(),
-                                                description: None,
-                                                content: serde_json::to_string(&artifact_data)
-                                                    .unwrap_or_default(),
-                                                files: None,
-                                                entry: None,
-                                            };
-                                            send_artifact_stream(
-                                                &artifact,
-                                                &session_id,
-                                                session_manager,
-                                                &proxy_id,
-                                                channel,
-                                                &request_id,
-                                                &identity,
-                                                &response_tx,
-                                            )
-                                            .await;
-                                        }
-                                    }
-                                }
-                            }
-                        } else if let Some(err) = &code_result.error {
-                            summary = format!("Code execution failed: {}", err);
-                        }
-
-                        // Strip the ```python-exec block from the text shown to the user.
-                        // The code was executed — the user should see the result, not the raw code.
-                        let display_text = crate::agent::runner::strip_python_exec_block(raw_text);
+                        let (final_text, summary, tool_results) =
+                            process_code_mode_result(
+                                raw_text, code_result,
+                                &session_id, session_manager, &proxy_id, channel,
+                                &request_id, &identity, &response_tx,
+                            ).await;
 
                         // Send the Code Mode result to sidebar.
                         // The forwarder already suppressed the code block from streaming,
@@ -2683,13 +2572,7 @@ async fn handle_chat_message_streaming(
                             }
                         }
 
-                        // Save clean text (without code block) + result to DB
-                        let final_text = format_code_mode_result(display_text, &summary);
-
-                        let cm_tool_calls: Vec<crate::agent::code_mode::ToolCallResult> =
-                            code_result.tool_results;
-
-                        (final_text, cm_tool_calls)
+                        (final_text, tool_results)
                     }
                     None => {
                         // No python-exec block found by Code Mode.
@@ -2966,6 +2849,80 @@ async fn send_artifact_stream(
 }
 
 /// Format Code Mode display text + execution summary for DB storage.
+/// Process a `CodeModeResult`: build summary, extract canvas_render artifacts, return display text.
+///
+/// Returns `(display_text, summary, tool_call_results)` where `display_text` has the python-exec
+/// block stripped and `summary` contains execution output or error message.
+async fn process_code_mode_result(
+    raw_text: &str,
+    code_result: crate::agent::code_mode::CodeModeResult,
+    session_id: &str,
+    session_manager: &Arc<SessionManager>,
+    proxy_id: &str,
+    channel: Channel,
+    request_id: &str,
+    identity: &[u8],
+    response_tx: &mpsc::Sender<(Vec<u8>, DaemonEnvelope)>,
+) -> (String, String, Vec<crate::agent::code_mode::ToolCallResult>) {
+    let mut summary = String::new();
+
+    if code_result.success {
+        if !code_result.output.is_empty() {
+            summary.push_str(&code_result.output);
+        }
+        for tr in &code_result.tool_results {
+            if tr.tool_name == "canvas_render" {
+                if let Ok(artifact_data) = serde_json::from_str::<serde_json::Value>(
+                    tr.result.as_str().unwrap_or(""),
+                )
+                .or_else(|_| Ok::<_, serde_json::Error>(tr.result.clone()))
+                {
+                    if artifact_data
+                        .get("success")
+                        .and_then(|s| s.as_bool())
+                        .unwrap_or(false)
+                    {
+                        let artifact = nevoflux_protocol::Artifact {
+                            id: artifact_data
+                                .get("artifact_id")
+                                .and_then(|a| a.as_str())
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            title: artifact_data
+                                .get("title")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("Generated App")
+                                .to_string(),
+                            content_type: "application/project+json".to_string(),
+                            description: None,
+                            content: serde_json::to_string(&artifact_data).unwrap_or_default(),
+                            files: None,
+                            entry: None,
+                        };
+                        send_artifact_stream(
+                            &artifact,
+                            session_id,
+                            session_manager,
+                            proxy_id,
+                            channel,
+                            request_id,
+                            identity,
+                            response_tx,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    } else if let Some(err) = &code_result.error {
+        summary = format!("Code execution failed: {}", err);
+    }
+
+    let display_text = crate::agent::runner::strip_python_exec_block(raw_text);
+    let final_text = format_code_mode_result(display_text, &summary);
+    (final_text, summary, code_result.tool_results)
+}
+
 fn format_code_mode_result(display_text: String, summary: &str) -> String {
     if summary.is_empty() {
         display_text
