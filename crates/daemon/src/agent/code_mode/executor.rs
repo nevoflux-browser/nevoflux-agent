@@ -662,6 +662,74 @@ pub fn execute_python_simple(
     })
 }
 
+/// Execute Python code with LLM-powered error recovery.
+///
+/// Like [`execute_python_simple`], but uses a real LLM call to rewrite code
+/// when the linter finds violations or the runtime encounters errors.
+/// The LLM receives a repair prompt and returns corrected Python code.
+///
+/// # Arguments
+/// * `code` - Raw Python code from the LLM
+/// * `browser_ctx` - Optional browser context for browser/web tool access
+/// * `provider` - LLM provider type (Anthropic, OpenAI, etc.)
+/// * `api_key` - API key for the provider
+/// * `model` - Model name to use for the rewrite call
+pub fn execute_python_with_llm(
+    code: &str,
+    browser_ctx: Option<BrowserContext>,
+    provider: nevoflux_llm::ProviderType,
+    api_key: String,
+    model: String,
+) -> CodeModeResult {
+    let runtime = tokio::runtime::Handle::current();
+    let (external_names, tool_executor) =
+        build_registry_and_executor(browser_ctx, HashMap::new());
+    let executor = CodeModeExecutor::new();
+
+    let llm_rewrite = move |prompt: &str| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+        let prompt = prompt.to_string();
+        let api_key = api_key.clone();
+        let model = model.clone();
+        Box::pin(async move {
+            let request = crate::wasm::llm::LlmChatRequest {
+                messages: vec![crate::wasm::llm::LlmMessage::user(&prompt)],
+                system: Some(
+                    "You are a Python code repair assistant. \
+                     Fix the code according to the error description. \
+                     Return ONLY the corrected Python code inside a ```python fence. \
+                     Do not include any explanation outside the fence."
+                        .to_string(),
+                ),
+                temperature: Some(0.0),
+                max_tokens: Some(4096),
+                tools: None,
+            };
+
+            let response = crate::wasm::llm::execute_llm_chat(provider, &api_key, &model, request)
+                .await
+                .map_err(|e| format!("LLM rewrite call failed: {e}"))?;
+
+            // Extract Python code from the response (handles ```python, ```py, ``` fences)
+            let text = response.content;
+            if let Some(code) = crate::agent::runner::extract_any_python_block(&text) {
+                Ok(code)
+            } else {
+                // If no fence found, use the raw response as code
+                // (the LLM may have returned bare code without fences)
+                Ok(text)
+            }
+        })
+    };
+
+    tokio::task::block_in_place(|| {
+        runtime.block_on(async {
+            executor
+                .execute(code, &external_names, tool_executor, llm_rewrite)
+                .await
+        })
+    })
+}
+
 /// Convert positional args to named args using auto-generated parameter mapping.
 /// If args is already an object, pass through unchanged.
 fn positional_to_named_auto(param_names: &[String], args: &serde_json::Value) -> serde_json::Value {

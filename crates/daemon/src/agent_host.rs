@@ -1312,7 +1312,7 @@ impl HostFunctions for DaemonHostFunctions {
 
         // 3. Mark as hot immediately
         let hot_summary = if summary.len() > 120 {
-            format!("{}...", &summary[..117])
+            format!("{}...", &summary[..summary.floor_char_boundary(117)])
         } else {
             summary.to_string()
         };
@@ -1564,7 +1564,7 @@ impl HostFunctions for DaemonHostFunctions {
                 .iter()
                 .map(|line| {
                     if line.len() > 2000 {
-                        format!("{}\u{2026}[truncated]", &line[..2000])
+                        format!("{}\u{2026}[truncated]", &line[..line.floor_char_boundary(2000)])
                     } else {
                         line.to_string()
                     }
@@ -2356,31 +2356,62 @@ impl HostFunctions for DaemonHostFunctions {
             tool_name, arguments
         );
 
-        // Intercept "python-exec" early (before MCP services check):
-        // LLM sometimes calls tool_call_dynamic with tool_name="python-exec"
-        // instead of writing ```python-exec code blocks.
-        // Execute via the Monty interpreter (same engine as Code Mode).
-        if tool_name == "python-exec" {
+        // Intercept "orchestrate" (sandboxed Python script for multi-tool orchestration).
+        // Execute via the Monty interpreter with LLM-powered error recovery when possible.
+        if tool_name == "orchestrate" {
             let code = arguments.get("code").and_then(|v| v.as_str()).unwrap_or("");
             if code.is_empty() {
                 return Err(HostError {
                     code: 100,
-                    message: "python-exec: no code provided".into(),
+                    message: "orchestrate: no code provided".into(),
                 });
             }
             debug!(
-                "tool_call_dynamic: intercepting python-exec via Monty, code_len={}",
+                "tool_call_dynamic: orchestrate via Monty, code_len={}",
                 code.len()
             );
             let browser_ctx = self.services.as_ref().and_then(|s| s.browser_context());
-            let result = crate::agent::code_mode::execute_python_simple(code, browser_ctx);
+
+            // Try to resolve LLM provider for error recovery rewrites.
+            // Falls back to no-op rewrite if LLM is not available.
+            let result = match self.resolve_provider_and_model() {
+                Ok((provider_name, api_key, model)) => {
+                    match ProviderType::from_str(&provider_name) {
+                        Ok(provider) => {
+                            debug!(
+                                "orchestrate: LLM rewrite enabled (provider={}, model={})",
+                                provider_name, model
+                            );
+                            crate::agent::code_mode::execute_python_with_llm(
+                                code,
+                                browser_ctx,
+                                provider,
+                                api_key,
+                                model,
+                            )
+                        }
+                        Err(_) => {
+                            debug!(
+                                "orchestrate: invalid provider '{}', falling back to no-op rewrite",
+                                provider_name
+                            );
+                            crate::agent::code_mode::execute_python_simple(code, browser_ctx)
+                        }
+                    }
+                }
+                Err(_) => {
+                    debug!("orchestrate: no LLM provider available, using no-op rewrite");
+                    crate::agent::code_mode::execute_python_simple(code, browser_ctx)
+                }
+            };
+
             if result.success {
                 return Ok(result.output);
             } else {
                 return Err(HostError {
                     code: 100,
                     message: format!(
-                        "python-exec failed: {}",
+                        "orchestrate failed: {}",
                         result.error.unwrap_or_else(|| "unknown error".into())
                     ),
                 });
@@ -3486,7 +3517,7 @@ impl DaemonHostFunctions {
 
         // Truncate content if too long (keep first 50000 chars to leave room for response)
         let truncated_content = if content.len() > 50000 {
-            format!("{}...\n\n[Content truncated]", &content[..50000])
+            format!("{}...\n\n[Content truncated]", &content[..content.floor_char_boundary(50000)])
         } else {
             content.to_string()
         };
@@ -3643,7 +3674,7 @@ impl DaemonHostFunctions {
                                 response.result.as_ref().map(|v| {
                                     let s = v.to_string();
                                     if s.len() > 200 {
-                                        format!("{}...({}B)", &s[..200], s.len())
+                                        format!("{}...({}B)", &s[..s.floor_char_boundary(200)], s.len())
                                     } else {
                                         s
                                     }

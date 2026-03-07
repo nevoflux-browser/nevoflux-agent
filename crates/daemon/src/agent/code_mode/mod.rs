@@ -12,4 +12,7 @@ pub mod linter;
 pub mod repair_prompt;
 pub mod signature;
 
-pub use executor::{execute_python_simple, CodeModeExecutor, CodeModeResult, ToolCallResult};
+pub use executor::{
+    execute_python_simple, execute_python_with_llm, CodeModeExecutor, CodeModeResult,
+    ToolCallResult,
+};
