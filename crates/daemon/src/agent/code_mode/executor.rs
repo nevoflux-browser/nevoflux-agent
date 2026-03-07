@@ -6,7 +6,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use monty::{
-    CollectStringPrint, LimitedTracker, MontyObject, MontyRun, ResourceLimits, RunProgress,
+    LimitedTracker, MontyObject, MontyRun, PrintWriter, ResourceLimits, RunProgress,
 };
 
 use super::auto_fixer::MontyAutoFixer;
@@ -166,12 +166,21 @@ fn json_to_monty_object(val: &serde_json::Value) -> MontyObject {
         serde_json::Value::Array(arr) => {
             MontyObject::List(arr.iter().map(json_to_monty_object).collect())
         }
-        serde_json::Value::Object(_) => {
-            // Serialize the object as a JSON string for simplicity,
-            // since MontyObject::Dict requires DictPairs which is complex
-            // to construct from the public API.
-            MontyObject::String(serde_json::to_string(val).unwrap_or_default())
+        serde_json::Value::Object(map) => {
+            let pairs: Vec<(MontyObject, MontyObject)> = map
+                .iter()
+                .map(|(k, v)| (MontyObject::String(k.clone()), json_to_monty_object(v)))
+                .collect();
+            MontyObject::dict(pairs)
         }
+    }
+}
+
+/// Extract collected output from a `PrintWriter::Collect`, returning an empty string for other variants.
+fn collect_output(print_writer: PrintWriter<'_>) -> String {
+    match print_writer {
+        PrintWriter::Collect(s) => s,
+        _ => String::new(),
     }
 }
 
@@ -275,7 +284,7 @@ impl CodeModeExecutor {
                         MAX_RETRIES,
                         error_type,
                         error_msg,
-                        &auto_fixed[..auto_fixed.len().min(200)]
+                        &auto_fixed[..auto_fixed.floor_char_boundary(200)]
                     );
 
                     if retries < MAX_RETRIES {
@@ -315,7 +324,7 @@ impl CodeModeExecutor {
             };
 
             let resource_tracker = LimitedTracker::new(default_resource_limits());
-            let mut print_writer = CollectStringPrint::new();
+            let mut print_writer = PrintWriter::Collect(String::new());
             let mut tool_results: Vec<ToolCallResult> = Vec::new();
 
             let start_result = runner.start(vec![], resource_tracker, &mut print_writer);
@@ -343,7 +352,7 @@ impl CodeModeExecutor {
                             }
                             Err(e) => {
                                 return CodeModeResult::fail_with_output(
-                                    print_writer.into_output(),
+                                    collect_output(print_writer),
                                     format!("Runtime error and LLM rewrite failed: {error_type}: {error_msg} (rewrite error: {e})"),
                                 )
                                 .with_tool_results(tool_results)
@@ -353,7 +362,7 @@ impl CodeModeExecutor {
                     }
 
                     return CodeModeResult::fail_with_output(
-                        print_writer.into_output(),
+                        collect_output(print_writer),
                         format!("{error_type}: {error_msg}"),
                     )
                     .with_tool_results(tool_results)
@@ -369,6 +378,7 @@ impl CodeModeExecutor {
                         args,
                         kwargs: _,
                         call_id: _,
+                        method_call: _,
                         state,
                     } => {
                         // Convert args to JSON
@@ -427,7 +437,7 @@ impl CodeModeExecutor {
                                         }
                                         Err(e) => {
                                             return CodeModeResult::fail_with_output(
-                                                print_writer.into_output(),
+                                                collect_output(print_writer),
                                                 format!("Runtime error after tool call and LLM rewrite failed: {error_type}: {error_msg} (rewrite error: {e})"),
                                             )
                                             .with_tool_results(tool_results)
@@ -437,7 +447,7 @@ impl CodeModeExecutor {
                                 }
 
                                 return CodeModeResult::fail_with_output(
-                                    print_writer.into_output(),
+                                    collect_output(print_writer),
                                     format!("{error_type}: {error_msg}"),
                                 )
                                 .with_tool_results(tool_results)
@@ -446,13 +456,13 @@ impl CodeModeExecutor {
                         }
                     }
                     RunProgress::Complete(_value) => {
-                        return CodeModeResult::success(print_writer.into_output())
+                        return CodeModeResult::success(collect_output(print_writer))
                             .with_tool_results(tool_results)
                             .with_retries(retries);
                     }
                     RunProgress::OsCall { .. } => {
                         return CodeModeResult::fail_with_output(
-                            print_writer.into_output(),
+                            collect_output(print_writer),
                             "OS calls are not permitted in sandboxed execution",
                         )
                         .with_tool_results(tool_results)
@@ -460,7 +470,7 @@ impl CodeModeExecutor {
                     }
                     RunProgress::ResolveFutures(_) => {
                         return CodeModeResult::fail_with_output(
-                            print_writer.into_output(),
+                            collect_output(print_writer),
                             "Async futures are not supported in Code Mode",
                         )
                         .with_tool_results(tool_results)
@@ -475,16 +485,10 @@ impl CodeModeExecutor {
 }
 
 use crate::agent::tools::ToolRegistry;
-use crate::wasm::llm::{execute_llm_chat, LlmChatRequest, LlmMessage};
 use crate::wasm::services::BrowserContext;
-use nevoflux_llm::ProviderType;
-use std::str::FromStr;
 use std::sync::Arc;
 
-/// Create a shared ToolRegistry and tool executor callback.
-///
-/// Deduplicates the registry+executor setup shared by `execute_python_simple`
-/// and `execute_code_mode`.
+/// Create a shared ToolRegistry and tool executor callback for `execute_python_simple`.
 fn build_registry_and_executor(
     browser_ctx: Option<BrowserContext>,
 ) -> (
@@ -536,8 +540,7 @@ fn build_registry_and_executor(
 /// Execute Python code through Monty with optional tool support.
 ///
 /// When `browser_ctx` is provided, browser and web tools are available.
-/// This is the entry point for when LLMs call `python-exec` as a tool
-/// instead of writing ```python-exec code blocks.
+/// This is the entry point for the `orchestrate` tool call.
 ///
 /// Delegates to `CodeModeExecutor::execute()` with a no-op LLM rewrite callback.
 pub fn execute_python_simple(
@@ -550,7 +553,7 @@ pub fn execute_python_simple(
 
     let llm_rewrite =
         |_prompt: &str| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
-            Box::pin(async { Err("No LLM retry in python-exec tool mode".to_string()) })
+            Box::pin(async { Err("No LLM retry in orchestrate tool mode".to_string()) })
         };
 
     tokio::task::block_in_place(|| {
@@ -560,90 +563,6 @@ pub fn execute_python_simple(
                 .await
         })
     })
-}
-
-// ============================================================================
-// Integration function: wires CodeModeExecutor into the daemon response path
-// ============================================================================
-
-/// Execute Code Mode: extract Python from text, run through 4-layer pipeline.
-///
-/// When `browser_ctx` is provided, browser tools (browser_get_markdown, etc.)
-/// and web tools (web_search, fetch_page) are available to the Python code.
-///
-/// Returns `Some(CodeModeResult)` if a Python block was found and executed,
-/// or `None` if no Python block was found in the text.
-pub async fn execute_code_mode(
-    text: &str,
-    config: &crate::config::AgentConfig,
-    browser_ctx: Option<BrowserContext>,
-) -> Option<CodeModeResult> {
-    // Extract Python block from LLM response
-    let python_code = crate::agent::runner::extract_python_block(text)?;
-    tracing::info!(
-        "Code Mode: extracted python block ({} bytes), first 200 chars: {:?}",
-        python_code.len(),
-        &python_code[..python_code.len().min(200)]
-    );
-
-    let (external_names, tool_executor) = build_registry_and_executor(browser_ctx);
-    let executor = CodeModeExecutor::new();
-
-    // LLM rewrite callback: sends repair prompt to the LLM
-    let provider_name = config
-        .llm
-        .active_provider()
-        .unwrap_or("anthropic")
-        .to_string();
-    let api_key = config.llm.active_api_key().unwrap_or("").to_string();
-    let model = config
-        .llm
-        .active_model()
-        .unwrap_or("gpt-4o-mini")
-        .to_string();
-
-    let llm_rewrite =
-        move |prompt: &str| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
-            let prompt = prompt.to_string();
-            let provider_name = provider_name.clone();
-            let api_key = api_key.clone();
-            let model = model.clone();
-            Box::pin(async move {
-                if api_key.is_empty() {
-                    return Err("No API key configured for LLM rewrite".to_string());
-                }
-                let provider = ProviderType::from_str(&provider_name)
-                    .map_err(|_| format!("Invalid provider: {provider_name}"))?;
-                let request = LlmChatRequest {
-                    messages: vec![LlmMessage::user(&prompt)],
-                    system: None,
-                    temperature: Some(0.0),
-                    max_tokens: Some(4096),
-                    tools: None,
-                };
-                let response = execute_llm_chat(provider, &api_key, &model, request)
-                    .await
-                    .map_err(|e| format!("LLM rewrite failed: {e}"))?;
-                // Extract Python code from the rewrite response, or use raw content.
-                // Use extract_any_python_block to handle ```python, ```py, etc.
-                // (LLMs often wrap rewrites in ```python instead of ```python-exec)
-                let code = crate::agent::runner::extract_any_python_block(&response.content)
-                    .unwrap_or(response.content);
-                Ok(code)
-            })
-        };
-
-    let result = executor
-        .execute(&python_code, &external_names, tool_executor, llm_rewrite)
-        .await;
-    tracing::info!(
-        "Code Mode: execution complete. success={}, retries={}, output_len={}, error={:?}",
-        result.success,
-        result.retries,
-        result.output.len(),
-        result.error
-    );
-    Some(result)
 }
 
 /// Convert positional args (JSON array from Monty) to named args (JSON object for ToolRegistry).
@@ -668,9 +587,28 @@ fn positional_to_named(tool_name: &str, args: &serde_json::Value) -> serde_json:
         "browser_snapshot" => &["tab_id"],
         "browser_click_by_id" => &["element_id", "tab_id"],
         "browser_type_by_id" => &["element_id", "text", "tab_id"],
+        "browser_fill_by_id" => &["element_id", "value", "tab_id"],
         "browser_navigate" => &["url", "tab_id"],
+        "browser_go_back" => &["tab_id"],
+        "browser_go_forward" => &["tab_id"],
         "browser_scroll" => &["direction", "amount", "tab_id"],
         "browser_get_tabs" => &[],
+        "browser_query_tabs" => &["url", "title", "active"],
+        "browser_get_elements" => &["tab_id"],
+        "browser_click" => &["selector", "tab_id"],
+        "browser_type" => &["selector", "text", "tab_id"],
+        "browser_fill" => &["selector", "value", "tab_id"],
+        "browser_get_content" => &["tab_id"],
+        "browser_screenshot" => &["tab_id"],
+        "browser_eval_js" => &["expression", "tab_id"],
+        "browser_wait_for" => &["selector", "timeout_ms", "tab_id"],
+        "browser_wait_for_stable" => &["strategy", "max_wait", "tab_id"],
+        "browser_key_press" => &["key", "modifiers", "tab_id"],
+        "browser_get_element" => &["selector", "tab_id"],
+        "browser_query_all" => &["selector", "tab_id"],
+        "browser_read_artifact" => &["id", "offset", "limit", "grep"],
+        "browser_edit_artifact" => &["id", "old_str", "new_str"],
+        "browser_ask_user" => &["question", "options", "allow_custom"],
         _ => &[],
     };
     let mut obj = serde_json::Map::new();
@@ -749,6 +687,38 @@ mod tests {
         match json_to_monty_object(&serde_json::json!(3.14)) {
             MontyObject::Float(f) => assert!((f - 3.14).abs() < f64::EPSILON),
             other => panic!("Expected Float, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_json_to_monty_object_dict() {
+        let json = serde_json::json!({"name": "test", "value": 42});
+        let obj = json_to_monty_object(&json);
+        // Should convert to Dict, not String
+        match &obj {
+            MontyObject::Dict(_) => {}
+            other => panic!("Expected Dict, got {:?}", other),
+        }
+        // Round-trip: Dict → JSON → verify keys
+        let back = monty_object_to_json(&obj);
+        assert_eq!(back.get("name").unwrap(), "test");
+        assert_eq!(back.get("value").unwrap(), 42);
+    }
+
+    #[test]
+    fn test_json_to_monty_object_nested_dict() {
+        let json = serde_json::json!([{"id": "e1", "tag": "a"}, {"id": "e2", "tag": "div"}]);
+        let obj = json_to_monty_object(&json);
+        // Should be a list of dicts
+        match &obj {
+            MontyObject::List(items) => {
+                assert_eq!(items.len(), 2);
+                match &items[0] {
+                    MontyObject::Dict(_) => {}
+                    other => panic!("Expected Dict element, got {:?}", other),
+                }
+            }
+            other => panic!("Expected List, got {:?}", other),
         }
     }
 

@@ -95,7 +95,7 @@ hex = "0.4"
 rfd = "0.15"
 
 # Code Mode - Python interpreter for agent code execution
-monty = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.4" }
+monty = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.7" }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }

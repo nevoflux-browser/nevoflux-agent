@@ -3128,12 +3128,13 @@ dependencies = [
 
 [[package]]
 name = "monty"
-version = "0.0.4"
-source = "git+https://github.com/pydantic/monty.git?tag=v0.0.4#6c277bcf2c530bfc449174c9b14213a5f88add26"
+version = "0.0.7"
+source = "git+https://github.com/pydantic/monty.git?tag=v0.0.7#24dad053ac36cef25951370001c57a5c5bc5a64d"
 dependencies = [
  "ahash",
  "hashbrown 0.16.1",
  "indexmap",
+ "itertools 0.14.0",
  "num-bigint",
  "num-integer",
  "num-traits",
@@ -3190,7 +3191,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -3218,7 +3219,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-bridge"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "directories",
@@ -3237,7 +3238,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-builtin-wasm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "nevoflux-protocol",
  "rmp-serde",
@@ -3247,7 +3248,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-computer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3267,7 +3268,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-daemon"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -3318,7 +3319,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-llm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "dirs 5.0.1",
@@ -3337,7 +3338,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -3353,7 +3354,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-protocol"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "proptest",
  "rmp-serde",
@@ -3365,7 +3366,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-skills"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "directories",
@@ -3381,7 +3382,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-storage"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "nevoflux-protocol",
  "proptest",
@@ -3394,7 +3395,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-testing"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "nevoflux-daemon",
@@ -4732,7 +4733,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_ast"
 version = "0.0.0"
-source = "git+https://github.com/astral-sh/ruff.git?branch=main#a2f11d239f91cf8daedb0764ec15fcfe29c5ae6d"
+source = "git+https://github.com/astral-sh/ruff.git?rev=6ded4bed1651e30b34dd04cdaa50c763036abb0d#6ded4bed1651e30b34dd04cdaa50c763036abb0d"
 dependencies = [
  "aho-corasick",
  "bitflags 2.10.0",
@@ -4750,7 +4751,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_parser"
 version = "0.0.0"
-source = "git+https://github.com/astral-sh/ruff.git?branch=main#a2f11d239f91cf8daedb0764ec15fcfe29c5ae6d"
+source = "git+https://github.com/astral-sh/ruff.git?rev=6ded4bed1651e30b34dd04cdaa50c763036abb0d#6ded4bed1651e30b34dd04cdaa50c763036abb0d"
 dependencies = [
  "bitflags 2.10.0",
  "bstr",
@@ -4770,7 +4771,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_trivia"
 version = "0.0.0"
-source = "git+https://github.com/astral-sh/ruff.git?branch=main#a2f11d239f91cf8daedb0764ec15fcfe29c5ae6d"
+source = "git+https://github.com/astral-sh/ruff.git?rev=6ded4bed1651e30b34dd04cdaa50c763036abb0d#6ded4bed1651e30b34dd04cdaa50c763036abb0d"
 dependencies = [
  "itertools 0.14.0",
  "ruff_source_file",
@@ -4781,7 +4782,7 @@ dependencies = [
 [[package]]
 name = "ruff_source_file"
 version = "0.0.0"
-source = "git+https://github.com/astral-sh/ruff.git?branch=main#a2f11d239f91cf8daedb0764ec15fcfe29c5ae6d"
+source = "git+https://github.com/astral-sh/ruff.git?rev=6ded4bed1651e30b34dd04cdaa50c763036abb0d#6ded4bed1651e30b34dd04cdaa50c763036abb0d"
 dependencies = [
  "memchr",
  "ruff_text_size",
@@ -4790,7 +4791,7 @@ dependencies = [
 [[package]]
 name = "ruff_text_size"
 version = "0.0.0"
-source = "git+https://github.com/astral-sh/ruff.git?branch=main#a2f11d239f91cf8daedb0764ec15fcfe29c5ae6d"
+source = "git+https://github.com/astral-sh/ruff.git?rev=6ded4bed1651e30b34dd04cdaa50c763036abb0d#6ded4bed1651e30b34dd04cdaa50c763036abb0d"
 dependencies = [
  "get-size2",
 ]
