@@ -6,7 +6,8 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use monty::{
-    LimitedTracker, MontyObject, MontyRun, PrintWriter, ResourceLimits, RunProgress,
+    ExternalResult, LimitedTracker, MontyObject, MontyRun, PrintWriter, ResourceLimits,
+    RunProgress,
 };
 
 use super::auto_fixer::MontyAutoFixer;
@@ -326,6 +327,11 @@ impl CodeModeExecutor {
             let resource_tracker = LimitedTracker::new(default_resource_limits());
             let mut print_writer = PrintWriter::Collect(String::new());
             let mut tool_results: Vec<ToolCallResult> = Vec::new();
+            // Track resolved external call results keyed by call_id for ResolveFutures.
+            // When a FunctionCall is processed synchronously via state.run(), we also
+            // store the result here so that if ResolveFutures fires (e.g. from
+            // asyncio.gather edge cases), we can provide the already-computed values.
+            let mut pending_results: Vec<(u32, MontyObject)> = Vec::new();
 
             let start_result = runner.start(vec![], resource_tracker, &mut print_writer);
 
@@ -377,7 +383,7 @@ impl CodeModeExecutor {
                         function_name,
                         args,
                         kwargs: _,
-                        call_id: _,
+                        call_id,
                         method_call: _,
                         state,
                     } => {
@@ -408,6 +414,9 @@ impl CodeModeExecutor {
                             arguments,
                             result: result_json,
                         });
+
+                        // Store the result for potential ResolveFutures handling
+                        pending_results.push((call_id, return_obj.clone()));
 
                         // Resume execution with the result
                         match state.run(return_obj, &mut print_writer) {
@@ -468,13 +477,83 @@ impl CodeModeExecutor {
                         .with_tool_results(tool_results)
                         .with_retries(retries);
                     }
-                    RunProgress::ResolveFutures(_) => {
-                        return CodeModeResult::fail_with_output(
-                            collect_output(print_writer),
-                            "Async futures are not supported in Code Mode",
-                        )
-                        .with_tool_results(tool_results)
-                        .with_retries(retries);
+                    RunProgress::ResolveFutures(future_state) => {
+                        // Sequential dispatch: resolve all pending futures using
+                        // results that were already computed during FunctionCall
+                        // handling.  For any call_id without a stored result, we
+                        // fall back to MontyObject::None.
+                        let results: Vec<(u32, ExternalResult)> = future_state
+                            .pending_call_ids()
+                            .iter()
+                            .map(|&cid| {
+                                let value = pending_results
+                                    .iter()
+                                    .find(|(id, _)| *id == cid)
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or_else(|| {
+                                        tracing::warn!(
+                                            "Code Mode: ResolveFutures has unknown call_id {cid}, \
+                                             resolving with None"
+                                        );
+                                        MontyObject::None
+                                    });
+                                (cid, ExternalResult::Return(value))
+                            })
+                            .collect();
+
+                        tracing::debug!(
+                            "Code Mode: resolving {} pending futures sequentially",
+                            results.len()
+                        );
+
+                        match future_state.resume(results, &mut print_writer) {
+                            Ok(next) => {
+                                progress = next;
+                            }
+                            Err(exc) => {
+                                let error_msg =
+                                    exc.message().unwrap_or("runtime error").to_string();
+                                let error_type = format!("{}", exc.exc_type());
+
+                                if retries < MAX_RETRIES {
+                                    let line =
+                                        exc.traceback().last().map(|f| f.start.line as usize);
+                                    let repair_prompt = RepairPrompt::from_runtime_error(
+                                        &auto_fixed,
+                                        &error_type,
+                                        &error_msg,
+                                        line,
+                                        external_function_names,
+                                    );
+                                    match llm_rewrite(&repair_prompt).await {
+                                        Ok(rewritten) => {
+                                            current_code = rewritten;
+                                            retries += 1;
+                                            break; // break inner loop to restart outer
+                                        }
+                                        Err(e) => {
+                                            return CodeModeResult::fail_with_output(
+                                                collect_output(print_writer),
+                                                format!(
+                                                    "Runtime error resolving futures and LLM \
+                                                     rewrite failed: {error_type}: {error_msg} \
+                                                     (rewrite error: {e})"
+                                                ),
+                                            )
+                                            .with_tool_results(tool_results)
+                                            .with_retries(retries);
+                                        }
+                                    }
+                                }
+
+                                return CodeModeResult::fail_with_output(
+                                    collect_output(print_writer),
+                                    format!("{error_type}: {error_msg}"),
+                                )
+                                .with_tool_results(tool_results)
+                                .with_retries(retries);
+                            }
+                        }
                     }
                 }
             }
@@ -900,6 +979,91 @@ mod tests {
         // (depends on Monty behavior with empty input)
         // Just verify it doesn't panic
         assert!(result.output.is_empty() || result.success || result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_async_external_call() {
+        // Verifies that calling an external function in non-async context still works
+        // (goes through FunctionCall path, ResolveFutures should not fire).
+        let executor = CodeModeExecutor::new();
+        let result = executor
+            .execute(
+                "result = fetch(\"https://example.com\")\nprint(result)",
+                &["fetch".to_string()],
+                |_name, _args| Box::pin(async { Ok(serde_json::json!("page content")) }),
+                |_prompt| Box::pin(async { Err("no rewrite".to_string()) }),
+            )
+            .await;
+        assert!(
+            result.success,
+            "Expected success, got error: {:?}",
+            result.error
+        );
+        assert_eq!(result.tool_results.len(), 1);
+        assert_eq!(result.tool_results[0].tool_name, "fetch");
+        assert!(
+            result.output.contains("page content"),
+            "Expected output to contain 'page content', got: {:?}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn test_async_gather_rewritten_to_sequential() {
+        // Verify that async gather code triggers lint → rewrite → sequential execution.
+        // The LLM rewrite callback converts async code into sequential calls.
+        use std::sync::{Arc, Mutex};
+
+        let call_order = Arc::new(Mutex::new(Vec::new()));
+        let call_order_clone = call_order.clone();
+
+        let executor = CodeModeExecutor::new();
+        let result = executor
+            .execute(
+                // Initial code uses async (triggers lint violation)
+                "import asyncio\n\
+                 async def main():\n\
+                     a, b, c = await asyncio.gather(api_a(), api_b(), api_c())\n\
+                     return [a, b, c]\n\
+                 results = await main()\n\
+                 print(results)",
+                &[
+                    "api_a".to_string(),
+                    "api_b".to_string(),
+                    "api_c".to_string(),
+                ],
+                move |name, _args| {
+                    let name = name.to_string();
+                    let order = call_order_clone.clone();
+                    Box::pin(async move {
+                        order.lock().unwrap().push(name.clone());
+                        Ok(serde_json::json!(format!("result_{}", name)))
+                    })
+                },
+                |_prompt| {
+                    // Rewrite async code as sequential calls
+                    Box::pin(async {
+                        Ok("a = api_a()\nb = api_b()\nc = api_c()\n\
+                            results = [a, b, c]\nprint(results)"
+                            .to_string())
+                    })
+                },
+            )
+            .await;
+        assert!(
+            result.success,
+            "Expected success, got error: {:?}",
+            result.error
+        );
+        assert!(result.retries >= 1, "Should have retried at least once");
+        // All three tools should have been called sequentially
+        assert_eq!(result.tool_results.len(), 3);
+
+        let order = call_order.lock().unwrap();
+        assert_eq!(order.len(), 3);
+        assert_eq!(order[0], "api_a");
+        assert_eq!(order[1], "api_b");
+        assert_eq!(order[2], "api_c");
     }
 
     #[test]
