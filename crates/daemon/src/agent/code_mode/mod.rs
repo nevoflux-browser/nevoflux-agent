@@ -10,7 +10,6 @@ pub mod auto_fixer;
 pub mod executor;
 pub mod linter;
 pub mod repair_prompt;
+pub mod signature;
 
-pub use executor::{
-    execute_code_mode, execute_python_simple, CodeModeExecutor, CodeModeResult, ToolCallResult,
-};
+pub use executor::{execute_python_simple, CodeModeExecutor, CodeModeResult, ToolCallResult};
