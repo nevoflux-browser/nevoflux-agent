@@ -6,8 +6,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use monty::{
-    ExternalResult, LimitedTracker, MontyObject, MontyRun, PrintWriter, ResourceLimits,
-    RunProgress,
+    ExternalResult, LimitedTracker, MontyObject, MontyRun, PrintWriter, ResourceLimits, RunProgress,
 };
 
 use super::auto_fixer::MontyAutoFixer;
@@ -603,10 +602,7 @@ fn build_registry_and_executor(
         let mappings = param_cache.clone();
         let fut: Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send>> =
             Box::pin(async move {
-                let param_names = mappings
-                    .get(&name)
-                    .cloned()
-                    .unwrap_or_default();
+                let param_names = mappings.get(&name).cloned().unwrap_or_default();
                 let named_args = positional_to_named_auto(&param_names, &args);
                 let call = crate::agent::abi::PendingToolCall {
                     id: format!("code-mode-{}", uuid_simple()),
@@ -636,16 +632,12 @@ fn build_registry_and_executor(
 /// This is the entry point for the `orchestrate` tool call.
 ///
 /// Delegates to `CodeModeExecutor::execute()` with a no-op LLM rewrite callback.
-pub fn execute_python_simple(
-    code: &str,
-    browser_ctx: Option<BrowserContext>,
-) -> CodeModeResult {
+pub fn execute_python_simple(code: &str, browser_ctx: Option<BrowserContext>) -> CodeModeResult {
     let runtime = tokio::runtime::Handle::current();
     // Build param mappings from registry tool definitions.
     // Empty mappings = positional args use generic names (arg0, arg1, ...).
     // When SignatureCache is wired in from the caller, real mappings will be provided.
-    let (external_names, tool_executor) =
-        build_registry_and_executor(browser_ctx, HashMap::new());
+    let (external_names, tool_executor) = build_registry_and_executor(browser_ctx, HashMap::new());
     let executor = CodeModeExecutor::new();
 
     let llm_rewrite =
@@ -682,44 +674,45 @@ pub fn execute_python_with_llm(
     model: String,
 ) -> CodeModeResult {
     let runtime = tokio::runtime::Handle::current();
-    let (external_names, tool_executor) =
-        build_registry_and_executor(browser_ctx, HashMap::new());
+    let (external_names, tool_executor) = build_registry_and_executor(browser_ctx, HashMap::new());
     let executor = CodeModeExecutor::new();
 
-    let llm_rewrite = move |prompt: &str| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
-        let prompt = prompt.to_string();
-        let api_key = api_key.clone();
-        let model = model.clone();
-        Box::pin(async move {
-            let request = crate::wasm::llm::LlmChatRequest {
-                messages: vec![crate::wasm::llm::LlmMessage::user(&prompt)],
-                system: Some(
-                    "You are a Python code repair assistant. \
+    let llm_rewrite =
+        move |prompt: &str| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
+            let prompt = prompt.to_string();
+            let api_key = api_key.clone();
+            let model = model.clone();
+            Box::pin(async move {
+                let request = crate::wasm::llm::LlmChatRequest {
+                    messages: vec![crate::wasm::llm::LlmMessage::user(&prompt)],
+                    system: Some(
+                        "You are a Python code repair assistant. \
                      Fix the code according to the error description. \
                      Return ONLY the corrected Python code inside a ```python fence. \
                      Do not include any explanation outside the fence."
-                        .to_string(),
-                ),
-                temperature: Some(0.0),
-                max_tokens: Some(4096),
-                tools: None,
-            };
+                            .to_string(),
+                    ),
+                    temperature: Some(0.0),
+                    max_tokens: Some(4096),
+                    tools: None,
+                };
 
-            let response = crate::wasm::llm::execute_llm_chat(provider, &api_key, &model, request)
-                .await
-                .map_err(|e| format!("LLM rewrite call failed: {e}"))?;
+                let response =
+                    crate::wasm::llm::execute_llm_chat(provider, &api_key, &model, request)
+                        .await
+                        .map_err(|e| format!("LLM rewrite call failed: {e}"))?;
 
-            // Extract Python code from the response (handles ```python, ```py, ``` fences)
-            let text = response.content;
-            if let Some(code) = crate::agent::runner::extract_any_python_block(&text) {
-                Ok(code)
-            } else {
-                // If no fence found, use the raw response as code
-                // (the LLM may have returned bare code without fences)
-                Ok(text)
-            }
-        })
-    };
+                // Extract Python code from the response (handles ```python, ```py, ``` fences)
+                let text = response.content;
+                if let Some(code) = crate::agent::runner::extract_any_python_block(&text) {
+                    Ok(code)
+                } else {
+                    // If no fence found, use the raw response as code
+                    // (the LLM may have returned bare code without fences)
+                    Ok(text)
+                }
+            })
+        };
 
     tokio::task::block_in_place(|| {
         runtime.block_on(async {
@@ -1152,5 +1145,87 @@ mod tests {
         let args = serde_json::json!(null);
         let named = positional_to_named_auto(&mapping, &args);
         assert_eq!(named, serde_json::json!({}));
+    }
+
+    // ---- End-to-end integration tests ----
+
+    #[tokio::test]
+    async fn test_orchestrate_full_pipeline() {
+        let executor = CodeModeExecutor::new();
+        let result = executor
+            .execute(
+                r#"
+a = fetch("https://a.com")
+b = fetch("https://b.com")
+combined = a + " | " + b
+print(combined)
+combined
+"#,
+                &["fetch".to_string()],
+                |_name, args| {
+                    Box::pin(async move {
+                        let url = args
+                            .as_array()
+                            .and_then(|a| a.first())
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        Ok(serde_json::json!(format!("content from {}", url)))
+                    })
+                },
+                |_prompt| Box::pin(async { Err("no rewrite".to_string()) }),
+            )
+            .await;
+
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        assert_eq!(result.tool_results.len(), 2);
+        assert!(
+            result.output.contains("content from"),
+            "Expected output to contain 'content from', got: {:?}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn test_orchestrate_auto_fix_import() {
+        let executor = CodeModeExecutor::new();
+        let result = executor
+            .execute(
+                "import json\nx = 42\nprint(x)",
+                &[],
+                |_name, _args| Box::pin(async { Ok(serde_json::json!("ok")) }),
+                |_prompt| Box::pin(async { Err("no rewrite".to_string()) }),
+            )
+            .await;
+
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        assert!(
+            result.output.contains("42"),
+            "Expected output to contain '42', got: {:?}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn test_orchestrate_tool_result_in_computation() {
+        let executor = CodeModeExecutor::new();
+        let result = executor
+            .execute(
+                "items = search(\"rust programming\")\ncount = len(items)\nprint(\"Found \" + str(count) + \" results\")",
+                &["search".to_string()],
+                |_name, _args| {
+                    Box::pin(async {
+                        Ok(serde_json::json!(["result1", "result2", "result3"]))
+                    })
+                },
+                |_prompt| Box::pin(async { Err("no rewrite".to_string()) }),
+            )
+            .await;
+
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        assert!(
+            result.output.contains("Found 3 results"),
+            "Expected output to contain 'Found 3 results', got: {:?}",
+            result.output
+        );
     }
 }
