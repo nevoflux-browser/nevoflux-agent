@@ -488,8 +488,6 @@ pub struct ComputerUseFlags {
     pub inject_guide: bool,
     pub inject_examples: bool,
 }
-const CODE_MODE_PROMPT: &str = "You are in Code Mode. You MUST call the `orchestrate` tool with your Python script. Do NOT make individual tool calls — write a single script that orchestrates everything.\n\nThe code runs in a sandboxed Python interpreter (Monty). Write code using Python syntax.\n\nSupported syntax: variables, def, if/elif/else, for/while, try/except, comprehensions, f-strings, lambda, slicing.\nDO NOT use: class, match/case, import, with, yield, decorators.\n\nPre-injected functions (call directly, no import):\n\nFiles:\n- read_file(path) → str\n- write_file(path, content) → str\n- list_files(path) → list[str]\n- run_command(command) → str\n\nBrowser:\n- browser_get_markdown(tab_id=None) → str (page content as markdown)\n- browser_snapshot(tab_id=None) → str (element structure/accessibility tree)\n- browser_click_by_id(element_id, tab_id=None) → str\n- browser_type_by_id(element_id, text, tab_id=None) → str\n- browser_navigate(url, tab_id=None) → str\n- browser_scroll(direction, amount=3, tab_id=None) → str\n- browser_get_tabs() → list[dict] with keys: id, url, title, active\n\nSearch & Web:\n- web_search(query) → list[dict] with keys: title, url, snippet\n- fetch_page(url) → str (markdown content)\n\nCanvas:\n- canvas_render(files, entry, title) → dict (renders app in browser canvas)\n\nCall the orchestrate tool with {\"code\": \"your script here\"}.";
-
 /// Check if a tool should be marked sequential in orchestrate signatures.
 ///
 /// Tools *not* in the ASYNC_SAFE list are sequential — they modify browser
@@ -733,7 +731,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             AgentMode::Chat => CHAT_PROMPT,
             AgentMode::Browser => BROWSER_PROMPT,
             AgentMode::Agent => AGENT_PROMPT,
-            AgentMode::Code => CODE_MODE_PROMPT,
+            AgentMode::Code => AGENT_PROMPT,
         }
     }
 

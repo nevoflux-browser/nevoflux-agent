@@ -32,7 +32,8 @@ pub enum AgentMode {
     Browser,
     /// Agent mode - full capabilities including file/bash/computer use.
     Agent,
-    /// Code mode - Python code generation and execution via Monty interpreter.
+    /// Code mode - DEPRECATED. Maps to Agent mode internally.
+    /// Kept for protocol backward compatibility.
     Code,
 }
 
