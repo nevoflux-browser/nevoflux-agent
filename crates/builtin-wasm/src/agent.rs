@@ -488,7 +488,99 @@ pub struct ComputerUseFlags {
     pub inject_guide: bool,
     pub inject_examples: bool,
 }
-const CODE_MODE_PROMPT: &str = "You are in Code Mode. You MUST write a Python script to accomplish the task. Do NOT make individual tool calls — write a single ```python-exec script that orchestrates everything.\n\nThe code runs in a sandboxed Python interpreter (Monty).\n\nSupported syntax: variables, def, if/elif/else, for/while, try/except, comprehensions, f-strings, lambda, slicing.\nDO NOT use: class, match/case, import, with, async/await, yield, decorators.\n\nPre-injected functions (call directly, no import):\n\nFiles:\n- read_file(path) → str\n- write_file(path, content) → str\n- list_files(path) → list[str]\n- run_command(command) → str\n\nBrowser:\n- browser_get_markdown(tab_id=None) → str (page content as markdown)\n- browser_snapshot(tab_id=None) → str (element structure/accessibility tree)\n- browser_click_by_id(element_id, tab_id=None) → str\n- browser_type_by_id(element_id, text, tab_id=None) → str\n- browser_navigate(url, tab_id=None) → str\n- browser_scroll(direction, amount=3, tab_id=None) → str\n- browser_get_tabs() → list[dict] with keys: id, url, title, active\n\nSearch & Web:\n- web_search(query) → list[dict] with keys: title, url, snippet\n- fetch_page(url) → str (markdown content)\n\nCanvas:\n- canvas_render(files, entry, title) → dict (renders app in browser canvas)\n\nReturn code in a ```python-exec block. Use ```python (without -exec) ONLY for display-only code examples shown to the user.";
+const CODE_MODE_PROMPT: &str = "You are in Code Mode. You MUST call the `orchestrate` tool with your Python script. Do NOT make individual tool calls — write a single script that orchestrates everything.\n\nThe code runs in a sandboxed Python interpreter (Monty). Write code using Python syntax.\n\nSupported syntax: variables, def, if/elif/else, for/while, try/except, comprehensions, f-strings, lambda, slicing.\nDO NOT use: class, match/case, import, with, yield, decorators.\n\nPre-injected functions (call directly, no import):\n\nFiles:\n- read_file(path) → str\n- write_file(path, content) → str\n- list_files(path) → list[str]\n- run_command(command) → str\n\nBrowser:\n- browser_get_markdown(tab_id=None) → str (page content as markdown)\n- browser_snapshot(tab_id=None) → str (element structure/accessibility tree)\n- browser_click_by_id(element_id, tab_id=None) → str\n- browser_type_by_id(element_id, text, tab_id=None) → str\n- browser_navigate(url, tab_id=None) → str\n- browser_scroll(direction, amount=3, tab_id=None) → str\n- browser_get_tabs() → list[dict] with keys: id, url, title, active\n\nSearch & Web:\n- web_search(query) → list[dict] with keys: title, url, snippet\n- fetch_page(url) → str (markdown content)\n\nCanvas:\n- canvas_render(files, entry, title) → dict (renders app in browser canvas)\n\nCall the orchestrate tool with {\"code\": \"your script here\"}.";
+
+/// Check if a tool should be marked sequential in orchestrate signatures.
+///
+/// Tools *not* in the ASYNC_SAFE list are sequential — they modify browser
+/// state (navigation, clicks, etc.) and must be called one at a time.
+fn is_orchestrate_sequential(name: &str) -> bool {
+    const ASYNC_SAFE: &[&str] = &[
+        "browser_screenshot",
+        "browser_get_content",
+        "browser_get_elements",
+        "browser_get_element",
+        "browser_query_all",
+        "browser_get_markdown",
+        "browser_eval_js",
+        "browser_read_artifact",
+        "browser_get_tabs",
+        "browser_query_tabs",
+        "browser_find_elements",
+        "browser_element_info",
+        "web_search",
+        "web_fetch",
+        "fetch_page",
+        "read_file",
+        "read",
+        "glob",
+        "grep",
+        "list_files",
+        "memory_search",
+        "memory_create",
+        "memory_update",
+        "memory_delete",
+        "memory_view",
+        "knowledge_teach",
+        "tool_search",
+        "tool_call_dynamic",
+        "think",
+        "switch_model",
+    ];
+    !ASYNC_SAFE.contains(&name)
+}
+
+/// Compact JSON Schema -> Python type (just primitives, no TypedDict).
+fn schema_to_py_type_compact(schema: &serde_json::Value) -> &'static str {
+    match schema.get("type").and_then(|t| t.as_str()) {
+        Some("string") => "str",
+        Some("integer") => "int",
+        Some("number") => "float",
+        Some("boolean") => "bool",
+        Some("array") => "list",
+        Some("object") => "dict",
+        _ => "Any",
+    }
+}
+
+/// Extract a compact parameter string from a tool's JSON Schema.
+fn extract_params_compact(schema: &serde_json::Value) -> String {
+    let props = match schema.get("properties").and_then(|p| p.as_object()) {
+        Some(p) => p,
+        None => return String::new(),
+    };
+    let required: std::collections::HashSet<&str> = schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    let mut req_params = Vec::new();
+    let mut opt_params = Vec::new();
+
+    for (name, prop_schema) in props {
+        let py_type = schema_to_py_type_compact(prop_schema);
+        if required.contains(name.as_str()) {
+            req_params.push(format!("{}: {}", name, py_type));
+        } else {
+            let default = prop_schema
+                .get("default")
+                .map(|d| match d {
+                    serde_json::Value::Null => "None".to_string(),
+                    serde_json::Value::Bool(true) => "True".to_string(),
+                    serde_json::Value::Bool(false) => "False".to_string(),
+                    serde_json::Value::String(s) => format!("\"{}\"", s),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    _ => "None".to_string(),
+                })
+                .unwrap_or_else(|| "None".to_string());
+            opt_params.push(format!("{}: {} = {}", name, py_type, default));
+        }
+    }
+
+    req_params.extend(opt_params);
+    req_params.join(", ")
+}
 
 impl<H: HostFunctions> Agent<H> {
     /// Create a new agent with the given host functions.
@@ -528,14 +620,7 @@ impl<H: HostFunctions> Agent<H> {
             self.computer_use_triggered.set(true);
         }
 
-        // Override mode to Code when user explicitly requests python-exec (Agent mode only)
-        let mode = if input.mode == AgentMode::Agent
-            && should_override_to_code_mode(&input.user_message)
-        {
-            AgentMode::Code
-        } else {
-            input.mode
-        };
+        let mode = input.mode;
 
         // Use custom system prompt if provided, otherwise use mode-based prompt
         let base_prompt = match &input.custom_system_prompt {
@@ -1957,15 +2042,15 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let list = self.host.subagent_list()?;
                 serde_json::to_string_pretty(&list).unwrap_or_default()
             }
-            // python-exec: LLM may call this directly instead of writing ```python-exec blocks.
-            // Route through tool_call_dynamic which intercepts and executes via Monty interpreter.
-            "python-exec" => {
+            // orchestrate: execute a Python script in sandboxed Monty interpreter
+            // to orchestrate multiple tool calls in a single script.
+            "orchestrate" => {
                 match self
                     .host
-                    .tool_call_dynamic("python-exec", &tool_call.arguments)
+                    .tool_call_dynamic("orchestrate", &tool_call.arguments)
                 {
                     Ok(output) => output,
-                    Err(e) => format!("python-exec error: {}", e.message),
+                    Err(e) => format!("orchestrate error: {}", e.message),
                 }
             }
             _ => {
@@ -2020,7 +2105,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 | "skill_load"
                 | "tool_search"
                 | "tool_call_dynamic"
-                | "python-exec"
+                | "orchestrate"
                 | "load_computer_use_tools"
                 | "subagent_spawn"
                 | "subagent_wait_all"
@@ -3059,8 +3144,92 @@ The following skill instructions MUST be followed exactly. These instructions ta
         tools
     }
 
-    /// Get available tools for agent mode.
-    fn get_agent_tools(&self) -> Vec<ToolDefinition> {
+    /// Build the orchestrate ToolDefinition with dynamic signatures scoped to `mode`.
+    fn orchestrate_tool(&self, mode: AgentMode) -> ToolDefinition {
+        // Get tools for this mode *without* orchestrate to avoid recursion.
+        let mode_tools = match mode {
+            AgentMode::Chat => self.get_chat_tools(),
+            AgentMode::Browser => self.get_browser_tools(),
+            AgentMode::Agent | AgentMode::Code => self.get_agent_tools_without_orchestrate(),
+        };
+
+        // Filter out meta-tools that don't make sense inside orchestrate.
+        let orchestrable: Vec<&ToolDefinition> = mode_tools
+            .iter()
+            .filter(|t| {
+                !matches!(
+                    t.name.as_str(),
+                    "orchestrate"
+                        | "think"
+                        | "plan"
+                        | "create_artifact"
+                        | "switch_model"
+                        | "load_computer_use_tools"
+                        | "subagent_spawn"
+                        | "subagent_wait"
+                        | "subagent_wait_all"
+                        | "subagent_status"
+                        | "subagent_kill"
+                        | "subagent_list"
+                        | "skill_load"
+                )
+            })
+            .collect();
+
+        // Build compact signatures.
+        let mut signatures = String::new();
+        for tool in &orchestrable {
+            let is_seq = is_orchestrate_sequential(&tool.name);
+            let prefix = if is_seq { "def" } else { "async def" };
+            let tag = if is_seq { " [sequential]" } else { "" };
+            let params = extract_params_compact(&tool.input_schema);
+            let desc_short = tool
+                .description
+                .split('.')
+                .next()
+                .unwrap_or(&tool.description);
+            signatures.push_str(&format!(
+                "  {} {}({}) -> Any  # {}{}\n",
+                prefix, tool.name, params, desc_short, tag
+            ));
+        }
+
+        let description = format!(
+            "Orchestrate multiple tool calls in a single Python script. \
+Use when a task needs 3+ tool calls, loops, conditionals, or data transformation.\n\
+\n\
+Available functions (call directly, no import needed):\n\
+{}\n\
+Rules:\n\
+- async def tools can be combined with asyncio.gather() for parallel execution\n\
+- def tools marked [sequential] must be called one at a time\n\
+- Do NOT use: class, match/case, import, with, yield, decorators\n\
+- Supported: variables, def, if/elif/else, for/while, try/except, \
+comprehensions, f-strings, lambda, asyncio.gather\n\
+- The last expression value is returned as the tool result\n\
+- Use print() for debug output (included in result)",
+            signatures.trim_end()
+        );
+
+        ToolDefinition {
+            name: "orchestrate".into(),
+            description,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Python code to execute"
+                    }
+                },
+                "required": ["code"]
+            }),
+        }
+    }
+
+    /// Get available tools for agent mode (without orchestrate). Used by
+    /// `orchestrate_tool` to avoid infinite recursion.
+    fn get_agent_tools_without_orchestrate(&self) -> Vec<ToolDefinition> {
         let mut tools = self.get_browser_tools();
 
         // Add file tools
@@ -3640,6 +3809,13 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
         tools
     }
+
+    /// Get available tools for agent mode (includes dynamically-generated orchestrate tool).
+    fn get_agent_tools(&self) -> Vec<ToolDefinition> {
+        let mut tools = self.get_agent_tools_without_orchestrate();
+        tools.push(self.orchestrate_tool(AgentMode::Agent));
+        tools
+    }
 }
 
 /// Check if `text` ends with a non-empty prefix of `<tool_call>`.
@@ -3800,25 +3976,6 @@ fn should_trigger_computer_use(message: &str) -> bool {
     ];
     for kw in ZH_KEYWORDS {
         if message.contains(kw) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Check if user message explicitly requests python-exec / Code Mode.
-/// When detected, override the current mode to AgentMode::Code so the LLM
-/// receives CODE_MODE_PROMPT and is forced to generate python-exec scripts.
-fn should_override_to_code_mode(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    const KEYWORDS: &[&str] = &[
-        "python-exec",
-        "python exec",
-        "code mode",
-        "代码模式",
-    ];
-    for kw in KEYWORDS {
-        if lower.contains(kw) {
             return true;
         }
     }
@@ -4357,27 +4514,6 @@ mod tests {
         assert!(!should_trigger_computer_use("Fill in the login form"));
         assert!(!should_trigger_computer_use("Click the submit button"));
         assert!(!should_trigger_computer_use("Navigate to google.com"));
-    }
-
-    // =========================================================================
-    // Code Mode Override Tests
-    // =========================================================================
-
-    #[test]
-    fn test_should_override_to_code_mode() {
-        assert!(should_override_to_code_mode("请用 python-exec 分析页面"));
-        assert!(should_override_to_code_mode("Use python exec to process data"));
-        assert!(should_override_to_code_mode("Switch to code mode"));
-        assert!(should_override_to_code_mode("请切换到代码模式"));
-        assert!(should_override_to_code_mode("用Python-Exec处理"));
-    }
-
-    #[test]
-    fn test_should_not_override_to_code_mode() {
-        assert!(!should_override_to_code_mode("Search for python tutorials"));
-        assert!(!should_override_to_code_mode("Write a python script"));
-        assert!(!should_override_to_code_mode("Execute this command"));
-        assert!(!should_override_to_code_mode("帮我写代码"));
     }
 
     #[test]

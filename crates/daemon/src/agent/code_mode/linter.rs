@@ -4,8 +4,7 @@
 //! Python code line-by-line to detect constructs that Monty cannot
 //! execute, returning actionable suggestions for each violation.
 //!
-//! Detects: class, match/case, with, import, async, await, yield,
-//! global, nonlocal.
+//! Detects: class, match/case, with, import, yield, global, nonlocal.
 
 /// A single violation found by the linter, with a concrete suggestion
 /// for how to rewrite the offending construct.
@@ -13,7 +12,7 @@
 pub struct Violation {
     /// 1-based line number where the violation was found.
     pub line: usize,
-    /// Name of the unsupported construct (e.g. "class", "async def").
+    /// Name of the unsupported construct (e.g. "class", "import").
     pub construct: String,
     /// Concrete alternative suggestion for the user/LLM.
     pub suggestion: String,
@@ -67,24 +66,6 @@ impl MontyLinter {
                     line: line_num,
                     construct: "with".to_string(),
                     suggestion: "Use try/finally, or call tool function directly".to_string(),
-                });
-            }
-
-            // async def
-            if trimmed.contains("async def ") {
-                violations.push(Violation {
-                    line: line_num,
-                    construct: "async def".to_string(),
-                    suggestion: "Use synchronous def; async is handled by host".to_string(),
-                });
-            }
-
-            // await expressions (skip if line also has `async def` to avoid double-reporting)
-            if trimmed.contains("await ") && !trimmed.contains("async def ") {
-                violations.push(Violation {
-                    line: line_num,
-                    construct: "await".to_string(),
-                    suggestion: "Remove await; call function synchronously".to_string(),
                 });
             }
 
@@ -163,14 +144,11 @@ mod tests {
     }
 
     #[test]
-    fn test_detects_async() {
+    fn test_allows_async_await() {
+        // async/await are now supported for orchestrate parallel execution
         let code = "async def fetch():\n    await get()";
         let violations = MontyLinter::check(code);
-        assert!(violations.len() >= 1);
-        // Should detect both async def and await
-        let constructs: Vec<&str> = violations.iter().map(|v| v.construct.as_str()).collect();
-        assert!(constructs.contains(&"async def"));
-        assert!(constructs.contains(&"await"));
+        assert!(violations.is_empty());
     }
 
     #[test]
@@ -242,8 +220,8 @@ mod tests {
     fn test_multiple_violations() {
         let code = "import os\nclass Foo:\n    global x\n    async def bar():\n        await baz()\n        yield 1";
         let violations = MontyLinter::check(code);
-        // import, class, global, async def, await, yield = 6
-        assert_eq!(violations.len(), 6);
+        // import, class, global, yield = 4 (async/await are now allowed)
+        assert_eq!(violations.len(), 4);
     }
 
     #[test]

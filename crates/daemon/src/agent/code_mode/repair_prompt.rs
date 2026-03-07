@@ -22,7 +22,6 @@ Common patterns:
 - match → if/elif/else chain
 - import → not needed (tools pre-injected as functions)
 - with → try/finally or call tool directly
-- async → remove async/await, call functions synchronously
 - yield → use list.append() to collect results";
 
 /// Generates structured repair prompts for the LLM to fix Python code
