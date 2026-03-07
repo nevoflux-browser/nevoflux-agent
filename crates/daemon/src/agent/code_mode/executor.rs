@@ -565,11 +565,18 @@ impl CodeModeExecutor {
 
 use crate::agent::tools::ToolRegistry;
 use crate::wasm::services::BrowserContext;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Create a shared ToolRegistry and tool executor callback for `execute_python_simple`.
+///
+/// `param_mappings` maps tool names to ordered parameter name lists, used to
+/// convert positional args (JSON arrays from Monty) to named args (JSON objects
+/// for ToolRegistry).  When a tool is not present in the map, extra positional
+/// arguments are assigned generic names (`arg0`, `arg1`, ...).
 fn build_registry_and_executor(
     browser_ctx: Option<BrowserContext>,
+    param_mappings: HashMap<String, Vec<String>>,
 ) -> (
     Vec<String>,
     impl Fn(
@@ -587,13 +594,20 @@ fn build_registry_and_executor(
         .map(|s| s.to_string())
         .collect();
 
+    let param_cache = Arc::new(param_mappings);
+
     let tool_executor = move |name: &str, args: serde_json::Value| {
         let name = name.to_string();
         let args = args.clone();
         let registry = shared_registry.clone();
+        let mappings = param_cache.clone();
         let fut: Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send>> =
             Box::pin(async move {
-                let named_args = positional_to_named(&name, &args);
+                let param_names = mappings
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_default();
+                let named_args = positional_to_named_auto(&param_names, &args);
                 let call = crate::agent::abi::PendingToolCall {
                     id: format!("code-mode-{}", uuid_simple()),
                     name: name.clone(),
@@ -627,7 +641,11 @@ pub fn execute_python_simple(
     browser_ctx: Option<BrowserContext>,
 ) -> CodeModeResult {
     let runtime = tokio::runtime::Handle::current();
-    let (external_names, tool_executor) = build_registry_and_executor(browser_ctx);
+    // Build param mappings from registry tool definitions.
+    // Empty mappings = positional args use generic names (arg0, arg1, ...).
+    // When SignatureCache is wired in from the caller, real mappings will be provided.
+    let (external_names, tool_executor) =
+        build_registry_and_executor(browser_ctx, HashMap::new());
     let executor = CodeModeExecutor::new();
 
     let llm_rewrite =
@@ -644,8 +662,9 @@ pub fn execute_python_simple(
     })
 }
 
-/// Convert positional args (JSON array from Monty) to named args (JSON object for ToolRegistry).
-fn positional_to_named(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
+/// Convert positional args to named args using auto-generated parameter mapping.
+/// If args is already an object, pass through unchanged.
+fn positional_to_named_auto(param_names: &[String], args: &serde_json::Value) -> serde_json::Value {
     if args.is_object() {
         return args.clone();
     }
@@ -653,47 +672,10 @@ fn positional_to_named(tool_name: &str, args: &serde_json::Value) -> serde_json:
         Some(a) => a,
         None => return serde_json::json!({}),
     };
-    let param_names: &[&str] = match tool_name {
-        "read_file" => &["path"],
-        "write_file" => &["path", "content"],
-        "list_files" => &["path"],
-        "canvas_render" => &["files", "entry"],
-        "web_search" => &["query"],
-        "fetch_page" => &["url"],
-        "run_command" => &["command"],
-        "get_code_mode_context" => &[],
-        "browser_get_markdown" => &["tab_id"],
-        "browser_snapshot" => &["tab_id"],
-        "browser_click_by_id" => &["element_id", "tab_id"],
-        "browser_type_by_id" => &["element_id", "text", "tab_id"],
-        "browser_fill_by_id" => &["element_id", "value", "tab_id"],
-        "browser_navigate" => &["url", "tab_id"],
-        "browser_go_back" => &["tab_id"],
-        "browser_go_forward" => &["tab_id"],
-        "browser_scroll" => &["direction", "amount", "tab_id"],
-        "browser_get_tabs" => &[],
-        "browser_query_tabs" => &["url", "title", "active"],
-        "browser_get_elements" => &["tab_id"],
-        "browser_click" => &["selector", "tab_id"],
-        "browser_type" => &["selector", "text", "tab_id"],
-        "browser_fill" => &["selector", "value", "tab_id"],
-        "browser_get_content" => &["tab_id"],
-        "browser_screenshot" => &["tab_id"],
-        "browser_eval_js" => &["expression", "tab_id"],
-        "browser_wait_for" => &["selector", "timeout_ms", "tab_id"],
-        "browser_wait_for_stable" => &["strategy", "max_wait", "tab_id"],
-        "browser_key_press" => &["key", "modifiers", "tab_id"],
-        "browser_get_element" => &["selector", "tab_id"],
-        "browser_query_all" => &["selector", "tab_id"],
-        "browser_read_artifact" => &["id", "offset", "limit", "grep"],
-        "browser_edit_artifact" => &["id", "old_str", "new_str"],
-        "browser_ask_user" => &["question", "options", "allow_custom"],
-        _ => &[],
-    };
     let mut obj = serde_json::Map::new();
     for (i, val) in arr.iter().enumerate() {
         let key = if i < param_names.len() {
-            param_names[i].to_string()
+            param_names[i].clone()
         } else {
             format!("arg{}", i)
         };
@@ -1067,42 +1049,40 @@ mod tests {
     }
 
     #[test]
-    fn test_positional_to_named_read_file() {
-        let args = serde_json::json!(["/tmp/test.txt"]);
-        let named = positional_to_named("read_file", &args);
-        assert_eq!(named, serde_json::json!({"path": "/tmp/test.txt"}));
-    }
-
-    #[test]
-    fn test_positional_to_named_write_file() {
-        let args = serde_json::json!(["/tmp/out.txt", "hello"]);
-        let named = positional_to_named("write_file", &args);
+    fn test_positional_to_named_auto() {
+        let mapping = vec!["selector".to_string(), "button".to_string()];
+        let args = serde_json::json!(["#submit", "right"]);
+        let named = positional_to_named_auto(&mapping, &args);
         assert_eq!(
             named,
-            serde_json::json!({"path": "/tmp/out.txt", "content": "hello"})
+            serde_json::json!({"selector": "#submit", "button": "right"})
         );
     }
 
     #[test]
-    fn test_positional_to_named_object_passthrough() {
-        let args = serde_json::json!({"path": "/test"});
-        let named = positional_to_named("read_file", &args);
-        assert_eq!(named, serde_json::json!({"path": "/test"}));
+    fn test_positional_to_named_auto_object_passthrough() {
+        let mapping = vec!["url".to_string()];
+        let args = serde_json::json!({"url": "https://example.com"});
+        let named = positional_to_named_auto(&mapping, &args);
+        assert_eq!(named, serde_json::json!({"url": "https://example.com"}));
     }
 
     #[test]
-    fn test_positional_to_named_canvas_render() {
-        let files = serde_json::json!({"index.tsx": "code"});
-        let args = serde_json::json!([files, "index.tsx"]);
-        let named = positional_to_named("canvas_render", &args);
-        assert_eq!(named["files"], serde_json::json!({"index.tsx": "code"}));
-        assert_eq!(named["entry"], serde_json::json!("index.tsx"));
+    fn test_positional_to_named_auto_overflow() {
+        let mapping = vec!["url".to_string()];
+        let args = serde_json::json!(["https://example.com", "extra"]);
+        let named = positional_to_named_auto(&mapping, &args);
+        assert_eq!(
+            named,
+            serde_json::json!({"url": "https://example.com", "arg1": "extra"})
+        );
     }
 
     #[test]
-    fn test_positional_to_named_unknown_tool() {
-        let args = serde_json::json!(["a", "b"]);
-        let named = positional_to_named("unknown_tool", &args);
-        assert_eq!(named, serde_json::json!({"arg0": "a", "arg1": "b"}));
+    fn test_positional_to_named_auto_empty() {
+        let mapping: Vec<String> = vec![];
+        let args = serde_json::json!(null);
+        let named = positional_to_named_auto(&mapping, &args);
+        assert_eq!(named, serde_json::json!({}));
     }
 }
