@@ -439,6 +439,7 @@ impl SubagentExecutor {
 
         // Create host functions for the subagent
         let mut host = DaemonHostFunctions::new(Arc::new(config), runtime);
+        host = host.with_is_subagent(true);
         if let Some(services) = base_services {
             // Create a new services instance with its own interrupt flag
             let subagent_services = services.clone();

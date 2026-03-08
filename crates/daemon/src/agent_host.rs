@@ -163,6 +163,8 @@ pub struct DaemonHostFunctions {
     /// Sandbox directory for subagent writes. When set, tool_write and tool_edit
     /// are restricted to paths within this directory.
     subagent_sandbox: Option<String>,
+    /// When true, this agent is a subagent and cannot spawn further subagents.
+    is_subagent: bool,
     /// Current thinking block ID for reasoning→ThinkingEvent conversion.
     current_thinking_id: Arc<Mutex<Option<String>>>,
     /// Domain from the most recent successful browser_navigate.
@@ -187,6 +189,7 @@ impl DaemonHostFunctions {
             model_override_model: Arc::new(Mutex::new(None)),
             skill_base_path: None,
             subagent_sandbox: None,
+            is_subagent: false,
             current_thinking_id: Arc::new(Mutex::new(None)),
             last_navigated_domain: Arc::new(Mutex::new(None)),
         }
@@ -228,6 +231,12 @@ impl DaemonHostFunctions {
     /// Set the subagent sandbox directory for write/edit path restrictions.
     pub fn with_subagent_sandbox(mut self, path: String) -> Self {
         self.subagent_sandbox = Some(path);
+        self
+    }
+
+    /// Mark this host as running inside a subagent (prevents nesting).
+    pub fn with_is_subagent(mut self, is_subagent: bool) -> Self {
+        self.is_subagent = is_subagent;
         self
     }
 
@@ -3150,6 +3159,12 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn subagent_spawn(&self, task: &str, mode: &str, tab_id: Option<i64>) -> HostResult<u64> {
+        if self.is_subagent {
+            return Err(HostError {
+                code: 403,
+                message: "Subagents cannot spawn further subagents".into(),
+            });
+        }
         debug!(
             "subagent_spawn: task='{}', mode={}, tab_id={:?}",
             task, mode, tab_id
@@ -3197,6 +3212,12 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn subagent_status(&self, id: u64) -> HostResult<String> {
+        if self.is_subagent {
+            return Err(HostError {
+                code: 403,
+                message: "Subagent management not available for subagents".into(),
+            });
+        }
         debug!("subagent_status: id={}", id);
 
         // Try WASM executor first
@@ -3228,6 +3249,12 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn subagent_wait(&self, id: u64) -> HostResult<String> {
+        if self.is_subagent {
+            return Err(HostError {
+                code: 403,
+                message: "Subagent management not available for subagents".into(),
+            });
+        }
         debug!("subagent_wait: id={}", id);
 
         // Try WASM executor first
@@ -3251,6 +3278,12 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn subagent_wait_all(&self, ids: &[u64]) -> HostResult<String> {
+        if self.is_subagent {
+            return Err(HostError {
+                code: 403,
+                message: "Subagent management not available for subagents".into(),
+            });
+        }
         debug!("subagent_wait_all: ids={:?}", ids);
 
         let results: Vec<serde_json::Value> = ids
@@ -3273,6 +3306,12 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn subagent_kill(&self, id: u64) -> HostResult<bool> {
+        if self.is_subagent {
+            return Err(HostError {
+                code: 403,
+                message: "Subagent management not available for subagents".into(),
+            });
+        }
         debug!("subagent_kill: id={}", id);
 
         // Try WASM executor first
@@ -3315,6 +3354,12 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn subagent_list(&self) -> HostResult<Vec<SubagentInfo>> {
+        if self.is_subagent {
+            return Err(HostError {
+                code: 403,
+                message: "Subagent listing not available for subagents".into(),
+            });
+        }
         debug!("subagent_list");
 
         let mut all_subagents = Vec::new();
@@ -3471,6 +3516,7 @@ impl DaemonHostFunctions {
             model_override_model: self.model_override_model.clone(),
             skill_base_path: self.skill_base_path.clone(),
             subagent_sandbox: self.subagent_sandbox.clone(),
+            is_subagent: self.is_subagent,
             current_thinking_id: Arc::new(Mutex::new(None)),
             last_navigated_domain: self.last_navigated_domain.clone(),
         }
@@ -5450,5 +5496,62 @@ mod tests {
             .unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().sample_count, 1);
+    }
+
+    // ==================== Subagent Nesting Tests ====================
+
+    #[test]
+    fn test_subagent_nesting_blocked() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host =
+            DaemonHostFunctions::new(config, rt.handle().clone()).with_is_subagent(true);
+
+        // spawn should be blocked
+        let result = host.subagent_spawn("test task", "agent", None);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code, 403);
+        assert!(err.message.contains("cannot spawn"));
+
+        // list should be blocked
+        let result = host.subagent_list();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, 403);
+
+        // status should be blocked
+        let result = host.subagent_status(1);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, 403);
+
+        // wait should be blocked
+        let result = host.subagent_wait(1);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, 403);
+
+        // wait_all should be blocked
+        let result = host.subagent_wait_all(&[1, 2]);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, 403);
+
+        // kill should be blocked
+        let result = host.subagent_kill(1);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code, 403);
+    }
+
+    #[test]
+    fn test_is_subagent_default_false() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        // Default: not a subagent, so spawn should not be blocked by this guard
+        // (may still fail for other reasons like no executor, but not 403)
+        let result = host.subagent_list();
+        // Should either succeed or fail with non-403 error
+        if let Err(e) = result {
+            assert_ne!(e.code, 403, "Should not get 403 when is_subagent=false");
+        }
     }
 }
