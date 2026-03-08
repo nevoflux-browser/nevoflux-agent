@@ -21,6 +21,9 @@ const MAX_RETRIES: u32 = 2;
 pub struct CodeModeResult {
     /// Final output from print() statements during execution.
     pub output: String,
+    /// Final expression value as JSON (the last expression in the script).
+    /// `None` when the script has no trailing expression or ends with a statement.
+    pub result: Option<serde_json::Value>,
     /// Tool call results collected during execution.
     pub tool_results: Vec<ToolCallResult>,
     /// Whether execution completed successfully.
@@ -36,6 +39,7 @@ impl CodeModeResult {
     pub fn success(output: String) -> Self {
         Self {
             output,
+            result: None,
             tool_results: Vec::new(),
             success: true,
             error: None,
@@ -47,6 +51,7 @@ impl CodeModeResult {
     pub fn fail(error: impl Into<String>) -> Self {
         Self {
             output: String::new(),
+            result: None,
             tool_results: Vec::new(),
             success: false,
             error: Some(error.into()),
@@ -58,11 +63,18 @@ impl CodeModeResult {
     pub fn fail_with_output(output: String, error: impl Into<String>) -> Self {
         Self {
             output,
+            result: None,
             tool_results: Vec::new(),
             success: false,
             error: Some(error.into()),
             retries: 0,
         }
+    }
+
+    /// Set the final expression result.
+    pub fn with_result(mut self, value: serde_json::Value) -> Self {
+        self.result = Some(value);
+        self
     }
 
     /// Set the retry count.
@@ -75,6 +87,18 @@ impl CodeModeResult {
     pub fn with_tool_results(mut self, tool_results: Vec<ToolCallResult>) -> Self {
         self.tool_results = tool_results;
         self
+    }
+
+    /// Format the result as a JSON string matching the design spec:
+    /// `{"output": "...", "result": ..., "success": true, "error": null}`
+    pub fn to_json_string(&self) -> String {
+        serde_json::json!({
+            "output": self.output,
+            "result": self.result,
+            "success": self.success,
+            "error": self.error,
+        })
+        .to_string()
     }
 }
 
@@ -381,15 +405,35 @@ impl CodeModeExecutor {
                     RunProgress::FunctionCall {
                         function_name,
                         args,
-                        kwargs: _,
+                        kwargs,
                         call_id,
                         method_call: _,
                         state,
                     } => {
-                        // Convert args to JSON
-                        let json_args: Vec<serde_json::Value> =
-                            args.iter().map(monty_object_to_json).collect();
-                        let arguments = serde_json::Value::Array(json_args);
+                        // Build arguments JSON, merging positional args and kwargs.
+                        // When kwargs are present, use a special envelope so
+                        // positional_to_named_auto can map positional args by
+                        // index (using param names) and merge kwargs on top.
+                        let arguments = if kwargs.is_empty() {
+                            let json_args: Vec<serde_json::Value> =
+                                args.iter().map(monty_object_to_json).collect();
+                            serde_json::Value::Array(json_args)
+                        } else {
+                            let positional: Vec<serde_json::Value> =
+                                args.iter().map(monty_object_to_json).collect();
+                            let mut kw_obj = serde_json::Map::new();
+                            for (key, val) in &kwargs {
+                                let key_str = match monty_object_to_json(key) {
+                                    serde_json::Value::String(s) => s,
+                                    other => other.to_string(),
+                                };
+                                kw_obj.insert(key_str, monty_object_to_json(val));
+                            }
+                            serde_json::json!({
+                                "__positional": positional,
+                                "__kwargs": kw_obj
+                            })
+                        };
 
                         // Execute the tool
                         let tool_result = tool_executor(&function_name, arguments.clone()).await;
@@ -463,10 +507,16 @@ impl CodeModeExecutor {
                             }
                         }
                     }
-                    RunProgress::Complete(_value) => {
-                        return CodeModeResult::success(collect_output(print_writer))
+                    RunProgress::Complete(value) => {
+                        let final_value = monty_object_to_json(&value);
+                        let mut result = CodeModeResult::success(collect_output(print_writer))
                             .with_tool_results(tool_results)
                             .with_retries(retries);
+                        // Capture non-None final expressions as the result
+                        if !final_value.is_null() {
+                            result = result.with_result(final_value);
+                        }
+                        return result;
                     }
                     RunProgress::OsCall { .. } => {
                         return CodeModeResult::fail_with_output(
@@ -583,17 +633,26 @@ fn build_registry_and_executor(
         serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send>>,
 ) {
-    let shared_registry = Arc::new(match browser_ctx {
+    let registry = match browser_ctx {
         Some(ctx) => ToolRegistry::with_browser(ctx),
         None => ToolRegistry::new(),
-    });
+    };
+
+    // Use caller-provided param_mappings, or auto-generate from registry hints.
+    let effective_mappings = if param_mappings.is_empty() {
+        registry.param_mappings()
+    } else {
+        param_mappings
+    };
+
+    let shared_registry = Arc::new(registry);
     let external_names: Vec<String> = shared_registry
         .tool_names()
         .iter()
         .map(|s| s.to_string())
         .collect();
 
-    let param_cache = Arc::new(param_mappings);
+    let param_cache = Arc::new(effective_mappings);
 
     let tool_executor = move |name: &str, args: serde_json::Value| {
         let name = name.to_string();
@@ -610,6 +669,27 @@ fn build_registry_and_executor(
                     arguments: named_args,
                 };
                 let result = registry.execute(&call).await;
+
+                // Auto-inject wait_for_stable after navigation actions so that
+                // SPA pages have time to render before the next tool call reads
+                // page content. This mirrors the Agent-mode behaviour in
+                // auto_snapshot_after_action().
+                if matches!(
+                    name.as_str(),
+                    "browser_navigate" | "browser_go_back" | "browser_go_forward"
+                ) {
+                    let wait_call = crate::agent::abi::PendingToolCall {
+                        id: format!("code-mode-wait-{}", uuid_simple()),
+                        name: "browser_wait_for_stable".to_string(),
+                        arguments: serde_json::json!({
+                            "strategy": "navigation",
+                            "max_wait": 3000
+                        }),
+                    };
+                    // Best-effort: ignore wait errors (page may already be stable)
+                    let _ = registry.execute(&wait_call).await;
+                }
+
                 if let Some(error) = result.error {
                     Err(error)
                 } else {
@@ -724,11 +804,40 @@ pub fn execute_python_with_llm(
 }
 
 /// Convert positional args to named args using auto-generated parameter mapping.
-/// If args is already an object, pass through unchanged.
+/// If args is already a plain object, pass through unchanged.
+///
+/// Also handles the `{"__positional": [...], "__kwargs": {...}}` envelope
+/// produced when Monty delivers both positional and keyword arguments:
+/// positional args are mapped by index using `param_names`, then kwargs
+/// are merged on top (kwargs override positional).
 fn positional_to_named_auto(param_names: &[String], args: &serde_json::Value) -> serde_json::Value {
-    if args.is_object() {
+    // Special envelope: positional + kwargs from Monty FunctionCall
+    if let Some(obj) = args.as_object() {
+        if obj.contains_key("__positional") || obj.contains_key("__kwargs") {
+            let mut result = serde_json::Map::new();
+            // Map positional args by index
+            if let Some(positional) = obj.get("__positional").and_then(|v| v.as_array()) {
+                for (i, val) in positional.iter().enumerate() {
+                    let key = if i < param_names.len() {
+                        param_names[i].clone()
+                    } else {
+                        format!("arg{}", i)
+                    };
+                    result.insert(key, val.clone());
+                }
+            }
+            // Merge kwargs (override positional)
+            if let Some(kwargs) = obj.get("__kwargs").and_then(|v| v.as_object()) {
+                for (k, v) in kwargs {
+                    result.insert(k.clone(), v.clone());
+                }
+            }
+            return serde_json::Value::Object(result);
+        }
+        // Plain object — pass through
         return args.clone();
     }
+    // Array — map by index
     let arr = match args.as_array() {
         Some(a) => a,
         None => return serde_json::json!({}),
@@ -1147,6 +1256,45 @@ mod tests {
         assert_eq!(named, serde_json::json!({}));
     }
 
+    #[test]
+    fn test_positional_to_named_auto_kwargs_only() {
+        // Pure kwargs: web_fetch(url="https://example.com")
+        let mapping = vec!["url".to_string()];
+        let args = serde_json::json!({
+            "__positional": [],
+            "__kwargs": {"url": "https://example.com"}
+        });
+        let named = positional_to_named_auto(&mapping, &args);
+        assert_eq!(named, serde_json::json!({"url": "https://example.com"}));
+    }
+
+    #[test]
+    fn test_positional_to_named_auto_mixed_positional_kwargs() {
+        // Mixed: browser_click("#btn", button="right")
+        let mapping = vec!["selector".to_string(), "button".to_string()];
+        let args = serde_json::json!({
+            "__positional": ["#btn"],
+            "__kwargs": {"button": "right"}
+        });
+        let named = positional_to_named_auto(&mapping, &args);
+        assert_eq!(
+            named,
+            serde_json::json!({"selector": "#btn", "button": "right"})
+        );
+    }
+
+    #[test]
+    fn test_positional_to_named_auto_kwargs_override_positional() {
+        // kwargs should override positional when both specify the same param
+        let mapping = vec!["url".to_string()];
+        let args = serde_json::json!({
+            "__positional": ["https://old.com"],
+            "__kwargs": {"url": "https://new.com"}
+        });
+        let named = positional_to_named_auto(&mapping, &args);
+        assert_eq!(named, serde_json::json!({"url": "https://new.com"}));
+    }
+
     // ---- End-to-end integration tests ----
 
     #[tokio::test]
@@ -1227,5 +1375,70 @@ combined
             "Expected output to contain 'Found 3 results', got: {:?}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn test_final_expression_captured_as_result() {
+        // §3.7: Final expression value should be captured in `result` field
+        let executor = CodeModeExecutor::new();
+        let result = executor
+            .execute(
+                "x = 40 + 2\nx",
+                &[],
+                |_name, _args| Box::pin(async { Ok(serde_json::json!("ok")) }),
+                |_prompt| Box::pin(async { Err("no rewrite".to_string()) }),
+            )
+            .await;
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        assert_eq!(
+            result.result,
+            Some(serde_json::json!(42)),
+            "Final expression should be captured as result"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_final_expression_result_is_none() {
+        // When code ends with a statement (not an expression), result should be None
+        let executor = CodeModeExecutor::new();
+        let result = executor
+            .execute(
+                "x = 42\nprint(x)",
+                &[],
+                |_name, _args| Box::pin(async { Ok(serde_json::json!("ok")) }),
+                |_prompt| Box::pin(async { Err("no rewrite".to_string()) }),
+            )
+            .await;
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        // print() returns None, which is filtered out
+        assert!(
+            result.result.is_none(),
+            "Result should be None when code has no trailing expression, got: {:?}",
+            result.result
+        );
+    }
+
+    #[test]
+    fn test_to_json_string_format() {
+        // §3.7: Return format must be {"output", "result", "success", "error"}
+        let result =
+            CodeModeResult::success("hello world".to_string()).with_result(serde_json::json!(42));
+        let json_str = result.to_json_string();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["output"], "hello world");
+        assert_eq!(parsed["result"], 42);
+        assert_eq!(parsed["success"], true);
+        assert!(parsed["error"].is_null());
+    }
+
+    #[test]
+    fn test_to_json_string_error_format() {
+        let result = CodeModeResult::fail("something broke");
+        let json_str = result.to_json_string();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["output"], "");
+        assert!(parsed["result"].is_null());
+        assert_eq!(parsed["success"], false);
+        assert_eq!(parsed["error"], "something broke");
     }
 }

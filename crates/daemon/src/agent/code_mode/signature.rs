@@ -5,57 +5,14 @@
 
 use std::collections::HashMap;
 
-use nevoflux_builtin_wasm::ToolDefinition;
+use nevoflux_builtin_wasm::{ToolDefinition, ASYNC_SAFE_TOOLS};
 use serde_json::Value;
 
-/// Tools safe for parallel execution (rendered as `async def`).
-/// All other tools default to sequential (`def`). This is fail-safe:
-/// a new tool not in this list defaults to sequential (slower but correct).
-const ASYNC_SAFE: &[&str] = &[
-    // Browser read-only
-    "browser_screenshot",
-    "browser_get_content",
-    "browser_get_elements",
-    "browser_get_element",
-    "browser_query_all",
-    "browser_get_markdown",
-    "browser_eval_js",
-    "browser_read_artifact",
-    "browser_get_tabs",
-    "browser_query_tabs",
-    "browser_find_elements",
-    "browser_element_info",
-    // Network
-    "web_search",
-    "web_fetch",
-    "fetch_page",
-    // File read-only
-    "read_file",
-    "read",
-    "glob",
-    "grep",
-    "list_files",
-    // Memory
-    "memory_search",
-    "memory_create",
-    "memory_update",
-    "memory_delete",
-    "memory_view",
-    "knowledge_teach",
-    // MCP
-    "mcp_list_tools",
-    "mcp_call",
-    "mcp_read_resource",
-    "tool_search",
-    "tool_call_dynamic",
-    // Meta
-    "think",
-    "switch_model",
-];
-
-/// Returns `true` if a tool must run sequentially (not in ASYNC_SAFE list).
+/// Returns `true` if a tool must run sequentially (not in the ASYNC_SAFE_TOOLS list).
+///
+/// Uses the canonical list from `nevoflux_builtin_wasm::ASYNC_SAFE_TOOLS`.
 pub fn is_sequential(name: &str) -> bool {
-    !ASYNC_SAFE.contains(&name)
+    !ASYNC_SAFE_TOOLS.contains(&name)
 }
 
 /// Maps a JSON Schema type definition to a Python type annotation string.
@@ -64,6 +21,14 @@ pub fn is_sequential(name: &str) -> bool {
 /// `anyOf` unions (including nullable types), and falls back to `Any` for
 /// unrecognized or empty schemas.
 pub fn json_schema_to_python_type(schema: &Value) -> String {
+    // Const takes priority — a single fixed value
+    if let Some(const_val) = schema.get("const") {
+        return match const_val {
+            Value::String(s) => format!("Literal[\"{s}\"]"),
+            other => format!("Literal[{other}]"),
+        };
+    }
+
     // Enum takes priority — even if "type" is also present
     if let Some(enum_values) = schema.get("enum") {
         if let Some(arr) = enum_values.as_array() {
@@ -119,7 +84,10 @@ pub fn format_default(val: &Value) -> String {
                 "False".to_string()
             }
         }
-        Value::String(s) => format!("\"{s}\""),
+        Value::String(s) => {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("\"{escaped}\"")
+        }
         Value::Number(n) => n.to_string(),
         Value::Array(arr) => {
             let items: Vec<String> = arr.iter().map(format_default).collect();
@@ -266,7 +234,7 @@ pub fn generate_full_stub(tool: &ToolDefinition) -> String {
     let param_docs = generate_param_docs(&tool.input_schema);
 
     let mut stub = format!("{keyword} {}({params}) -> Any:\n", tool.name);
-    stub.push_str(&format!("    \"\"\"{}",  tool.description));
+    stub.push_str(&format!("    \"\"\"{}", tool.description));
 
     if !param_docs.is_empty() {
         stub.push_str(&format!("\n\n{param_docs}\n"));
@@ -372,10 +340,7 @@ mod tests {
 
     #[test]
     fn test_null_type() {
-        assert_eq!(
-            json_schema_to_python_type(&json!({"type": "null"})),
-            "None"
-        );
+        assert_eq!(json_schema_to_python_type(&json!({"type": "null"})), "None");
     }
 
     #[test]
@@ -435,10 +400,38 @@ mod tests {
     #[test]
     fn test_nullable() {
         assert_eq!(
-            json_schema_to_python_type(
-                &json!({"anyOf": [{"type": "string"}, {"type": "null"}]})
-            ),
+            json_schema_to_python_type(&json!({"anyOf": [{"type": "string"}, {"type": "null"}]})),
             "str | None"
+        );
+    }
+
+    #[test]
+    fn test_format_default_escapes_special_chars() {
+        // String with quotes should be escaped
+        assert_eq!(
+            format_default(&serde_json::json!("hello \"world\"")),
+            "\"hello \\\"world\\\"\""
+        );
+        // String with backslash should be escaped
+        assert_eq!(
+            format_default(&serde_json::json!("path\\to\\file")),
+            "\"path\\\\to\\\\file\""
+        );
+    }
+
+    #[test]
+    fn test_const_string() {
+        assert_eq!(
+            json_schema_to_python_type(&json!({"const": "fixed_value"})),
+            "Literal[\"fixed_value\"]"
+        );
+    }
+
+    #[test]
+    fn test_const_number() {
+        assert_eq!(
+            json_schema_to_python_type(&json!({"const": 42})),
+            "Literal[42]"
         );
     }
 

@@ -6,11 +6,11 @@
 use crate::error::{DaemonError, Result};
 use futures::StreamExt;
 use nevoflux_llm::providers::claude_code::ClaudeCodeClient;
-use nevoflux_protocol::json_repair::parse_tool_arguments_json;
 use nevoflux_llm::providers::gemini_cli::GeminiCliClient;
 use nevoflux_llm::providers::kimi_agent::KimiAgentClient;
 use nevoflux_llm::providers::qwen::QwenClient;
 use nevoflux_llm::ProviderType;
+use nevoflux_protocol::json_repair::parse_tool_arguments_json;
 use rig::client::CompletionClient;
 use rig::client::Nothing;
 use rig::completion::{CompletionModel, ToolDefinition};
@@ -2446,7 +2446,7 @@ where
                                 "Updating accumulated tool call {} with call_id={:?}, signature={:?}",
                                 tc.id,
                                 tc.call_id,
-                                tc.signature.as_ref().map(|s| &s[..s.len().min(20)])
+                                tc.signature.as_ref().map(|s| &s[..s.floor_char_boundary(20)])
                             );
                             accumulated_tc.call_id = tc.call_id.clone();
                             accumulated_tc.signature = tc.signature.clone();

@@ -108,6 +108,19 @@ impl Server {
     }
 }
 
+/// Parse an agent mode string into `AgentMode`.
+///
+/// `"code"` is deprecated and silently maps to `AgentMode::Agent`.
+/// Unknown strings default to `AgentMode::Chat`.
+fn parse_agent_mode(mode_str: &str) -> AgentMode {
+    match mode_str {
+        "browser" => AgentMode::Browser,
+        "agent" => AgentMode::Agent,
+        "code" => AgentMode::Agent, // Code mode deprecated, maps to Agent
+        _ => AgentMode::Chat,
+    }
+}
+
 /// Find an available port in the range.
 pub async fn find_available_port(config: &ServerConfig) -> Result<u16> {
     use std::net::TcpListener;
@@ -1430,12 +1443,7 @@ async fn handle_chat_message_streaming(
         .get("payload")
         .and_then(|p| p.get("mode"))
         .and_then(|m| m.as_str())
-        .map(|m| match m {
-            "browser" => AgentMode::Browser,
-            "agent" => AgentMode::Agent,
-            "code" => AgentMode::Agent, // Code mode deprecated, maps to Agent
-            _ => AgentMode::Chat,
-        })
+        .map(parse_agent_mode)
         .unwrap_or(AgentMode::Chat);
 
     // Extract attachments (multimodal: images, files)
@@ -1867,9 +1875,23 @@ async fn handle_chat_message_streaming(
 
                 let to_send = &text;
                 if !to_send.is_empty() {
-                    send_chunk!(to_send.to_string(), $done, None::<&serde_json::Value>, None::<&nevoflux_protocol::ThinkingEvent>, is_first).is_ok()
+                    send_chunk!(
+                        to_send.to_string(),
+                        $done,
+                        None::<&serde_json::Value>,
+                        None::<&nevoflux_protocol::ThinkingEvent>,
+                        is_first
+                    )
+                    .is_ok()
                 } else if $done {
-                    send_chunk!("", true, None::<&serde_json::Value>, None::<&nevoflux_protocol::ThinkingEvent>, is_first).is_ok()
+                    send_chunk!(
+                        "",
+                        true,
+                        None::<&serde_json::Value>,
+                        None::<&nevoflux_protocol::ThinkingEvent>,
+                        is_first
+                    )
+                    .is_ok()
                 } else {
                     true
                 }
@@ -2828,12 +2850,7 @@ async fn handle_chat_message(
                 .get("payload")
                 .and_then(|p| p.get("mode"))
                 .and_then(|m| m.as_str())
-                .map(|m| match m {
-                    "browser" => AgentMode::Browser,
-                    "agent" => AgentMode::Agent,
-                    "code" => AgentMode::Agent, // Code mode deprecated, maps to Agent
-                    _ => AgentMode::Chat,
-                })
+                .map(parse_agent_mode)
                 .unwrap_or(AgentMode::Chat);
 
             // Extract attachments (multimodal: images, files)
@@ -5894,6 +5911,21 @@ mod tests {
         assert_eq!(config.port_start, 19500);
         assert_eq!(config.port_end, 19600);
         assert_eq!(config.bind_address, "127.0.0.1");
+    }
+
+    #[test]
+    fn test_parse_agent_mode() {
+        assert!(matches!(parse_agent_mode("browser"), AgentMode::Browser));
+        assert!(matches!(parse_agent_mode("agent"), AgentMode::Agent));
+        // §3.2: "code" deprecated, maps to Agent
+        #[allow(deprecated)]
+        {
+            assert!(matches!(parse_agent_mode("code"), AgentMode::Agent));
+        }
+        // Unknown defaults to Chat
+        assert!(matches!(parse_agent_mode("chat"), AgentMode::Chat));
+        assert!(matches!(parse_agent_mode("unknown"), AgentMode::Chat));
+        assert!(matches!(parse_agent_mode(""), AgentMode::Chat));
     }
 
     #[tokio::test]

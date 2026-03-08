@@ -488,44 +488,59 @@ pub struct ComputerUseFlags {
     pub inject_guide: bool,
     pub inject_examples: bool,
 }
+/// Tools safe for parallel execution (rendered as `async def` in orchestrate).
+/// All other tools default to sequential (`def`). This is fail-safe:
+/// a new tool not in this list defaults to sequential (slower but correct).
+///
+/// This is the canonical list — `daemon/code_mode/signature.rs` imports it.
+pub const ASYNC_SAFE_TOOLS: &[&str] = &[
+    // Browser read-only
+    "browser_screenshot",
+    "browser_get_content",
+    "browser_get_elements",
+    "browser_get_element",
+    "browser_query_all",
+    "browser_get_markdown",
+    "browser_eval_js",
+    "browser_read_artifact",
+    "browser_get_tabs",
+    "browser_query_tabs",
+    "browser_find_elements",
+    "browser_element_info",
+    // Network
+    "web_search",
+    "web_fetch",
+    "fetch_page",
+    // File read-only
+    "read_file",
+    "read",
+    "glob",
+    "grep",
+    "list_files",
+    // Memory
+    "memory_search",
+    "memory_create",
+    "memory_update",
+    "memory_delete",
+    "memory_view",
+    "knowledge_teach",
+    // MCP
+    "mcp_list_tools",
+    "mcp_call",
+    "mcp_read_resource",
+    "tool_search",
+    "tool_call_dynamic",
+    // Meta
+    "think",
+    "switch_model",
+];
+
 /// Check if a tool should be marked sequential in orchestrate signatures.
 ///
-/// Tools *not* in the ASYNC_SAFE list are sequential — they modify browser
+/// Tools *not* in the ASYNC_SAFE_TOOLS list are sequential — they modify browser
 /// state (navigation, clicks, etc.) and must be called one at a time.
 fn is_orchestrate_sequential(name: &str) -> bool {
-    const ASYNC_SAFE: &[&str] = &[
-        "browser_screenshot",
-        "browser_get_content",
-        "browser_get_elements",
-        "browser_get_element",
-        "browser_query_all",
-        "browser_get_markdown",
-        "browser_eval_js",
-        "browser_read_artifact",
-        "browser_get_tabs",
-        "browser_query_tabs",
-        "browser_find_elements",
-        "browser_element_info",
-        "web_search",
-        "web_fetch",
-        "fetch_page",
-        "read_file",
-        "read",
-        "glob",
-        "grep",
-        "list_files",
-        "memory_search",
-        "memory_create",
-        "memory_update",
-        "memory_delete",
-        "memory_view",
-        "knowledge_teach",
-        "tool_search",
-        "tool_call_dynamic",
-        "think",
-        "switch_model",
-    ];
-    !ASYNC_SAFE.contains(&name)
+    !ASYNC_SAFE_TOOLS.contains(&name)
 }
 
 /// Compact JSON Schema -> Python type (just primitives, no TypedDict).
@@ -2782,8 +2797,9 @@ The following skill instructions MUST be followed exactly. These instructions ta
         ]
     }
 
-    /// Get available tools for browser mode.
-    fn get_browser_tools(&self) -> Vec<ToolDefinition> {
+    /// Get available tools for browser mode (without orchestrate). Used by
+    /// `orchestrate_tool` and `get_agent_tools_without_orchestrate` to avoid recursion.
+    fn get_browser_tools_without_orchestrate(&self) -> Vec<ToolDefinition> {
         let mut tools = self.get_chat_tools();
 
         // Browser navigation
@@ -3142,12 +3158,19 @@ The following skill instructions MUST be followed exactly. These instructions ta
         tools
     }
 
+    /// Get available tools for browser mode (includes dynamically-generated orchestrate tool).
+    fn get_browser_tools(&self) -> Vec<ToolDefinition> {
+        let mut tools = self.get_browser_tools_without_orchestrate();
+        tools.push(self.orchestrate_tool(AgentMode::Browser));
+        tools
+    }
+
     /// Build the orchestrate ToolDefinition with dynamic signatures scoped to `mode`.
     fn orchestrate_tool(&self, mode: AgentMode) -> ToolDefinition {
         // Get tools for this mode *without* orchestrate to avoid recursion.
         let mode_tools = match mode {
             AgentMode::Chat => self.get_chat_tools(),
-            AgentMode::Browser => self.get_browser_tools(),
+            AgentMode::Browser => self.get_browser_tools_without_orchestrate(),
             AgentMode::Agent | AgentMode::Code => self.get_agent_tools_without_orchestrate(),
         };
 
@@ -3228,7 +3251,7 @@ comprehensions, f-strings, lambda, asyncio.gather\n\
     /// Get available tools for agent mode (without orchestrate). Used by
     /// `orchestrate_tool` to avoid infinite recursion.
     fn get_agent_tools_without_orchestrate(&self) -> Vec<ToolDefinition> {
-        let mut tools = self.get_browser_tools();
+        let mut tools = self.get_browser_tools_without_orchestrate();
 
         // Add file tools
         tools.push(ToolDefinition {
@@ -3373,7 +3396,7 @@ comprehensions, f-strings, lambda, asyncio.gather\n\
         // Dynamic tool discovery
         tools.push(ToolDefinition {
             name: "tool_search".into(),
-            description: "Search for available external tools (MCP) by keyword. Always search first — never guess tool names or schemas.".into(),
+            description: "Search for external MCP server tools only (NOT built-in tools like web_search, browser_*, bash, read, write). Use when you need tools from connected MCP servers. Always search first — never guess tool names or schemas.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -3843,7 +3866,12 @@ fn parse_tool_calls_from_text(text: &str) -> (String, Vec<ToolCall>) {
 
     loop {
         let Some(start_idx) = remaining.find("<tool_call>") else {
-            cleaned.push_str(remaining);
+            // If we already extracted tool calls, discard any trailing text —
+            // the model should have stopped after </tool_call> but may have
+            // hallucinated tool results, explanations, or other garbage.
+            if tool_calls.is_empty() {
+                cleaned.push_str(remaining);
+            }
             break;
         };
 
@@ -4266,6 +4294,86 @@ mod tests {
         let agent_tools = agent.get_tools_for_mode(AgentMode::Agent);
         assert!(agent_tools.iter().any(|t| t.name == "bash"));
         assert!(agent_tools.iter().any(|t| t.name == "subagent_spawn"));
+    }
+
+    #[test]
+    fn test_orchestrate_tool_in_browser_mode() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        let browser_tools = agent.get_browser_tools();
+        let orchestrate = browser_tools.iter().find(|t| t.name == "orchestrate");
+        assert!(
+            orchestrate.is_some(),
+            "Browser mode should include orchestrate tool"
+        );
+        let desc = &orchestrate.unwrap().description;
+        assert!(
+            desc.contains("browser_navigate"),
+            "Browser orchestrate should list browser tools"
+        );
+        assert!(
+            !desc.contains("bash"),
+            "Browser orchestrate should not list agent-only tools"
+        );
+    }
+
+    #[test]
+    fn test_orchestrate_tool_in_agent_mode() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        let agent_tools = agent.get_agent_tools();
+        let orchestrate = agent_tools.iter().find(|t| t.name == "orchestrate");
+        assert!(
+            orchestrate.is_some(),
+            "Agent mode should include orchestrate tool"
+        );
+        let desc = &orchestrate.unwrap().description;
+        assert!(
+            desc.contains("bash"),
+            "Agent orchestrate should list bash tool"
+        );
+        assert!(
+            desc.contains("async def"),
+            "Should contain async def signatures"
+        );
+        assert!(
+            desc.contains("[sequential]"),
+            "Should contain sequential markers"
+        );
+    }
+
+    #[test]
+    fn test_orchestrate_excludes_meta_tools() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        let agent_tools = agent.get_agent_tools();
+        let orchestrate = agent_tools
+            .iter()
+            .find(|t| t.name == "orchestrate")
+            .unwrap();
+        let desc = &orchestrate.description;
+        assert!(!desc.contains("  orchestrate("), "Should not list itself");
+        assert!(!desc.contains("  think("), "Should not list think tool");
+        assert!(!desc.contains("  plan("), "Should not list plan tool");
+        assert!(
+            !desc.contains("  load_computer_use_tools("),
+            "Should not list meta-tools"
+        );
+    }
+
+    #[test]
+    fn test_orchestrate_no_duplicate_in_agent_mode() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        let agent_tools = agent.get_agent_tools();
+        let orchestrate_count = agent_tools
+            .iter()
+            .filter(|t| t.name == "orchestrate")
+            .count();
+        assert_eq!(
+            orchestrate_count, 1,
+            "Agent mode should have exactly 1 orchestrate tool (not duplicated from browser)"
+        );
     }
 
     #[test]
@@ -4979,10 +5087,10 @@ mod tests {
 
         let browser_tools = agent.get_browser_tools();
         let chat_tools = agent.get_chat_tools();
-        // Browser tools = chat tools + 16 browser-specific tools
-        // (15 browser interaction tools + 1 load_computer_use_tools meta-tool)
+        // Browser tools = chat tools + 17 browser-specific tools
+        // (15 browser interaction tools + 1 load_computer_use_tools meta-tool + 1 orchestrate)
         // (browser_get_content, browser_get_markdown, browser_screenshot are already in chat tools)
-        assert_eq!(browser_tools.len(), chat_tools.len() + 16);
+        assert_eq!(browser_tools.len(), chat_tools.len() + 17);
     }
 
     #[test]
@@ -6065,5 +6173,63 @@ mod tests {
             .unwrap();
         let props = spawn_tool.input_schema["properties"].as_object().unwrap();
         assert!(props.contains_key("tab_id"));
+    }
+
+    // ---- parse_tool_calls_from_text tests ----
+
+    #[test]
+    fn test_parse_tool_calls_plain_text_only() {
+        let (cleaned, calls) = parse_tool_calls_from_text("Hello world");
+        assert_eq!(cleaned, "Hello world");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_parse_tool_calls_extracts_valid_call() {
+        let input = r#"Before <tool_call>{"id":"c1","name":"foo","arguments":{"x":1}}</tool_call> After"#;
+        let (cleaned, calls) = parse_tool_calls_from_text(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "foo");
+        // Text before the tag is kept
+        assert!(cleaned.contains("Before"));
+        // Trailing text after extracted tool call is discarded
+        assert!(!cleaned.contains("After"));
+    }
+
+    #[test]
+    fn test_parse_tool_calls_discards_hallucinated_tool_result() {
+        // Simulates LLM hallucinating both a tool_call and a tool_result
+        let input = concat!(
+            "<tool_call>{\"id\":\"c1\",\"name\":\"bar\",\"arguments\":{}}</tool_call>\n",
+            "[tool_result call_id=\"c1\"]\n",
+            "{\"output\":\"fake\"}\n",
+            "Here is the summary based on the results."
+        );
+        let (cleaned, calls) = parse_tool_calls_from_text(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bar");
+        // All trailing text (hallucinated result + explanation) must be discarded
+        assert!(!cleaned.contains("fake"));
+        assert!(!cleaned.contains("summary"));
+    }
+
+    #[test]
+    fn test_parse_tool_calls_no_closing_tag() {
+        let input = "Text <tool_call>{\"id\":\"c1\",\"name\":\"x\",\"arguments\":{}}";
+        let (cleaned, calls) = parse_tool_calls_from_text(input);
+        // No closing tag — keep everything as-is
+        assert!(calls.is_empty());
+        assert!(cleaned.contains("Text"));
+        assert!(cleaned.contains("<tool_call>"));
+    }
+
+    #[test]
+    fn test_parse_tool_calls_malformed_json() {
+        let input = "<tool_call>NOT JSON</tool_call> trailing";
+        let (cleaned, calls) = parse_tool_calls_from_text(input);
+        assert!(calls.is_empty());
+        // Malformed JSON kept as raw text, trailing text also kept (no calls extracted)
+        assert!(cleaned.contains("NOT JSON"));
+        assert!(cleaned.contains("trailing"));
     }
 }

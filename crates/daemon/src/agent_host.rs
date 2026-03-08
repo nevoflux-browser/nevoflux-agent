@@ -1564,7 +1564,10 @@ impl HostFunctions for DaemonHostFunctions {
                 .iter()
                 .map(|line| {
                     if line.len() > 2000 {
-                        format!("{}\u{2026}[truncated]", &line[..line.floor_char_boundary(2000)])
+                        format!(
+                            "{}\u{2026}[truncated]",
+                            &line[..line.floor_char_boundary(2000)]
+                        )
                     } else {
                         line.to_string()
                     }
@@ -2406,7 +2409,9 @@ impl HostFunctions for DaemonHostFunctions {
             };
 
             if result.success {
-                return Ok(result.output);
+                // Return JSON envelope per design §3.7:
+                // {output, result, success, error}
+                return Ok(result.to_json_string());
             } else {
                 return Err(HostError {
                     code: 100,
@@ -3517,7 +3522,10 @@ impl DaemonHostFunctions {
 
         // Truncate content if too long (keep first 50000 chars to leave room for response)
         let truncated_content = if content.len() > 50000 {
-            format!("{}...\n\n[Content truncated]", &content[..content.floor_char_boundary(50000)])
+            format!(
+                "{}...\n\n[Content truncated]",
+                &content[..content.floor_char_boundary(50000)]
+            )
         } else {
             content.to_string()
         };

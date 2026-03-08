@@ -34,6 +34,7 @@ pub enum AgentMode {
     Agent,
     /// Code mode - DEPRECATED. Maps to Agent mode internally.
     /// Kept for protocol backward compatibility.
+    #[deprecated(note = "Use AgentMode::Agent instead. Code mode maps to Agent internally.")]
     Code,
 }
 

@@ -92,15 +92,39 @@ impl ToolRegistry {
         let ctx = Arc::new(ctx);
 
         let browser_tools = [
+            // Core browser tools
             ("browser_get_markdown", BrowserToolAction::GetMarkdown),
             ("browser_snapshot", BrowserToolAction::Snapshot),
             ("browser_click_by_id", BrowserToolAction::ClickById),
             ("browser_type_by_id", BrowserToolAction::TypeById),
+            ("browser_fill_by_id", BrowserToolAction::FillById),
             ("browser_navigate", BrowserToolAction::Navigate),
+            ("browser_go_back", BrowserToolAction::GoBack),
+            ("browser_go_forward", BrowserToolAction::GoForward),
             ("browser_scroll", BrowserToolAction::Scroll),
             ("browser_get_tabs", BrowserToolAction::ListTabs),
+            ("browser_query_tabs", BrowserToolAction::QueryTabs),
+            ("browser_get_elements", BrowserToolAction::GetElements),
+            // Lower-level browser tools
+            ("browser_click", BrowserToolAction::Click),
+            ("browser_type", BrowserToolAction::Type),
+            ("browser_fill", BrowserToolAction::Fill),
+            ("browser_get_content", BrowserToolAction::GetContent),
+            ("browser_screenshot", BrowserToolAction::Screenshot),
+            ("browser_eval_js", BrowserToolAction::EvalJs),
+            ("browser_wait_for", BrowserToolAction::WaitFor),
+            ("browser_wait_for_stable", BrowserToolAction::WaitForStable),
+            ("browser_key_press", BrowserToolAction::KeyPress),
+            ("browser_get_element", BrowserToolAction::GetElement),
+            ("browser_query_all", BrowserToolAction::QueryAll),
+            // Artifact tools
+            ("browser_read_artifact", BrowserToolAction::ReadArtifact),
+            ("browser_edit_artifact", BrowserToolAction::EditArtifact),
+            // Web tools
             ("web_search", BrowserToolAction::WebSearch),
             ("fetch_page", BrowserToolAction::WebFetch),
+            // User interaction
+            ("browser_ask_user", BrowserToolAction::AskUser),
         ];
 
         for (name, action) in browser_tools {
@@ -213,8 +237,109 @@ impl ToolRegistry {
                 "",
                 "List all open browser tabs. Returns list of dicts with keys: id, url, title, active.",
             ),
+            "browser_fill_by_id" => (
+                "element_id: str, value: str, tab_id: int = None",
+                "Fill a form field by its snapshot ID (clears existing value first).",
+            ),
+            "browser_go_back" => (
+                "tab_id: int = None",
+                "Navigate back to the previous page.",
+            ),
+            "browser_go_forward" => (
+                "tab_id: int = None",
+                "Navigate forward to the next page.",
+            ),
+            "browser_query_tabs" => (
+                "url: str = None, title: str = None, active: bool = None",
+                "Query tabs with optional filters. Returns filtered list of tab dicts.",
+            ),
+            "browser_get_elements" => (
+                "tab_id: int = None",
+                "Get all interactive elements on the page. Returns list of element dicts.",
+            ),
+            "browser_click" => (
+                "selector: str, tab_id: int = None",
+                "Click an element by CSS selector.",
+            ),
+            "browser_type" => (
+                "selector: str, text: str, tab_id: int = None",
+                "Type text into an element by CSS selector.",
+            ),
+            "browser_fill" => (
+                "selector: str, value: str, tab_id: int = None",
+                "Fill a form field by CSS selector (clears existing value first).",
+            ),
+            "browser_get_content" => (
+                "tab_id: int = None",
+                "Get the full HTML content of the current page.",
+            ),
+            "browser_screenshot" => (
+                "tab_id: int = None",
+                "Take a screenshot of the current page. Returns base64 image data.",
+            ),
+            "browser_eval_js" => (
+                "expression: str, tab_id: int = None",
+                "Evaluate a JavaScript expression in the page context. Returns the result.",
+            ),
+            "browser_wait_for" => (
+                "selector: str, timeout_ms: int = 30000, tab_id: int = None",
+                "Wait for an element matching the selector to appear.",
+            ),
+            "browser_wait_for_stable" => (
+                "strategy: str = 'interaction', max_wait: int = 3000, tab_id: int = None",
+                "Wait for page to stabilize. strategy: 'navigation', 'interaction', or 'scroll'.",
+            ),
+            "browser_key_press" => (
+                "key: str, modifiers: list = None, tab_id: int = None",
+                "Press a keyboard key. key: 'Enter', 'Tab', 'Escape', etc.",
+            ),
+            "browser_get_element" => (
+                "selector: str, tab_id: int = None",
+                "Get a single element by CSS selector. Returns element dict.",
+            ),
+            "browser_query_all" => (
+                "selector: str, tab_id: int = None",
+                "Query all elements matching a CSS selector. Returns list of element dicts.",
+            ),
+            "browser_read_artifact" => (
+                "id: str, offset: int = None, limit: int = None, grep: str = None",
+                "Read the source code of a canvas artifact.",
+            ),
+            "browser_edit_artifact" => (
+                "id: str, old_str: str, new_str: str",
+                "Edit a canvas artifact using search-and-replace.",
+            ),
+            "browser_ask_user" => (
+                "question: str, options: list = None, allow_custom: bool = True",
+                "Ask the user a question and wait for response.",
+            ),
             _ => ("**kwargs", "Execute this tool with keyword arguments."),
         }
+    }
+
+    /// Build parameter name mappings for all registered tools.
+    ///
+    /// Extracts ordered parameter names from `tool_signature_hint`, which is the
+    /// same source used by `to_python_stubs`. Returns a map of tool name →
+    /// ordered param names, used by `positional_to_named_auto` in the executor.
+    pub fn param_mappings(&self) -> std::collections::HashMap<String, Vec<String>> {
+        let mut map = std::collections::HashMap::new();
+        for name in self.tool_names() {
+            let (sig, _) = Self::tool_signature_hint(name);
+            let names: Vec<String> = sig
+                .split(',')
+                .filter_map(|p| {
+                    let p = p.trim();
+                    if p.is_empty() || p == "**kwargs" {
+                        return None;
+                    }
+                    // Extract name before ':' (e.g., "path: str" → "path")
+                    p.split(':').next().map(|n| n.trim().to_string())
+                })
+                .collect();
+            map.insert(name.to_string(), names);
+        }
+        map
     }
 
     /// Generate Python function signatures for all registered tools.
@@ -270,7 +395,7 @@ impl ToolRegistry {
         prompt.push_str(
             "You are in Code Mode. You MUST write a single Python script to accomplish the task.\n",
         );
-        prompt.push_str("Do NOT make individual tool calls — write a ```python-exec script that orchestrates everything.\n\n");
+        prompt.push_str("Do NOT make individual tool calls — call the `orchestrate` tool with a single Python script.\n\n");
         prompt.push_str("Supported constructs:\n");
         prompt.push_str("- Statements: variable, def, if/elif/else, for/while, break, continue, try/except/finally, return, pass, del, assert, raise\n");
         prompt.push_str("- Expressions: arithmetic, comparison, boolean, f-string, lambda, comprehensions, ternary, slice, unpack, walrus (:=)\n");
@@ -288,7 +413,24 @@ impl ToolRegistry {
         prompt.push_str("- Instead of with: use try/finally or call tool directly\n\n");
         prompt.push_str(&self.tool_categories_summary());
         prompt.push_str("\nCall get_code_mode_context() to see full function signatures.\n");
-        prompt.push_str("\nReturn the Python code in a ```python-exec block (NOT ```python — that is for display-only code examples).\n");
+        prompt.push_str(
+            "\nPass the Python code via the `orchestrate` tool call with {\"code\": \"...\"}.\n",
+        );
+        prompt.push_str("\nIMPORTANT — plan before execute:\n");
+        prompt.push_str("- If the user explicitly asks to see a plan first, or asks for confirmation before executing, you MUST call the `plan` tool BEFORE writing any orchestrate code.\n");
+        prompt.push_str(
+            "- Wait for the user to confirm the plan. Only then proceed with orchestrate.\n",
+        );
+        prompt.push_str("- Keywords: \"先列出计划\", \"制定计划\", \"plan first\", \"confirm before\", \"我同意后\", \"确认后再执行\".\n\n");
+        prompt.push_str("IMPORTANT — orchestrate output rules:\n");
+        prompt.push_str(
+            "- Do NOT call canvas_render() or create_artifact() inside orchestrate scripts.\n",
+        );
+        prompt.push_str("- Do NOT generate HTML/CSS in orchestrate. Keep scripts focused on data collection and processing.\n");
+        prompt.push_str(
+            "- orchestrate should return structured data (print dicts/lists/text summaries).\n",
+        );
+        prompt.push_str("- To create reports, apps, or rich artifacts, call create_artifact as a SEPARATE tool call AFTER orchestrate completes, using the returned data.\n");
         prompt
     }
 
@@ -589,7 +731,6 @@ pub struct BrowserTool {
 }
 
 impl BrowserTool {
-
     /// Build the params JSON from tool arguments based on the action type.
     fn build_params(
         action: BrowserToolAction,
@@ -607,11 +748,28 @@ impl BrowserTool {
             });
 
         let params = match action {
-            BrowserToolAction::GetMarkdown | BrowserToolAction::Snapshot => {
+            BrowserToolAction::GetMarkdown
+            | BrowserToolAction::Snapshot
+            | BrowserToolAction::GoBack
+            | BrowserToolAction::GoForward
+            | BrowserToolAction::GetContent
+            | BrowserToolAction::Screenshot
+            | BrowserToolAction::GetElements => {
                 serde_json::json!({})
             }
-            BrowserToolAction::ListTabs => {
-                serde_json::json!({})
+            BrowserToolAction::ListTabs | BrowserToolAction::QueryTabs => {
+                // QueryTabs may have optional filters, pass through
+                let mut p = serde_json::Map::new();
+                if let Some(url) = arguments.get("url").and_then(|v| v.as_str()) {
+                    p.insert("url".into(), serde_json::json!(url));
+                }
+                if let Some(title) = arguments.get("title").and_then(|v| v.as_str()) {
+                    p.insert("title".into(), serde_json::json!(title));
+                }
+                if let Some(active) = arguments.get("active").and_then(|v| v.as_bool()) {
+                    p.insert("active".into(), serde_json::json!(active));
+                }
+                serde_json::Value::Object(p)
             }
             BrowserToolAction::ClickById => {
                 let element_id = arguments
@@ -625,17 +783,11 @@ impl BrowserTool {
                     .get("element_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let text = arguments
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let text = arguments.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 serde_json::json!({ "element_id": element_id, "text": text })
             }
             BrowserToolAction::Navigate => {
-                let url = arguments
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let url = arguments.get("url").and_then(|v| v.as_str()).unwrap_or("");
                 serde_json::json!({ "url": url })
             }
             BrowserToolAction::Scroll => {
@@ -657,10 +809,7 @@ impl BrowserTool {
                 serde_json::json!({ "query": query, "max_results": 10, "timeout_ms": 30000 })
             }
             BrowserToolAction::WebFetch => {
-                let url = arguments
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let url = arguments.get("url").and_then(|v| v.as_str()).unwrap_or("");
                 serde_json::json!({
                     "url": url,
                     "timeout_ms": 30000,
@@ -668,9 +817,140 @@ impl BrowserTool {
                     "max_length": 100000
                 })
             }
-            _ => {
-                // Pass through all arguments as params
-                arguments.clone()
+            BrowserToolAction::FillById => {
+                let element_id = arguments
+                    .get("element_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let value = arguments
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                serde_json::json!({ "element_id": element_id, "value": value })
+            }
+            BrowserToolAction::Click => {
+                let selector = arguments
+                    .get("selector")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                serde_json::json!({ "selector": selector })
+            }
+            BrowserToolAction::Type => {
+                let selector = arguments
+                    .get("selector")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let text = arguments.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                serde_json::json!({ "selector": selector, "text": text })
+            }
+            BrowserToolAction::Fill => {
+                let selector = arguments
+                    .get("selector")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let value = arguments
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                serde_json::json!({ "selector": selector, "value": value })
+            }
+            BrowserToolAction::EvalJs => {
+                let expression = arguments
+                    .get("expression")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                serde_json::json!({ "expression": expression })
+            }
+            BrowserToolAction::WaitFor => {
+                let selector = arguments
+                    .get("selector")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let timeout_ms = arguments
+                    .get("timeout_ms")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(30000);
+                serde_json::json!({ "selector": selector, "timeout_ms": timeout_ms })
+            }
+            BrowserToolAction::WaitForStable => {
+                let strategy = arguments
+                    .get("strategy")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("interaction");
+                let max_wait = arguments
+                    .get("max_wait")
+                    .or_else(|| arguments.get("maxWait"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(3000);
+                serde_json::json!({ "strategy": strategy, "maxWait": max_wait })
+            }
+            BrowserToolAction::KeyPress => {
+                let key = arguments.get("key").and_then(|v| v.as_str()).unwrap_or("");
+                let mut p = serde_json::json!({ "key": key });
+                if let Some(modifiers) = arguments.get("modifiers") {
+                    p["modifiers"] = modifiers.clone();
+                }
+                p
+            }
+            BrowserToolAction::GetElement => {
+                let selector = arguments
+                    .get("selector")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                serde_json::json!({ "selector": selector })
+            }
+            BrowserToolAction::QueryAll => {
+                let selector = arguments
+                    .get("selector")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                serde_json::json!({ "selector": selector })
+            }
+            BrowserToolAction::ReadArtifact => {
+                let id = arguments.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let mut p = serde_json::json!({ "id": id });
+                if let Some(offset) = arguments.get("offset") {
+                    p["offset"] = offset.clone();
+                }
+                if let Some(limit) = arguments.get("limit") {
+                    p["limit"] = limit.clone();
+                }
+                if let Some(grep) = arguments.get("grep") {
+                    p["grep"] = grep.clone();
+                }
+                if let Some(context) = arguments.get("context") {
+                    p["context"] = context.clone();
+                }
+                p
+            }
+            BrowserToolAction::EditArtifact => {
+                let id = arguments.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                let old_str = arguments
+                    .get("old_str")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let new_str = arguments
+                    .get("new_str")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                serde_json::json!({ "id": id, "old_str": old_str, "new_str": new_str })
+            }
+            BrowserToolAction::AskUser => {
+                let question = arguments
+                    .get("question")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let mut p = serde_json::json!({ "question": question });
+                if let Some(options) = arguments.get("options") {
+                    p["options"] = options.clone();
+                }
+                if let Some(allow_custom) = arguments.get("allow_custom") {
+                    p["allow_custom"] = allow_custom.clone();
+                }
+                if let Some(timeout_ms) = arguments.get("timeout_ms") {
+                    p["timeout_ms"] = timeout_ms.clone();
+                }
+                p
             }
         };
 
@@ -722,16 +1002,16 @@ impl ToolExecutor for BrowserTool {
 
         let (response_tx, response_rx) = oneshot::channel();
 
-        self.ctx.sender
+        self.ctx
+            .sender
             .send((request, response_tx))
             .await
             .map_err(|_| DaemonError::InternalError("Failed to send browser request".into()))?;
 
-        let response: BrowserResponse =
-            tokio::time::timeout(Duration::from_secs(30), response_rx)
-                .await
-                .map_err(|_| DaemonError::InternalError("Browser request timed out".into()))?
-                .map_err(|_| DaemonError::InternalError("Response channel closed".into()))?;
+        let response: BrowserResponse = tokio::time::timeout(Duration::from_secs(30), response_rx)
+            .await
+            .map_err(|_| DaemonError::InternalError("Browser request timed out".into()))?
+            .map_err(|_| DaemonError::InternalError("Response channel closed".into()))?;
 
         if response.success {
             match response.result {
@@ -825,18 +1105,43 @@ mod tests {
         assert!(names.contains(&"canvas_render"));
         assert!(names.contains(&"run_command"));
 
-        // Browser tools
+        // Core browser tools
         assert!(names.contains(&"browser_get_markdown"));
         assert!(names.contains(&"browser_snapshot"));
         assert!(names.contains(&"browser_click_by_id"));
         assert!(names.contains(&"browser_type_by_id"));
+        assert!(names.contains(&"browser_fill_by_id"));
         assert!(names.contains(&"browser_navigate"));
+        assert!(names.contains(&"browser_go_back"));
+        assert!(names.contains(&"browser_go_forward"));
         assert!(names.contains(&"browser_scroll"));
         assert!(names.contains(&"browser_get_tabs"));
+        assert!(names.contains(&"browser_query_tabs"));
+        assert!(names.contains(&"browser_get_elements"));
 
-        // Web tools (previously stub-only)
+        // Lower-level browser tools
+        assert!(names.contains(&"browser_click"));
+        assert!(names.contains(&"browser_type"));
+        assert!(names.contains(&"browser_fill"));
+        assert!(names.contains(&"browser_get_content"));
+        assert!(names.contains(&"browser_screenshot"));
+        assert!(names.contains(&"browser_eval_js"));
+        assert!(names.contains(&"browser_wait_for"));
+        assert!(names.contains(&"browser_wait_for_stable"));
+        assert!(names.contains(&"browser_key_press"));
+        assert!(names.contains(&"browser_get_element"));
+        assert!(names.contains(&"browser_query_all"));
+
+        // Artifact tools
+        assert!(names.contains(&"browser_read_artifact"));
+        assert!(names.contains(&"browser_edit_artifact"));
+
+        // Web tools
         assert!(names.contains(&"web_search"));
         assert!(names.contains(&"fetch_page"));
+
+        // User interaction
+        assert!(names.contains(&"browser_ask_user"));
     }
 
     #[tokio::test]
@@ -897,7 +1202,7 @@ mod tests {
         assert!(prompt.contains("Code Mode"));
         assert!(prompt.contains("DO NOT use"));
         assert!(prompt.contains("class"));
-        assert!(prompt.contains("```python-exec"));
+        assert!(prompt.contains("orchestrate"));
     }
 
     #[test]
@@ -927,6 +1232,46 @@ mod tests {
         assert!(content.contains("def read_file("));
         assert!(content.contains("def write_file("));
         assert!(content.contains("# Available tool functions"));
+    }
+
+    #[test]
+    fn test_param_mappings_basic() {
+        let registry = ToolRegistry::new();
+        let mappings = registry.param_mappings();
+
+        // read_file has "path" param
+        assert_eq!(mappings.get("read_file"), Some(&vec!["path".to_string()]));
+
+        // write_file has "path" and "content"
+        let wf = mappings.get("write_file").unwrap();
+        assert_eq!(wf.len(), 2);
+        assert!(wf.contains(&"path".to_string()));
+        assert!(wf.contains(&"content".to_string()));
+
+        // run_command has "command"
+        assert_eq!(
+            mappings.get("run_command"),
+            Some(&vec!["command".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_param_mappings_browser() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let registry = ToolRegistry::with_browser(BrowserContext {
+            sender: tx,
+            proxy_id: String::new(),
+            client_identity: vec![],
+        });
+        let mappings = registry.param_mappings();
+
+        // browser_navigate has "url" and "tab_id"
+        let nav = mappings.get("browser_navigate").unwrap();
+        assert!(nav.contains(&"url".to_string()));
+        assert!(nav.contains(&"tab_id".to_string()));
+
+        // web_search has "query"
+        assert_eq!(mappings.get("web_search"), Some(&vec!["query".to_string()]));
     }
 
     #[test]

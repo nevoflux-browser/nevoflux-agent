@@ -34,7 +34,7 @@ pub mod agent;
 pub mod host;
 pub mod types;
 
-pub use agent::{Agent, AgentConfig};
+pub use agent::{Agent, AgentConfig, ASYNC_SAFE_TOOLS};
 pub use host::{HostError, HostFunctions, HostResult};
 pub use nevoflux_protocol::LocalFileRef;
 pub use types::{

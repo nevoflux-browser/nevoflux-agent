@@ -13,7 +13,6 @@ pub use abi::{
     PendingToolCall, ToolResult, ABI_VERSION, ABI_VERSION_FUNC, ALLOC_FUNC, ENTRY_POINT, FREE_FUNC,
     MEMORY_EXPORT,
 };
-pub use code_mode::execute_code_mode;
 pub use computer_tools::{
     create_mock_computer, register_computer_tools, GetDisplaysTool, GetMousePositionTool,
     MouseClickTool, MouseDragTool, MouseMoveTool, MouseScrollTool, PressKeyTool, ScreenshotTool,

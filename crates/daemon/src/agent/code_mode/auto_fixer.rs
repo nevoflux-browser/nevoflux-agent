@@ -44,6 +44,7 @@ impl MontyAutoFixer {
         let code = Self::rewrite_re(&code);
         let code = Self::rewrite_datetime(&code);
         let code = Self::rewrite_random(&code);
+        let code = Self::rewrite_time(&code);
 
         // Phase 3: Per-line transforms
         let mut result_lines: Vec<String> = Vec::new();
@@ -205,36 +206,36 @@ impl MontyAutoFixer {
         // Check if any sorted() or .sort() call uses keyword arguments
         let has_sorted_key = code.contains("sorted(") && code.contains("key=");
         let has_sorted_reverse = code.contains("sorted(") && code.contains("reverse=");
-        let has_sort_method = code.contains(".sort(") && (code.contains("key=") || code.contains("reverse="));
+        let has_sort_method =
+            code.contains(".sort(") && (code.contains("key=") || code.contains("reverse="));
 
         if !has_sorted_key && !has_sorted_reverse && !has_sort_method {
             return code.to_string();
         }
 
-        // Inject helper function at the top
+        // Inject helper function at the top.
+        // Uses insertion sort with slice concatenation to avoid subscript
+        // assignment (result[i] = x), which Monty does not support.
         let helper = r#"def _keysort(items, key_fn=None, reverse=False):
-    result = list(items)
-    n = len(result)
-    for i in range(n):
-        for j in range(i + 1, n):
-            a = result[i]
-            b = result[j]
-            if key_fn:
-                va = key_fn(a)
-                vb = key_fn(b)
-            else:
-                va = a
-                vb = b
-            swap = False
+    result = []
+    for item in items:
+        k = key_fn(item) if key_fn else item
+        inserted = False
+        for i in range(len(result)):
+            rk = key_fn(result[i]) if key_fn else result[i]
+            do_insert = False
             if reverse:
-                if va < vb:
-                    swap = True
+                if k > rk:
+                    do_insert = True
             else:
-                if va > vb:
-                    swap = True
-            if swap:
-                result[i] = b
-                result[j] = a
+                if k < rk:
+                    do_insert = True
+            if do_insert:
+                result = result[:i] + [item] + result[i:]
+                inserted = True
+                break
+        if not inserted:
+            result.append(item)
     return result
 "#;
 
@@ -372,7 +373,10 @@ impl MontyAutoFixer {
         }
 
         if !key_fn.is_empty() && !reverse.is_empty() {
-            format!("{} = _keysort({}, {}, {})", var_name, var_name, key_fn, reverse)
+            format!(
+                "{} = _keysort({}, {}, {})",
+                var_name, var_name, key_fn, reverse
+            )
         } else if !key_fn.is_empty() {
             format!("{} = _keysort({}, {})", var_name, var_name, key_fn)
         } else if !reverse.is_empty() {
@@ -1388,6 +1392,40 @@ impl MontyAutoFixer {
                 ));
             }
             result = result.replace("random.sample(", "_random_sample(");
+        }
+
+        format!("{}\n{}", helpers.trim(), result)
+    }
+
+    /// Rewrite `time.sleep(N)` → `run_command("sleep N")`.
+    /// Also handles `time.time()` for elapsed-time patterns.
+    fn rewrite_time(code: &str) -> String {
+        if !code.contains("time.") {
+            return code.to_string();
+        }
+
+        let mut helpers = String::new();
+        let mut result = code.to_string();
+
+        if code.contains("time.sleep(") {
+            helpers.push_str(concat!(
+                "def _time_sleep(seconds):\n",
+                "    run_command(\"sleep \" + str(seconds))\n",
+            ));
+            result = result.replace("time.sleep(", "_time_sleep(");
+        }
+
+        if code.contains("time.time(") {
+            helpers.push_str(concat!(
+                "def _time_time():\n",
+                "    out = run_command('python3 -c \"import time; print(time.time())\"')\n",
+                "    return float(out.strip())\n",
+            ));
+            result = result.replace("time.time()", "_time_time()");
+        }
+
+        if helpers.is_empty() {
+            return result;
         }
 
         format!("{}\n{}", helpers.trim(), result)

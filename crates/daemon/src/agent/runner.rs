@@ -692,71 +692,17 @@ fn extract_tool_params_summary(tool_name: &str, args: &serde_json::Value) -> Opt
         .map(|v| serde_json::json!({ key: v }).to_string())
 }
 
-/// Fence marker for python-exec code blocks.
-pub const PYTHON_EXEC_FENCE: &str = "```python-exec";
-
-/// Extract Python code from markdown \`\`\`python-exec blocks in LLM response.
-/// Only matches the `python-exec` fence marker (not plain `python`),
-/// so normal code examples in responses are never accidentally executed.
-/// Returns None if no `python-exec` code block is found.
-pub fn extract_python_block(text: &str) -> Option<String> {
-    extract_fenced_block(text, PYTHON_EXEC_FENCE)
-}
-
 /// Extract Python code from any Python-flavored markdown fence.
 ///
 /// Tries markers in order: ```python-exec, ```python, ```py, ```.
 /// Used by the LLM rewrite path where the LLM may wrap code in any fence style.
 pub fn extract_any_python_block(text: &str) -> Option<String> {
-    for marker in &[PYTHON_EXEC_FENCE, "```python", "```py", "```"] {
+    for marker in &["```python-exec", "```python", "```py", "```"] {
         if let Some(code) = extract_fenced_block(text, marker) {
             return Some(code);
         }
     }
     None
-}
-
-/// Strip the \`\`\`python-exec code block from text, keeping surrounding content.
-///
-/// Returns the text with the fenced block removed. If the block is the entire
-/// content, returns an empty string. Used to hide executed code from the sidebar.
-pub fn strip_python_exec_block(text: &str) -> String {
-    let marker = PYTHON_EXEC_FENCE;
-    let Some(start) = text.find(marker) else {
-        return text.to_string();
-    };
-    // Find the closing fence after the opening marker
-    let after_marker = start + marker.len();
-    let remaining = &text[after_marker..];
-    // Find end of the opening line
-    let Some(nl) = remaining.find('\n') else {
-        return text[..start].trim_end().to_string();
-    };
-    let body_start = after_marker + nl + 1;
-    // Find closing ``` on its own line
-    let closing = text[body_start..]
-        .find("\n```")
-        .map(|p| body_start + p + 1); // position of the ```
-    let block_end = match closing {
-        Some(pos) => {
-            // Skip past the ``` and any remaining chars on that line
-            let after_close = pos + 3;
-            text[after_close..]
-                .find('\n')
-                .map(|nl| after_close + nl + 1)
-                .unwrap_or(text.len())
-        }
-        None => text.len(), // No closing fence — strip to end
-    };
-
-    let before = text[..start].trim_end();
-    let after = text[block_end..].trim_start();
-    match (before.is_empty(), after.is_empty()) {
-        (true, true) => String::new(),
-        (true, false) => after.to_string(),
-        (false, true) => before.to_string(),
-        (false, false) => format!("{}\n\n{}", before, after),
-    }
 }
 
 /// Extract code from a markdown fence with the given marker prefix.
@@ -1172,65 +1118,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_python_block() {
-        let text = "Here's the code:\n```python-exec\nx = 1 + 2\nprint(x)\n```\nDone.";
-        let code = extract_python_block(text);
-        assert_eq!(code, Some("x = 1 + 2\nprint(x)".to_string()));
-    }
-
-    #[test]
-    fn test_extract_python_block_none() {
-        let text = "No code here, just text.";
-        assert_eq!(extract_python_block(text), None);
-    }
-
-    #[test]
-    fn test_extract_python_block_empty() {
-        let text = "```python-exec\n```";
-        assert_eq!(extract_python_block(text), None);
-    }
-
-    #[test]
-    fn test_extract_python_block_with_surrounding_text() {
-        let text = "I'll write a script for you:\n\n```python-exec\nresult = read_file(\"/tmp/test.txt\")\nfor line in result.split(\"\\n\"):\n    print(line)\n```\n\nThis will read and print each line.";
-        let code = extract_python_block(text).unwrap();
-        assert!(code.contains("read_file"));
-        assert!(code.contains("for line in"));
-    }
-
-    #[test]
-    fn test_extract_python_block_ignores_plain_python() {
-        // Plain ```python blocks should NOT be extracted (display-only code)
-        let text = "Here's an example:\n```python\nx = 1 + 2\nprint(x)\n```\nThat's how it works.";
-        assert_eq!(extract_python_block(text), None);
-    }
-
-    #[test]
-    fn test_extract_python_block_extra_backticks() {
-        // LLM sometimes uses 4+ backticks
-        let text = "````python-exec\nx = 42\nprint(x)\n````";
-        let code = extract_python_block(text).unwrap();
-        assert_eq!(code, "x = 42\nprint(x)");
-        assert!(!code.starts_with('`'));
-    }
-
-    #[test]
-    fn test_extract_python_block_trailing_space_on_marker() {
-        // Trailing space after marker
-        let text = "```python-exec \nx = 1\n```";
-        let code = extract_python_block(text).unwrap();
-        assert_eq!(code, "x = 1");
-    }
-
-    #[test]
-    fn test_extract_python_block_crlf() {
-        // Windows-style line endings
-        let text = "```python-exec\r\nx = 1\r\n```";
-        let code = extract_python_block(text).unwrap();
-        assert_eq!(code, "x = 1");
-    }
-
-    #[test]
     fn test_extract_any_python_block_prefers_python_exec() {
         let text = "```python-exec\nx = 1\n```";
         let code = extract_any_python_block(text).unwrap();
@@ -1263,42 +1150,6 @@ mod tests {
     fn test_extract_any_python_block_no_fence() {
         let text = "x = 1\nprint(x)";
         assert!(extract_any_python_block(text).is_none());
-    }
-
-    #[test]
-    fn test_strip_python_exec_block_only_code() {
-        let text = "```python-exec\nx = 1\nprint(x)\n```";
-        assert_eq!(strip_python_exec_block(text), "");
-    }
-
-    #[test]
-    fn test_strip_python_exec_block_with_preamble() {
-        let text = "I'll analyze the page for you.\n\n```python-exec\nprint('hello')\n```";
-        assert_eq!(
-            strip_python_exec_block(text),
-            "I'll analyze the page for you."
-        );
-    }
-
-    #[test]
-    fn test_strip_python_exec_block_with_trailing_text() {
-        let text = "```python-exec\nprint('hello')\n```\n\nDone!";
-        assert_eq!(strip_python_exec_block(text), "Done!");
-    }
-
-    #[test]
-    fn test_strip_python_exec_block_with_both() {
-        let text = "Let me run this:\n\n```python-exec\nprint('hello')\n```\n\nAbove is the result.";
-        assert_eq!(
-            strip_python_exec_block(text),
-            "Let me run this:\n\nAbove is the result."
-        );
-    }
-
-    #[test]
-    fn test_strip_python_exec_block_no_block() {
-        let text = "No code here, just text.";
-        assert_eq!(strip_python_exec_block(text), "No code here, just text.");
     }
 
     #[test]
