@@ -2,6 +2,7 @@
 //!
 //! These types are serialized via MessagePack for efficient transfer.
 
+use nevoflux_protocol::subagent::ToolsConfig;
 use nevoflux_protocol::{Artifact, LocalFileRef, PlanProposal};
 use serde::{Deserialize, Serialize};
 
@@ -278,6 +279,13 @@ pub struct AgentInput {
     /// TOOLS.md, and AGENTS.md for persona and knowledge injection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soul_context: Option<String>,
+    /// Tool filtering config for this agent instance.
+    ///
+    /// - `None` (Option::None): inherit the mode's full tool set
+    /// - `Some(ToolsConfig::None)`: disable all tools (single text response)
+    /// - `Some(ToolsConfig::Allow(list))`: allowlist with wildcard support
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_config: Option<ToolsConfig>,
 }
 
 /// Skill context for injection into system prompt.
@@ -584,6 +592,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
         assert_eq!(input.mode, AgentMode::Agent);
         assert_eq!(input.history.len(), 1);
@@ -606,6 +615,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
         assert!(input.custom_system_prompt.is_some());
         assert!(input
@@ -631,6 +641,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         assert!(json.contains("custom_system_prompt"));
@@ -651,6 +662,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
         let json2 = serde_json::to_string(&input_no_prompt).unwrap();
         assert!(!json2.contains("custom_system_prompt"));
@@ -857,6 +869,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         assert!(json.contains("local_files"));
@@ -883,6 +896,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         // Empty vec should not be serialized
@@ -905,6 +919,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
         assert_eq!(input.tab_id, Some(42));
 
@@ -927,6 +942,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
         let json2 = serde_json::to_string(&input_no_tab).unwrap();
         assert!(!json2.contains("tab_id"));
@@ -967,6 +983,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
         assert_eq!(input.tab_ids.len(), 3);
         assert_eq!(input.tab_ids[0].space, "Work");
@@ -997,6 +1014,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
         let json2 = serde_json::to_string(&input_no_tabs).unwrap();
         assert!(!json2.contains("tab_ids"));

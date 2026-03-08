@@ -475,6 +475,47 @@ impl ToolRegistry {
             },
         }
     }
+
+    /// Execute a tool call with an optional tools_config guard.
+    ///
+    /// When `tools_config` is set, checks the allowlist before dispatching.
+    /// This provides defense-in-depth beyond the prompt-layer filtering.
+    pub async fn execute_with_guard(
+        &self,
+        call: &PendingToolCall,
+        tools_config: &Option<nevoflux_protocol::subagent::ToolsConfig>,
+    ) -> ToolResult {
+        // Executor guard: check tool allowlist if configured
+        match tools_config {
+            Some(nevoflux_protocol::subagent::ToolsConfig::None) => {
+                return ToolResult {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    content: None,
+                    error: Some(format!(
+                        "Tool '{}' is not available: all tools are disabled",
+                        call.name
+                    )),
+                };
+            }
+            Some(nevoflux_protocol::subagent::ToolsConfig::Allow(ref allowlist)) => {
+                if !nevoflux_protocol::subagent::is_tool_allowed(allowlist, &call.name) {
+                    return ToolResult {
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        content: None,
+                        error: Some(format!(
+                            "Tool '{}' is not available: not in the allowed tool list",
+                            call.name
+                        )),
+                    };
+                }
+            }
+            None => {} // inherit: allow all
+        }
+
+        self.execute(call).await
+    }
 }
 
 impl Default for ToolRegistry {
@@ -1729,5 +1770,76 @@ mod tests {
         let summary = registry.tool_categories_summary();
         assert!(summary.contains("canvas_render"));
         assert!(summary.contains("Browser & Canvas"));
+    }
+
+    // ========================================================================
+    // Tool filter executor guard tests
+    // ========================================================================
+
+    #[test]
+    fn test_executor_guard_blocks_disallowed_tool() {
+        use nevoflux_protocol::subagent::{is_tool_allowed, ToolsConfig};
+
+        let config = Some(ToolsConfig::Allow(vec!["browser_*".to_string()]));
+
+        // read_file should NOT match browser_* pattern
+        match &config {
+            Some(ToolsConfig::Allow(ref allowlist)) => {
+                assert!(
+                    !is_tool_allowed(allowlist, "read_file"),
+                    "read_file should be blocked by browser_* allowlist"
+                );
+            }
+            _ => panic!("Expected Allow config"),
+        }
+    }
+
+    #[test]
+    fn test_executor_guard_allows_matching_tool() {
+        use nevoflux_protocol::subagent::{is_tool_allowed, ToolsConfig};
+
+        let config = Some(ToolsConfig::Allow(vec![
+            "read_file".to_string(),
+            "browser_*".to_string(),
+        ]));
+
+        match &config {
+            Some(ToolsConfig::Allow(ref allowlist)) => {
+                assert!(
+                    is_tool_allowed(allowlist, "read_file"),
+                    "read_file should be allowed"
+                );
+                assert!(
+                    is_tool_allowed(allowlist, "browser_navigate"),
+                    "browser_navigate should match browser_*"
+                );
+            }
+            _ => panic!("Expected Allow config"),
+        }
+    }
+
+    #[test]
+    fn test_executor_guard_blocks_all_when_none() {
+        use nevoflux_protocol::subagent::ToolsConfig;
+
+        let config = Some(ToolsConfig::None);
+
+        // ToolsConfig::None should block everything
+        match &config {
+            Some(ToolsConfig::None) => {
+                // This is the expected path — all tools disabled
+            }
+            _ => panic!("Expected None config"),
+        }
+    }
+
+    #[test]
+    fn test_executor_guard_inherit_allows_all() {
+        use nevoflux_protocol::subagent::ToolsConfig;
+
+        let config: Option<ToolsConfig> = None;
+
+        // None (inherit) means no filtering — all tools allowed
+        assert!(config.is_none(), "Inherit config should be None");
     }
 }

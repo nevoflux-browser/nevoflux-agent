@@ -697,6 +697,9 @@ The following skill instructions MUST be followed exactly. These instructions ta
             self.get_tools_for_mode(mode)
         };
 
+        // Apply tool filtering based on tools_config
+        tools = self.filter_tools(tools, &input.tools_config);
+
         // When user attached specific tabs, update browser tool tab_id descriptions
         // to guide the LLM toward the attached tabs instead of defaulting to current_tab.
         if !input.tab_ids.is_empty() {
@@ -737,6 +740,26 @@ The following skill instructions MUST be followed exactly. These instructions ta
             AgentMode::Browser => self.get_browser_tools(),
             AgentMode::Agent => self.get_agent_tools(),
             AgentMode::Code => self.get_agent_tools(),
+        }
+    }
+
+    /// Filter tools based on the tools_config.
+    ///
+    /// - `None` (Option::None / inherit): returns the full tool set unchanged
+    /// - `Some(ToolsConfig::None)`: returns an empty vec (no tools)
+    /// - `Some(ToolsConfig::Allow(list))`: keeps only tools matching the allowlist
+    fn filter_tools(
+        &self,
+        tools: Vec<ToolDefinition>,
+        tools_config: &Option<nevoflux_protocol::subagent::ToolsConfig>,
+    ) -> Vec<ToolDefinition> {
+        match tools_config {
+            None => tools, // inherit: full tool set
+            Some(nevoflux_protocol::subagent::ToolsConfig::None) => Vec::new(),
+            Some(nevoflux_protocol::subagent::ToolsConfig::Allow(ref allowlist)) => tools
+                .into_iter()
+                .filter(|t| nevoflux_protocol::subagent::is_tool_allowed(allowlist, &t.name))
+                .collect(),
         }
     }
 
@@ -1105,6 +1128,13 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
             // If no tool calls, we're done
             if response.tool_calls.is_empty() {
+                final_text = response.text;
+                break;
+            }
+
+            // When tools are disabled (empty tools vec), ignore any tool_use blocks
+            // and treat the response as a final text response.
+            if tools.is_empty() {
                 final_text = response.text;
                 break;
             }
@@ -4251,6 +4281,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
 
         // Should run successfully with custom prompt
@@ -4450,6 +4481,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -4475,6 +4507,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -4500,6 +4533,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -4546,6 +4580,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -5168,6 +5203,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
 
         // Should complete normally
@@ -5197,6 +5233,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
 
         // Should exit early due to interrupt
@@ -6286,5 +6323,128 @@ mod tests {
         // Malformed JSON kept as raw text, trailing text also kept (no calls extracted)
         assert!(cleaned.contains("NOT JSON"));
         assert!(cleaned.contains("trailing"));
+    }
+
+    // ========================================================================
+    // Tool filtering tests
+    // ========================================================================
+
+    #[test]
+    fn test_tool_filter_allow_list() {
+        use nevoflux_protocol::subagent::ToolsConfig;
+
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        // Get the full browser tool set
+        let all_tools = agent.get_browser_tools();
+        assert!(!all_tools.is_empty(), "Browser mode should have tools");
+
+        // Filter with browser_* wildcard
+        let config = Some(ToolsConfig::Allow(vec!["browser_*".to_string()]));
+        let filtered = agent.filter_tools(all_tools.clone(), &config);
+
+        // All filtered tools should start with "browser_"
+        assert!(!filtered.is_empty(), "Should have some browser tools");
+        for tool in &filtered {
+            assert!(
+                tool.name.starts_with("browser_"),
+                "Tool '{}' should start with 'browser_'",
+                tool.name
+            );
+        }
+
+        // Should have fewer tools than the full set (which includes non-browser tools)
+        assert!(
+            filtered.len() <= all_tools.len(),
+            "Filtered set should be <= full set"
+        );
+    }
+
+    #[test]
+    fn test_tool_filter_none() {
+        use nevoflux_protocol::subagent::ToolsConfig;
+
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let all_tools = agent.get_agent_tools();
+        assert!(!all_tools.is_empty(), "Agent mode should have tools");
+
+        // Filter with ToolsConfig::None should return empty vec
+        let config = Some(ToolsConfig::None);
+        let filtered = agent.filter_tools(all_tools, &config);
+
+        assert!(
+            filtered.is_empty(),
+            "ToolsConfig::None should disable all tools"
+        );
+    }
+
+    #[test]
+    fn test_tool_filter_inherit() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let all_tools = agent.get_agent_tools();
+        let tool_count = all_tools.len();
+        assert!(tool_count > 0, "Agent mode should have tools");
+
+        // Filter with None (inherit) should return the full set
+        let config: Option<nevoflux_protocol::subagent::ToolsConfig> = None;
+        let filtered = agent.filter_tools(all_tools, &config);
+
+        assert_eq!(
+            filtered.len(),
+            tool_count,
+            "Inherit (None) should return full tool set"
+        );
+    }
+
+    #[test]
+    fn test_tool_filter_allow_multiple_patterns() {
+        use nevoflux_protocol::subagent::ToolsConfig;
+
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let all_tools = agent.get_agent_tools();
+
+        // Filter with specific tools + wildcard
+        let config = Some(ToolsConfig::Allow(vec![
+            "browser_*".to_string(),
+            "read".to_string(),
+        ]));
+        let filtered = agent.filter_tools(all_tools, &config);
+
+        // Should include browser tools and read
+        let has_browser = filtered.iter().any(|t| t.name.starts_with("browser_"));
+        let has_read = filtered.iter().any(|t| t.name == "read");
+        assert!(has_browser, "Should include browser tools");
+        assert!(has_read, "Should include read tool");
+
+        // Should not include tools outside the allowlist
+        let has_bash = filtered.iter().any(|t| t.name == "bash");
+        assert!(!has_bash, "Should not include bash tool");
+    }
+
+    #[test]
+    fn test_tool_filter_allow_empty_list() {
+        use nevoflux_protocol::subagent::ToolsConfig;
+
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let all_tools = agent.get_chat_tools();
+        assert!(!all_tools.is_empty());
+
+        // Empty allowlist means nothing matches
+        let config = Some(ToolsConfig::Allow(vec![]));
+        let filtered = agent.filter_tools(all_tools, &config);
+
+        assert!(
+            filtered.is_empty(),
+            "Empty allowlist should match no tools"
+        );
     }
 }

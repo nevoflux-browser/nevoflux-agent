@@ -131,6 +131,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -164,6 +165,7 @@ mod tests {
                 available_models: vec![],
                 mcp_servers: vec![],
                 soul_context: None,
+                tools_config: None,
             };
 
             let output = agent.run(&input);
@@ -190,6 +192,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -221,6 +224,7 @@ mod tests {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
 
         let output = agent.run(&input);

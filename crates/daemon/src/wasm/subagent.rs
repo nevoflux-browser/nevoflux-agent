@@ -79,6 +79,8 @@ pub struct SubagentHandle {
     completion: Arc<Notify>,
     /// Kill flag for cooperative termination.
     kill_flag: Arc<AtomicBool>,
+    /// Timestamp when this subagent was spawned.
+    pub spawn_time: std::time::Instant,
 }
 
 impl SubagentHandle {
@@ -93,6 +95,7 @@ impl SubagentHandle {
             result: Arc::new(RwLock::new(None)),
             completion: Arc::new(Notify::new()),
             kill_flag: Arc::new(AtomicBool::new(false)),
+            spawn_time: std::time::Instant::now(),
         }
     }
 
@@ -215,6 +218,7 @@ impl Clone for SubagentHandle {
             result: self.result.clone(),
             completion: self.completion.clone(),
             kill_flag: self.kill_flag.clone(),
+            spawn_time: self.spawn_time,
         }
     }
 }
@@ -485,6 +489,7 @@ impl SubagentExecutor {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
+            tools_config: None,
         };
 
         // Check for kill before running
@@ -749,5 +754,35 @@ mod tests {
         // Only running subagent should remain
         assert_eq!(executor.handles.read().unwrap().len(), 1);
         assert!(executor.get(2).is_some());
+    }
+
+    #[test]
+    fn test_subagent_handle_spawn_time() {
+        let before = std::time::Instant::now();
+        let handle = SubagentHandle::new(1, "task".into(), "agent".into(), None);
+        let after = std::time::Instant::now();
+
+        // spawn_time should be between before and after
+        assert!(handle.spawn_time >= before);
+        assert!(handle.spawn_time <= after);
+    }
+
+    #[test]
+    fn test_subagent_handle_spawn_time_duration() {
+        let handle = SubagentHandle::new(1, "task".into(), "agent".into(), None);
+
+        // Small sleep to verify elapsed time tracking works
+        std::thread::sleep(Duration::from_millis(10));
+
+        let elapsed = handle.spawn_time.elapsed();
+        assert!(elapsed.as_millis() >= 10);
+    }
+
+    #[test]
+    fn test_subagent_handle_clone_preserves_spawn_time() {
+        let handle = SubagentHandle::new(1, "task".into(), "agent".into(), None);
+        let cloned = handle.clone();
+
+        assert_eq!(handle.spawn_time, cloned.spawn_time);
     }
 }

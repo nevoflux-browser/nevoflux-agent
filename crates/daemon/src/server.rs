@@ -1818,6 +1818,7 @@ async fn handle_chat_message_streaming(
             );
             sc
         },
+        tools_config: None,
     };
 
     // Create cancellation token for this streaming session
@@ -2119,6 +2120,7 @@ async fn handle_chat_message_streaming(
                             available_models: config.llm.configured_providers(),
                             mcp_servers: mcp_servers.clone(),
                             soul_context: build_soul_context(&services),
+                            tools_config: None,
                         };
 
                         // Spawn stream forwarder for re-run
@@ -3061,6 +3063,7 @@ async fn handle_chat_message(
                 available_models: config.llm.configured_providers(),
                 mcp_servers,
                 soul_context: build_soul_context(&services),
+                tools_config: None,
             };
 
             // Run agent

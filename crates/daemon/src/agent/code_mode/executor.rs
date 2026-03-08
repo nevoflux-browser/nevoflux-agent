@@ -623,9 +623,13 @@ use std::sync::Arc;
 /// convert positional args (JSON arrays from Monty) to named args (JSON objects
 /// for ToolRegistry).  When a tool is not present in the map, extra positional
 /// arguments are assigned generic names (`arg0`, `arg1`, ...).
+///
+/// `tools_config` optionally restricts which tools can be executed at runtime.
+/// When set, the executor guard checks the allowlist before dispatching.
 fn build_registry_and_executor(
     browser_ctx: Option<BrowserContext>,
     param_mappings: HashMap<String, Vec<String>>,
+    tools_config: Option<nevoflux_protocol::subagent::ToolsConfig>,
 ) -> (
     Vec<String>,
     impl Fn(
@@ -653,14 +657,35 @@ fn build_registry_and_executor(
         .collect();
 
     let param_cache = Arc::new(effective_mappings);
+    let tools_config = Arc::new(tools_config);
 
     let tool_executor = move |name: &str, args: serde_json::Value| {
         let name = name.to_string();
         let args = args.clone();
         let registry = shared_registry.clone();
         let mappings = param_cache.clone();
+        let tools_config = tools_config.clone();
         let fut: Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send>> =
             Box::pin(async move {
+                // Executor guard: check tool allowlist if configured
+                match tools_config.as_ref() {
+                    Some(nevoflux_protocol::subagent::ToolsConfig::None) => {
+                        return Err(format!(
+                            "Tool '{}' is not available: all tools are disabled",
+                            name
+                        ));
+                    }
+                    Some(nevoflux_protocol::subagent::ToolsConfig::Allow(ref allowlist)) => {
+                        if !nevoflux_protocol::subagent::is_tool_allowed(allowlist, &name) {
+                            return Err(format!(
+                                "Tool '{}' is not available: not in the allowed tool list",
+                                name
+                            ));
+                        }
+                    }
+                    None => {} // inherit: allow all
+                }
+
                 let param_names = mappings.get(&name).cloned().unwrap_or_default();
                 let named_args = positional_to_named_auto(&param_names, &args);
                 let call = crate::agent::abi::PendingToolCall {
@@ -717,7 +742,7 @@ pub fn execute_python_simple(code: &str, browser_ctx: Option<BrowserContext>) ->
     // Build param mappings from registry tool definitions.
     // Empty mappings = positional args use generic names (arg0, arg1, ...).
     // When SignatureCache is wired in from the caller, real mappings will be provided.
-    let (external_names, tool_executor) = build_registry_and_executor(browser_ctx, HashMap::new());
+    let (external_names, tool_executor) = build_registry_and_executor(browser_ctx, HashMap::new(), None);
     let executor = CodeModeExecutor::new();
 
     let llm_rewrite =
@@ -754,7 +779,7 @@ pub fn execute_python_with_llm(
     model: String,
 ) -> CodeModeResult {
     let runtime = tokio::runtime::Handle::current();
-    let (external_names, tool_executor) = build_registry_and_executor(browser_ctx, HashMap::new());
+    let (external_names, tool_executor) = build_registry_and_executor(browser_ctx, HashMap::new(), None);
     let executor = CodeModeExecutor::new();
 
     let llm_rewrite =
