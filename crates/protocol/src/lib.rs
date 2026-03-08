@@ -30,6 +30,7 @@ pub mod envelope;
 mod error;
 pub mod json_repair;
 pub mod mcp;
+pub mod subagent;
 
 // Re-export main types at crate root
 pub use channel::Channel;
