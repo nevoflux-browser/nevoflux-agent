@@ -817,4 +817,36 @@ Always add tests.
         assert!(body.contains("fn main()"));
         assert!(body.contains("Always add tests."));
     }
+
+    #[test]
+    fn test_builtin_roles_parse() {
+        // Path to built-in role files relative to daemon crate
+        let builtin_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../builtin-wasm/prompts/agents");
+
+        let expected_roles = vec![
+            ("explorer", "browser", 10),
+            ("researcher", "browser", 20),
+            ("worker", "agent", 15),
+            ("reader", "agent", 10),
+        ];
+
+        for (name, mode, max_iter) in expected_roles {
+            let path = builtin_dir.join(format!("{}.md", name));
+            assert!(path.exists(), "Built-in role file not found: {}", path.display());
+
+            let content = std::fs::read_to_string(&path).unwrap();
+            let (meta, body) = parse_role_frontmatter(&content).unwrap();
+
+            assert_eq!(meta.name, name, "Name mismatch for {}", name);
+            assert!(!meta.description.is_empty(), "Description empty for {}", name);
+            assert_eq!(meta.mode, mode, "Mode mismatch for {}", name);
+            assert_eq!(meta.max_iterations, max_iter, "max_iterations mismatch for {}", name);
+            assert!(!body.is_empty(), "Body empty for {}", name);
+
+            // Verify it validates as a definition too
+            let def = AgentRoleDefinition::from_metadata_and_body(meta, body).unwrap();
+            assert_eq!(def.name, name);
+        }
+    }
 }
