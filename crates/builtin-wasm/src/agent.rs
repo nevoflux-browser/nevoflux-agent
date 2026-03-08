@@ -2020,11 +2020,32 @@ The following skill instructions MUST be followed exactly. These instructions ta
             }
             // Subagent tools
             "subagent_spawn" => {
-                let task = tool_call.arguments["task"].as_str().unwrap_or("");
-                let mode = tool_call.arguments["mode"].as_str().unwrap_or("agent");
-                let tab_id = tool_call.arguments["tab_id"].as_i64();
-                let id = self.host.subagent_spawn(task, mode, tab_id)?;
-                format!("Spawned sub-agent with ID: {}", id)
+                // If args contain role-system fields, use new JSON config path
+                if tool_call.arguments.get("role").is_some()
+                    || tool_call.arguments.get("tools").is_some()
+                    || tool_call.arguments.get("provider").is_some()
+                    || tool_call.arguments.get("system_prompt").is_some()
+                {
+                    // New path: serialize entire args as SpawnSubagentConfig JSON
+                    // Rename "task" -> "prompt" for SpawnSubagentConfig compatibility
+                    let mut config_obj = tool_call.arguments.clone();
+                    if let Some(task_val) = config_obj.get("task").cloned() {
+                        config_obj
+                            .as_object_mut()
+                            .map(|m| m.insert("prompt".to_string(), task_val));
+                        config_obj.as_object_mut().map(|m| m.remove("task"));
+                    }
+                    let config_json = serde_json::to_string(&config_obj).unwrap_or_default();
+                    let id = self.host.subagent_spawn(&config_json, "agent", None)?;
+                    format!("Spawned sub-agent with ID: {}", id)
+                } else {
+                    // Legacy path: extract task, mode, tab_id as before
+                    let task = tool_call.arguments["task"].as_str().unwrap_or("");
+                    let mode = tool_call.arguments["mode"].as_str().unwrap_or("agent");
+                    let tab_id = tool_call.arguments["tab_id"].as_i64();
+                    let id = self.host.subagent_spawn(task, mode, tab_id)?;
+                    format!("Spawned sub-agent with ID: {}", id)
+                }
             }
             "subagent_wait_all" => {
                 let ids: Vec<u64> = tool_call.arguments["ids"]
@@ -2054,6 +2075,9 @@ The following skill instructions MUST be followed exactly. These instructions ta
             "subagent_list" => {
                 let list = self.host.subagent_list()?;
                 serde_json::to_string_pretty(&list).unwrap_or_default()
+            }
+            "list_agents" => {
+                self.host.list_agents()?
             }
             // orchestrate: execute a Python script in sandboxed Monty interpreter
             // to orchestrate multiple tool calls in a single script.
@@ -2126,6 +2150,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 | "subagent_wait"
                 | "subagent_kill"
                 | "subagent_list"
+                | "list_agents"
         ) || name.starts_with("computer_")
             || name.starts_with("browser_")
     }
@@ -3192,6 +3217,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                         | "subagent_status"
                         | "subagent_kill"
                         | "subagent_list"
+                        | "list_agents"
                         | "skill_load"
                 )
             })
@@ -3731,7 +3757,7 @@ comprehensions, f-strings, lambda, asyncio.gather\n\
         // Subagent tools for parallel work
         tools.push(ToolDefinition {
             name: "subagent_spawn".into(),
-            description: "Spawn a lightweight subagent for a focused parallel task. Returns an ID. Subagents have NO page interaction — read-only browser access (with tab_id) and web search. Use for: parallel research, parallel summarization, independent subtasks.".into(),
+            description: "Spawn a lightweight subagent for a focused parallel task. Returns an ID. Subagents have NO page interaction — read-only browser access (with tab_id) and web search. Use for: parallel research, parallel summarization, independent subtasks. Use list_agents to discover available roles.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -3748,6 +3774,26 @@ comprehensions, f-strings, lambda, asyncio.gather\n\
                     "tab_id": {
                         "type": "integer",
                         "description": "Optional tab ID for the sub-agent to read page content from (read-only access)"
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Named role to apply (e.g. 'researcher', 'explorer'). Use list_agents to see available roles."
+                    },
+                    "system_prompt": {
+                        "type": "string",
+                        "description": "Custom system prompt override for the sub-agent"
+                    },
+                    "provider": {
+                        "type": "string",
+                        "description": "LLM provider name (e.g. 'anthropic', 'openai'). Required when specifying model."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model name override (requires provider to be set)"
+                    },
+                    "max_iterations": {
+                        "type": "integer",
+                        "description": "Maximum iterations before timeout"
                     }
                 },
                 "required": ["task"]
@@ -3822,6 +3868,15 @@ comprehensions, f-strings, lambda, asyncio.gather\n\
         tools.push(ToolDefinition {
             name: "subagent_list".into(),
             description: "List all sub-agents with their IDs, tasks, modes, and statuses.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "list_agents".into(),
+            description: "List available agent roles for subagent spawning. Returns role names and descriptions. Use these roles with subagent_spawn's role parameter.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {}

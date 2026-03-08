@@ -473,6 +473,12 @@ pub trait HostFunctions {
     /// A list of sub-agent information.
     fn subagent_list(&self) -> HostResult<Vec<SubagentInfo>>;
 
+    /// List available agent roles for subagent spawning.
+    ///
+    /// Returns a JSON string of `Vec<AgentRoleSummary>` for WASM ABI compatibility.
+    /// Returns an empty list if no role registry is configured.
+    fn list_agents(&self) -> HostResult<String>;
+
     // =========================================================================
     // Streaming Functions
     // =========================================================================
@@ -1175,6 +1181,11 @@ impl HostFunctions for MockHostFunctions {
 
     fn subagent_list(&self) -> HostResult<Vec<SubagentInfo>> {
         Ok(self.subagents.borrow().clone())
+    }
+
+    fn list_agents(&self) -> HostResult<String> {
+        // Mock: return empty list
+        Ok("[]".to_string())
     }
 
     fn stream_emit(&self, _text: &str) -> HostResult<()> {

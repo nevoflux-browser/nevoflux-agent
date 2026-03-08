@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -167,8 +168,8 @@ pub fn parse_role_frontmatter(content: &str) -> Result<(AgentRoleMetadata, Strin
 pub struct AgentRoleRegistry {
     /// L1 summaries (name -> description)
     summaries: HashMap<String, AgentRoleSummary>,
-    /// L2 cached full definitions
-    definitions: HashMap<String, AgentRoleDefinition>,
+    /// L2 cached full definitions (RwLock for interior mutability through &self)
+    definitions: RwLock<HashMap<String, AgentRoleDefinition>>,
     /// User role definitions directory
     user_dir: PathBuf,
     /// Built-in role definitions directory
@@ -180,7 +181,7 @@ impl AgentRoleRegistry {
     pub fn new(user_dir: PathBuf, builtin_dir: PathBuf) -> Self {
         Self {
             summaries: HashMap::new(),
-            definitions: HashMap::new(),
+            definitions: RwLock::new(HashMap::new()),
             user_dir,
             builtin_dir,
         }
@@ -193,7 +194,7 @@ impl AgentRoleRegistry {
     /// Returns the total number of roles found.
     pub fn scan(&mut self) -> Result<usize, String> {
         self.summaries.clear();
-        self.definitions.clear();
+        self.definitions.write().unwrap().clear();
 
         // Scan builtin directory first
         self.scan_directory(&self.builtin_dir.clone())?;
@@ -212,14 +213,26 @@ impl AgentRoleRegistry {
     ///
     /// Checks the definition cache first. On cache miss, loads from
     /// the user directory first, falling back to the built-in directory.
-    pub fn get(&mut self, name: &str) -> Result<&AgentRoleDefinition, String> {
-        if self.definitions.contains_key(name) {
-            return Ok(&self.definitions[name]);
+    /// Returns a cloned definition to avoid holding the lock.
+    pub fn get(&self, name: &str) -> Result<AgentRoleDefinition, String> {
+        // Check cache first
+        {
+            let cache = self.definitions.read().unwrap();
+            if let Some(def) = cache.get(name) {
+                return Ok(def.clone());
+            }
         }
 
+        // Load from disk
         let definition = self.load_definition(name)?;
-        self.definitions.insert(name.to_string(), definition);
-        Ok(&self.definitions[name])
+
+        // Cache it
+        {
+            let mut cache = self.definitions.write().unwrap();
+            cache.insert(name.to_string(), definition.clone());
+        }
+
+        Ok(definition)
     }
 
     /// Scan a single directory for role definition files.
@@ -642,7 +655,7 @@ You test things.
         assert_eq!(def2.name, "tester");
 
         // Verify it's in the cache
-        assert!(registry.definitions.contains_key("tester"));
+        assert!(registry.definitions.read().unwrap().contains_key("tester"));
     }
 
     #[test]

@@ -34,6 +34,7 @@ use nevoflux_builtin_wasm::{
 };
 use nevoflux_llm::ProviderType;
 use nevoflux_mcp::ToolResultContent;
+use nevoflux_protocol::subagent::{AgentRoleSummary, SpawnSubagentConfig};
 use nevoflux_protocol::BrowserToolAction;
 use nevoflux_storage::VectorSearchResult;
 use std::collections::HashMap;
@@ -3165,6 +3166,17 @@ impl HostFunctions for DaemonHostFunctions {
                 message: "Subagents cannot spawn further subagents".into(),
             });
         }
+
+        // Try to parse task as SpawnSubagentConfig JSON (new role-aware path)
+        if let Ok(config) = serde_json::from_str::<SpawnSubagentConfig>(task) {
+            debug!(
+                "subagent_spawn (config): prompt='{}', role={:?}, mode={:?}",
+                config.prompt, config.role, config.mode
+            );
+            return self.spawn_with_config(config);
+        }
+
+        // Legacy path: old-style (task, mode, tab_id) call
         debug!(
             "subagent_spawn: task='{}', mode={}, tab_id={:?}",
             task, mode, tab_id
@@ -3209,6 +3221,30 @@ impl HostFunctions for DaemonHostFunctions {
             agent_mode,
             tab_id,
         )
+    }
+
+    fn list_agents(&self) -> HostResult<String> {
+        if self.is_subagent {
+            return Err(HostError {
+                code: 403,
+                message: "Agent role listing not available for subagents".into(),
+            });
+        }
+
+        let summaries: Vec<AgentRoleSummary> = if let Some(services) = &self.services {
+            if let Some(registry) = services.role_registry() {
+                registry.list()
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+
+        serde_json::to_string(&summaries).map_err(|e| HostError {
+            code: 500,
+            message: format!("Failed to serialize agent roles: {}", e),
+        })
     }
 
     fn subagent_status(&self, id: u64) -> HostResult<String> {
@@ -3806,6 +3842,111 @@ impl DaemonHostFunctions {
         self.record_site_adaptation(action, &params_for_adaptation, success, &error_msg);
 
         host_result
+    }
+
+    /// Spawn a subagent using a `SpawnSubagentConfig` (role-aware path).
+    ///
+    /// Resolves the role definition (if specified), merges config layers
+    /// (defaults <- role <- spawn params), and dispatches to the executor.
+    fn spawn_with_config(&self, config: SpawnSubagentConfig) -> HostResult<u64> {
+        // 1. Validate: model without provider
+        if config.model.is_some() && config.provider.is_none() {
+            return Err(HostError {
+                code: 400,
+                message: "model requires provider to be specified".into(),
+            });
+        }
+
+        // 2. Resolve role definition if specified
+        let role_def = if let Some(role_name) = &config.role {
+            let registry = self
+                .services
+                .as_ref()
+                .and_then(|s| s.role_registry())
+                .ok_or_else(|| HostError {
+                    code: 500,
+                    message: "Role registry not available".into(),
+                })?;
+
+            let def = registry.get(role_name).map_err(|e| HostError {
+                code: 404,
+                message: format!("Role '{}' not found: {}", role_name, e),
+            })?;
+            Some(def)
+        } else {
+            None
+        };
+
+        // 3. Merge config: defaults <- role <- spawn params
+        let final_mode_str = config
+            .mode
+            .or(role_def.as_ref().map(|r| r.mode.clone()))
+            .unwrap_or_else(|| "agent".to_string());
+
+        let agent_mode = match final_mode_str.as_str() {
+            "chat" => AgentMode::Chat,
+            "browser" => AgentMode::Browser,
+            _ => AgentMode::Agent,
+        };
+
+        let final_system_prompt = config
+            .system_prompt
+            .or(role_def.as_ref().map(|r| r.system_prompt.clone()));
+
+        let _final_provider = config
+            .provider
+            .or(role_def.as_ref().and_then(|r| r.provider.clone()));
+
+        let _final_model = config
+            .model
+            .or(role_def.as_ref().and_then(|r| r.model.clone()));
+
+        let _final_tools_config = config
+            .tools
+            .or(role_def.as_ref().and_then(|r| r.tools_config.clone()));
+
+        let _final_max_iterations = config
+            .max_iterations
+            .or(role_def.as_ref().map(|r| r.max_iterations));
+
+        let tab_id = config.tab_id;
+
+        // 4. Build custom prompt
+        let custom_prompt = final_system_prompt.unwrap_or_else(|| {
+            Agent::<DaemonHostFunctions>::subagent_prompt_for_mode(agent_mode).to_string()
+        });
+
+        // 5. Dispatch to executor
+        if let Some(services) = &self.services {
+            if let Some(executor) = &services.subagent_executor {
+                debug!("Using WASM sandboxed executor for role-aware subagent");
+
+                let handle = executor
+                    .spawn(config.prompt, agent_mode, Some(custom_prompt), tab_id)
+                    .map_err(|e| HostError {
+                        code: 500,
+                        message: format!("Failed to spawn subagent: {}", e),
+                    })?;
+
+                // TODO: Pass _final_provider, _final_model, _final_tools_config,
+                // _final_max_iterations to the executor. Provider/model override
+                // and tool filtering will be wired in follow-up tasks.
+                return Ok(handle.id);
+            }
+        }
+
+        // Fall back to legacy implementation
+        debug!("Using legacy Tokio-based subagent execution for role-aware spawn");
+        Self::spawn_legacy_subagent_impl(
+            &self.subagent_registry,
+            &self.config,
+            &self.runtime,
+            &self.services,
+            &config.prompt,
+            &final_mode_str,
+            agent_mode,
+            tab_id,
+        )
     }
 
     /// Legacy subagent spawn implementation using Tokio tasks.
