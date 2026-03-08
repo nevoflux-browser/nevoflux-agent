@@ -4,6 +4,7 @@
 //! dependencies needed by Wasm host functions to interact with
 //! the NevoFlux system.
 
+use crate::agent::roles::AgentRoleRegistry;
 use crate::learning::retriever::KnowledgeRetriever;
 use crate::wasm::subagent::SubagentExecutor;
 use nevoflux_computer::ComputerController;
@@ -145,6 +146,8 @@ pub struct HostServices {
     /// When set, enables the subagent_spawn host function to create
     /// isolated WASM instances for sub-agent execution.
     pub subagent_executor: Option<Arc<SubagentExecutor>>,
+    /// Agent role registry for subagent role definitions.
+    pub role_registry: Option<Arc<AgentRoleRegistry>>,
     /// Current client identity for routing browser tool responses.
     pub client_identity: Vec<u8>,
     /// Current proxy ID for the response envelope.
@@ -200,6 +203,7 @@ impl HostServices {
             browser_sender: None,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             subagent_executor: None,
+            role_registry: None,
             client_identity: Vec::new(),
             proxy_id: String::new(),
             knowledge_retriever: None,
@@ -225,6 +229,7 @@ impl HostServices {
             browser_sender: None,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             subagent_executor: None,
+            role_registry: None,
             client_identity: Vec::new(),
             proxy_id: String::new(),
             knowledge_retriever: None,
@@ -353,6 +358,17 @@ impl HostServices {
     pub fn with_subagent_executor(mut self, executor: Arc<SubagentExecutor>) -> Self {
         self.subagent_executor = Some(executor);
         self
+    }
+
+    /// Set the agent role registry.
+    pub fn with_role_registry(mut self, registry: Arc<AgentRoleRegistry>) -> Self {
+        self.role_registry = Some(registry);
+        self
+    }
+
+    /// Get the agent role registry.
+    pub fn role_registry(&self) -> Option<&Arc<AgentRoleRegistry>> {
+        self.role_registry.as_ref()
     }
 
     /// Set the client context for routing browser tool responses.
@@ -487,6 +503,10 @@ impl std::fmt::Debug for HostServices {
             .field(
                 "subagent_executor",
                 &self.subagent_executor.as_ref().map(|_| "Some(...)"),
+            )
+            .field(
+                "role_registry",
+                &self.role_registry.as_ref().map(|_| "Some(...)"),
             )
             .field(
                 "knowledge_retriever",

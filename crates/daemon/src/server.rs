@@ -706,11 +706,29 @@ pub async fn start_server(
         info!("Learning system disabled by config");
     }
 
+    // Create agent role registry
+    let role_registry = {
+        let user_dir = dirs::config_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+            .join("nevoflux")
+            .join("agents");
+        let builtin_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../builtin-wasm/prompts/agents");
+        let mut registry = crate::agent::roles::AgentRoleRegistry::new(user_dir, builtin_dir);
+        if let Err(e) = registry.scan() {
+            tracing::warn!("Failed to scan agent roles: {}", e);
+        } else {
+            tracing::info!("Loaded {} agent roles", registry.list().len());
+        }
+        Arc::new(registry)
+    };
+
     let mut services = HostServices::new(Arc::new(db))
         .with_browser_sender(browser_tx)
         .with_mcp_manager(mcp_manager)
         .with_tool_search(tool_search_index)
-        .with_vector_index(vector_index);
+        .with_vector_index(vector_index)
+        .with_role_registry(role_registry);
     if let Some(ref emb) = embedding {
         services = services.with_embedding(Arc::clone(emb));
     }
