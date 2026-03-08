@@ -119,9 +119,7 @@ pub fn matches_tool_pattern(pattern: &str, tool_name: &str) -> bool {
 ///
 /// Returns `true` if any pattern in the allowlist matches.
 pub fn is_tool_allowed(allowlist: &[String], tool_name: &str) -> bool {
-    allowlist
-        .iter()
-        .any(|p| matches_tool_pattern(p, tool_name))
+    allowlist.iter().any(|p| matches_tool_pattern(p, tool_name))
 }
 
 #[cfg(test)]
@@ -150,10 +148,7 @@ mod tests {
 
     #[test]
     fn test_is_tool_allowed() {
-        let allowlist = vec![
-            "browser_*".to_string(),
-            "read_file".to_string(),
-        ];
+        let allowlist = vec!["browser_*".to_string(), "read_file".to_string()];
         assert!(is_tool_allowed(&allowlist, "browser_navigate"));
         assert!(is_tool_allowed(&allowlist, "browser_click"));
         assert!(is_tool_allowed(&allowlist, "read_file"));
@@ -179,10 +174,7 @@ mod tests {
 
     #[test]
     fn test_tools_config_serde_allow() {
-        let config = ToolsConfig::Allow(vec![
-            "browser_*".to_string(),
-            "read_file".to_string(),
-        ]);
+        let config = ToolsConfig::Allow(vec!["browser_*".to_string(), "read_file".to_string()]);
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: ToolsConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, config);

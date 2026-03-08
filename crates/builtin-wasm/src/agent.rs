@@ -2106,9 +2106,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let list = self.host.subagent_list()?;
                 serde_json::to_string_pretty(&list).unwrap_or_default()
             }
-            "list_agents" => {
-                self.host.list_agents()?
-            }
+            "list_agents" => self.host.list_agents()?,
             // orchestrate: execute a Python script in sandboxed Monty interpreter
             // to orchestrate multiple tool calls in a single script.
             "orchestrate" => {
@@ -6278,7 +6276,8 @@ mod tests {
 
     #[test]
     fn test_parse_tool_calls_extracts_valid_call() {
-        let input = r#"Before <tool_call>{"id":"c1","name":"foo","arguments":{"x":1}}</tool_call> After"#;
+        let input =
+            r#"Before <tool_call>{"id":"c1","name":"foo","arguments":{"x":1}}</tool_call> After"#;
         let (cleaned, calls) = parse_tool_calls_from_text(input);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "foo");
@@ -6442,9 +6441,6 @@ mod tests {
         let config = Some(ToolsConfig::Allow(vec![]));
         let filtered = agent.filter_tools(all_tools, &config);
 
-        assert!(
-            filtered.is_empty(),
-            "Empty allowlist should match no tools"
-        );
+        assert!(filtered.is_empty(), "Empty allowlist should match no tools");
     }
 }

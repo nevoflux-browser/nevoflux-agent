@@ -32,7 +32,11 @@ fn test_role_registry_with_builtin_roles() {
     let count = registry.scan().unwrap();
 
     // We expect at least 4 built-in roles: explorer, researcher, worker, reader
-    assert!(count >= 4, "Expected at least 4 builtin roles, got {}", count);
+    assert!(
+        count >= 4,
+        "Expected at least 4 builtin roles, got {}",
+        count
+    );
 
     let summaries = registry.list();
     let names: Vec<&str> = summaries.iter().map(|s| s.name.as_str()).collect();
@@ -94,9 +98,18 @@ fn test_spawn_config_role_resolution() {
     // Verify tools_config from role
     match &role_def.tools_config {
         Some(ToolsConfig::Allow(tools)) => {
-            assert!(tools.contains(&"read".to_string()), "Reader should allow 'read'");
-            assert!(tools.contains(&"glob".to_string()), "Reader should allow 'glob'");
-            assert!(tools.contains(&"grep".to_string()), "Reader should allow 'grep'");
+            assert!(
+                tools.contains(&"read".to_string()),
+                "Reader should allow 'read'"
+            );
+            assert!(
+                tools.contains(&"glob".to_string()),
+                "Reader should allow 'glob'"
+            );
+            assert!(
+                tools.contains(&"grep".to_string()),
+                "Reader should allow 'grep'"
+            );
             assert_eq!(tools.len(), 3, "Reader should have exactly 3 tools");
         }
         other => panic!("Expected ToolsConfig::Allow for reader, got {:?}", other),
@@ -147,7 +160,10 @@ fn test_spawn_config_inline_overrides() {
 
     // But config override should win
     let final_max_iterations = config.max_iterations.unwrap_or(role_def.max_iterations);
-    assert_eq!(final_max_iterations, 5, "Config override should win over role default");
+    assert_eq!(
+        final_max_iterations, 5,
+        "Config override should win over role default"
+    );
 
     // Mode from role (no override in config)
     let final_mode = config.mode.unwrap_or_else(|| role_def.mode.clone());
@@ -277,7 +293,10 @@ fn test_nesting_prevention() {
 
     // subagent_spawn should return 403
     let result = host.subagent_spawn("test task", "agent", None);
-    assert!(result.is_err(), "Subagent spawn should fail for nested subagent");
+    assert!(
+        result.is_err(),
+        "Subagent spawn should fail for nested subagent"
+    );
     let err = result.unwrap_err();
     assert_eq!(err.code, 403, "Expected 403 error code, got {}", err.code);
     assert!(
@@ -288,27 +307,42 @@ fn test_nesting_prevention() {
 
     // list_agents should also return 403
     let result = host.list_agents();
-    assert!(result.is_err(), "list_agents should fail for nested subagent");
+    assert!(
+        result.is_err(),
+        "list_agents should fail for nested subagent"
+    );
     assert_eq!(result.unwrap_err().code, 403);
 
     // subagent_list should return 403
     let result = host.subagent_list();
-    assert!(result.is_err(), "subagent_list should fail for nested subagent");
+    assert!(
+        result.is_err(),
+        "subagent_list should fail for nested subagent"
+    );
     assert_eq!(result.unwrap_err().code, 403);
 
     // subagent_wait should return 403
     let result = host.subagent_wait(1);
-    assert!(result.is_err(), "subagent_wait should fail for nested subagent");
+    assert!(
+        result.is_err(),
+        "subagent_wait should fail for nested subagent"
+    );
     assert_eq!(result.unwrap_err().code, 403);
 
     // subagent_wait_all should return 403
     let result = host.subagent_wait_all(&[1, 2]);
-    assert!(result.is_err(), "subagent_wait_all should fail for nested subagent");
+    assert!(
+        result.is_err(),
+        "subagent_wait_all should fail for nested subagent"
+    );
     assert_eq!(result.unwrap_err().code, 403);
 
     // subagent_kill should return 403
     let result = host.subagent_kill(1);
-    assert!(result.is_err(), "subagent_kill should fail for nested subagent");
+    assert!(
+        result.is_err(),
+        "subagent_kill should fail for nested subagent"
+    );
     assert_eq!(result.unwrap_err().code, 403);
 }
 
@@ -352,7 +386,12 @@ fn test_tool_filter_integration() {
         .collect();
 
     // Only browser tools should remain
-    assert_eq!(filtered.len(), 7, "Expected 7 browser_* tools, got {}", filtered.len());
+    assert_eq!(
+        filtered.len(),
+        7,
+        "Expected 7 browser_* tools, got {}",
+        filtered.len()
+    );
     for tool in &filtered {
         assert!(
             tool.starts_with("browser_"),
@@ -392,11 +431,7 @@ fn test_tool_filter_integration() {
     assert!(!is_tool_allowed(&multi_allowlist, "bash"));
 
     // Test exact match patterns (like reader role: read, glob, grep)
-    let exact_allowlist = vec![
-        "read".to_string(),
-        "glob".to_string(),
-        "grep".to_string(),
-    ];
+    let exact_allowlist = vec!["read".to_string(), "glob".to_string(), "grep".to_string()];
     let exact_filtered: Vec<&&str> = all_tools
         .iter()
         .filter(|name| is_tool_allowed(&exact_allowlist, name))
@@ -449,7 +484,10 @@ fn test_tools_config_none_returns_empty() {
             .collect(),
     };
 
-    assert!(filtered.is_empty(), "ToolsConfig::None should result in empty tool set");
+    assert!(
+        filtered.is_empty(),
+        "ToolsConfig::None should result in empty tool set"
+    );
 
     // Also verify that Option::None (inherit) returns all tools
     let inherit_config: Option<ToolsConfig> = None;
@@ -538,8 +576,7 @@ You are a custom explorer agent with additional capabilities.
     )
     .unwrap();
 
-    let mut registry =
-        AgentRoleRegistry::new(user_dir.path().to_path_buf(), builtin_dir);
+    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf(), builtin_dir);
     registry.scan().unwrap();
 
     // The user override should win
@@ -573,8 +610,8 @@ fn test_full_config_merge_chain() {
         provider: Some("openai".to_string()),
         model: Some("gpt-4o".to_string()),
         max_iterations: Some(30),
-        mode: None,        // inherit from role -> "browser"
-        tools: None,       // inherit from role -> Allow(["browser_*", "web_*", "memory_*"])
+        mode: None,          // inherit from role -> "browser"
+        tools: None,         // inherit from role -> Allow(["browser_*", "web_*", "memory_*"])
         system_prompt: None, // inherit from role
         tab_id: None,
     };

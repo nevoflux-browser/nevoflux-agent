@@ -742,7 +742,8 @@ pub fn execute_python_simple(code: &str, browser_ctx: Option<BrowserContext>) ->
     // Build param mappings from registry tool definitions.
     // Empty mappings = positional args use generic names (arg0, arg1, ...).
     // When SignatureCache is wired in from the caller, real mappings will be provided.
-    let (external_names, tool_executor) = build_registry_and_executor(browser_ctx, HashMap::new(), None);
+    let (external_names, tool_executor) =
+        build_registry_and_executor(browser_ctx, HashMap::new(), None);
     let executor = CodeModeExecutor::new();
 
     let llm_rewrite =
@@ -779,7 +780,8 @@ pub fn execute_python_with_llm(
     model: String,
 ) -> CodeModeResult {
     let runtime = tokio::runtime::Handle::current();
-    let (external_names, tool_executor) = build_registry_and_executor(browser_ctx, HashMap::new(), None);
+    let (external_names, tool_executor) =
+        build_registry_and_executor(browser_ctx, HashMap::new(), None);
     let executor = CodeModeExecutor::new();
 
     let llm_rewrite =

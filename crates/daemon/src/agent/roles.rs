@@ -78,22 +78,15 @@ impl AgentRoleDefinition {
     /// - `tools: "none"` and non-empty `allowed_tools` are mutually exclusive
     /// - `model` requires `provider` to be set
     /// - `tools: "none"` forces `max_iterations` to 1
-    pub fn from_metadata_and_body(
-        meta: AgentRoleMetadata,
-        body: String,
-    ) -> Result<Self, String> {
+    pub fn from_metadata_and_body(meta: AgentRoleMetadata, body: String) -> Result<Self, String> {
         // Validate: tools=none and allowed_tools are mutually exclusive
         if meta.tools.as_deref() == Some("none") && !meta.allowed_tools.is_empty() {
-            return Err(
-                "Cannot specify both 'tools: none' and 'allowed_tools'".to_string(),
-            );
+            return Err("Cannot specify both 'tools: none' and 'allowed_tools'".to_string());
         }
 
         // Validate: model requires provider
         if meta.model.is_some() && meta.provider.is_none() {
-            return Err(
-                "Specifying 'model' requires 'provider' to also be set".to_string(),
-            );
+            return Err("Specifying 'model' requires 'provider' to also be set".to_string());
         }
 
         // Compute tools_config and max_iterations
@@ -101,7 +94,10 @@ impl AgentRoleDefinition {
             // tools: none disables all tools and forces single iteration
             (Some(ToolsConfig::None), 1)
         } else if !meta.allowed_tools.is_empty() {
-            (Some(ToolsConfig::Allow(meta.allowed_tools)), meta.max_iterations)
+            (
+                Some(ToolsConfig::Allow(meta.allowed_tools)),
+                meta.max_iterations,
+            )
         } else {
             // No tool restrictions specified: inherit mode's defaults
             (None, meta.max_iterations)
@@ -246,8 +242,7 @@ impl AgentRoleRegistry {
 
         let mut count = 0;
         for entry in entries {
-            let entry =
-                entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
+            let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
             let path = entry.path();
 
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
@@ -265,28 +260,18 @@ impl AgentRoleRegistry {
             let (metadata, _body) = match parse_role_frontmatter(&content) {
                 Ok(parsed) => parsed,
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to parse role file {}: {}",
-                        path.display(),
-                        e
-                    );
+                    tracing::warn!("Failed to parse role file {}: {}", path.display(), e);
                     continue;
                 }
             };
 
             if metadata.name.is_empty() {
-                tracing::warn!(
-                    "Skipping role file {} with empty name",
-                    path.display()
-                );
+                tracing::warn!("Skipping role file {} with empty name", path.display());
                 continue;
             }
 
             if metadata.description.is_empty() {
-                tracing::warn!(
-                    "Role file {} has empty description",
-                    path.display()
-                );
+                tracing::warn!("Role file {} has empty description", path.display());
             }
 
             self.summaries.insert(
@@ -395,7 +380,9 @@ Just a simple system prompt.
         let content = "name: broken\nno frontmatter here";
         let result = parse_role_frontmatter(content);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Missing frontmatter delimiter"));
+        assert!(result
+            .unwrap_err()
+            .contains("Missing frontmatter delimiter"));
     }
 
     #[test]
@@ -462,8 +449,7 @@ Content
         };
 
         let def =
-            AgentRoleDefinition::from_metadata_and_body(meta, "Analyze this.".to_string())
-                .unwrap();
+            AgentRoleDefinition::from_metadata_and_body(meta, "Analyze this.".to_string()).unwrap();
         assert_eq!(def.max_iterations, 1);
         assert_eq!(def.tools_config, Some(ToolsConfig::None));
     }
@@ -783,11 +769,8 @@ Content.
             max_iterations: 5,
         };
 
-        let def = AgentRoleDefinition::from_metadata_and_body(
-            meta,
-            "Use GPT-4o.".to_string(),
-        )
-        .unwrap();
+        let def =
+            AgentRoleDefinition::from_metadata_and_body(meta, "Use GPT-4o.".to_string()).unwrap();
         assert_eq!(def.provider, Some("openai".to_string()));
         assert_eq!(def.model, Some("gpt-4o".to_string()));
         assert_eq!(def.max_iterations, 5);
@@ -846,15 +829,27 @@ Always add tests.
 
         for (name, mode, max_iter) in expected_roles {
             let path = builtin_dir.join(format!("{}.md", name));
-            assert!(path.exists(), "Built-in role file not found: {}", path.display());
+            assert!(
+                path.exists(),
+                "Built-in role file not found: {}",
+                path.display()
+            );
 
             let content = std::fs::read_to_string(&path).unwrap();
             let (meta, body) = parse_role_frontmatter(&content).unwrap();
 
             assert_eq!(meta.name, name, "Name mismatch for {}", name);
-            assert!(!meta.description.is_empty(), "Description empty for {}", name);
+            assert!(
+                !meta.description.is_empty(),
+                "Description empty for {}",
+                name
+            );
             assert_eq!(meta.mode, mode, "Mode mismatch for {}", name);
-            assert_eq!(meta.max_iterations, max_iter, "max_iterations mismatch for {}", name);
+            assert_eq!(
+                meta.max_iterations, max_iter,
+                "max_iterations mismatch for {}",
+                name
+            );
             assert!(!body.is_empty(), "Body empty for {}", name);
 
             // Verify it validates as a definition too

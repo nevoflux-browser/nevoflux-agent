@@ -35,8 +35,7 @@ use nevoflux_builtin_wasm::{
 use nevoflux_llm::ProviderType;
 use nevoflux_mcp::ToolResultContent;
 use nevoflux_protocol::subagent::{
-    AgentRoleSummary, SpawnSubagentConfig,
-    SubagentResult as ProtocolSubagentResult,
+    AgentRoleSummary, SpawnSubagentConfig, SubagentResult as ProtocolSubagentResult,
     SubagentStatus as ProtocolSubagentStatus,
 };
 use nevoflux_protocol::BrowserToolAction;
@@ -5698,8 +5697,7 @@ mod tests {
     fn test_subagent_nesting_blocked() {
         let config = Arc::new(AgentConfig::default());
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let host =
-            DaemonHostFunctions::new(config, rt.handle().clone()).with_is_subagent(true);
+        let host = DaemonHostFunctions::new(config, rt.handle().clone()).with_is_subagent(true);
 
         // spawn should be blocked
         let result = host.subagent_spawn("test task", "agent", None);
@@ -5857,12 +5855,10 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = Arc::new(Database::open_in_memory().unwrap());
         let subagent_config = crate::config::SubagentConfig::default();
-        let executor = Arc::new(
-            crate::wasm::subagent::SubagentExecutor::new(
-                subagent_config,
-                rt.handle().clone(),
-            ),
-        );
+        let executor = Arc::new(crate::wasm::subagent::SubagentExecutor::new(
+            subagent_config,
+            rt.handle().clone(),
+        ));
 
         // Manually insert a completed handle
         {
@@ -5872,8 +5868,7 @@ mod tests {
         }
 
         let services = HostServices::new(db).with_subagent_executor(executor);
-        let host =
-            DaemonHostFunctions::new(config, rt.handle().clone()).with_services(services);
+        let host = DaemonHostFunctions::new(config, rt.handle().clone()).with_services(services);
 
         // Wait for non-existent id - falls through to legacy, returns error
         let result = host.subagent_wait(999);
