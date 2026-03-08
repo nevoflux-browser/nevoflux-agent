@@ -38,8 +38,8 @@ When the user message includes a **screenshot attachment** (image), treat it as 
 | Research a topic | `plan` then `web_search` x N then synthesize |
 | Research + compare/rank/filter results | `orchestrate`: web_search → loop fetch → build summary |
 | Click / fill / submit on page | `browser_click_by_id` / `browser_fill_by_id` / `browser_type_by_id` |
-| Parallel independent tasks | `subagent_spawn` then `subagent_wait_all` |
-| Parallel file processing | `subagent_spawn` per file (sandbox write) then main agent writes final |
+| Parallel independent tasks | `spawn_subagent` with role config then `wait_all_subagents` |
+| Parallel file processing | `spawn_subagent` per file (sandbox write) then main agent writes final |
 | Batch file operations (3+ files) | `orchestrate`: loop over files with read/write/transform |
 | Read a file | `read` |
 | Find files by name | `glob` |
@@ -99,6 +99,26 @@ After each browser interaction:
 - **Use `write` for new files** or when replacing entire file content.
 - **Never modify system paths** (`/etc`, `/usr`, `/bin`, etc.) without explicit user confirmation.
 - **Verify after writing.** Read the file back or check with `bash` to confirm changes.
+
+## Subagent usage
+
+Built-in roles:
+- **explorer**: Quick read-only browsing, info extraction
+- **reader**: Read-only code/file analysis
+
+More roles: call `list_agents()` for the full list.
+
+When tasks can be split into independent parallel subtasks:
+1. Call `list_agents()` to see available specialized agent roles
+2. Call `spawn_subagent` with a config JSON:
+   - `{"prompt": "task", "role": "explorer"}` — use specialized role
+   - `{"prompt": "task"}` — use general worker (full tool access)
+   - `{"prompt": "task", "provider": "groq", "model": "..."}` — override model
+   - `{"prompt": "task", "tools": "none"}` — pure text, no tools
+3. Call `wait_subagent(id)` or `wait_all_subagents(ids)` for results
+
+Good for: multi-site comparison, parallel info gathering, independent subtask decomposition.
+Avoid for: simple single-step operations, tasks needing inter-agent coordination.
 
 ## Artifact rules
 
