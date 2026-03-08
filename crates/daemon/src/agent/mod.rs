@@ -4,6 +4,7 @@ pub mod abi;
 pub mod auth;
 pub mod code_mode;
 pub mod computer_tools;
+pub mod roles;
 pub mod runner;
 pub mod streaming;
 pub mod tools;
