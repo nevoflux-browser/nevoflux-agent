@@ -13,9 +13,19 @@ Monty supported syntax: variables, def, if/elif/else, for/while,
 try/except/finally, break, continue, return, pass, del, assert, raise,
 comprehensions, f-string, lambda, ternary, slice, unpack, walrus (:=).
 
-Built-ins: len, range, sorted, enumerate, zip, map, filter, sum,
+Built-ins: len, range, sorted, enumerate, zip, sum,
 min, max, abs, round, isinstance, type, print, int, str, float,
 bool, list, dict, set, tuple, repr, any, all, reversed, chr, ord.
+
+NOT supported (common pitfalls):
+- sorted() does NOT support key= or reverse= kwargs. \
+Use a manual loop or list comprehension to sort: \
+pairs = [[key_fn(x), x] for x in items]; pairs.sort(); result = [p[1] for p in pairs]
+- map() and filter() are NOT available. \
+Use list comprehensions: [f(x) for x in items], [x for x in items if cond(x)]
+- class, import, with, async/await, yield, match/case, decorators are NOT supported
+- Tool calls that fail return {\"__tool_error\": true, \"error\": \"...\"}. \
+Always check: if isinstance(result, dict) and result.get(\"__tool_error\"): handle error
 
 Common patterns:
 - class → dict + factory function: def make_item(x): return {\"x\": x}
@@ -173,5 +183,19 @@ mod tests {
         assert!(prompt.contains("Line 3"));
         assert!(prompt.contains("`import`"));
         assert!(prompt.contains("`class`"));
+    }
+
+    #[test]
+    fn test_monty_limitations_in_prompt() {
+        let prompt = RepairPrompt::from_runtime_error(
+            "sorted(items, key=lambda x: x)",
+            "TypeError",
+            "sorted() got unexpected keyword argument",
+            Some(1),
+            &[],
+        );
+        assert!(prompt.contains("sorted() does NOT support key="));
+        assert!(prompt.contains("map() and filter() are NOT available"));
+        assert!(prompt.contains("__tool_error"));
     }
 }

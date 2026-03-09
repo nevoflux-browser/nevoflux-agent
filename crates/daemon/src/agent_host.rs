@@ -2379,9 +2379,26 @@ impl HostFunctions for DaemonHostFunctions {
             if code.is_empty() {
                 return Err(HostError {
                     code: 100,
-                    message: "orchestrate: no code provided".into(),
+                    message: "orchestrate: no code provided. Call with {\"code\": \"your_python_code\"}".into(),
                 });
             }
+
+            // Reject oversized code — likely contains embedded HTML/data as string literals
+            const MAX_CODE_SIZE: usize = 8 * 1024; // 8 KB
+            if code.len() > MAX_CODE_SIZE {
+                return Err(HostError {
+                    code: 100,
+                    message: format!(
+                        "orchestrate: code too large ({:.1} KB, max {} KB). \
+                         Do NOT embed raw HTML/data as string literals in code. \
+                         Use tool calls to retrieve data at runtime: \
+                         browser_get_markdown(), fetch_page(), read().",
+                        code.len() as f64 / 1024.0,
+                        MAX_CODE_SIZE / 1024
+                    ),
+                });
+            }
+
             debug!(
                 "tool_call_dynamic: orchestrate via Monty, code_len={}",
                 code.len()

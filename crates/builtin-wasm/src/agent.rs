@@ -3270,9 +3270,14 @@ The following skill instructions MUST be followed exactly. These instructions ta
         }
 
         let description = format!(
-            "Orchestrate multiple tool calls in a single Python script. \
-Use when a task needs 3+ tool calls, loops, conditionals, or data transformation.\n\
-\n\
+            "Write Python to orchestrate multiple tool calls in one step.\n\n\
+When to use: If you can reasonably predict what each tool will return, \
+use orchestrate to batch the calls. If unsure what a page or file contains, \
+call a read-only tool first to inspect, then orchestrate the remaining steps.\n\n\
+Example — \"save top 10 HN titles to a file\":\n  \
+items = browser_eval_js(\"Array.from(document.querySelectorAll('.titleline > a'))\
+.slice(0,10).map(a => a.textContent)\")\n  \
+write_file(\"hn.txt\", '\\n'.join(items))\n\n\
 Available functions (call directly, no import needed):\n\
 {}\n\
 Rules:\n\

@@ -145,30 +145,23 @@ files = {"index.html": html}
 canvas_render(files, "index.html", "Solar System Dashboard")
 ```
 
-## Code Mode (orchestrate tool)
+## Orchestrate tool
 
-**PREFER the `orchestrate` tool over chaining multiple individual tool calls.** When a task needs 3+ tool calls, conditional logic, loops, or data transformation, call `orchestrate` with a single script instead of making tool calls one by one. This is faster, more reliable, and produces better results.
+When a task involves multiple steps with predictable data flow, use the `orchestrate` tool to batch operations in Python. If unsure about the structure of a page or file, inspect it first with a read-only tool, then orchestrate the processing steps.
 
-**IMPORTANT:** Always use the `orchestrate` tool call. Do NOT write code blocks in your response — use the tool call to ensure reliable execution.
+**NEVER embed large data as string literals in orchestrate code.** Do NOT paste HTML, markdown, JSON, or other content (from pages, files, API responses) into the code as string constants. Instead, call the appropriate tool inside the script to retrieve data at runtime:
+- Page content: `browser_get_markdown()` or `fetch_page(url)`
+- Files: `read(path)` or `glob(pattern)`
+- Orchestrate code should be **logic only** — loops, conditionals, transformations — not a data container.
 
-### When to use orchestrate
-
-Use `orchestrate` when ANY of these apply:
-- **3+ tool calls needed** — e.g., search then fetch multiple pages then summarize
-- **Loop over items** — e.g., process each file in a directory, fetch multiple URLs
-- **Conditional logic** — e.g., different actions based on file content or search results
-- **Data transformation** — e.g., parse, filter, sort, aggregate data before responding
-- **Build + render** — e.g., gather data then generate a visualization with `canvas_render`
-- **Batch file operations** — e.g., read multiple files, modify, write back
-
-### When NOT to use orchestrate (use direct tool call)
-
-- Single tool call (one `read`, one `web_search`, one `edit`)
-- Simple two-step operations (search → answer)
-
-### Important: Prefer orchestrate from the start
-
-When possible, use `orchestrate` **from the start** rather than calling tools individually then switching. Write a single script that does everything: reading, processing, and outputting.
+**Tool error handling in orchestrate:** When a tool call fails, it returns a dict with `"__tool_error": True` and `"error": "message"`. Always check for errors:
+```python
+result = browser_eval_js("document.title")
+if isinstance(result, dict) and result.get("__tool_error"):
+    # fallback: use browser_get_markdown instead
+    result = browser_get_markdown()
+```
+Prefer `browser_get_markdown` over `browser_eval_js` — many sites block eval() via CSP.
 
 ### Syntax
 
@@ -180,14 +173,6 @@ When possible, use `orchestrate` **from the start** rather than calling tools in
   - **Pure Python helpers** (zero overhead): `json.loads`, `json.dumps`, `math.sqrt`, `math.floor`, `math.ceil`, `math.log`, `math.pi`, `os.path.join`, `os.path.basename`, `functools.reduce`, `collections.Counter`
   - **Bash-bridged helpers** (uses `run_command` + python3): `re.findall`, `re.search`, `re.sub`, `re.split`, `re.match`, `datetime.datetime.now`, `datetime.date.today`, `datetime.datetime.strptime`, `random.randint`, `random.choice`, `random.shuffle`, `random.sample`, `random.random`, `time.sleep`, `time.time`
 - **Truly unavailable**: `itertools`, `subprocess`, `requests`, `asyncio`. Do NOT use these — there are no replacements.
-- **Pre-injected functions** (call directly, no import needed):
-  - Files: `read_file(path)`, `write_file(path, content)`, `list_files(path)`, `run_command(command)`
-  - Browser (core): `browser_get_markdown(tab_id=None)`, `browser_snapshot(tab_id=None)`, `browser_click_by_id(element_id, tab_id=None)`, `browser_type_by_id(element_id, text, tab_id=None)`, `browser_fill_by_id(element_id, value, tab_id=None)`, `browser_navigate(url, tab_id=None)`, `browser_go_back(tab_id=None)`, `browser_go_forward(tab_id=None)`, `browser_scroll(direction, amount=3, tab_id=None)`, `browser_get_tabs()`, `browser_query_tabs(url=None, title=None, active=None)`, `browser_get_elements(tab_id=None)`
-  - Browser (advanced): `browser_click(selector, tab_id=None)`, `browser_type(selector, text, tab_id=None)`, `browser_fill(selector, value, tab_id=None)`, `browser_get_content(tab_id=None)`, `browser_screenshot(tab_id=None)`, `browser_eval_js(expression, tab_id=None)`, `browser_wait_for(selector, timeout_ms=30000, tab_id=None)`, `browser_wait_for_stable(strategy='interaction', max_wait=3000, tab_id=None)`, `browser_key_press(key, modifiers=None, tab_id=None)`, `browser_get_element(selector, tab_id=None)`, `browser_query_all(selector, tab_id=None)`
-  - Artifacts: `browser_read_artifact(id, offset=None, limit=None, grep=None)`, `browser_edit_artifact(id, old_str, new_str)`
-  - Search & Web: `web_search(query)`, `fetch_page(url)`
-  - User interaction: `browser_ask_user(question, options=None, allow_custom=True)`
-  - Canvas: `canvas_render(files, entry, title)`
 
 ### Examples
 
@@ -200,16 +185,6 @@ for r in results[:3]:
     sites.append({"title": r["title"], "url": r["url"], "summary": page[:500]})
 for s in sites:
     print(f"## {s['title']}\n{s['url']}\n{s['summary']}\n")
-```
-
-**Browser data analysis** (read page + process):
-```python
-md = browser_get_markdown()
-lines = md.split("\n")
-headings = [l for l in lines if l.startswith("# ") or l.startswith("## ")]
-print(f"Page has {len(lines)} lines, {len(headings)} headings:")
-for h in headings:
-    print(h)
 ```
 
 **Batch file processing**:
@@ -226,24 +201,6 @@ for f in files:
 for r in report:
     print(r)
 print(f"\nTotal: {total_lines} lines")
-```
-
-**Build a visualization from data**:
-```python
-data = read_file("/data/sales.csv")
-rows = data.strip().split("\n")
-html_rows = ""
-for row in rows[1:]:
-    cols = row.split(",")
-    html_rows = html_rows + f"<tr><td>{cols[0]}</td><td>{cols[1]}</td></tr>"
-files = {
-    "src/App.jsx": f'''export default function App() {{
-        return <table><thead><tr><th>Product</th><th>Sales</th></tr></thead>
-        <tbody dangerouslySetInnerHTML={{{{__html: `{html_rows}`}}}} /></table>
-    }}''',
-    "src/index.jsx": "import App from './App'; render(<App />);"
-}
-canvas_render(files, "src/index.jsx", "Sales Dashboard")
 ```
 
 ## Bash safety

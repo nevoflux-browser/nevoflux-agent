@@ -103,13 +103,17 @@ impl GeminiCliCompletionModel {
     }
 
     /// Build the CLI command with appropriate arguments.
+    ///
+    /// Returns `(Command, prompt)`. The prompt is NOT passed via `-p` to avoid
+    /// hitting the OS `ARG_MAX` limit on large conversations. Callers must pipe
+    /// the prompt to the child process via stdin.
     fn build_command(
         &self,
         system_prompt: Option<&str>,
         messages: &[Message],
         documents: &[Document],
         tools: &[ToolDefinition],
-    ) -> Command {
+    ) -> (Command, String) {
         let prompt = self.build_prompt(system_prompt, messages, documents, tools);
 
         let mut cmd = Command::new(self.client.command());
@@ -119,7 +123,10 @@ impl GeminiCliCompletionModel {
             cmd.arg("-m").arg(&self.model);
         }
 
-        cmd.arg("-p").arg(&prompt);
+        // Prompt is piped via stdin instead of -p to avoid ARG_MAX (E2BIG)
+        // on large conversations. The gemini CLI reads from stdin when it
+        // is not a TTY.
+
         // Use plan (read-only) mode instead of yolo to prevent the CLI
         // from executing tools internally.  Tool definitions are in the
         // prompt text; the model outputs <tool_call> XML markers which
@@ -149,7 +156,7 @@ impl GeminiCliCompletionModel {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        cmd
+        (cmd, prompt)
     }
 }
 
@@ -308,7 +315,7 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
     ) -> Result<CompletionResponse<Self::Response>, CompletionError> {
         let messages: Vec<Message> = completion_request.chat_history.iter().cloned().collect();
 
-        let mut cmd = self.build_command(
+        let (mut cmd, prompt) = self.build_command(
             completion_request.preamble.as_deref(),
             &messages,
             &completion_request.documents,
@@ -318,7 +325,8 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
         // Use JSON output format for structured response with token stats
         cmd.arg("-o").arg("json");
 
-        let child = cmd
+        let mut child = cmd
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -330,6 +338,21 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
                     e
                 ))
             })?;
+
+        // Pipe prompt via stdin to avoid ARG_MAX limits
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                CompletionError::ProviderError("Failed to open stdin for gemini CLI".into())
+            })?;
+            stdin.write_all(prompt.as_bytes()).await.map_err(|e| {
+                CompletionError::ProviderError(format!(
+                    "Failed to write prompt to gemini CLI stdin: {}",
+                    e
+                ))
+            })?;
+            // Drop stdin to close the pipe and signal EOF
+        }
 
         let output = child.wait_with_output().await.map_err(|e| {
             CompletionError::ProviderError(format!("Failed to wait for gemini CLI: {}", e))
@@ -394,7 +417,7 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
     ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
         let messages: Vec<Message> = completion_request.chat_history.iter().cloned().collect();
 
-        let mut cmd = self.build_command(
+        let (mut cmd, prompt) = self.build_command(
             completion_request.preamble.as_deref(),
             &messages,
             &completion_request.documents,
@@ -406,12 +429,25 @@ impl completion::CompletionModel for GeminiCliCompletionModel {
         cmd.arg("-o").arg("stream-json");
 
         let mut child = cmd
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| {
                 CompletionError::ProviderError(format!("Failed to spawn gemini CLI: {}", e))
             })?;
+
+        // Pipe prompt via stdin in a background task to avoid deadlock
+        // (stdout buffer may fill while stdin write blocks on large prompts).
+        let stdin = child.stdin.take().ok_or_else(|| {
+            CompletionError::ProviderError("Failed to open stdin for gemini CLI".into())
+        })?;
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut stdin = stdin;
+            let _ = stdin.write_all(prompt.as_bytes()).await;
+            // stdin dropped here, closing pipe and signaling EOF
+        });
 
         let stdout = child
             .stdout

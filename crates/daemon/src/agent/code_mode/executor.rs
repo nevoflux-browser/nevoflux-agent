@@ -6,11 +6,13 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use monty::{
-    ExternalResult, LimitedTracker, MontyObject, MontyRun, PrintWriter, ResourceLimits, RunProgress,
+    ExternalResult, LimitedTracker, MontyObject, MontyRun, PrintWriter, ResourceLimits,
+    RunProgress,
 };
 
 use super::auto_fixer::MontyAutoFixer;
 use super::linter::MontyLinter;
+use super::mechanical_fixer;
 use super::repair_prompt::RepairPrompt;
 
 /// Maximum number of retries (rewrite attempts) before giving up.
@@ -254,10 +256,21 @@ impl CodeModeExecutor {
     {
         let mut current_code = code.to_string();
         let mut retries: u32 = 0;
+        // E: Tool result cache — survives across retries so re-executed code
+        // reuses results from previous tool calls with identical arguments.
+        let mut tool_cache: std::collections::HashMap<String, serde_json::Value> =
+            std::collections::HashMap::new();
 
         loop {
             // Layer 2: Auto-fix mechanical transforms
             let auto_fixed = MontyAutoFixer::fix(&current_code);
+            if auto_fixed != current_code {
+                tracing::debug!(
+                    "Code Mode: auto_fixer modified code (retry {}), first 300 chars: {:?}",
+                    retries,
+                    &auto_fixed[..auto_fixed.floor_char_boundary(300)]
+                );
+            }
 
             // Layer 3: Lint for unsupported constructs
             let violations = MontyLinter::check(&auto_fixed);
@@ -312,8 +325,29 @@ impl CodeModeExecutor {
                     );
 
                     if retries < MAX_RETRIES {
-                        // Extract line number from traceback if available
                         let line = exc.traceback().last().map(|f| f.start.line as usize);
+
+                        // B: Try mechanical fix before expensive LLM rewrite
+                        if let Some(fixed) =
+                            mechanical_fixer::try_fix(&auto_fixed, &error_type, &error_msg, line)
+                        {
+                            tracing::info!(
+                                "Code Mode: mechanical fix applied for parse error: {}: {}",
+                                error_type,
+                                error_msg
+                            );
+                            current_code = fixed;
+                            retries += 1;
+                            continue;
+                        }
+
+                        tracing::debug!(
+                            "Code Mode: mechanical_fixer returned None for parse error: {}: {} (line={:?})",
+                            error_type,
+                            error_msg,
+                            line
+                        );
+
                         let repair_prompt = RepairPrompt::from_runtime_error(
                             &auto_fixed,
                             &error_type,
@@ -363,9 +397,39 @@ impl CodeModeExecutor {
                 Err(exc) => {
                     let error_msg = exc.message().unwrap_or("runtime error").to_string();
                     let error_type = format!("{}", exc.exc_type());
+                    tracing::warn!(
+                        "Code Mode: start error (retry {}/{}): {}: {}, first 200 chars: {:?}",
+                        retries,
+                        MAX_RETRIES,
+                        error_type,
+                        error_msg,
+                        &auto_fixed[..auto_fixed.floor_char_boundary(200)]
+                    );
 
                     if retries < MAX_RETRIES {
                         let line = exc.traceback().last().map(|f| f.start.line as usize);
+
+                        // B: Try mechanical fix first
+                        if let Some(fixed) =
+                            mechanical_fixer::try_fix(&auto_fixed, &error_type, &error_msg, line)
+                        {
+                            tracing::info!(
+                                "Code Mode: mechanical fix applied for start error: {}: {}",
+                                error_type,
+                                error_msg
+                            );
+                            current_code = fixed;
+                            retries += 1;
+                            continue;
+                        }
+
+                        tracing::debug!(
+                            "Code Mode: mechanical_fixer returned None for start error: {}: {} (line={:?})",
+                            error_type,
+                            error_msg,
+                            line
+                        );
+
                         let repair_prompt = RepairPrompt::from_runtime_error(
                             &auto_fixed,
                             &error_type,
@@ -373,13 +437,19 @@ impl CodeModeExecutor {
                             line,
                             external_function_names,
                         );
+                        tracing::info!("Code Mode: requesting LLM rewrite for start error");
                         match llm_rewrite(&repair_prompt).await {
                             Ok(rewritten) => {
+                                tracing::info!(
+                                    "Code Mode: LLM rewrite succeeded for start error ({} bytes)",
+                                    rewritten.len()
+                                );
                                 current_code = rewritten;
                                 retries += 1;
                                 continue;
                             }
                             Err(e) => {
+                                tracing::error!("Code Mode: LLM rewrite failed for start error: {}", e);
                                 return CodeModeResult::fail_with_output(
                                     collect_output(print_writer),
                                     format!("Runtime error and LLM rewrite failed: {error_type}: {error_msg} (rewrite error: {e})"),
@@ -435,22 +505,54 @@ impl CodeModeExecutor {
                             })
                         };
 
-                        // Execute the tool
-                        let tool_result = tool_executor(&function_name, arguments.clone()).await;
+                        // E: Check tool cache before executing
+                        let cache_key = format!(
+                            "{}:{}",
+                            function_name,
+                            serde_json::to_string(&arguments).unwrap_or_default()
+                        );
 
-                        let (result_json, return_obj) = match tool_result {
-                            Ok(result_val) => {
-                                let return_obj = json_to_monty_object(&result_val);
-                                (result_val, return_obj)
-                            }
-                            Err(e) => {
-                                let error_val = serde_json::json!({
-                                    "error": e
-                                });
-                                let return_obj = MontyObject::String(format!("Error: {e}"));
-                                (error_val, return_obj)
-                            }
-                        };
+                        let (result_json, resume_value): (serde_json::Value, ExternalResult) =
+                            if let Some(cached) = tool_cache.get(&cache_key) {
+                                tracing::debug!(
+                                    "Code Mode: tool cache hit for {} (key len={})",
+                                    function_name,
+                                    cache_key.len()
+                                );
+                                let return_obj = json_to_monty_object(cached);
+                                (cached.clone(), ExternalResult::Return(return_obj))
+                            } else {
+                                // Execute the tool
+                                let tool_result =
+                                    tool_executor(&function_name, arguments.clone()).await;
+
+                                let (rj, rv) = match tool_result {
+                                    Ok(result_val) => {
+                                        let return_obj = json_to_monty_object(&result_val);
+                                        (result_val, ExternalResult::Return(return_obj))
+                                    }
+                                    Err(e) => {
+                                        // Return error as a dict rather than
+                                        // ExternalResult::Error, because Monty may not
+                                        // properly raise Python exceptions from
+                                        // ExternalResult::Error.
+                                        let error_val = serde_json::json!({
+                                            "__tool_error": true,
+                                            "error": format!("{function_name}: {e}"),
+                                        });
+                                        let return_obj = json_to_monty_object(&error_val);
+                                        (error_val, ExternalResult::Return(return_obj))
+                                    }
+                                };
+                                // Cache successful results (skip error dicts)
+                                if !rj
+                                    .as_object()
+                                    .is_some_and(|o| o.contains_key("__tool_error"))
+                                {
+                                    tool_cache.insert(cache_key, rj.clone());
+                                }
+                                (rj, rv)
+                            };
 
                         tool_results.push(ToolCallResult {
                             tool_name: function_name,
@@ -458,11 +560,14 @@ impl CodeModeExecutor {
                             result: result_json,
                         });
 
-                        // Store the result for potential ResolveFutures handling
-                        pending_results.push((call_id, return_obj.clone()));
+                        let pending_obj = match &resume_value {
+                            ExternalResult::Return(obj) => obj.clone(),
+                            _ => MontyObject::None,
+                        };
+                        pending_results.push((call_id, pending_obj));
 
                         // Resume execution with the result
-                        match state.run(return_obj, &mut print_writer) {
+                        match state.run(resume_value, &mut print_writer) {
                             Ok(next) => {
                                 progress = next;
                             }
@@ -470,10 +575,43 @@ impl CodeModeExecutor {
                                 let error_msg =
                                     exc.message().unwrap_or("runtime error").to_string();
                                 let error_type = format!("{}", exc.exc_type());
+                                tracing::warn!(
+                                    "Code Mode: post-tool-call error (retry {}/{}): {}: {}, first 200 chars: {:?}",
+                                    retries,
+                                    MAX_RETRIES,
+                                    error_type,
+                                    error_msg,
+                                    &auto_fixed[..auto_fixed.floor_char_boundary(200)]
+                                );
 
                                 if retries < MAX_RETRIES {
                                     let line =
                                         exc.traceback().last().map(|f| f.start.line as usize);
+
+                                    // B: Try mechanical fix first
+                                    if let Some(fixed) = mechanical_fixer::try_fix(
+                                        &auto_fixed,
+                                        &error_type,
+                                        &error_msg,
+                                        line,
+                                    ) {
+                                        tracing::info!(
+                                            "Code Mode: mechanical fix applied after tool call: {}: {}",
+                                            error_type,
+                                            error_msg
+                                        );
+                                        current_code = fixed;
+                                        retries += 1;
+                                        break;
+                                    }
+
+                                    tracing::debug!(
+                                        "Code Mode: mechanical_fixer returned None for post-tool-call error: {}: {} (line={:?})",
+                                        error_type,
+                                        error_msg,
+                                        line
+                                    );
+
                                     let repair_prompt = RepairPrompt::from_runtime_error(
                                         &auto_fixed,
                                         &error_type,
@@ -481,13 +619,19 @@ impl CodeModeExecutor {
                                         line,
                                         external_function_names,
                                     );
+                                    tracing::info!("Code Mode: requesting LLM rewrite for post-tool-call error");
                                     match llm_rewrite(&repair_prompt).await {
                                         Ok(rewritten) => {
+                                            tracing::info!(
+                                                "Code Mode: LLM rewrite succeeded for post-tool-call error ({} bytes)",
+                                                rewritten.len()
+                                            );
                                             current_code = rewritten;
                                             retries += 1;
                                             break; // break inner loop to restart outer loop
                                         }
                                         Err(e) => {
+                                            tracing::error!("Code Mode: LLM rewrite failed for post-tool-call error: {}", e);
                                             return CodeModeResult::fail_with_output(
                                                 collect_output(print_writer),
                                                 format!("Runtime error after tool call and LLM rewrite failed: {error_type}: {error_msg} (rewrite error: {e})"),
@@ -563,10 +707,43 @@ impl CodeModeExecutor {
                                 let error_msg =
                                     exc.message().unwrap_or("runtime error").to_string();
                                 let error_type = format!("{}", exc.exc_type());
+                                tracing::warn!(
+                                    "Code Mode: post-futures error (retry {}/{}): {}: {}, first 200 chars: {:?}",
+                                    retries,
+                                    MAX_RETRIES,
+                                    error_type,
+                                    error_msg,
+                                    &auto_fixed[..auto_fixed.floor_char_boundary(200)]
+                                );
 
                                 if retries < MAX_RETRIES {
                                     let line =
                                         exc.traceback().last().map(|f| f.start.line as usize);
+
+                                    // B: Try mechanical fix first
+                                    if let Some(fixed) = mechanical_fixer::try_fix(
+                                        &auto_fixed,
+                                        &error_type,
+                                        &error_msg,
+                                        line,
+                                    ) {
+                                        tracing::info!(
+                                            "Code Mode: mechanical fix applied after futures: {}: {}",
+                                            error_type,
+                                            error_msg
+                                        );
+                                        current_code = fixed;
+                                        retries += 1;
+                                        break;
+                                    }
+
+                                    tracing::debug!(
+                                        "Code Mode: mechanical_fixer returned None for post-futures error: {}: {} (line={:?})",
+                                        error_type,
+                                        error_msg,
+                                        line
+                                    );
+
                                     let repair_prompt = RepairPrompt::from_runtime_error(
                                         &auto_fixed,
                                         &error_type,
@@ -574,13 +751,19 @@ impl CodeModeExecutor {
                                         line,
                                         external_function_names,
                                     );
+                                    tracing::info!("Code Mode: requesting LLM rewrite for post-futures error");
                                     match llm_rewrite(&repair_prompt).await {
                                         Ok(rewritten) => {
+                                            tracing::info!(
+                                                "Code Mode: LLM rewrite succeeded for post-futures error ({} bytes)",
+                                                rewritten.len()
+                                            );
                                             current_code = rewritten;
                                             retries += 1;
                                             break; // break inner loop to restart outer
                                         }
                                         Err(e) => {
+                                            tracing::error!("Code Mode: LLM rewrite failed for post-futures error: {}", e);
                                             return CodeModeResult::fail_with_output(
                                                 collect_output(print_writer),
                                                 format!(

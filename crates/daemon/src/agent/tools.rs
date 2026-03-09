@@ -211,7 +211,7 @@ impl ToolRegistry {
             ),
             "browser_get_markdown" => (
                 "tab_id: int = None",
-                "Get the current page content as markdown. Returns markdown string.",
+                "Get the current page content as markdown. Returns dict with key 'markdown' (str).",
             ),
             "browser_snapshot" => (
                 "tab_id: int = None",
@@ -279,7 +279,10 @@ impl ToolRegistry {
             ),
             "browser_eval_js" => (
                 "expression: str, tab_id: int = None",
-                "Evaluate a JavaScript expression in the page context. Returns the result.",
+                "Evaluate a JavaScript expression in the page context. Returns the result. \
+                 WARNING: Many sites block eval() via CSP. For reading page content, prefer \
+                 browser_get_markdown. Only use eval_js for DOM interactions that other \
+                 browser tools cannot handle.",
             ),
             "browser_wait_for" => (
                 "selector: str, timeout_ms: int = 30000, tab_id: int = None",
@@ -400,10 +403,14 @@ impl ToolRegistry {
         prompt.push_str("- Statements: variable, def, if/elif/else, for/while, break, continue, try/except/finally, return, pass, del, assert, raise\n");
         prompt.push_str("- Expressions: arithmetic, comparison, boolean, f-string, lambda, comprehensions, ternary, slice, unpack, walrus (:=)\n");
         prompt.push_str("- Types: int, float, str, bool, list, dict, set, tuple, None, bytes\n");
-        prompt.push_str("- Built-ins: len, range, sorted, enumerate, zip, map, filter, sum, min, max, abs, round, isinstance, type, print\n\n");
+        prompt.push_str("- Built-ins: len, range, sorted, enumerate, zip, sum, min, max, abs, round, isinstance, type, print\n\n");
         prompt.push_str(
             "DO NOT use: class, match/case, import, with, async/await, yield, decorators\n\n",
         );
+        prompt.push_str("Built-in limitations (IMPORTANT):\n");
+        prompt.push_str("- sorted() does NOT support key= or reverse= kwargs. Use manual sort: pairs = [[key_fn(x), x] for x in items]; pairs.sort(); result = [p[1] for p in pairs]\n");
+        prompt.push_str("- map() and filter() are NOT available. Use list comprehensions: [f(x) for x in items], [x for x in items if cond(x)]\n");
+        prompt.push_str("- Tool calls that fail return {\"__tool_error\": true, \"error\": \"...\"}. Always check: if isinstance(result, dict) and result.get(\"__tool_error\"): handle_error\n\n");
         prompt.push_str("Pattern corrections:\n");
         prompt.push_str(
             "- Instead of class: use dict + factory function: def make_item(x): return {\"x\": x}\n",
@@ -431,6 +438,7 @@ impl ToolRegistry {
             "- orchestrate should return structured data (print dicts/lists/text summaries).\n",
         );
         prompt.push_str("- To create reports, apps, or rich artifacts, call create_artifact as a SEPARATE tool call AFTER orchestrate completes, using the returned data.\n");
+        prompt.push_str("- NEVER embed large data (HTML, markdown, JSON) as string literals in code. Use tool calls to retrieve data at runtime (browser_get_markdown, fetch_page, read).\n");
         prompt
     }
 
@@ -896,11 +904,12 @@ impl BrowserTool {
                 serde_json::json!({ "selector": selector, "value": value })
             }
             BrowserToolAction::EvalJs => {
-                let expression = arguments
+                let script = arguments
                     .get("expression")
+                    .or_else(|| arguments.get("script"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                serde_json::json!({ "expression": expression })
+                serde_json::json!({ "script": script })
             }
             BrowserToolAction::WaitFor => {
                 let selector = arguments
@@ -1007,11 +1016,11 @@ impl BrowserTool {
     fn extract_result(action: BrowserToolAction, val: &serde_json::Value) -> String {
         match action {
             BrowserToolAction::GetMarkdown => {
-                // Extract just the markdown text
-                val.get("markdown")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| val.to_string())
+                // Return the full response dict so code can access result["markdown"].
+                // LLMs in Code Mode consistently assume dict returns (e.g.
+                // `result.get("markdown")`); returning a plain string caused
+                // AttributeError/TypeError crashes and expensive LLM rewrites.
+                val.to_string()
             }
             BrowserToolAction::Snapshot => {
                 // Extract the snapshot/elements data
@@ -1019,6 +1028,32 @@ impl BrowserTool {
                     .or_else(|| val.get("elements"))
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| val.to_string())
+            }
+            BrowserToolAction::EvalJs => {
+                // Extract the JS return value from the response.
+                // The extension uses different wrapper formats:
+                //   Simple values: {"value": "https://...", "type": "string"}
+                //   Objects:       {"result": {"title": "...", "url": "..."}}
+                //   Legacy:        {"success": true, "result": "..."}
+                // Extract the inner value so Python code gets the actual JS result.
+                if let Some(inner) = val.get("value") {
+                    // Extension format: {"value": <actual>, "type": "string"|"number"|...}
+                    match inner {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    }
+                } else if let Some(inner) = val.get("result") {
+                    // Legacy/object format: {"result": <actual>}
+                    match inner {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    }
+                } else if let serde_json::Value::String(s) = val {
+                    // Already a plain string value
+                    s.clone()
+                } else {
+                    val.to_string()
+                }
             }
             _ => val.to_string(),
         }
@@ -1060,10 +1095,33 @@ impl ToolExecutor for BrowserTool {
                 None => Ok("OK".to_string()),
             }
         } else {
-            let error_msg = response
-                .error
-                .map(|e| e.message)
-                .unwrap_or_else(|| "Browser action failed".to_string());
+            let error_msg = match &response.error {
+                Some(e) if e.code == 9001 && self.action == BrowserToolAction::EvalJs => {
+                    format!(
+                        "{} — This site blocks eval() via Content Security Policy. \
+                         Use browser_get_markdown to read page content instead, \
+                         or use browser_click_by_id/browser_type_by_id for interactions.",
+                        e.message
+                    )
+                }
+                Some(e)
+                    if matches!(
+                        self.action,
+                        BrowserToolAction::Fill
+                            | BrowserToolAction::FillById
+                            | BrowserToolAction::Click
+                            | BrowserToolAction::ClickById
+                    ) && e.message.contains("not found") =>
+                {
+                    format!(
+                        "{} — Take a new snapshot to get fresh element IDs, \
+                         or try browser_type_by_id as an alternative.",
+                        e.message
+                    )
+                }
+                Some(e) => e.message.clone(),
+                None => "Browser action failed".to_string(),
+            };
             Err(DaemonError::InternalError(error_msg))
         }
     }
@@ -1841,5 +1899,65 @@ mod tests {
 
         // None (inherit) means no filtering — all tools allowed
         assert!(config.is_none(), "Inherit config should be None");
+    }
+
+    #[test]
+    fn test_extract_result_eval_js_value_string() {
+        // Extension format: {"value": "https://www.google.com/", "type": "string"}
+        let val = serde_json::json!({"value": "https://www.google.com/", "type": "string"});
+        let result = BrowserTool::extract_result(BrowserToolAction::EvalJs, &val);
+        assert_eq!(result, "https://www.google.com/");
+    }
+
+    #[test]
+    fn test_extract_result_eval_js_value_number() {
+        // Extension format: {"value": 42, "type": "number"}
+        let val = serde_json::json!({"value": 42, "type": "number"});
+        let result = BrowserTool::extract_result(BrowserToolAction::EvalJs, &val);
+        assert_eq!(result, "42");
+    }
+
+    #[test]
+    fn test_extract_result_eval_js_result_string() {
+        // Legacy format: {"success":true,"result":"Google"}
+        let val = serde_json::json!({"success": true, "result": "Google"});
+        let result = BrowserTool::extract_result(BrowserToolAction::EvalJs, &val);
+        assert_eq!(result, "Google");
+    }
+
+    #[test]
+    fn test_extract_result_eval_js_result_object() {
+        // Object format: {"result":{"title":"Google","url":"https://google.com"}}
+        let val =
+            serde_json::json!({"result": {"title": "Google", "url": "https://google.com"}});
+        let result = BrowserTool::extract_result(BrowserToolAction::EvalJs, &val);
+        assert!(result.contains("Google"));
+        assert!(result.contains("https://google.com"));
+    }
+
+    #[test]
+    fn test_extract_result_eval_js_plain_string() {
+        // Already a plain string value (no wrapper)
+        let val = serde_json::Value::String("hello".into());
+        let result = BrowserTool::extract_result(BrowserToolAction::EvalJs, &val);
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_extract_result_eval_js_no_extractable_field() {
+        // Extension returns {"success":true} with no value/result field
+        let val = serde_json::json!({"success": true});
+        let result = BrowserTool::extract_result(BrowserToolAction::EvalJs, &val);
+        assert_eq!(result, r#"{"success":true}"#);
+    }
+
+    #[test]
+    fn test_extract_result_eval_js_complex_elements() {
+        // Extension returns element query result: {"count":1,"elements":[...]}
+        let val = serde_json::json!({"count": 1, "elements": [{"tag": "textarea", "id": "APjFqb"}]});
+        let result = BrowserTool::extract_result(BrowserToolAction::EvalJs, &val);
+        // No value/result field, falls through to full JSON
+        assert!(result.contains("APjFqb"));
+        assert!(result.contains("textarea"));
     }
 }

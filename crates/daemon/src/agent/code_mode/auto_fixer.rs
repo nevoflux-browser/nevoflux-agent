@@ -32,6 +32,11 @@ impl MontyAutoFixer {
         // Phase 1: Strip markdown artifacts that LLMs sometimes include
         let code = Self::strip_markdown_artifacts(code);
 
+        // Phase 1b: Strip async/await — Monty external functions return
+        // synchronously, so `await func(...)` would cause
+        // `TypeError: 'str' object can't be awaited` at runtime.
+        let code = Self::strip_await(&code);
+
         // Phase 2: Rewrite unsupported builtins patterns
         let code = Self::rewrite_sorted_with_key(&code);
         let code = Self::rewrite_map_filter(&code);
@@ -127,6 +132,22 @@ impl MontyAutoFixer {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Strip `await` / `async def` / `async for` / `async with` keywords.
+    ///
+    /// Monty allows async/await syntax but external tool functions return
+    /// synchronously.  `await tool(...)` causes `TypeError: 'str' object
+    /// can't be awaited` at runtime.  Stripping before execution is the
+    /// cheapest fix (no LLM rewrite needed).
+    fn strip_await(code: &str) -> String {
+        if !code.contains("await ") && !code.contains("async ") {
+            return code.to_string();
+        }
+        code.replace("await ", "")
+            .replace("async def ", "def ")
+            .replace("async for ", "for ")
+            .replace("async with ", "with ")
     }
 
     /// Strip type annotations from simple variable assignments.
@@ -833,33 +854,16 @@ impl MontyAutoFixer {
         }
 
         if need_loads {
+            // Order matters: Monty requires functions to be defined before
+            // they are referenced.  Leaf helpers first, then the recursive
+            // dispatcher, then the public entry-point last.
             helpers.push_str(concat!(
-                "def _json_loads(s):\n",
-                "    s = s.strip()\n",
-                "    val, _ = _json_parse(s, 0)\n",
-                "    return val\n",
-                "def _json_parse(s, i):\n",
-                "    i = _json_skip_ws(s, i)\n",
-                "    if i >= len(s):\n",
-                "        return [None, i]\n",
-                "    c = s[i]\n",
-                "    if c == '\"':\n",
-                "        return _json_parse_str(s, i)\n",
-                "    if c == '{':\n",
-                "        return _json_parse_obj(s, i)\n",
-                "    if c == '[':\n",
-                "        return _json_parse_arr(s, i)\n",
-                "    if s[i:i+4] == \"true\":\n",
-                "        return [True, i + 4]\n",
-                "    if s[i:i+5] == \"false\":\n",
-                "        return [False, i + 5]\n",
-                "    if s[i:i+4] == \"null\":\n",
-                "        return [None, i + 4]\n",
-                "    return _json_parse_num(s, i)\n",
+                // --- leaf helpers (no inter-function deps) ---
                 "def _json_skip_ws(s, i):\n",
                 "    while i < len(s) and s[i] in \" \\t\\n\\r\":\n",
                 "        i = i + 1\n",
                 "    return i\n",
+                "\n",
                 "def _json_parse_str(s, i):\n",
                 "    i = i + 1\n",
                 "    result = \"\"\n",
@@ -884,6 +888,7 @@ impl MontyAutoFixer {
                 "            result = result + s[i]\n",
                 "        i = i + 1\n",
                 "    return [result, i + 1]\n",
+                "\n",
                 "def _json_parse_num(s, i):\n",
                 "    start = i\n",
                 "    if i < len(s) and s[i] == '-':\n",
@@ -907,40 +912,62 @@ impl MontyAutoFixer {
                 "    if is_float:\n",
                 "        return [float(raw), i]\n",
                 "    return [int(raw), i]\n",
-                "def _json_parse_obj(s, i):\n",
-                "    i = i + 1\n",
-                "    obj = {}\n",
+                "\n",
+                // --- recursive dispatcher (inlines obj/arr to avoid cycles) ---
+                "def _json_parse(s, i):\n",
                 "    i = _json_skip_ws(s, i)\n",
-                "    if i < len(s) and s[i] == '}':\n",
-                "        return [obj, i + 1]\n",
-                "    while i < len(s):\n",
-                "        i = _json_skip_ws(s, i)\n",
-                "        key, i = _json_parse_str(s, i)\n",
-                "        i = _json_skip_ws(s, i)\n",
+                "    if i >= len(s):\n",
+                "        return [None, i]\n",
+                "    c = s[i]\n",
+                "    if c == '\"':\n",
+                "        return _json_parse_str(s, i)\n",
+                "    if c == '{':\n",
                 "        i = i + 1\n",
-                "        val, i = _json_parse(s, i)\n",
-                "        obj[key] = val\n",
+                "        obj = {}\n",
                 "        i = _json_skip_ws(s, i)\n",
-                "        if i < len(s) and s[i] == ',':\n",
+                "        if i < len(s) and s[i] == '}':\n",
+                "            return [obj, i + 1]\n",
+                "        while i < len(s):\n",
+                "            i = _json_skip_ws(s, i)\n",
+                "            key, i = _json_parse_str(s, i)\n",
+                "            i = _json_skip_ws(s, i)\n",
                 "            i = i + 1\n",
-                "        else:\n",
-                "            break\n",
-                "    return [obj, i + 1]\n",
-                "def _json_parse_arr(s, i):\n",
-                "    i = i + 1\n",
-                "    arr = []\n",
-                "    i = _json_skip_ws(s, i)\n",
-                "    if i < len(s) and s[i] == ']':\n",
+                "            val, i = _json_parse(s, i)\n",
+                "            obj[key] = val\n",
+                "            i = _json_skip_ws(s, i)\n",
+                "            if i < len(s) and s[i] == ',':\n",
+                "                i = i + 1\n",
+                "            else:\n",
+                "                break\n",
+                "        return [obj, i + 1]\n",
+                "    if c == '[':\n",
+                "        i = i + 1\n",
+                "        arr = []\n",
+                "        i = _json_skip_ws(s, i)\n",
+                "        if i < len(s) and s[i] == ']':\n",
+                "            return [arr, i + 1]\n",
+                "        while i < len(s):\n",
+                "            val, i = _json_parse(s, i)\n",
+                "            arr.append(val)\n",
+                "            i = _json_skip_ws(s, i)\n",
+                "            if i < len(s) and s[i] == ',':\n",
+                "                i = i + 1\n",
+                "            else:\n",
+                "                break\n",
                 "        return [arr, i + 1]\n",
-                "    while i < len(s):\n",
-                "        val, i = _json_parse(s, i)\n",
-                "        arr.append(val)\n",
-                "        i = _json_skip_ws(s, i)\n",
-                "        if i < len(s) and s[i] == ',':\n",
-                "            i = i + 1\n",
-                "        else:\n",
-                "            break\n",
-                "    return [arr, i + 1]\n",
+                "    if s[i:i+4] == \"true\":\n",
+                "        return [True, i + 4]\n",
+                "    if s[i:i+5] == \"false\":\n",
+                "        return [False, i + 5]\n",
+                "    if s[i:i+4] == \"null\":\n",
+                "        return [None, i + 4]\n",
+                "    return _json_parse_num(s, i)\n",
+                "\n",
+                // --- public entry-point (all deps defined above) ---
+                "def _json_loads(s):\n",
+                "    s = s.strip()\n",
+                "    val, _ = _json_parse(s, 0)\n",
+                "    return val\n",
             ));
             result = result.replace("json.loads(", "_json_loads(");
             if has_standalone_loads {
@@ -1090,7 +1117,9 @@ impl MontyAutoFixer {
         if needs_json_parse && !result.contains("def _json_loads(") {
             helpers.push_str(concat!(
                 "def _json_parse_simple(s):\n",
-                "    s = s.strip()\n",
+                "    if isinstance(s, list) or isinstance(s, dict):\n",
+                "        return s\n",
+                "    s = str(s).strip()\n",
                 "    if s == \"null\" or s == \"None\":\n",
                 "        return None\n",
                 "    if s[0:1] == \"[\":\n",
@@ -1135,10 +1164,14 @@ impl MontyAutoFixer {
             ));
         }
 
+        // NOTE: python3 commands use aliased imports (`import re as _R, json as _J`)
+        // to avoid `rewrite_json`'s global `str::replace("json.dumps(", ...)` from
+        // corrupting the command strings during LLM rewrite cycles.
+
         if needs_findall {
             helpers.push_str(concat!(
                 "def _re_findall(pattern, text):\n",
-                "    cmd = 'python3 -c \"import re,json,sys; print(json.dumps(re.findall(sys.argv[1], sys.argv[2])))\" '\n",
+                "    cmd = 'python3 -c \"import re as _R,json as _J,sys; print(_J.dumps(_R.findall(sys.argv[1], sys.argv[2])))\" '\n",
                 "    cmd = cmd + _shell_quote(pattern) + ' ' + _shell_quote(text)\n",
                 "    out = run_command(cmd)\n",
                 "    return _json_parse_simple(out)\n",
@@ -1149,7 +1182,7 @@ impl MontyAutoFixer {
         if needs_search {
             helpers.push_str(concat!(
                 "def _re_search(pattern, text):\n",
-                "    cmd = 'python3 -c \"import re,json,sys; m=re.search(sys.argv[1],sys.argv[2]); print(json.dumps(m.group(0) if m else None))\" '\n",
+                "    cmd = 'python3 -c \"import re as _R,json as _J,sys; m=_R.search(sys.argv[1],sys.argv[2]); print(_J.dumps(m.group(0) if m else None))\" '\n",
                 "    cmd = cmd + _shell_quote(pattern) + ' ' + _shell_quote(text)\n",
                 "    out = run_command(cmd)\n",
                 "    return _json_parse_simple(out)\n",
@@ -1160,7 +1193,7 @@ impl MontyAutoFixer {
         if needs_match {
             helpers.push_str(concat!(
                 "def _re_match(pattern, text):\n",
-                "    cmd = 'python3 -c \"import re,json,sys; m=re.match(sys.argv[1],sys.argv[2]); print(json.dumps(m.group(0) if m else None))\" '\n",
+                "    cmd = 'python3 -c \"import re as _R,json as _J,sys; m=_R.match(sys.argv[1],sys.argv[2]); print(_J.dumps(m.group(0) if m else None))\" '\n",
                 "    cmd = cmd + _shell_quote(pattern) + ' ' + _shell_quote(text)\n",
                 "    out = run_command(cmd)\n",
                 "    return _json_parse_simple(out)\n",
@@ -1171,7 +1204,7 @@ impl MontyAutoFixer {
         if needs_sub {
             helpers.push_str(concat!(
                 "def _re_sub(pattern, repl, text):\n",
-                "    cmd = 'python3 -c \"import re,sys; print(re.sub(sys.argv[1],sys.argv[2],sys.argv[3]))\" '\n",
+                "    cmd = 'python3 -c \"import re as _R,sys; print(_R.sub(sys.argv[1],sys.argv[2],sys.argv[3]))\" '\n",
                 "    cmd = cmd + _shell_quote(pattern) + ' ' + _shell_quote(repl) + ' ' + _shell_quote(text)\n",
                 "    out = run_command(cmd)\n",
                 "    return out.strip()\n",
@@ -1182,7 +1215,7 @@ impl MontyAutoFixer {
         if needs_split {
             helpers.push_str(concat!(
                 "def _re_split(pattern, text):\n",
-                "    cmd = 'python3 -c \"import re,json,sys; print(json.dumps(re.split(sys.argv[1],sys.argv[2])))\" '\n",
+                "    cmd = 'python3 -c \"import re as _R,json as _J,sys; print(_J.dumps(_R.split(sys.argv[1],sys.argv[2])))\" '\n",
                 "    cmd = cmd + _shell_quote(pattern) + ' ' + _shell_quote(text)\n",
                 "    out = run_command(cmd)\n",
                 "    return _json_parse_simple(out)\n",
@@ -1494,6 +1527,31 @@ impl MontyAutoFixer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_strip_await() {
+        let code = "result = await browser_eval_js(\"document.title\")\nprint(result)";
+        let fixed = MontyAutoFixer::fix(code);
+        assert!(!fixed.contains("await "));
+        assert!(fixed.contains("result = browser_eval_js(\"document.title\")"));
+    }
+
+    #[test]
+    fn test_strip_async_def() {
+        let code = "async def fetch():\n    data = await get_data()\n    return data";
+        let fixed = MontyAutoFixer::fix(code);
+        assert!(!fixed.contains("async "));
+        assert!(!fixed.contains("await "));
+        assert!(fixed.contains("def fetch():"));
+        assert!(fixed.contains("data = get_data()"));
+    }
+
+    #[test]
+    fn test_no_strip_await_when_absent() {
+        let code = "x = browser_eval_js(\"test\")\nprint(x)";
+        let fixed = MontyAutoFixer::fix(code);
+        assert_eq!(fixed, code);
+    }
 
     #[test]
     fn test_strip_imports() {
@@ -2184,6 +2242,22 @@ mod tests {
         assert!(fixed.contains("_re_sub("));
         // Shell quote helper should appear only once
         assert_eq!(fixed.matches("def _shell_quote(").count(), 1);
+    }
+
+    #[test]
+    fn test_re_findall_with_json_dumps_no_cross_contamination() {
+        // Regression: rewrite_json must NOT corrupt json.dumps inside _re_findall's python3 command.
+        // When LLM rewrite copies helpers and adds json.dumps, the global replace would turn
+        // 'json.dumps(' into '_json_dumps(' inside the python3 -c string, causing NameError.
+        let code = "import re\nimport json\nm = re.findall(r'\\d+', t)\nout = json.dumps(m)";
+        let fixed = MontyAutoFixer::fix(code);
+        // User code should use internal helpers
+        assert!(fixed.contains("_re_findall(r'\\d+', t)"));
+        assert!(fixed.contains("_json_dumps(m)"));
+        // python3 command inside _re_findall must NOT contain _json_dumps or _re_findall
+        // (it uses aliased imports _J.dumps and _R.findall)
+        assert!(!fixed.contains("print(_json_dumps("));
+        assert!(!fixed.contains("print(_re_findall("));
     }
 
     // === datetime.* rewriting tests (bash-bridged) ===

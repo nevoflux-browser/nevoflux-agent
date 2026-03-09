@@ -148,7 +148,10 @@ fn create_browser_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "browser_eval_js".to_string(),
-            description: "Execute JavaScript code in the browser context and return the result"
+            description: "Execute JavaScript code in the browser context and return the result. \
+                WARNING: Many sites block eval() via Content Security Policy (CSP). \
+                For reading page content, prefer browser_get_markdown. \
+                Only use eval_js for DOM interactions that other browser tools cannot handle."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
