@@ -23,6 +23,7 @@ target
 CLAUDE.md
 .claude
 docs/plans/
+docs/testing/
 *.plan
 *_plan.md
 
