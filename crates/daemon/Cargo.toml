@@ -31,6 +31,9 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 
+# HTTP client
+reqwest = { workspace = true }
+
 # Async runtime
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "signal", "fs", "net", "io-util"] }
 tokio-util = "0.7"

@@ -241,6 +241,8 @@ pub struct SubagentExecutor {
     runtime: tokio::runtime::Handle,
     /// Base services to clone for each subagent.
     base_services: Option<HostServices>,
+    /// Optional sidebar stream sender from the parent agent.
+    sidebar_stream_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::agent_host::SidebarStreamChunk>>,
 }
 
 impl SubagentExecutor {
@@ -252,12 +254,22 @@ impl SubagentExecutor {
             handles: Arc::new(RwLock::new(HashMap::new())),
             runtime,
             base_services: None,
+            sidebar_stream_tx: None,
         }
     }
 
     /// Set the base services to use for subagents.
     pub fn with_services(mut self, services: HostServices) -> Self {
         self.base_services = Some(services);
+        self
+    }
+
+    /// Set the sidebar stream sender for subagents to pipe output to the parent's sidebar.
+    pub fn with_sidebar_stream(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::agent_host::SidebarStreamChunk>,
+    ) -> Self {
+        self.sidebar_stream_tx = Some(tx);
         self
     }
 
@@ -353,6 +365,7 @@ impl SubagentExecutor {
         let timeout_secs = self.config.timeout_secs;
         let base_services = self.base_services.clone();
         let config = crate::config::AgentConfig::default();
+        let sidebar_tx = self.sidebar_stream_tx.clone();
 
         self.runtime.spawn(async move {
             let result = Self::run_subagent_with_timeout(
@@ -368,6 +381,7 @@ impl SubagentExecutor {
                 config,
                 Duration::from_secs(timeout_secs),
                 executor_handle.clone(),
+                sidebar_tx,
             )
             .await;
 
@@ -409,6 +423,7 @@ impl SubagentExecutor {
         config: crate::config::AgentConfig,
         timeout_duration: Duration,
         handle: SubagentHandle,
+        sidebar_stream_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::agent_host::SidebarStreamChunk>>,
     ) -> Result<AgentOutput, String> {
         let execution = Self::run_subagent_inner(
             id,
@@ -422,6 +437,7 @@ impl SubagentExecutor {
             base_services,
             config,
             handle.clone(),
+            sidebar_stream_tx,
         );
 
         match timeout(timeout_duration, execution).await {
@@ -448,6 +464,7 @@ impl SubagentExecutor {
         base_services: Option<HostServices>,
         config: crate::config::AgentConfig,
         handle: SubagentHandle,
+        sidebar_stream_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::agent_host::SidebarStreamChunk>>,
     ) -> Result<AgentOutput, String> {
         use crate::agent_host::DaemonHostFunctions;
         use nevoflux_builtin_wasm::{Agent, AgentConfig as WasmAgentConfig};
@@ -464,6 +481,11 @@ impl SubagentExecutor {
             let subagent_services = services.clone();
             // The interrupt flag is checked via the handle's kill_flag
             host = host.with_services(subagent_services);
+        }
+
+        // Pipe subagent stream to parent's sidebar
+        if let Some(tx) = sidebar_stream_tx {
+            host = host.with_sidebar_stream(tx);
         }
 
         // Apply provider/model override if specified

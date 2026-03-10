@@ -39,9 +39,9 @@ pub use host::{HostError, HostFunctions, HostResult};
 pub use nevoflux_protocol::LocalFileRef;
 pub use types::{
     AgentInput, AgentMode, AgentOutput, Attachment, BashResult, BashStatus, BrowserToolResult,
-    GrepMatch, GrepResult, LlmChunk, LlmRequest, LlmResponse, MemoryChunk, Message, MessageRole,
-    ReadResult, SkillContext, SkillSummary, SubagentInfo, TabInfo, ToolCall, ToolDefinition,
-    ToolResult, ToolSearchResult,
+    GeneratedImage, GrepMatch, GrepResult, LlmChunk, LlmRequest, LlmResponse, MemoryChunk,
+    Message, MessageRole, ReadResult, SkillContext, SkillSummary, SubagentInfo, TabInfo, ToolCall,
+    ToolDefinition, ToolResult, ToolSearchResult,
 };
 
 /// Version of the builtin-wasm module.

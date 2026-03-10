@@ -593,6 +593,7 @@ impl HostFunctions for MockHostFunctions {
             text: Some("Mock".into()),
             tool_calls: vec![],
             done: true,
+            images: vec![],
         }))
     }
 

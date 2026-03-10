@@ -999,6 +999,17 @@ impl HostFunctions for DaemonHostFunctions {
                     tool_calls: vec![],
                     done: false,
                     reasoning: None,
+                    images: vec![],
+                });
+            }
+            // Send images if present
+            if !response.images.is_empty() {
+                let _ = tx.try_send(LlmStreamChunk {
+                    text: None,
+                    tool_calls: vec![],
+                    done: false,
+                    reasoning: None,
+                    images: response.images,
                 });
             }
             // Send tool calls if present
@@ -1009,6 +1020,7 @@ impl HostFunctions for DaemonHostFunctions {
                         tool_calls,
                         done: false,
                         reasoning: None,
+                        images: vec![],
                     });
                 }
             }
@@ -1018,6 +1030,7 @@ impl HostFunctions for DaemonHostFunctions {
                 tool_calls: vec![],
                 done: true,
                 reasoning: None,
+                images: vec![],
             });
 
             registry.register(stream_id, rx);
@@ -1107,6 +1120,14 @@ impl HostFunctions for DaemonHostFunctions {
                         })
                         .collect(),
                     done: chunk.done,
+                    images: chunk
+                        .images
+                        .into_iter()
+                        .map(|img| nevoflux_builtin_wasm::GeneratedImage {
+                            media_type: img.media_type,
+                            data: img.data,
+                        })
+                        .collect(),
                 };
                 Ok(Some(wasm_chunk))
             }
@@ -3312,6 +3333,7 @@ impl HostFunctions for DaemonHostFunctions {
             None,
             None,
             None,
+            self.sidebar_stream_tx.clone(),
         )
     }
 
@@ -3398,7 +3420,7 @@ impl HostFunctions for DaemonHostFunctions {
                         Ok(output) => ProtocolSubagentResult {
                             id,
                             status: ProtocolSubagentStatus::Completed,
-                            output: Some(output),
+                            output: Some(Self::strip_data_urls(&output)),
                             error: None,
                             duration_ms,
                             tokens_used: 0, // TODO: implement token tracking
@@ -3587,19 +3609,33 @@ impl HostFunctions for DaemonHostFunctions {
                 event: None,
                 thinking_event: None,
             };
-            tx.send(chunk).map_err(|_| HostError {
-                code: 500,
-                message: "Failed to send stream chunk: channel closed".into(),
-            })?;
+            if tx.send(chunk).is_err() {
+                // For subagents, a closed channel is non-fatal (parent stream may
+                // have ended). For the main agent it's an error.
+                if self.is_subagent {
+                    debug!("stream_emit (subagent): channel closed, ignoring {} bytes", text.len());
+                    return Ok(());
+                }
+                return Err(HostError {
+                    code: 500,
+                    message: "Failed to send stream chunk: channel closed".into(),
+                });
+            }
             debug!("stream_emit: sent {} bytes", text.len());
         } else {
-            // If no stream sender is configured, just log and continue
             debug!("stream_emit: no sidebar stream configured, ignoring chunk");
         }
         Ok(())
     }
 
     fn stream_end(&self) -> HostResult<()> {
+        // Subagents must NOT send the done signal — only the main agent
+        // should terminate the sidebar stream.
+        if self.is_subagent {
+            debug!("stream_end (subagent): skipping done signal to avoid closing parent stream");
+            return Ok(());
+        }
+
         if let Some(tx) = &self.sidebar_stream_tx {
             let chunk = SidebarStreamChunk {
                 text: String::new(),
@@ -3641,6 +3677,45 @@ impl HostFunctions for DaemonHostFunctions {
 }
 
 impl DaemonHostFunctions {
+    /// Strip large base64 data URLs from subagent result text to prevent
+    /// bloating the main agent's context window. Images are already streamed
+    /// to the sidebar, so the main agent only needs a summary.
+    fn strip_data_urls(text: &str) -> String {
+        use std::fmt::Write;
+        let mut result = String::with_capacity(text.len().min(4096));
+        let mut remaining = text;
+        let mut image_count = 0u32;
+
+        while let Some(start) = remaining.find("data:image/") {
+            // Write everything before the data URL
+            result.push_str(&remaining[..start]);
+
+            // Find the end of the data URL (look for closing paren, quote, or whitespace)
+            let after = &remaining[start..];
+            let end = after
+                .find(|c: char| c == ')' || c == '"' || c == '\'' || c == ' ' || c == '\n')
+                .unwrap_or(after.len());
+
+            image_count += 1;
+            let _ = write!(result, "[image_{}:displayed_to_user]", image_count);
+            remaining = &remaining[start + end..];
+        }
+
+        // Append the rest
+        result.push_str(remaining);
+
+        if image_count > 0 {
+            debug!(
+                "Stripped {} data URL image(s) from subagent result ({} -> {} bytes)",
+                image_count,
+                text.len(),
+                result.len()
+            );
+        }
+
+        result
+    }
+
     /// Send a tool event to the sidebar without any text content.
     pub fn stream_tool_event(&self, event: nevoflux_protocol::ToolEvent) -> HostResult<()> {
         if let Some(tx) = &self.sidebar_stream_tx {
@@ -4103,6 +4178,7 @@ impl DaemonHostFunctions {
             final_tools_config,
             final_provider,
             final_model,
+            self.sidebar_stream_tx.clone(),
         )
     }
 
@@ -4124,6 +4200,7 @@ impl DaemonHostFunctions {
         tools_config: Option<nevoflux_protocol::subagent::ToolsConfig>,
         provider_override: Option<String>,
         model_override: Option<String>,
+        sidebar_stream_tx: Option<tokio::sync::mpsc::UnboundedSender<SidebarStreamChunk>>,
     ) -> HostResult<u64> {
         let id = subagent_registry.allocate_id();
         let task_str = task.to_string();
@@ -4165,8 +4242,14 @@ impl DaemonHostFunctions {
             let result = tokio::task::spawn_blocking(move || {
                 // Create a new host functions instance for the subagent
                 let mut host = DaemonHostFunctions::new(config, runtime_clone.clone());
+                host = host.with_is_subagent(true);
                 if let Some(svc) = services {
                     host = host.with_services(svc);
+                }
+
+                // Pipe subagent stream to parent's sidebar
+                if let Some(tx) = sidebar_stream_tx {
+                    host = host.with_sidebar_stream(tx);
                 }
 
                 // Apply provider/model override if specified
@@ -4215,9 +4298,9 @@ impl DaemonHostFunctions {
                 }),
             };
 
-            // Update the registry with the result
+            // Update the registry with the result (strip data URLs to avoid bloating context)
             let (status, result_text) = match result {
-                Ok(output) => (SubagentStatus::Completed, output.text),
+                Ok(output) => (SubagentStatus::Completed, Self::strip_data_urls(&output.text)),
                 Err(e) => (SubagentStatus::Failed, format!("Error: {}", e)),
             };
 

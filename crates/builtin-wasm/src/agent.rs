@@ -1377,6 +1377,18 @@ The following skill instructions MUST be followed exactly. These instructions ta
                         }
                     }
 
+                    // Handle generated images: emit as inline data URL markdown
+                    if !chunk.images.is_empty() {
+                        for img in &chunk.images {
+                            let md = format!(
+                                "\n\n![Generated Image](data:{};base64,{})\n",
+                                img.media_type, img.data
+                            );
+                            accumulated_text.push_str(&md);
+                            self.host.stream_emit(&md)?;
+                        }
+                    }
+
                     // Accumulate tool calls, preferring those with call_id set
                     // This handles the case where OpenAI Responses API sends both
                     // delta-accumulated tool calls (without call_id) and complete

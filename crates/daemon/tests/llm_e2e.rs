@@ -1591,3 +1591,117 @@ async fn test_openai_custom_base_url_streaming() {
         Err(e) => panic!("Custom base_url streaming failed: {:?}", e),
     }
 }
+
+// ==================== Image generation tests ====================
+
+#[tokio::test]
+#[ignore]
+async fn test_openrouter_image_generation() {
+    let api_key = match get_env_key("OPENROUTER_API_KEY") {
+        Some(key) => key,
+        None => {
+            eprintln!("Skipping: OPENROUTER_API_KEY not set");
+            return;
+        }
+    };
+
+    let request = LlmChatRequest {
+        messages: vec![LlmMessage::user("Generate a small red circle on a white background")],
+        system: None,
+        temperature: None,
+        max_tokens: Some(2048),
+        tools: None,
+    };
+
+    let response = execute_llm_chat(
+        ProviderType::OpenRouter,
+        &api_key,
+        "google/gemini-3.1-flash-image-preview",
+        request,
+        None,
+    )
+    .await;
+
+    match response {
+        Ok(resp) => {
+            println!("Image generation response: content_len={}", resp.content.len());
+            println!("Image count: {}", resp.images.len());
+            assert!(!resp.images.is_empty(), "Should contain at least one image");
+            let img = &resp.images[0];
+            assert_eq!(img.media_type, "image/png");
+            assert!(!img.data.is_empty(), "Image data should not be empty");
+            println!(
+                "Image: media_type={}, data_len={}",
+                img.media_type,
+                img.data.len()
+            );
+            println!("✅ Image generation test passed!");
+        }
+        Err(e) => panic!("Image generation failed: {:?}", e),
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_openrouter_image_generation_streaming() {
+    let api_key = match get_env_key("OPENROUTER_API_KEY") {
+        Some(key) => key,
+        None => {
+            eprintln!("Skipping: OPENROUTER_API_KEY not set");
+            return;
+        }
+    };
+
+    let request = LlmChatRequest {
+        messages: vec![LlmMessage::user("Generate a small blue square on a white background")],
+        system: None,
+        temperature: None,
+        max_tokens: Some(2048),
+        tools: None,
+    };
+
+    let registry = Arc::new(LlmStreamRegistry::new());
+
+    let stream_id = start_llm_stream(
+        ProviderType::OpenRouter,
+        &api_key,
+        "google/gemini-3.1-flash-image-preview",
+        request,
+        registry.clone(),
+        None,
+    )
+    .await;
+
+    match stream_id {
+        Ok(id) => {
+            println!("Image stream started with id: {}", id);
+            let mut full_text = String::new();
+            let mut image_count = 0;
+            let mut done = false;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            while std::time::Instant::now() < deadline {
+                match registry.next_chunk(id) {
+                    Ok(Some(chunk)) => {
+                        if let Some(text) = &chunk.text {
+                            full_text.push_str(text);
+                        }
+                        image_count += chunk.images.len();
+                        if chunk.done {
+                            done = true;
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    Err(e) => panic!("next_chunk error: {:?}", e),
+                }
+            }
+            assert!(done, "Stream should complete");
+            assert!(image_count > 0, "Should receive at least one image");
+            println!("Image stream: text_len={}, images={}", full_text.len(), image_count);
+            println!("✅ Image generation streaming test passed!");
+        }
+        Err(e) => panic!("Image generation streaming failed: {:?}", e),
+    }
+}

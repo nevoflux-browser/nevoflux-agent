@@ -1886,29 +1886,64 @@ async fn handle_chat_message_streaming(
 
         // Flush buffered text to sidebar.
         // Returns true if text was sent (or nothing to send), false on send error.
+        // Large payloads are split into chunks to stay under native messaging size limits (~1MB).
+        const MAX_PROXY_CHUNK: usize = 800_000;
+
         macro_rules! flush_buffer {
             ($done:expr) => {{
                 let text = std::mem::take(&mut buffer);
-                let is_first = accumulated_text.is_empty();
+                let is_first_chunk = accumulated_text.is_empty();
                 accumulated_text.push_str(&text);
 
-                let to_send = &text;
-                if !to_send.is_empty() {
-                    send_chunk!(
-                        to_send.to_string(),
-                        $done,
-                        None::<&serde_json::Value>,
-                        None::<&nevoflux_protocol::ThinkingEvent>,
-                        is_first
-                    )
-                    .is_ok()
+                if !text.is_empty() {
+                    if text.len() <= MAX_PROXY_CHUNK {
+                        // Small enough to send in one message
+                        send_chunk!(
+                            text,
+                            $done,
+                            None::<&serde_json::Value>,
+                            None::<&nevoflux_protocol::ThinkingEvent>,
+                            is_first_chunk
+                        )
+                        .is_ok()
+                    } else {
+                        // Split large payload into multiple proxy messages
+                        let mut offset = 0;
+                        let mut first = is_first_chunk;
+                        let mut ok = true;
+                        while offset < text.len() {
+                            let mut end = (offset + MAX_PROXY_CHUNK).min(text.len());
+                            // Ensure we don't split a multi-byte UTF-8 character
+                            while end < text.len() && !text.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            let chunk_text = &text[offset..end];
+                            let is_last = end >= text.len();
+                            let done_flag = is_last && $done;
+                            if send_chunk!(
+                                chunk_text.to_string(),
+                                done_flag,
+                                None::<&serde_json::Value>,
+                                None::<&nevoflux_protocol::ThinkingEvent>,
+                                first
+                            )
+                            .is_err()
+                            {
+                                ok = false;
+                                break;
+                            }
+                            first = false;
+                            offset = end;
+                        }
+                        ok
+                    }
                 } else if $done {
                     send_chunk!(
                         "",
                         true,
                         None::<&serde_json::Value>,
                         None::<&nevoflux_protocol::ThinkingEvent>,
-                        is_first
+                        is_first_chunk
                     )
                     .is_ok()
                 } else {
