@@ -299,30 +299,57 @@ pub async fn execute_llm_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
+    base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
     match provider {
-        ProviderType::Anthropic => execute_anthropic_chat(api_key, model, request, provider).await,
-        ProviderType::OpenAi => execute_openai_chat(api_key, model, request, provider).await,
+        ProviderType::Anthropic => {
+            execute_anthropic_chat(api_key, model, request, provider, base_url).await
+        }
+        ProviderType::OpenAi => {
+            execute_openai_chat(api_key, model, request, provider, base_url).await
+        }
         ProviderType::OpenRouter => {
-            execute_openrouter_chat(api_key, model, request, provider).await
+            execute_openrouter_chat(api_key, model, request, provider, base_url).await
         }
-        ProviderType::DeepSeek => execute_deepseek_chat(api_key, model, request, provider).await,
-        ProviderType::Qwen => execute_qwen_chat(api_key, model, request, provider).await,
-        ProviderType::Gemini => execute_gemini_chat(api_key, model, request, provider).await,
-        ProviderType::Groq => execute_groq_chat(api_key, model, request, provider).await,
-        ProviderType::Ollama => execute_ollama_chat(api_key, model, request, provider).await,
-        ProviderType::Mistral => execute_mistral_chat(api_key, model, request, provider).await,
-        ProviderType::XAi => execute_xai_chat(api_key, model, request, provider).await,
-        ProviderType::Cohere => execute_cohere_chat(api_key, model, request, provider).await,
+        ProviderType::DeepSeek => {
+            execute_deepseek_chat(api_key, model, request, provider, base_url).await
+        }
+        ProviderType::Qwen => {
+            execute_qwen_chat(api_key, model, request, provider, base_url).await
+        }
+        ProviderType::Gemini => {
+            execute_gemini_chat(api_key, model, request, provider, base_url).await
+        }
+        ProviderType::Groq => {
+            execute_groq_chat(api_key, model, request, provider, base_url).await
+        }
+        ProviderType::Ollama => {
+            execute_ollama_chat(api_key, model, request, provider, base_url).await
+        }
+        ProviderType::Mistral => {
+            execute_mistral_chat(api_key, model, request, provider, base_url).await
+        }
+        ProviderType::XAi => {
+            execute_xai_chat(api_key, model, request, provider, base_url).await
+        }
+        ProviderType::Cohere => {
+            execute_cohere_chat(api_key, model, request, provider, base_url).await
+        }
         ProviderType::Perplexity => {
-            execute_perplexity_chat(api_key, model, request, provider).await
+            execute_perplexity_chat(api_key, model, request, provider, base_url).await
         }
-        ProviderType::Together => execute_together_chat(api_key, model, request, provider).await,
+        ProviderType::Together => {
+            execute_together_chat(api_key, model, request, provider, base_url).await
+        }
         ProviderType::ClaudeCode => {
-            execute_claude_code_chat(api_key, model, request, provider).await
+            execute_claude_code_chat(api_key, model, request, provider, base_url).await
         }
-        ProviderType::GeminiCli => execute_gemini_cli_chat(api_key, model, request, provider).await,
-        ProviderType::KimiAgent => execute_kimi_agent_chat(api_key, model, request, provider).await,
+        ProviderType::GeminiCli => {
+            execute_gemini_cli_chat(api_key, model, request, provider, base_url).await
+        }
+        ProviderType::KimiAgent => {
+            execute_kimi_agent_chat(api_key, model, request, provider, base_url).await
+        }
     }
 }
 
@@ -332,33 +359,55 @@ async fn execute_anthropic_chat(
     model: &str,
     request: LlmChatRequest,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    let client: anthropic::Client = anthropic::Client::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|e| {
-            DaemonError::InternalError(format!("Failed to create Anthropic client: {}", e))
-        })?;
+    let mut builder = anthropic::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: anthropic::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create Anthropic client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     execute_rig_completion(completion_model, request, provider).await
 }
 
 /// Execute a chat request using the OpenAI provider.
+///
+/// When `base_url` is set (custom OpenAI-compatible endpoint), uses the Chat Completions API
+/// (`/chat/completions`) since most custom providers don't support the Responses API.
+/// When using default OpenAI, uses the Responses API (`/responses`).
 async fn execute_openai_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    let client: openai::Client =
-        openai::Client::builder()
-            .api_key(api_key)
-            .build()
-            .map_err(|e| {
-                DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
-            })?;
-    let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request, provider).await
+    if let Some(url) = base_url {
+        // Custom endpoint: use Chat Completions API (/chat/completions)
+        let client: openai::CompletionsClient =
+            openai::CompletionsClient::builder()
+                .api_key(api_key)
+                .base_url(url)
+                .build()
+                .map_err(|e| {
+                    DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
+                })?;
+        let completion_model = client.completion_model(model);
+        execute_rig_completion(completion_model, request, provider).await
+    } else {
+        // Default OpenAI: use Responses API (/responses)
+        let client: openai::Client =
+            openai::Client::builder()
+                .api_key(api_key)
+                .build()
+                .map_err(|e| {
+                    DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
+                })?;
+        let completion_model = client.completion_model(model);
+        execute_rig_completion(completion_model, request, provider).await
+    }
 }
 
 /// Execute a chat request using the OpenRouter provider (native rig provider).
@@ -367,13 +416,15 @@ async fn execute_openrouter_chat(
     model: &str,
     request: LlmChatRequest,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    let client: openrouter::Client = openrouter::Client::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|e| {
-            DaemonError::InternalError(format!("Failed to create OpenRouter client: {}", e))
-        })?;
+    let mut builder = openrouter::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: openrouter::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create OpenRouter client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     execute_rig_completion(completion_model, request, provider).await
 }
@@ -384,13 +435,15 @@ async fn execute_deepseek_chat(
     model: &str,
     request: LlmChatRequest,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    let client: deepseek::Client = deepseek::Client::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|e| {
-            DaemonError::InternalError(format!("Failed to create DeepSeek client: {}", e))
-        })?;
+    let mut builder = deepseek::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: deepseek::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create DeepSeek client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     execute_rig_completion(completion_model, request, provider).await
 }
@@ -401,8 +454,12 @@ async fn execute_qwen_chat(
     model: &str,
     request: LlmChatRequest,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    let client = QwenClient::new(api_key);
+    let mut client = QwenClient::new(api_key);
+    if let Some(url) = base_url {
+        client = client.with_base_url(url);
+    }
     let completion_model = client.completion_model(model);
     execute_rig_completion(completion_model, request, provider).await
 }
@@ -413,6 +470,7 @@ async fn execute_claude_code_chat(
     model: &str,
     request: LlmChatRequest,
     provider: ProviderType,
+    _base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
     let client = if api_key == "claude-code-cli" {
         ClaudeCodeClient::new("claude")
@@ -436,6 +494,7 @@ async fn execute_gemini_cli_chat(
     model: &str,
     request: LlmChatRequest,
     provider: ProviderType,
+    _base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
     let client = if api_key == "gemini-cli" {
         GeminiCliClient::new("gemini")
@@ -458,6 +517,7 @@ async fn execute_kimi_agent_chat(
     model: &str,
     request: LlmChatRequest,
     provider: ProviderType,
+    _base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
     let client = if api_key == "kimi-agent-cli" {
         KimiAgentClient::new("kimi-agent")
@@ -505,14 +565,15 @@ async fn execute_gemini_chat(
     model: &str,
     request: LlmChatRequest,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    let client: gemini::Client =
-        gemini::Client::builder()
-            .api_key(api_key)
-            .build()
-            .map_err(|e| {
-                DaemonError::InternalError(format!("Failed to create Gemini client: {}", e))
-            })?;
+    let mut builder = gemini::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: gemini::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create Gemini client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     execute_rig_completion(completion_model, request, provider).await
 }
@@ -523,11 +584,15 @@ async fn execute_groq_chat(
     model: &str,
     request: LlmChatRequest,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    let client: groq::Client = groq::Client::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|e| DaemonError::InternalError(format!("Failed to create Groq client: {}", e)))?;
+    let mut builder = groq::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: groq::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create Groq client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     execute_rig_completion(completion_model, request, provider).await
 }
@@ -538,15 +603,16 @@ async fn execute_ollama_chat(
     model: &str,
     request: LlmChatRequest,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
     // Ollama doesn't need an API key for local usage, use Nothing
-    let client: ollama::Client =
-        ollama::Client::builder()
-            .api_key(Nothing)
-            .build()
-            .map_err(|e| {
-                DaemonError::InternalError(format!("Failed to create Ollama client: {}", e))
-            })?;
+    let mut builder = ollama::Client::builder().api_key(Nothing);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: ollama::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create Ollama client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     execute_rig_completion(completion_model, request, provider).await
 }
@@ -557,13 +623,15 @@ async fn execute_mistral_chat(
     model: &str,
     request: LlmChatRequest,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    let client: mistral::Client = mistral::Client::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|e| {
-            DaemonError::InternalError(format!("Failed to create Mistral client: {}", e))
-        })?;
+    let mut builder = mistral::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: mistral::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create Mistral client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     execute_rig_completion(completion_model, request, provider).await
 }
@@ -574,11 +642,15 @@ async fn execute_xai_chat(
     model: &str,
     request: LlmChatRequest,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    let client: xai::Client = xai::Client::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|e| DaemonError::InternalError(format!("Failed to create xAI client: {}", e)))?;
+    let mut builder = xai::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: xai::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create xAI client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     execute_rig_completion(completion_model, request, provider).await
 }
@@ -589,14 +661,15 @@ async fn execute_cohere_chat(
     model: &str,
     request: LlmChatRequest,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    let client: cohere::Client =
-        cohere::Client::builder()
-            .api_key(api_key)
-            .build()
-            .map_err(|e| {
-                DaemonError::InternalError(format!("Failed to create Cohere client: {}", e))
-            })?;
+    let mut builder = cohere::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: cohere::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create Cohere client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     execute_rig_completion(completion_model, request, provider).await
 }
@@ -607,13 +680,15 @@ async fn execute_perplexity_chat(
     model: &str,
     request: LlmChatRequest,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    let client: perplexity::Client = perplexity::Client::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|e| {
-            DaemonError::InternalError(format!("Failed to create Perplexity client: {}", e))
-        })?;
+    let mut builder = perplexity::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: perplexity::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create Perplexity client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     execute_rig_completion(completion_model, request, provider).await
 }
@@ -624,13 +699,15 @@ async fn execute_together_chat(
     model: &str,
     request: LlmChatRequest,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    let client: together::Client = together::Client::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|e| {
-            DaemonError::InternalError(format!("Failed to create Together client: {}", e))
-        })?;
+    let mut builder = together::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: together::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create Together client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     execute_rig_completion(completion_model, request, provider).await
 }
@@ -1302,6 +1379,7 @@ pub async fn start_llm_stream(
     model: &str,
     request: LlmChatRequest,
     registry: Arc<LlmStreamRegistry>,
+    base_url: Option<&str>,
 ) -> Result<u64> {
     let stream_id = registry.allocate_id();
     let (tx, rx) = mpsc::channel(32);
@@ -1312,11 +1390,19 @@ pub async fn start_llm_stream(
     // Clone values for the spawned task
     let api_key = api_key.to_string();
     let model = model.to_string();
+    let base_url_owned = base_url.map(String::from);
 
     // Spawn background task to process the stream
     tokio::spawn(async move {
-        let result =
-            execute_llm_stream_inner(provider, &api_key, &model, request, tx.clone()).await;
+        let result = execute_llm_stream_inner(
+            provider,
+            &api_key,
+            &model,
+            request,
+            tx.clone(),
+            base_url_owned.as_deref(),
+        )
+        .await;
         if let Err(e) = result {
             tracing::error!("Stream error: {}", e);
             // Send error as final chunk
@@ -1341,22 +1427,47 @@ async fn execute_llm_stream_inner(
     model: &str,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
+    base_url: Option<&str>,
 ) -> Result<()> {
     match provider {
-        ProviderType::Anthropic => stream_anthropic(api_key, model, request, tx, provider).await,
-        ProviderType::OpenAi => stream_openai(api_key, model, request, tx, provider).await,
-        ProviderType::OpenRouter => stream_openrouter(api_key, model, request, tx, provider).await,
-        ProviderType::DeepSeek => stream_deepseek(api_key, model, request, tx, provider).await,
-        ProviderType::Gemini => stream_gemini(api_key, model, request, tx, provider).await,
-        ProviderType::Groq => stream_groq(api_key, model, request, tx, provider).await,
-        ProviderType::Mistral => stream_mistral(api_key, model, request, tx, provider).await,
-        ProviderType::XAi => stream_xai(api_key, model, request, tx, provider).await,
-        ProviderType::Cohere => stream_cohere(api_key, model, request, tx, provider).await,
-        ProviderType::Perplexity => stream_perplexity(api_key, model, request, tx, provider).await,
-        ProviderType::Together => stream_together(api_key, model, request, tx, provider).await,
-        ProviderType::ClaudeCode => stream_claude_code(api_key, model, request, tx, provider).await,
-        ProviderType::GeminiCli => stream_gemini_cli(api_key, model, request, tx, provider).await,
-        ProviderType::KimiAgent => stream_kimi_agent(api_key, model, request, tx, provider).await,
+        ProviderType::Anthropic => {
+            stream_anthropic(api_key, model, request, tx, provider, base_url).await
+        }
+        ProviderType::OpenAi => {
+            stream_openai(api_key, model, request, tx, provider, base_url).await
+        }
+        ProviderType::OpenRouter => {
+            stream_openrouter(api_key, model, request, tx, provider, base_url).await
+        }
+        ProviderType::DeepSeek => {
+            stream_deepseek(api_key, model, request, tx, provider, base_url).await
+        }
+        ProviderType::Gemini => {
+            stream_gemini(api_key, model, request, tx, provider, base_url).await
+        }
+        ProviderType::Groq => stream_groq(api_key, model, request, tx, provider, base_url).await,
+        ProviderType::Mistral => {
+            stream_mistral(api_key, model, request, tx, provider, base_url).await
+        }
+        ProviderType::XAi => stream_xai(api_key, model, request, tx, provider, base_url).await,
+        ProviderType::Cohere => {
+            stream_cohere(api_key, model, request, tx, provider, base_url).await
+        }
+        ProviderType::Perplexity => {
+            stream_perplexity(api_key, model, request, tx, provider, base_url).await
+        }
+        ProviderType::Together => {
+            stream_together(api_key, model, request, tx, provider, base_url).await
+        }
+        ProviderType::ClaudeCode => {
+            stream_claude_code(api_key, model, request, tx, provider, base_url).await
+        }
+        ProviderType::GeminiCli => {
+            stream_gemini_cli(api_key, model, request, tx, provider, base_url).await
+        }
+        ProviderType::KimiAgent => {
+            stream_kimi_agent(api_key, model, request, tx, provider, base_url).await
+        }
         // Qwen and Ollama don't support streaming in rig yet
         ProviderType::Qwen | ProviderType::Ollama => Err(DaemonError::InternalError(format!(
             "Streaming not supported for provider {:?}",
@@ -1372,34 +1483,56 @@ async fn stream_anthropic(
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<()> {
-    let client: anthropic::Client = anthropic::Client::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|e| {
-            DaemonError::InternalError(format!("Failed to create Anthropic client: {}", e))
-        })?;
+    let mut builder = anthropic::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: anthropic::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create Anthropic client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     stream_rig_completion(completion_model, request, tx, provider).await
 }
 
 /// Stream from OpenAI provider.
+///
+/// When `base_url` is set (custom OpenAI-compatible endpoint), uses the Chat Completions API
+/// (`/chat/completions`) since most custom providers don't support the Responses API.
+/// When using default OpenAI, uses the Responses API (`/responses`).
 async fn stream_openai(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<()> {
-    let client: openai::Client =
-        openai::Client::builder()
-            .api_key(api_key)
-            .build()
-            .map_err(|e| {
-                DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
-            })?;
-    let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx, provider).await
+    if let Some(url) = base_url {
+        // Custom endpoint: use Chat Completions API (/chat/completions)
+        let client: openai::CompletionsClient =
+            openai::CompletionsClient::builder()
+                .api_key(api_key)
+                .base_url(url)
+                .build()
+                .map_err(|e| {
+                    DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
+                })?;
+        let completion_model = client.completion_model(model);
+        stream_rig_completion(completion_model, request, tx, provider).await
+    } else {
+        // Default OpenAI: use Responses API (/responses)
+        let client: openai::Client =
+            openai::Client::builder()
+                .api_key(api_key)
+                .build()
+                .map_err(|e| {
+                    DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
+                })?;
+        let completion_model = client.completion_model(model);
+        stream_rig_completion(completion_model, request, tx, provider).await
+    }
 }
 
 /// Stream from OpenRouter provider.
@@ -1409,13 +1542,15 @@ async fn stream_openrouter(
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<()> {
-    let client: openrouter::Client = openrouter::Client::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|e| {
-            DaemonError::InternalError(format!("Failed to create OpenRouter client: {}", e))
-        })?;
+    let mut builder = openrouter::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: openrouter::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create OpenRouter client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     stream_rig_completion(completion_model, request, tx, provider).await
 }
@@ -1427,13 +1562,15 @@ async fn stream_deepseek(
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<()> {
-    let client: deepseek::Client = deepseek::Client::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|e| {
-            DaemonError::InternalError(format!("Failed to create DeepSeek client: {}", e))
-        })?;
+    let mut builder = deepseek::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: deepseek::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create DeepSeek client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     stream_rig_completion(completion_model, request, tx, provider).await
 }
@@ -1445,14 +1582,15 @@ async fn stream_gemini(
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<()> {
-    let client: gemini::Client =
-        gemini::Client::builder()
-            .api_key(api_key)
-            .build()
-            .map_err(|e| {
-                DaemonError::InternalError(format!("Failed to create Gemini client: {}", e))
-            })?;
+    let mut builder = gemini::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: gemini::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create Gemini client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     stream_rig_completion(completion_model, request, tx, provider).await
 }
@@ -1464,11 +1602,15 @@ async fn stream_groq(
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<()> {
-    let client: groq::Client = groq::Client::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|e| DaemonError::InternalError(format!("Failed to create Groq client: {}", e)))?;
+    let mut builder = groq::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: groq::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create Groq client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     stream_rig_completion(completion_model, request, tx, provider).await
 }
@@ -1480,13 +1622,15 @@ async fn stream_mistral(
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<()> {
-    let client: mistral::Client = mistral::Client::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|e| {
-            DaemonError::InternalError(format!("Failed to create Mistral client: {}", e))
-        })?;
+    let mut builder = mistral::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: mistral::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create Mistral client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     stream_rig_completion(completion_model, request, tx, provider).await
 }
@@ -1498,11 +1642,15 @@ async fn stream_xai(
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<()> {
-    let client: xai::Client = xai::Client::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|e| DaemonError::InternalError(format!("Failed to create xAI client: {}", e)))?;
+    let mut builder = xai::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: xai::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create xAI client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     stream_rig_completion(completion_model, request, tx, provider).await
 }
@@ -1514,14 +1662,15 @@ async fn stream_cohere(
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<()> {
-    let client: cohere::Client =
-        cohere::Client::builder()
-            .api_key(api_key)
-            .build()
-            .map_err(|e| {
-                DaemonError::InternalError(format!("Failed to create Cohere client: {}", e))
-            })?;
+    let mut builder = cohere::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: cohere::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create Cohere client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     stream_rig_completion(completion_model, request, tx, provider).await
 }
@@ -1533,13 +1682,15 @@ async fn stream_perplexity(
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<()> {
-    let client: perplexity::Client = perplexity::Client::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|e| {
-            DaemonError::InternalError(format!("Failed to create Perplexity client: {}", e))
-        })?;
+    let mut builder = perplexity::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: perplexity::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create Perplexity client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     stream_rig_completion(completion_model, request, tx, provider).await
 }
@@ -1551,13 +1702,15 @@ async fn stream_together(
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     provider: ProviderType,
+    base_url: Option<&str>,
 ) -> Result<()> {
-    let client: together::Client = together::Client::builder()
-        .api_key(api_key)
-        .build()
-        .map_err(|e| {
-            DaemonError::InternalError(format!("Failed to create Together client: {}", e))
-        })?;
+    let mut builder = together::Client::builder().api_key(api_key);
+    if let Some(url) = base_url {
+        builder = builder.base_url(url);
+    }
+    let client: together::Client = builder.build().map_err(|e| {
+        DaemonError::InternalError(format!("Failed to create Together client: {}", e))
+    })?;
     let completion_model = client.completion_model(model);
     stream_rig_completion(completion_model, request, tx, provider).await
 }
@@ -1569,6 +1722,7 @@ async fn stream_claude_code(
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     provider: ProviderType,
+    _base_url: Option<&str>,
 ) -> Result<()> {
     let client = if api_key == "claude-code-cli" {
         ClaudeCodeClient::new("claude")
@@ -1593,6 +1747,7 @@ async fn stream_gemini_cli(
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     provider: ProviderType,
+    _base_url: Option<&str>,
 ) -> Result<()> {
     let client = if api_key == "gemini-cli" {
         GeminiCliClient::new("gemini")
@@ -1619,6 +1774,7 @@ async fn stream_kimi_agent(
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     _provider: ProviderType,
+    _base_url: Option<&str>,
 ) -> Result<()> {
     use nevoflux_llm::providers::kimi_agent::wire::{WireClient, WireEvent};
 

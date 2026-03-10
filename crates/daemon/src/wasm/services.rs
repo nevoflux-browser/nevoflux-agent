@@ -29,6 +29,8 @@ pub struct LlmConfig {
     pub api_key: String,
     /// The model name to use.
     pub model: String,
+    /// Optional base URL override for the API endpoint.
+    pub base_url: Option<String>,
 }
 
 impl LlmConfig {
@@ -61,6 +63,7 @@ impl LlmConfig {
             provider,
             api_key: api_key.into(),
             model: model.into(),
+            base_url: None,
         }
     }
 }

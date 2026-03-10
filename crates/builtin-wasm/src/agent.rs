@@ -3827,6 +3827,9 @@ comprehensions, f-strings, lambda, asyncio.gather\n\
                     "max_iterations": {
                         "type": "integer",
                         "description": "Maximum iterations before timeout"
+                    },
+                    "tools": {
+                        "description": "Tool access configuration. Use \"none\" to disable all tools (pure text mode), or {\"Allow\": [\"read\", \"glob\", \"browser_*\"]} for an allowlist with optional wildcard."
                     }
                 },
                 "required": ["task"]

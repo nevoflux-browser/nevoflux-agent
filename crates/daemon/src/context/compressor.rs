@@ -196,7 +196,7 @@ Be concise (2-4 sentences)."#;
         summarization_model, provider
     );
 
-    let response = execute_llm_chat(provider, &api_key, summarization_model, request).await?;
+    let response = execute_llm_chat(provider, &api_key, summarization_model, request, None).await?;
 
     Ok(response.content)
 }

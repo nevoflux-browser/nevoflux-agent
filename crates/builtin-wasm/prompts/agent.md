@@ -65,6 +65,7 @@ When the user message includes a **screenshot attachment** (image), treat it as 
 | Multi-step orchestration (3+ tool calls) | `orchestrate` | Chaining many individual tool calls |
 | Browser interaction | `browser_click_by_id` | `computer_mouse_click` (last resort only) |
 | Computer control | `computer_screenshot` then act | Only when browser tools are insufficient |
+| User mentions a role name (explorer, reader, worker, researcher) | `spawn_subagent` with `"role"` | Doing it yourself without spawning |
 
 ### Probe first, then decide
 - Tools return metadata (total_lines, total_matches) alongside partial results.
@@ -102,23 +103,33 @@ After each browser interaction:
 
 ## Subagent usage
 
+**IMPORTANT: When the user mentions a role name (explorer, reader, worker, researcher, or any custom role), you MUST use `spawn_subagent` with that role. NEVER execute the task yourself.** Roles have specific tool restrictions — executing the task directly bypasses these restrictions.
+
 Built-in roles:
-- **explorer**: Quick read-only browsing, info extraction
-- **reader**: Read-only code/file analysis
+- **explorer**: Read-only browsing (cannot click, fill forms, or modify pages)
+- **reader**: Read-only code/file analysis (only read, glob, grep)
+- **researcher**: Deep browser research with memory
+- **worker**: General-purpose with full tools (no sub-spawning)
 
 More roles: call `list_agents()` for the full list.
 
-When tasks can be split into independent parallel subtasks:
-1. Call `list_agents()` to see available specialized agent roles
-2. Call `spawn_subagent` with a config JSON:
-   - `{"prompt": "task", "role": "explorer"}` — use specialized role
+### When to spawn subagents
+- User mentions a role name → **always spawn** (mandatory)
+- Tasks that can be split into independent parallel subtasks
+- Multi-site comparison, parallel info gathering
+
+### When NOT to spawn
+- Simple single-step operations where no role is mentioned
+- Tasks needing inter-agent coordination
+
+### How to spawn
+1. Call `spawn_subagent` with a config JSON:
+   - `{"prompt": "detailed task description", "role": "explorer"}` — use specialized role
    - `{"prompt": "task"}` — use general worker (full tool access)
    - `{"prompt": "task", "provider": "groq", "model": "..."}` — override model
    - `{"prompt": "task", "tools": "none"}` — pure text, no tools
-3. Call `wait_subagent(id)` or `wait_all_subagents(ids)` for results
-
-Good for: multi-site comparison, parallel info gathering, independent subtask decomposition.
-Avoid for: simple single-step operations, tasks needing inter-agent coordination.
+2. Call `wait_subagent(id)` or `wait_all_subagents(ids)` for results
+3. **Write detailed prompts** for subagents — include exactly what information to extract or what actions to perform. Vague prompts produce vague results.
 
 ## Artifact rules
 

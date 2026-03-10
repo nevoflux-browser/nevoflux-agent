@@ -48,6 +48,7 @@ async fn test_anthropic_chat() {
         &api_key,
         "claude-3-haiku-20240307",
         request,
+        None,
     )
     .await;
 
@@ -82,7 +83,8 @@ async fn test_openai_chat() {
         tools: None,
     };
 
-    let response = execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request).await;
+    let response =
+        execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request, None).await;
 
     match response {
         Ok(resp) => {
@@ -120,6 +122,7 @@ async fn test_openrouter_chat() {
         &api_key,
         "openai/gpt-4o-mini",
         request,
+        None,
     )
     .await;
 
@@ -155,7 +158,7 @@ async fn test_deepseek_chat() {
     };
 
     let response =
-        execute_llm_chat(ProviderType::DeepSeek, &api_key, "deepseek-chat", request).await;
+        execute_llm_chat(ProviderType::DeepSeek, &api_key, "deepseek-chat", request, None).await;
 
     match response {
         Ok(resp) => {
@@ -186,7 +189,8 @@ async fn test_qwen_chat() {
         tools: None,
     };
 
-    let response = execute_llm_chat(ProviderType::Qwen, &api_key, "qwen-turbo", request).await;
+    let response =
+        execute_llm_chat(ProviderType::Qwen, &api_key, "qwen-turbo", request, None).await;
 
     match response {
         Ok(resp) => {
@@ -234,7 +238,8 @@ async fn test_openai_tool_calling() {
         }]),
     };
 
-    let response = execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request).await;
+    let response =
+        execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request, None).await;
 
     match response {
         Ok(resp) => {
@@ -276,7 +281,8 @@ async fn test_openai_tool_calling() {
             };
 
             let response2 =
-                execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request2).await;
+                execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request2, None)
+                    .await;
 
             match response2 {
                 Ok(resp2) => {
@@ -317,7 +323,7 @@ async fn test_multi_turn_conversation() {
         tools: None,
     };
 
-    let resp1 = execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request1)
+    let resp1 = execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request1, None)
         .await
         .expect("Turn 1 failed");
 
@@ -336,7 +342,7 @@ async fn test_multi_turn_conversation() {
         tools: None,
     };
 
-    let resp2 = execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request2)
+    let resp2 = execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request2, None)
         .await
         .expect("Turn 2 failed");
 
@@ -391,6 +397,7 @@ async fn test_openai_streaming_tool_calling() {
         "gpt-4o-mini",
         request,
         registry.clone(),
+        None,
     )
     .await
     .expect("Failed to start stream");
@@ -501,9 +508,10 @@ async fn test_openai_streaming_tool_calling() {
     };
 
     // Use non-streaming for the follow-up to verify it works
-    let response2 = execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request2)
-        .await
-        .expect("Second request with tool result failed");
+    let response2 =
+        execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request2, None)
+            .await
+            .expect("Second request with tool result failed");
 
     println!("\nFinal response: {}", response2.content);
     assert_eq!(response2.finish_reason, "stop");
@@ -565,6 +573,7 @@ async fn test_openai_streaming_tool_calling_full_streaming() {
         "gpt-4o-mini",
         request,
         registry.clone(),
+        None,
     )
     .await
     .expect("Failed to start stream");
@@ -630,6 +639,7 @@ async fn test_openai_streaming_tool_calling_full_streaming() {
         "gpt-4o-mini",
         request2,
         registry.clone(),
+        None,
     )
     .await
     .expect("Failed to start second stream");
@@ -824,6 +834,7 @@ async fn test_multi_round_tool_calling() {
             "gpt-4o-mini",
             request,
             registry.clone(),
+            None,
         )
         .await
         .expect("Failed to start stream");
@@ -928,7 +939,8 @@ async fn test_openai_image_attachment() {
         tools: None,
     };
 
-    let response = execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request).await;
+    let response =
+        execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request, None).await;
 
     match response {
         Ok(resp) => {
@@ -1008,6 +1020,7 @@ async fn test_openai_image_attachment_streaming() {
         "gpt-4o-mini",
         request,
         registry.clone(),
+        None,
     )
     .await
     .expect("Failed to start stream");
@@ -1134,6 +1147,7 @@ Ask for permission before destructive operations."#;
         "gpt-4o-mini",
         request,
         registry.clone(),
+        None,
     )
     .await
     .expect("Failed to start stream");
@@ -1212,6 +1226,7 @@ async fn test_anthropic_image_attachment() {
         &api_key,
         "claude-3-haiku-20240307",
         request,
+        None,
     )
     .await;
 
@@ -1303,6 +1318,7 @@ async fn test_openai_large_screenshot_image() {
         "gpt-4o-mini",
         request,
         registry.clone(),
+        None,
     )
     .await
     .expect("Failed to start stream");
@@ -1373,6 +1389,7 @@ async fn test_openai_large_screenshot_image() {
             "gpt-4o",
             request_gpt4o,
             registry.clone(),
+            None,
         )
         .await
         .expect("Failed to start stream with gpt-4o");
@@ -1443,7 +1460,8 @@ async fn test_multiple_image_attachments() {
         tools: None,
     };
 
-    let response = execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request).await;
+    let response =
+        execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request, None).await;
 
     match response {
         Ok(resp) => {
@@ -1464,5 +1482,112 @@ async fn test_multiple_image_attachments() {
             println!("✅ Multiple image attachments test passed!");
         }
         Err(e) => panic!("Multiple images chat failed: {:?}", e),
+    }
+}
+
+// ==================== Custom base_url (OpenAI-compatible) tests ====================
+
+#[tokio::test]
+#[ignore]
+async fn test_openai_custom_base_url_chat() {
+    let api_key = match get_env_key("XFYUN_API_KEY") {
+        Some(key) => key,
+        None => {
+            eprintln!("Skipping: XFYUN_API_KEY not set");
+            return;
+        }
+    };
+
+    let request = LlmChatRequest {
+        messages: vec![LlmMessage::user("Say 'hello' and nothing else.")],
+        system: Some("You are a helpful assistant. Be very concise.".into()),
+        temperature: Some(0.0),
+        max_tokens: Some(50),
+        tools: None,
+    };
+
+    let base_url = Some("https://maas-coding-api.cn-huabei-1.xf-yun.com/v2");
+
+    let response = execute_llm_chat(
+        ProviderType::OpenAi,
+        &api_key,
+        "astron-code-latest",
+        request,
+        base_url,
+    )
+    .await;
+
+    match response {
+        Ok(resp) => {
+            println!("xfyun non-streaming response: {:?}", resp);
+            assert!(!resp.content.is_empty(), "Response should not be empty");
+            println!("✅ Custom base_url non-streaming test passed!");
+        }
+        Err(e) => panic!("Custom base_url chat failed: {:?}", e),
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_openai_custom_base_url_streaming() {
+    let api_key = match get_env_key("XFYUN_API_KEY") {
+        Some(key) => key,
+        None => {
+            eprintln!("Skipping: XFYUN_API_KEY not set");
+            return;
+        }
+    };
+
+    let request = LlmChatRequest {
+        messages: vec![LlmMessage::user("Say 'hello' and nothing else.")],
+        system: Some("You are a helpful assistant. Be very concise.".into()),
+        temperature: Some(0.0),
+        max_tokens: Some(50),
+        tools: None,
+    };
+
+    let registry = Arc::new(LlmStreamRegistry::new());
+    let base_url = Some("https://maas-coding-api.cn-huabei-1.xf-yun.com/v2");
+
+    let stream_id = start_llm_stream(
+        ProviderType::OpenAi,
+        &api_key,
+        "astron-code-latest",
+        request,
+        registry.clone(),
+        base_url,
+    )
+    .await;
+
+    match stream_id {
+        Ok(id) => {
+            println!("xfyun streaming started with id: {}", id);
+            let mut full_text = String::new();
+            let mut done = false;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                match registry.next_chunk(id) {
+                    Ok(Some(chunk)) => {
+                        if let Some(text) = &chunk.text {
+                            full_text.push_str(text);
+                        }
+                        if chunk.done {
+                            done = true;
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        // No chunk yet, wait a bit
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(e) => panic!("next_chunk error: {:?}", e),
+                }
+            }
+            assert!(done, "Stream should complete");
+            assert!(!full_text.is_empty(), "Should receive text content");
+            println!("xfyun streaming response: {}", full_text);
+            println!("✅ Custom base_url streaming test passed!");
+        }
+        Err(e) => panic!("Custom base_url streaming failed: {:?}", e),
     }
 }

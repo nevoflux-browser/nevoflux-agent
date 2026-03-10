@@ -244,6 +244,17 @@ impl DaemonHostFunctions {
         self
     }
 
+    /// Set provider/model override for this host instance.
+    ///
+    /// Unlike `set_model_override` (which validates API key), this method
+    /// sets the override unconditionally. Use when creating subagent hosts
+    /// where the parent has already validated the configuration.
+    pub fn with_llm_override(self, provider: impl Into<String>, model: impl Into<String>) -> Self {
+        *self.model_override_provider.lock().unwrap() = Some(provider.into());
+        *self.model_override_model.lock().unwrap() = Some(model.into());
+        self
+    }
+
     /// Validate that a write/edit target path is within the subagent sandbox.
     /// Returns Ok(()) for main agents (sandbox=None) or if path is in sandbox.
     /// Returns Err(403) if path escapes the sandbox.
@@ -668,13 +679,14 @@ impl DaemonHostFunctions {
 
     /// Resolve the active provider name, API key, and model.
     /// Uses model override if set, otherwise falls back to config.
-    fn resolve_provider_and_model(&self) -> Result<(String, String, String), HostError> {
+    fn resolve_provider_and_model(&self) -> Result<(String, String, String, Option<String>), HostError> {
         let override_provider = self.model_override_provider.lock().unwrap().clone();
         let override_model = self.model_override_model.lock().unwrap().clone();
 
         if let (Some(provider), Some(model)) = (override_provider, override_model) {
             let api_key = self.get_api_key_for_provider(&provider)?;
-            Ok((provider, api_key, model))
+            let base_url = self.config.llm.base_url_for_provider(&provider).map(String::from);
+            Ok((provider, api_key, model, base_url))
         } else {
             let provider = self
                 .config
@@ -701,7 +713,8 @@ impl DaemonHostFunctions {
                 .active_model()
                 .unwrap_or("gpt-4o-mini")
                 .to_string();
-            Ok((provider, api_key, model))
+            let base_url = self.config.llm.active_base_url().map(String::from);
+            Ok((provider, api_key, model, base_url))
         }
     }
 
@@ -760,7 +773,7 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 impl HostFunctions for DaemonHostFunctions {
     fn llm_chat(&self, request: &LlmRequest) -> HostResult<LlmResponse> {
         // Resolve provider (uses override if set, otherwise config)
-        let (provider_name, api_key, model) = self.resolve_provider_and_model()?;
+        let (provider_name, api_key, model, base_url) = self.resolve_provider_and_model()?;
 
         let provider = ProviderType::from_str(&provider_name).map_err(|_| HostError {
             code: 3,
@@ -850,7 +863,7 @@ impl HostFunctions for DaemonHostFunctions {
         let runtime = self.runtime.clone();
         let result = tokio::task::block_in_place(|| {
             runtime.block_on(async {
-                execute_llm_chat(provider, &api_key, &model, daemon_request).await
+                execute_llm_chat(provider, &api_key, &model, daemon_request, base_url.as_deref()).await
             })
         });
 
@@ -919,18 +932,22 @@ impl HostFunctions for DaemonHostFunctions {
 
     fn llm_stream_start(&self, request: &LlmRequest) -> HostResult<u64> {
         // Resolve provider (uses override if set, otherwise config)
-        let (provider_name, api_key, model) = self.resolve_provider_and_model()?;
+        let (provider_name, api_key, model, base_url) = self.resolve_provider_and_model()?;
 
         let provider = ProviderType::from_str(&provider_name).map_err(|_| HostError {
             code: 3,
             message: format!("Invalid provider: {}", provider_name),
         })?;
 
+        // Check if this provider supports streaming
+        let use_streaming = self.config.llm.use_streaming_for_provider(&provider_name);
+
         debug!(
-            "llm_stream_start: provider={}, model={}, messages={}",
+            "llm_stream_start: provider={}, model={}, messages={}, streaming={}",
             provider_name,
             model,
-            request.messages.len()
+            request.messages.len(),
+            use_streaming
         );
 
         // Convert request to daemon format
@@ -943,19 +960,69 @@ impl HostFunctions for DaemonHostFunctions {
             .and_then(|_| serde_json::to_value(&daemon_request).ok());
         let llm_start = std::time::Instant::now();
 
-        // Start the stream
         let registry = Arc::clone(&self.stream_registry);
-
         let runtime = self.runtime.clone();
-        let stream_id = tokio::task::block_in_place(|| {
-            runtime.block_on(async {
-                start_llm_stream(provider, &api_key, &model, daemon_request, registry).await
+
+        let stream_id = if use_streaming {
+            // Real streaming via SSE
+            tokio::task::block_in_place(|| {
+                runtime.block_on(async {
+                    start_llm_stream(provider, &api_key, &model, daemon_request, registry, base_url.as_deref()).await
+                })
             })
-        })
-        .map_err(|e| HostError {
-            code: 100,
-            message: format!("Failed to start stream: {}", e),
-        })?;
+            .map_err(|e| HostError {
+                code: 100,
+                message: format!("Failed to start stream: {}", e),
+            })?
+        } else {
+            // Emulate streaming via non-streaming call for providers that don't support SSE
+            debug!("Emulating streaming via non-streaming call for provider {}", provider_name);
+            let response = tokio::task::block_in_place(|| {
+                runtime.block_on(async {
+                    execute_llm_chat(provider, &api_key, &model, daemon_request, base_url.as_deref()).await
+                })
+            })
+            .map_err(|e| HostError {
+                code: 100,
+                message: format!("Non-streaming LLM call failed: {}", e),
+            })?;
+
+            // Convert non-streaming response into stream chunks
+            use crate::wasm::llm::LlmStreamChunk;
+            let stream_id = registry.allocate_id();
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+
+            // Send text chunk if present
+            if !response.content.is_empty() {
+                let _ = tx.try_send(LlmStreamChunk {
+                    text: Some(response.content),
+                    tool_calls: vec![],
+                    done: false,
+                    reasoning: None,
+                });
+            }
+            // Send tool calls if present
+            if let Some(tool_calls) = response.tool_calls {
+                if !tool_calls.is_empty() {
+                    let _ = tx.try_send(LlmStreamChunk {
+                        text: None,
+                        tool_calls,
+                        done: false,
+                        reasoning: None,
+                    });
+                }
+            }
+            // Send done chunk
+            let _ = tx.try_send(LlmStreamChunk {
+                text: None,
+                tool_calls: vec![],
+                done: true,
+                reasoning: None,
+            });
+
+            registry.register(stream_id, rx);
+            stream_id
+        };
 
         // Store trace data for this stream
         if self.trace_collector.is_some() {
@@ -2408,7 +2475,7 @@ impl HostFunctions for DaemonHostFunctions {
             // Try to resolve LLM provider for error recovery rewrites.
             // Falls back to no-op rewrite if LLM is not available.
             let result = match self.resolve_provider_and_model() {
-                Ok((provider_name, api_key, model)) => {
+                Ok((provider_name, api_key, model, base_url)) => {
                     match ProviderType::from_str(&provider_name) {
                         Ok(provider) => {
                             debug!(
@@ -2421,6 +2488,7 @@ impl HostFunctions for DaemonHostFunctions {
                                 provider,
                                 api_key,
                                 model,
+                                base_url,
                             )
                         }
                         Err(_) => {
@@ -3219,7 +3287,7 @@ impl HostFunctions for DaemonHostFunctions {
                 );
 
                 let handle = executor
-                    .spawn(task.to_string(), agent_mode, custom_prompt, tab_id)
+                    .spawn(task.to_string(), agent_mode, custom_prompt, tab_id, None, None, None)
                     .map_err(|e| HostError {
                         code: 500,
                         message: format!("Failed to spawn subagent: {}", e),
@@ -3240,6 +3308,10 @@ impl HostFunctions for DaemonHostFunctions {
             mode,
             agent_mode,
             tab_id,
+            None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -3961,21 +4033,29 @@ impl DaemonHostFunctions {
             .system_prompt
             .or(role_def.as_ref().map(|r| r.system_prompt.clone()));
 
-        let _final_provider = config
+        let final_provider = config
             .provider
             .or(role_def.as_ref().and_then(|r| r.provider.clone()));
 
-        let _final_model = config
+        let final_model = config
             .model
             .or(role_def.as_ref().and_then(|r| r.model.clone()));
 
-        let _final_tools_config = config
+        let final_tools_config = config
             .tools
             .or(role_def.as_ref().and_then(|r| r.tools_config.clone()));
 
         let _final_max_iterations = config
             .max_iterations
             .or(role_def.as_ref().map(|r| r.max_iterations));
+
+        // Log provider/model override for debugging
+        if final_provider.is_some() || final_model.is_some() {
+            debug!(
+                "Subagent provider/model override: provider={:?}, model={:?}",
+                final_provider, final_model
+            );
+        }
 
         let tab_id = config.tab_id;
 
@@ -3990,15 +4070,20 @@ impl DaemonHostFunctions {
                 debug!("Using WASM sandboxed executor for role-aware subagent");
 
                 let handle = executor
-                    .spawn(config.prompt, agent_mode, Some(custom_prompt), tab_id)
+                    .spawn(
+                        config.prompt,
+                        agent_mode,
+                        Some(custom_prompt),
+                        tab_id,
+                        final_tools_config.clone(),
+                        final_provider.clone(),
+                        final_model.clone(),
+                    )
                     .map_err(|e| HostError {
                         code: 500,
                         message: format!("Failed to spawn subagent: {}", e),
                     })?;
 
-                // TODO: Pass _final_provider, _final_model, _final_tools_config,
-                // _final_max_iterations to the executor. Provider/model override
-                // and tool filtering will be wired in follow-up tasks.
                 return Ok(handle.id);
             }
         }
@@ -4014,6 +4099,10 @@ impl DaemonHostFunctions {
             &final_mode_str,
             agent_mode,
             tab_id,
+            Some(custom_prompt),
+            final_tools_config,
+            final_provider,
+            final_model,
         )
     }
 
@@ -4031,6 +4120,10 @@ impl DaemonHostFunctions {
         mode: &str,
         agent_mode: AgentMode,
         tab_id: Option<i64>,
+        custom_system_prompt: Option<String>,
+        tools_config: Option<nevoflux_protocol::subagent::ToolsConfig>,
+        provider_override: Option<String>,
+        model_override: Option<String>,
     ) -> HostResult<u64> {
         let id = subagent_registry.allocate_id();
         let task_str = task.to_string();
@@ -4076,7 +4169,17 @@ impl DaemonHostFunctions {
                     host = host.with_services(svc);
                 }
 
+                // Apply provider/model override if specified
+                if let (Some(provider), Some(model)) = (provider_override, model_override) {
+                    debug!("Legacy subagent {}: applying provider/model override: provider={}, model={}", id, provider, model);
+                    host = host.with_llm_override(provider, model);
+                }
+
                 // Create agent input with custom prompt for sub-agent
+                let system_prompt = custom_system_prompt.unwrap_or_else(|| {
+                    Agent::<DaemonHostFunctions>::subagent_prompt_for_mode(agent_mode)
+                        .to_string()
+                });
                 let input = AgentInput {
                     session_id: format!("subagent-{}", id),
                     mode: agent_mode,
@@ -4084,17 +4187,14 @@ impl DaemonHostFunctions {
                     history: vec![],
                     attachments: vec![],
                     local_files: vec![],
-                    custom_system_prompt: Some(
-                        Agent::<DaemonHostFunctions>::subagent_prompt_for_mode(agent_mode)
-                            .to_string(),
-                    ),
+                    custom_system_prompt: Some(system_prompt),
                     tab_id,
                     tab_ids: vec![],
                     skill_context: None,
                     available_models: vec![],
                     mcp_servers: vec![],
                     soul_context: None,
-                    tools_config: None,
+                    tools_config,
                 };
 
                 // Run the appropriate builtin mode
@@ -5264,7 +5364,7 @@ mod tests {
         let host = DaemonHostFunctions::new(config, rt.handle().clone());
 
         // Without override, should use anthropic from config
-        let (provider, api_key, _model) = host.resolve_provider_and_model().unwrap();
+        let (provider, api_key, _model, _base_url) = host.resolve_provider_and_model().unwrap();
         assert_eq!(provider, "anthropic");
         assert_eq!(api_key, "anthropic-key");
 
@@ -5272,7 +5372,7 @@ mod tests {
         *host.model_override_provider.lock().unwrap() = Some("openai".to_string());
         *host.model_override_model.lock().unwrap() = Some("gpt-4o".to_string());
 
-        let (provider, api_key, model) = host.resolve_provider_and_model().unwrap();
+        let (provider, api_key, model, _base_url) = host.resolve_provider_and_model().unwrap();
         assert_eq!(provider, "openai");
         assert_eq!(api_key, "openai-key");
         assert_eq!(model, "gpt-4o");

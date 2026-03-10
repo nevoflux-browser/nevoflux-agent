@@ -304,6 +304,9 @@ impl SubagentExecutor {
         mode: AgentMode,
         custom_prompt: Option<String>,
         tab_id: Option<i64>,
+        tools_config: Option<nevoflux_protocol::subagent::ToolsConfig>,
+        provider_override: Option<String>,
+        model_override: Option<String>,
     ) -> Result<SubagentHandle, String> {
         // Prune completed handles when the map grows too large to prevent
         // unbounded memory growth. We keep a generous threshold so callers
@@ -358,6 +361,9 @@ impl SubagentExecutor {
                 mode,
                 custom_prompt,
                 tab_id,
+                tools_config,
+                provider_override,
+                model_override,
                 base_services,
                 config,
                 Duration::from_secs(timeout_secs),
@@ -396,6 +402,9 @@ impl SubagentExecutor {
         mode: AgentMode,
         custom_prompt: Option<String>,
         tab_id: Option<i64>,
+        tools_config: Option<nevoflux_protocol::subagent::ToolsConfig>,
+        provider_override: Option<String>,
+        model_override: Option<String>,
         base_services: Option<HostServices>,
         config: crate::config::AgentConfig,
         timeout_duration: Duration,
@@ -407,6 +416,9 @@ impl SubagentExecutor {
             mode,
             custom_prompt,
             tab_id,
+            tools_config,
+            provider_override,
+            model_override,
             base_services,
             config,
             handle.clone(),
@@ -430,6 +442,9 @@ impl SubagentExecutor {
         mode: AgentMode,
         custom_prompt: Option<String>,
         tab_id: Option<i64>,
+        tools_config: Option<nevoflux_protocol::subagent::ToolsConfig>,
+        provider_override: Option<String>,
+        model_override: Option<String>,
         base_services: Option<HostServices>,
         config: crate::config::AgentConfig,
         handle: SubagentHandle,
@@ -449,6 +464,12 @@ impl SubagentExecutor {
             let subagent_services = services.clone();
             // The interrupt flag is checked via the handle's kill_flag
             host = host.with_services(subagent_services);
+        }
+
+        // Apply provider/model override if specified
+        if let (Some(provider), Some(model)) = (provider_override, model_override) {
+            debug!("Subagent {}: applying provider/model override: provider={}, model={}", id, provider, model);
+            host = host.with_llm_override(provider, model);
         }
 
         // Create sandbox for agent-mode subagents
@@ -489,7 +510,7 @@ impl SubagentExecutor {
             available_models: vec![],
             mcp_servers: vec![],
             soul_context: None,
-            tools_config: None,
+            tools_config,
         };
 
         // Check for kill before running

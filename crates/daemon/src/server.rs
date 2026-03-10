@@ -5427,6 +5427,7 @@ async fn handle_config_llm_get(params: &serde_json::Value) -> serde_json::Value 
                 "api_key": masked_key,
                 "has_api_key": provider_config.api_key.is_some(),
                 "model": provider_config.model,
+                "base_url": provider_config.base_url,
                 "context_window": provider_config.context_window,
                 "default_model": default_model,
                 "default_context_window": default_context_window,
@@ -5521,6 +5522,15 @@ async fn handle_config_llm_set(
             provider_config.model = None;
         } else {
             provider_config.model = Some(model.to_string());
+        }
+    }
+
+    // Update base_url if provided
+    if let Some(base_url) = params.get("base_url").and_then(|u| u.as_str()) {
+        if base_url.is_empty() {
+            provider_config.base_url = None;
+        } else {
+            provider_config.base_url = Some(base_url.to_string());
         }
     }
 

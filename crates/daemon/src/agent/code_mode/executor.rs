@@ -961,6 +961,7 @@ pub fn execute_python_with_llm(
     provider: nevoflux_llm::ProviderType,
     api_key: String,
     model: String,
+    base_url: Option<String>,
 ) -> CodeModeResult {
     let runtime = tokio::runtime::Handle::current();
     let (external_names, tool_executor) =
@@ -972,6 +973,7 @@ pub fn execute_python_with_llm(
             let prompt = prompt.to_string();
             let api_key = api_key.clone();
             let model = model.clone();
+            let base_url = base_url.clone();
             Box::pin(async move {
                 let request = crate::wasm::llm::LlmChatRequest {
                     messages: vec![crate::wasm::llm::LlmMessage::user(&prompt)],
@@ -987,10 +989,15 @@ pub fn execute_python_with_llm(
                     tools: None,
                 };
 
-                let response =
-                    crate::wasm::llm::execute_llm_chat(provider, &api_key, &model, request)
-                        .await
-                        .map_err(|e| format!("LLM rewrite call failed: {e}"))?;
+                let response = crate::wasm::llm::execute_llm_chat(
+                    provider,
+                    &api_key,
+                    &model,
+                    request,
+                    base_url.as_deref(),
+                )
+                .await
+                .map_err(|e| format!("LLM rewrite call failed: {e}"))?;
 
                 // Extract Python code from the response (handles ```python, ```py, ``` fences)
                 let text = response.content;

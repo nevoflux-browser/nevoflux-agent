@@ -388,6 +388,7 @@ pub fn create_linker(engine: &Engine) -> Result<Linker<HostState>> {
                                 &llm_config.api_key,
                                 &llm_config.model,
                                 request,
+                                llm_config.base_url.as_deref(),
                             ))
                         })
                         .join()

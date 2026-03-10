@@ -251,6 +251,12 @@ fn merge_provider(target: &mut ProviderConfig, other: &ProviderConfig) {
     if other.add_dirs.is_some() {
         target.add_dirs = other.add_dirs.clone();
     }
+    if other.base_url.is_some() {
+        target.base_url = other.base_url.clone();
+    }
+    if other.use_streaming.is_some() {
+        target.use_streaming = other.use_streaming;
+    }
 }
 
 /// LLM provider configuration.
@@ -367,6 +373,16 @@ pub struct ProviderConfig {
     /// Additional directories to pass via `--add-dir` (Claude Code CLI only).
     #[serde(default)]
     pub add_dirs: Option<Vec<String>>,
+
+    /// Custom base URL for the API endpoint.
+    #[serde(default)]
+    pub base_url: Option<String>,
+
+    /// Whether to use streaming for this provider.
+    /// Set to `false` if the provider doesn't support SSE streaming properly.
+    /// Defaults to `true` when not specified.
+    #[serde(default)]
+    pub use_streaming: Option<bool>,
 }
 
 impl LlmConfig {
@@ -431,6 +447,84 @@ impl LlmConfig {
             "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.model.as_deref(),
             _ => self.default_model.as_deref(),
         }
+    }
+
+    /// Get the base URL for the active provider.
+    pub fn active_base_url(&self) -> Option<&str> {
+        match self.active_provider()? {
+            "anthropic" => self.anthropic.base_url.as_deref(),
+            "openai" => self.openai.base_url.as_deref(),
+            "qwen" => self.qwen.base_url.as_deref(),
+            "deepseek" => self.deepseek.base_url.as_deref(),
+            "openrouter" => self.openrouter.base_url.as_deref(),
+            "claude-code" | "claude_code" => self.claude_code.base_url.as_deref(),
+            "gemini-cli" | "gemini_cli" => self.gemini_cli.base_url.as_deref(),
+            "gemini" => self.gemini.base_url.as_deref(),
+            "groq" => self.groq.base_url.as_deref(),
+            "ollama" => self.ollama.base_url.as_deref(),
+            "mistral" => self.mistral.base_url.as_deref(),
+            "xai" | "grok" => self.xai.base_url.as_deref(),
+            "cohere" => self.cohere.base_url.as_deref(),
+            "perplexity" => self.perplexity.base_url.as_deref(),
+            "together" => self.together.base_url.as_deref(),
+            "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.base_url.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Get the base URL for a specific provider by name.
+    pub fn base_url_for_provider(&self, provider: &str) -> Option<&str> {
+        match provider {
+            "anthropic" => self.anthropic.base_url.as_deref(),
+            "openai" => self.openai.base_url.as_deref(),
+            "qwen" => self.qwen.base_url.as_deref(),
+            "deepseek" => self.deepseek.base_url.as_deref(),
+            "openrouter" => self.openrouter.base_url.as_deref(),
+            "claude-code" | "claude_code" => self.claude_code.base_url.as_deref(),
+            "gemini-cli" | "gemini_cli" => self.gemini_cli.base_url.as_deref(),
+            "gemini" => self.gemini.base_url.as_deref(),
+            "groq" => self.groq.base_url.as_deref(),
+            "ollama" => self.ollama.base_url.as_deref(),
+            "mistral" => self.mistral.base_url.as_deref(),
+            "xai" | "grok" => self.xai.base_url.as_deref(),
+            "cohere" => self.cohere.base_url.as_deref(),
+            "perplexity" => self.perplexity.base_url.as_deref(),
+            "together" => self.together.base_url.as_deref(),
+            "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.base_url.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Get use_streaming for the active provider. Defaults to true.
+    pub fn active_use_streaming(&self) -> bool {
+        match self.active_provider() {
+            Some(p) => self.use_streaming_for_provider(p),
+            None => true,
+        }
+    }
+
+    /// Get use_streaming for a specific provider. Defaults to true.
+    pub fn use_streaming_for_provider(&self, provider: &str) -> bool {
+        match provider {
+            "anthropic" => self.anthropic.use_streaming,
+            "openai" => self.openai.use_streaming,
+            "qwen" => self.qwen.use_streaming,
+            "deepseek" => self.deepseek.use_streaming,
+            "openrouter" => self.openrouter.use_streaming,
+            "claude-code" | "claude_code" => self.claude_code.use_streaming,
+            "gemini-cli" | "gemini_cli" => self.gemini_cli.use_streaming,
+            "gemini" => self.gemini.use_streaming,
+            "groq" => self.groq.use_streaming,
+            "ollama" => self.ollama.use_streaming,
+            "mistral" => self.mistral.use_streaming,
+            "xai" | "grok" => self.xai.use_streaming,
+            "cohere" => self.cohere.use_streaming,
+            "perplexity" => self.perplexity.use_streaming,
+            "together" => self.together.use_streaming,
+            "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.use_streaming,
+            _ => None,
+        }
+        .unwrap_or(true)
     }
 
     /// Get list of configured providers with their model names.
