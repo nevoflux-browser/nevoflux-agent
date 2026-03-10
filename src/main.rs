@@ -376,6 +376,13 @@ async fn run_daemon(
 
     logging::log_startup(env!("CARGO_PKG_VERSION"));
 
+    // Install bundled default skills on first launch
+    match nevoflux_skills::install_default_skills() {
+        Ok(0) => {} // already installed or no bundled skills
+        Ok(n) => tracing::info!("Installed {} default skill files", n),
+        Err(e) => tracing::warn!("Failed to install default skills: {}", e),
+    }
+
     // In managed+port mode the proxy is the lifecycle manager — skip file lock.
     let _lock = if managed && port.is_some() {
         None

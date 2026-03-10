@@ -67,7 +67,10 @@ pub mod types;
 pub use error::{Result, SkillsError};
 #[allow(deprecated)]
 pub use loader::default_user_skills_dir;
-pub use loader::{default_user_skills_dirs, AsyncSkillLoader, LoaderConfig, SkillLoader};
+pub use loader::{
+    default_user_skills_dirs, install_default_skills, nevoflux_user_skills_dir, AsyncSkillLoader,
+    LoaderConfig, SkillLoader,
+};
 pub use parser::{parse_skill, parse_skill_file, serialize_skill};
 pub use registry::{AsyncSkillRegistry, SkillRegistry};
 pub use tool_check::{check_tool_availability, format_missing_tools_message, ToolCheckResult};

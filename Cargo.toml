@@ -98,6 +98,7 @@ path = "src/main.rs"
 nevoflux-daemon = { path = "crates/daemon", default-features = false }
 nevoflux-bridge = { path = "crates/bridge" }
 nevoflux-mcp = { path = "crates/mcp" }
+nevoflux-skills = { path = "crates/skills" }
 nevoflux-protocol = { path = "crates/protocol" }
 nevoflux-storage = { path = "crates/storage" }
 clap = { workspace = true }

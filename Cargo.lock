@@ -3205,6 +3205,7 @@ dependencies = [
  "nevoflux-llm",
  "nevoflux-mcp",
  "nevoflux-protocol",
+ "nevoflux-skills",
  "nevoflux-storage",
  "predicates",
  "serde_json",

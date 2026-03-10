@@ -128,6 +128,129 @@ pub fn default_user_skills_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Get the primary NevoFlux user skills directory (the install target).
+///
+/// - Linux: `~/.config/nevoflux/skills/`
+/// - macOS: `~/Library/Application Support/nevoflux/skills/`
+/// - Windows: `%APPDATA%\nevoflux\skills\`
+pub fn nevoflux_user_skills_dir() -> Option<PathBuf> {
+    let base = directories::BaseDirs::new()?;
+    let dir = if cfg!(windows) {
+        base.data_dir().join("nevoflux").join("skills")
+    } else if cfg!(target_os = "macos") {
+        base.data_dir().join("nevoflux").join("skills")
+    } else {
+        // Linux
+        base.config_dir().join("nevoflux").join("skills")
+    };
+    Some(dir)
+}
+
+/// Resolve the bundled default skills directory relative to the executable.
+///
+/// Looks for `defaults/skills/` next to the binary (the path used by the
+/// installation package: `distribution/bin/defaults/skills/`).
+fn bundled_skills_dir() -> Option<PathBuf> {
+    let exe_path = std::env::current_exe().ok()?;
+    let exe_dir = exe_path.parent()?;
+    let dir = exe_dir.join("defaults").join("skills");
+    if dir.is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// Install bundled default skills to the user's NevoFlux skills directory.
+///
+/// Called once on first launch. Copies skill directories from the installation
+/// package (`<exe_dir>/defaults/skills/`) to the platform-specific user
+/// directory. Existing files are **not** overwritten so user customizations
+/// are preserved.
+///
+/// Returns the number of skill entries (top-level files/dirs) installed,
+/// or an error string.
+pub fn install_default_skills() -> std::result::Result<usize, String> {
+    let source = match bundled_skills_dir() {
+        Some(d) => d,
+        None => {
+            debug!("No bundled skills directory found, skipping install");
+            return Ok(0);
+        }
+    };
+
+    let target = nevoflux_user_skills_dir()
+        .ok_or_else(|| "Cannot determine user skills directory".to_string())?;
+
+    // If the target already contains skill entries, assume install was done.
+    if target.is_dir() {
+        let has_entries = std::fs::read_dir(&target)
+            .map(|mut rd| rd.next().is_some())
+            .unwrap_or(false);
+        if has_entries {
+            debug!(
+                "User skills directory already populated: {}",
+                target.display()
+            );
+            return Ok(0);
+        }
+    }
+
+    debug!(
+        "Installing default skills: {} -> {}",
+        source.display(),
+        target.display()
+    );
+
+    std::fs::create_dir_all(&target)
+        .map_err(|e| format!("Failed to create skills directory {}: {}", target.display(), e))?;
+
+    let mut installed = 0;
+    copy_dir_recursive(&source, &target, &mut installed)?;
+
+    tracing::info!(
+        "Installed {} default skill entries to {}",
+        installed,
+        target.display()
+    );
+    Ok(installed)
+}
+
+/// Recursively copy a directory tree, skipping files that already exist
+/// in the destination. `count` is incremented for each file copied.
+fn copy_dir_recursive(src: &Path, dst: &Path, count: &mut usize) -> std::result::Result<(), String> {
+    let entries = std::fs::read_dir(src)
+        .map_err(|e| format!("Failed to read {}: {}", src.display(), e))?;
+
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| format!("Failed to read entry in {}: {}", src.display(), e))?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if src_path.is_dir() {
+            std::fs::create_dir_all(&dst_path).map_err(|e| {
+                format!("Failed to create directory {}: {}", dst_path.display(), e)
+            })?;
+            copy_dir_recursive(&src_path, &dst_path, count)?;
+        } else {
+            // Do not overwrite existing files (user customizations)
+            if !dst_path.exists() {
+                std::fs::copy(&src_path, &dst_path).map_err(|e| {
+                    format!(
+                        "Failed to copy {} -> {}: {}",
+                        src_path.display(),
+                        dst_path.display(),
+                        e
+                    )
+                })?;
+                *count += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Get the default user skills directory (legacy, returns first directory).
 #[deprecated(note = "Use default_user_skills_dirs() instead")]
 pub fn default_user_skills_dir() -> Option<PathBuf> {
@@ -983,5 +1106,73 @@ Disabled content."#,
         // Direct file should be preferred when loading by name
         let skill = loader.load_skill("shared").unwrap();
         assert_eq!(skill.description(), "Direct version");
+    }
+
+    #[test]
+    fn test_copy_dir_recursive() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+        let dst_path = dst.path().join("skills");
+
+        // Create source structure:
+        // src/app/SKILL.md
+        // src/app/actions.md
+        // src/readme.md
+        let app_dir = src.path().join("app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("SKILL.md"), "skill content").unwrap();
+        std::fs::write(app_dir.join("actions.md"), "actions").unwrap();
+        std::fs::write(src.path().join("readme.md"), "readme").unwrap();
+
+        std::fs::create_dir_all(&dst_path).unwrap();
+        let mut count = 0;
+        copy_dir_recursive(src.path(), &dst_path, &mut count).unwrap();
+
+        assert_eq!(count, 3);
+        assert!(dst_path.join("app").join("SKILL.md").exists());
+        assert!(dst_path.join("app").join("actions.md").exists());
+        assert!(dst_path.join("readme.md").exists());
+
+        // Verify content
+        assert_eq!(
+            std::fs::read_to_string(dst_path.join("app").join("SKILL.md")).unwrap(),
+            "skill content"
+        );
+    }
+
+    #[test]
+    fn test_copy_dir_recursive_no_overwrite() {
+        let src = TempDir::new().unwrap();
+        let dst = TempDir::new().unwrap();
+
+        std::fs::write(src.path().join("file.md"), "new content").unwrap();
+        std::fs::write(dst.path().join("file.md"), "user customized").unwrap();
+
+        let mut count = 0;
+        copy_dir_recursive(src.path(), dst.path(), &mut count).unwrap();
+
+        // Should NOT overwrite existing file
+        assert_eq!(count, 0);
+        assert_eq!(
+            std::fs::read_to_string(dst.path().join("file.md")).unwrap(),
+            "user customized"
+        );
+    }
+
+    #[test]
+    fn test_nevoflux_user_skills_dir() {
+        let dir = nevoflux_user_skills_dir();
+        assert!(dir.is_some());
+        let dir = dir.unwrap();
+
+        // Should end with "skills"
+        assert_eq!(dir.file_name().unwrap(), "skills");
+
+        // Should contain "nevoflux" in the path
+        assert!(
+            dir.to_string_lossy().contains("nevoflux"),
+            "Path should contain 'nevoflux': {:?}",
+            dir
+        );
     }
 }
