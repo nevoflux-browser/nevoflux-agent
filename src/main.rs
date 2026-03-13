@@ -252,8 +252,11 @@ async fn run_proxy(verbose: bool, dev_mode: bool) -> Result<(), Box<dyn std::err
         }
     }
 
+    // Ensure data directory exists before writing log files or port/pid files.
+    let data_dir = ensure_data_dir().unwrap_or_else(|_| get_data_dir());
+
     // Initialize logging to file only (stdout/stderr must be silent for Native Messaging)
-    let log_file = get_data_dir().join("proxy.log");
+    let log_file = data_dir.join("proxy.log");
     logging::init_file_only_logging(log_file, verbose);
 
     let mode = if dev_mode {
@@ -266,7 +269,7 @@ async fn run_proxy(verbose: bool, dev_mode: bool) -> Result<(), Box<dyn std::err
 
     let bridge_config = BridgeConfig::new()
         .with_mode(mode)
-        .with_data_dir(get_data_dir());
+        .with_data_dir(data_dir);
     let config = AsyncProxyConfig::new().with_bridge(bridge_config);
 
     let result = run_async_proxy(stdin(), stdout(), config).await?;
@@ -354,10 +357,15 @@ async fn run_daemon(
     port: Option<u16>,
     managed: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Ensure data directory exists first — managed daemons need it for the
+    // log file, and SessionManager needs it for the database. This must
+    // happen before init_logging() so the log file can actually be created.
+    let data_dir = ensure_data_dir()?;
+
     // Initialize logging — managed daemons write to a log file since the
     // bridge launches them with stderr redirected to null.
     let log_file = if managed {
-        Some(get_data_dir().join("daemon.log"))
+        Some(data_dir.join("daemon.log"))
     } else {
         None
     };
@@ -370,11 +378,19 @@ async fn run_daemon(
     if trace_enabled {
         tracing::info!(
             "Trace enabled: writing to {}/traces/",
-            get_data_dir().display()
+            data_dir.display()
         );
     }
 
     logging::log_startup(env!("CARGO_PKG_VERSION"));
+
+    // Ensure config file exists on first launch. This must happen early so
+    // users have a config.toml to edit even if the daemon fails later.
+    // On Windows in managed mode, stdout/stderr are null, so without this
+    // explicit step, a missing config would be silently ignored.
+    if let Err(e) = nevoflux_daemon::AgentConfig::load() {
+        tracing::warn!("Failed to initialize config file: {}", e);
+    }
 
     // Install bundled default skills on first launch
     match nevoflux_skills::install_default_skills() {
@@ -410,10 +426,6 @@ async fn run_daemon(
     // Remember whether we're in zero-file mode before `port` gets shadowed
     // by `server.port()`.
     let zero_file_mode = managed && port.is_some();
-
-    // Start server — pass data_dir so port/pid files are written early
-    // (right after port discovery, before MCP/embedding init).
-    let data_dir = ensure_data_dir()?;
     let mut config = nevoflux_daemon::ServerConfig {
         trace_enabled,
         managed,
