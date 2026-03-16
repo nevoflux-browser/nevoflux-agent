@@ -202,8 +202,9 @@ impl RmcpClient {
         // and nvm/pyenv paths not on daemon PATH)
         let (resolved_cmd, all_args) = crate::command::split_command(command, args);
 
-        let mut cmd = Command::new(&resolved_cmd);
-        cmd.args(&all_args);
+        // On Windows, use cmd /C to resolve .cmd scripts (npx.cmd, etc.)
+        // On Unix, execute directly.
+        let mut cmd = crate::command::build_command(&resolved_cmd, &all_args);
 
         // Add environment variables
         for (key, value) in env {

@@ -39,6 +39,38 @@ pub fn split_command<'a>(command: &'a str, args: &[&'a str]) -> (String, Vec<Str
     }
 }
 
+/// Build a `tokio::process::Command` with correct platform semantics.
+///
+/// On Windows, npm-installed tools like `npx` are `.cmd` scripts that
+/// `Command::new("npx")` cannot find — Windows `CreateProcessW` only
+/// resolves `.exe` files by default. We wrap with `cmd /C` so the
+/// Windows command interpreter handles PATHEXT resolution.
+///
+/// On Unix, the command is executed directly.
+pub fn build_command(command: &str, args: &[String]) -> tokio::process::Command {
+    #[cfg(windows)]
+    {
+        // If already an absolute path to an .exe, run directly
+        let is_direct = command.contains('\\') || command.contains('/')
+            || command.ends_with(".exe");
+        if is_direct {
+            let mut cmd = tokio::process::Command::new(command);
+            cmd.args(args);
+            return cmd;
+        }
+        // Use cmd /C to resolve .cmd/.bat scripts via PATHEXT
+        let mut cmd = tokio::process::Command::new("cmd");
+        cmd.arg("/C").arg(command).args(args);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        let mut cmd = tokio::process::Command::new(command);
+        cmd.args(args);
+        cmd
+    }
+}
+
 /// Try to resolve a command name to its absolute path.
 ///
 /// When the daemon process runs without a full login shell environment
