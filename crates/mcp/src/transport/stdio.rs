@@ -72,8 +72,12 @@ impl StdioTransport {
         args: &[&str],
         env: &HashMap<String, String>,
     ) -> Result<Self> {
-        let mut cmd = Command::new(command);
-        cmd.args(args)
+        // Split command string and resolve path (handles "npx -y @pkg" in one string
+        // and nvm/pyenv paths not on daemon PATH)
+        let (resolved_cmd, all_args) = crate::command::split_command(command, args);
+
+        let mut cmd = Command::new(&resolved_cmd);
+        cmd.args(&all_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

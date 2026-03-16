@@ -38,6 +38,7 @@
 
 pub mod backend;
 pub mod client;
+pub mod command;
 pub mod error;
 pub mod manager;
 pub mod registry;

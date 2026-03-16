@@ -818,8 +818,9 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
         if !skills.is_empty() {
             prompt.push_str("\n\n# Skills\n\n");
+            prompt.push_str("The following skills are available. When a user's request matches a skill's description, you MUST use `skill_load(name)` to load the skill's full instructions BEFORE responding. Skills provide specialized workflows that produce better results than generic responses. Even a partial match (e.g., user asks to \"build a dashboard\" and a skill handles web apps) means you should load the skill.\n\n");
             prompt.push_str(&format_skill_summaries(skills));
-            prompt.push_str("\n\nUse skill_load(name) to load a skill's full content.");
+            prompt.push_str("\n\nUsers can also invoke skills explicitly with `/skill_name`. If the user's message starts with `/`, treat the first word as a skill name.");
         }
 
         prompt
@@ -2749,13 +2750,13 @@ The following skill instructions MUST be followed exactly. These instructions ta
             },
             ToolDefinition {
                 name: "skill_load".into(),
-                description: "Load a skill's full content".into(),
+                description: "Load a skill's full instructions by name. MUST be called before responding when the user's request matches any skill listed in the system prompt. The loaded content becomes your primary instructions for the task.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "name": {
                             "type": "string",
-                            "description": "The skill name"
+                            "description": "The skill name (from the Skills section in system prompt)"
                         }
                     },
                     "required": ["name"]
@@ -3220,6 +3221,47 @@ The following skill instructions MUST be followed exactly. These instructions ta
             }),
         });
 
+        // Dynamic MCP tool discovery (available in Browser and Agent modes)
+        tools.push(ToolDefinition {
+            name: "tool_search".into(),
+            description: "Search for external MCP server tools only (NOT built-in tools like web_search, browser_*, read, write). Use when you need tools from connected MCP servers. Always search first — never guess tool names or schemas.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keywords to search for (e.g., 'git', 'database', 'image')"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default: 5)",
+                        "default": 5
+                    }
+                },
+                "required": ["query"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "tool_call_dynamic".into(),
+            description: "Call a tool discovered via tool_search. Read the returned schema carefully before calling.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": "The exact name of the tool to call"
+                    },
+                    "arguments": {
+                        "type": "string",
+                        "description": "JSON string of arguments to pass to the tool (e.g., '{\"key\": \"value\"}')"
+                    }
+                },
+                "required": ["tool_name", "arguments"],
+                "additionalProperties": false
+            }),
+        });
+
         tools
     }
 
@@ -3464,46 +3506,7 @@ comprehensions, f-strings, lambda, asyncio.gather\n\
             }),
         });
 
-        // Dynamic tool discovery
-        tools.push(ToolDefinition {
-            name: "tool_search".into(),
-            description: "Search for external MCP server tools only (NOT built-in tools like web_search, browser_*, bash, read, write). Use when you need tools from connected MCP servers. Always search first — never guess tool names or schemas.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Keywords to search for (e.g., 'git', 'database', 'image')"
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return (default: 5)",
-                        "default": 5
-                    }
-                },
-                "required": ["query"]
-            }),
-        });
-
-        tools.push(ToolDefinition {
-            name: "tool_call_dynamic".into(),
-            description: "Call a tool discovered via tool_search. Read the returned schema carefully before calling.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "tool_name": {
-                        "type": "string",
-                        "description": "The exact name of the tool to call"
-                    },
-                    "arguments": {
-                        "type": "string",
-                        "description": "JSON string of arguments to pass to the tool (e.g., '{\"key\": \"value\"}')"
-                    }
-                },
-                "required": ["tool_name", "arguments"],
-                "additionalProperties": false
-            }),
-        });
+        // tool_search and tool_call_dynamic are inherited from browser tools
 
         // Computer control tools
         tools.push(ToolDefinition {
@@ -5195,10 +5198,11 @@ mod tests {
 
         let browser_tools = agent.get_browser_tools();
         let chat_tools = agent.get_chat_tools();
-        // Browser tools = chat tools + 17 browser-specific tools
-        // (15 browser interaction tools + 1 load_computer_use_tools meta-tool + 1 orchestrate)
+        // Browser tools = chat tools + 19 browser-specific tools
+        // (15 browser interaction tools + 1 load_computer_use_tools meta-tool + 1 orchestrate
+        //  + 2 MCP dynamic tools: tool_search, tool_call_dynamic)
         // (browser_get_content, browser_get_markdown, browser_screenshot are already in chat tools)
-        assert_eq!(browser_tools.len(), chat_tools.len() + 17);
+        assert_eq!(browser_tools.len(), chat_tools.len() + 19);
     }
 
     #[test]

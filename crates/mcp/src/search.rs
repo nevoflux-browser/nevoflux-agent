@@ -120,9 +120,26 @@ impl ToolSearchIndex {
     /// Search for tools matching the query.
     ///
     /// Returns results sorted by relevance score (highest first).
+    /// Special queries like "*", "all", "mcp", "list" return all indexed tools.
     pub fn search(&self, query: &str) -> Vec<SearchResult> {
         if self.documents.is_empty() {
             return Vec::new();
+        }
+
+        // Generic queries that mean "show me everything"
+        let normalized = query.trim().to_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "*" | "all" | "mcp" | "list" | "tools" | ""
+        ) {
+            return self
+                .documents
+                .iter()
+                .map(|doc| SearchResult {
+                    tool: doc.tool.clone(),
+                    score: 1.0,
+                })
+                .collect();
         }
 
         let query_terms = tokenize(query);
@@ -167,6 +184,11 @@ impl ToolSearchIndex {
     /// Check if the index is empty.
     pub fn is_empty(&self) -> bool {
         self.documents.is_empty()
+    }
+
+    /// Return all indexed tool definitions.
+    pub fn all_tools(&self) -> Vec<ToolDefinition> {
+        self.documents.iter().map(|d| d.tool.clone()).collect()
     }
 
     /// Clear the index.
@@ -505,11 +527,18 @@ mod tests {
 
         index.add(&create_tool("read_file", "Read a file"));
 
+        // Empty/generic queries return all tools
         let results = index.search("");
-        assert!(results.is_empty());
+        assert_eq!(results.len(), 1);
 
         let results = index.search("   ");
-        assert!(results.is_empty());
+        assert_eq!(results.len(), 1);
+
+        let results = index.search("*");
+        assert_eq!(results.len(), 1);
+
+        let results = index.search("mcp");
+        assert_eq!(results.len(), 1);
     }
 
     #[test]

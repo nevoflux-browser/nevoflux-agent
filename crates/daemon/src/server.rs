@@ -1251,7 +1251,10 @@ fn build_soul_context(services: &HostServices) -> Option<String> {
         sections.push(cache.user_raw.trim().to_string());
     }
     if !cache.tools_raw.trim().is_empty() {
-        sections.push(cache.tools_raw.trim().to_string());
+        let mut tools_content = cache.tools_raw.trim().to_string();
+        // Replace MCP Tool Inventory placeholder with actual tool data
+        tools_content = populate_mcp_tool_inventory(tools_content, services);
+        sections.push(tools_content);
     }
     if !cache.agents_raw.trim().is_empty() {
         sections.push(cache.agents_raw.trim().to_string());
@@ -1267,6 +1270,39 @@ fn build_soul_context(services: &HostServices) -> Option<String> {
         return None;
     }
     Some(sections.join("\n\n"))
+}
+
+/// Replace the MCP Tool Inventory placeholder in TOOLS.md with actual tool data
+/// from connected MCP servers.
+fn populate_mcp_tool_inventory(mut content: String, services: &HostServices) -> String {
+    const PLACEHOLDER: &str =
+        "| (Populated at runtime from MCP registry) | | | | |";
+
+    if !content.contains(PLACEHOLDER) {
+        return content;
+    }
+
+    // Read tool names from the search index (try_read to avoid blocking tokio runtime)
+    let tool_rows = if let Some(ref index) = services.tool_search {
+        let Ok(index) = index.try_read() else {
+            return content; // Lock contended, skip replacement
+        };
+        let tools = index.all_tools();
+        if tools.is_empty() {
+            "| (No MCP tools connected) | | | | |".to_string()
+        } else {
+            tools
+                .iter()
+                .map(|t| format!("| `{}` | MCP | - | - | - |", t.name))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    } else {
+        "| (No MCP tool search index) | | | | |".to_string()
+    };
+
+    content = content.replace(PLACEHOLDER, &tool_rows);
+    content
 }
 
 /// Build a markdown section from hot knowledge entries, grouped by category.
