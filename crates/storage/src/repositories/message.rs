@@ -145,7 +145,7 @@ impl<'a> MessageRepository<'a> {
 
             let sql = format!(
                 "SELECT id, session_id, role, content, content_type, created_at, metadata
-                 FROM messages {} ORDER BY created_at ASC{}{}",
+                 FROM messages {} ORDER BY created_at ASC, rowid ASC{}{}",
                 where_clause, limit_clause, offset_clause
             );
 
@@ -187,13 +187,40 @@ impl<'a> MessageRepository<'a> {
         })
     }
 
+    /// List the most recent N messages for a session, returned in chronological order.
+    ///
+    /// Uses `ORDER BY created_at DESC LIMIT N` with the composite index
+    /// `(session_id, created_at DESC)` to avoid loading all messages, then
+    /// reverses the result to return oldest-first order.
+    pub fn list_recent(&self, session_id: &str, limit: u32) -> Result<Vec<Message>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, role, content, content_type, created_at, metadata
+                 FROM messages
+                 WHERE session_id = ?1
+                 ORDER BY created_at DESC, rowid DESC
+                 LIMIT ?2",
+            )?;
+
+            let mut messages = stmt
+                .query_map(params![session_id, limit], row_to_message)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+
+            // Reverse to chronological order (oldest first)
+            messages.reverse();
+            Ok(messages)
+        })
+    }
+
     /// Get the last (most recent) message in a session.
     pub fn get_last(&self, session_id: &str) -> Result<Option<Message>> {
         self.db.with_connection(|conn| {
             let result = conn
                 .query_row(
                     "SELECT id, session_id, role, content, content_type, created_at, metadata
-                     FROM messages WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 1",
+                     FROM messages WHERE session_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
                     params![session_id],
                     row_to_message,
                 )

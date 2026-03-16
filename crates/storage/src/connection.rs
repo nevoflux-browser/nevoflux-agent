@@ -18,6 +18,7 @@ impl Database {
     /// Open database at the given path, creating if necessary.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
+        Self::configure_pragmas(&conn)?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -28,11 +29,21 @@ impl Database {
     /// Create an in-memory database for testing.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        Self::configure_pragmas(&conn)?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
         db.run_migrations()?;
         Ok(db)
+    }
+
+    /// Configure SQLite pragmas for performance.
+    fn configure_pragmas(conn: &Connection) -> Result<()> {
+        // WAL mode allows concurrent reads while writing, reducing lock contention.
+        conn.execute_batch("PRAGMA journal_mode=WAL")?;
+        // Synchronous NORMAL is safe with WAL and faster than FULL.
+        conn.execute_batch("PRAGMA synchronous=NORMAL")?;
+        Ok(())
     }
 
     /// Execute a function with the connection.

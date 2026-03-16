@@ -25,8 +25,10 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, warn};
 
 /// Registry for pending browser tool requests.
-/// Maps request_id to the response sender.
-type BrowserRequestRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<BrowserResponse>>>>;
+/// Maps request_id to (created_at, response_sender).
+/// Entries are cleaned up periodically to prevent unbounded growth.
+type BrowserRequestRegistry =
+    Arc<Mutex<HashMap<String, (std::time::Instant, oneshot::Sender<BrowserResponse>)>>>;
 
 /// Registry for pending plan proposals.
 /// Maps session_id to the response sender.
@@ -862,10 +864,13 @@ pub async fn start_server(
                 request_id, request.action, request.proxy_id, request.client_identity.len()
             );
 
-            // Store the response sender in the registry
+            // Store the response sender in the registry with timestamp
             {
                 let mut registry = browser_registry_clone.lock().await;
-                registry.insert(request_id.clone(), response_sender);
+                registry.insert(
+                    request_id.clone(),
+                    (std::time::Instant::now(), response_sender),
+                );
                 info!(
                     "Browser request registered: id={}, registry_size={}",
                     request_id,
@@ -897,6 +902,30 @@ pub async fn start_server(
                 error!("Failed to send browser request: {}", e);
             } else {
                 info!("Browser request sent to response queue: id={}", request_id);
+            }
+        }
+    });
+
+    // Spawn periodic cleanup task for stale browser request registry entries.
+    // Removes entries where the receiver has been dropped (agent cancelled) or
+    // entries older than 5 minutes (response lost / sidebar disconnected).
+    let cleanup_browser_registry = browser_registry.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let mut registry = cleanup_browser_registry.lock().await;
+            let before = registry.len();
+            registry.retain(|_id, (created_at, sender)| {
+                !sender.is_closed() && created_at.elapsed() < std::time::Duration::from_secs(300)
+            });
+            let removed = before - registry.len();
+            if removed > 0 {
+                info!(
+                    "Browser registry cleanup: removed {} stale entries, {} remaining",
+                    removed,
+                    registry.len()
+                );
             }
         }
     });
@@ -1000,7 +1029,7 @@ pub async fn start_server(
                         // Find the pending request and send the response
                         let sender = {
                             let mut registry = process_browser_registry.lock().await;
-                            registry.remove(&request_id)
+                            registry.remove(&request_id).map(|(_, sender)| sender)
                         };
 
                         if let Some(sender) = sender {
@@ -1371,24 +1400,24 @@ fn convert_history_messages(messages: Vec<StorageMessage>) -> Vec<WasmMessage> {
 
 /// Load session history messages for the agent.
 ///
-/// Retrieves all messages from the session, removes the last one (which is the
-/// current user message just saved), and truncates to `max_messages` most recent.
+/// Retrieves only the most recent messages using an efficient SQL query with
+/// `ORDER BY created_at DESC LIMIT N` (leverages composite index), then removes
+/// the last message (the current user message just saved).
 async fn load_session_history(
     session_manager: &SessionManager,
     session_id: &str,
     max_messages: u32,
 ) -> Vec<WasmMessage> {
-    match session_manager.get_messages(session_id).await {
+    // Fetch max_messages + 1 so we can pop the current user message and still
+    // have max_messages of history.
+    match session_manager
+        .get_recent_messages(session_id, max_messages + 1)
+        .await
+    {
         Ok(mut messages) => {
             // Remove the last message (the current user message we just saved)
             if !messages.is_empty() {
                 messages.pop();
-            }
-            // Keep only the most recent max_messages
-            let len = messages.len();
-            let max = max_messages as usize;
-            if len > max {
-                messages = messages.split_off(len - max);
             }
             convert_history_messages(messages)
         }

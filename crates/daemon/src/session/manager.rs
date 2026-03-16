@@ -231,9 +231,11 @@ impl SessionManager {
     }
 
     /// Get recent messages for a session (with limit).
+    ///
+    /// Uses an efficient DESC + LIMIT query that leverages the composite
+    /// index `(session_id, created_at DESC)` instead of loading all messages.
     pub async fn get_recent_messages(&self, session_id: &str, limit: u32) -> Result<Vec<Message>> {
-        let params = ListMessagesParams::new(session_id).with_limit(limit);
-        Ok(self.storage.messages().list(params)?)
+        Ok(self.storage.messages().list_recent(session_id, limit)?)
     }
 
     /// Get message count for a session.
