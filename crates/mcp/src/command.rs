@@ -89,6 +89,15 @@ fn resolve_command_path(command: &str) -> String {
         return command.to_string();
     }
 
+    // Windows absolute paths (e.g. C:\..., D:\...)
+    #[cfg(windows)]
+    if command.len() >= 3 {
+        let bytes = command.as_bytes();
+        if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
+            return command.to_string();
+        }
+    }
+
     // Try `which` with current PATH
     if let Some(path) = which_command(command) {
         return path;
@@ -129,9 +138,38 @@ fn which_command(command: &str) -> Option<String> {
 
     if output.status.success() {
         let path = String::from_utf8(output.stdout).ok()?;
-        let path = path.lines().next()?.trim();
-        if !path.is_empty() {
-            return Some(path.to_string());
+
+        // On Windows, `where` returns multiple results. Node.js installs both
+        // extensionless Unix shell scripts and .cmd wrappers. We must prefer
+        // .exe > .cmd > .bat since cmd.exe cannot execute bare shell scripts.
+        #[cfg(windows)]
+        {
+            let lines: Vec<&str> = path.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+            // First pass: prefer .exe
+            if let Some(p) = lines.iter().find(|l| l.ends_with(".exe")) {
+                return Some(p.to_string());
+            }
+            // Second pass: prefer .cmd
+            if let Some(p) = lines.iter().find(|l| l.ends_with(".cmd")) {
+                return Some(p.to_string());
+            }
+            // Third pass: prefer .bat
+            if let Some(p) = lines.iter().find(|l| l.ends_with(".bat")) {
+                return Some(p.to_string());
+            }
+            // Last resort: take first result (may be extensionless)
+            if let Some(p) = lines.first() {
+                return Some(p.to_string());
+            }
+            return None;
+        }
+
+        #[cfg(not(windows))]
+        {
+            let path = path.lines().next()?.trim();
+            if !path.is_empty() {
+                return Some(path.to_string());
+            }
         }
     }
     None
@@ -243,5 +281,66 @@ mod tests {
         // Non-existent command should return as-is
         let result = resolve_command_path("nonexistent_command_12345");
         assert_eq!(result, "nonexistent_command_12345");
+    }
+
+    /// Simulate the Windows `where` output parsing logic that prefers
+    /// .exe > .cmd > .bat over extensionless entries.
+    #[test]
+    fn test_prefer_executable_extensions() {
+        // Simulate `where npx` output on Windows with extensionless entry first
+        let where_output = "C:\\Program Files\\nodejs\\npx\r\nC:\\Program Files\\nodejs\\npx.cmd\r\nC:\\Users\\P1\\AppData\\Local\\Goose\\bin\\npx.cmd\r\n";
+
+        let lines: Vec<&str> = where_output
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect();
+
+        // Should prefer .cmd over extensionless
+        let selected = lines
+            .iter()
+            .find(|l| l.ends_with(".exe"))
+            .or_else(|| lines.iter().find(|l| l.ends_with(".cmd")))
+            .or_else(|| lines.iter().find(|l| l.ends_with(".bat")))
+            .or_else(|| lines.first());
+
+        assert_eq!(
+            selected.unwrap().to_owned(),
+            "C:\\Program Files\\nodejs\\npx.cmd"
+        );
+    }
+
+    /// Ensure .exe is preferred over .cmd when both are present.
+    #[test]
+    fn test_prefer_exe_over_cmd() {
+        let where_output = "C:\\nodejs\\node.cmd\r\nC:\\nodejs\\node.exe\r\n";
+
+        let lines: Vec<&str> = where_output
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect();
+
+        let selected = lines
+            .iter()
+            .find(|l| l.ends_with(".exe"))
+            .or_else(|| lines.iter().find(|l| l.ends_with(".cmd")))
+            .or_else(|| lines.iter().find(|l| l.ends_with(".bat")))
+            .or_else(|| lines.first());
+
+        assert_eq!(selected.unwrap().to_owned(), "C:\\nodejs\\node.exe");
+    }
+
+    #[test]
+    fn test_resolve_command_windows_absolute_path() {
+        // Windows drive-letter paths should be returned as-is
+        assert_eq!(
+            resolve_command_path("C:\\Program Files\\nodejs\\npx.cmd"),
+            "C:\\Program Files\\nodejs\\npx.cmd"
+        );
+        assert_eq!(
+            resolve_command_path("D:\\tools\\server.exe"),
+            "D:\\tools\\server.exe"
+        );
     }
 }
