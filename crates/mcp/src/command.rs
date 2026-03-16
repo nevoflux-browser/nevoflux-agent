@@ -50,15 +50,16 @@ pub fn split_command<'a>(command: &'a str, args: &[&'a str]) -> (String, Vec<Str
 pub fn build_command(command: &str, args: &[String]) -> tokio::process::Command {
     #[cfg(windows)]
     {
-        // If already an absolute path to an .exe, run directly
-        let is_direct = command.contains('\\') || command.contains('/')
-            || command.ends_with(".exe");
-        if is_direct {
+        // .cmd/.bat scripts (e.g. npx.cmd) can't be executed directly by
+        // CreateProcessW — they always need cmd /C, even with a full path.
+        // Only bare .exe files can be run directly.
+        let is_exe = command.ends_with(".exe");
+        if is_exe {
             let mut cmd = tokio::process::Command::new(command);
             cmd.args(args);
             return cmd;
         }
-        // Use cmd /C to resolve .cmd/.bat scripts via PATHEXT
+        // Use cmd /C for everything else (.cmd, .bat, bare names)
         let mut cmd = tokio::process::Command::new("cmd");
         cmd.arg("/C").arg(command).args(args);
         cmd
