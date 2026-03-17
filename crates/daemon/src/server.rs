@@ -347,62 +347,100 @@ pub async fn start_server(
     // Create tool auth registry for pending tool authorization requests
     let tool_auth_registry: ToolAuthRegistry = Arc::new(Mutex::new(HashMap::new()));
 
-    // Initialize MCP manager and tool search index from config
+    // Initialize MCP manager (empty) and tool search index.
+    // Actual connections happen in a background task so the daemon starts fast.
     let mcp_manager = {
-        use nevoflux_mcp::{ManagerConfig, McpManager, ServerConfig as McpServerConfig};
+        use nevoflux_mcp::{ManagerConfig, McpManager};
+        Arc::new(McpManager::new(ManagerConfig::default()))
+    };
+    let tool_search_index = nevoflux_mcp::ToolSearchIndex::new();
 
-        let manager = Arc::new(McpManager::new(ManagerConfig::default()));
+    // Spawn background task: load MCP configs, connect servers, index tools.
+    {
+        use nevoflux_mcp::ServerConfig as McpServerConfig;
 
-        // Load MCP server configs and connect to enabled servers
-        if let Ok(mcp_config) = crate::mcp_config::McpServersConfig::load() {
+        let bg_manager = Arc::clone(&mcp_manager);
+        tokio::spawn(async move {
+            let mcp_config = match crate::mcp_config::McpServersConfig::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Failed to load MCP config: {}", e);
+                    return;
+                }
+            };
+
+            // Register all server configs first (non-blocking)
+            let mut server_names = Vec::new();
             for server in mcp_config.enabled_servers() {
-                let sc = if server.server_type == "http" || server.server_type == "sse" {
+                if server.server_type == "http" || server.server_type == "sse" {
                     warn!(
                         "HTTP/SSE MCP servers not yet supported, skipping {}",
                         server.name
                     );
                     continue;
-                } else if let Some(ref command) = server.command {
-                    let mut sc = McpServerConfig::new(&server.name, command)
-                        .with_args(server.args.iter().map(|s| s.as_str()).collect());
-                    for (k, v) in &server.env {
-                        sc = sc.with_env(k, v);
-                    }
-                    sc
-                } else {
+                }
+                let Some(ref command) = server.command else {
                     warn!(
                         "MCP server {} has no command configured, skipping",
                         server.name
                     );
                     continue;
                 };
-                match manager.add_and_connect(sc).await {
-                    Ok(()) => info!("Connected MCP server: {}", server.name),
-                    Err(e) => warn!("Failed to connect MCP server {}: {}", server.name, e),
+                let mut sc = McpServerConfig::new(&server.name, command)
+                    .with_args(server.args.iter().map(|s| s.as_str()).collect());
+                for (k, v) in &server.env {
+                    sc = sc.with_env(k, v);
+                }
+                if let Err(e) = bg_manager.add_server(sc).await {
+                    warn!("Failed to add MCP server config {}: {}", server.name, e);
+                } else {
+                    server_names.push(server.name.clone());
                 }
             }
-        }
 
-        manager
-    };
+            if server_names.is_empty() {
+                return;
+            }
 
-    // Build tool search index from connected MCP server tools
-    let tool_search_index = {
-        use nevoflux_mcp::ToolSearchIndex;
-
-        let mut index = ToolSearchIndex::new();
-        match mcp_manager.list_all_tools().await {
-            Ok(server_tools) => {
-                let tool_defs: Vec<_> = server_tools.iter().map(|st| st.tool.clone()).collect();
-                if !tool_defs.is_empty() {
-                    index.index(&tool_defs);
-                    info!("Indexed {} MCP tools for tool_search", tool_defs.len());
+            // Connect all servers concurrently
+            info!(
+                "Connecting {} MCP servers in background: {:?}",
+                server_names.len(),
+                server_names
+            );
+            let results = bg_manager.connect_all().await;
+            let mut connected = 0u32;
+            for (name, result) in &results {
+                match result {
+                    Ok(()) => {
+                        connected += 1;
+                        info!("Connected MCP server: {}", name);
+                    }
+                    Err(e) => warn!("Failed to connect MCP server {}: {}", name, e),
                 }
             }
-            Err(e) => warn!("Failed to list MCP tools for indexing: {}", e),
-        }
-        index
-    };
+
+            // Index tools from successfully connected servers
+            if connected > 0 {
+                match bg_manager.list_all_tools().await {
+                    Ok(server_tools) => {
+                        let tool_defs: Vec<_> =
+                            server_tools.iter().map(|st| st.tool.clone()).collect();
+                        if !tool_defs.is_empty() {
+                            info!("Indexed {} MCP tools for tool_search", tool_defs.len());
+                        }
+                    }
+                    Err(e) => warn!("Failed to list MCP tools for indexing: {}", e),
+                }
+            }
+
+            info!(
+                "MCP background init complete: {}/{} servers connected",
+                connected,
+                results.len()
+            );
+        });
+    }
 
     // Initialize embedding provider for semantic search and knowledge embeddings
     let embedding: Option<Arc<dyn nevoflux_llm::EmbeddingProvider>> = {

@@ -167,7 +167,7 @@ impl McpRegistry {
         Ok(())
     }
 
-    /// Connect to all enabled servers.
+    /// Connect to all enabled servers concurrently.
     pub async fn connect_all(&self) -> Vec<(String, Result<()>)> {
         let configs: Vec<ServerConfig> = self
             .configs
@@ -178,12 +178,18 @@ impl McpRegistry {
             .cloned()
             .collect();
 
-        let mut results = Vec::new();
-        for config in configs {
-            let result = self.connect(&config.name).await;
-            results.push((config.name, result));
-        }
-        results
+        let futures: Vec<_> = configs
+            .into_iter()
+            .map(|config| {
+                let name = config.name.clone();
+                async move {
+                    let result = self.connect(&name).await;
+                    (name, result)
+                }
+            })
+            .collect();
+
+        futures::future::join_all(futures).await
     }
 
     /// Disconnect from a server.
