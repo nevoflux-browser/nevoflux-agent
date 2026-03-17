@@ -202,6 +202,13 @@ impl RmcpClient {
         // and nvm/pyenv paths not on daemon PATH)
         let (resolved_cmd, all_args) = crate::command::split_command(command, args);
 
+        tracing::info!(
+            command = %command,
+            resolved = %resolved_cmd,
+            args = ?all_args,
+            "Spawning MCP server process"
+        );
+
         // On Windows, use cmd /C to resolve .cmd scripts (npx.cmd, etc.)
         // On Unix, execute directly.
         let mut cmd = crate::command::build_command(&resolved_cmd, &all_args);
@@ -211,12 +218,6 @@ impl RmcpClient {
             cmd.env(key, value);
         }
 
-        // Set up stdio
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true);
-
         // On Windows, hide the console window for MCP server subprocesses
         #[cfg(windows)]
         {
@@ -225,13 +226,55 @@ impl RmcpClient {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        let transport = TokioChildProcess::new(cmd)
-            .map_err(|e| McpError::SpawnFailed(format!("{} (resolved: {}): {:?}", command, resolved_cmd, e)))?;
+        // Use rmcp builder to capture stderr for diagnostics.
+        // Default TokioChildProcess::new() inherits stderr (invisible when no console).
+        let (transport, stderr_handle) = TokioChildProcess::builder(cmd)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| McpError::SpawnFailed(format!("{} (resolved: {}): {}", command, resolved_cmd, e)))?;
 
-        let service = ()
-            .serve(transport)
-            .await
-            .map_err(|e| McpError::ConnectionFailed(format!("Failed to connect: {:?}", e)))?;
+        // Drain stderr in background, collecting output for failure diagnostics
+        let stderr_cmd = command.to_string();
+        let stderr_log = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let stderr_log_clone = stderr_log.clone();
+        if let Some(stderr) = stderr_handle {
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let reader = tokio::io::BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!(server = %stderr_cmd, "[stderr] {}", line);
+                    let mut log = stderr_log_clone.lock().await;
+                    if log.len() < 4096 {
+                        if !log.is_empty() {
+                            log.push('\n');
+                        }
+                        log.push_str(&line);
+                    }
+                }
+            });
+        }
+
+        let service = match ().serve(transport).await {
+            Ok(s) => s,
+            Err(e) => {
+                // Log captured stderr to help diagnose why the MCP server failed
+                let captured = stderr_log.lock().await;
+                if captured.is_empty() {
+                    tracing::warn!(
+                        server = %command,
+                        "MCP server process closed without stderr output"
+                    );
+                } else {
+                    tracing::warn!(
+                        server = %command,
+                        stderr = %*captured,
+                        "MCP server stderr output before failure"
+                    );
+                }
+                return Err(McpError::ConnectionFailed(format!("Failed to connect: {:?}", e)));
+            }
+        };
 
         // Extract server info from initialization
         // peer_info returns InitializeResult which has server_info field
