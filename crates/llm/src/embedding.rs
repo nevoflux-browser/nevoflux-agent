@@ -102,24 +102,46 @@ pub trait EmbeddingProvider: Send + Sync {
 /// Resolves the model cache directory with the following priority:
 ///
 /// 1. `{exe_dir}/models/fastembed/` — for bundled/portable deployments
-/// 2. `~/.cache/fastembed/` — standard user cache location
+/// 2. `{data_dir}/models/fastembed/` — NEVOFLUX_DATA_DIR override
+/// 3. `~/.cache/fastembed/` (Unix) or `%LOCALAPPDATA%/fastembed/` (Windows)
 ///
 /// Returns the first directory that exists, or the user cache dir as fallback.
 #[cfg(feature = "embedding")]
 pub fn resolve_cache_dir() -> PathBuf {
-    // Priority 1: Next to the executable
+    // Priority 1: Next to the executable (portable/bundled)
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
             let portable_dir = exe_dir.join("models").join("fastembed");
             if portable_dir.exists() {
+                tracing::info!(path = %portable_dir.display(), "Using portable model directory");
                 return portable_dir;
             }
         }
     }
 
-    // Priority 2: User cache directory
+    // Priority 2: NEVOFLUX_DATA_DIR override
+    if let Some(data_dir) = std::env::var_os("NEVOFLUX_DATA_DIR") {
+        let data_path = PathBuf::from(data_dir).join("models").join("fastembed");
+        if data_path.exists() {
+            tracing::info!(path = %data_path.display(), "Using data dir model directory");
+            return data_path;
+        }
+    }
+
+    // Priority 3: User cache directory
+    // On Windows, use %LOCALAPPDATA% (writable even in restricted contexts)
+    // instead of dirs::cache_dir() which may return a less accessible path.
+    #[cfg(windows)]
+    if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+        let cache = PathBuf::from(local_appdata).join("fastembed");
+        tracing::info!(path = %cache.display(), "Using LOCALAPPDATA model cache");
+        return cache;
+    }
+
     if let Some(cache_dir) = dirs::cache_dir() {
-        return cache_dir.join("fastembed");
+        let cache = cache_dir.join("fastembed");
+        tracing::info!(path = %cache.display(), "Using user cache model directory");
+        return cache;
     }
 
     // Fallback: current directory
@@ -167,12 +189,23 @@ impl FastEmbedProvider {
         let dims = config.model.dimensions();
         let cache_dir = resolve_cache_dir();
 
+        tracing::info!(
+            cache_dir = %cache_dir.display(),
+            model = ?config.model,
+            "Initializing embedding model"
+        );
+
         let options = fastembed::InitOptions::new(fastembed_model)
-            .with_cache_dir(cache_dir)
+            .with_cache_dir(cache_dir.clone())
             .with_show_download_progress(config.show_download_progress);
 
-        let text_embedding = fastembed::TextEmbedding::try_new(options)
-            .map_err(|e| EmbeddingError::InitError(e.to_string()))?;
+        let text_embedding = fastembed::TextEmbedding::try_new(options).map_err(|e| {
+            EmbeddingError::InitError(format!(
+                "{} (cache_dir: {})",
+                e,
+                cache_dir.display()
+            ))
+        })?;
 
         Ok(Self {
             model: Arc::new(text_embedding),
