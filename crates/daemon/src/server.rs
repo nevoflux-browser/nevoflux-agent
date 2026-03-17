@@ -5424,13 +5424,39 @@ fn get_provider_config<'a>(
     }
 }
 
-/// Check if any LLM provider has a configured API key.
+/// Check if any LLM provider is configured and usable.
+/// Providers with API keys are always considered configured.
+/// Keyless providers (ollama, claude-code, gemini-cli, kimi-agent) are
+/// considered configured when they are the active provider.
 fn has_any_configured_provider(llm: &crate::config::LlmConfig) -> bool {
-    PROVIDER_METAS.iter().any(|meta| {
+    // Check if any provider has an explicit API key
+    let has_key = PROVIDER_METAS.iter().any(|meta| {
         get_provider_config(llm, meta.id)
             .map(|pc| pc.api_key.is_some())
             .unwrap_or(false)
-    })
+    });
+    if has_key {
+        return true;
+    }
+
+    // Keyless providers are usable simply by being selected as active
+    const KEYLESS_PROVIDERS: &[&str] = &[
+        "ollama",
+        "claude-code",
+        "claude_code",
+        "gemini-cli",
+        "gemini_cli",
+        "kimi-agent",
+        "kimi_agent",
+        "kimi",
+    ];
+    if let Some(active) = llm.active_provider() {
+        if KEYLESS_PROVIDERS.contains(&active) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Get a mutable reference to the ProviderConfig for a given provider id.
