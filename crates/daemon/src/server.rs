@@ -3335,6 +3335,8 @@ async fn handle_chat_message(
 
             match command {
                 "status" => {
+                    let config = AgentConfig::load().unwrap_or_default();
+                    let has_configured = has_any_configured_provider(&config.llm);
                     serde_json::json!({
                         "type": "system_response",
                         "payload": {
@@ -3343,7 +3345,9 @@ async fn handle_chat_message(
                             "success": true,
                             "data": {
                                 "status": "ok",
-                                "version": env!("CARGO_PKG_VERSION")
+                                "version": env!("CARGO_PKG_VERSION"),
+                                "first_run": !has_configured,
+                                "has_configured_provider": has_configured
                             }
                         }
                     })
@@ -5418,6 +5422,15 @@ fn get_provider_config<'a>(
         "kimi-agent" | "kimi_agent" | "kimi" => Some(&llm.kimi_agent),
         _ => None,
     }
+}
+
+/// Check if any LLM provider has a configured API key.
+fn has_any_configured_provider(llm: &crate::config::LlmConfig) -> bool {
+    PROVIDER_METAS.iter().any(|meta| {
+        get_provider_config(llm, meta.id)
+            .map(|pc| pc.api_key.is_some())
+            .unwrap_or(false)
+    })
 }
 
 /// Get a mutable reference to the ProviderConfig for a given provider id.
