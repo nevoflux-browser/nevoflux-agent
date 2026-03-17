@@ -101,14 +101,72 @@ pub trait EmbeddingProvider: Send + Sync {
 
 /// Resolves the model cache directory with the following priority:
 ///
-/// 1. `{exe_dir}/models/fastembed/` — for bundled/portable deployments
-/// 2. `{data_dir}/models/fastembed/` — NEVOFLUX_DATA_DIR override
-/// 3. `~/.cache/fastembed/` (Unix) or `%LOCALAPPDATA%/fastembed/` (Windows)
+/// 1. `{data_dir}/models/fastembed/` — NEVOFLUX_DATA_DIR override
+/// 2. `%LOCALAPPDATA%/nevoflux/models/fastembed/` (Windows) or `~/.cache/fastembed/` (Unix)
+///    - On Windows, if bundled models exist at `{exe_dir}/models/fastembed/`, they are
+///      automatically copied to the writable location on first run.
+/// 3. `{exe_dir}/models/fastembed/` — direct use on Unix (typically writable)
 ///
-/// Returns the first directory that exists, or the user cache dir as fallback.
+/// Returns the first usable directory found.
 #[cfg(feature = "embedding")]
 pub fn resolve_cache_dir() -> PathBuf {
-    // Priority 1: Next to the executable (portable/bundled)
+    // Priority 1: NEVOFLUX_DATA_DIR override
+    if let Some(data_dir) = std::env::var_os("NEVOFLUX_DATA_DIR") {
+        let data_path = PathBuf::from(data_dir).join("models").join("fastembed");
+        if data_path.exists() {
+            tracing::info!(path = %data_path.display(), "Using data dir model directory");
+            return data_path;
+        }
+    }
+
+    // Priority 2 (Windows): writable %LOCALAPPDATA% location.
+    // If bundled models exist next to exe, copy them here on first run.
+    #[cfg(windows)]
+    {
+        if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
+            let writable_dir = PathBuf::from(local_appdata)
+                .join("nevoflux")
+                .join("models")
+                .join("fastembed");
+
+            // Already copied — use it directly
+            if writable_dir.exists() {
+                tracing::info!(path = %writable_dir.display(), "Using local model cache");
+                return writable_dir;
+            }
+
+            // Check for bundled models next to the executable
+            if let Ok(exe_path) = std::env::current_exe() {
+                if let Some(exe_dir) = exe_path.parent() {
+                    let bundled_dir = exe_dir.join("models").join("fastembed");
+                    if bundled_dir.exists() {
+                        // First run: copy bundled models to writable location
+                        tracing::info!(
+                            src = %bundled_dir.display(),
+                            dst = %writable_dir.display(),
+                            "Copying bundled models to writable location (first run)"
+                        );
+                        if let Err(e) = copy_dir_recursive(&bundled_dir, &writable_dir) {
+                            tracing::warn!(
+                                error = %e,
+                                "Failed to copy models, falling back to bundled directory"
+                            );
+                            return bundled_dir;
+                        }
+                        tracing::info!(path = %writable_dir.display(), "Models copied successfully");
+                        return writable_dir;
+                    }
+                }
+            }
+
+            // No bundled models — use writable dir as download target
+            tracing::info!(path = %writable_dir.display(), "Using local model cache (download target)");
+            return writable_dir;
+        }
+    }
+
+    // Priority 2 (Unix): use portable dir directly if it exists
+    #[cfg(not(windows))]
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
             let portable_dir = exe_dir.join("models").join("fastembed");
@@ -119,25 +177,7 @@ pub fn resolve_cache_dir() -> PathBuf {
         }
     }
 
-    // Priority 2: NEVOFLUX_DATA_DIR override
-    if let Some(data_dir) = std::env::var_os("NEVOFLUX_DATA_DIR") {
-        let data_path = PathBuf::from(data_dir).join("models").join("fastembed");
-        if data_path.exists() {
-            tracing::info!(path = %data_path.display(), "Using data dir model directory");
-            return data_path;
-        }
-    }
-
     // Priority 3: User cache directory
-    // On Windows, use %LOCALAPPDATA% (writable even in restricted contexts)
-    // instead of dirs::cache_dir() which may return a less accessible path.
-    #[cfg(windows)]
-    if let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") {
-        let cache = PathBuf::from(local_appdata).join("fastembed");
-        tracing::info!(path = %cache.display(), "Using LOCALAPPDATA model cache");
-        return cache;
-    }
-
     if let Some(cache_dir) = dirs::cache_dir() {
         let cache = cache_dir.join("fastembed");
         tracing::info!(path = %cache.display(), "Using user cache model directory");
@@ -146,6 +186,24 @@ pub fn resolve_cache_dir() -> PathBuf {
 
     // Fallback: current directory
     PathBuf::from("fastembed")
+}
+
+/// Recursively copy a directory tree.
+#[cfg(windows)]
+#[cfg(feature = "embedding")]
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Embedding provider using the fastembed crate for local CPU-based inference.
