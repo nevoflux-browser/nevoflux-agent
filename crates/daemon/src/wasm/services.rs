@@ -269,6 +269,12 @@ impl HostServices {
         self
     }
 
+    /// Add a shared tool search index (already wrapped in Arc<RwLock>).
+    pub fn with_shared_tool_search(mut self, index: Arc<RwLock<ToolSearchIndex>>) -> Self {
+        self.tool_search = Some(index);
+        self
+    }
+
     /// Add LLM configuration to the services.
     ///
     /// This enables the `llm_chat` host function to make LLM API calls.

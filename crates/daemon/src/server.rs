@@ -353,13 +353,14 @@ pub async fn start_server(
         use nevoflux_mcp::{ManagerConfig, McpManager};
         Arc::new(McpManager::new(ManagerConfig::default()))
     };
-    let tool_search_index = nevoflux_mcp::ToolSearchIndex::new();
+    let tool_search_index = Arc::new(tokio::sync::RwLock::new(nevoflux_mcp::ToolSearchIndex::new()));
 
     // Spawn background task: load MCP configs, connect servers, index tools.
     {
         use nevoflux_mcp::ServerConfig as McpServerConfig;
 
         let bg_manager = Arc::clone(&mcp_manager);
+        let bg_tool_search = Arc::clone(&tool_search_index);
         tokio::spawn(async move {
             let mcp_config = match crate::mcp_config::McpServersConfig::load() {
                 Ok(c) => c,
@@ -427,13 +428,14 @@ pub async fn start_server(
                 }
             }
 
-            // Index tools from successfully connected servers
+            // Index tools from successfully connected servers into the shared search index
             if connected > 0 {
                 match bg_manager.list_all_tools().await {
                     Ok(server_tools) => {
                         let tool_defs: Vec<_> =
                             server_tools.iter().map(|st| st.tool.clone()).collect();
                         if !tool_defs.is_empty() {
+                            bg_tool_search.write().await.index(&tool_defs);
                             info!("Indexed {} MCP tools for tool_search", tool_defs.len());
                         }
                     }
@@ -773,7 +775,7 @@ pub async fn start_server(
     let mut services = HostServices::new(Arc::new(db))
         .with_browser_sender(browser_tx)
         .with_mcp_manager(mcp_manager)
-        .with_tool_search(tool_search_index)
+        .with_shared_tool_search(tool_search_index)
         .with_vector_index(vector_index)
         .with_role_registry(role_registry);
     if let Some(ref emb) = embedding {
