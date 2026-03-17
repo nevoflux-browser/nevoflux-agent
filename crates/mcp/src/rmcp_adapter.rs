@@ -313,6 +313,59 @@ impl RmcpClient {
         })
     }
 
+    /// Connect to an MCP server via HTTP/SSE (Streamable HTTP) transport.
+    ///
+    /// # Arguments
+    ///
+    /// * `url` - The HTTP endpoint URL (e.g., "http://localhost:8080/mcp")
+    pub async fn connect_http(url: &str) -> Result<Self> {
+        use rmcp::transport::StreamableHttpClientTransport;
+
+        tracing::info!(url = %url, "Connecting to MCP server via HTTP/SSE");
+
+        let transport = StreamableHttpClientTransport::from_uri(url);
+
+        let service = ()
+            .serve(transport)
+            .await
+            .map_err(|e| McpError::ConnectionFailed(format!("HTTP/SSE connect failed: {:?}", e)))?;
+
+        let server_info = service.peer_info().map(|result| ServerInfo {
+            name: result.server_info.name.to_string(),
+            version: result.server_info.version.to_string(),
+            protocol_version: Some(result.protocol_version.to_string()),
+        });
+
+        let capabilities = service.peer_info().map(|result| ServerCapabilities {
+            tools: result
+                .capabilities
+                .tools
+                .as_ref()
+                .map(|_| crate::types::ToolsCapability {
+                    list_changed: false,
+                }),
+            resources: result.capabilities.resources.as_ref().map(|r| {
+                crate::types::ResourcesCapability {
+                    list_changed: false,
+                    subscribe: r.subscribe.unwrap_or(false),
+                }
+            }),
+            prompts: result.capabilities.prompts.as_ref().map(|_| {
+                crate::types::PromptsCapability {
+                    list_changed: false,
+                }
+            }),
+        });
+
+        tracing::info!(url = %url, "Connected to MCP server via HTTP/SSE");
+
+        Ok(Self {
+            service: Arc::new(RwLock::new(Some(service))),
+            server_info: RwLock::new(server_info),
+            capabilities: RwLock::new(capabilities),
+        })
+    }
+
     /// Check if the client is connected.
     pub async fn is_ready(&self) -> bool {
         let guard = self.service.read().await;

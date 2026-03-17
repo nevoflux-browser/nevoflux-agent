@@ -16,23 +16,35 @@ use crate::rmcp_adapter::RmcpClient;
 #[cfg(feature = "legacy-backend")]
 use crate::client::McpClient;
 
+/// Transport type for connecting to an MCP server.
+#[derive(Debug, Clone, Default)]
+pub enum TransportType {
+    /// Stdio transport (spawn a child process).
+    #[default]
+    Stdio,
+    /// HTTP/SSE (Streamable HTTP) transport.
+    Http,
+}
+
 /// Configuration for an MCP server.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     /// Server name (unique identifier).
     pub name: String,
-    /// Command to execute.
+    /// Command to execute (for stdio) or URL (for http/sse).
     pub command: String,
-    /// Arguments to pass to the command.
+    /// Arguments to pass to the command (stdio only).
     pub args: Vec<String>,
     /// Whether the server is enabled.
     pub enabled: bool,
-    /// Environment variables to set.
+    /// Environment variables to set (stdio only).
     pub env: HashMap<String, String>,
+    /// Transport type.
+    pub transport: TransportType,
 }
 
 impl ServerConfig {
-    /// Create a new server configuration.
+    /// Create a new server configuration (stdio transport).
     pub fn new(name: impl Into<String>, command: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -40,6 +52,19 @@ impl ServerConfig {
             args: Vec::new(),
             enabled: true,
             env: HashMap::new(),
+            transport: TransportType::Stdio,
+        }
+    }
+
+    /// Create an HTTP/SSE server configuration.
+    pub fn new_http(name: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            command: url.into(),
+            args: Vec::new(),
+            enabled: true,
+            env: HashMap::new(),
+            transport: TransportType::Http,
         }
     }
 
@@ -152,11 +177,19 @@ impl McpRegistry {
 
         let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
 
-        // Use official rmcp SDK by default, custom McpClient with legacy-backend feature
+        // Connect using the appropriate transport
         #[cfg(not(feature = "legacy-backend"))]
-        let client: Arc<dyn McpClientBackend> = Arc::new(
-            RmcpClient::connect_stdio_with_env(&config.command, &args, &config.env).await?,
-        );
+        let client: Arc<dyn McpClientBackend> = match config.transport {
+            TransportType::Http => {
+                Arc::new(RmcpClient::connect_http(&config.command).await?)
+            }
+            TransportType::Stdio => {
+                Arc::new(
+                    RmcpClient::connect_stdio_with_env(&config.command, &args, &config.env)
+                        .await?,
+                )
+            }
+        };
 
         #[cfg(feature = "legacy-backend")]
         let client: Arc<dyn McpClientBackend> =

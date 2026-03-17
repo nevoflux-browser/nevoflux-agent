@@ -372,25 +372,32 @@ pub async fn start_server(
             // Register all server configs first (non-blocking)
             let mut server_names = Vec::new();
             for server in mcp_config.enabled_servers() {
-                if server.server_type == "http" || server.server_type == "sse" {
-                    warn!(
-                        "HTTP/SSE MCP servers not yet supported, skipping {}",
-                        server.name
-                    );
-                    continue;
-                }
-                let Some(ref command) = server.command else {
-                    warn!(
-                        "MCP server {} has no command configured, skipping",
-                        server.name
-                    );
-                    continue;
+                let sc = if server.server_type == "http" || server.server_type == "sse" {
+                    // HTTP/SSE transport: use URL from config
+                    let Some(ref url) = server.url else {
+                        warn!(
+                            "MCP server {} has no URL configured for HTTP/SSE, skipping",
+                            server.name
+                        );
+                        continue;
+                    };
+                    McpServerConfig::new_http(&server.name, url.as_str())
+                } else {
+                    // Stdio transport: use command + args
+                    let Some(ref command) = server.command else {
+                        warn!(
+                            "MCP server {} has no command configured, skipping",
+                            server.name
+                        );
+                        continue;
+                    };
+                    let mut sc = McpServerConfig::new(&server.name, command)
+                        .with_args(server.args.iter().map(|s| s.as_str()).collect());
+                    for (k, v) in &server.env {
+                        sc = sc.with_env(k, v);
+                    }
+                    sc
                 };
-                let mut sc = McpServerConfig::new(&server.name, command)
-                    .with_args(server.args.iter().map(|s| s.as_str()).collect());
-                for (k, v) in &server.env {
-                    sc = sc.with_env(k, v);
-                }
                 if let Err(e) = bg_manager.add_server(sc).await {
                     warn!("Failed to add MCP server config {}: {}", server.name, e);
                 } else {
