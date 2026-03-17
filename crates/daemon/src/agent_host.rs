@@ -1205,9 +1205,8 @@ impl HostFunctions for DaemonHostFunctions {
             })?;
 
         // Path 2: Vector semantic search (if embedding provider is available)
-        let semantic_results = if let Some(ref provider) = services.embedding {
+        let semantic_results = if let Some(provider) = crate::wasm::services::get_embedding(&services.embedding) {
             let runtime = self.runtime.clone();
-            let provider = Arc::clone(provider);
             let query_owned = query.to_string();
             let embed_result = tokio::task::block_in_place(|| {
                 runtime.block_on(async { provider.embed(&query_owned).await })
@@ -1275,9 +1274,8 @@ impl HostFunctions for DaemonHostFunctions {
             })?;
 
         // Generate embedding and update vector index if provider is available
-        if let Some(ref provider) = services.embedding {
+        if let Some(provider) = crate::wasm::services::get_embedding(&services.embedding) {
             let runtime = self.runtime.clone();
-            let provider = Arc::clone(provider);
             let content_owned = content.to_string();
             let embed_result = tokio::task::block_in_place(|| {
                 runtime.block_on(async { provider.embed(&content_owned).await })

@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use nevoflux_llm::EmbeddingProvider;
 use nevoflux_storage::{CreateKnowledgeParams, CreateLearningMetricParams, Storage};
+
+use crate::wasm::services::{get_embedding, SharedEmbedding};
 
 use super::buffer::MemoryBuffer;
 use super::conflict::{detect_conflict_against, resolve_conflict, ConflictAction};
@@ -147,18 +148,18 @@ pub struct LearningPipeline {
     storage: Arc<Storage>,
     enabled: Arc<AtomicBool>,
     encryption: Option<Arc<EncryptionService>>,
-    embedding: Option<Arc<dyn EmbeddingProvider>>,
+    embedding: SharedEmbedding,
 }
 
 impl LearningPipeline {
     /// Create a new pipeline that reads from `buffer` and writes to `storage`.
     ///
-    /// An optional [`EmbeddingProvider`] can be supplied to generate vector
-    /// embeddings for new knowledge entries during [`flush`](Self::flush).
+    /// A [`SharedEmbedding`] is supplied so that vector embeddings become
+    /// available once the background init completes.
     pub fn new(
         buffer: Arc<MemoryBuffer>,
         storage: Arc<Storage>,
-        embedding: Option<Arc<dyn EmbeddingProvider>>,
+        embedding: SharedEmbedding,
     ) -> Self {
         Self {
             buffer,
@@ -268,7 +269,7 @@ impl LearningPipeline {
                 let mut params = Self::entry_to_knowledge_params(entry);
 
                 // Generate embedding for the new entry when a provider is available
-                if let Some(ref provider) = self.embedding {
+                if let Some(ref provider) = get_embedding(&self.embedding) {
                     let text = format!(
                         "{} {}",
                         entry.summary,
@@ -578,7 +579,7 @@ mod tests {
     fn setup() -> (LearningPipeline, Arc<Storage>) {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let buffer = Arc::new(MemoryBuffer::new(20, Duration::from_secs(30)));
-        let pipeline = LearningPipeline::new(buffer, storage.clone(), None);
+        let pipeline = LearningPipeline::new(buffer, storage.clone(), std::sync::Arc::new(std::sync::RwLock::new(None)));
         (pipeline, storage)
     }
 
@@ -706,7 +707,7 @@ mod tests {
         let provider = InMemoryKeyProvider::random();
         let enc = Arc::new(EncryptionService::new(&provider).unwrap());
         let pipeline =
-            LearningPipeline::new(buffer, storage.clone(), None).with_encryption(Arc::clone(&enc));
+            LearningPipeline::new(buffer, storage.clone(), std::sync::Arc::new(std::sync::RwLock::new(None))).with_encryption(Arc::clone(&enc));
         (pipeline, storage, enc)
     }
 
@@ -2374,7 +2375,7 @@ mod tests {
         // 1. Setup: in-memory Storage + Pipeline
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let buffer = Arc::new(MemoryBuffer::new(20, Duration::from_secs(30)));
-        let pipeline = LearningPipeline::new(buffer.clone(), storage.clone(), None);
+        let pipeline = LearningPipeline::new(buffer.clone(), storage.clone(), std::sync::Arc::new(std::sync::RwLock::new(None)));
 
         // 2. Insert tool execution spans (simulating a tool with 80% failure rate)
         //    Need >= 3 calls to pass ToolTraceLearningSource.min_calls threshold

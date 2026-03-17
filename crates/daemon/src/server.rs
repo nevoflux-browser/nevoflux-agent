@@ -451,100 +451,121 @@ pub async fn start_server(
         });
     }
 
-    // Initialize embedding provider for semantic search and knowledge embeddings.
-    // Uses spawn_blocking (model loading is CPU-heavy) with a timeout to avoid
-    // blocking startup if the model can't be loaded.
-    let embedding: Option<Arc<dyn nevoflux_llm::EmbeddingProvider>> = {
+    // Shared embedding provider slot — initially empty, populated by the
+    // background init task below once the ONNX model finishes loading.
+    use crate::wasm::services::SharedEmbedding;
+    let shared_embedding: SharedEmbedding = Arc::new(std::sync::RwLock::new(None));
+
+    // Build vector index (starts empty; populated by background task after
+    // the embedding provider is ready).
+    let vector_index = Arc::new(std::sync::RwLock::new(
+        nevoflux_storage::SimpleVectorIndex::new(),
+    ));
+
+    // Spawn background embedding init task — loads ONNX model, populates the
+    // shared embedding slot, loads existing memory vectors, and starts backfill.
+    // This avoids blocking daemon startup (~8-9s for model loading).
+    {
+        let embedding_slot = Arc::clone(&shared_embedding);
+        let vi = Arc::clone(&vector_index);
+        let db_arc = session_manager.storage().database().clone();
+        let backfill_storage = session_manager.shared_storage();
+
         #[cfg(feature = "embedding")]
         {
             let embedding_config = agent_config.read().unwrap().embedding.clone();
             if embedding_config.enabled {
-                use nevoflux_llm::{
-                    EmbeddingConfig as LlmEmbeddingConfig, EmbeddingModel, FastEmbedProvider,
-                };
+                tokio::spawn(async move {
+                    use nevoflux_llm::{
+                        EmbeddingConfig as LlmEmbeddingConfig, EmbeddingModel, FastEmbedProvider,
+                    };
 
-                let model = match embedding_config.model.as_str() {
-                    "multilingual-e5-small" => EmbeddingModel::MultilingualE5Small,
-                    other => EmbeddingModel::Custom(other.to_string()),
-                };
-                let llm_config = LlmEmbeddingConfig {
-                    model,
-                    show_download_progress: true,
-                };
+                    let model = match embedding_config.model.as_str() {
+                        "multilingual-e5-small" => EmbeddingModel::MultilingualE5Small,
+                        other => EmbeddingModel::Custom(other.to_string()),
+                    };
+                    let llm_config = LlmEmbeddingConfig {
+                        model,
+                        show_download_progress: true,
+                    };
 
-                // Run model loading on a blocking thread with a 10s timeout.
-                // FastEmbedProvider::new() is synchronous and may take seconds
-                // to load the ONNX model, or 20+ seconds if it tries to download.
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
-                    tokio::task::spawn_blocking(move || FastEmbedProvider::new(llm_config)),
-                )
-                .await
-                {
-                    Ok(Ok(Ok(provider))) => {
-                        info!(
-                            model = embedding_config.model.as_str(),
-                            "Embedding provider initialized"
-                        );
-                        Some(Arc::new(provider) as Arc<dyn nevoflux_llm::EmbeddingProvider>)
+                    // Run model loading on a blocking thread with a 30s timeout.
+                    let provider: Option<Arc<dyn nevoflux_llm::EmbeddingProvider>> =
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            tokio::task::spawn_blocking(move || FastEmbedProvider::new(llm_config)),
+                        )
+                        .await
+                        {
+                            Ok(Ok(Ok(p))) => {
+                                info!(
+                                    model = embedding_config.model.as_str(),
+                                    "Embedding provider initialized"
+                                );
+                                Some(Arc::new(p) as _)
+                            }
+                            Ok(Ok(Err(e))) => {
+                                warn!(
+                                    "Embedding provider unavailable: {e}, semantic search disabled"
+                                );
+                                None
+                            }
+                            Ok(Err(e)) => {
+                                warn!(
+                                    "Embedding task panicked: {e}, semantic search disabled"
+                                );
+                                None
+                            }
+                            Err(_) => {
+                                warn!(
+                                    "Embedding init timed out (30s), semantic search disabled"
+                                );
+                                None
+                            }
+                        };
+
+                    if let Some(ref provider) = provider {
+                        // Publish to the shared slot so all consumers see it
+                        if let Ok(mut slot) = embedding_slot.write() {
+                            *slot = Some(Arc::clone(provider));
+                        }
+
+                        // Load existing memory embeddings into vector index
+                        match db_arc.memory().list_with_embeddings(10_000) {
+                            Ok(chunks) => {
+                                if let Ok(mut idx) = vi.write() {
+                                    for chunk in &chunks {
+                                        if let Some(ref emb) = chunk.embedding {
+                                            idx.add(&chunk.id, emb.clone());
+                                        }
+                                    }
+                                    info!(
+                                        count = chunks.len(),
+                                        "Loaded memory embeddings into vector index"
+                                    );
+                                }
+                            }
+                            Err(e) => warn!("Failed to load memory embeddings: {e}"),
+                        }
+
+                        // Backfill entries that lack embeddings
+                        backfill_embeddings(
+                            Arc::clone(provider),
+                            backfill_storage,
+                            vi,
+                        )
+                        .await;
                     }
-                    Ok(Ok(Err(e))) => {
-                        warn!("Embedding provider unavailable: {e}, semantic search disabled");
-                        None
-                    }
-                    Ok(Err(e)) => {
-                        warn!("Embedding task panicked: {e}, semantic search disabled");
-                        None
-                    }
-                    Err(_) => {
-                        warn!("Embedding init timed out (10s), semantic search disabled");
-                        None
-                    }
-                }
+                });
             } else {
                 info!("Embedding provider disabled in config");
-                None
             }
         }
         #[cfg(not(feature = "embedding"))]
         {
+            let _ = (embedding_slot, vi, db_arc, backfill_storage);
             info!("Embedding support not compiled in, semantic search disabled");
-            None
         }
-    };
-
-    // Build vector index from existing memory embeddings
-    let vector_index = Arc::new(std::sync::RwLock::new(
-        nevoflux_storage::SimpleVectorIndex::new(),
-    ));
-    if embedding.is_some() {
-        let db_ref = session_manager.storage().database();
-        match db_ref.memory().list_with_embeddings(10_000) {
-            Ok(chunks) => {
-                if let Ok(mut idx) = vector_index.write() {
-                    for chunk in &chunks {
-                        if let Some(ref emb) = chunk.embedding {
-                            idx.add(&chunk.id, emb.clone());
-                        }
-                    }
-                    info!(
-                        count = chunks.len(),
-                        "Loaded memory embeddings into vector index"
-                    );
-                }
-            }
-            Err(e) => warn!("Failed to load memory embeddings: {e}"),
-        }
-    }
-
-    // Spawn background backfill task for entries that lack embeddings
-    if let Some(ref provider) = embedding {
-        let backfill_provider = Arc::clone(provider);
-        let backfill_storage = session_manager.shared_storage();
-        let backfill_index = Arc::clone(&vector_index);
-        tokio::spawn(async move {
-            backfill_embeddings(backfill_provider, backfill_storage, backfill_index).await;
-        });
     }
 
     // Load soul documents for system prompt injection
@@ -568,10 +589,8 @@ pub async fn start_server(
                 );
                 let cache = Arc::new(cache.clone());
                 let storage = session_manager.shared_storage();
-                let mut retriever = KnowledgeRetriever::new(cache, storage);
-                if let Some(ref emb) = embedding {
-                    retriever = retriever.with_embedding(Arc::clone(emb));
-                }
+                let retriever = KnowledgeRetriever::new(cache, storage)
+                    .with_embedding(Arc::clone(&shared_embedding));
                 Some(Arc::new(retriever))
             }
             Err(e) => {
@@ -655,7 +674,7 @@ pub async fn start_server(
         let pipeline = Arc::new(LearningPipeline::new(
             Arc::clone(&buffer),
             Arc::clone(&shared_storage),
-            embedding.clone(),
+            Arc::clone(&shared_embedding),
         ));
 
         // Create collector with ToolTraceLearningSource and link to pipeline
@@ -796,10 +815,8 @@ pub async fn start_server(
         .with_mcp_manager(mcp_manager)
         .with_shared_tool_search(tool_search_index)
         .with_vector_index(vector_index)
-        .with_role_registry(role_registry);
-    if let Some(ref emb) = embedding {
-        services = services.with_embedding(Arc::clone(emb));
-    }
+        .with_role_registry(role_registry)
+        .with_embedding(Arc::clone(&shared_embedding));
     if let Some(retriever) = knowledge_retriever {
         services = services.with_knowledge_retriever(retriever);
     }

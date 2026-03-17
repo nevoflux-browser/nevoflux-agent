@@ -7,8 +7,9 @@
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
-use nevoflux_llm::EmbeddingProvider;
 use nevoflux_storage::{cosine_similarity, Knowledge, SiteAdaptation, Storage};
+
+use crate::wasm::services::{get_embedding, SharedEmbedding};
 
 use super::soul::manager::FiveDocCache;
 
@@ -170,7 +171,7 @@ pub struct KnowledgeRetriever {
     soul_cache: RwLock<Arc<FiveDocCache>>,
     storage: Arc<Storage>,
     config: RetrievalConfig,
-    embedding: Option<Arc<dyn EmbeddingProvider>>,
+    embedding: SharedEmbedding,
 }
 
 impl KnowledgeRetriever {
@@ -180,7 +181,7 @@ impl KnowledgeRetriever {
             soul_cache: RwLock::new(soul_cache),
             storage,
             config: RetrievalConfig::default(),
-            embedding: None,
+            embedding: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -194,13 +195,13 @@ impl KnowledgeRetriever {
             soul_cache: RwLock::new(soul_cache),
             storage,
             config,
-            embedding: None,
+            embedding: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
-    /// Attach an embedding provider for semantic scoring in `retrieve()`.
-    pub fn with_embedding(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
-        self.embedding = Some(provider);
+    /// Attach a shared embedding provider for semantic scoring in `retrieve()`.
+    pub fn with_embedding(mut self, shared: SharedEmbedding) -> Self {
+        self.embedding = shared;
         self
     }
 
@@ -242,7 +243,7 @@ impl KnowledgeRetriever {
     ) -> crate::error::Result<RetrievalResult> {
         // Generate query embedding (failure = None, graceful degradation)
         let query_emb = if !query.is_empty() {
-            if let Some(ref provider) = self.embedding {
+            if let Some(provider) = get_embedding(&self.embedding) {
                 provider.embed(query).await.ok()
             } else {
                 None

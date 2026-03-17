@@ -17,6 +17,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, RwLock};
 
+/// Shared embedding provider that can be lazily initialized in the background.
+///
+/// Initially `None`; set by the background embedding init task after the ONNX
+/// model finishes loading.  All consumers (HostServices, KnowledgeRetriever,
+/// LearningPipeline) share the same `Arc` and read-lock briefly to clone the
+/// inner provider.
+pub type SharedEmbedding = Arc<std::sync::RwLock<Option<Arc<dyn EmbeddingProvider>>>>;
+
+/// Helper: read the current embedding provider from a [`SharedEmbedding`].
+///
+/// Returns `Some(Arc<dyn EmbeddingProvider>)` when the background init has
+/// completed, `None` otherwise.
+pub fn get_embedding(shared: &SharedEmbedding) -> Option<Arc<dyn EmbeddingProvider>> {
+    shared.read().ok().and_then(|guard| guard.clone())
+}
+
 /// LLM configuration for host functions.
 ///
 /// This struct holds the configuration needed to make LLM API calls
@@ -162,8 +178,8 @@ pub struct HostServices {
     pub knowledge_retriever: Option<Arc<KnowledgeRetriever>>,
     /// Computer controller for screenshot/mouse/keyboard operations.
     pub computer_controller: Option<Arc<dyn ComputerController>>,
-    /// Embedding provider for generating vector embeddings.
-    pub embedding: Option<Arc<dyn EmbeddingProvider>>,
+    /// Shared embedding provider (lazily initialized in background).
+    pub embedding: SharedEmbedding,
     /// In-memory vector index for semantic similarity search.
     pub vector_index: Arc<std::sync::RwLock<SimpleVectorIndex>>,
 }
@@ -211,7 +227,7 @@ impl HostServices {
             proxy_id: String::new(),
             knowledge_retriever: None,
             computer_controller: None,
-            embedding: None,
+            embedding: Arc::new(std::sync::RwLock::new(None)),
             vector_index: Arc::new(std::sync::RwLock::new(SimpleVectorIndex::new())),
         }
     }
@@ -237,7 +253,7 @@ impl HostServices {
             proxy_id: String::new(),
             knowledge_retriever: None,
             computer_controller: None,
-            embedding: None,
+            embedding: Arc::new(std::sync::RwLock::new(None)),
             vector_index: Arc::new(std::sync::RwLock::new(SimpleVectorIndex::new())),
         }
     }
@@ -436,8 +452,8 @@ impl HostServices {
     /// # Returns
     ///
     /// Returns self for method chaining.
-    pub fn with_embedding(mut self, provider: Arc<dyn EmbeddingProvider>) -> Self {
-        self.embedding = Some(provider);
+    pub fn with_embedding(mut self, shared: SharedEmbedding) -> Self {
+        self.embedding = shared;
         self
     }
 
@@ -525,7 +541,14 @@ impl std::fmt::Debug for HostServices {
                 "computer_controller",
                 &self.computer_controller.as_ref().map(|_| "Some(...)"),
             )
-            .field("embedding", &self.embedding.as_ref().map(|_| "Some(...)"))
+            .field(
+                "embedding",
+                &if get_embedding(&self.embedding).is_some() {
+                    "Some(...)"
+                } else {
+                    "None (pending)"
+                },
+            )
             .field("vector_index", &"Arc<RwLock<SimpleVectorIndex>>")
             .finish()
     }

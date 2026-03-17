@@ -3191,7 +3191,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux"
-version = "0.1.2"
+version = "0.1.5"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -3220,7 +3220,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-bridge"
-version = "0.1.2"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "directories",
@@ -3239,7 +3239,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-builtin-wasm"
-version = "0.1.2"
+version = "0.1.5"
 dependencies = [
  "nevoflux-protocol",
  "rmp-serde",
@@ -3249,7 +3249,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-computer"
-version = "0.1.2"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3269,7 +3269,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-daemon"
-version = "0.1.2"
+version = "0.1.5"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -3322,7 +3322,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-llm"
-version = "0.1.2"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "dirs 5.0.1",
@@ -3337,11 +3337,12 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+ "tracing",
 ]
 
 [[package]]
 name = "nevoflux-mcp"
-version = "0.1.2"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "futures",
@@ -3357,7 +3358,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-protocol"
-version = "0.1.2"
+version = "0.1.5"
 dependencies = [
  "proptest",
  "rmp-serde",
@@ -3369,7 +3370,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-skills"
-version = "0.1.2"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "directories",
@@ -3385,7 +3386,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-storage"
-version = "0.1.2"
+version = "0.1.5"
 dependencies = [
  "nevoflux-protocol",
  "proptest",
@@ -3398,7 +3399,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-testing"
-version = "0.1.2"
+version = "0.1.5"
 dependencies = [
  "async-trait",
  "nevoflux-daemon",
@@ -4687,13 +4688,16 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "futures",
+ "http",
  "pastey 0.2.1",
  "pin-project-lite",
  "process-wrap",
+ "reqwest",
  "rmcp-macros",
  "schemars",
  "serde",
  "serde_json",
+ "sse-stream",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -5293,6 +5297,19 @@ name = "sptr"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b9b39299b249ad65f3b7e96443bad61c02ca5cd3589f46cb6d610a0fd6c0d6a"
+
+[[package]]
+name = "sse-stream"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb4dc4d33c68ec1f27d386b5610a351922656e1fdf5c05bbaad930cd1519479a"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body",
+ "http-body-util",
+ "pin-project-lite",
+]
 
 [[package]]
 name = "stable_deref_trait"
