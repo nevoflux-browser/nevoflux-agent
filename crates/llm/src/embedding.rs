@@ -253,6 +253,14 @@ impl FastEmbedProvider {
             "Initializing embedding model"
         );
 
+        // If local model files exist, set HF_HUB_OFFLINE=1 to prevent
+        // fastembed from trying to download from huggingface.co (which may
+        // be unreachable and causes a 20+ second timeout).
+        if cache_dir.exists() {
+            std::env::set_var("HF_HUB_OFFLINE", "1");
+            tracing::debug!("Set HF_HUB_OFFLINE=1 (local cache exists)");
+        }
+
         let options = fastembed::InitOptions::new(fastembed_model)
             .with_cache_dir(cache_dir.clone())
             .with_show_download_progress(config.show_download_progress);

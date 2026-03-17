@@ -36,6 +36,11 @@ jobs:
               'intfloat/multilingual-e5-small',
               cache_dir=cache_dir,
               allow_patterns=[
+                  'tokenizer.json',
+                  'config.json',
+                  'special_tokens_map.json',
+                  'tokenizer_config.json',
+                  'sentencepiece.bpe.model',
                   'onnx/model_O4.onnx',
                   'onnx/tokenizer.json',
                   'onnx/config.json',

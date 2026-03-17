@@ -451,7 +451,9 @@ pub async fn start_server(
         });
     }
 
-    // Initialize embedding provider for semantic search and knowledge embeddings
+    // Initialize embedding provider for semantic search and knowledge embeddings.
+    // Uses spawn_blocking (model loading is CPU-heavy) with a timeout to avoid
+    // blocking startup if the model can't be loaded.
     let embedding: Option<Arc<dyn nevoflux_llm::EmbeddingProvider>> = {
         #[cfg(feature = "embedding")]
         {
@@ -469,16 +471,33 @@ pub async fn start_server(
                     model,
                     show_download_progress: true,
                 };
-                match FastEmbedProvider::new(llm_config) {
-                    Ok(provider) => {
+
+                // Run model loading on a blocking thread with a 10s timeout.
+                // FastEmbedProvider::new() is synchronous and may take seconds
+                // to load the ONNX model, or 20+ seconds if it tries to download.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    tokio::task::spawn_blocking(move || FastEmbedProvider::new(llm_config)),
+                )
+                .await
+                {
+                    Ok(Ok(Ok(provider))) => {
                         info!(
                             model = embedding_config.model.as_str(),
                             "Embedding provider initialized"
                         );
                         Some(Arc::new(provider) as Arc<dyn nevoflux_llm::EmbeddingProvider>)
                     }
-                    Err(e) => {
+                    Ok(Ok(Err(e))) => {
                         warn!("Embedding provider unavailable: {e}, semantic search disabled");
+                        None
+                    }
+                    Ok(Err(e)) => {
+                        warn!("Embedding task panicked: {e}, semantic search disabled");
+                        None
+                    }
+                    Err(_) => {
+                        warn!("Embedding init timed out (10s), semantic search disabled");
                         None
                     }
                 }
