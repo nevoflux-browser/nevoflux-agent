@@ -16,11 +16,9 @@ current_tab: 42 | "Page Title" | https://example.com
 
 In browser/agent mode, a **page state snapshot** is appended to the user message. It shows visible interactive elements with IDs like `[e1]`, `[e2]`, etc. These IDs are your only way to reference elements for interaction.
 
-## Attachment-aware decision making
+## Attachments
 
-When the user message includes a **screenshot attachment** (image), treat it as the sole reference material. Do NOT call `browser_screenshot`, `browser_get_content`, or `browser_get_markdown` — the screenshot's origin is unknown and may not correspond to any open tab. Work directly from the attached image.
-
-**Exception:** If the user explicitly asks to reference a specific tab (e.g., "look at tab 3" or "replicate the current page"), then use browser tools on that tab.
+When the user message includes attached images, files, or directories, prioritize using the attachments directly. Do not call browser tools to re-fetch content that is already provided in the attachments.
 
 ## Decision flow
 

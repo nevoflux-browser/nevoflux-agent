@@ -1302,46 +1302,51 @@ where
         ));
     }
 
-    // Check if this is a continuation after tool calls (has tool result messages)
-    let has_tool_results = chat_history
-        .iter()
-        .any(|m| matches!(m, Message::User { content } if content.iter().any(|c| matches!(c, UserContent::ToolResult(_)))));
-
-    // Check if any user message has multimodal content (images, documents)
-    let has_multimodal = chat_history.iter().any(|m| match m {
-        Message::User { content } => content
-            .iter()
-            .any(|c| matches!(c, UserContent::Image(_) | UserContent::Document(_))),
-        _ => false,
-    });
-
     // Build the completion request
     // IMPORTANT: rig's builder appends prompt to the END of chat_history.
-    // For multi-turn with tool results OR multimodal content, we must keep all messages
-    // in their original order, so we use empty prompt and put everything in chat_history.
-    let (prompt, chat_history) = if has_tool_results || has_multimodal {
-        // Continuation after tool calls OR multimodal content: keep all messages in order, use empty prompt
-        // We can't extract multimodal content as a simple string prompt
-        (String::new(), chat_history)
-    } else {
-        // First request with text only: extract last user message as prompt
-        let last_text_user_idx = chat_history.iter().rposition(|m| match m {
-            Message::User { content } => content.iter().any(|c| matches!(c, UserContent::Text(_))),
-            _ => false,
-        });
-
-        if let Some(idx) = last_text_user_idx {
-            let prompt = extract_text_from_message(&chat_history[idx]);
-            let mut history = chat_history;
-            history.remove(idx);
-            (prompt, history)
+    // We extract the last user message and pass it as the prompt so rig places it at the end.
+    // For multi-turn with multimodal content, we keep all messages in chat_history and use
+    // the text from the last user message as prompt. Some API providers return empty responses
+    // when a multimodal message is passed directly as the prompt in multi-turn conversations.
+    let (prompt_message, chat_history) = {
+        let last_user_idx = chat_history
+            .iter()
+            .rposition(|m| matches!(m, Message::User { .. }));
+        if let Some(idx) = last_user_idx {
+            let has_multimodal = match &chat_history[idx] {
+                Message::User { content } => content
+                    .iter()
+                    .any(|c| matches!(c, UserContent::Image(_) | UserContent::Document(_))),
+                _ => false,
+            };
+            if has_multimodal && idx > 0 {
+                // Multi-turn multimodal: keep all messages in chat_history,
+                // use text from last user message as prompt
+                let text = match &chat_history[idx] {
+                    Message::User { content } => content
+                        .iter()
+                        .filter_map(|c| match c {
+                            UserContent::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => String::new(),
+                };
+                (Message::from(text), chat_history)
+            } else {
+                // Single-turn or text-only: pop the message as prompt
+                let mut history = chat_history;
+                let msg = history.remove(idx);
+                (msg, history)
+            }
         } else {
-            (String::new(), chat_history)
+            (Message::from(""), chat_history)
         }
     };
 
     // Build the completion request using the builder pattern
-    let mut builder = completion_model.completion_request(&prompt);
+    let mut builder = completion_model.completion_request(prompt_message);
 
     // Add system prompt (preamble) if present
     if let Some(preamble) = system_prompt {
@@ -1382,7 +1387,18 @@ fn merge_consecutive_same_role_messages(messages: Vec<Message>) -> Vec<Message> 
 
     for msg in messages {
         let should_merge = match (&merged.last(), &msg) {
-            (Some(Message::User { .. }), Message::User { .. }) => true,
+            (Some(Message::User { content: existing }), Message::User { content: new }) => {
+                // Don't merge if either message contains ToolResult — rig's OpenAI provider
+                // drops non-ToolResult content (e.g. Image) when ToolResult is present.
+                // Tool result images are intentionally separated into their own User message.
+                let existing_has_tool_result = existing
+                    .iter()
+                    .any(|c| matches!(c, UserContent::ToolResult(_)));
+                let new_has_tool_result = new
+                    .iter()
+                    .any(|c| matches!(c, UserContent::ToolResult(_)));
+                !existing_has_tool_result && !new_has_tool_result
+            }
             (Some(Message::Assistant { .. }), Message::Assistant { .. }) => true,
             _ => false,
         };
@@ -1490,26 +1506,6 @@ fn clean_base64_data(data: &str) -> String {
 }
 
 /// Extract text content from a rig Message.
-fn extract_text_from_message(msg: &Message) -> String {
-    match msg {
-        Message::User { content } => content
-            .iter()
-            .filter_map(|c| match c {
-                UserContent::Text(t) => Some(t.text.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Message::Assistant { content, .. } => content
-            .iter()
-            .filter_map(|c| match c {
-                AssistantContent::Text(t) => Some(t.text.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
-}
 
 /// Process the completion response and convert to LlmChatResponse.
 fn process_completion_response(choice: OneOrMany<AssistantContent>) -> Result<LlmChatResponse> {
@@ -1522,11 +1518,17 @@ fn process_completion_response(choice: OneOrMany<AssistantContent>) -> Result<Ll
                 text_parts.push(t.text.clone());
             }
             AssistantContent::ToolCall(tc) => {
+                // Parse stringified JSON arguments into Object.
+                // Some providers return arguments as a JSON string even in complete tool calls.
+                let arguments = match &tc.function.arguments {
+                    serde_json::Value::String(s) => parse_tool_arguments_json(s),
+                    other => other.clone(),
+                };
                 tool_calls.push(LlmToolCall {
                     id: tc.id.clone(),
                     call_id: tc.call_id.clone(),
                     name: tc.function.name.clone(),
-                    arguments: tc.function.arguments.clone(),
+                    arguments,
                     signature: tc.signature.clone(),
                 });
             }
@@ -2794,61 +2796,66 @@ where
 
     // Build the completion request
     // IMPORTANT: rig's builder appends prompt to the END of chat_history.
-    // For multi-turn with tool results, we must keep all messages in their original order,
-    // so we use empty prompt and put everything in chat_history.
+    // We must extract the last user message and pass it directly as the prompt Message,
+    // so rig places it at the end. Using an empty string prompt would create an extra
+    // empty User message, causing the LLM to lose focus on multimodal content (images).
     tracing::info!(
         "has_tool_results={}, message_count={}",
         has_tool_results,
         chat_history.len()
     );
 
-    // Check if last user message has multimodal content (images, etc.)
-    let has_multimodal = chat_history.iter().any(|m| match m {
-        Message::User { content } => content
+    let (prompt_message, chat_history) = {
+        let last_user_idx = chat_history
             .iter()
-            .any(|c| matches!(c, UserContent::Image(_) | UserContent::Document(_))),
-        _ => false,
-    });
-
-    let (prompt, chat_history) = if has_tool_results || has_multimodal {
-        // Continuation after tool calls OR multimodal content: keep all messages in order, use empty prompt
-        // We can't extract multimodal content as a simple string prompt
-        tracing::info!(
-            "Using empty prompt (has_tool_results={}, has_multimodal={})",
-            has_tool_results,
-            has_multimodal
-        );
-        (String::new(), chat_history)
-    } else {
-        // First request with text only: extract last user message as prompt
-        let last_text_user_idx = chat_history.iter().rposition(|m| match m {
-            Message::User { content } => content.iter().any(|c| matches!(c, UserContent::Text(_))),
-            _ => false,
-        });
-
-        if let Some(idx) = last_text_user_idx {
-            let prompt = extract_text_from_message(&chat_history[idx]);
-            tracing::info!(
-                "Extracted prompt from message[{}]: len={}",
-                idx,
-                prompt.len()
-            );
-            let mut history = chat_history;
-            history.remove(idx);
-            (prompt, history)
+            .rposition(|m| matches!(m, Message::User { .. }));
+        if let Some(idx) = last_user_idx {
+            let has_multimodal = match &chat_history[idx] {
+                Message::User { content } => content
+                    .iter()
+                    .any(|c| matches!(c, UserContent::Image(_) | UserContent::Document(_))),
+                _ => false,
+            };
+            if has_multimodal && idx > 0 {
+                // Multi-turn multimodal: keep all messages in chat_history,
+                // use text from last user message as prompt. Some API providers
+                // return empty responses when a multimodal message is passed
+                // directly as the prompt in multi-turn conversations.
+                let text = match &chat_history[idx] {
+                    Message::User { content } => content
+                        .iter()
+                        .filter_map(|c| match c {
+                            UserContent::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => String::new(),
+                };
+                tracing::info!(
+                    "Multi-turn multimodal: keeping message[{}] in history, prompt text_len={}",
+                    idx,
+                    text.len()
+                );
+                (Message::from(text), chat_history)
+            } else {
+                tracing::info!("Extracted prompt message from message[{}]", idx);
+                let mut history = chat_history;
+                let msg = history.remove(idx);
+                (msg, history)
+            }
         } else {
-            tracing::info!("No user text message found, using empty prompt");
-            (String::new(), chat_history)
+            tracing::info!("No user message found, using empty prompt");
+            (Message::from(""), chat_history)
         }
     };
 
     tracing::info!(
-        "Final: prompt_len={}, chat_history_len={}",
-        prompt.len(),
+        "Final: chat_history_len={}",
         chat_history.len()
     );
 
-    let mut builder = completion_model.completion_request(&prompt);
+    let mut builder = completion_model.completion_request(prompt_message);
 
     if let Some(preamble) = system_prompt {
         builder = builder.preamble(preamble);
@@ -2944,38 +2951,52 @@ where
                     }
                     StreamedAssistantContent::ToolCall(tc) => {
                         tracing::info!(
-                            "Stream chunk: COMPLETE ToolCall received - id={}, call_id={:?}, name={}",
+                            "Stream chunk: COMPLETE ToolCall received - id={}, call_id={:?}, name={}, complete_args_type={:?}",
                             tc.id,
                             tc.call_id,
-                            tc.function.name
+                            tc.function.name,
+                            match &tc.function.arguments {
+                                serde_json::Value::String(s) => format!("String(len={})", s.len()),
+                                serde_json::Value::Object(o) => format!("Object(keys={})", o.len()),
+                                other => format!("{:?}", other),
+                            }
                         );
-                        let tool_call = LlmToolCall {
-                            id: tc.id.clone(),
-                            call_id: tc.call_id.clone(),
-                            name: tc.function.name.clone(),
-                            arguments: tc.function.arguments.clone(),
-                            signature: tc.signature.clone(),
+                        // Defer tool call to final chunk processing. Update accumulated entry
+                        // with metadata and COMPLETE arguments (which may be more complete
+                        // than delta-accumulated content for some providers).
+                        let entry = accumulated_tool_calls.entry(tc.id.clone()).or_insert_with(|| {
+                            LlmToolCall {
+                                id: tc.id.clone(),
+                                call_id: None,
+                                name: String::new(),
+                                arguments: serde_json::Value::String(String::new()),
+                                signature: None,
+                            }
+                        });
+                        if entry.name.is_empty() {
+                            entry.name = tc.function.name.clone();
+                        }
+                        entry.call_id = tc.call_id.clone().or(entry.call_id.take());
+                        entry.signature = tc.signature.clone().or(entry.signature.take());
+                        // Keep the more complete arguments: compare COMPLETE's args with accumulated delta.
+                        // Some providers send full args in COMPLETE, others only in deltas.
+                        let complete_args_len = match &tc.function.arguments {
+                            serde_json::Value::String(s) => s.len(),
+                            serde_json::Value::Object(o) if !o.is_empty() => tc.function.arguments.to_string().len(),
+                            _ => 0,
                         };
-                        // Mark this tool call as already sent
-                        sent_tool_call_ids.insert(tc.id.clone());
-                        // Also update accumulated_tool_calls with call_id and signature if it was being built from deltas
-                        if let Some(accumulated_tc) = accumulated_tool_calls.get_mut(&tc.id) {
+                        let accumulated_args_len = match &entry.arguments {
+                            serde_json::Value::String(s) => s.len(),
+                            _ => 0,
+                        };
+                        if complete_args_len > 0 && complete_args_len >= accumulated_args_len {
                             tracing::info!(
-                                "Updating accumulated tool call {} with call_id={:?}, signature={:?}",
-                                tc.id,
-                                tc.call_id,
-                                tc.signature.as_ref().map(|s| &s[..s.floor_char_boundary(20)])
+                                "Using COMPLETE args (len={}) over accumulated (len={}) for {}",
+                                complete_args_len, accumulated_args_len, tc.id
                             );
-                            accumulated_tc.call_id = tc.call_id.clone();
-                            accumulated_tc.signature = tc.signature.clone();
+                            entry.arguments = tc.function.arguments.clone();
                         }
-                        LlmStreamChunk {
-                            text: None,
-                            tool_calls: vec![tool_call],
-                            done: false,
-                            reasoning: None,
-                            images: vec![],
-                        }
+                        continue; // Don't emit a chunk — tool call will be sent at stream end
                     }
                     StreamedAssistantContent::ToolCallDelta { id, content } => {
                         tracing::debug!("Stream chunk: ToolCallDelta(id={})", id);

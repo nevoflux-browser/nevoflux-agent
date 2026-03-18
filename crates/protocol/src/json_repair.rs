@@ -15,6 +15,10 @@
 /// and finally tries lenient field extraction for malformed strings with
 /// unescaped quotes.
 pub fn parse_tool_arguments_json(s: &str) -> serde_json::Value {
+    if s.is_empty() {
+        return serde_json::json!({});
+    }
+
     if let Ok(v) = serde_json::from_str(s) {
         return v;
     }
@@ -26,7 +30,23 @@ pub fn parse_tool_arguments_json(s: &str) -> serde_json::Value {
 
     // Last resort: LLMs may produce unescaped quotes inside string values.
     // Try lenient field extraction for the "code" field (python-exec).
-    lenient_extract_json_field(s, "code").unwrap_or_else(|| serde_json::json!({}))
+    if let Some(v) = lenient_extract_json_field(s, "code") {
+        return v;
+    }
+
+    // Try to repair truncated JSON (common when model output hits token limit).
+    // Close any open strings and braces to make it parseable.
+    if let Some(v) = repair_truncated_json(s) {
+        return v;
+    }
+
+    let fixed_truncated = repair_truncated_json(&fixed);
+    if let Some(v) = fixed_truncated {
+        return v;
+    }
+
+    // If all parsing fails, wrap the raw string so callers can still access it.
+    serde_json::json!({ "_raw": s })
 }
 
 /// Fix invalid JSON escape sequences produced by LLMs.
@@ -102,6 +122,39 @@ fn unescape_json_string_lenient(s: &str) -> String {
         }
     }
     result
+}
+
+/// Repair truncated JSON by closing open strings and braces.
+///
+/// When a model's output hits the token limit, the JSON is cut off mid-value.
+/// This function attempts to close any open string and the top-level object
+/// so that fields completed before the truncation point can still be parsed.
+fn repair_truncated_json(s: &str) -> Option<serde_json::Value> {
+    let trimmed = s.trim();
+    if !trimmed.starts_with('{') || trimmed.ends_with('}') {
+        // Not a truncated object (either not an object, or already complete)
+        return None;
+    }
+
+    // Walk the string to find the state at the end: are we inside a string?
+    let mut in_string = false;
+    let mut escape_next = false;
+    for ch in trimmed.chars() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escape_next = true,
+            '"' => in_string = !in_string,
+            _ => {}
+        }
+    }
+
+    // Try closing the JSON: if inside a string, close it; then close the object.
+    let suffix = if in_string { "\"}" } else { "}" };
+    let repaired = format!("{}{}", trimmed, suffix);
+    serde_json::from_str(&repaired).ok()
 }
 
 /// Extract a string field from a malformed JSON object string.
@@ -285,5 +338,32 @@ mod tests {
         let code = result["code"].as_str().unwrap();
         assert!(code.contains("print(\"Title\")"));
         assert!(code.contains("print(\"=\" * 80)"));
+    }
+
+    #[test]
+    fn test_repair_truncated_json_in_string() {
+        // Simulate truncated create_artifact args (cut off inside "content" string)
+        let truncated = r#"{"title": "Test Page", "content_type": "text/html", "content": "<!DOCTYPE html><html><body>trunc"#;
+        let result = parse_tool_arguments_json(truncated);
+        assert_eq!(result["title"].as_str().unwrap(), "Test Page");
+        assert_eq!(result["content_type"].as_str().unwrap(), "text/html");
+        assert!(result["content"].as_str().unwrap().contains("<!DOCTYPE html>"));
+    }
+
+    #[test]
+    fn test_repair_truncated_json_between_fields() {
+        // Truncated between fields
+        let truncated = r#"{"title": "Page", "content_type": "text/html""#;
+        let result = parse_tool_arguments_json(truncated);
+        assert_eq!(result["title"].as_str().unwrap(), "Page");
+        assert_eq!(result["content_type"].as_str().unwrap(), "text/html");
+    }
+
+    #[test]
+    fn test_repair_truncated_json_not_truncated() {
+        // Complete JSON should NOT go through repair
+        let complete = r#"{"title": "Page"}"#;
+        let result = parse_tool_arguments_json(complete);
+        assert_eq!(result["title"].as_str().unwrap(), "Page");
     }
 }
