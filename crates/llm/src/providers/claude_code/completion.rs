@@ -60,6 +60,16 @@ impl ClaudeCodeCompletionModel {
     /// The streaming code stops the CLI subprocess as soon as tool calls are
     /// detected, preventing the model from hallucinating `<tool_result>` blocks.
     fn build_command(&self, system_prompt: Option<&str>, tools: &[ToolDefinition]) -> Command {
+        // On Windows, npm installs CLI tools as .ps1/.cmd scripts (e.g. claude.ps1).
+        // Command::new("claude") only finds .exe files, so we need cmd.exe /C to
+        // resolve the script via PATHEXT.
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            let mut c = Command::new("cmd.exe");
+            c.arg("/C").arg(self.client.command());
+            c
+        };
+        #[cfg(not(target_os = "windows"))]
         let mut cmd = Command::new(self.client.command());
 
         cmd.arg("-p");

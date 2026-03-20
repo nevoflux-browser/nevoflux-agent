@@ -541,11 +541,40 @@ fn test_send_sync() {
 
 /// Helper: check whether the `claude` CLI is available and authenticated.
 fn claude_cli_available() -> bool {
-    std::process::Command::new("claude")
+    claude_command()
         .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Build a `std::process::Command` for the `claude` CLI, handling Windows
+/// where npm installs it as a `.ps1`/`.cmd` script.
+fn claude_command() -> std::process::Command {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.args(["/C", "claude"]);
+        cmd
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::process::Command::new("claude")
+    }
+}
+
+/// Async version of [`claude_command`].
+fn claude_command_async() -> tokio::process::Command {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = tokio::process::Command::new("cmd.exe");
+        cmd.args(["/C", "claude"]);
+        cmd
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        tokio::process::Command::new("claude")
+    }
 }
 
 #[tokio::test]
@@ -711,7 +740,7 @@ async fn test_real_cli_json_output_is_parseable() {
     // Run the CLI directly with stream-json (matching how completion model invokes it)
     let stdin_input = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Say exactly: test123"}]}}"#;
 
-    let mut child = tokio::process::Command::new("claude")
+    let mut child = claude_command_async()
         .args([
             "-p",
             "--input-format",

@@ -3191,7 +3191,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -3220,7 +3220,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-bridge"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "directories",
@@ -3239,7 +3239,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-builtin-wasm"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "nevoflux-protocol",
  "rmp-serde",
@@ -3249,7 +3249,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-computer"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3269,7 +3269,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-daemon"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -3322,7 +3322,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-llm"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "dirs 5.0.1",
@@ -3342,7 +3342,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-mcp"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "futures",
@@ -3358,7 +3358,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-protocol"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "proptest",
  "rmp-serde",
@@ -3370,7 +3370,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-skills"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "directories",
@@ -3386,7 +3386,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-storage"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "nevoflux-protocol",
  "proptest",
@@ -3399,7 +3399,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-testing"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "nevoflux-daemon",
@@ -7376,7 +7376,7 @@ dependencies = [
 
 [[package]]
 name = "zerofrom"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50cc42e0333e05660c3587f3bf9d0478688e15d870fab3346451ce7f8c9fbea5"
 dependencies = [
@@ -7385,7 +7385,7 @@ dependencies = [
 
 [[package]]
 name = "zerofrom-derive"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d71e5d6e06ab090c67b5e44993ec16b72dcbaabc526db883a360057678b48502"
 dependencies = [
