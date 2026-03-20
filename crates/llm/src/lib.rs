@@ -15,6 +15,7 @@ pub mod embedding;
 pub mod error;
 pub mod factory;
 pub mod providers;
+mod util;
 
 // Re-export rig for convenience
 pub use rig;

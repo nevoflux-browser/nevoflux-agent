@@ -138,7 +138,7 @@ impl WireClient {
     /// The subprocess is started with `--yolo` mode and configured based on
     /// the client settings (model, working directory, thinking mode).
     pub fn spawn(config: &KimiAgentClient, model: &str) -> Result<Self, String> {
-        let mut cmd = Command::new(config.command());
+        let mut cmd = crate::util::cli_command_sync(config.command());
 
         cmd.arg("--yolo");
 

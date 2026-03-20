@@ -116,7 +116,7 @@ impl GeminiCliCompletionModel {
     ) -> (Command, String) {
         let prompt = self.build_prompt(system_prompt, messages, documents, tools);
 
-        let mut cmd = Command::new(self.client.command());
+        let mut cmd = crate::util::cli_command(self.client.command());
 
         // Only pass model parameter if it's in the known models list
         if GEMINI_CLI_KNOWN_MODELS.contains(&self.model.as_str()) {

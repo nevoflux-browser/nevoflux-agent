@@ -617,11 +617,40 @@ fn test_send_sync() {
 
 /// Helper: check whether the `gemini` CLI is available.
 fn gemini_cli_available() -> bool {
-    std::process::Command::new("gemini")
+    gemini_command()
         .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Build a `std::process::Command` for the `gemini` CLI, handling Windows
+/// where npm installs it as a `.ps1`/`.cmd` script.
+fn gemini_command() -> std::process::Command {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.args(["/C", "gemini"]);
+        cmd
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::process::Command::new("gemini")
+    }
+}
+
+/// Async version of [`gemini_command`].
+fn gemini_command_async() -> tokio::process::Command {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = tokio::process::Command::new("cmd.exe");
+        cmd.args(["/C", "gemini"]);
+        cmd
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        tokio::process::Command::new("gemini")
+    }
 }
 
 #[tokio::test]
@@ -836,7 +865,7 @@ async fn test_real_cli_raw_stdout_is_parseable() {
     let model_name = configured_model();
 
     // Run the CLI directly to verify raw output can be parsed
-    let output = tokio::process::Command::new("gemini")
+    let output = gemini_command_async()
         .args(["-m", &model_name, "-p", "Say exactly: test123", "--yolo"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

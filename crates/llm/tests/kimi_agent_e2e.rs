@@ -101,13 +101,28 @@ fn api_key() -> Option<String> {
 
 /// Check whether the `kimi-agent` CLI is available on PATH.
 fn kimi_agent_available() -> bool {
-    std::process::Command::new("kimi-agent")
+    kimi_agent_command()
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Build a `std::process::Command` for `kimi-agent`, handling Windows
+/// where npm installs it as a `.ps1`/`.cmd` script.
+fn kimi_agent_command() -> std::process::Command {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.args(["/C", "kimi-agent"]);
+        cmd
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::process::Command::new("kimi-agent")
+    }
 }
 
 /// Build a client with the API key.
