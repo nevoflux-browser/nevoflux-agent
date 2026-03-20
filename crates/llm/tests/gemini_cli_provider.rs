@@ -624,32 +624,39 @@ fn gemini_cli_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Build a `std::process::Command` for the `gemini` CLI, handling Windows
-/// where npm installs it as a `.ps1`/`.cmd` script.
+/// Build a `std::process::Command` for the `gemini` CLI, resolving the full
+/// path on Windows where npm installs it as a `.cmd` script.
 fn gemini_command() -> std::process::Command {
-    #[cfg(target_os = "windows")]
-    {
-        let mut cmd = std::process::Command::new("cmd.exe");
-        cmd.args(["/C", "gemini"]);
-        cmd
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::process::Command::new("gemini")
-    }
+    std::process::Command::new(resolve_cli("gemini"))
 }
 
 /// Async version of [`gemini_command`].
 fn gemini_command_async() -> tokio::process::Command {
+    tokio::process::Command::new(resolve_cli("gemini"))
+}
+
+/// Resolve a CLI program name to its full path on Windows (.cmd/.exe).
+/// On non-Windows, returns the name unchanged.
+fn resolve_cli(name: &str) -> String {
     #[cfg(target_os = "windows")]
     {
-        let mut cmd = tokio::process::Command::new("cmd.exe");
-        cmd.args(["/C", "gemini"]);
-        cmd
+        if let Some(path_var) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                let cmd_path = dir.join(format!("{}.cmd", name));
+                if cmd_path.is_file() {
+                    return cmd_path.to_string_lossy().into_owned();
+                }
+                let exe_path = dir.join(format!("{}.exe", name));
+                if exe_path.is_file() {
+                    return exe_path.to_string_lossy().into_owned();
+                }
+            }
+        }
+        name.to_string()
     }
     #[cfg(not(target_os = "windows"))]
     {
-        tokio::process::Command::new("gemini")
+        name.to_string()
     }
 }
 
