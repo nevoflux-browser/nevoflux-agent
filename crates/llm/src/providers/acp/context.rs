@@ -269,6 +269,47 @@ mod tests {
     }
 
     #[test]
+    fn test_compress_tool_with_result() {
+        let content = r#"read_file("config.toml") returned: [workspace]\nmembers = ["daemon", "protocol"]"#;
+        let result = compress_message("tool", content);
+        assert!(result.starts_with("[tool:"));
+        assert!(result.len() <= 120);
+    }
+
+    #[test]
+    fn test_compress_tool_short() {
+        let result = compress_message("tool", "ok");
+        assert_eq!(result, "[tool: ok]");
+    }
+
+    #[test]
+    fn test_compress_assistant_short() {
+        let result = compress_message("assistant", "Sure, I can help.");
+        assert_eq!(result, "[assistant] Sure, I can help.");
+    }
+
+    #[test]
+    fn test_compress_unknown_role() {
+        let result = compress_message("system", "You are a helpful assistant.");
+        assert_eq!(result, "[system] You are a helpful assistant.");
+    }
+
+    #[test]
+    fn test_history_all_protected() {
+        // Fewer messages than protected turns — nothing to compress
+        let messages = vec![
+            ("user".into(), "q1".into()),
+            ("assistant".into(), "a1".into()),
+            ("user".into(), "q2".into()),
+            ("assistant".into(), "a2".into()),
+        ];
+        let result = compress_history(&messages, 10, 3); // budget tiny but all protected
+        assert!(result.contains("q1"));
+        assert!(result.contains("q2"));
+        assert!(!result.contains("[Earlier conversation summary]"));
+    }
+
+    #[test]
     fn test_middle_out_priority() {
         // Build a conversation large enough to need compression.
         let messages: Vec<(String, String)> = (0..30)
