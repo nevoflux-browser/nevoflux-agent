@@ -8,7 +8,6 @@ pub mod claude;
 pub mod context;
 pub mod gemini;
 
-use anyhow::{Context as _, Result};
 // Re-export key schema types so downstream crates (e.g. nevoflux-daemon)
 // can construct ContentBlock values without a direct sacp dependency.
 pub use sacp::schema::{ContentBlock, TextContent};
@@ -26,6 +25,25 @@ use std::sync::{Arc, Mutex};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+/// Errors from ACP provider operations.
+#[derive(Debug, thiserror::Error)]
+pub enum AcpError {
+    #[error("{0}")]
+    Internal(String),
+}
+
+impl From<String> for AcpError {
+    fn from(s: String) -> Self {
+        AcpError::Internal(s)
+    }
+}
+
+type Result<T> = std::result::Result<T, AcpError>;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -90,9 +108,6 @@ impl AcpProvider {
     }
 
     /// Spawn the agent process and complete the ACP handshake.
-    ///
-    /// After this returns successfully the provider is ready for
-    /// [`new_session`](Self::new_session) and [`prompt`](Self::prompt) calls.
     pub async fn connect(&mut self) -> Result<()> {
         let child = spawn_acp_process(&self.config).await?;
         let (tx, rx) = mpsc::channel(32);
@@ -105,10 +120,10 @@ impl AcpProvider {
             }
         });
 
-        // Wait for the initialization handshake to complete.
-        let _init_response = init_rx
+        let init_result = init_rx
             .await
-            .context("ACP client initialization cancelled")??;
+            .map_err(|_| AcpError::Internal("ACP client initialization cancelled".into()))?;
+        let _init_response = init_result?;
 
         self.tx = Some(tx);
         Ok(())
@@ -129,28 +144,24 @@ impl AcpProvider {
     }
 
     /// Create a new session on the connected agent.
-    ///
-    /// Sends `session/new` followed by `session/set_mode` if the requested
-    /// mode differs from the default.
     pub async fn new_session(&self) -> Result<SessionId> {
         let tx = self
             .tx
             .as_ref()
-            .context("ACP provider is not connected")?;
+            .ok_or_else(|| AcpError::Internal("ACP provider is not connected".into()))?;
 
         let (response_tx, response_rx) = oneshot::channel();
         tx.send(ClientRequest::NewSession { response_tx })
             .await
-            .context("ACP client is unavailable")?;
+            .map_err(|_| AcpError::Internal("ACP client is unavailable".into()))?;
 
-        let session = response_rx.await.context("ACP session/new cancelled")??;
+        let session = response_rx
+            .await
+            .map_err(|_| AcpError::Internal("ACP session/new cancelled".into()))??;
         Ok(session.session_id)
     }
 
     /// Send a prompt to the agent and receive streaming updates.
-    ///
-    /// Returns a receiver that yields [`AcpUpdate`] values. The last update
-    /// will be either [`AcpUpdate::Complete`] or [`AcpUpdate::Error`].
     pub async fn prompt(
         &self,
         session_id: SessionId,
@@ -159,7 +170,7 @@ impl AcpProvider {
         let tx = self
             .tx
             .as_ref()
-            .context("ACP provider is not connected")?;
+            .ok_or_else(|| AcpError::Internal("ACP provider is not connected".into()))?;
 
         let (response_tx, response_rx) = mpsc::channel(64);
         tx.send(ClientRequest::Prompt {
@@ -168,7 +179,7 @@ impl AcpProvider {
             response_tx,
         })
         .await
-        .context("ACP client is unavailable")?;
+        .map_err(|_| AcpError::Internal("ACP client is unavailable".into()))?;
 
         Ok(response_rx)
     }
@@ -195,7 +206,6 @@ impl Drop for AcpProvider {
 // Process spawning
 // ---------------------------------------------------------------------------
 
-/// Spawn the ACP agent as a child process with piped stdio.
 async fn spawn_acp_process(config: &AcpProviderConfig) -> Result<Child> {
     let mut cmd = Command::new(&config.command);
     cmd.args(&config.args)
@@ -211,7 +221,6 @@ async fn spawn_acp_process(config: &AcpProviderConfig) -> Result<Child> {
         cmd.env(key, value);
     }
 
-    // On Windows, prevent the child from creating a visible console window.
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -219,30 +228,31 @@ async fn spawn_acp_process(config: &AcpProviderConfig) -> Result<Child> {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    cmd.spawn().context("failed to spawn ACP process")
+    cmd.spawn()
+        .map_err(|e| AcpError::Internal(format!("failed to spawn ACP process: {e}")))
 }
 
 // ---------------------------------------------------------------------------
 // Background client loop
 // ---------------------------------------------------------------------------
 
-/// Run the full ACP client lifecycle: spawn transport, build protocol client,
-/// and process requests until shutdown.
 async fn run_client_loop(
     config: AcpProviderConfig,
     mut child: Child,
     mut rx: mpsc::Receiver<ClientRequest>,
     init_tx: oneshot::Sender<Result<InitializeResponse>>,
-) -> Result<()> {
-    let stdin = child.stdin.take().context("no stdin on ACP child process")?;
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or("no stdin on ACP child process")?;
     let stdout = child
         .stdout
         .take()
-        .context("no stdout on ACP child process")?;
+        .ok_or("no stdout on ACP child process")?;
 
     let transport = sacp::ByteStreams::new(stdin.compat_write(), stdout.compat());
 
-    // Shared slot for routing notifications to the active prompt's channel.
     let prompt_response_tx: Arc<Mutex<Option<mpsc::Sender<AcpUpdate>>>> =
         Arc::new(Mutex::new(None));
 
@@ -279,20 +289,19 @@ async fn run_client_loop(
             sacp::on_receive_notification!(),
         )
         .on_receive_request(
-            // Auto-approve all permission requests. We run in plan mode where
-            // the agent does not execute dangerous tools, and we do not surface
-            // permission prompts to the user.
+            // Auto-cancel permission requests. We run in plan mode where the
+            // agent should not execute tools requiring permission.
             async move |_request: RequestPermissionRequest,
                         request_cx,
                         _connection_cx| {
                 let response =
-                    RequestPermissionResponse::new(RequestPermissionOutcome::Approved);
+                    RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
                 request_cx.respond(response)
             },
             sacp::on_receive_request!(),
         )
         .connect_to(transport)?
-        .run_until(move |cx: JrConnectionCx<ClientToAgent>| {
+        .run_until(|cx: JrConnectionCx<ClientToAgent>| {
             handle_requests(config, cx, &mut rx, prompt_response_tx, init_tx)
         })
         .await?;
@@ -300,18 +309,15 @@ async fn run_client_loop(
     Ok(())
 }
 
-/// Process requests from the `AcpProvider` channel. Runs inside `run_until`
-/// so it has access to the protocol connection context.
 async fn handle_requests(
     config: AcpProviderConfig,
     cx: JrConnectionCx<ClientToAgent>,
     rx: &mut mpsc::Receiver<ClientRequest>,
     prompt_response_tx: Arc<Mutex<Option<mpsc::Sender<AcpUpdate>>>>,
     init_tx: oneshot::Sender<Result<InitializeResponse>>,
-) -> Result<(), sacp::Error> {
+) -> std::result::Result<(), sacp::Error> {
     let mut init_tx = Some(init_tx);
 
-    // Perform the ACP initialization handshake.
     let init_response = cx
         .send_request(InitializeRequest::new(ProtocolVersion::LATEST))
         .block_task()
@@ -319,7 +325,7 @@ async fn handle_requests(
         .map_err(|err| {
             let message = format!("ACP initialize failed: {err}");
             if let Some(tx) = init_tx.take() {
-                let _ = tx.send(Err(anyhow::anyhow!(message.clone())));
+                let _ = tx.send(Err(AcpError::Internal(message.clone())));
             }
             sacp::Error::internal_error().data(message)
         })?;
@@ -328,7 +334,6 @@ async fn handle_requests(
         let _ = tx.send(Ok(init_response));
     }
 
-    // Main request loop.
     while let Some(request) = rx.recv().await {
         match request {
             ClientRequest::NewSession { response_tx } => {
@@ -339,7 +344,9 @@ async fn handle_requests(
 
                 let result = match session {
                     Ok(session) => apply_session_mode(&config, &cx, session).await,
-                    Err(err) => Err(anyhow::anyhow!("ACP session/new failed: {err}")),
+                    Err(err) => Err(AcpError::Internal(format!(
+                        "ACP session/new failed: {err}"
+                    ))),
                 };
 
                 let _ = response_tx.send(result);
@@ -350,7 +357,6 @@ async fn handle_requests(
                 content,
                 response_tx,
             } => {
-                // Install the channel so notifications route to this prompt.
                 *prompt_response_tx.lock().unwrap() = Some(response_tx.clone());
 
                 let response = cx
@@ -367,7 +373,6 @@ async fn handle_requests(
                     }
                 }
 
-                // Clear the channel after the prompt completes.
                 *prompt_response_tx.lock().unwrap() = None;
             }
 
@@ -378,15 +383,12 @@ async fn handle_requests(
     Ok(())
 }
 
-/// If the requested session mode differs from the current one, send
-/// `session/set_mode` to switch.
 async fn apply_session_mode(
     config: &AcpProviderConfig,
     cx: &JrConnectionCx<ClientToAgent>,
     session: NewSessionResponse,
 ) -> Result<NewSessionResponse> {
     if let Some(modes) = session.modes.as_ref() {
-        // Only switch if the current mode doesn't match the requested one.
         if modes.current_mode_id.0.as_ref() != config.session_mode.as_str() {
             let available: Vec<String> = modes
                 .available_modes
@@ -395,11 +397,11 @@ async fn apply_session_mode(
                 .collect();
 
             if !available.iter().any(|id| id == &config.session_mode) {
-                return Err(anyhow::anyhow!(
+                return Err(AcpError::Internal(format!(
                     "Requested mode '{}' not offered by agent. Available modes: {}",
                     config.session_mode,
                     available.join(", ")
-                ));
+                )));
             }
 
             cx.send_request(SetSessionModeRequest::new(
@@ -409,7 +411,7 @@ async fn apply_session_mode(
             .block_task()
             .await
             .map_err(|err| {
-                anyhow::anyhow!("ACP agent rejected session/set_mode: {err}")
+                AcpError::Internal(format!("ACP agent rejected session/set_mode: {err}"))
             })?;
         }
     }
