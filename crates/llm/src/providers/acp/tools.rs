@@ -25,7 +25,12 @@ pub fn format_tool_definitions_prompt(tools: &[ToolDefinition]) -> String {
     }
 
     let mut out = String::from(
-        "\n\n# Available Tools\n\nYou have access to the following tools:\n\n<tools>\n",
+        "\n\n# External Tool Protocol\n\n\
+         CRITICAL: The following tools are executed by an EXTERNAL system (NevoFlux browser engine), NOT by you.\n\
+         You do NOT need to check if you \"have\" these tools. You do NOT execute them.\n\
+         Your ONLY job is to OUTPUT the <tool_call> XML block. The external system intercepts it, \
+         executes the tool, and returns the result in the next message.\n\n\
+         Available external tools:\n\n<tools>\n",
     );
     for tool in tools {
         let params = serde_json::to_string(&tool.parameters).unwrap_or_default();
@@ -35,14 +40,18 @@ pub fn format_tool_definitions_prompt(tools: &[ToolDefinition]) -> String {
         ));
     }
     out.push_str("</tools>\n\n");
-    out.push_str("When you need to use a tool, output EXACTLY this XML format (do NOT execute the tool yourself):\n");
+    out.push_str("To use a tool, output EXACTLY this XML (nothing else around it):\n");
     out.push_str("<tool_call>\n");
     out.push_str("{\"id\":\"call_1\",\"name\":\"tool_name\",\"arguments\":{...}}\n");
-    out.push_str("</tool_call>\n");
-    out.push_str("After outputting a tool call, STOP and wait for the tool result.\n");
-    out.push_str("Generate a unique id for each tool call (e.g., \"call_1\", \"call_2\").\n");
-    out.push_str("Do NOT wrap tool_call in markdown code blocks.\n");
-    out.push_str("Do NOT use bash, read, write, web fetch, or any other built-in tools. ONLY use the <tool_call> XML protocol above.");
+    out.push_str("</tool_call>\n\n");
+    out.push_str("Rules:\n");
+    out.push_str("- After outputting <tool_call>, STOP immediately. Do NOT continue writing.\n");
+    out.push_str("- The external system will execute the tool and give you the result.\n");
+    out.push_str("- Generate a unique id for each call (\"call_1\", \"call_2\", etc.).\n");
+    out.push_str("- Do NOT wrap <tool_call> in markdown code blocks.\n");
+    out.push_str("- Do NOT say \"I don't have this tool\" — you DO have them via this protocol.\n");
+    out.push_str("- Do NOT use your own built-in tools (bash, read, write, etc.). ONLY use <tool_call> XML.\n");
+    out.push_str("- Do NOT hallucinate tool results. Wait for the external system to respond.");
     out
 }
 
