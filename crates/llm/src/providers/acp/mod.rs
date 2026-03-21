@@ -256,7 +256,9 @@ async fn run_client_loop(
     let prompt_response_tx: Arc<Mutex<Option<mpsc::Sender<AcpUpdate>>>> =
         Arc::new(Mutex::new(None));
 
-    ClientToAgent::builder()
+    let error_notify_tx = prompt_response_tx.clone();
+
+    let result = ClientToAgent::builder()
         .on_receive_notification(
             {
                 let prompt_response_tx = prompt_response_tx.clone();
@@ -304,9 +306,25 @@ async fn run_client_loop(
         .run_until(|cx: JrConnectionCx<ClientToAgent>| {
             handle_requests(config, cx, &mut rx, prompt_response_tx, init_tx)
         })
-        .await?;
+        .await;
 
-    Ok(())
+    // If the client loop exits (e.g. due to a parse error from an unknown
+    // notification like "usage_update"), notify any active prompt receiver
+    // so it doesn't hang forever waiting for AcpUpdate::Complete.
+    if let Some(tx) = error_notify_tx.lock().ok().and_then(|mut g| g.take()) {
+        let err_msg = match &result {
+            Ok(()) => "ACP client loop exited".to_string(),
+            Err(e) => format!("ACP client loop error: {e}"),
+        };
+        // Treat unexpected exit as completion — the agent likely already
+        // finished its response (text chunks were delivered via notifications).
+        // sacp 10.x doesn't know about "usage_update" which the agent sends
+        // AFTER the response is complete, causing a parse error.
+        tracing::warn!("{}, sending synthetic completion", err_msg);
+        let _ = tx.try_send(AcpUpdate::Complete(StopReason::EndTurn));
+    }
+
+    result.map_err(|e| e.into())
 }
 
 async fn handle_requests(
