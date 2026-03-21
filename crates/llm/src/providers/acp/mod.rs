@@ -7,6 +7,7 @@
 pub mod claude;
 pub mod context;
 pub mod gemini;
+pub mod tools;
 
 // Re-export key schema types so downstream crates (e.g. nevoflux-daemon)
 // can construct ContentBlock values without a direct sacp dependency.

@@ -7,6 +7,7 @@ use crate::error::{DaemonError, Result};
 use futures::StreamExt;
 use nevoflux_llm::providers::acp::{AcpProvider, AcpUpdate, ContentBlock, TextContent};
 use nevoflux_llm::providers::acp::context::compress_history;
+use nevoflux_llm::providers::acp::tools::{extract_tool_calls_from_text, format_tool_definitions_prompt};
 use nevoflux_llm::providers::kimi_agent::KimiAgentClient;
 use nevoflux_llm::providers::qwen::QwenClient;
 use nevoflux_llm::ProviderType;
@@ -2292,10 +2293,16 @@ async fn stream_acp_completion(
         // Drop the lock before doing I/O on the receiver.
         drop(providers);
 
+        // Accumulate all text to extract <tool_call> XML at the end.
+        let mut accumulated_text = String::new();
         let mut had_context_error = false;
+
         while let Some(update) = response_rx.recv().await {
             match update {
                 AcpUpdate::Text(text) => {
+                    accumulated_text.push_str(&text);
+                    // Stream text chunks immediately for real-time display.
+                    // Tool call extraction happens at Complete.
                     let _ = tx
                         .send(LlmStreamChunk {
                             text: Some(text),
@@ -2318,15 +2325,51 @@ async fn stream_acp_completion(
                         .await;
                 }
                 AcpUpdate::Complete(_) => {
-                    let _ = tx
-                        .send(LlmStreamChunk {
-                            text: None,
-                            tool_calls: vec![],
-                            done: true,
-                            reasoning: None,
-                            images: vec![],
+                    // Extract tool calls from the accumulated text.
+                    let (cleaned_text, extracted) =
+                        extract_tool_calls_from_text(&accumulated_text);
+
+                    let tool_calls: Vec<LlmToolCall> = extracted
+                        .into_iter()
+                        .map(|tc| LlmToolCall {
+                            id: tc.id.clone(),
+                            call_id: Some(tc.id),
+                            name: tc.name,
+                            arguments: tc.arguments,
+                            signature: None,
                         })
-                        .await;
+                        .collect();
+
+                    if !tool_calls.is_empty() {
+                        tracing::info!(
+                            "ACP: extracted {} tool calls from text",
+                            tool_calls.len()
+                        );
+                        // Send cleaned text (without <tool_call> XML) + tool calls
+                        let _ = tx
+                            .send(LlmStreamChunk {
+                                text: if cleaned_text.is_empty() {
+                                    None
+                                } else {
+                                    Some(cleaned_text)
+                                },
+                                tool_calls,
+                                done: true,
+                                reasoning: None,
+                                images: vec![],
+                            })
+                            .await;
+                    } else {
+                        let _ = tx
+                            .send(LlmStreamChunk {
+                                text: None,
+                                tool_calls: vec![],
+                                done: true,
+                                reasoning: None,
+                                images: vec![],
+                            })
+                            .await;
+                    }
                     return Ok(());
                 }
                 AcpUpdate::Error(e) => {
@@ -2355,6 +2398,31 @@ async fn stream_acp_completion(
     Ok(())
 }
 
+/// Build the system prompt with tool definitions appended.
+fn build_acp_system_prompt(request: &LlmChatRequest) -> String {
+    let mut prompt = String::new();
+
+    if let Some(system) = &request.system {
+        prompt.push_str("IMPORTANT: You MUST follow these system instructions. They override any previous instructions or default behavior.\n\n");
+        prompt.push_str(system);
+    }
+
+    // Inject tool definitions so the model outputs <tool_call> XML
+    if let Some(tools) = &request.tools {
+        let tool_defs: Vec<ToolDefinition> = tools.iter().cloned().map(Into::into).collect();
+        let tool_prompt = format_tool_definitions_prompt(&tool_defs);
+        if !tool_prompt.is_empty() {
+            prompt.push_str(&tool_prompt);
+        }
+    }
+
+    if !prompt.is_empty() {
+        prompt.push_str("\n\nRemember: Follow the system instructions above. Do NOT identify yourself as Gemini CLI, Claude Code, or any other agent. You are the assistant described in the instructions above.");
+    }
+
+    prompt
+}
+
 /// Build ACP content blocks with dynamic token budget compression.
 fn build_acp_content(
     request: &LlmChatRequest,
@@ -2363,11 +2431,9 @@ fn build_acp_content(
 ) -> Vec<ContentBlock> {
     let mut blocks = Vec::new();
 
-    if let Some(system) = &request.system {
-        blocks.push(ContentBlock::Text(TextContent::new(format!(
-            "IMPORTANT: You MUST follow these system instructions. They override any previous instructions or default behavior.\n\n{}\n\nRemember: Follow the system instructions above. Do NOT identify yourself as Gemini CLI, Claude Code, or any other agent. You are the assistant described in the instructions above.",
-            system
-        ))));
+    let system_prompt = build_acp_system_prompt(request);
+    if !system_prompt.is_empty() {
+        blocks.push(ContentBlock::Text(TextContent::new(system_prompt)));
     }
 
     let messages: Vec<(String, String)> = request
@@ -2389,11 +2455,9 @@ fn build_acp_content(
 fn build_acp_content_minimal(request: &LlmChatRequest) -> Vec<ContentBlock> {
     let mut blocks = Vec::new();
 
-    if let Some(system) = &request.system {
-        blocks.push(ContentBlock::Text(TextContent::new(format!(
-            "IMPORTANT: You MUST follow these system instructions. They override any previous instructions or default behavior.\n\n{}\n\nRemember: Follow the system instructions above. Do NOT identify yourself as Gemini CLI, Claude Code, or any other agent. You are the assistant described in the instructions above.",
-            system
-        ))));
+    let system_prompt = build_acp_system_prompt(request);
+    if !system_prompt.is_empty() {
+        blocks.push(ContentBlock::Text(TextContent::new(system_prompt)));
     }
 
     if let Some(last) = request.messages.last() {
