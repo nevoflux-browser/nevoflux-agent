@@ -805,16 +805,6 @@ fn resolve_workspace_dir() -> String {
 
 /// Resolve skills directories to pass as `--add-dir` to CLI providers.
 ///
-/// Returns existing user skills directories so the CLI subprocess can access skill files.
-#[allow(dead_code)]
-fn resolve_skills_dirs() -> Vec<String> {
-    nevoflux_skills::default_user_skills_dirs()
-        .into_iter()
-        .filter(|d| d.exists())
-        .map(|d| d.to_string_lossy().to_string())
-        .collect()
-}
-
 /// Execute a chat request using the Google Gemini provider.
 async fn execute_gemini_chat(
     api_key: &str,
