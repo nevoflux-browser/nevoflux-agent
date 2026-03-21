@@ -1,129 +1,72 @@
-/// Create a `tokio::process::Command` that correctly resolves CLI tools on all
-/// platforms.
+/// Create a `tokio::process::Command` for a CLI tool, resolving the full path
+/// on all platforms.
 ///
-/// On Windows, npm-installed CLIs are `.cmd` wrapper scripts. These have two
-/// problems:
-/// 1. `Command::new("name")` can't find them (only resolves `.exe` via PATH)
-/// 2. `.cmd` files run through `cmd.exe` which has an 8191-char command line
-///    limit — too small for long `--system-prompt` args
+/// On Windows, npm-installed CLIs are `.cmd` wrapper scripts. The `which` crate
+/// resolves them correctly via PATHEXT. Rust's `Command::new()` handles `.cmd`
+/// files internally by invoking `cmd.exe`.
 ///
-/// Solution: resolve the `.cmd` file, parse it to extract the underlying
-/// `node.exe` + script path, and call `node` directly. This bypasses `cmd.exe`
-/// and its length limit (`CreateProcessW` supports 32767 chars).
+/// This approach matches Goose's implementation:
+/// `SearchPaths::builder().with_npm().resolve(command)` → `Command::new(resolved)`
 pub(crate) fn cli_command(program: &str) -> tokio::process::Command {
+    let resolved = resolve_program(program);
+    tokio::process::Command::new(resolved)
+}
+
+/// Resolve a program name to its full executable path.
+///
+/// Uses the `which` crate which correctly handles Windows PATHEXT
+/// (finding `.cmd`, `.bat`, `.exe` etc.) and Unix PATH lookup.
+fn resolve_program(program: &str) -> std::path::PathBuf {
+    // If it already has a path separator, use as-is
+    if program.contains(std::path::MAIN_SEPARATOR)
+        || program.contains('/')
+        || program.contains('.')
+    {
+        return std::path::PathBuf::from(program);
+    }
+
+    // Build extended search paths (include npm global dirs like Goose does)
+    let search_path = build_search_path();
+    which::which_in(program, search_path.as_deref(), std::env::current_dir().unwrap_or_default())
+        .unwrap_or_else(|_| std::path::PathBuf::from(program))
+}
+
+/// Build an extended PATH that includes npm global directories.
+///
+/// Mirrors Goose's `SearchPaths::builder().with_npm()`:
+/// - Windows: adds `%APPDATA%/npm`
+/// - Unix: adds `~/.npm-global/bin`
+fn build_search_path() -> Option<std::ffi::OsString> {
+    let mut extra_dirs: Vec<std::path::PathBuf> = Vec::new();
+
     #[cfg(target_os = "windows")]
     {
-        let resolved = resolve_windows_program(program);
-
-        // For .cmd/.bat files, try to extract the underlying node command
-        // to bypass cmd.exe's 8191-char command line limit.
-        if is_batch_script(&resolved) {
-            if let Some((node_exe, script_path)) = extract_node_entry_from_cmd(&resolved) {
-                let mut cmd = tokio::process::Command::new(&node_exe);
-                cmd.arg(&script_path);
-                return cmd;
-            }
-            // Fallback: use cmd.exe /C (will hit length limits with long args)
-            let mut cmd = tokio::process::Command::new("cmd.exe");
-            cmd.arg("/C").arg(&resolved);
-            return cmd;
+        // npm global bin on Windows: %APPDATA%\npm
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            extra_dirs.push(std::path::PathBuf::from(appdata).join("npm"));
         }
-
-        tokio::process::Command::new(resolved)
     }
+
     #[cfg(not(target_os = "windows"))]
     {
-        tokio::process::Command::new(program)
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn is_batch_script(path: &str) -> bool {
-    let lower = path.to_lowercase();
-    lower.ends_with(".cmd") || lower.ends_with(".bat")
-}
-
-/// Resolve a program name to its full path on Windows.
-///
-/// Searches PATH for `<program>.cmd` (npm wrapper scripts) and
-/// `<program>.exe`, returning the first match.
-#[cfg(target_os = "windows")]
-fn resolve_windows_program(program: &str) -> String {
-    // Already has an extension or is a full path — use as-is
-    if program.contains('.') || program.contains('\\') || program.contains('/') {
-        return program.to_string();
-    }
-
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let cmd_path = dir.join(format!("{}.cmd", program));
-            if cmd_path.is_file() {
-                return cmd_path.to_string_lossy().into_owned();
-            }
-            let exe_path = dir.join(format!("{}.exe", program));
-            if exe_path.is_file() {
-                return exe_path.to_string_lossy().into_owned();
-            }
+        if let Some(home) = std::env::var_os("HOME") {
+            extra_dirs.push(std::path::PathBuf::from(&home).join(".npm-global/bin"));
+            extra_dirs.push(std::path::PathBuf::from(&home).join(".local/bin"));
         }
+        extra_dirs.push(std::path::PathBuf::from("/usr/local/bin"));
     }
 
-    program.to_string()
-}
+    // Prepend extra dirs to existing PATH
+    let existing = std::env::var_os("PATH");
+    let all_paths = extra_dirs
+        .into_iter()
+        .chain(
+            existing
+                .as_ref()
+                .map(std::env::split_paths)
+                .into_iter()
+                .flatten(),
+        );
 
-/// Parse an npm-generated `.cmd` wrapper to extract the `node` executable
-/// and the JS entry point script path.
-///
-/// npm `.cmd` files follow a standard pattern generated by `cmd-shim`:
-/// ```text
-/// IF EXIST "%dp0%\node.exe" (
-///   SET "_prog=%dp0%\node.exe"
-/// ) ELSE (
-///   SET "_prog=node"
-/// )
-/// ... "%_prog%" "%dp0%\node_modules\@pkg\cli.mjs" %*
-/// ```
-///
-/// We look for the line containing `node_modules` + `%*` and extract the
-/// script path, resolving `%dp0%` / `%~dp0` to the `.cmd` file's directory.
-#[cfg(target_os = "windows")]
-fn extract_node_entry_from_cmd(cmd_path: &str) -> Option<(String, String)> {
-    let content = std::fs::read_to_string(cmd_path).ok()?;
-    let dir = std::path::Path::new(cmd_path).parent()?;
-
-    // Find the node.exe: prefer local node.exe in same dir as .cmd, fall back to PATH
-    let local_node = dir.join("node.exe");
-    let node_exe = if local_node.is_file() {
-        local_node.to_string_lossy().into_owned()
-    } else {
-        "node".to_string()
-    };
-
-    // Find the JS entry point from the .cmd content
-    for line in content.lines() {
-        // Look for the execution line: contains node_modules and ends with %*
-        if !line.contains("node_modules") || !line.contains("%*") {
-            continue;
-        }
-
-        // Extract quoted paths from the line
-        for part in line.split('"') {
-            if !part.contains("node_modules") {
-                continue;
-            }
-            // Resolve %dp0% / %~dp0 placeholders to the actual directory
-            let relative = part
-                .replace("%dp0%\\", "")
-                .replace("%~dp0\\", "")
-                .replace("%dp0%/", "")
-                .replace("%~dp0/", "")
-                .replace("%dp0%", "")
-                .replace("%~dp0", "");
-            let script_path = dir.join(&relative);
-            if script_path.is_file() {
-                return Some((node_exe, script_path.to_string_lossy().into_owned()));
-            }
-        }
-    }
-
-    None
+    std::env::join_paths(all_paths).ok()
 }

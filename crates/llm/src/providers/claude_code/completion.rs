@@ -62,7 +62,6 @@ impl ClaudeCodeCompletionModel {
     fn build_command(&self, system_prompt: Option<&str>, tools: &[ToolDefinition]) -> Command {
         let mut cmd = crate::util::cli_command(self.client.command());
 
-        cmd.arg("-p");
         cmd.arg("--input-format").arg("stream-json");
         cmd.arg("--output-format").arg("stream-json");
         cmd.arg("--verbose");
