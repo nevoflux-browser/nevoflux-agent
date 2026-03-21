@@ -5,6 +5,7 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+pub mod acp;
 pub mod claude_code;
 pub mod gemini_cli;
 pub mod kimi_agent;
