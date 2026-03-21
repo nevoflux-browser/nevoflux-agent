@@ -5,8 +5,8 @@
 
 use crate::error::{DaemonError, Result};
 use futures::StreamExt;
-use nevoflux_llm::providers::claude_code::ClaudeCodeClient;
-use nevoflux_llm::providers::gemini_cli::GeminiCliClient;
+use nevoflux_llm::providers::acp::{AcpProvider, AcpUpdate, ContentBlock, TextContent};
+use nevoflux_llm::providers::acp::context::compress_history;
 use nevoflux_llm::providers::kimi_agent::KimiAgentClient;
 use nevoflux_llm::providers::qwen::QwenClient;
 use nevoflux_llm::ProviderType;
@@ -28,8 +28,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use tokio::sync::mpsc;
+use std::sync::{Arc, OnceLock, RwLock};
+use tokio::sync::{mpsc, Mutex as TokioMutex};
+
+static ACP_PROVIDERS: OnceLock<Arc<TokioMutex<HashMap<String, AcpProvider>>>> = OnceLock::new();
+
+fn acp_providers() -> &'static Arc<TokioMutex<HashMap<String, AcpProvider>>> {
+    ACP_PROVIDERS.get_or_init(|| Arc::new(TokioMutex::new(HashMap::new())))
+}
 
 /// Tool definition for LLM function calling.
 ///
@@ -353,11 +359,10 @@ pub async fn execute_llm_chat(
         ProviderType::Together => {
             execute_together_chat(api_key, model, request, provider, base_url).await
         }
-        ProviderType::ClaudeCode => {
-            execute_claude_code_chat(api_key, model, request, provider, base_url).await
-        }
-        ProviderType::GeminiCli => {
-            execute_gemini_cli_chat(api_key, model, request, provider, base_url).await
+        ProviderType::ClaudeCode | ProviderType::GeminiCli => {
+            Err(DaemonError::InternalError(
+                "ACP providers only support streaming mode".to_string(),
+            ))
         }
         ProviderType::KimiAgent => {
             execute_kimi_agent_chat(api_key, model, request, provider, base_url).await
@@ -761,53 +766,6 @@ async fn execute_qwen_chat(
     execute_rig_completion(completion_model, request, provider).await
 }
 
-/// Execute a chat request using the Claude Code CLI provider.
-async fn execute_claude_code_chat(
-    api_key: &str,
-    model: &str,
-    request: LlmChatRequest,
-    provider: ProviderType,
-    _base_url: Option<&str>,
-) -> Result<LlmChatResponse> {
-    let client = if api_key == "claude-code-cli" {
-        ClaudeCodeClient::new("claude")
-    } else {
-        ClaudeCodeClient::new("claude").with_api_key(api_key)
-    };
-
-    // Set CWD to isolated workspace directory
-    let workspace_dir = resolve_workspace_dir();
-    let client = client
-        .with_working_dir(workspace_dir)
-        .with_add_dirs(resolve_skills_dirs());
-
-    let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request, provider).await
-}
-
-/// Execute a chat request using the Gemini CLI provider.
-async fn execute_gemini_cli_chat(
-    api_key: &str,
-    model: &str,
-    request: LlmChatRequest,
-    provider: ProviderType,
-    _base_url: Option<&str>,
-) -> Result<LlmChatResponse> {
-    let client = if api_key == "gemini-cli" {
-        GeminiCliClient::new("gemini")
-    } else {
-        GeminiCliClient::new("gemini").with_api_key(api_key)
-    };
-
-    let workspace_dir = resolve_workspace_dir();
-    let client = client
-        .with_working_dir(workspace_dir)
-        .with_add_dirs(resolve_skills_dirs());
-
-    let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request, provider).await
-}
-
 /// Execute a chat request using the Kimi Agent CLI provider.
 async fn execute_kimi_agent_chat(
     api_key: &str,
@@ -848,6 +806,7 @@ fn resolve_workspace_dir() -> String {
 /// Resolve skills directories to pass as `--add-dir` to CLI providers.
 ///
 /// Returns existing user skills directories so the CLI subprocess can access skill files.
+#[allow(dead_code)]
 fn resolve_skills_dirs() -> Vec<String> {
     nevoflux_skills::default_user_skills_dirs()
         .into_iter()
@@ -1764,11 +1723,8 @@ async fn execute_llm_stream_inner(
         ProviderType::Together => {
             stream_together(api_key, model, request, tx, provider, base_url).await
         }
-        ProviderType::ClaudeCode => {
-            stream_claude_code(api_key, model, request, tx, provider, base_url).await
-        }
-        ProviderType::GeminiCli => {
-            stream_gemini_cli(api_key, model, request, tx, provider, base_url).await
+        ProviderType::ClaudeCode | ProviderType::GeminiCli => {
+            stream_acp_completion(api_key, model, request, tx, provider, base_url).await
         }
         ProviderType::KimiAgent => {
             stream_kimi_agent(api_key, model, request, tx, provider, base_url).await
@@ -2073,55 +2029,6 @@ async fn stream_together(
     stream_rig_completion(completion_model, request, tx, provider).await
 }
 
-/// Stream from Claude Code CLI provider.
-async fn stream_claude_code(
-    api_key: &str,
-    model: &str,
-    request: LlmChatRequest,
-    tx: mpsc::Sender<LlmStreamChunk>,
-    provider: ProviderType,
-    _base_url: Option<&str>,
-) -> Result<()> {
-    let client = if api_key == "claude-code-cli" {
-        ClaudeCodeClient::new("claude")
-    } else {
-        ClaudeCodeClient::new("claude").with_api_key(api_key)
-    };
-
-    // Set CWD to isolated workspace directory
-    let workspace_dir = resolve_workspace_dir();
-    let client = client
-        .with_working_dir(workspace_dir)
-        .with_add_dirs(resolve_skills_dirs());
-
-    let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx, provider).await
-}
-
-/// Stream from Gemini CLI provider.
-async fn stream_gemini_cli(
-    api_key: &str,
-    model: &str,
-    request: LlmChatRequest,
-    tx: mpsc::Sender<LlmStreamChunk>,
-    provider: ProviderType,
-    _base_url: Option<&str>,
-) -> Result<()> {
-    let client = if api_key == "gemini-cli" {
-        GeminiCliClient::new("gemini")
-    } else {
-        GeminiCliClient::new("gemini").with_api_key(api_key)
-    };
-
-    let workspace_dir = resolve_workspace_dir();
-    let client = client
-        .with_working_dir(workspace_dir)
-        .with_add_dirs(resolve_skills_dirs());
-
-    let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx, provider).await
-}
-
 /// Stream from Kimi Agent CLI provider.
 ///
 /// Uses the kimi-agent wire protocol's native streaming: spawns the subprocess,
@@ -2317,6 +2224,196 @@ async fn stream_kimi_agent(
         .await;
 
     Ok(())
+}
+
+/// Stream completion via ACP protocol.
+///
+/// Manages a persistent ACP subprocess per provider type. Creates a fresh
+/// session for each request to avoid context duplication (the WASM agent
+/// sends full conversation history). Supports automatic retry with
+/// progressively more aggressive context compression on ContextLengthExceeded.
+async fn stream_acp_completion(
+    _api_key: &str,
+    model: &str,
+    request: LlmChatRequest,
+    tx: mpsc::Sender<LlmStreamChunk>,
+    provider: ProviderType,
+    _base_url: Option<&str>,
+) -> Result<()> {
+    let context_limit = nevoflux_llm::default_context_window_for(provider) as usize;
+
+    // Get or create ACP provider (lazy init, auto-reconnect on crash).
+    let provider_key = format!("{:?}", provider);
+
+    {
+        let mut providers = acp_providers().lock().await;
+
+        if !providers.contains_key(&provider_key) || !providers[&provider_key].is_alive() {
+            let work_dir = resolve_workspace_dir();
+            let config = match provider {
+                ProviderType::ClaudeCode => {
+                    nevoflux_llm::providers::acp::claude::build_config(
+                        std::path::PathBuf::from(&work_dir),
+                    )
+                }
+                ProviderType::GeminiCli => {
+                    nevoflux_llm::providers::acp::gemini::build_config(
+                        model,
+                        std::path::PathBuf::from(&work_dir),
+                    )
+                }
+                _ => {
+                    return Err(DaemonError::InternalError(format!(
+                        "ACP not supported for {:?}",
+                        provider
+                    )));
+                }
+            };
+
+            let mut acp = AcpProvider::new(config);
+            acp.connect().await.map_err(|e| {
+                DaemonError::InternalError(format!("Failed to connect ACP: {}", e))
+            })?;
+            providers.insert(provider_key.clone(), acp);
+        }
+    }
+
+    // Retry with progressive compression on context length errors.
+    for level in 0..=2u8 {
+        let content = match level {
+            0 => build_acp_content(&request, context_limit, 0.30),
+            1 => build_acp_content(&request, context_limit, 0.15),
+            _ => build_acp_content_minimal(&request),
+        };
+
+        let providers = acp_providers().lock().await;
+        let acp = providers.get(&provider_key).ok_or_else(|| {
+            DaemonError::InternalError("ACP provider disappeared".to_string())
+        })?;
+
+        let session_id = acp.new_session().await.map_err(|e| {
+            DaemonError::InternalError(format!("Failed to create ACP session: {}", e))
+        })?;
+
+        let mut response_rx = acp.prompt(session_id, content).await.map_err(|e| {
+            DaemonError::InternalError(format!("Failed to send ACP prompt: {}", e))
+        })?;
+
+        // Drop the lock before doing I/O on the receiver.
+        drop(providers);
+
+        let mut had_context_error = false;
+        while let Some(update) = response_rx.recv().await {
+            match update {
+                AcpUpdate::Text(text) => {
+                    let _ = tx
+                        .send(LlmStreamChunk {
+                            text: Some(text),
+                            tool_calls: vec![],
+                            done: false,
+                            reasoning: None,
+                            images: vec![],
+                        })
+                        .await;
+                }
+                AcpUpdate::Thought(thought) => {
+                    let _ = tx
+                        .send(LlmStreamChunk {
+                            text: None,
+                            tool_calls: vec![],
+                            done: false,
+                            reasoning: Some(thought),
+                            images: vec![],
+                        })
+                        .await;
+                }
+                AcpUpdate::Complete(_) => {
+                    let _ = tx
+                        .send(LlmStreamChunk {
+                            text: None,
+                            tool_calls: vec![],
+                            done: true,
+                            reasoning: None,
+                            images: vec![],
+                        })
+                        .await;
+                    return Ok(());
+                }
+                AcpUpdate::Error(e) => {
+                    if e.to_lowercase().contains("context")
+                        && e.to_lowercase().contains("length")
+                        && level < 2
+                    {
+                        tracing::warn!(
+                            "Context length exceeded at level {}, retrying with level {}",
+                            level,
+                            level + 1
+                        );
+                        had_context_error = true;
+                        break;
+                    }
+                    return Err(DaemonError::InternalError(format!("ACP error: {}", e)));
+                }
+            }
+        }
+
+        if !had_context_error {
+            return Ok(());
+        }
+    }
+
+    Ok(())
+}
+
+/// Build ACP content blocks with dynamic token budget compression.
+fn build_acp_content(
+    request: &LlmChatRequest,
+    context_limit: usize,
+    budget_ratio: f32,
+) -> Vec<ContentBlock> {
+    let mut blocks = Vec::new();
+
+    if let Some(system) = &request.system {
+        blocks.push(ContentBlock::Text(TextContent::new(format!(
+            "[System Instructions]\n{}\n[End System Instructions]",
+            system
+        ))));
+    }
+
+    let messages: Vec<(String, String)> = request
+        .messages
+        .iter()
+        .map(|m| (m.role.clone(), m.content.clone()))
+        .collect();
+
+    let budget = (context_limit as f32 * budget_ratio) as usize;
+    let history = compress_history(&messages, budget, 3);
+    if !history.is_empty() {
+        blocks.push(ContentBlock::Text(TextContent::new(history)));
+    }
+
+    blocks
+}
+
+/// Build minimal ACP content: system prompt + last message only.
+fn build_acp_content_minimal(request: &LlmChatRequest) -> Vec<ContentBlock> {
+    let mut blocks = Vec::new();
+
+    if let Some(system) = &request.system {
+        blocks.push(ContentBlock::Text(TextContent::new(format!(
+            "[System Instructions]\n{}\n[End System Instructions]",
+            system
+        ))));
+    }
+
+    if let Some(last) = request.messages.last() {
+        blocks.push(ContentBlock::Text(TextContent::new(format!(
+            "[{}]\n{}",
+            last.role, last.content
+        ))));
+    }
+
+    blocks
 }
 
 /// Build a kimi-agent prompt string from an LLM chat request.
