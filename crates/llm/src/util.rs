@@ -16,7 +16,7 @@ pub(crate) fn cli_command(program: &str) -> tokio::process::Command {
 ///
 /// Uses the `which` crate which correctly handles Windows PATHEXT
 /// (finding `.cmd`, `.bat`, `.exe` etc.) and Unix PATH lookup.
-fn resolve_program(program: &str) -> std::path::PathBuf {
+pub fn resolve_program(program: &str) -> std::path::PathBuf {
     // If it already has a path separator, use as-is
     if program.contains(std::path::MAIN_SEPARATOR)
         || program.contains('/')
