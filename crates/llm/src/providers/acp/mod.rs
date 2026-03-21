@@ -229,6 +229,13 @@ async fn spawn_acp_process(config: &AcpProviderConfig) -> Result<Child> {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
+    tracing::info!(
+        command = %config.command.display(),
+        args = ?config.args,
+        work_dir = %config.work_dir.display(),
+        "ACP: spawning process"
+    );
+
     cmd.spawn()
         .map_err(|e| AcpError::Internal(format!("failed to spawn ACP process: {e}")))
 }
@@ -356,13 +363,40 @@ async fn handle_requests(
     while let Some(request) = rx.recv().await {
         match request {
             ClientRequest::NewSession { response_tx } => {
+                tracing::info!(
+                    cwd = %config.work_dir.display(),
+                    "ACP: sending NewSessionRequest"
+                );
                 let session = cx
                     .send_request(NewSessionRequest::new(config.work_dir.clone()))
                     .block_task()
                     .await;
 
                 let result = match session {
-                    Ok(session) => apply_session_mode(&config, &cx, session).await,
+                    Ok(session) => {
+                        let modes_str = session
+                            .modes
+                            .as_ref()
+                            .map(|m| {
+                                let available: Vec<&str> = m
+                                    .available_modes
+                                    .iter()
+                                    .map(|mode| mode.id.0.as_ref())
+                                    .collect();
+                                format!(
+                                    "current={}, available=[{}]",
+                                    m.current_mode_id.0,
+                                    available.join(", ")
+                                )
+                            })
+                            .unwrap_or_else(|| "None".to_string());
+                        tracing::info!(
+                            session_id = %session.session_id.0,
+                            modes = %modes_str,
+                            "ACP: session created"
+                        );
+                        apply_session_mode(&config, &cx, session).await
+                    }
                     Err(err) => Err(AcpError::Internal(format!(
                         "ACP session/new failed: {err}"
                     ))),
@@ -376,6 +410,16 @@ async fn handle_requests(
                 content,
                 response_tx,
             } => {
+                let content_len: usize = content.iter().map(|b| match b {
+                    ContentBlock::Text(t) => t.text.len(),
+                    _ => 0,
+                }).sum();
+                tracing::info!(
+                    session_id = %session_id.0,
+                    content_blocks = content.len(),
+                    content_bytes = content_len,
+                    "ACP: sending PromptRequest"
+                );
                 *prompt_response_tx.lock().unwrap() = Some(response_tx.clone());
 
                 let response = cx
@@ -385,9 +429,11 @@ async fn handle_requests(
 
                 match response {
                     Ok(r) => {
+                        tracing::info!(stop_reason = ?r.stop_reason, "ACP: prompt completed");
                         let _ = response_tx.try_send(AcpUpdate::Complete(r.stop_reason));
                     }
                     Err(e) => {
+                        tracing::error!(error = %e, "ACP: prompt failed");
                         let _ = response_tx.try_send(AcpUpdate::Error(e.to_string()));
                     }
                 }
