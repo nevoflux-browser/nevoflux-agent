@@ -827,6 +827,29 @@ pub async fn start_server(
         warn!("Computer controller not available on this platform");
     }
 
+    // Set LLM config on services so subagents can make LLM calls.
+    {
+        let config = agent_config.read().unwrap();
+        if let (Some(provider_str), Some(api_key), Some(model)) = (
+            config.llm.active_provider(),
+            config.llm.active_api_key(),
+            config.llm.active_model(),
+        ) {
+            if let Ok(provider) = provider_str.parse::<nevoflux_llm::ProviderType>() {
+                let mut llm_config = crate::wasm::services::LlmConfig::new(
+                    provider,
+                    api_key,
+                    model,
+                );
+                if let Some(base_url) = config.llm.active_base_url() {
+                    llm_config.base_url = Some(base_url.to_string());
+                }
+                services = services.with_llm(llm_config);
+                info!("LLM config set on services: provider={:?}, model={}", provider, model);
+            }
+        }
+    }
+
     // Initialize subagent executor for MCP bridge mode (subagent_spawn tool).
     // Must pass services clone so subagents have access to LLM, browser, etc.
     let subagent_config = crate::config::SubagentConfig::default();
