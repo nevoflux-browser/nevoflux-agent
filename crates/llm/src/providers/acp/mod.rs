@@ -135,8 +135,9 @@ impl AcpProvider {
         let (init_tx, init_rx) = oneshot::channel();
         let config = self.config.clone();
 
+        let tool_bridge = self.tool_bridge.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_client_loop_direct(config, child, rx, init_tx).await {
+            if let Err(e) = run_client_loop_direct(config, child, rx, init_tx, tool_bridge).await {
                 tracing::error!(error = %e, "ACP client loop error");
             }
         });
@@ -269,6 +270,7 @@ async fn run_client_loop_direct(
     mut child: Child,
     mut rx: mpsc::Receiver<ClientRequest>,
     init_tx: oneshot::Sender<Result<InitializeResponse>>,
+    tool_bridge: Option<Arc<mcp_bridge::McpToolBridge>>,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let stdin = child
         .stdin
@@ -332,7 +334,7 @@ async fn run_client_loop_direct(
         )
         .connect_to(transport)?
         .run_until(|cx: JrConnectionCx<ClientToAgent>| {
-            handle_requests(config, cx, &mut rx, prompt_response_tx, init_tx)
+            handle_requests(config, cx, &mut rx, prompt_response_tx, init_tx, tool_bridge)
         })
         .await;
 
@@ -361,6 +363,7 @@ async fn handle_requests(
     rx: &mut mpsc::Receiver<ClientRequest>,
     prompt_response_tx: Arc<Mutex<Option<mpsc::Sender<AcpUpdate>>>>,
     init_tx: oneshot::Sender<Result<InitializeResponse>>,
+    tool_bridge: Option<Arc<mcp_bridge::McpToolBridge>>,
 ) -> std::result::Result<(), sacp::Error> {
     let mut init_tx = Some(init_tx);
 
@@ -387,8 +390,18 @@ async fn handle_requests(
                     cwd = %config.work_dir.display(),
                     "ACP: sending NewSessionRequest"
                 );
+                let mut request = NewSessionRequest::new(config.work_dir.clone());
+                if let Some(ref bridge) = tool_bridge {
+                    if let Some(url) = bridge.mcp_server_url() {
+                        use sacp::schema::McpServerHttp;
+                        request.mcp_servers.push(sacp::schema::McpServer::Http(
+                            McpServerHttp::new("nevoflux-tools", url),
+                        ));
+                        tracing::info!("ACP: injecting MCP server URL into session: {}", url);
+                    }
+                }
                 let session = cx
-                    .send_request(NewSessionRequest::new(config.work_dir.clone()))
+                    .send_request(request)
                     .block_task()
                     .await;
 
