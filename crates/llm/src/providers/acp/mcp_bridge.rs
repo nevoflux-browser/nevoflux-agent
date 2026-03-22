@@ -22,12 +22,26 @@ pub struct ToolCallRequest {
     pub result_tx: oneshot::Sender<Result<String, String>>,
 }
 
+/// Artifact data created via MCP tool call, pending delivery to sidebar.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PendingArtifact {
+    pub id: String,
+    pub title: String,
+    pub content_type: String,
+    pub description: Option<String>,
+    pub content: String,
+    pub files: Option<std::collections::HashMap<String, String>>,
+    pub entry: Option<String>,
+}
+
 /// Bridge between MCP HTTP server and daemon tool execution.
 pub struct McpToolBridge {
     tools: Arc<RwLock<Vec<McpToolDef>>>,
     executor: Arc<Mutex<Option<mpsc::Sender<ToolCallRequest>>>>,
     mcp_server_url: OnceLock<String>,
     server_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Artifacts created via MCP tool calls, waiting to be sent to sidebar.
+    pending_artifacts: Arc<Mutex<Vec<PendingArtifact>>>,
 }
 
 impl Drop for McpToolBridge {
@@ -56,6 +70,7 @@ impl McpToolBridge {
             executor: Arc::new(Mutex::new(None)),
             mcp_server_url: OnceLock::new(),
             server_handle: Mutex::new(None),
+            pending_artifacts: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -98,6 +113,16 @@ impl McpToolBridge {
     /// Store the server task handle for shutdown.
     pub fn set_server_handle(&self, handle: JoinHandle<()>) {
         *self.server_handle.lock().unwrap() = Some(handle);
+    }
+
+    /// Add a pending artifact (called by MCP tool executor on create_artifact).
+    pub fn push_artifact(&self, artifact: PendingArtifact) {
+        self.pending_artifacts.lock().unwrap().push(artifact);
+    }
+
+    /// Drain all pending artifacts (called by server after agent response completes).
+    pub fn drain_artifacts(&self) -> Vec<PendingArtifact> {
+        std::mem::take(&mut *self.pending_artifacts.lock().unwrap())
     }
 }
 

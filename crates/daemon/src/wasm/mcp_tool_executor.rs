@@ -8,7 +8,8 @@ use nevoflux_computer::{
     ClickType, ComputerController, Key, KeyCombination, KeyOrChar, KeyboardController,
     MouseButton, MouseController, Point, Region, ScreenshotProvider, ScrollDirection,
 };
-use nevoflux_llm::providers::acp::mcp_bridge::ToolCallRequest;
+use nevoflux_llm::providers::acp::mcp_bridge::{McpToolBridge, PendingArtifact, ToolCallRequest};
+use std::sync::Arc;
 use nevoflux_protocol::BrowserToolAction;
 use nevoflux_storage::{CreateKnowledgeParams, KnowledgeRepository, MemoryChunk};
 use tokio::sync::mpsc;
@@ -20,9 +21,11 @@ use super::services::{BrowserContext, BrowserRequest, HostServices};
 pub async fn run_tool_executor(
     mut rx: mpsc::Receiver<ToolCallRequest>,
     services: HostServices,
+    tool_bridge: Arc<McpToolBridge>,
 ) {
     while let Some(req) = rx.recv().await {
-        let result = execute_mcp_tool(&req.name, &req.arguments, &services).await;
+        let result =
+            execute_mcp_tool(&req.name, &req.arguments, &services, &tool_bridge).await;
         let _ = req.result_tx.send(result);
     }
 }
@@ -36,6 +39,7 @@ pub async fn execute_mcp_tool(
     name: &str,
     arguments: &serde_json::Value,
     services: &HostServices,
+    tool_bridge: &Arc<McpToolBridge>,
 ) -> Result<String, String> {
     // 1. Browser tools
     if let Some(action) = tool_name_to_browser_action(name) {
@@ -57,7 +61,7 @@ pub async fn execute_mcp_tool(
             return Ok("Plan submitted for review.".to_string());
         }
         "create_artifact" => {
-            return execute_create_artifact(arguments, services).await;
+            return execute_create_artifact(arguments, tool_bridge).await;
         }
         _ => {}
     }
@@ -460,45 +464,64 @@ fn parse_key_string(key_str: &str) -> Result<KeyOrChar, String> {
 /// The sidebar picks up artifacts via the existing session artifact API.
 async fn execute_create_artifact(
     arguments: &serde_json::Value,
-    services: &HostServices,
+    tool_bridge: &Arc<McpToolBridge>,
 ) -> Result<String, String> {
-    let id = arguments
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_else(|| "artifact");
     let title = arguments
         .get("title")
         .and_then(|v| v.as_str())
-        .unwrap_or("Untitled");
+        .unwrap_or("Untitled")
+        .to_string();
     let content_type = arguments
         .get("content_type")
         .and_then(|v| v.as_str())
-        .unwrap_or("text/html");
+        .unwrap_or("text/html")
+        .to_string();
     let content = arguments
         .get("content")
         .and_then(|v| v.as_str())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
+    let description = arguments
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let entry = arguments
+        .get("entry")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let files: Option<std::collections::HashMap<String, String>> =
+        arguments.get("files").and_then(|f| {
+            if let Some(obj) = f.as_object() {
+                Some(
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect(),
+                )
+            } else if let Some(s) = f.as_str() {
+                serde_json::from_str(s).ok()
+            } else {
+                None
+            }
+        });
 
-    let session_id = if services.session_id.is_empty() {
-        "mcp-session"
-    } else {
-        &services.session_id
-    };
+    // Generate unique artifact ID
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let id = format!("art-{}-1", ts);
 
-    let mut params =
-        nevoflux_storage::CreateArtifactParams::new(id, session_id, title, content_type)
-            .with_content(content);
-
-    if let Some(desc) = arguments.get("description").and_then(|v| v.as_str()) {
-        params = params.with_description(desc);
-    }
-    if let Some(entry) = arguments.get("entry").and_then(|v| v.as_str()) {
-        params = params.with_entry(entry);
-    }
-
-    let repo = nevoflux_storage::ArtifactRepository::new(&services.database);
-    repo.create(params)
-        .map_err(|e| format!("artifact creation failed: {e}"))?;
+    // Store as pending artifact — server will pick it up after prompt completes
+    // and call send_artifact_stream to push to sidebar.
+    tool_bridge.push_artifact(PendingArtifact {
+        id: id.clone(),
+        title: title.clone(),
+        content_type,
+        description,
+        content,
+        files,
+        entry,
+    });
 
     Ok(serde_json::json!({
         "id": id,

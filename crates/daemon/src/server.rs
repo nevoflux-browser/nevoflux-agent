@@ -2620,6 +2620,45 @@ async fn handle_chat_message_streaming(
                 .await;
             }
 
+            // Handle pending artifacts from MCP bridge mode (create_artifact via MCP tool calls)
+            {
+                use nevoflux_llm::providers::acp::mcp_bridge::McpToolBridge;
+                let acp_providers = crate::wasm::llm::acp_providers();
+                let providers = acp_providers.lock().await;
+                // Check all providers for pending artifacts
+                for provider in providers.values() {
+                    if let Some(bridge) = provider.tool_bridge() {
+                        let pending = bridge.drain_artifacts();
+                        for pa in pending {
+                            let artifact = Artifact {
+                                id: pa.id,
+                                title: pa.title,
+                                content_type: pa.content_type,
+                                description: pa.description,
+                                content: pa.content,
+                                files: pa.files,
+                                entry: pa.entry,
+                            };
+                            info!(
+                                "MCP bridge: sending artifact '{}' to sidebar for session {}",
+                                artifact.title, session_id
+                            );
+                            send_artifact_stream(
+                                &artifact,
+                                &session_id,
+                                session_manager,
+                                &proxy_id,
+                                channel,
+                                &request_id,
+                                &identity,
+                                &response_tx,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+
             // Execute Code Mode if agent returned Python code
             let raw_text = if output.text.is_empty() {
                 &accumulated_text

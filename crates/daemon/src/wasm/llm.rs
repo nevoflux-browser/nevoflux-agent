@@ -34,7 +34,7 @@ use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 static ACP_PROVIDERS: OnceLock<Arc<TokioMutex<HashMap<String, AcpProvider>>>> = OnceLock::new();
 
-fn acp_providers() -> &'static Arc<TokioMutex<HashMap<String, AcpProvider>>> {
+pub fn acp_providers() -> &'static Arc<TokioMutex<HashMap<String, AcpProvider>>> {
     ACP_PROVIDERS.get_or_init(|| Arc::new(TokioMutex::new(HashMap::new())))
 }
 
@@ -2322,7 +2322,9 @@ async fn stream_acp_completion(
         if let Some(services) = host_services.clone() {
             let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(32);
             tool_bridge.set_executor(tool_tx);
-            tokio::spawn(crate::wasm::mcp_tool_executor::run_tool_executor(tool_rx, services));
+            tokio::spawn(crate::wasm::mcp_tool_executor::run_tool_executor(
+                tool_rx, services, tool_bridge.clone(),
+            ));
         } else {
             tracing::warn!("MCP bridge mode but no host_services — MCP tool calls will return 'no active tool executor'");
         }
