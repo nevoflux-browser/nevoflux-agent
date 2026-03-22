@@ -243,6 +243,8 @@ pub struct SubagentExecutor {
     base_services: Option<HostServices>,
     /// Optional sidebar stream sender from the parent agent.
     sidebar_stream_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::agent_host::SidebarStreamChunk>>,
+    /// Agent configuration with provider API keys for subagent LLM calls.
+    agent_config: Option<Arc<crate::config::AgentConfig>>,
 }
 
 impl SubagentExecutor {
@@ -255,6 +257,7 @@ impl SubagentExecutor {
             runtime,
             base_services: None,
             sidebar_stream_tx: None,
+            agent_config: None,
         }
     }
 
@@ -270,6 +273,12 @@ impl SubagentExecutor {
         tx: tokio::sync::mpsc::UnboundedSender<crate::agent_host::SidebarStreamChunk>,
     ) -> Self {
         self.sidebar_stream_tx = Some(tx);
+        self
+    }
+
+    /// Set the agent configuration (provides API keys for subagent LLM calls).
+    pub fn with_agent_config(mut self, config: Arc<crate::config::AgentConfig>) -> Self {
+        self.agent_config = Some(config);
         self
     }
 
@@ -364,7 +373,9 @@ impl SubagentExecutor {
         let executor_handle = handle.clone();
         let timeout_secs = self.config.timeout_secs;
         let base_services = self.base_services.clone();
-        let config = crate::config::AgentConfig::default();
+        let config = self.agent_config.as_ref()
+            .map(|c| (**c).clone())
+            .unwrap_or_default();
         let sidebar_tx = self.sidebar_stream_tx.clone();
 
         self.runtime.spawn(async move {

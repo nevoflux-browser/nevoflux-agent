@@ -858,7 +858,8 @@ pub async fn start_server(
             subagent_config,
             tokio::runtime::Handle::current(),
         )
-        .with_services(services.clone()),
+        .with_services(services.clone())
+        .with_agent_config(agent_config.read().unwrap().clone()),
     );
     services = services.with_subagent_executor(subagent_executor);
     info!("Subagent executor initialized");
