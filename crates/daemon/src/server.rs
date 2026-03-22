@@ -827,6 +827,15 @@ pub async fn start_server(
         warn!("Computer controller not available on this platform");
     }
 
+    // Initialize subagent executor for MCP bridge mode (subagent_spawn tool)
+    let subagent_config = crate::config::SubagentConfig::default();
+    let subagent_executor = Arc::new(crate::wasm::subagent::SubagentExecutor::new(
+        subagent_config,
+        tokio::runtime::Handle::current(),
+    ));
+    services = services.with_subagent_executor(subagent_executor);
+    info!("Subagent executor initialized");
+
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let (msg_tx, mut msg_rx) = mpsc::channel::<(Vec<u8>, ProxyEnvelope)>(100);
     let (response_tx, mut response_rx) = mpsc::channel::<(Vec<u8>, DaemonEnvelope)>(100);
