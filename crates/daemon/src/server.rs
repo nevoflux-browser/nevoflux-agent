@@ -827,12 +827,16 @@ pub async fn start_server(
         warn!("Computer controller not available on this platform");
     }
 
-    // Initialize subagent executor for MCP bridge mode (subagent_spawn tool)
+    // Initialize subagent executor for MCP bridge mode (subagent_spawn tool).
+    // Must pass services clone so subagents have access to LLM, browser, etc.
     let subagent_config = crate::config::SubagentConfig::default();
-    let subagent_executor = Arc::new(crate::wasm::subagent::SubagentExecutor::new(
-        subagent_config,
-        tokio::runtime::Handle::current(),
-    ));
+    let subagent_executor = Arc::new(
+        crate::wasm::subagent::SubagentExecutor::new(
+            subagent_config,
+            tokio::runtime::Handle::current(),
+        )
+        .with_services(services.clone()),
+    );
     services = services.with_subagent_executor(subagent_executor);
     info!("Subagent executor initialized");
 
