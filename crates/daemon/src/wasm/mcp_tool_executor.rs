@@ -479,8 +479,14 @@ async fn execute_create_artifact(
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
+    let session_id = if services.session_id.is_empty() {
+        "mcp-session"
+    } else {
+        &services.session_id
+    };
+
     let mut params =
-        nevoflux_storage::CreateArtifactParams::new(id, "", title, content_type)
+        nevoflux_storage::CreateArtifactParams::new(id, session_id, title, content_type)
             .with_content(content);
 
     if let Some(desc) = arguments.get("description").and_then(|v| v.as_str()) {

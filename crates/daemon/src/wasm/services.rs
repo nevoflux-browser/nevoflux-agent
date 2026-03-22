@@ -171,6 +171,8 @@ pub struct HostServices {
     pub client_identity: Vec<u8>,
     /// Current proxy ID for the response envelope.
     pub proxy_id: String,
+    /// Current session ID for artifact creation and other session-scoped operations.
+    pub session_id: String,
     /// Knowledge retriever for injecting learned context into agent execution.
     ///
     /// When set, enables the agent to retrieve relevant knowledge entries
@@ -225,6 +227,7 @@ impl HostServices {
             role_registry: None,
             client_identity: Vec::new(),
             proxy_id: String::new(),
+            session_id: String::new(),
             knowledge_retriever: None,
             computer_controller: None,
             embedding: Arc::new(std::sync::RwLock::new(None)),
@@ -251,6 +254,7 @@ impl HostServices {
             role_registry: None,
             client_identity: Vec::new(),
             proxy_id: String::new(),
+            session_id: String::new(),
             knowledge_retriever: None,
             computer_controller: None,
             embedding: Arc::new(std::sync::RwLock::new(None)),
@@ -412,6 +416,12 @@ impl HostServices {
     pub fn with_client_context(mut self, identity: Vec<u8>, proxy_id: String) -> Self {
         self.client_identity = identity;
         self.proxy_id = proxy_id;
+        self
+    }
+
+    /// Set session ID for session-scoped operations (e.g. artifact creation).
+    pub fn with_session_id(mut self, session_id: String) -> Self {
+        self.session_id = session_id;
         self
     }
 

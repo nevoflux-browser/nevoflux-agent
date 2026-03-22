@@ -1897,7 +1897,8 @@ async fn handle_chat_message_streaming(
     // Set client context on services so browser tool requests can be routed back
     let mut services_with_context = services
         .clone()
-        .with_client_context(identity.clone(), proxy_id.clone());
+        .with_client_context(identity.clone(), proxy_id.clone())
+        .with_session_id(session_id.clone());
 
     // Create a per-session interrupt flag and register it so stop_generation can find it
     let session_interrupt_flag = Arc::new(AtomicBool::new(false));
