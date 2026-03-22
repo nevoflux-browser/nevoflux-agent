@@ -474,13 +474,19 @@ async fn handle_requests_with_mcp(
                                     .collect();
 
                                 if available.iter().any(|id| id == &config.session_mode) {
-                                    let _ = cx
+                                    if let Err(e) = cx
                                         .send_request(SetSessionModeRequest::new(
                                             active.session_id().clone(),
                                             config.session_mode.clone(),
                                         ))
                                         .block_task()
-                                        .await;
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            "Failed to set session mode to '{}': {e}",
+                                            config.session_mode
+                                        );
+                                    }
                                 }
 
                                 let modes_str = format!(

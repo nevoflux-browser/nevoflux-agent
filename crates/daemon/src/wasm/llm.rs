@@ -2302,14 +2302,13 @@ async fn stream_acp_completion(
             tool_bridge.update_tools(mcp_tools);
         }
 
-        // Spawn tool executor task
-        let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(32);
-        tool_bridge.set_executor(tool_tx);
-
+        // Spawn tool executor task (only if browser_ctx available)
         if let Some(ctx) = browser_ctx {
+            let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(32);
+            tool_bridge.set_executor(tool_tx);
             tokio::spawn(crate::wasm::mcp_tool_executor::run_tool_executor(tool_rx, ctx));
         } else {
-            tracing::warn!("MCP bridge mode but no browser_ctx — tool calls will fail");
+            tracing::warn!("MCP bridge mode but no browser_ctx — MCP tool calls will return 'no active tool executor'");
         }
 
         Some(tool_bridge.executor_guard())
