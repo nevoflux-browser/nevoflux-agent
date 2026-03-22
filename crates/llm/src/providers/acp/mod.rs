@@ -7,6 +7,7 @@
 pub mod claude;
 pub mod context;
 pub mod gemini;
+pub mod mcp_bridge;
 pub mod tools;
 
 // Re-export key schema types so downstream crates (e.g. nevoflux-daemon)
