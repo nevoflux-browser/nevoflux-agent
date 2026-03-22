@@ -3418,6 +3418,7 @@ dependencies = [
  "mockall",
  "reqwest",
  "rig-core",
+ "rmcp 0.12.0",
  "sacp",
  "serde",
  "serde_json",

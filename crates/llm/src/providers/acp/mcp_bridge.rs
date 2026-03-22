@@ -6,6 +6,11 @@
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{mpsc, oneshot};
 
+use sacp::mcp::McpServerToClient;
+use sacp::mcp_server::{McpContext, McpServerConnect};
+use sacp::{ByteStreams, Component, DynComponent, JrLink};
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
 /// Tool definition for MCP tools/list.
 #[derive(Debug, Clone)]
 pub struct McpToolDef {
@@ -77,6 +82,149 @@ impl McpToolBridge {
     }
 }
 
+/// Convert a McpToolDef to an rmcp Tool model.
+pub fn tool_def_to_rmcp_tool(def: &McpToolDef) -> rmcp::model::Tool {
+    rmcp::model::Tool {
+        name: def.name.clone().into(),
+        description: Some(def.description.clone().into()),
+        input_schema: serde_json::from_value(def.input_schema.clone()).unwrap_or_default(),
+        output_schema: None,
+        annotations: None,
+        icons: None,
+        meta: None,
+        title: None,
+    }
+}
+
+/// MCP server that bridges to NevoFlux tool execution.
+pub(crate) struct NevoFluxMcpServer {
+    pub tool_bridge: Arc<McpToolBridge>,
+}
+
+impl<Link: JrLink> McpServerConnect<Link> for NevoFluxMcpServer {
+    fn name(&self) -> String {
+        "nevoflux-tools".to_string()
+    }
+
+    fn connect(&self, _cx: McpContext<Link>) -> DynComponent<McpServerToClient> {
+        DynComponent::new(NevoFluxMcpHandler {
+            tool_bridge: self.tool_bridge.clone(),
+        })
+    }
+}
+
+/// rmcp ServerHandler that dispatches tool calls through McpToolBridge.
+pub(crate) struct NevoFluxMcpHandler {
+    tool_bridge: Arc<McpToolBridge>,
+}
+
+impl Component<McpServerToClient> for NevoFluxMcpHandler {
+    async fn serve(
+        self,
+        client: impl Component<sacp::mcp::McpClientToServer>,
+    ) -> Result<(), sacp::Error> {
+        // Duplex stream pattern from sacp::mcp_server::builder.rs:359-390
+        let (mcp_server_stream, mcp_client_stream) = tokio::io::duplex(8192);
+        let (mcp_server_read, mcp_server_write) = tokio::io::split(mcp_server_stream);
+        let (mcp_client_read, mcp_client_write) = tokio::io::split(mcp_client_stream);
+
+        let byte_streams =
+            ByteStreams::new(mcp_client_write.compat_write(), mcp_client_read.compat());
+
+        tokio::spawn(async move {
+            let _ = Component::<McpServerToClient>::serve(byte_streams, client).await;
+        });
+
+        let running_server =
+            rmcp::ServiceExt::serve(self, (mcp_server_read, mcp_server_write))
+                .await
+                .map_err(sacp::Error::into_internal_error)?;
+
+        running_server
+            .waiting()
+            .await
+            .map(|_| ())
+            .map_err(sacp::Error::into_internal_error)
+    }
+}
+
+impl rmcp::ServerHandler for NevoFluxMcpHandler {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo {
+            protocol_version: rmcp::model::ProtocolVersion::default(),
+            capabilities: rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+            server_info: rmcp::model::Implementation {
+                name: "nevoflux-tools".to_string(),
+                version: "1.0.0".to_string(),
+                title: None,
+                icons: None,
+                website_url: None,
+            },
+            instructions: Some("NevoFlux browser and computer control tools".to_string()),
+        }
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParam>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let tools: Vec<rmcp::model::Tool> = self
+            .tool_bridge
+            .get_tools()
+            .iter()
+            .map(tool_def_to_rmcp_tool)
+            .collect();
+        Ok(rmcp::model::ListToolsResult::with_all_items(tools))
+    }
+
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParam,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let tx = self.tool_bridge.clone_executor().ok_or_else(|| {
+            rmcp::ErrorData::internal_error("no active tool executor", None)
+        })?;
+
+        let (result_tx, result_rx) = oneshot::channel();
+        tx.send(ToolCallRequest {
+            name: request.name.to_string(),
+            arguments: serde_json::to_value(request.arguments).unwrap_or_default(),
+            result_tx,
+        })
+        .await
+        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+
+        match result_rx.await {
+            Ok(Ok(text)) => Ok(rmcp::model::CallToolResult::success(vec![
+                rmcp::model::Content::text(text),
+            ])),
+            Ok(Err(e)) => Ok(rmcp::model::CallToolResult::error(vec![
+                rmcp::model::Content::text(e),
+            ])),
+            Err(_) => Err(rmcp::ErrorData::internal_error(
+                "tool executor dropped",
+                None,
+            )),
+        }
+    }
+}
+
+/// Build an MCP server from a tool bridge.
+pub(crate) fn build_mcp_server(
+    bridge: &Arc<McpToolBridge>,
+) -> sacp::mcp_server::McpServer<sacp::ClientToAgent, sacp::NullResponder> {
+    sacp::mcp_server::McpServer::new(
+        NevoFluxMcpServer {
+            tool_bridge: bridge.clone(),
+        },
+        sacp::NullResponder,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +270,24 @@ mod tests {
         }
         // Guard dropped — executor should be cleared
         assert!(bridge.clone_executor().is_none());
+    }
+
+    #[test]
+    fn test_tool_def_to_rmcp_tool() {
+        let def = McpToolDef {
+            name: "browser_navigate".to_string(),
+            description: "Navigate browser to URL".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"}
+                },
+                "required": ["url"]
+            }),
+        };
+        let tool = tool_def_to_rmcp_tool(&def);
+        assert_eq!(&*tool.name, "browser_navigate");
+        assert_eq!(tool.description.as_deref(), Some("Navigate browser to URL"));
     }
 
     #[tokio::test]
