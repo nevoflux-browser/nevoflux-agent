@@ -20,7 +20,7 @@ pub fn build_config(model: &str, work_dir: PathBuf) -> AcpProviderConfig {
         env: vec![],
         env_remove: vec![],
         work_dir,
-        session_mode: "plan".to_string(),
-        use_mcp_bridge: false,
+        session_mode: "default".to_string(),
+        use_mcp_bridge: true,
     }
 }

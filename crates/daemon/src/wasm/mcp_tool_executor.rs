@@ -983,12 +983,17 @@ mod tests {
         assert!(parse_key_string("unknown_key").is_err());
     }
 
+    fn make_test_bridge() -> Arc<McpToolBridge> {
+        Arc::new(McpToolBridge::new())
+    }
+
     #[test]
     fn test_dispatch_think_tool() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
         let services = HostServices::new(db);
-        let result = rt.block_on(execute_mcp_tool("think", &serde_json::json!({}), &services));
+        let bridge = make_test_bridge();
+        let result = rt.block_on(execute_mcp_tool("think", &serde_json::json!({}), &services, &bridge));
         assert_eq!(result, Ok("Thought recorded.".to_string()));
     }
 
@@ -997,8 +1002,9 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
         let services = HostServices::new(db);
+        let bridge = make_test_bridge();
         let result =
-            rt.block_on(execute_mcp_tool("create_plan", &serde_json::json!({}), &services));
+            rt.block_on(execute_mcp_tool("create_plan", &serde_json::json!({}), &services, &bridge));
         assert_eq!(result, Ok("Plan submitted for review.".to_string()));
     }
 
@@ -1007,10 +1013,12 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
         let services = HostServices::new(db);
+        let bridge = make_test_bridge();
         let result = rt.block_on(execute_mcp_tool(
             "nonexistent_tool",
             &serde_json::json!({}),
             &services,
+            &bridge,
         ));
         assert_eq!(result, Err("unknown tool: nonexistent_tool".to_string()));
     }
@@ -1094,10 +1102,12 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
         let services = HostServices::new(db);
+        let bridge = make_test_bridge();
         let result = rt.block_on(execute_mcp_tool(
             "browser_navigate",
             &serde_json::json!({"url": "https://example.com"}),
             &services,
+            &bridge,
         ));
         assert_eq!(result, Err("browser not available".to_string()));
     }
