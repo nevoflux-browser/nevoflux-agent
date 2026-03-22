@@ -36,7 +36,7 @@ pub fn resolve_program(program: &str) -> std::path::PathBuf {
 /// Mirrors Goose's `SearchPaths::builder().with_npm()`:
 /// - Windows: adds `%APPDATA%/npm`
 /// - Unix: adds `~/.npm-global/bin`
-fn build_search_path() -> Option<std::ffi::OsString> {
+pub fn build_search_path() -> Option<std::ffi::OsString> {
     let mut extra_dirs: Vec<std::path::PathBuf> = Vec::new();
 
     #[cfg(target_os = "windows")]

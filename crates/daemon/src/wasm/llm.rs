@@ -1634,7 +1634,7 @@ pub async fn start_llm_stream(
     request: LlmChatRequest,
     registry: Arc<LlmStreamRegistry>,
     base_url: Option<&str>,
-    browser_ctx: Option<crate::wasm::services::BrowserContext>,
+    host_services: Option<crate::wasm::services::HostServices>,
 ) -> Result<u64> {
     let stream_id = registry.allocate_id();
     let (tx, rx) = mpsc::channel(32);
@@ -1656,7 +1656,7 @@ pub async fn start_llm_stream(
             request,
             tx.clone(),
             base_url_owned.as_deref(),
-            browser_ctx,
+            host_services,
         )
         .await;
         if let Err(e) = result {
@@ -1685,7 +1685,7 @@ async fn execute_llm_stream_inner(
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     base_url: Option<&str>,
-    browser_ctx: Option<crate::wasm::services::BrowserContext>,
+    _host_services: Option<crate::wasm::services::HostServices>,
 ) -> Result<()> {
     match provider {
         ProviderType::Anthropic => {
@@ -1718,7 +1718,7 @@ async fn execute_llm_stream_inner(
             stream_together(api_key, model, request, tx, provider, base_url).await
         }
         ProviderType::ClaudeCode | ProviderType::GeminiCli => {
-            stream_acp_completion(api_key, model, request, tx, provider, base_url, browser_ctx)
+            stream_acp_completion(api_key, model, request, tx, provider, base_url, _host_services)
                 .await
         }
         ProviderType::KimiAgent => {
@@ -2234,7 +2234,7 @@ async fn stream_acp_completion(
     tx: mpsc::Sender<LlmStreamChunk>,
     provider: ProviderType,
     _base_url: Option<&str>,
-    browser_ctx: Option<crate::wasm::services::BrowserContext>,
+    host_services: Option<crate::wasm::services::HostServices>,
 ) -> Result<()> {
     let context_limit = nevoflux_llm::default_context_window_for(provider) as usize;
 
@@ -2318,13 +2318,13 @@ async fn stream_acp_completion(
             tool_bridge.update_tools(mcp_tools);
         }
 
-        // Spawn tool executor task (only if browser_ctx available)
-        if let Some(ctx) = browser_ctx {
+        // Spawn tool executor task (only if host_services available)
+        if let Some(services) = host_services.clone() {
             let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(32);
             tool_bridge.set_executor(tool_tx);
-            tokio::spawn(crate::wasm::mcp_tool_executor::run_tool_executor(tool_rx, ctx));
+            tokio::spawn(crate::wasm::mcp_tool_executor::run_tool_executor(tool_rx, services));
         } else {
-            tracing::warn!("MCP bridge mode but no browser_ctx — MCP tool calls will return 'no active tool executor'");
+            tracing::warn!("MCP bridge mode but no host_services — MCP tool calls will return 'no active tool executor'");
         }
 
         Some(tool_bridge.executor_guard())
