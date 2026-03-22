@@ -2400,16 +2400,11 @@ async fn stream_acp_completion(
                 }
                 AcpUpdate::Complete(_) => {
                     if use_mcp_bridge {
-                        // MCP mode: no tool call extraction — tools called natively via MCP
-                        let _ = tx
-                            .send(LlmStreamChunk {
-                                text: None,
-                                tool_calls: vec![],
-                                done: true,
-                                reasoning: None,
-                                images: vec![],
-                            })
-                            .await;
+                        // MCP mode: do NOT send done:true here.
+                        // The channel will close naturally when this function returns,
+                        // and the forwarder will flush its buffer without sending done.
+                        // server.rs will drain pending artifacts (e.g., create_artifact)
+                        // and send them to sidebar BEFORE sending the final done:true.
                     } else {
                         // Direct mode: extract tool calls from the accumulated text.
                         let (cleaned_text, extracted) =

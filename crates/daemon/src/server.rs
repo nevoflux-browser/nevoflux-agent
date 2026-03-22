@@ -2622,13 +2622,17 @@ async fn handle_chat_message_streaming(
 
             // Handle pending artifacts from MCP bridge mode (create_artifact via MCP tool calls)
             {
+                #[allow(unused_imports)]
                 use nevoflux_llm::providers::acp::mcp_bridge::McpToolBridge;
                 let acp_providers = crate::wasm::llm::acp_providers();
                 let providers = acp_providers.lock().await;
+                info!("Checking {} ACP providers for pending artifacts", providers.len());
                 // Check all providers for pending artifacts
-                for provider in providers.values() {
+                for (key, provider) in providers.iter() {
+                    info!("ACP provider '{}': has_tool_bridge={}", key, provider.tool_bridge().is_some());
                     if let Some(bridge) = provider.tool_bridge() {
                         let pending = bridge.drain_artifacts();
+                        info!("ACP provider '{}': drained {} pending artifacts", key, pending.len());
                         for pa in pending {
                             let artifact = Artifact {
                                 id: pa.id,

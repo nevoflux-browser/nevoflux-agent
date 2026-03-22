@@ -84,7 +84,16 @@ pub async fn execute_mcp_tool(
         _ => {}
     }
 
-    // 6. External MCP tools (via McpManager)
+    // 6. Subagent tools
+    match name {
+        "subagent_spawn" | "subagent_status" | "subagent_wait" | "subagent_wait_all"
+        | "subagent_kill" | "subagent_list" => {
+            return execute_subagent_tool(name, arguments, services).await;
+        }
+        _ => {}
+    }
+
+    // 7. External MCP tools (via McpManager)
     if let Some(ref mcp_manager) = services.mcp_manager {
         if let Ok(result) = execute_mcp_manager_tool(name, arguments, mcp_manager).await {
             return Ok(result);
@@ -755,6 +764,87 @@ async fn execute_mcp_manager_tool(
         Err(text_parts.join("\n"))
     } else {
         Ok(text_parts.join("\n"))
+    }
+}
+
+// ============================================================================
+// 6. Subagent tools
+// ============================================================================
+
+async fn execute_subagent_tool(
+    name: &str,
+    arguments: &serde_json::Value,
+    services: &HostServices,
+) -> Result<String, String> {
+    let executor = services
+        .subagent_executor
+        .as_ref()
+        .ok_or_else(|| "subagent executor not available".to_string())?;
+
+    match name {
+        "subagent_spawn" => {
+            let task = arguments["task"]
+                .as_str()
+                .or_else(|| arguments.as_str()) // task may be the entire argument
+                .unwrap_or("")
+                .to_string();
+            let mode = arguments
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("agent");
+            let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
+
+            let agent_mode = match mode {
+                "chat" => nevoflux_builtin_wasm::AgentMode::Chat,
+                "browser" => nevoflux_builtin_wasm::AgentMode::Browser,
+                _ => nevoflux_builtin_wasm::AgentMode::Agent,
+            };
+
+            let handle = executor
+                .spawn(task, agent_mode, None, tab_id, None, None, None)
+                .map_err(|e| format!("subagent spawn failed: {e}"))?;
+
+            let id = handle.id;
+            Ok(serde_json::json!({"id": id, "status": "spawned"}).to_string())
+        }
+        "subagent_status" => {
+            let id = arguments["id"].as_u64().unwrap_or(0);
+            match executor.status(id) {
+                Some(status) => Ok(serde_json::json!({
+                    "id": id,
+                    "status": status.as_str(),
+                }).to_string()),
+                None => Err(format!("subagent {id} not found")),
+            }
+        }
+        "subagent_wait" => {
+            let id = arguments["id"].as_u64().unwrap_or(0);
+            executor.wait(id).await.map_err(|e| format!("wait failed: {e}"))
+        }
+        "subagent_wait_all" => {
+            let ids: Vec<u64> = arguments["ids"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+                .unwrap_or_default();
+            let results = executor.wait_all(&ids).await;
+            Ok(serde_json::to_string(&results).unwrap_or_default())
+        }
+        "subagent_kill" => {
+            let id = arguments["id"].as_u64().unwrap_or(0);
+            match executor.get(id) {
+                Some(handle) => {
+                    let killed = handle.kill();
+                    Ok(serde_json::json!({"id": id, "killed": killed}).to_string())
+                }
+                None => Err(format!("subagent {id} not found")),
+            }
+        }
+        "subagent_list" => {
+            // List running subagent count — detailed listing not available via public API
+            let count = executor.running_count();
+            Ok(serde_json::json!({"running_count": count}).to_string())
+        }
+        _ => Err(format!("unknown subagent tool: {name}")),
     }
 }
 
