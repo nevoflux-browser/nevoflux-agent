@@ -793,6 +793,14 @@ async fn execute_subagent_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("agent");
             let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
+            let provider_override = arguments
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let model_override = arguments
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(String::from);
 
             let agent_mode = match mode {
                 "chat" => nevoflux_builtin_wasm::AgentMode::Chat,
@@ -801,7 +809,7 @@ async fn execute_subagent_tool(
             };
 
             let handle = executor
-                .spawn(task, agent_mode, None, tab_id, None, None, None)
+                .spawn(task, agent_mode, None, tab_id, None, provider_override, model_override)
                 .map_err(|e| format!("subagent spawn failed: {e}"))?;
 
             let id = handle.id;
