@@ -2288,6 +2288,22 @@ async fn stream_acp_completion(
         let providers = acp_providers().lock().await;
         let acp = providers.get(&provider_key).unwrap();
         let tool_bridge = acp.tool_bridge().unwrap().clone();
+        drop(providers);
+
+        // Start HTTP MCP server (once, persists across requests)
+        if tool_bridge.mcp_server_url().is_none() {
+            match crate::wasm::mcp_http_server::start_mcp_http_server(tool_bridge.clone()).await {
+                Ok((port, handle)) => {
+                    let url = format!("http://127.0.0.1:{port}/mcp");
+                    tracing::info!("MCP HTTP server started at {}", url);
+                    tool_bridge.set_mcp_server_url(url);
+                    tool_bridge.set_server_handle(handle);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to start MCP HTTP server: {}", e);
+                }
+            }
+        }
 
         // Update tool definitions from request
         if let Some(tools) = &request.tools {
