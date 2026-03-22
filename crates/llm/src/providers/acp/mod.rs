@@ -104,12 +104,28 @@ pub enum AcpUpdate {
 pub struct AcpProvider {
     config: AcpProviderConfig,
     tx: Option<mpsc::Sender<ClientRequest>>,
+    /// MCP tool bridge, only present when use_mcp_bridge is true.
+    tool_bridge: Option<Arc<mcp_bridge::McpToolBridge>>,
 }
 
 impl AcpProvider {
     /// Create a new (disconnected) provider with the given config.
     pub fn new(config: AcpProviderConfig) -> Self {
-        Self { config, tx: None }
+        let tool_bridge = if config.use_mcp_bridge {
+            Some(Arc::new(mcp_bridge::McpToolBridge::new()))
+        } else {
+            None
+        };
+        Self {
+            config,
+            tx: None,
+            tool_bridge,
+        }
+    }
+
+    /// Return the MCP tool bridge, if present.
+    pub fn tool_bridge(&self) -> Option<&Arc<mcp_bridge::McpToolBridge>> {
+        self.tool_bridge.as_ref()
     }
 
     /// Spawn the agent process and complete the ACP handshake.
@@ -117,13 +133,22 @@ impl AcpProvider {
         let child = spawn_acp_process(&self.config).await?;
         let (tx, rx) = mpsc::channel(32);
         let (init_tx, init_rx) = oneshot::channel();
-
         let config = self.config.clone();
-        tokio::spawn(async move {
-            if let Err(e) = run_client_loop(config, child, rx, init_tx).await {
-                tracing::error!(error = %e, "ACP client loop error");
-            }
-        });
+
+        if config.use_mcp_bridge {
+            let tool_bridge = self.tool_bridge.clone().unwrap();
+            tokio::spawn(async move {
+                if let Err(e) = run_client_loop_proxy(config, child, rx, init_tx, tool_bridge).await {
+                    tracing::error!(error = %e, "ACP proxy client loop error");
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Err(e) = run_client_loop_direct(config, child, rx, init_tx).await {
+                    tracing::error!(error = %e, "ACP client loop error");
+                }
+            });
+        }
 
         let init_result = init_rx
             .await
@@ -248,7 +273,7 @@ async fn spawn_acp_process(config: &AcpProviderConfig) -> Result<Child> {
 // Background client loop
 // ---------------------------------------------------------------------------
 
-async fn run_client_loop(
+async fn run_client_loop_direct(
     config: AcpProviderConfig,
     mut child: Child,
     mut rx: mpsc::Receiver<ClientRequest>,
@@ -337,6 +362,18 @@ async fn run_client_loop(
     }
 
     result.map_err(|e| e.into())
+}
+
+async fn run_client_loop_proxy(
+    config: AcpProviderConfig,
+    child: Child,
+    rx: mpsc::Receiver<ClientRequest>,
+    init_tx: oneshot::Sender<Result<InitializeResponse>>,
+    _tool_bridge: Arc<mcp_bridge::McpToolBridge>,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // TODO: Implement MCP bridge mode (Task 5)
+    // For now, fall back to direct mode
+    run_client_loop_direct(config, child, rx, init_tx).await
 }
 
 async fn handle_requests(
