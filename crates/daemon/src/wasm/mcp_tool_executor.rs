@@ -636,7 +636,44 @@ async fn execute_skill_load(
         .ok_or_else(|| "missing 'name' argument".to_string())?;
     let skills = services.skills.read().await;
     match skills.get(name) {
-        Some(skill) => Ok(skill.content.clone()),
+        Some(skill) => {
+            let mut result = String::new();
+
+            // Inject base_path instruction so Claude Code can read auxiliary files
+            if let Some(ref file_path) = skill.file_path {
+                if let Some(base_dir) = file_path.parent() {
+                    let base_path = base_dir.display();
+                    // List available files in skill directory
+                    let available_files: Vec<String> = std::fs::read_dir(base_dir)
+                        .ok()
+                        .map(|entries| {
+                            entries
+                                .filter_map(|e| e.ok())
+                                .filter(|e| {
+                                    e.path().is_file()
+                                        && e.file_name() != "SKILL.md"
+                                })
+                                .map(|e| e.file_name().to_string_lossy().to_string())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    result.push_str(&format!(
+                        "[Skill directory: {base_path}]\n\
+                         [To read any file referenced below, use the Read tool with full path: {base_path}/<filename>]\n"
+                    ));
+                    if !available_files.is_empty() {
+                        result.push_str("[Available files: ");
+                        result.push_str(&available_files.join(", "));
+                        result.push_str("]\n");
+                    }
+                    result.push('\n');
+                }
+            }
+
+            result.push_str(&skill.content);
+            Ok(result)
+        }
         None => Err(format!("skill not found: {name}")),
     }
 }
