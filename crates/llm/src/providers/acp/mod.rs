@@ -65,6 +65,9 @@ pub struct AcpProviderConfig {
     pub work_dir: PathBuf,
     /// Session mode to request (e.g. "plan", "code").
     pub session_mode: String,
+    /// When true, use MCP server for native tool calling.
+    /// When false, use <tool_call> XML extraction.
+    pub use_mcp_bridge: bool,
 }
 
 /// Internal request sent from `AcpProvider` to the background client loop.

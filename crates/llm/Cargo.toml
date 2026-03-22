@@ -24,6 +24,8 @@ thiserror = { workspace = true }
 tracing = "0.1"
 which = "7"
 sacp = "10.1.0"
+# Must match sacp 10.1.0's rmcp version (NOT the 0.14 in crates/mcp)
+rmcp = { version = "0.12", features = ["server"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 fastembed = { version = "4", optional = true }
 dirs = { version = "5.0", optional = true }
