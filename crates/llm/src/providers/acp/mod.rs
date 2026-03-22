@@ -236,6 +236,14 @@ async fn spawn_acp_process(config: &AcpProviderConfig) -> Result<Child> {
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
 
+    // Ensure the child process has an extended PATH that includes common
+    // locations for npm-installed CLIs (e.g. /usr/local/bin on macOS).
+    // This is critical because shebang scripts like `gemini` use
+    // `#!/usr/bin/env node` which needs `node` in the child's PATH.
+    if let Some(extended_path) = crate::util::build_search_path() {
+        cmd.env("PATH", extended_path);
+    }
+
     for key in &config.env_remove {
         cmd.env_remove(key);
     }
@@ -321,13 +329,17 @@ async fn run_client_loop_direct(
             sacp::on_receive_notification!(),
         )
         .on_receive_request(
-            // Auto-cancel permission requests. We run in plan mode where the
-            // agent should not execute tools requiring permission.
+            // Auto-approve all tool permission requests (both MCP and built-in).
+            // TODO: Forward to sidebar for user confirmation instead of auto-approve.
             async move |_request: RequestPermissionRequest,
                         request_cx,
                         _connection_cx| {
-                let response =
-                    RequestPermissionResponse::new(RequestPermissionOutcome::Cancelled);
+                use sacp::schema::SelectedPermissionOutcome;
+                let response = RequestPermissionResponse::new(
+                    RequestPermissionOutcome::Selected(
+                        SelectedPermissionOutcome::new("allow"),
+                    ),
+                );
                 request_cx.respond(response)
             },
             sacp::on_receive_request!(),
