@@ -1634,6 +1634,7 @@ pub async fn start_llm_stream(
     request: LlmChatRequest,
     registry: Arc<LlmStreamRegistry>,
     base_url: Option<&str>,
+    browser_ctx: Option<crate::wasm::services::BrowserContext>,
 ) -> Result<u64> {
     let stream_id = registry.allocate_id();
     let (tx, rx) = mpsc::channel(32);
@@ -1655,6 +1656,7 @@ pub async fn start_llm_stream(
             request,
             tx.clone(),
             base_url_owned.as_deref(),
+            browser_ctx,
         )
         .await;
         if let Err(e) = result {
@@ -1683,6 +1685,7 @@ async fn execute_llm_stream_inner(
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     base_url: Option<&str>,
+    browser_ctx: Option<crate::wasm::services::BrowserContext>,
 ) -> Result<()> {
     match provider {
         ProviderType::Anthropic => {
@@ -1715,7 +1718,8 @@ async fn execute_llm_stream_inner(
             stream_together(api_key, model, request, tx, provider, base_url).await
         }
         ProviderType::ClaudeCode | ProviderType::GeminiCli => {
-            stream_acp_completion(api_key, model, request, tx, provider, base_url).await
+            stream_acp_completion(api_key, model, request, tx, provider, base_url, browser_ctx)
+                .await
         }
         ProviderType::KimiAgent => {
             stream_kimi_agent(api_key, model, request, tx, provider, base_url).await
@@ -2230,6 +2234,7 @@ async fn stream_acp_completion(
     tx: mpsc::Sender<LlmStreamChunk>,
     provider: ProviderType,
     _base_url: Option<&str>,
+    browser_ctx: Option<crate::wasm::services::BrowserContext>,
 ) -> Result<()> {
     let context_limit = nevoflux_llm::default_context_window_for(provider) as usize;
 
@@ -2269,12 +2274,64 @@ async fn stream_acp_completion(
         }
     }
 
+    // Detect MCP bridge mode via tool_bridge presence
+    let use_mcp_bridge = {
+        let providers = acp_providers().lock().await;
+        providers
+            .get(&provider_key)
+            .and_then(|p| p.tool_bridge())
+            .is_some()
+    };
+
+    // MCP bridge setup
+    let _tool_executor_guard = if use_mcp_bridge {
+        let providers = acp_providers().lock().await;
+        let acp = providers.get(&provider_key).unwrap();
+        let tool_bridge = acp.tool_bridge().unwrap().clone();
+
+        // Update tool definitions from request
+        if let Some(tools) = &request.tools {
+            let mcp_tools: Vec<nevoflux_llm::providers::acp::mcp_bridge::McpToolDef> = tools
+                .iter()
+                .map(|t| nevoflux_llm::providers::acp::mcp_bridge::McpToolDef {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    input_schema: t.parameters.clone(),
+                })
+                .collect();
+            tool_bridge.update_tools(mcp_tools);
+        }
+
+        // Spawn tool executor task
+        let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(32);
+        tool_bridge.set_executor(tool_tx);
+
+        if let Some(ctx) = browser_ctx {
+            tokio::spawn(crate::wasm::mcp_tool_executor::run_tool_executor(tool_rx, ctx));
+        } else {
+            tracing::warn!("MCP bridge mode but no browser_ctx — tool calls will fail");
+        }
+
+        Some(tool_bridge.executor_guard())
+    } else {
+        None
+    };
+
     // Retry with progressive compression on context length errors.
     for level in 0..=2u8 {
-        let content = match level {
-            0 => build_acp_content(&request, context_limit, 0.30),
-            1 => build_acp_content(&request, context_limit, 0.15),
-            _ => build_acp_content_minimal(&request),
+        let content = if use_mcp_bridge {
+            // MCP mode: system prompt WITHOUT tool XML (tools discovered via MCP)
+            build_acp_content_mcp(&request, context_limit, match level {
+                0 => 0.30,
+                1 => 0.15,
+                _ => 0.0,
+            })
+        } else {
+            match level {
+                0 => build_acp_content(&request, context_limit, 0.30),
+                1 => build_acp_content(&request, context_limit, 0.15),
+                _ => build_acp_content_minimal(&request),
+            }
         };
 
         let providers = acp_providers().lock().await;
@@ -2325,41 +2382,8 @@ async fn stream_acp_completion(
                         .await;
                 }
                 AcpUpdate::Complete(_) => {
-                    // Extract tool calls from the accumulated text.
-                    let (cleaned_text, extracted) =
-                        extract_tool_calls_from_text(&accumulated_text);
-
-                    let tool_calls: Vec<LlmToolCall> = extracted
-                        .into_iter()
-                        .map(|tc| LlmToolCall {
-                            id: tc.id.clone(),
-                            call_id: Some(tc.id),
-                            name: tc.name,
-                            arguments: tc.arguments,
-                            signature: None,
-                        })
-                        .collect();
-
-                    if !tool_calls.is_empty() {
-                        tracing::info!(
-                            "ACP: extracted {} tool calls from text",
-                            tool_calls.len()
-                        );
-                        // Send cleaned text (without <tool_call> XML) + tool calls
-                        let _ = tx
-                            .send(LlmStreamChunk {
-                                text: if cleaned_text.is_empty() {
-                                    None
-                                } else {
-                                    Some(cleaned_text)
-                                },
-                                tool_calls,
-                                done: true,
-                                reasoning: None,
-                                images: vec![],
-                            })
-                            .await;
-                    } else {
+                    if use_mcp_bridge {
+                        // MCP mode: no tool call extraction — tools called natively via MCP
                         let _ = tx
                             .send(LlmStreamChunk {
                                 text: None,
@@ -2369,6 +2393,52 @@ async fn stream_acp_completion(
                                 images: vec![],
                             })
                             .await;
+                    } else {
+                        // Direct mode: extract tool calls from the accumulated text.
+                        let (cleaned_text, extracted) =
+                            extract_tool_calls_from_text(&accumulated_text);
+
+                        let tool_calls: Vec<LlmToolCall> = extracted
+                            .into_iter()
+                            .map(|tc| LlmToolCall {
+                                id: tc.id.clone(),
+                                call_id: Some(tc.id),
+                                name: tc.name,
+                                arguments: tc.arguments,
+                                signature: None,
+                            })
+                            .collect();
+
+                        if !tool_calls.is_empty() {
+                            tracing::info!(
+                                "ACP: extracted {} tool calls from text",
+                                tool_calls.len()
+                            );
+                            // Send cleaned text (without <tool_call> XML) + tool calls
+                            let _ = tx
+                                .send(LlmStreamChunk {
+                                    text: if cleaned_text.is_empty() {
+                                        None
+                                    } else {
+                                        Some(cleaned_text)
+                                    },
+                                    tool_calls,
+                                    done: true,
+                                    reasoning: None,
+                                    images: vec![],
+                                })
+                                .await;
+                        } else {
+                            let _ = tx
+                                .send(LlmStreamChunk {
+                                    text: None,
+                                    tool_calls: vec![],
+                                    done: true,
+                                    reasoning: None,
+                                    images: vec![],
+                                })
+                                .await;
+                        }
                     }
                     return Ok(());
                 }
@@ -2465,6 +2535,46 @@ fn build_acp_content_minimal(request: &LlmChatRequest) -> Vec<ContentBlock> {
             "[{}]\n{}",
             last.role, last.content
         ))));
+    }
+
+    blocks
+}
+
+/// Build content for MCP bridge mode — system prompt WITHOUT tool XML.
+fn build_acp_content_mcp(
+    request: &LlmChatRequest,
+    context_limit: usize,
+    budget_ratio: f32,
+) -> Vec<ContentBlock> {
+    let mut blocks = Vec::new();
+
+    // System prompt without tool definitions (tools discovered via MCP)
+    if let Some(system) = &request.system {
+        blocks.push(ContentBlock::Text(TextContent::new(system.clone())));
+    }
+
+    // Compressed history (same as direct mode)
+    if !request.messages.is_empty() && budget_ratio > 0.0 {
+        let budget = (context_limit as f32 * budget_ratio) as usize;
+        let messages: Vec<(String, String)> = request
+            .messages
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect();
+        let compressed = compress_history(&messages, budget, 3);
+        if !compressed.is_empty() {
+            blocks.push(ContentBlock::Text(TextContent::new(compressed)));
+        }
+    }
+
+    // For minimal mode (budget_ratio == 0.0), add only last message
+    if budget_ratio == 0.0 && !request.messages.is_empty() {
+        if let Some(last) = request.messages.last() {
+            blocks.push(ContentBlock::Text(TextContent::new(format!(
+                "[{}] {}",
+                last.role, last.content
+            ))));
+        }
     }
 
     blocks

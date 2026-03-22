@@ -398,6 +398,7 @@ async fn test_openai_streaming_tool_calling() {
         request,
         registry.clone(),
         None,
+        None,
     )
     .await
     .expect("Failed to start stream");
@@ -574,6 +575,7 @@ async fn test_openai_streaming_tool_calling_full_streaming() {
         request,
         registry.clone(),
         None,
+        None,
     )
     .await
     .expect("Failed to start stream");
@@ -639,6 +641,7 @@ async fn test_openai_streaming_tool_calling_full_streaming() {
         "gpt-4o-mini",
         request2,
         registry.clone(),
+        None,
         None,
     )
     .await
@@ -835,6 +838,7 @@ async fn test_multi_round_tool_calling() {
             request,
             registry.clone(),
             None,
+            None,
         )
         .await
         .expect("Failed to start stream");
@@ -1021,6 +1025,7 @@ async fn test_openai_image_attachment_streaming() {
         request,
         registry.clone(),
         None,
+        None,
     )
     .await
     .expect("Failed to start stream");
@@ -1147,6 +1152,7 @@ Ask for permission before destructive operations."#;
         "gpt-4o-mini",
         request,
         registry.clone(),
+        None,
         None,
     )
     .await
@@ -1319,6 +1325,7 @@ async fn test_openai_large_screenshot_image() {
         request,
         registry.clone(),
         None,
+        None,
     )
     .await
     .expect("Failed to start stream");
@@ -1389,6 +1396,7 @@ async fn test_openai_large_screenshot_image() {
             "gpt-4o",
             request_gpt4o,
             registry.clone(),
+            None,
             None,
         )
         .await
@@ -1556,6 +1564,7 @@ async fn test_openai_custom_base_url_streaming() {
         request,
         registry.clone(),
         base_url,
+        None,
     )
     .await;
 
@@ -1668,6 +1677,7 @@ async fn test_openrouter_image_generation_streaming() {
         "google/gemini-3.1-flash-image-preview",
         request,
         registry.clone(),
+        None,
         None,
     )
     .await;

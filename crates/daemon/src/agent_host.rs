@@ -962,12 +962,13 @@ impl HostFunctions for DaemonHostFunctions {
 
         let registry = Arc::clone(&self.stream_registry);
         let runtime = self.runtime.clone();
+        let browser_ctx = self.services.as_ref().and_then(|s| s.browser_context());
 
         let stream_id = if use_streaming {
             // Real streaming via SSE
             tokio::task::block_in_place(|| {
                 runtime.block_on(async {
-                    start_llm_stream(provider, &api_key, &model, daemon_request, registry, base_url.as_deref()).await
+                    start_llm_stream(provider, &api_key, &model, daemon_request, registry, base_url.as_deref(), browser_ctx).await
                 })
             })
             .map_err(|e| HostError {
