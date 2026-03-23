@@ -173,6 +173,8 @@ pub struct DaemonHostFunctions {
     current_thinking_id: Arc<Mutex<Option<String>>>,
     /// Domain from the most recent successful browser_navigate.
     last_navigated_domain: Arc<Mutex<Option<String>>>,
+    /// Tools that user has approved "Always Allow" for this session (API mode permission).
+    always_allowed_tools: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
 }
 
 impl DaemonHostFunctions {
@@ -196,6 +198,7 @@ impl DaemonHostFunctions {
             is_subagent: false,
             current_thinking_id: Arc::new(Mutex::new(None)),
             last_navigated_domain: Arc::new(Mutex::new(None)),
+            always_allowed_tools: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         }
     }
 
@@ -253,6 +256,100 @@ impl DaemonHostFunctions {
         *self.model_override_provider.lock().unwrap() = Some(provider.into());
         *self.model_override_model.lock().unwrap() = Some(model.into());
         self
+    }
+
+    /// Check if a tool requires user permission (API mode).
+    /// Low-risk read-only tools are auto-approved. Others prompt via browser_ask_user.
+    /// Session-level "Always Allow" decisions are cached.
+    fn check_tool_permission(&self, tool_name: &str, args_summary: &str) -> HostResult<()> {
+        // Low-risk tools: auto-approve
+        if is_low_risk_tool_api(tool_name) {
+            return Ok(());
+        }
+
+        // Check session-level always-allow cache
+        if self.always_allowed_tools.read().unwrap().contains(tool_name) {
+            return Ok(());
+        }
+
+        // Need sidebar to ask user — requires browser_sender
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available for permission check".into(),
+        })?;
+        let browser_ctx = services.browser_context().ok_or_else(|| HostError {
+            code: 2,
+            message: "Browser not available for permission dialog".into(),
+        })?;
+
+        let question = format!(
+            "Tool permission request:\n\nTool: {}\nArguments: {}\n\nAllow this tool call?",
+            tool_name,
+            if args_summary.len() > 200 { &args_summary[..200] } else { args_summary }
+        );
+        let options = vec![
+            "Allow once".to_string(),
+            "Always allow this tool".to_string(),
+            "Reject".to_string(),
+        ];
+
+        // browser_ask_user via block_in_place
+        let sender = browser_ctx.sender.clone();
+        let runtime = self.runtime.clone();
+        let result: Result<String, String> = tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                use tokio::sync::oneshot;
+                let (response_tx, response_rx) = oneshot::channel();
+                let request = crate::wasm::services::BrowserRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    session_id: String::new(),
+                    tab_id: None,
+                    action: nevoflux_protocol::BrowserToolAction::AskUser,
+                    params: serde_json::json!({
+                        "question": question,
+                        "options": options,
+                        "allow_custom": false,
+                        "timeout_ms": 60000
+                    }),
+                    timeout_ms: 60_000,
+                    client_identity: browser_ctx.client_identity.clone(),
+                    proxy_id: browser_ctx.proxy_id.clone(),
+                };
+                sender.send((request, response_tx)).await
+                    .map_err(|_| "Failed to send permission request".to_string())?;
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    response_rx,
+                ).await
+                    .map_err(|_| "Permission dialog timed out".to_string())?
+                    .map_err(|_| "Permission response channel closed".to_string())?;
+                if response.success {
+                    response.result
+                        .as_ref()
+                        .and_then(|v| v.get("answer").and_then(|a| a.as_str()).map(String::from))
+                        .ok_or_else(|| "No answer in permission response".to_string())
+                } else {
+                    Err("Permission dialog failed".to_string())
+                }
+            })
+        });
+
+        match result.as_deref() {
+            Ok("Allow once") => Ok(()),
+            Ok("Always allow this tool") => {
+                self.always_allowed_tools.write().unwrap().insert(tool_name.to_string());
+                Ok(())
+            }
+            Ok("Reject") => Err(HostError {
+                code: 403,
+                message: format!("Tool '{}' rejected by user", tool_name),
+            }),
+            _ => {
+                // Timeout or error — default to allow once
+                tracing::warn!("Permission check failed for {}, defaulting to allow", tool_name);
+                Ok(())
+            }
+        }
     }
 
     /// Validate that a write/edit target path is within the subagent sandbox.
@@ -760,6 +857,46 @@ impl DaemonHostFunctions {
     }
 }
 
+/// Check if a tool is low-risk (read-only) for API mode permission control.
+/// Same list as ACP mode's `McpToolBridge::is_low_risk_tool`.
+fn is_low_risk_tool_api(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        // Read-only browser tools
+        "browser_get_markdown"
+            | "browser_snapshot"
+            | "browser_get_tabs"
+            | "browser_query_tabs"
+            | "browser_get_elements"
+            | "browser_get_element"
+            | "browser_get_content"
+            | "browser_screenshot"
+            | "browser_read_artifact"
+            | "browser_query_all"
+            | "browser_scroll"
+            // Wait/utility (no side effects)
+            | "browser_wait_for"
+            | "browser_wait_for_stable"
+            | "browser_ask_user"
+            // Web fetch (read-only)
+            | "web_search"
+            | "fetch_page"
+            // Memory/knowledge read
+            | "memory_search"
+            | "memory_view"
+            // Agent internal
+            | "tool_search"
+            | "skill_load"
+            | "think"
+            | "create_plan"
+            // File read (read-only)
+            | "read_file"
+            | "list_files"
+            | "glob"
+            | "grep"
+    )
+}
+
 /// Expand ~ to actual home directory in a file path.
 fn expand_tilde(path: &str) -> std::path::PathBuf {
     if path.starts_with("~/") {
@@ -1250,6 +1387,7 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn memory_create(&self, content: &str, metadata: &serde_json::Value) -> HostResult<String> {
+        self.check_tool_permission("memory_create", content)?;
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
             message: "Services not available".into(),
@@ -1306,6 +1444,7 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn memory_update(&self, id: &str, content: &str) -> HostResult<()> {
+        self.check_tool_permission("memory_update", &format!("id={}", id))?;
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
             message: "Services not available".into(),
@@ -1333,6 +1472,7 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn memory_delete(&self, id: &str) -> HostResult<()> {
+        self.check_tool_permission("memory_delete", &format!("id={}", id))?;
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
             message: "Services not available".into(),
@@ -1366,6 +1506,7 @@ impl HostFunctions for DaemonHostFunctions {
         details: &str,
         domain: Option<&str>,
     ) -> HostResult<String> {
+        self.check_tool_permission("knowledge_teach", summary)?;
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
             message: "Services not available".into(),
@@ -1714,6 +1855,7 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn tool_write(&self, path: &str, content: &str) -> HostResult<()> {
+        self.check_tool_permission("write_file", path)?;
         use std::fs;
 
         let start = std::time::Instant::now();
@@ -1762,6 +1904,7 @@ impl HostFunctions for DaemonHostFunctions {
         new_string: &str,
         replace_all: bool,
     ) -> HostResult<()> {
+        self.check_tool_permission("edit_file", path)?;
         use std::fs;
 
         let start = std::time::Instant::now();
@@ -1811,6 +1954,7 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn tool_bash(&self, command: &str, timeout_ms: Option<u64>) -> HostResult<BashResult> {
+        self.check_tool_permission("run_command", command)?;
         use std::process::{Command, Stdio};
         use std::time::Duration;
 
@@ -2656,6 +2800,7 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn computer_mouse_move(&self, x: i64, y: i64) -> HostResult<String> {
+        self.check_tool_permission("computer_mouse_move", &format!("x={}, y={}", x, y))?;
         use nevoflux_computer::Point;
 
         let controller = self.get_computer_controller()?.clone();
@@ -2681,6 +2826,7 @@ impl HostFunctions for DaemonHostFunctions {
         end_y: i64,
         button: Option<&str>,
     ) -> HostResult<String> {
+        self.check_tool_permission("computer_drag", &format!("from=({},{})", start_x, start_y))?;
         use nevoflux_computer::Point;
 
         let controller = self.get_computer_controller()?.clone();
@@ -2719,6 +2865,7 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn computer_mouse_down(&self, x: i64, y: i64, button: Option<&str>) -> HostResult<String> {
+        self.check_tool_permission("computer_mouse_down", &format!("x={}, y={}", x, y))?;
         use nevoflux_computer::Point;
 
         let controller = self.get_computer_controller()?.clone();
@@ -2747,6 +2894,7 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn computer_mouse_up(&self, x: i64, y: i64, button: Option<&str>) -> HostResult<String> {
+        self.check_tool_permission("computer_mouse_up", &format!("x={}, y={}", x, y))?;
         use nevoflux_computer::Point;
 
         let controller = self.get_computer_controller()?.clone();
@@ -2780,6 +2928,7 @@ impl HostFunctions for DaemonHostFunctions {
         duration_ms: u64,
         modifiers: &[String],
     ) -> HostResult<String> {
+        self.check_tool_permission("computer_hold_key", key)?;
         use nevoflux_computer::KeyCombination;
 
         let controller = self.get_computer_controller()?.clone();
@@ -2833,6 +2982,7 @@ impl HostFunctions for DaemonHostFunctions {
         button: Option<&str>,
         click_type: Option<&str>,
     ) -> HostResult<String> {
+        self.check_tool_permission("computer_click", &format!("x={}, y={}", x, y))?;
         use nevoflux_computer::{ClickType, Point};
 
         let controller = self.get_computer_controller()?.clone();
@@ -2866,6 +3016,7 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn computer_type_text(&self, text: &str, _delay_ms: Option<u64>) -> HostResult<String> {
+        self.check_tool_permission("computer_type_text", text)?;
         let controller = self.get_computer_controller()?.clone();
         let text_owned = text.to_string();
 
@@ -2890,6 +3041,7 @@ impl HostFunctions for DaemonHostFunctions {
         modifiers: &[String],
         repeat: Option<u64>,
     ) -> HostResult<String> {
+        self.check_tool_permission("computer_key_press", key)?;
         use nevoflux_computer::KeyCombination;
 
         let controller = self.get_computer_controller()?.clone();
@@ -3268,6 +3420,7 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn subagent_spawn(&self, task: &str, mode: &str, tab_id: Option<i64>) -> HostResult<u64> {
+        self.check_tool_permission("subagent_spawn", task)?;
         if self.is_subagent {
             return Err(HostError {
                 code: 403,
@@ -3769,6 +3922,7 @@ impl DaemonHostFunctions {
             is_subagent: self.is_subagent,
             current_thinking_id: Arc::new(Mutex::new(None)),
             last_navigated_domain: self.last_navigated_domain.clone(),
+            always_allowed_tools: self.always_allowed_tools.clone(),
         }
     }
 
@@ -3893,6 +4047,10 @@ impl DaemonHostFunctions {
             .ok()
             .and_then(|v| v.as_str().map(|s| format!("browser_{}", s)))
             .unwrap_or_else(|| format!("browser_{:?}", action).to_lowercase());
+
+        // Permission check (API mode)
+        let args_summary = serde_json::to_string(&params).unwrap_or_default();
+        self.check_tool_permission(&tool_name, &args_summary)?;
 
         // Capture params summary for trace (guard clone with trace check)
         let params_summary = if self.trace_collector.is_some() {
