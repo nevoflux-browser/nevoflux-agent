@@ -339,12 +339,12 @@ async fn run_client_loop_direct(
                     use sacp::schema::SelectedPermissionOutcome;
                     use mcp_bridge::PermissionResponse;
 
-                    // Extract tool name from the request
-                    let tool_name = request
-                        .tool_call
-                        .fields
-                        .title
-                        .clone()
+                    // Extract tool name from toolCallId or title.
+                    // Gemini CLI uses toolCallId format: "mcp_nevoflux-tools_<tool_name>-<timestamp>"
+                    // Claude Code uses title: "mcp__nevoflux-tools__<tool_name>"
+                    let tool_call_id = request.tool_call.tool_call_id.0.to_string();
+                    let tool_name = extract_tool_name_from_id(&tool_call_id)
+                        .or_else(|| request.tool_call.fields.title.clone())
                         .unwrap_or_default();
                     let args_summary = request
                         .tool_call
@@ -451,6 +451,33 @@ async fn run_client_loop_direct(
     }
 
     result.map_err(|e| e.into())
+}
+
+/// Extract tool name from ACP toolCallId.
+/// Gemini CLI: "mcp_nevoflux-tools_browser_get_markdown-1774240394151" → "browser_get_markdown"
+/// Claude Code: "toolu_01BKyw4Ubz7YNgaL5vNouGCo" → None (use title instead)
+fn extract_tool_name_from_id(tool_call_id: &str) -> Option<String> {
+    // Gemini format: mcp_<server>_<tool_name>-<timestamp>
+    if tool_call_id.starts_with("mcp_nevoflux-tools_") {
+        let rest = &tool_call_id["mcp_nevoflux-tools_".len()..];
+        // Remove trailing -<timestamp>
+        if let Some(dash_pos) = rest.rfind('-') {
+            let name = &rest[..dash_pos];
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    // Claude Code format with double underscore
+    if tool_call_id.contains("__nevoflux-tools__") {
+        let parts: Vec<&str> = tool_call_id.split("__").collect();
+        if let Some(name) = parts.last() {
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
 }
 
 async fn handle_requests(

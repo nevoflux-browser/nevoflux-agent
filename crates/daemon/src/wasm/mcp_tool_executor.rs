@@ -123,14 +123,14 @@ async fn execute_ask_user(
 
     match response_rx.await {
         Ok(response) if response.success => {
-            let result = response.result;
-            result
+            // browser_ask_user returns {"answer": "user's selection"} in result
+            response
+                .result
                 .as_ref()
-                .and_then(|v| v.as_str().map(String::from))
-                .or_else(|| {
-                    result
-                        .as_ref()
-                        .and_then(|v| v.get("response").and_then(|r| r.as_str()).map(String::from))
+                .and_then(|v| {
+                    v.get("answer")
+                        .and_then(|a| a.as_str())
+                        .map(String::from)
                 })
         }
         _ => None,
