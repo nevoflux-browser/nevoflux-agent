@@ -20,7 +20,7 @@ use sacp::schema::{
     RequestPermissionRequest, RequestPermissionResponse, SessionId, SessionNotification,
     SessionUpdate, SetSessionModeRequest, StopReason,
 };
-use sacp::{ClientToAgent, JrConnectionCx};
+use sacp::{ClientToAgent, JrConnectionCx, JrMessage};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -300,29 +300,39 @@ async fn run_client_loop_direct(
         .on_receive_notification(
             {
                 let prompt_response_tx = prompt_response_tx.clone();
-                async move |notification: SessionNotification, _cx| {
-                    if let Some(tx) = prompt_response_tx
-                        .lock()
-                        .ok()
-                        .as_ref()
-                        .and_then(|g| g.as_ref())
+                // Use UntypedMessage to catch ALL notifications including unknown ones
+                // like `usage_update` which would crash the loop if we used SessionNotification.
+                // sacp 10.x / 11.x fails to deserialize `usage_update` variant, causing
+                // `Some(Err(parse_error))` which terminates the client loop.
+                async move |message: sacp::UntypedMessage, _cx| {
+                    // Try to parse as SessionNotification — ignore parse failures silently
+                    if let Some(Ok(notification)) =
+                        SessionNotification::parse_message(&message.method, &message.params)
                     {
-                        match notification.update {
-                            SessionUpdate::AgentMessageChunk(ContentChunk {
-                                content: ContentBlock::Text(TextContent { text, .. }),
-                                ..
-                            }) => {
-                                let _ = tx.try_send(AcpUpdate::Text(text));
+                        if let Some(tx) = prompt_response_tx
+                            .lock()
+                            .ok()
+                            .as_ref()
+                            .and_then(|g| g.as_ref())
+                        {
+                            match notification.update {
+                                SessionUpdate::AgentMessageChunk(ContentChunk {
+                                    content: ContentBlock::Text(TextContent { text, .. }),
+                                    ..
+                                }) => {
+                                    let _ = tx.try_send(AcpUpdate::Text(text));
+                                }
+                                SessionUpdate::AgentThoughtChunk(ContentChunk {
+                                    content: ContentBlock::Text(TextContent { text, .. }),
+                                    ..
+                                }) => {
+                                    let _ = tx.try_send(AcpUpdate::Thought(text));
+                                }
+                                _ => {}
                             }
-                            SessionUpdate::AgentThoughtChunk(ContentChunk {
-                                content: ContentBlock::Text(TextContent { text, .. }),
-                                ..
-                            }) => {
-                                let _ = tx.try_send(AcpUpdate::Thought(text));
-                            }
-                            _ => {}
                         }
                     }
+                    // Unknown notifications (usage_update, etc.) are silently ignored
                     Ok(())
                 }
             },
