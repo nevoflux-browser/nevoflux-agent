@@ -199,6 +199,7 @@ impl McpToolBridge {
         // which means the tool name is in the request title, not parsed
         matches!(
             name,
+            // Read-only browser tools
             "browser_get_markdown"
                 | "browser_snapshot"
                 | "browser_get_tabs"
@@ -208,8 +209,19 @@ impl McpToolBridge {
                 | "browser_get_content"
                 | "browser_screenshot"
                 | "browser_read_artifact"
+                | "browser_query_all"
+                | "browser_scroll"
+                // Wait/utility tools (no side effects)
+                | "browser_wait_for"
+                | "browser_wait_for_stable"
+                | "browser_ask_user"
+                // Web fetch (read-only)
+                | "web_search"
+                | "fetch_page"
+                // Memory/knowledge read
                 | "memory_search"
                 | "memory_view"
+                // Agent internal tools
                 | "tool_search"
                 | "skill_load"
                 | "think"
