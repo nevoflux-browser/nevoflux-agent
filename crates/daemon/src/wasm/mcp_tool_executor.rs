@@ -8,7 +8,9 @@ use nevoflux_computer::{
     ClickType, ComputerController, Key, KeyCombination, KeyOrChar, KeyboardController,
     MouseButton, MouseController, Point, Region, ScreenshotProvider, ScrollDirection,
 };
-use nevoflux_llm::providers::acp::mcp_bridge::{McpToolBridge, PendingArtifact, ToolCallRequest};
+use nevoflux_llm::providers::acp::mcp_bridge::{
+    McpToolBridge, PendingArtifact, PermissionRequest, PermissionResponse, ToolCallRequest,
+};
 use std::sync::Arc;
 use nevoflux_protocol::BrowserToolAction;
 use nevoflux_storage::{CreateKnowledgeParams, KnowledgeRepository, MemoryChunk};
@@ -43,6 +45,95 @@ pub async fn run_tool_executor(
         });
 
         let _ = req.result_tx.send(result);
+    }
+}
+
+/// Handle permission requests by showing a dialog in the sidebar via browser_ask_user.
+pub async fn run_permission_handler(
+    mut rx: mpsc::Receiver<PermissionRequest>,
+    browser_ctx: BrowserContext,
+) {
+    while let Some(req) = rx.recv().await {
+        let question = format!(
+            "Tool permission request:\n\n\
+             Tool: {}\n\
+             Arguments: {}\n\n\
+             Allow this tool call?",
+            req.tool_name,
+            if req.arguments_summary.len() > 200 {
+                format!("{}...", &req.arguments_summary[..200])
+            } else {
+                req.arguments_summary.clone()
+            }
+        );
+
+        let options = vec![
+            "Allow once".to_string(),
+            "Always allow this tool".to_string(),
+            "Reject".to_string(),
+        ];
+
+        // Use browser_ask_user to show dialog in sidebar
+        let response = execute_ask_user(&question, &options, &browser_ctx).await;
+
+        let decision = match response.as_deref() {
+            Some("Allow once") => PermissionResponse::AllowOnce,
+            Some("Always allow this tool") => PermissionResponse::AllowAlways,
+            Some("Reject") => PermissionResponse::Reject,
+            _ => {
+                // Timeout or error — default to allow once
+                tracing::warn!("Permission dialog failed or timed out for {}, defaulting to AllowOnce", req.tool_name);
+                PermissionResponse::AllowOnce
+            }
+        };
+
+        let _ = req.result_tx.send(decision);
+    }
+}
+
+/// Show a question dialog in the sidebar via browser_ask_user action.
+async fn execute_ask_user(
+    question: &str,
+    options: &[String],
+    browser_ctx: &BrowserContext,
+) -> Option<String> {
+    use tokio::sync::oneshot;
+
+    let (response_tx, response_rx) = oneshot::channel();
+
+    let request = BrowserRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        session_id: String::new(),
+        tab_id: None,
+        action: BrowserToolAction::AskUser,
+        params: serde_json::json!({
+            "question": question,
+            "options": options,
+            "allow_custom": false,
+            "timeout_ms": 60000
+        }),
+        timeout_ms: 60_000,
+        client_identity: browser_ctx.client_identity.clone(),
+        proxy_id: browser_ctx.proxy_id.clone(),
+    };
+
+    if browser_ctx.sender.send((request, response_tx)).await.is_err() {
+        return None;
+    }
+
+    match response_rx.await {
+        Ok(response) if response.success => {
+            let result = response.result;
+            result
+                .as_ref()
+                .and_then(|v| v.as_str().map(String::from))
+                .or_else(|| {
+                    result
+                        .as_ref()
+                        .and_then(|v| v.get("response").and_then(|r| r.as_str()).map(String::from))
+                })
+        }
+        _ => None,
     }
 }
 

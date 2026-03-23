@@ -45,6 +45,24 @@ pub struct ToolCallRecord {
     pub duration_ms: u64,
 }
 
+/// Permission request sent from ACP permission handler to daemon for sidebar approval.
+pub struct PermissionRequest {
+    pub tool_name: String,
+    pub arguments_summary: String,
+    pub result_tx: oneshot::Sender<PermissionResponse>,
+}
+
+/// User's response to a permission request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionResponse {
+    /// Allow this one call.
+    AllowOnce,
+    /// Allow this tool for the rest of the session.
+    AllowAlways,
+    /// Reject this call.
+    Reject,
+}
+
 /// Bridge between MCP HTTP server and daemon tool execution.
 pub struct McpToolBridge {
     tools: Arc<RwLock<Vec<McpToolDef>>>,
@@ -55,6 +73,10 @@ pub struct McpToolBridge {
     pending_artifacts: Arc<Mutex<Vec<PendingArtifact>>>,
     /// Log of tool calls made during current request, for sidebar display.
     tool_call_log: Arc<Mutex<Vec<ToolCallRecord>>>,
+    /// Channel for forwarding permission requests to sidebar.
+    permission_tx: Arc<Mutex<Option<mpsc::Sender<PermissionRequest>>>>,
+    /// Tools that user has approved "Always Allow" for this session.
+    always_allowed_tools: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 impl Drop for McpToolBridge {
@@ -85,6 +107,8 @@ impl McpToolBridge {
             server_handle: Mutex::new(None),
             pending_artifacts: Arc::new(Mutex::new(Vec::new())),
             tool_call_log: Arc::new(Mutex::new(Vec::new())),
+            permission_tx: Arc::new(Mutex::new(None)),
+            always_allowed_tools: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }
     }
 
@@ -147,6 +171,70 @@ impl McpToolBridge {
     /// Drain all tool call records (called by server to inject into final response).
     pub fn drain_tool_calls(&self) -> Vec<ToolCallRecord> {
         std::mem::take(&mut *self.tool_call_log.lock().unwrap())
+    }
+
+    /// Set the permission handler channel (daemon side connects to sidebar).
+    pub fn set_permission_handler(&self, tx: mpsc::Sender<PermissionRequest>) {
+        *self.permission_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Check if a tool is in the session-level always-allow list.
+    pub fn is_always_allowed(&self, tool_name: &str) -> bool {
+        self.always_allowed_tools.read().unwrap().contains(tool_name)
+    }
+
+    /// Add a tool to the session-level always-allow list.
+    pub fn add_always_allowed(&self, tool_name: &str) {
+        self.always_allowed_tools.write().unwrap().insert(tool_name.to_string());
+    }
+
+    /// Request permission for a tool call. Returns the user's decision.
+    /// If the tool is already always-allowed, returns AllowAlways immediately.
+    /// Otherwise sends to sidebar via permission_tx channel and waits.
+    pub async fn request_permission(
+        &self,
+        tool_name: &str,
+        arguments_summary: &str,
+    ) -> PermissionResponse {
+        // Check always-allow list first
+        if self.is_always_allowed(tool_name) {
+            return PermissionResponse::AllowAlways;
+        }
+
+        // Try to send to sidebar for user decision
+        let tx = self.permission_tx.lock().unwrap().clone();
+        let Some(tx) = tx else {
+            // No permission handler — auto-approve (fallback)
+            tracing::warn!("No permission handler set, auto-approving {}", tool_name);
+            return PermissionResponse::AllowOnce;
+        };
+
+        let (result_tx, result_rx) = oneshot::channel();
+        if tx
+            .send(PermissionRequest {
+                tool_name: tool_name.to_string(),
+                arguments_summary: arguments_summary.to_string(),
+                result_tx,
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!("Permission handler dropped, auto-approving {}", tool_name);
+            return PermissionResponse::AllowOnce;
+        }
+
+        match result_rx.await {
+            Ok(response) => {
+                if response == PermissionResponse::AllowAlways {
+                    self.add_always_allowed(tool_name);
+                }
+                response
+            }
+            Err(_) => {
+                tracing::warn!("Permission response channel dropped, auto-approving {}", tool_name);
+                PermissionResponse::AllowOnce
+            }
+        }
     }
 }
 

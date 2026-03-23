@@ -329,34 +329,102 @@ async fn run_client_loop_direct(
             sacp::on_receive_notification!(),
         )
         .on_receive_request(
-            // Auto-approve all tool permission requests (both MCP and built-in).
-            // Select the first allow-type option from the request's options list,
-            // since option IDs differ between providers (Claude Code uses "allow",
-            // Gemini CLI uses "proceed_once"/"proceed_always_tool"/etc.).
-            // TODO: Forward to sidebar for user confirmation instead of auto-approve.
-            async move |request: RequestPermissionRequest,
-                        request_cx,
-                        _connection_cx| {
-                use sacp::schema::SelectedPermissionOutcome;
-                // Pick the first allow_once or allow_always option from the request
-                let option_id = request
-                    .options
-                    .iter()
-                    .find(|o| {
-                        matches!(
-                            o.kind,
-                            sacp::schema::PermissionOptionKind::AllowOnce
-                                | sacp::schema::PermissionOptionKind::AllowAlways
-                        )
-                    })
-                    .map(|o| o.option_id.0.to_string())
-                    .unwrap_or_else(|| "allow".to_string());
-                let response = RequestPermissionResponse::new(
-                    RequestPermissionOutcome::Selected(
-                        SelectedPermissionOutcome::new(option_id),
-                    ),
-                );
-                request_cx.respond(response)
+            {
+                let tool_bridge = tool_bridge.clone();
+                // Permission handler: forwards to sidebar via McpToolBridge for user approval.
+                // Session-level "Always Allow" decisions are cached to avoid repeated prompts.
+                async move |request: RequestPermissionRequest,
+                            request_cx,
+                            _connection_cx| {
+                    use sacp::schema::SelectedPermissionOutcome;
+                    use mcp_bridge::PermissionResponse;
+
+                    // Extract tool name from the request
+                    let tool_name = request
+                        .tool_call
+                        .fields
+                        .title
+                        .clone()
+                        .unwrap_or_default();
+                    let args_summary = request
+                        .tool_call
+                        .fields
+                        .raw_input
+                        .as_ref()
+                        .and_then(|v| serde_json::to_string(v).ok())
+                        .unwrap_or_default();
+
+                    // Check with McpToolBridge — may ask sidebar or return cached decision
+                    let decision = if let Some(ref bridge) = tool_bridge {
+                        bridge
+                            .request_permission(&tool_name, &args_summary)
+                            .await
+                    } else {
+                        // No bridge (non-MCP mode) — auto-approve
+                        PermissionResponse::AllowOnce
+                    };
+
+                    // Map decision to ACP option ID
+                    let option_id = match decision {
+                        PermissionResponse::AllowAlways => {
+                            // Pick the allow_always option
+                            request
+                                .options
+                                .iter()
+                                .find(|o| {
+                                    matches!(
+                                        o.kind,
+                                        sacp::schema::PermissionOptionKind::AllowAlways
+                                    )
+                                })
+                                .or_else(|| {
+                                    request.options.iter().find(|o| {
+                                        matches!(
+                                            o.kind,
+                                            sacp::schema::PermissionOptionKind::AllowOnce
+                                        )
+                                    })
+                                })
+                                .map(|o| o.option_id.0.to_string())
+                                .unwrap_or_else(|| "allow".to_string())
+                        }
+                        PermissionResponse::AllowOnce => {
+                            // Pick the allow_once option
+                            request
+                                .options
+                                .iter()
+                                .find(|o| {
+                                    matches!(
+                                        o.kind,
+                                        sacp::schema::PermissionOptionKind::AllowOnce
+                                    )
+                                })
+                                .map(|o| o.option_id.0.to_string())
+                                .unwrap_or_else(|| "allow".to_string())
+                        }
+                        PermissionResponse::Reject => {
+                            // Pick the reject option, or cancel
+                            request
+                                .options
+                                .iter()
+                                .find(|o| {
+                                    matches!(
+                                        o.kind,
+                                        sacp::schema::PermissionOptionKind::RejectOnce
+                                    )
+                                })
+                                .map(|o| o.option_id.0.to_string())
+                                .unwrap_or_else(|| "cancel".to_string())
+                        }
+                    };
+
+                    let response = RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Selected(
+                            SelectedPermissionOutcome::new(option_id),
+                        ),
+                    );
+                    request_cx.respond(response)
+                }
             },
             sacp::on_receive_request!(),
         )

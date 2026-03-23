@@ -2323,8 +2323,19 @@ async fn stream_acp_completion(
             let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(32);
             tool_bridge.set_executor(tool_tx);
             tokio::spawn(crate::wasm::mcp_tool_executor::run_tool_executor(
-                tool_rx, services, tool_bridge.clone(),
+                tool_rx, services.clone(), tool_bridge.clone(),
             ));
+
+            // Spawn permission handler — forwards permission requests to sidebar via browser_ask_user
+            let (perm_tx, perm_rx) = tokio::sync::mpsc::channel::<
+                nevoflux_llm::providers::acp::mcp_bridge::PermissionRequest,
+            >(4);
+            tool_bridge.set_permission_handler(perm_tx);
+            if let Some(browser_ctx) = services.browser_context() {
+                tokio::spawn(crate::wasm::mcp_tool_executor::run_permission_handler(
+                    perm_rx, browser_ctx,
+                ));
+            }
         } else {
             tracing::warn!("MCP bridge mode but no host_services — MCP tool calls will return 'no active tool executor'");
         }
