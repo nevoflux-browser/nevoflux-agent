@@ -153,6 +153,16 @@ async fn execute_browser_tool(
 
     let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
 
+    // Remove tab_id from params — it's a routing field on BrowserRequest,
+    // not a tool parameter. Firefox WebExtension schema rejects unknown properties.
+    let params = if let Some(obj) = arguments.as_object() {
+        let mut clean = obj.clone();
+        clean.remove("tab_id");
+        serde_json::Value::Object(clean)
+    } else {
+        arguments.clone()
+    };
+
     let (response_tx, response_rx) = oneshot::channel();
 
     let request = BrowserRequest {
@@ -160,7 +170,7 @@ async fn execute_browser_tool(
         session_id: String::new(),
         tab_id,
         action,
-        params: arguments.clone(),
+        params,
         timeout_ms: 30_000,
         client_identity: browser_ctx.client_identity.clone(),
         proxy_id: browser_ctx.proxy_id.clone(),
