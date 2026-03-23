@@ -823,14 +823,26 @@ async fn execute_subagent_tool(
                 .get("provider")
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            // If provider specified but model not, look up from config.toml
             let model_override = arguments
                 .get("model")
                 .and_then(|v| v.as_str())
-                .map(String::from);
+                .map(String::from)
+                .or_else(|| {
+                    let provider = provider_override.as_ref()?;
+                    let agent_config = executor.agent_config()?;
+                    agent_config
+                        .llm
+                        .model_for_provider(provider)
+                        .map(String::from)
+                });
 
             // In ACP bridge mode (ClaudeCode/GeminiCli), subagents cannot use the
-            // ACP provider directly. Require explicit provider AND model.
-            if provider_override.is_none() || model_override.is_none() {
+            // ACP provider directly. Require explicit provider/model specification.
+            // If provider given but no model found in config, also ask user.
+            if provider_override.is_none()
+                || (provider_override.is_some() && model_override.is_none())
+            {
                 let is_acp_mode = services.llm_config.as_ref().map_or(false, |c| {
                     matches!(
                         c.provider,

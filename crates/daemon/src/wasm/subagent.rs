@@ -282,6 +282,11 @@ impl SubagentExecutor {
         self
     }
 
+    /// Get the agent configuration (for looking up provider models).
+    pub fn agent_config(&self) -> Option<&Arc<crate::config::AgentConfig>> {
+        self.agent_config.as_ref()
+    }
+
     /// Get the configuration.
     pub fn config(&self) -> &SubagentConfig {
         &self.config

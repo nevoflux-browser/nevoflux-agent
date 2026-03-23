@@ -449,6 +449,29 @@ impl LlmConfig {
         }
     }
 
+    /// Get the configured model for a specific provider name.
+    pub fn model_for_provider(&self, provider: &str) -> Option<&str> {
+        match provider {
+            "anthropic" => self.anthropic.model.as_deref(),
+            "openai" => self.openai.model.as_deref(),
+            "qwen" => self.qwen.model.as_deref(),
+            "deepseek" => self.deepseek.model.as_deref(),
+            "openrouter" => self.openrouter.model.as_deref(),
+            "claude-code" | "claude_code" => self.claude_code.model.as_deref(),
+            "gemini-cli" | "gemini_cli" => self.gemini_cli.model.as_deref(),
+            "gemini" => self.gemini.model.as_deref(),
+            "groq" => self.groq.model.as_deref(),
+            "ollama" => self.ollama.model.as_deref(),
+            "mistral" => self.mistral.model.as_deref(),
+            "xai" | "grok" => self.xai.model.as_deref(),
+            "cohere" => self.cohere.model.as_deref(),
+            "perplexity" => self.perplexity.model.as_deref(),
+            "together" => self.together.model.as_deref(),
+            "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.model.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Get the base URL for the active provider.
     pub fn active_base_url(&self) -> Option<&str> {
         match self.active_provider()? {
