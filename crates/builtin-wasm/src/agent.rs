@@ -467,6 +467,8 @@ pub struct Agent<H: HostFunctions> {
     computer_use_triggered: Cell<bool>,
     /// Current keywords extracted from user message and LLM context, used for auto-snapshots.
     current_keywords: RefCell<Vec<String>>,
+    /// Skills that have been loaded in this session (prevent redundant re-loading).
+    loaded_skills: RefCell<std::collections::HashSet<String>>,
 }
 
 // Static base prompts, compiled into the binary
@@ -608,6 +610,7 @@ impl<H: HostFunctions> Agent<H> {
             artifact_counter: Cell::new(0),
             computer_use_triggered: Cell::new(false),
             current_keywords: RefCell::new(Vec::new()),
+            loaded_skills: RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -623,6 +626,7 @@ impl<H: HostFunctions> Agent<H> {
             artifact_counter: Cell::new(0),
             computer_use_triggered: Cell::new(false),
             current_keywords: RefCell::new(Vec::new()),
+            loaded_skills: RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -1699,7 +1703,22 @@ The following skill instructions MUST be followed exactly. These instructions ta
             }
             "skill_load" => {
                 let name = tool_call.arguments["name"].as_str().unwrap_or("");
-                self.host.skill_load(name)?
+                // Prevent redundant re-loading of already loaded skills.
+                // The full skill content (including API specs) is already in
+                // conversation history from the first load.
+                if self.loaded_skills.borrow().contains(name) {
+                    format!(
+                        "Skill '{}' is already loaded in this session. \
+                         Refer to the earlier skill_load result in conversation history \
+                         for the full instructions and API specifications. \
+                         Do NOT create a new artifact unless the user explicitly asks for it.",
+                        name
+                    )
+                } else {
+                    let content = self.host.skill_load(name)?;
+                    self.loaded_skills.borrow_mut().insert(name.to_string());
+                    content
+                }
             }
             "tool_search" => {
                 let query = tool_call.arguments["query"].as_str().unwrap_or("");
