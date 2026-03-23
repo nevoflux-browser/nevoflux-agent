@@ -173,8 +173,8 @@ pub struct DaemonHostFunctions {
     current_thinking_id: Arc<Mutex<Option<String>>>,
     /// Domain from the most recent successful browser_navigate.
     last_navigated_domain: Arc<Mutex<Option<String>>>,
-    /// Tools that user has approved "Always Allow" for this session (API mode permission).
-    always_allowed_tools: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    // Note: always_allowed_tools is on HostServices (shared across requests),
+    // not here (per-request DaemonHostFunctions).
 }
 
 impl DaemonHostFunctions {
@@ -198,7 +198,6 @@ impl DaemonHostFunctions {
             is_subagent: false,
             current_thinking_id: Arc::new(Mutex::new(None)),
             last_navigated_domain: Arc::new(Mutex::new(None)),
-            always_allowed_tools: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         }
     }
 
@@ -267,16 +266,17 @@ impl DaemonHostFunctions {
             return Ok(());
         }
 
-        // Check session-level always-allow cache
-        if self.always_allowed_tools.read().unwrap().contains(tool_name) {
-            return Ok(());
-        }
-
-        // Need sidebar to ask user — requires browser_sender
+        // Need services for always-allow cache and browser_sender
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
             message: "Services not available for permission check".into(),
         })?;
+
+        // Check always-allow cache (shared across requests on HostServices)
+        if services.always_allowed_tools.read().unwrap().contains(tool_name) {
+            return Ok(());
+        }
+
         let browser_ctx = services.browser_context().ok_or_else(|| HostError {
             code: 2,
             message: "Browser not available for permission dialog".into(),
@@ -337,7 +337,9 @@ impl DaemonHostFunctions {
         match result.as_deref() {
             Ok("Allow") => Ok(()),
             Ok("Always allow this type of action") => {
-                self.always_allowed_tools.write().unwrap().insert(tool_name.to_string());
+                if let Some(services) = &self.services {
+                    services.always_allowed_tools.write().unwrap().insert(tool_name.to_string());
+                }
                 Ok(())
             }
             Ok("Deny") => Err(HostError {
@@ -3925,7 +3927,6 @@ impl DaemonHostFunctions {
             is_subagent: self.is_subagent,
             current_thinking_id: Arc::new(Mutex::new(None)),
             last_navigated_domain: self.last_navigated_domain.clone(),
-            always_allowed_tools: self.always_allowed_tools.clone(),
         }
     }
 

@@ -173,6 +173,8 @@ pub struct HostServices {
     pub proxy_id: String,
     /// Current session ID for artifact creation and other session-scoped operations.
     pub session_id: String,
+    /// Tools that user has approved "Always Allow" (shared across requests in the same daemon).
+    pub always_allowed_tools: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     /// Knowledge retriever for injecting learned context into agent execution.
     ///
     /// When set, enables the agent to retrieve relevant knowledge entries
@@ -228,6 +230,7 @@ impl HostServices {
             client_identity: Vec::new(),
             proxy_id: String::new(),
             session_id: String::new(),
+            always_allowed_tools: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             knowledge_retriever: None,
             computer_controller: None,
             embedding: Arc::new(std::sync::RwLock::new(None)),
@@ -255,6 +258,7 @@ impl HostServices {
             client_identity: Vec::new(),
             proxy_id: String::new(),
             session_id: String::new(),
+            always_allowed_tools: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             knowledge_retriever: None,
             computer_controller: None,
             embedding: Arc::new(std::sync::RwLock::new(None)),
