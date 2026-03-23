@@ -852,11 +852,11 @@ async fn execute_subagent_tool(
                 });
                 if is_acp_mode {
                     return Err(
-                        "subagent_spawn requires 'provider' and 'model' parameters in ACP mode. \
-                         The current LLM provider (ACP) cannot be used by subagents directly. \
-                         Please specify a direct API provider, e.g.: \
-                         {\"task\": \"...\", \"provider\": \"anthropic\", \"model\": \"claude-sonnet-4-20250514\"} or \
-                         {\"task\": \"...\", \"provider\": \"openai\", \"model\": \"gpt-4o\"}"
+                        "subagent_spawn requires 'provider' and 'model' parameters. \
+                         IMPORTANT: Do NOT choose a provider/model yourself. \
+                         You MUST ask the user which provider and model to use for this subagent. \
+                         Tell the user that subagent needs a direct API provider (not the current ACP provider), \
+                         and ask them to specify both provider and model."
                             .to_string(),
                     );
                 }
