@@ -23,9 +23,25 @@ pub async fn run_tool_executor(
     services: HostServices,
     tool_bridge: Arc<McpToolBridge>,
 ) {
+    use nevoflux_llm::providers::acp::mcp_bridge::ToolCallRecord;
+
     while let Some(req) = rx.recv().await {
+        let start = std::time::Instant::now();
         let result =
             execute_mcp_tool(&req.name, &req.arguments, &services, &tool_bridge).await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        // Log tool call for sidebar display
+        let call_id = format!("mcp-{}-{}", req.name, start.elapsed().as_nanos());
+        tool_bridge.log_tool_call(ToolCallRecord {
+            id: call_id,
+            name: req.name.clone(),
+            arguments: req.arguments.clone(),
+            result: result.as_ref().ok().cloned(),
+            error: result.as_ref().err().cloned(),
+            duration_ms,
+        });
+
         let _ = req.result_tx.send(result);
     }
 }

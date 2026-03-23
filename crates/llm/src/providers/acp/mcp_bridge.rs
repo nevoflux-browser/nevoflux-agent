@@ -34,6 +34,17 @@ pub struct PendingArtifact {
     pub entry: Option<String>,
 }
 
+/// Record of a tool call made via MCP, for sidebar display.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallRecord {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub duration_ms: u64,
+}
+
 /// Bridge between MCP HTTP server and daemon tool execution.
 pub struct McpToolBridge {
     tools: Arc<RwLock<Vec<McpToolDef>>>,
@@ -42,6 +53,8 @@ pub struct McpToolBridge {
     server_handle: Mutex<Option<JoinHandle<()>>>,
     /// Artifacts created via MCP tool calls, waiting to be sent to sidebar.
     pending_artifacts: Arc<Mutex<Vec<PendingArtifact>>>,
+    /// Log of tool calls made during current request, for sidebar display.
+    tool_call_log: Arc<Mutex<Vec<ToolCallRecord>>>,
 }
 
 impl Drop for McpToolBridge {
@@ -71,6 +84,7 @@ impl McpToolBridge {
             mcp_server_url: OnceLock::new(),
             server_handle: Mutex::new(None),
             pending_artifacts: Arc::new(Mutex::new(Vec::new())),
+            tool_call_log: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -123,6 +137,16 @@ impl McpToolBridge {
     /// Drain all pending artifacts (called by server after agent response completes).
     pub fn drain_artifacts(&self) -> Vec<PendingArtifact> {
         std::mem::take(&mut *self.pending_artifacts.lock().unwrap())
+    }
+
+    /// Record a tool call for sidebar display.
+    pub fn log_tool_call(&self, record: ToolCallRecord) {
+        self.tool_call_log.lock().unwrap().push(record);
+    }
+
+    /// Drain all tool call records (called by server to inject into final response).
+    pub fn drain_tool_calls(&self) -> Vec<ToolCallRecord> {
+        std::mem::take(&mut *self.tool_call_log.lock().unwrap())
     }
 }
 

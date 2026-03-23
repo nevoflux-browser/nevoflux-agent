@@ -2746,12 +2746,34 @@ async fn handle_chat_message_streaming(
                 }
             }
 
+            // Merge MCP bridge tool calls with WASM agent tool calls for sidebar display
+            let mut all_tool_calls = output.tool_calls.clone();
+            {
+                let acp_providers = crate::wasm::llm::acp_providers();
+                if let Ok(providers) = acp_providers.try_lock() {
+                    for provider in providers.values() {
+                        if let Some(bridge) = provider.tool_bridge() {
+                            let mcp_calls = bridge.drain_tool_calls();
+                            for tc in mcp_calls {
+                                all_tool_calls.push(nevoflux_builtin_wasm::ToolCall {
+                                    id: tc.id,
+                                    call_id: None,
+                                    name: tc.name,
+                                    arguments: tc.arguments,
+                                    signature: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
             // Send final completion message
             let mut final_payload = serde_json::json!({
                 "type": "stream_chunk",
                 "payload": {
                     "content": "",
-                    "tool_calls": output.tool_calls,
+                    "tool_calls": all_tool_calls,
                     "done": true
                 }
             });
