@@ -309,16 +309,16 @@ impl DaemonHostFunctions {
                         "question": question,
                         "options": options,
                         "allow_custom": false,
-                        "timeout_ms": 300000
+                        "timeout_ms": 86400000
                     }),
-                    timeout_ms: 300_000,  // 5 minutes — generous time for user decision
+                    timeout_ms: 86_400_000,  // 24 hours — wait for user decision
                     client_identity: browser_ctx.client_identity.clone(),
                     proxy_id: browser_ctx.proxy_id.clone(),
                 };
                 sender.send((request, response_tx)).await
                     .map_err(|_| "Failed to send permission request".to_string())?;
                 let response = tokio::time::timeout(
-                    std::time::Duration::from_secs(300),  // 5 minutes
+                    std::time::Duration::from_secs(86400),  // 24 hours
                     response_rx,
                 ).await
                     .map_err(|_| "Permission dialog timed out".to_string())?

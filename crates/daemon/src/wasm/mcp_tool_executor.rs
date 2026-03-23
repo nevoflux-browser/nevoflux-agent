@@ -210,9 +210,9 @@ async fn execute_ask_user(
             "question": question,
             "options": options,
             "allow_custom": false,
-            "timeout_ms": 300000
+            "timeout_ms": 86400000
         }),
-        timeout_ms: 300_000,  // 5 minutes — generous time for user decision
+        timeout_ms: 86_400_000,  // 24 hours — wait for user decision
         client_identity: browser_ctx.client_identity.clone(),
         proxy_id: browser_ctx.proxy_id.clone(),
     };
