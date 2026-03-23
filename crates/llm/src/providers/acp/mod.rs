@@ -367,7 +367,10 @@ async fn run_client_loop_direct(
                     // Map decision to ACP option ID
                     let option_id = match decision {
                         PermissionResponse::AllowAlways => {
-                            // Pick the allow_always option
+                            // Pick the per-tool allow_always option (e.g. "proceed_always_tool"),
+                            // NOT the per-server option ("proceed_always_server") which would
+                            // bypass permission for ALL tools. Prefer option whose name contains
+                            // the tool name (Gemini uses "Always Allow <tool_name>").
                             request
                                 .options
                                 .iter()
@@ -375,7 +378,16 @@ async fn run_client_loop_direct(
                                     matches!(
                                         o.kind,
                                         sacp::schema::PermissionOptionKind::AllowAlways
-                                    )
+                                    ) && o.option_id.0.as_ref().contains("tool")
+                                })
+                                .or_else(|| {
+                                    // Fallback: any allow_always
+                                    request.options.iter().find(|o| {
+                                        matches!(
+                                            o.kind,
+                                            sacp::schema::PermissionOptionKind::AllowAlways
+                                        )
+                                    })
                                 })
                                 .or_else(|| {
                                     request.options.iter().find(|o| {
