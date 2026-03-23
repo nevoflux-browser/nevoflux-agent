@@ -188,7 +188,37 @@ impl McpToolBridge {
         self.always_allowed_tools.write().unwrap().insert(tool_name.to_string());
     }
 
+    /// Check if a tool is low-risk (read-only) and can be auto-approved.
+    fn is_low_risk_tool(tool_name: &str) -> bool {
+        // Strip MCP prefix if present (e.g. "mcp__nevoflux-tools__browser_get_markdown")
+        let name = tool_name
+            .rsplit("__")
+            .next()
+            .unwrap_or(tool_name);
+        // Also handle the raw title format from ACP (e.g. "{\"tab_id\":3}")
+        // which means the tool name is in the request title, not parsed
+        matches!(
+            name,
+            "browser_get_markdown"
+                | "browser_snapshot"
+                | "browser_get_tabs"
+                | "browser_query_tabs"
+                | "browser_get_elements"
+                | "browser_get_element"
+                | "browser_get_content"
+                | "browser_screenshot"
+                | "browser_read_artifact"
+                | "memory_search"
+                | "memory_view"
+                | "tool_search"
+                | "skill_load"
+                | "think"
+                | "create_plan"
+        )
+    }
+
     /// Request permission for a tool call. Returns the user's decision.
+    /// Low-risk (read-only) tools are auto-approved.
     /// If the tool is already always-allowed, returns AllowAlways immediately.
     /// Otherwise sends to sidebar via permission_tx channel and waits.
     pub async fn request_permission(
@@ -196,7 +226,12 @@ impl McpToolBridge {
         tool_name: &str,
         arguments_summary: &str,
     ) -> PermissionResponse {
-        // Check always-allow list first
+        // Auto-approve low-risk read-only tools
+        if Self::is_low_risk_tool(tool_name) {
+            return PermissionResponse::AllowOnce;
+        }
+
+        // Check always-allow list
         if self.is_always_allowed(tool_name) {
             return PermissionResponse::AllowAlways;
         }
