@@ -828,6 +828,28 @@ async fn execute_subagent_tool(
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
+            // In ACP bridge mode (ClaudeCode/GeminiCli), subagents cannot use the
+            // ACP provider directly. Require explicit provider/model specification.
+            if provider_override.is_none() {
+                let is_acp_mode = services.llm_config.as_ref().map_or(false, |c| {
+                    matches!(
+                        c.provider,
+                        nevoflux_llm::ProviderType::ClaudeCode
+                            | nevoflux_llm::ProviderType::GeminiCli
+                    )
+                });
+                if is_acp_mode {
+                    return Err(
+                        "subagent_spawn requires 'provider' and 'model' parameters in ACP mode. \
+                         The current LLM provider (ACP) cannot be used by subagents directly. \
+                         Please specify a direct API provider, e.g.: \
+                         {\"task\": \"...\", \"provider\": \"anthropic\", \"model\": \"claude-sonnet-4-20250514\"} or \
+                         {\"task\": \"...\", \"provider\": \"openai\", \"model\": \"gpt-4o\"}"
+                            .to_string(),
+                    );
+                }
+            }
+
             let agent_mode = match mode {
                 "chat" => nevoflux_builtin_wasm::AgentMode::Chat,
                 "browser" => nevoflux_builtin_wasm::AgentMode::Browser,
