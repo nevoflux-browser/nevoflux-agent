@@ -823,22 +823,14 @@ async fn execute_subagent_tool(
                 .get("provider")
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            // If provider specified but model not, use the provider's default model
             let model_override = arguments
                 .get("model")
                 .and_then(|v| v.as_str())
-                .map(String::from)
-                .or_else(|| {
-                    provider_override.as_ref().and_then(|p| {
-                        p.parse::<nevoflux_llm::ProviderType>()
-                            .ok()
-                            .map(|pt| nevoflux_llm::default_model_for(pt).to_string())
-                    })
-                });
+                .map(String::from);
 
             // In ACP bridge mode (ClaudeCode/GeminiCli), subagents cannot use the
-            // ACP provider directly. Require explicit provider/model specification.
-            if provider_override.is_none() {
+            // ACP provider directly. Require explicit provider AND model.
+            if provider_override.is_none() || model_override.is_none() {
                 let is_acp_mode = services.llm_config.as_ref().map_or(false, |c| {
                     matches!(
                         c.provider,
