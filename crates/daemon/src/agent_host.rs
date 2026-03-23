@@ -282,15 +282,15 @@ impl DaemonHostFunctions {
             message: "Browser not available for permission dialog".into(),
         })?;
 
+        let description = crate::wasm::mcp_tool_executor::describe_tool_action(tool_name, args_summary);
         let question = format!(
-            "Tool permission request:\n\nTool: {}\nArguments: {}\n\nAllow this tool call?",
-            tool_name,
-            if args_summary.len() > 200 { &args_summary[..200] } else { args_summary }
+            "AI wants to perform an action:\n\n{}\n\nDo you want to allow this?",
+            description
         );
         let options = vec![
-            "Allow once".to_string(),
-            "Always allow this tool".to_string(),
-            "Reject".to_string(),
+            "Allow".to_string(),
+            "Always allow this type of action".to_string(),
+            "Deny".to_string(),
         ];
 
         // browser_ask_user via block_in_place
@@ -335,14 +335,14 @@ impl DaemonHostFunctions {
         });
 
         match result.as_deref() {
-            Ok("Allow once") => Ok(()),
-            Ok("Always allow this tool") => {
+            Ok("Allow") => Ok(()),
+            Ok("Always allow this type of action") => {
                 self.always_allowed_tools.write().unwrap().insert(tool_name.to_string());
                 Ok(())
             }
-            Ok("Reject") => Err(HostError {
+            Ok("Deny") => Err(HostError {
                 code: 403,
-                message: format!("Tool '{}' rejected by user", tool_name),
+                message: format!("Action '{}' denied by user", tool_name),
             }),
             _ => {
                 // Timeout or error — default to allow once

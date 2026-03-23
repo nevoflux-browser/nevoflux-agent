@@ -54,32 +54,25 @@ pub async fn run_permission_handler(
     browser_ctx: BrowserContext,
 ) {
     while let Some(req) = rx.recv().await {
+        let description = describe_tool_action(&req.tool_name, &req.arguments_summary);
         let question = format!(
-            "Tool permission request:\n\n\
-             Tool: {}\n\
-             Arguments: {}\n\n\
-             Allow this tool call?",
-            req.tool_name,
-            if req.arguments_summary.len() > 200 {
-                format!("{}...", &req.arguments_summary[..200])
-            } else {
-                req.arguments_summary.clone()
-            }
+            "AI wants to perform an action:\n\n{}\n\nDo you want to allow this?",
+            description
         );
 
         let options = vec![
-            "Allow once".to_string(),
-            "Always allow this tool".to_string(),
-            "Reject".to_string(),
+            "Allow".to_string(),
+            "Always allow this type of action".to_string(),
+            "Deny".to_string(),
         ];
 
         // Use browser_ask_user to show dialog in sidebar
         let response = execute_ask_user(&question, &options, &browser_ctx).await;
 
         let decision = match response.as_deref() {
-            Some("Allow once") => PermissionResponse::AllowOnce,
-            Some("Always allow this tool") => PermissionResponse::AllowAlways,
-            Some("Reject") => PermissionResponse::Reject,
+            Some("Allow") => PermissionResponse::AllowOnce,
+            Some("Always allow this type of action") => PermissionResponse::AllowAlways,
+            Some("Deny") => PermissionResponse::Reject,
             _ => {
                 // Timeout or error — default to allow once
                 tracing::warn!("Permission dialog failed or timed out for {}, defaulting to AllowOnce", req.tool_name);
@@ -88,6 +81,113 @@ pub async fn run_permission_handler(
         };
 
         let _ = req.result_tx.send(decision);
+    }
+}
+
+/// Describe a tool action in natural language for the permission dialog.
+pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
+    let args: serde_json::Value = serde_json::from_str(args_summary).unwrap_or_default();
+
+    match tool_name {
+        // Browser navigation
+        "browser_navigate" => {
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("a webpage");
+            format!("Navigate to: {}", url)
+        }
+        "browser_go_back" => "Go back to the previous page".to_string(),
+        "browser_go_forward" => "Go forward to the next page".to_string(),
+
+        // Browser interaction
+        "browser_click" | "browser_click_by_id" => {
+            let target = args.get("element_id").and_then(|v| v.as_str())
+                .or_else(|| args.get("selector").and_then(|v| v.as_str()))
+                .unwrap_or("an element");
+            format!("Click on element '{}'", target)
+        }
+        "browser_type" | "browser_type_by_id" => {
+            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("...");
+            let short_text = if text.len() > 50 { &text[..50] } else { text };
+            format!("Type text: \"{}\"", short_text)
+        }
+        "browser_fill" | "browser_fill_by_id" => {
+            let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("...");
+            let short_val = if value.len() > 50 { &value[..50] } else { value };
+            format!("Fill a form field with: \"{}\"", short_val)
+        }
+        "browser_key_press" => {
+            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("a key");
+            format!("Press key: {}", key)
+        }
+        "browser_eval_js" => {
+            "Execute JavaScript code on the current page".to_string()
+        }
+        "browser_edit_artifact" => {
+            "Edit the Canvas content".to_string()
+        }
+
+        // Create
+        "create_artifact" => {
+            let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled");
+            format!("Create a Canvas artifact: \"{}\"", title)
+        }
+
+        // Computer control
+        n if n.starts_with("computer_") => {
+            match n {
+                "computer_mouse_move" => format!("Move the mouse cursor"),
+                "computer_mouse_click" | "computer_click" => format!("Click the mouse"),
+                "computer_mouse_down" => format!("Press mouse button down"),
+                "computer_mouse_up" => format!("Release mouse button"),
+                "computer_mouse_drag" | "computer_drag" => format!("Drag with the mouse"),
+                "computer_type_text" => {
+                    let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("...");
+                    let short = if text.len() > 50 { &text[..50] } else { text };
+                    format!("Type on keyboard: \"{}\"", short)
+                }
+                "computer_key_press" | "computer_key" => {
+                    let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("a key");
+                    format!("Press keyboard key: {}", key)
+                }
+                "computer_hold_key" => {
+                    let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("a key");
+                    format!("Hold keyboard key: {}", key)
+                }
+                _ => format!("Control the computer ({})", n.strip_prefix("computer_").unwrap_or(n)),
+            }
+        }
+
+        // Memory write
+        "memory_create" => "Save new information to memory".to_string(),
+        "memory_update" => "Update existing memory entry".to_string(),
+        "memory_delete" => "Delete a memory entry".to_string(),
+        "knowledge_teach" => "Learn new knowledge from you".to_string(),
+
+        // File operations
+        "write_file" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("a file");
+            format!("Write to file: {}", path)
+        }
+        "edit_file" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("a file");
+            format!("Edit file: {}", path)
+        }
+        "run_command" => {
+            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("...");
+            let short = if cmd.len() > 80 { &cmd[..80] } else { cmd };
+            format!("Run command: {}", short)
+        }
+
+        // Subagent
+        "subagent_spawn" => {
+            let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("a task");
+            let short = if task.len() > 80 { &task[..80] } else { task };
+            format!("Start a sub-agent: \"{}\"", short)
+        }
+
+        // Default
+        _ => {
+            format!("Perform action: {}", tool_name)
+        }
     }
 }
 
