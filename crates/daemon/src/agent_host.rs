@@ -346,8 +346,11 @@ impl DaemonHostFunctions {
             }),
             _ => {
                 // Timeout or error — default to allow once
-                tracing::warn!("Permission check failed for {}, defaulting to allow", tool_name);
-                Ok(())
+                tracing::warn!("Permission check failed for {}, defaulting to reject", tool_name);
+                Err(HostError {
+                    code: 403,
+                    message: format!("Action '{}' denied (permission dialog unavailable)", tool_name),
+                })
             }
         }
     }

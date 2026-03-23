@@ -251,9 +251,9 @@ impl McpToolBridge {
         // Try to send to sidebar for user decision
         let tx = self.permission_tx.lock().unwrap().clone();
         let Some(tx) = tx else {
-            // No permission handler — auto-approve (fallback)
-            tracing::warn!("No permission handler set, auto-approving {}", tool_name);
-            return PermissionResponse::AllowOnce;
+            // No permission handler — reject (no sidebar to ask user)
+            tracing::warn!("No permission handler set, rejecting {}", tool_name);
+            return PermissionResponse::Reject;
         };
 
         let (result_tx, result_rx) = oneshot::channel();
@@ -266,8 +266,8 @@ impl McpToolBridge {
             .await
             .is_err()
         {
-            tracing::warn!("Permission handler dropped, auto-approving {}", tool_name);
-            return PermissionResponse::AllowOnce;
+            tracing::warn!("Permission handler dropped, rejecting {}", tool_name);
+            return PermissionResponse::Reject;
         }
 
         match result_rx.await {
@@ -278,8 +278,8 @@ impl McpToolBridge {
                 response
             }
             Err(_) => {
-                tracing::warn!("Permission response channel dropped, auto-approving {}", tool_name);
-                PermissionResponse::AllowOnce
+                tracing::warn!("Permission response channel dropped, rejecting {}", tool_name);
+                PermissionResponse::Reject
             }
         }
     }

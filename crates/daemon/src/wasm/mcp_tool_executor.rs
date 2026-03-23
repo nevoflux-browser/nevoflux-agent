@@ -74,9 +74,9 @@ pub async fn run_permission_handler(
             Some("Always allow this type of action") => PermissionResponse::AllowAlways,
             Some("Deny") => PermissionResponse::Reject,
             _ => {
-                // Timeout or error — default to allow once
-                tracing::warn!("Permission dialog failed or timed out for {}, defaulting to AllowOnce", req.tool_name);
-                PermissionResponse::AllowOnce
+                // Timeout or error — default to reject (safer than allowing)
+                tracing::warn!("Permission dialog failed or timed out for {}, defaulting to Reject", req.tool_name);
+                PermissionResponse::Reject
             }
         };
 
