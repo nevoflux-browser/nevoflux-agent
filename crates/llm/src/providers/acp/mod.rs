@@ -330,14 +330,30 @@ async fn run_client_loop_direct(
         )
         .on_receive_request(
             // Auto-approve all tool permission requests (both MCP and built-in).
+            // Select the first allow-type option from the request's options list,
+            // since option IDs differ between providers (Claude Code uses "allow",
+            // Gemini CLI uses "proceed_once"/"proceed_always_tool"/etc.).
             // TODO: Forward to sidebar for user confirmation instead of auto-approve.
-            async move |_request: RequestPermissionRequest,
+            async move |request: RequestPermissionRequest,
                         request_cx,
                         _connection_cx| {
                 use sacp::schema::SelectedPermissionOutcome;
+                // Pick the first allow_once or allow_always option from the request
+                let option_id = request
+                    .options
+                    .iter()
+                    .find(|o| {
+                        matches!(
+                            o.kind,
+                            sacp::schema::PermissionOptionKind::AllowOnce
+                                | sacp::schema::PermissionOptionKind::AllowAlways
+                        )
+                    })
+                    .map(|o| o.option_id.0.to_string())
+                    .unwrap_or_else(|| "allow".to_string());
                 let response = RequestPermissionResponse::new(
                     RequestPermissionOutcome::Selected(
-                        SelectedPermissionOutcome::new("allow"),
+                        SelectedPermissionOutcome::new(option_id),
                     ),
                 );
                 request_cx.respond(response)
