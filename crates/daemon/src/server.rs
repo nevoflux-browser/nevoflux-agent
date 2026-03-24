@@ -6068,13 +6068,18 @@ async fn handle_openclaw_model_set(params: &serde_json::Value) -> serde_json::Va
 
     // Set as primary model if requested
     if set_as_primary {
-        let primary = format!("{}/{}", provider_name, model_id);
+        // If model_id already contains provider prefix (e.g. "provider/model"), don't double it
+        let primary = if model_id.contains('/') {
+            model_id.to_string()
+        } else {
+            format!("{}/{}", provider_name, model_id)
+        };
         let _ = Command::new("openclaw")
             .args(["config", "set", "agents.defaults.model.primary", &primary])
             .output();
 
         // Set alias
-        let alias_path = format!("agents.defaults.models.{}/{}", provider_name, model_id);
+        let alias_path = format!("agents.defaults.models.{}", primary);
         let alias_value = serde_json::json!({"alias": provider_name});
         let _ = Command::new("openclaw")
             .args([
