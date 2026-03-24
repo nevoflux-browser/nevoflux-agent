@@ -5521,6 +5521,12 @@ const PROVIDER_METAS: &[ProviderMeta] = &[
         provider_type: "cli",
         icon_bytes: include_bytes!("../../../assets/icons/providers/kimi.webp"),
     },
+    ProviderMeta {
+        id: "openclaw",
+        display_name: "OpenClaw",
+        provider_type: "agent",
+        icon_bytes: include_bytes!("../../../assets/icons/providers/openclaw.webp"),
+    },
 ];
 
 /// Get the ProviderConfig for a given provider id from the LlmConfig.
@@ -5545,6 +5551,7 @@ fn get_provider_config<'a>(
         "claude-code" | "claude_code" => Some(&llm.claude_code),
         "gemini-cli" | "gemini_cli" => Some(&llm.gemini_cli),
         "kimi-agent" | "kimi_agent" | "kimi" => Some(&llm.kimi_agent),
+        "openclaw" | "open_claw" | "open-claw" => Some(&llm.openclaw),
         _ => None,
     }
 }
