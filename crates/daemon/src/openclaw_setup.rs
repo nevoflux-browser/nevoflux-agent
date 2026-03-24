@@ -147,7 +147,7 @@ Use these tools for all browser operations.
 
 /// Run the complete first-time OpenClaw setup.
 /// Returns Ok(true) if setup was performed, Ok(false) if already configured.
-pub fn ensure_openclaw_configured(mcp_port: u16) -> Result<bool, String> {
+pub fn ensure_openclaw_configured(_mcp_port: u16) -> Result<bool, String> {
     if !is_openclaw_installed() {
         return Err(
             "OpenClaw is not installed. Install with: npm install -g openclaw@latest && openclaw onboard"
@@ -155,13 +155,20 @@ pub fn ensure_openclaw_configured(mcp_port: u16) -> Result<bool, String> {
         );
     }
 
-    if is_mcp_configured() {
+    // Check if skill is already installed as indicator of setup completion
+    let skill_dir = dirs::home_dir()
+        .ok_or_else(|| "Cannot determine home directory".to_string())?
+        .join(".openclaw/workspace/skills/nevoflux-browser");
+    if skill_dir.join("SKILL.md").exists() {
         return Ok(false); // Already configured
     }
 
     // First-time setup
-    register_mcp_server(mcp_port)?;
-    disable_openclaw_browser()?;
+    // Note: OpenClaw doesn't support HTTP MCP servers via config.
+    // NevoFlux tools are exposed through <tool_call> XML in system prompt
+    // and the nevoflux-browser skill teaches OpenClaw how to use them.
+    // register_mcp_server is skipped — tools defined in system prompt instead.
+    let _ = disable_openclaw_browser(); // Best effort — may fail if tools.deny path is invalid
     install_nevoflux_skill()?;
 
     tracing::info!(
