@@ -50,8 +50,42 @@ pub fn build_search_path() -> Option<std::ffi::OsString> {
     #[cfg(not(target_os = "windows"))]
     {
         if let Some(home) = std::env::var_os("HOME") {
-            extra_dirs.push(std::path::PathBuf::from(&home).join(".npm-global/bin"));
-            extra_dirs.push(std::path::PathBuf::from(&home).join(".local/bin"));
+            let home_path = std::path::PathBuf::from(&home);
+            extra_dirs.push(home_path.join(".npm-global/bin"));
+            extra_dirs.push(home_path.join(".local/bin"));
+
+            // nvm: scan ~/.nvm/versions/node/*/bin for the active or latest version
+            let nvm_dir = std::env::var_os("NVM_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| home_path.join(".nvm"));
+            let nvm_versions = nvm_dir.join("versions/node");
+            if nvm_versions.is_dir() {
+                // Add current nvm bin (from NVM_BIN env if set)
+                if let Some(nvm_bin) = std::env::var_os("NVM_BIN") {
+                    extra_dirs.push(std::path::PathBuf::from(nvm_bin));
+                }
+                // Also scan all installed versions as fallback
+                if let Ok(entries) = std::fs::read_dir(&nvm_versions) {
+                    for entry in entries.flatten() {
+                        let bin = entry.path().join("bin");
+                        if bin.is_dir() {
+                            extra_dirs.push(bin);
+                        }
+                    }
+                }
+            }
+
+            // fnm (Fast Node Manager): ~/.local/share/fnm/aliases/default/bin
+            let fnm_bin = home_path.join(".local/share/fnm/aliases/default/bin");
+            if fnm_bin.is_dir() {
+                extra_dirs.push(fnm_bin);
+            }
+
+            // Homebrew on macOS
+            #[cfg(target_os = "macos")]
+            {
+                extra_dirs.push(std::path::PathBuf::from("/opt/homebrew/bin"));
+            }
         }
         extra_dirs.push(std::path::PathBuf::from("/usr/local/bin"));
     }
