@@ -180,15 +180,10 @@ impl McpRegistry {
         // Connect using the appropriate transport
         #[cfg(not(feature = "legacy-backend"))]
         let client: Arc<dyn McpClientBackend> = match config.transport {
-            TransportType::Http => {
-                Arc::new(RmcpClient::connect_http(&config.command).await?)
-            }
-            TransportType::Stdio => {
-                Arc::new(
-                    RmcpClient::connect_stdio_with_env(&config.command, &args, &config.env)
-                        .await?,
-                )
-            }
+            TransportType::Http => Arc::new(RmcpClient::connect_http(&config.command).await?),
+            TransportType::Stdio => Arc::new(
+                RmcpClient::connect_stdio_with_env(&config.command, &args, &config.env).await?,
+            ),
         };
 
         #[cfg(feature = "legacy-backend")]

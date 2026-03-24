@@ -25,7 +25,7 @@ pub fn build_config(work_dir: PathBuf) -> AcpProviderConfig {
         env_remove: vec![],
         work_dir,
         session_mode: "high".to_string(), // OpenClaw uses thinking levels: off/minimal/low/medium/high/adaptive
-        use_mcp_bridge: false, // OpenClaw doesn't support HTTP MCP; use <tool_call> XML extraction
-        inject_mcp_url: false,
+        use_mcp_bridge: true,             // Start HTTP MCP server (same as Claude Code/Gemini CLI)
+        inject_mcp_url: false, // OpenClaw rejects per-session MCP; uses plugin bridge instead
     }
 }

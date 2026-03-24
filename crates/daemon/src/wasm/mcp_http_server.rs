@@ -213,10 +213,7 @@ mod tests {
 
     /// Create a reqwest client that bypasses proxy env vars for localhost tests.
     fn test_client() -> reqwest::Client {
-        reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap()
+        reqwest::Client::builder().no_proxy().build().unwrap()
     }
 
     #[test]

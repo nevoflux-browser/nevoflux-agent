@@ -202,8 +202,13 @@ pub fn install_default_skills() -> std::result::Result<usize, String> {
         target.display()
     );
 
-    std::fs::create_dir_all(&target)
-        .map_err(|e| format!("Failed to create skills directory {}: {}", target.display(), e))?;
+    std::fs::create_dir_all(&target).map_err(|e| {
+        format!(
+            "Failed to create skills directory {}: {}",
+            target.display(),
+            e
+        )
+    })?;
 
     let mut installed = 0;
     copy_dir_recursive(&source, &target, &mut installed)?;
@@ -218,9 +223,13 @@ pub fn install_default_skills() -> std::result::Result<usize, String> {
 
 /// Recursively copy a directory tree, skipping files that already exist
 /// in the destination. `count` is incremented for each file copied.
-fn copy_dir_recursive(src: &Path, dst: &Path, count: &mut usize) -> std::result::Result<(), String> {
-    let entries = std::fs::read_dir(src)
-        .map_err(|e| format!("Failed to read {}: {}", src.display(), e))?;
+fn copy_dir_recursive(
+    src: &Path,
+    dst: &Path,
+    count: &mut usize,
+) -> std::result::Result<(), String> {
+    let entries =
+        std::fs::read_dir(src).map_err(|e| format!("Failed to read {}: {}", src.display(), e))?;
 
     for entry in entries {
         let entry =
@@ -229,9 +238,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path, count: &mut usize) -> std::result:
         let dst_path = dst.join(entry.file_name());
 
         if src_path.is_dir() {
-            std::fs::create_dir_all(&dst_path).map_err(|e| {
-                format!("Failed to create directory {}: {}", dst_path.display(), e)
-            })?;
+            std::fs::create_dir_all(&dst_path)
+                .map_err(|e| format!("Failed to create directory {}: {}", dst_path.display(), e))?;
             copy_dir_recursive(&src_path, &dst_path, count)?;
         } else {
             // Do not overwrite existing files (user customizations)

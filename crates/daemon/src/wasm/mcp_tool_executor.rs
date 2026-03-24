@@ -5,15 +5,15 @@
 //! artifact creation, and external MCP servers.
 
 use nevoflux_computer::{
-    ClickType, ComputerController, Key, KeyCombination, KeyOrChar, KeyboardController,
-    MouseButton, MouseController, Point, Region, ScreenshotProvider, ScrollDirection,
+    ClickType, ComputerController, Key, KeyCombination, KeyOrChar, KeyboardController, MouseButton,
+    MouseController, Point, Region, ScreenshotProvider, ScrollDirection,
 };
 use nevoflux_llm::providers::acp::mcp_bridge::{
     McpToolBridge, PendingArtifact, PermissionRequest, PermissionResponse, ToolCallRequest,
 };
-use std::sync::Arc;
 use nevoflux_protocol::BrowserToolAction;
 use nevoflux_storage::{CreateKnowledgeParams, KnowledgeRepository, MemoryChunk};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use super::services::{BrowserContext, BrowserRequest, HostServices};
@@ -29,8 +29,7 @@ pub async fn run_tool_executor(
 
     while let Some(req) = rx.recv().await {
         let start = std::time::Instant::now();
-        let result =
-            execute_mcp_tool(&req.name, &req.arguments, &services, &tool_bridge).await;
+        let result = execute_mcp_tool(&req.name, &req.arguments, &services, &tool_bridge).await;
         let duration_ms = start.elapsed().as_millis() as u64;
 
         // Log tool call for sidebar display
@@ -75,7 +74,10 @@ pub async fn run_permission_handler(
             Some("Deny") => PermissionResponse::Reject,
             _ => {
                 // Timeout or error — default to reject (safer than allowing)
-                tracing::warn!("Permission dialog failed or timed out for {}, defaulting to Reject", req.tool_name);
+                tracing::warn!(
+                    "Permission dialog failed or timed out for {}, defaulting to Reject",
+                    req.tool_name
+                );
                 PermissionResponse::Reject
             }
         };
@@ -91,7 +93,10 @@ pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
     match tool_name {
         // Browser navigation
         "browser_navigate" => {
-            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("a webpage");
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("a webpage");
             format!("Navigate to: {}", url)
         }
         "browser_go_back" => "Go back to the previous page".to_string(),
@@ -99,7 +104,9 @@ pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
 
         // Browser interaction
         "browser_click" | "browser_click_by_id" => {
-            let target = args.get("element_id").and_then(|v| v.as_str())
+            let target = args
+                .get("element_id")
+                .and_then(|v| v.as_str())
                 .or_else(|| args.get("selector").and_then(|v| v.as_str()))
                 .unwrap_or("an element");
             format!("Click on element '{}'", target)
@@ -111,50 +118,54 @@ pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
         }
         "browser_fill" | "browser_fill_by_id" => {
             let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("...");
-            let short_val = if value.len() > 50 { &value[..50] } else { value };
+            let short_val = if value.len() > 50 {
+                &value[..50]
+            } else {
+                value
+            };
             format!("Fill a form field with: \"{}\"", short_val)
         }
         "browser_key_press" => {
             let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("a key");
             format!("Press key: {}", key)
         }
-        "browser_eval_js" => {
-            "Execute JavaScript code on the current page".to_string()
-        }
-        "browser_edit_artifact" => {
-            "Edit the Canvas content".to_string()
-        }
+        "browser_eval_js" => "Execute JavaScript code on the current page".to_string(),
+        "browser_edit_artifact" => "Edit the Canvas content".to_string(),
 
         // Create
         "create_artifact" => {
-            let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("Untitled");
+            let title = args
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Untitled");
             format!("Create a Canvas artifact: \"{}\"", title)
         }
 
         // Computer control
-        n if n.starts_with("computer_") => {
-            match n {
-                "computer_mouse_move" => format!("Move the mouse cursor"),
-                "computer_mouse_click" | "computer_click" => format!("Click the mouse"),
-                "computer_mouse_down" => format!("Press mouse button down"),
-                "computer_mouse_up" => format!("Release mouse button"),
-                "computer_mouse_drag" | "computer_drag" => format!("Drag with the mouse"),
-                "computer_type_text" => {
-                    let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("...");
-                    let short = if text.len() > 50 { &text[..50] } else { text };
-                    format!("Type on keyboard: \"{}\"", short)
-                }
-                "computer_key_press" | "computer_key" => {
-                    let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("a key");
-                    format!("Press keyboard key: {}", key)
-                }
-                "computer_hold_key" => {
-                    let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("a key");
-                    format!("Hold keyboard key: {}", key)
-                }
-                _ => format!("Control the computer ({})", n.strip_prefix("computer_").unwrap_or(n)),
+        n if n.starts_with("computer_") => match n {
+            "computer_mouse_move" => format!("Move the mouse cursor"),
+            "computer_mouse_click" | "computer_click" => format!("Click the mouse"),
+            "computer_mouse_down" => format!("Press mouse button down"),
+            "computer_mouse_up" => format!("Release mouse button"),
+            "computer_mouse_drag" | "computer_drag" => format!("Drag with the mouse"),
+            "computer_type_text" => {
+                let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("...");
+                let short = if text.len() > 50 { &text[..50] } else { text };
+                format!("Type on keyboard: \"{}\"", short)
             }
-        }
+            "computer_key_press" | "computer_key" => {
+                let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("a key");
+                format!("Press keyboard key: {}", key)
+            }
+            "computer_hold_key" => {
+                let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("a key");
+                format!("Hold keyboard key: {}", key)
+            }
+            _ => format!(
+                "Control the computer ({})",
+                n.strip_prefix("computer_").unwrap_or(n)
+            ),
+        },
 
         // Memory write
         "memory_create" => "Save new information to memory".to_string(),
@@ -164,22 +175,34 @@ pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
 
         // File operations
         "write_file" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("a file");
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("a file");
             format!("Write to file: {}", path)
         }
         "edit_file" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("a file");
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("a file");
             format!("Edit file: {}", path)
         }
         "run_command" => {
-            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("...");
+            let cmd = args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("...");
             let short = if cmd.len() > 80 { &cmd[..80] } else { cmd };
             format!("Run command: {}", short)
         }
 
         // Subagent
         "subagent_spawn" => {
-            let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("a task");
+            let task = args
+                .get("task")
+                .and_then(|v| v.as_str())
+                .unwrap_or("a task");
             let short = if task.len() > 80 { &task[..80] } else { task };
             format!("Start a sub-agent: \"{}\"", short)
         }
@@ -212,12 +235,17 @@ async fn execute_ask_user(
             "allow_custom": false,
             "timeout_ms": 86400000
         }),
-        timeout_ms: 86_400_000,  // 24 hours — wait for user decision
+        timeout_ms: 86_400_000, // 24 hours — wait for user decision
         client_identity: browser_ctx.client_identity.clone(),
         proxy_id: browser_ctx.proxy_id.clone(),
     };
 
-    if browser_ctx.sender.send((request, response_tx)).await.is_err() {
+    if browser_ctx
+        .sender
+        .send((request, response_tx))
+        .await
+        .is_err()
+    {
         return None;
     }
 
@@ -227,11 +255,7 @@ async fn execute_ask_user(
             response
                 .result
                 .as_ref()
-                .and_then(|v| {
-                    v.get("answer")
-                        .and_then(|a| a.as_str())
-                        .map(String::from)
-                })
+                .and_then(|v| v.get("answer").and_then(|a| a.as_str()).map(String::from))
         }
         _ => None,
     }
@@ -450,13 +474,11 @@ async fn execute_computer_tool(
             let x = arguments
                 .get("x")
                 .and_then(|v| v.as_i64())
-                .ok_or_else(|| "missing 'x' argument".to_string())?
-                as i32;
+                .ok_or_else(|| "missing 'x' argument".to_string())? as i32;
             let y = arguments
                 .get("y")
                 .and_then(|v| v.as_i64())
-                .ok_or_else(|| "missing 'y' argument".to_string())?
-                as i32;
+                .ok_or_else(|| "missing 'y' argument".to_string())? as i32;
             controller
                 .move_to(Point::new(x, y))
                 .await
@@ -509,23 +531,19 @@ async fn execute_computer_tool(
             let from_x = arguments
                 .get("from_x")
                 .and_then(|v| v.as_i64())
-                .ok_or_else(|| "missing 'from_x'".to_string())?
-                as i32;
+                .ok_or_else(|| "missing 'from_x'".to_string())? as i32;
             let from_y = arguments
                 .get("from_y")
                 .and_then(|v| v.as_i64())
-                .ok_or_else(|| "missing 'from_y'".to_string())?
-                as i32;
+                .ok_or_else(|| "missing 'from_y'".to_string())? as i32;
             let to_x = arguments
                 .get("to_x")
                 .and_then(|v| v.as_i64())
-                .ok_or_else(|| "missing 'to_x'".to_string())?
-                as i32;
+                .ok_or_else(|| "missing 'to_x'".to_string())? as i32;
             let to_y = arguments
                 .get("to_y")
                 .and_then(|v| v.as_i64())
-                .ok_or_else(|| "missing 'to_y'".to_string())?
-                as i32;
+                .ok_or_else(|| "missing 'to_y'".to_string())? as i32;
             let button = parse_mouse_button(arguments);
             controller
                 .drag(Point::new(from_x, from_y), Point::new(to_x, to_y), button)
@@ -554,17 +572,16 @@ async fn execute_computer_tool(
             Ok(format!("Typed {} characters", text.len()))
         }
         "computer_press_key" => {
-            let key_or_char =
-                if let Some(key_str) = arguments.get("key").and_then(|v| v.as_str()) {
-                    parse_key_string(key_str)?
-                } else if let Some(char_str) = arguments.get("char").and_then(|v| v.as_str()) {
-                    if char_str.len() != 1 {
-                        return Err("char must be a single character".to_string());
-                    }
-                    KeyOrChar::Char(char_str.chars().next().unwrap())
-                } else {
-                    return Err("missing 'key' or 'char' argument".to_string());
-                };
+            let key_or_char = if let Some(key_str) = arguments.get("key").and_then(|v| v.as_str()) {
+                parse_key_string(key_str)?
+            } else if let Some(char_str) = arguments.get("char").and_then(|v| v.as_str()) {
+                if char_str.len() != 1 {
+                    return Err("char must be a single character".to_string());
+                }
+                KeyOrChar::Char(char_str.chars().next().unwrap())
+            } else {
+                return Err("missing 'key' or 'char' argument".to_string());
+            };
 
             let mut combination = KeyCombination {
                 key: key_or_char,
@@ -854,7 +871,10 @@ fn execute_knowledge_teach(
         .to_string();
     let summary = args["summary"].as_str().unwrap_or("").to_string();
     let details = args["details"].as_str().unwrap_or("").to_string();
-    let domain = args.get("domain").and_then(|v| v.as_str()).map(String::from);
+    let domain = args
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     let params = CreateKnowledgeParams {
         category,
@@ -898,10 +918,7 @@ async fn execute_skill_load(
                         .map(|entries| {
                             entries
                                 .filter_map(|e| e.ok())
-                                .filter(|e| {
-                                    e.path().is_file()
-                                        && e.file_name() != "SKILL.md"
-                                })
+                                .filter(|e| e.path().is_file() && e.file_name() != "SKILL.md")
                                 .map(|e| e.file_name().to_string_lossy().to_string())
                                 .collect()
                         })
@@ -1060,7 +1077,15 @@ async fn execute_subagent_tool(
             };
 
             let handle = executor
-                .spawn(task, agent_mode, None, tab_id, None, provider_override, model_override)
+                .spawn(
+                    task,
+                    agent_mode,
+                    None,
+                    tab_id,
+                    None,
+                    provider_override,
+                    model_override,
+                )
                 .map_err(|e| format!("subagent spawn failed: {e}"))?;
 
             let id = handle.id;
@@ -1072,13 +1097,17 @@ async fn execute_subagent_tool(
                 Some(status) => Ok(serde_json::json!({
                     "id": id,
                     "status": status.as_str(),
-                }).to_string()),
+                })
+                .to_string()),
                 None => Err(format!("subagent {id} not found")),
             }
         }
         "subagent_wait" => {
             let id = arguments["id"].as_u64().unwrap_or(0);
-            executor.wait(id).await.map_err(|e| format!("wait failed: {e}"))
+            executor
+                .wait(id)
+                .await
+                .map_err(|e| format!("wait failed: {e}"))
         }
         "subagent_wait_all" => {
             let ids: Vec<u64> = arguments["ids"]
@@ -1206,10 +1235,7 @@ mod tests {
 
     #[test]
     fn test_parse_click_type() {
-        assert_eq!(
-            parse_click_type(&serde_json::json!({})),
-            ClickType::Single
-        );
+        assert_eq!(parse_click_type(&serde_json::json!({})), ClickType::Single);
         assert_eq!(
             parse_click_type(&serde_json::json!({"click_type": "double"})),
             ClickType::Double
@@ -1244,7 +1270,12 @@ mod tests {
         let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
         let services = HostServices::new(db);
         let bridge = make_test_bridge();
-        let result = rt.block_on(execute_mcp_tool("think", &serde_json::json!({}), &services, &bridge));
+        let result = rt.block_on(execute_mcp_tool(
+            "think",
+            &serde_json::json!({}),
+            &services,
+            &bridge,
+        ));
         assert_eq!(result, Ok("Thought recorded.".to_string()));
     }
 
@@ -1254,8 +1285,12 @@ mod tests {
         let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
         let services = HostServices::new(db);
         let bridge = make_test_bridge();
-        let result =
-            rt.block_on(execute_mcp_tool("create_plan", &serde_json::json!({}), &services, &bridge));
+        let result = rt.block_on(execute_mcp_tool(
+            "create_plan",
+            &serde_json::json!({}),
+            &services,
+            &bridge,
+        ));
         assert_eq!(result, Ok("Plan submitted for review.".to_string()));
     }
 
@@ -1342,10 +1377,7 @@ mod tests {
             &serde_json::json!({}),
             &services,
         ));
-        assert_eq!(
-            result,
-            Err("computer controller not available".to_string())
-        );
+        assert_eq!(result, Err("computer controller not available".to_string()));
     }
 
     #[test]

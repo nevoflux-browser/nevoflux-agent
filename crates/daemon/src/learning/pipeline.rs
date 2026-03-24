@@ -579,7 +579,11 @@ mod tests {
     fn setup() -> (LearningPipeline, Arc<Storage>) {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let buffer = Arc::new(MemoryBuffer::new(20, Duration::from_secs(30)));
-        let pipeline = LearningPipeline::new(buffer, storage.clone(), std::sync::Arc::new(std::sync::RwLock::new(None)));
+        let pipeline = LearningPipeline::new(
+            buffer,
+            storage.clone(),
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+        );
         (pipeline, storage)
     }
 
@@ -706,8 +710,12 @@ mod tests {
         let buffer = Arc::new(MemoryBuffer::new(20, Duration::from_secs(30)));
         let provider = InMemoryKeyProvider::random();
         let enc = Arc::new(EncryptionService::new(&provider).unwrap());
-        let pipeline =
-            LearningPipeline::new(buffer, storage.clone(), std::sync::Arc::new(std::sync::RwLock::new(None))).with_encryption(Arc::clone(&enc));
+        let pipeline = LearningPipeline::new(
+            buffer,
+            storage.clone(),
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+        )
+        .with_encryption(Arc::clone(&enc));
         (pipeline, storage, enc)
     }
 
@@ -2375,7 +2383,11 @@ mod tests {
         // 1. Setup: in-memory Storage + Pipeline
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let buffer = Arc::new(MemoryBuffer::new(20, Duration::from_secs(30)));
-        let pipeline = LearningPipeline::new(buffer.clone(), storage.clone(), std::sync::Arc::new(std::sync::RwLock::new(None)));
+        let pipeline = LearningPipeline::new(
+            buffer.clone(),
+            storage.clone(),
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+        );
 
         // 2. Insert tool execution spans (simulating a tool with 80% failure rate)
         //    Need >= 3 calls to pass ToolTraceLearningSource.min_calls threshold

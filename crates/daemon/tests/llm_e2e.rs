@@ -157,8 +157,14 @@ async fn test_deepseek_chat() {
         tools: None,
     };
 
-    let response =
-        execute_llm_chat(ProviderType::DeepSeek, &api_key, "deepseek-chat", request, None).await;
+    let response = execute_llm_chat(
+        ProviderType::DeepSeek,
+        &api_key,
+        "deepseek-chat",
+        request,
+        None,
+    )
+    .await;
 
     match response {
         Ok(resp) => {
@@ -280,9 +286,14 @@ async fn test_openai_tool_calling() {
                 tools: None,
             };
 
-            let response2 =
-                execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request2, None)
-                    .await;
+            let response2 = execute_llm_chat(
+                ProviderType::OpenAi,
+                &api_key,
+                "gpt-4o-mini",
+                request2,
+                None,
+            )
+            .await;
 
             match response2 {
                 Ok(resp2) => {
@@ -323,9 +334,15 @@ async fn test_multi_turn_conversation() {
         tools: None,
     };
 
-    let resp1 = execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request1, None)
-        .await
-        .expect("Turn 1 failed");
+    let resp1 = execute_llm_chat(
+        ProviderType::OpenAi,
+        &api_key,
+        "gpt-4o-mini",
+        request1,
+        None,
+    )
+    .await
+    .expect("Turn 1 failed");
 
     println!("Turn 1 response: {}", resp1.content);
 
@@ -342,9 +359,15 @@ async fn test_multi_turn_conversation() {
         tools: None,
     };
 
-    let resp2 = execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request2, None)
-        .await
-        .expect("Turn 2 failed");
+    let resp2 = execute_llm_chat(
+        ProviderType::OpenAi,
+        &api_key,
+        "gpt-4o-mini",
+        request2,
+        None,
+    )
+    .await
+    .expect("Turn 2 failed");
 
     println!("Turn 2 response: {}", resp2.content);
     assert!(
@@ -509,10 +532,15 @@ async fn test_openai_streaming_tool_calling() {
     };
 
     // Use non-streaming for the follow-up to verify it works
-    let response2 =
-        execute_llm_chat(ProviderType::OpenAi, &api_key, "gpt-4o-mini", request2, None)
-            .await
-            .expect("Second request with tool result failed");
+    let response2 = execute_llm_chat(
+        ProviderType::OpenAi,
+        &api_key,
+        "gpt-4o-mini",
+        request2,
+        None,
+    )
+    .await
+    .expect("Second request with tool result failed");
 
     println!("\nFinal response: {}", response2.content);
     assert_eq!(response2.finish_reason, "stop");
@@ -1615,7 +1643,9 @@ async fn test_openrouter_image_generation() {
     };
 
     let request = LlmChatRequest {
-        messages: vec![LlmMessage::user("Generate a small red circle on a white background")],
+        messages: vec![LlmMessage::user(
+            "Generate a small red circle on a white background",
+        )],
         system: None,
         temperature: None,
         max_tokens: Some(2048),
@@ -1633,7 +1663,10 @@ async fn test_openrouter_image_generation() {
 
     match response {
         Ok(resp) => {
-            println!("Image generation response: content_len={}", resp.content.len());
+            println!(
+                "Image generation response: content_len={}",
+                resp.content.len()
+            );
             println!("Image count: {}", resp.images.len());
             assert!(!resp.images.is_empty(), "Should contain at least one image");
             let img = &resp.images[0];
@@ -1662,7 +1695,9 @@ async fn test_openrouter_image_generation_streaming() {
     };
 
     let request = LlmChatRequest {
-        messages: vec![LlmMessage::user("Generate a small blue square on a white background")],
+        messages: vec![LlmMessage::user(
+            "Generate a small blue square on a white background",
+        )],
         system: None,
         temperature: None,
         max_tokens: Some(2048),
@@ -1709,7 +1744,11 @@ async fn test_openrouter_image_generation_streaming() {
             }
             assert!(done, "Stream should complete");
             assert!(image_count > 0, "Should receive at least one image");
-            println!("Image stream: text_len={}, images={}", full_text.len(), image_count);
+            println!(
+                "Image stream: text_len={}, images={}",
+                full_text.len(),
+                image_count
+            );
             println!("✅ Image generation streaming test passed!");
         }
         Err(e) => panic!("Image generation streaming failed: {:?}", e),

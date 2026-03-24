@@ -267,9 +267,7 @@ async fn run_proxy(verbose: bool, dev_mode: bool) -> Result<(), Box<dyn std::err
 
     tracing::debug!("Starting async proxy mode (full-duplex, {:?})", mode);
 
-    let bridge_config = BridgeConfig::new()
-        .with_mode(mode)
-        .with_data_dir(data_dir);
+    let bridge_config = BridgeConfig::new().with_mode(mode).with_data_dir(data_dir);
     let config = AsyncProxyConfig::new().with_bridge(bridge_config);
 
     let result = run_async_proxy(stdin(), stdout(), config).await?;
@@ -376,10 +374,7 @@ async fn run_daemon(
             .map(|v| v == "1")
             .unwrap_or(false);
     if trace_enabled {
-        tracing::info!(
-            "Trace enabled: writing to {}/traces/",
-            data_dir.display()
-        );
+        tracing::info!("Trace enabled: writing to {}/traces/", data_dir.display());
     }
 
     logging::log_startup(env!("CARGO_PKG_VERSION"));

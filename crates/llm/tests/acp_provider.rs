@@ -29,13 +29,19 @@ async fn test_claude_acp_basic_prompt() {
     provider.connect().await.expect("Failed to connect");
     assert!(provider.is_alive());
 
-    let session_id = provider.new_session().await.expect("Failed to create session");
+    let session_id = provider
+        .new_session()
+        .await
+        .expect("Failed to create session");
 
     let content = vec![ContentBlock::Text(TextContent::new(
         "Say exactly: hello world".to_string(),
     ))];
 
-    let mut rx = provider.prompt(session_id, content).await.expect("Failed to prompt");
+    let mut rx = provider
+        .prompt(session_id, content)
+        .await
+        .expect("Failed to prompt");
 
     let mut got_text = false;
     let mut got_complete = false;
@@ -67,13 +73,19 @@ async fn test_gemini_acp_basic_prompt() {
     let mut provider = AcpProvider::new(config);
     provider.connect().await.expect("Failed to connect");
 
-    let session_id = provider.new_session().await.expect("Failed to create session");
+    let session_id = provider
+        .new_session()
+        .await
+        .expect("Failed to create session");
 
     let content = vec![ContentBlock::Text(TextContent::new(
         "Say exactly: hello world".to_string(),
     ))];
 
-    let mut rx = provider.prompt(session_id, content).await.expect("Failed to prompt");
+    let mut rx = provider
+        .prompt(session_id, content)
+        .await
+        .expect("Failed to prompt");
 
     let mut got_text = false;
     while let Some(update) = rx.recv().await {

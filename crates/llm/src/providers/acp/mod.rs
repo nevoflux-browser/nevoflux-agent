@@ -16,10 +16,10 @@ pub mod tools;
 pub use sacp::schema::{ContentBlock, TextContent};
 
 use sacp::schema::{
-    ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest,
-    NewSessionResponse, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
-    RequestPermissionRequest, RequestPermissionResponse, SessionId, SessionNotification,
-    SessionUpdate, SetSessionModeRequest, StopReason,
+    ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
+    PromptRequest, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SessionId, SessionNotification, SessionUpdate,
+    SetSessionModeRequest, StopReason,
 };
 use sacp::{ClientToAgent, JrConnectionCx, JrMessage};
 use std::path::PathBuf;
@@ -284,10 +284,7 @@ async fn run_client_loop_direct(
     init_tx: oneshot::Sender<Result<InitializeResponse>>,
     tool_bridge: Option<Arc<mcp_bridge::McpToolBridge>>,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or("no stdin on ACP child process")?;
+    let stdin = child.stdin.take().ok_or("no stdin on ACP child process")?;
     let stdout = child
         .stdout
         .take()
@@ -347,11 +344,9 @@ async fn run_client_loop_direct(
                 let tool_bridge = tool_bridge.clone();
                 // Permission handler: forwards to sidebar via McpToolBridge for user approval.
                 // Session-level "Always Allow" decisions are cached to avoid repeated prompts.
-                async move |request: RequestPermissionRequest,
-                            request_cx,
-                            _connection_cx| {
-                    use sacp::schema::SelectedPermissionOutcome;
+                async move |request: RequestPermissionRequest, request_cx, _connection_cx| {
                     use mcp_bridge::PermissionResponse;
+                    use sacp::schema::SelectedPermissionOutcome;
 
                     // Extract tool name from toolCallId or title.
                     // Gemini CLI uses toolCallId format: "mcp_nevoflux-tools_<tool_name>-<timestamp>"
@@ -370,9 +365,7 @@ async fn run_client_loop_direct(
 
                     // Check with McpToolBridge — may ask sidebar or return cached decision
                     let decision = if let Some(ref bridge) = tool_bridge {
-                        bridge
-                            .request_permission(&tool_name, &args_summary)
-                            .await
+                        bridge.request_permission(&tool_name, &args_summary).await
                     } else {
                         // No bridge (non-MCP mode) — auto-approve
                         PermissionResponse::AllowOnce
@@ -420,10 +413,7 @@ async fn run_client_loop_direct(
                                 .options
                                 .iter()
                                 .find(|o| {
-                                    matches!(
-                                        o.kind,
-                                        sacp::schema::PermissionOptionKind::AllowOnce
-                                    )
+                                    matches!(o.kind, sacp::schema::PermissionOptionKind::AllowOnce)
                                 })
                                 .map(|o| o.option_id.0.to_string())
                                 .unwrap_or_else(|| "allow".to_string())
@@ -434,21 +424,17 @@ async fn run_client_loop_direct(
                                 .options
                                 .iter()
                                 .find(|o| {
-                                    matches!(
-                                        o.kind,
-                                        sacp::schema::PermissionOptionKind::RejectOnce
-                                    )
+                                    matches!(o.kind, sacp::schema::PermissionOptionKind::RejectOnce)
                                 })
                                 .map(|o| o.option_id.0.to_string())
                                 .unwrap_or_else(|| "cancel".to_string())
                         }
                     };
 
-                    let response = RequestPermissionResponse::new(
-                        RequestPermissionOutcome::Selected(
+                    let response =
+                        RequestPermissionResponse::new(RequestPermissionOutcome::Selected(
                             SelectedPermissionOutcome::new(option_id),
-                        ),
-                    );
+                        ));
                     request_cx.respond(response)
                 }
             },
@@ -456,7 +442,14 @@ async fn run_client_loop_direct(
         )
         .connect_to(transport)?
         .run_until(|cx: JrConnectionCx<ClientToAgent>| {
-            handle_requests(config, cx, &mut rx, prompt_response_tx, init_tx, tool_bridge)
+            handle_requests(
+                config,
+                cx,
+                &mut rx,
+                prompt_response_tx,
+                init_tx,
+                tool_bridge,
+            )
         })
         .await;
 
@@ -551,10 +544,7 @@ async fn handle_requests(
                         }
                     }
                 }
-                let session = cx
-                    .send_request(request)
-                    .block_task()
-                    .await;
+                let session = cx.send_request(request).block_task().await;
 
                 let result = match session {
                     Ok(session) => {
@@ -581,9 +571,7 @@ async fn handle_requests(
                         );
                         apply_session_mode(&config, &cx, session).await
                     }
-                    Err(err) => Err(AcpError::Internal(format!(
-                        "ACP session/new failed: {err}"
-                    ))),
+                    Err(err) => Err(AcpError::Internal(format!("ACP session/new failed: {err}"))),
                 };
 
                 let _ = response_tx.send(result);
@@ -594,10 +582,13 @@ async fn handle_requests(
                 content,
                 response_tx,
             } => {
-                let content_len: usize = content.iter().map(|b| match b {
-                    ContentBlock::Text(t) => t.text.len(),
-                    _ => 0,
-                }).sum();
+                let content_len: usize = content
+                    .iter()
+                    .map(|b| match b {
+                        ContentBlock::Text(t) => t.text.len(),
+                        _ => 0,
+                    })
+                    .sum();
                 tracing::info!(
                     session_id = %session_id.0,
                     content_blocks = content.len(),

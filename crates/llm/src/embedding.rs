@@ -266,11 +266,7 @@ impl FastEmbedProvider {
             .with_show_download_progress(config.show_download_progress);
 
         let text_embedding = fastembed::TextEmbedding::try_new(options).map_err(|e| {
-            EmbeddingError::InitError(format!(
-                "{} (cache_dir: {})",
-                e,
-                cache_dir.display()
-            ))
+            EmbeddingError::InitError(format!("{} (cache_dir: {})", e, cache_dir.display()))
         })?;
 
         Ok(Self {

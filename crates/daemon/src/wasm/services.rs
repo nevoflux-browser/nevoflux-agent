@@ -230,7 +230,9 @@ impl HostServices {
             client_identity: Vec::new(),
             proxy_id: String::new(),
             session_id: String::new(),
-            always_allowed_tools: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+            always_allowed_tools: Arc::new(
+                std::sync::RwLock::new(std::collections::HashSet::new()),
+            ),
             knowledge_retriever: None,
             computer_controller: None,
             embedding: Arc::new(std::sync::RwLock::new(None)),
@@ -258,7 +260,9 @@ impl HostServices {
             client_identity: Vec::new(),
             proxy_id: String::new(),
             session_id: String::new(),
-            always_allowed_tools: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+            always_allowed_tools: Arc::new(
+                std::sync::RwLock::new(std::collections::HashSet::new()),
+            ),
             knowledge_retriever: None,
             computer_controller: None,
             embedding: Arc::new(std::sync::RwLock::new(None)),

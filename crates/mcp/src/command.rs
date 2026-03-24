@@ -93,7 +93,10 @@ fn resolve_command_path(command: &str) -> String {
     #[cfg(windows)]
     if command.len() >= 3 {
         let bytes = command.as_bytes();
-        if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
+        if bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/')
+        {
             return command.to_string();
         }
     }
@@ -144,7 +147,11 @@ fn which_command(command: &str) -> Option<String> {
         // .exe > .cmd > .bat since cmd.exe cannot execute bare shell scripts.
         #[cfg(windows)]
         {
-            let lines: Vec<&str> = path.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+            let lines: Vec<&str> = path
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .collect();
             // First pass: prefer .exe
             if let Some(p) = lines.iter().find(|l| l.ends_with(".exe")) {
                 return Some(p.to_string());
@@ -262,18 +269,12 @@ mod tests {
 
     #[test]
     fn test_resolve_command_path_absolute() {
-        assert_eq!(
-            resolve_command_path("/usr/bin/env"),
-            "/usr/bin/env"
-        );
+        assert_eq!(resolve_command_path("/usr/bin/env"), "/usr/bin/env");
     }
 
     #[test]
     fn test_resolve_command_path_relative() {
-        assert_eq!(
-            resolve_command_path("./my-server"),
-            "./my-server"
-        );
+        assert_eq!(resolve_command_path("./my-server"), "./my-server");
     }
 
     #[test]

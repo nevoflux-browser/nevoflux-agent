@@ -6,8 +6,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use monty::{
-    ExternalResult, LimitedTracker, MontyObject, MontyRun, PrintWriter, ResourceLimits,
-    RunProgress,
+    ExternalResult, LimitedTracker, MontyObject, MontyRun, PrintWriter, ResourceLimits, RunProgress,
 };
 
 use super::auto_fixer::MontyAutoFixer;
@@ -449,7 +448,10 @@ impl CodeModeExecutor {
                                 continue;
                             }
                             Err(e) => {
-                                tracing::error!("Code Mode: LLM rewrite failed for start error: {}", e);
+                                tracing::error!(
+                                    "Code Mode: LLM rewrite failed for start error: {}",
+                                    e
+                                );
                                 return CodeModeResult::fail_with_output(
                                     collect_output(print_writer),
                                     format!("Runtime error and LLM rewrite failed: {error_type}: {error_msg} (rewrite error: {e})"),
@@ -751,7 +753,9 @@ impl CodeModeExecutor {
                                         line,
                                         external_function_names,
                                     );
-                                    tracing::info!("Code Mode: requesting LLM rewrite for post-futures error");
+                                    tracing::info!(
+                                        "Code Mode: requesting LLM rewrite for post-futures error"
+                                    );
                                     match llm_rewrite(&repair_prompt).await {
                                         Ok(rewritten) => {
                                             tracing::info!(

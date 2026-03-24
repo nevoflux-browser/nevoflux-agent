@@ -1928,8 +1928,7 @@ mod tests {
     #[test]
     fn test_extract_result_eval_js_result_object() {
         // Object format: {"result":{"title":"Google","url":"https://google.com"}}
-        let val =
-            serde_json::json!({"result": {"title": "Google", "url": "https://google.com"}});
+        let val = serde_json::json!({"result": {"title": "Google", "url": "https://google.com"}});
         let result = BrowserTool::extract_result(BrowserToolAction::EvalJs, &val);
         assert!(result.contains("Google"));
         assert!(result.contains("https://google.com"));
@@ -1954,7 +1953,8 @@ mod tests {
     #[test]
     fn test_extract_result_eval_js_complex_elements() {
         // Extension returns element query result: {"count":1,"elements":[...]}
-        let val = serde_json::json!({"count": 1, "elements": [{"tag": "textarea", "id": "APjFqb"}]});
+        let val =
+            serde_json::json!({"count": 1, "elements": [{"tag": "textarea", "id": "APjFqb"}]});
         let result = BrowserTool::extract_result(BrowserToolAction::EvalJs, &val);
         // No value/result field, falls through to full JSON
         assert!(result.contains("APjFqb"));

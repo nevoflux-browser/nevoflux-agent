@@ -1,59 +1,59 @@
 //! OpenClaw automatic configuration.
 //!
-//! Handles first-time setup of OpenClaw gateway configuration:
-//! - Registers NevoFlux MCP HTTP server
-//! - Disables OpenClaw's built-in browser tool (replaced by NevoFlux browser tools)
-//! - Installs nevoflux-browser skill
+//! Generates an OpenClaw plugin under `~/.openclaw/extensions/nevoflux-tools/`
+//! that bridges NevoFlux tools to OpenClaw via HTTP MCP.
+//!
+//! The plugin reads the MCP server URL from a state file written by the daemon,
+//! then proxies tool calls to the same HTTP MCP server used by Claude Code and
+//! Gemini CLI — ensuring consistent tool execution across all ACP providers.
 
+use std::ffi::OsString;
 use std::process::Command;
+
+/// Well-known path for the MCP server URL state file.
+/// Written by the daemon when the HTTP MCP server starts.
+const MCP_URL_FILENAME: &str = "openclaw_mcp_url";
+
+/// Resolve the `openclaw` binary to its full path.
+pub fn resolve_openclaw() -> OsString {
+    let search_path = nevoflux_llm::util::build_search_path();
+    which::which_in(
+        "openclaw",
+        search_path.as_deref(),
+        std::env::current_dir().unwrap_or_default(),
+    )
+    .map(|p| p.into_os_string())
+    .unwrap_or_else(|_| OsString::from("openclaw"))
+}
 
 /// Check if OpenClaw CLI is installed.
 pub fn is_openclaw_installed() -> bool {
-    which::which("openclaw").is_ok()
+    let search_path = nevoflux_llm::util::build_search_path();
+    which::which_in(
+        "openclaw",
+        search_path.as_deref(),
+        std::env::current_dir().unwrap_or_default(),
+    )
+    .is_ok()
 }
 
-/// Check if NevoFlux MCP server is already registered in OpenClaw config.
-pub fn is_mcp_configured() -> bool {
-    let output = Command::new("openclaw")
-        .args(["config", "get", "tools.mcpServers.nevoflux-tools"])
-        .output();
-    match output {
-        Ok(o) => o.status.success() && !String::from_utf8_lossy(&o.stdout).contains("not found"),
-        Err(_) => false,
-    }
-}
-
-/// Register NevoFlux MCP HTTP server in OpenClaw gateway config.
-pub fn register_mcp_server(port: u16) -> Result<(), String> {
-    let url = format!("http://127.0.0.1:{}/mcp", port);
-    let value = serde_json::json!({
-        "type": "http",
-        "url": url,
-    });
-    let output = Command::new("openclaw")
-        .args([
-            "config",
-            "set",
-            "tools.mcpServers.nevoflux-tools",
-            &serde_json::to_string(&value).unwrap(),
-            "--strict-json",
-        ])
-        .output()
-        .map_err(|e| format!("Failed to run openclaw config set: {}", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("openclaw config set failed: {}", stderr));
-    }
-    tracing::info!("Registered NevoFlux MCP server in OpenClaw config: {}", url);
+/// Write the MCP server URL to a well-known state file so the OpenClaw plugin
+/// can discover it at runtime.
+pub fn write_mcp_url(url: &str) -> Result<(), String> {
+    let state_dir = dirs::config_dir()
+        .ok_or_else(|| "Cannot determine config directory".to_string())?
+        .join("nevoflux");
+    std::fs::create_dir_all(&state_dir)
+        .map_err(|e| format!("Failed to create config dir: {}", e))?;
+    std::fs::write(state_dir.join(MCP_URL_FILENAME), url)
+        .map_err(|e| format!("Failed to write MCP URL state file: {}", e))?;
+    tracing::info!("Wrote MCP URL to state file: {}", url);
     Ok(())
 }
 
 /// Disable OpenClaw's built-in browser tool by adding "browser" to tools.deny.
-/// Merges with existing deny list to avoid overwriting user config.
 pub fn disable_openclaw_browser() -> Result<(), String> {
-    // Read existing deny list
-    let existing = Command::new("openclaw")
+    let existing = Command::new(resolve_openclaw())
         .args(["config", "get", "tools.deny"])
         .output()
         .ok()
@@ -67,13 +67,17 @@ pub fn disable_openclaw_browser() -> Result<(), String> {
         })
         .unwrap_or_default();
 
-    // Add "browser" if not already present
     let mut deny_list = existing;
-    if !deny_list.iter().any(|s| s == "browser") {
-        deny_list.push("browser".to_string());
+    // Deny OpenClaw's built-in tools that conflict with NevoFlux plugin tools.
+    // "browser" disables the entire browser group; individual names cover
+    // tools outside the group that still clash.
+    for name in ["browser", "browser_get_markdown", "web_search"] {
+        if !deny_list.iter().any(|s| s == name) {
+            deny_list.push(name.to_string());
+        }
     }
 
-    let output = Command::new("openclaw")
+    let output = Command::new(resolve_openclaw())
         .args([
             "config",
             "set",
@@ -92,62 +96,290 @@ pub fn disable_openclaw_browser() -> Result<(), String> {
     Ok(())
 }
 
-/// Install the nevoflux-browser skill into OpenClaw workspace.
-pub fn install_nevoflux_skill() -> Result<(), String> {
-    let skill_dir = dirs::home_dir()
-        .ok_or_else(|| "Cannot determine home directory".to_string())?
-        .join(".openclaw/workspace/skills/nevoflux-browser");
+/// Generate the OpenClaw plugin TypeScript file.
+///
+/// The plugin registers NevoFlux browser/computer tools as OpenClaw agent tools.
+/// Each tool's `execute` function proxies calls to the NevoFlux HTTP MCP server.
+fn generate_plugin_index() -> String {
+    let config_dir = dirs::config_dir()
+        .map(|d| d.join("nevoflux"))
+        .unwrap_or_default();
+    let mcp_url_path = config_dir.join(MCP_URL_FILENAME);
+    // Escape backslashes for Windows paths in TypeScript string
+    let mcp_url_path_str = mcp_url_path.to_string_lossy().replace('\\', "\\\\");
 
-    if skill_dir.join("SKILL.md").exists() {
-        tracing::info!("NevoFlux browser skill already installed");
-        return Ok(());
+    format!(
+        r#"// Auto-generated by NevoFlux — do not edit manually.
+// This plugin bridges NevoFlux browser/computer tools to OpenClaw
+// via the same HTTP MCP server used by Claude Code and Gemini CLI.
+
+import {{ definePluginEntry }} from "openclaw/plugin-sdk/plugin-entry";
+import {{ Type }} from "@sinclair/typebox";
+import {{ readFileSync }} from "node:fs";
+
+const MCP_URL_PATH = "{mcp_url_path}";
+
+function getMcpUrl(): string | null {{
+  try {{
+    return readFileSync(MCP_URL_PATH, "utf-8").trim();
+  }} catch {{
+    return null;
+  }}
+}}
+
+async function callMcpTool(name: string, args: Record<string, unknown>): Promise<string> {{
+  const url = getMcpUrl();
+  if (!url) {{
+    return "NevoFlux MCP server is not running. Please start NevoFlux first.";
+  }}
+  const body = JSON.stringify({{
+    jsonrpc: "2.0",
+    id: Date.now(),
+    method: "tools/call",
+    params: {{ name, arguments: args }},
+  }});
+  const resp = await fetch(url, {{
+    method: "POST",
+    headers: {{ "Content-Type": "application/json" }},
+    body,
+  }});
+  const json = await resp.json() as any;
+  if (json.error) {{
+    return `Tool error: ${{json.error.message || JSON.stringify(json.error)}}`;
+  }}
+  const content = json.result?.content;
+  if (Array.isArray(content)) {{
+    return content.map((c: any) => c.text || JSON.stringify(c)).join("\n");
+  }}
+  return JSON.stringify(json.result);
+}}
+
+// Register with "nf_" prefix to avoid conflicts with OpenClaw built-in tools.
+// MCP calls use the original name (without prefix).
+function tool(mcpName: string, description: string, parameters: any) {{
+  return {{
+    name: `nf_${{mcpName}}`,
+    description: `[NevoFlux] ${{description}}`,
+    parameters,
+    async execute(_id: string, params: any) {{
+      const text = await callMcpTool(mcpName, params ?? {{}});
+      return {{ content: [{{ type: "text" as const, text }}] }};
+    }},
+  }};
+}}
+
+export default definePluginEntry({{
+  id: "nevoflux-tools",
+  name: "NevoFlux Tools",
+  description: "Browser automation, computer control, and web tools powered by NevoFlux",
+  register(api) {{
+    // Browser tools
+    api.registerTool(tool("browser_get_markdown", "Read current page content as Markdown", Type.Object({{
+      tab_id: Type.Optional(Type.Number({{ description: "Browser tab ID" }})),
+    }})));
+    api.registerTool(tool("browser_navigate", "Navigate browser to a URL", Type.Object({{
+      url: Type.String({{ description: "URL to navigate to" }}),
+      tab_id: Type.Optional(Type.Number()),
+    }})));
+    api.registerTool(tool("browser_click_by_id", "Click page element by snapshot ref ID", Type.Object({{
+      element_id: Type.String({{ description: "Element ref ID from snapshot (e.g. 'e5')" }}),
+      tab_id: Type.Optional(Type.Number()),
+    }})));
+    api.registerTool(tool("browser_snapshot", "Get page accessibility tree with element ref IDs", Type.Object({{
+      tab_id: Type.Optional(Type.Number()),
+    }})));
+    api.registerTool(tool("browser_screenshot", "Take screenshot of current page", Type.Object({{
+      tab_id: Type.Optional(Type.Number()),
+    }})));
+    api.registerTool(tool("browser_scroll", "Scroll page up or down", Type.Object({{
+      direction: Type.String({{ description: "'up' or 'down'" }}),
+      amount: Type.Optional(Type.String({{ description: "'page', 'half', or pixel number" }})),
+      tab_id: Type.Optional(Type.Number()),
+    }})));
+    api.registerTool(tool("browser_get_tabs", "List all open browser tabs", Type.Object({{}})));
+    api.registerTool(tool("browser_get_content", "Get page HTML source", Type.Object({{
+      tab_id: Type.Optional(Type.Number()),
+    }})));
+    api.registerTool(tool("browser_eval_js", "Execute JavaScript on current page", Type.Object({{
+      code: Type.String({{ description: "JavaScript code to execute" }}),
+      tab_id: Type.Optional(Type.Number()),
+    }})));
+    api.registerTool(tool("browser_fill_by_id", "Fill form field by ref ID", Type.Object({{
+      element_id: Type.String(),
+      value: Type.String(),
+      tab_id: Type.Optional(Type.Number()),
+    }})));
+    api.registerTool(tool("browser_type_by_id", "Type text into element by ref ID", Type.Object({{
+      element_id: Type.String(),
+      text: Type.String(),
+      tab_id: Type.Optional(Type.Number()),
+    }})));
+    api.registerTool(tool("browser_get_markdown", "Read page as Markdown", Type.Object({{
+      tab_id: Type.Optional(Type.Number()),
+    }})));
+
+    // Web tools
+    api.registerTool(tool("web_search", "Search the web", Type.Object({{
+      query: Type.String({{ description: "Search query" }}),
+    }})));
+    api.registerTool(tool("fetch_page", "Fetch URL content as markdown", Type.Object({{
+      url: Type.String({{ description: "URL to fetch" }}),
+    }})));
+
+    // Artifact
+    api.registerTool(tool("create_artifact", "Create interactive Canvas app (HTML/React/SVG/Mermaid)", Type.Object({{
+      title: Type.String({{ description: "Artifact title" }}),
+      files: Type.Record(Type.String(), Type.String(), {{ description: "filename -> content map" }}),
+      type: Type.Optional(Type.String({{ description: "html, react, svg, mermaid, markdown" }})),
+    }})));
+
+    // Computer tools
+    api.registerTool(tool("computer_screenshot", "Take screenshot of entire screen", Type.Object({{
+      monitor: Type.Optional(Type.Number()),
+    }})));
+    api.registerTool(tool("computer_click", "Click at screen position", Type.Object({{
+      x: Type.Number(), y: Type.Number(),
+      button: Type.Optional(Type.String()),
+    }})));
+    api.registerTool(tool("computer_type_text", "Type text at current cursor", Type.Object({{
+      text: Type.String(),
+    }})));
+    api.registerTool(tool("computer_key", "Press keyboard keys", Type.Object({{
+      keys: Type.String({{ description: "Key combination e.g. 'ctrl+c'" }}),
+    }})));
+    api.registerTool(tool("computer_mouse_move", "Move mouse to position", Type.Object({{
+      x: Type.Number(), y: Type.Number(),
+    }})));
+    api.registerTool(tool("computer_scroll", "Scroll at screen position", Type.Object({{
+      x: Type.Number(), y: Type.Number(),
+      direction: Type.String(),
+      amount: Type.Optional(Type.Number()),
+    }})));
+  }},
+}});
+"#,
+        mcp_url_path = mcp_url_path_str,
+    )
+}
+
+/// Generate the OpenClaw plugin manifest file.
+fn generate_plugin_manifest() -> String {
+    r#"{
+  "id": "nevoflux-tools",
+  "name": "NevoFlux Tools",
+  "description": "Browser automation, computer control, and web tools powered by NevoFlux",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false
+  }
+}
+"#
+    .to_string()
+}
+
+/// Generate the plugin package.json.
+fn generate_plugin_package_json() -> String {
+    r#"{
+  "name": "nevoflux-tools",
+  "version": "1.0.0",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  }
+}
+"#
+    .to_string()
+}
+
+/// Find the OpenClaw npm package directory for symlinking.
+fn find_openclaw_package_dir() -> Option<std::path::PathBuf> {
+    let search_path = nevoflux_llm::util::build_search_path();
+    let openclaw_bin = which::which_in(
+        "openclaw",
+        search_path.as_deref(),
+        std::env::current_dir().unwrap_or_default(),
+    )
+    .ok()?;
+    // openclaw binary is typically at <prefix>/bin/openclaw or <prefix>/lib/node_modules/openclaw/...
+    // Follow symlinks to find the actual package directory
+    let resolved = std::fs::canonicalize(&openclaw_bin).unwrap_or(openclaw_bin);
+    // Walk up to find package.json with name "openclaw"
+    let mut dir = resolved.parent()?;
+    for _ in 0..10 {
+        let pkg_json = dir.join("package.json");
+        if pkg_json.exists() {
+            if let Ok(content) = std::fs::read_to_string(&pkg_json) {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if parsed.get("name").and_then(|n| n.as_str()) == Some("openclaw") {
+                        return Some(dir.to_path_buf());
+                    }
+                }
+            }
+        }
+        dir = dir.parent()?;
+    }
+    None
+}
+
+/// Install the NevoFlux tools plugin into OpenClaw extensions directory.
+fn install_plugin() -> Result<(), String> {
+    let plugin_dir = dirs::home_dir()
+        .ok_or_else(|| "Cannot determine home directory".to_string())?
+        .join(".openclaw/extensions/nevoflux-tools");
+
+    std::fs::create_dir_all(&plugin_dir)
+        .map_err(|e| format!("Failed to create plugin directory: {}", e))?;
+
+    std::fs::write(plugin_dir.join("index.ts"), generate_plugin_index())
+        .map_err(|e| format!("Failed to write index.ts: {}", e))?;
+    std::fs::write(
+        plugin_dir.join("openclaw.plugin.json"),
+        generate_plugin_manifest(),
+    )
+    .map_err(|e| format!("Failed to write manifest: {}", e))?;
+    std::fs::write(
+        plugin_dir.join("package.json"),
+        generate_plugin_package_json(),
+    )
+    .map_err(|e| format!("Failed to write package.json: {}", e))?;
+
+    // Create node_modules symlinks so the plugin can import openclaw SDK.
+    // Extensions outside the openclaw monorepo need the openclaw package
+    // in their local node_modules for module resolution.
+    let nm_dir = plugin_dir.join("node_modules");
+    let _ = std::fs::create_dir_all(&nm_dir);
+    if let Some(openclaw_pkg) = find_openclaw_package_dir() {
+        let openclaw_link = nm_dir.join("openclaw");
+        if !openclaw_link.exists() {
+            #[cfg(unix)]
+            let _ = std::os::unix::fs::symlink(&openclaw_pkg, &openclaw_link);
+            #[cfg(windows)]
+            let _ = std::os::windows::fs::symlink_dir(&openclaw_pkg, &openclaw_link);
+        }
+        // Also link @sinclair/typebox (used for parameter schemas)
+        let sinclair_src = openclaw_pkg.join("node_modules/@sinclair");
+        if sinclair_src.exists() {
+            let sinclair_link = nm_dir.join("@sinclair");
+            if !sinclair_link.exists() {
+                #[cfg(unix)]
+                let _ = std::os::unix::fs::symlink(&sinclair_src, &sinclair_link);
+                #[cfg(windows)]
+                let _ = std::os::windows::fs::symlink_dir(&sinclair_src, &sinclair_link);
+            }
+        }
     }
 
-    std::fs::create_dir_all(&skill_dir)
-        .map_err(|e| format!("Failed to create skill directory: {}", e))?;
-
-    let skill_content = r#"---
-name: nevoflux-browser
-description: Control NevoFlux browser for web browsing, page reading, and interaction. Use when user asks to navigate, read pages, click elements, or take screenshots. Prefer NevoFlux MCP tools over built-in browser tool.
-metadata: { "openclaw": { "requires": { "config": ["tools.mcpServers.nevoflux-tools"] } } }
----
-
-# NevoFlux Browser Control
-
-NevoFlux provides browser tools through MCP server "nevoflux-tools".
-Use these tools for all browser operations.
-
-## Available Tools
-- `browser_get_markdown` — Read current page as markdown
-- `browser_navigate` — Navigate to URL
-- `browser_click_by_id` — Click page element by snapshot ID
-- `browser_snapshot` — Get page element structure (accessibility tree)
-- `browser_screenshot` — Take screenshot of current page
-- `browser_scroll` — Scroll page up or down
-- `browser_get_tabs` — List all open browser tabs
-- `browser_get_content` — Get page HTML source
-- `browser_eval_js` — Execute JavaScript on current page
-- `web_search` — Search the web
-- `fetch_page` — Fetch URL content as markdown
-- `create_artifact` — Create interactive Canvas app (HTML/React/SVG/Mermaid/Markdown)
-
-## Usage Notes
-- These are MCP tools provided by the NevoFlux browser engine
-- Use `browser_get_markdown` to read page content before answering questions about a page
-- Use `browser_snapshot` to get interactive element IDs before clicking
-- Use `create_artifact` to build visual apps, dashboards, and tools
-"#;
-
-    std::fs::write(skill_dir.join("SKILL.md"), skill_content)
-        .map_err(|e| format!("Failed to write SKILL.md: {}", e))?;
-
-    tracing::info!("Installed NevoFlux browser skill to {:?}", skill_dir);
+    tracing::info!("Installed NevoFlux tools plugin to {:?}", plugin_dir);
     Ok(())
 }
 
-/// Run the complete first-time OpenClaw setup.
-/// Returns Ok(true) if setup was performed, Ok(false) if already configured.
-pub fn ensure_openclaw_configured(_mcp_port: u16) -> Result<bool, String> {
+/// Run OpenClaw setup — installs NevoFlux tools plugin.
+///
+/// The plugin bridges NevoFlux tools to OpenClaw via HTTP MCP, using the same
+/// MCP server that Claude Code and Gemini CLI connect to.
+///
+/// Returns Ok(true) if first-time setup was performed, Ok(false) if already configured.
+pub fn ensure_openclaw_configured() -> Result<bool, String> {
     if !is_openclaw_installed() {
         return Err(
             "OpenClaw is not installed. Install with: npm install -g openclaw@latest && openclaw onboard"
@@ -155,24 +387,29 @@ pub fn ensure_openclaw_configured(_mcp_port: u16) -> Result<bool, String> {
         );
     }
 
-    // Check if skill is already installed as indicator of setup completion
-    let skill_dir = dirs::home_dir()
+    let plugin_dir = dirs::home_dir()
         .ok_or_else(|| "Cannot determine home directory".to_string())?
-        .join(".openclaw/workspace/skills/nevoflux-browser");
-    if skill_dir.join("SKILL.md").exists() {
+        .join(".openclaw/extensions/nevoflux-tools");
+
+    if plugin_dir.join("index.ts").exists() {
         return Ok(false); // Already configured
     }
 
     // First-time setup
-    // Note: OpenClaw doesn't support HTTP MCP servers via config.
-    // NevoFlux tools are exposed through <tool_call> XML in system prompt
-    // and the nevoflux-browser skill teaches OpenClaw how to use them.
-    // register_mcp_server is skipped — tools defined in system prompt instead.
-    let _ = disable_openclaw_browser(); // Best effort — may fail if tools.deny path is invalid
-    install_nevoflux_skill()?;
+    install_plugin()?;
+    let _ = disable_openclaw_browser(); // Best effort
 
-    tracing::info!(
-        "OpenClaw first-time setup complete. Please restart OpenClaw gateway: openclaw gateway restart"
-    );
+    // Enable plugin in plugins.allow (required for non-bundled extensions)
+    let _ = Command::new(resolve_openclaw())
+        .args([
+            "config",
+            "set",
+            "plugins.allow",
+            r#"["nevoflux-tools"]"#,
+            "--strict-json",
+        ])
+        .output();
+
+    tracing::info!("OpenClaw first-time setup complete. Restart OpenClaw gateway to load plugin.");
     Ok(true)
 }

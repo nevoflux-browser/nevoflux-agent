@@ -39,8 +39,8 @@ pub use host::{HostError, HostFunctions, HostResult};
 pub use nevoflux_protocol::LocalFileRef;
 pub use types::{
     AgentInput, AgentMode, AgentOutput, Attachment, BashResult, BashStatus, BrowserToolResult,
-    GeneratedImage, GrepMatch, GrepResult, LlmChunk, LlmRequest, LlmResponse, MemoryChunk,
-    Message, MessageRole, ReadResult, SkillContext, SkillSummary, SubagentInfo, TabInfo, ToolCall,
+    GeneratedImage, GrepMatch, GrepResult, LlmChunk, LlmRequest, LlmResponse, MemoryChunk, Message,
+    MessageRole, ReadResult, SkillContext, SkillSummary, SubagentInfo, TabInfo, ToolCall,
     ToolDefinition, ToolResult, ToolSearchResult,
 };
 

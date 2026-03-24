@@ -18,17 +18,19 @@ pub(crate) fn cli_command(program: &str) -> tokio::process::Command {
 /// (finding `.cmd`, `.bat`, `.exe` etc.) and Unix PATH lookup.
 pub fn resolve_program(program: &str) -> std::path::PathBuf {
     // If it already has a path separator, use as-is
-    if program.contains(std::path::MAIN_SEPARATOR)
-        || program.contains('/')
-        || program.contains('.')
+    if program.contains(std::path::MAIN_SEPARATOR) || program.contains('/') || program.contains('.')
     {
         return std::path::PathBuf::from(program);
     }
 
     // Build extended search paths (include npm global dirs like Goose does)
     let search_path = build_search_path();
-    which::which_in(program, search_path.as_deref(), std::env::current_dir().unwrap_or_default())
-        .unwrap_or_else(|_| std::path::PathBuf::from(program))
+    which::which_in(
+        program,
+        search_path.as_deref(),
+        std::env::current_dir().unwrap_or_default(),
+    )
+    .unwrap_or_else(|_| std::path::PathBuf::from(program))
 }
 
 /// Build an extended PATH that includes npm global directories.
@@ -92,15 +94,13 @@ pub fn build_search_path() -> Option<std::ffi::OsString> {
 
     // Prepend extra dirs to existing PATH
     let existing = std::env::var_os("PATH");
-    let all_paths = extra_dirs
-        .into_iter()
-        .chain(
-            existing
-                .as_ref()
-                .map(std::env::split_paths)
-                .into_iter()
-                .flatten(),
-        );
+    let all_paths = extra_dirs.into_iter().chain(
+        existing
+            .as_ref()
+            .map(std::env::split_paths)
+            .into_iter()
+            .flatten(),
+    );
 
     std::env::join_paths(all_paths).ok()
 }

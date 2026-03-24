@@ -5,9 +5,11 @@
 
 use crate::error::{DaemonError, Result};
 use futures::StreamExt;
-use nevoflux_llm::providers::acp::{AcpProvider, AcpUpdate, ContentBlock, TextContent};
 use nevoflux_llm::providers::acp::context::compress_history;
-use nevoflux_llm::providers::acp::tools::{extract_tool_calls_from_text, format_tool_definitions_prompt};
+use nevoflux_llm::providers::acp::tools::{
+    extract_tool_calls_from_text, format_tool_definitions_prompt,
+};
+use nevoflux_llm::providers::acp::{AcpProvider, AcpUpdate, ContentBlock, TextContent};
 use nevoflux_llm::providers::kimi_agent::KimiAgentClient;
 use nevoflux_llm::providers::qwen::QwenClient;
 use nevoflux_llm::ProviderType;
@@ -333,24 +335,18 @@ pub async fn execute_llm_chat(
         ProviderType::DeepSeek => {
             execute_deepseek_chat(api_key, model, request, provider, base_url).await
         }
-        ProviderType::Qwen => {
-            execute_qwen_chat(api_key, model, request, provider, base_url).await
-        }
+        ProviderType::Qwen => execute_qwen_chat(api_key, model, request, provider, base_url).await,
         ProviderType::Gemini => {
             execute_gemini_chat(api_key, model, request, provider, base_url).await
         }
-        ProviderType::Groq => {
-            execute_groq_chat(api_key, model, request, provider, base_url).await
-        }
+        ProviderType::Groq => execute_groq_chat(api_key, model, request, provider, base_url).await,
         ProviderType::Ollama => {
             execute_ollama_chat(api_key, model, request, provider, base_url).await
         }
         ProviderType::Mistral => {
             execute_mistral_chat(api_key, model, request, provider, base_url).await
         }
-        ProviderType::XAi => {
-            execute_xai_chat(api_key, model, request, provider, base_url).await
-        }
+        ProviderType::XAi => execute_xai_chat(api_key, model, request, provider, base_url).await,
         ProviderType::Cohere => {
             execute_cohere_chat(api_key, model, request, provider, base_url).await
         }
@@ -360,11 +356,9 @@ pub async fn execute_llm_chat(
         ProviderType::Together => {
             execute_together_chat(api_key, model, request, provider, base_url).await
         }
-        ProviderType::ClaudeCode | ProviderType::GeminiCli | ProviderType::OpenClaw => {
-            Err(DaemonError::InternalError(
-                "ACP providers only support streaming mode".to_string(),
-            ))
-        }
+        ProviderType::ClaudeCode | ProviderType::GeminiCli | ProviderType::OpenClaw => Err(
+            DaemonError::InternalError("ACP providers only support streaming mode".to_string()),
+        ),
         ProviderType::KimiAgent => {
             execute_kimi_agent_chat(api_key, model, request, provider, base_url).await
         }
@@ -404,14 +398,13 @@ async fn execute_openai_chat(
 ) -> Result<LlmChatResponse> {
     if let Some(url) = base_url {
         // Custom endpoint: use Chat Completions API (/chat/completions)
-        let client: openai::CompletionsClient =
-            openai::CompletionsClient::builder()
-                .api_key(api_key)
-                .base_url(url)
-                .build()
-                .map_err(|e| {
-                    DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
-                })?;
+        let client: openai::CompletionsClient = openai::CompletionsClient::builder()
+            .api_key(api_key)
+            .base_url(url)
+            .build()
+            .map_err(|e| {
+                DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
+            })?;
         let completion_model = client.completion_model(model);
         execute_rig_completion(completion_model, request, provider).await
     } else {
@@ -661,7 +654,11 @@ async fn execute_raw_openai_compatible_chat(
 ) -> Result<LlmChatResponse> {
     let body = build_openai_request_body(model, &request);
 
-    tracing::debug!("Raw HTTP chat request to {}/chat/completions, model={}", base_url, model);
+    tracing::debug!(
+        "Raw HTTP chat request to {}/chat/completions, model={}",
+        base_url,
+        model
+    );
 
     let client = reqwest::Client::new();
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
@@ -689,9 +686,11 @@ async fn execute_raw_openai_compatible_chat(
         .await
         .map_err(|e| DaemonError::InternalError(format!("Failed to parse response: {}", e)))?;
 
-    let choice = raw.choices.into_iter().next().ok_or_else(|| {
-        DaemonError::InternalError("No choices in response".to_string())
-    })?;
+    let choice = raw
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| DaemonError::InternalError("No choices in response".to_string()))?;
 
     // Extract text content
     let content = match choice.message.content {
@@ -712,15 +711,16 @@ async fn execute_raw_openai_compatible_chat(
         .images
         .iter()
         .filter_map(|img| {
-            parse_data_url(&img.image_url.url).map(|(media_type, data)| LlmGeneratedImage {
-                media_type,
-                data,
-            })
+            parse_data_url(&img.image_url.url)
+                .map(|(media_type, data)| LlmGeneratedImage { media_type, data })
         })
         .collect();
 
     if !images.is_empty() {
-        tracing::info!("Raw HTTP response contains {} generated image(s)", images.len());
+        tracing::info!(
+            "Raw HTTP response contains {} generated image(s)",
+            images.len()
+        );
     }
 
     Ok(LlmChatResponse {
@@ -837,9 +837,9 @@ async fn execute_groq_chat(
     if let Some(url) = base_url {
         builder = builder.base_url(url);
     }
-    let client: groq::Client = builder.build().map_err(|e| {
-        DaemonError::InternalError(format!("Failed to create Groq client: {}", e))
-    })?;
+    let client: groq::Client = builder
+        .build()
+        .map_err(|e| DaemonError::InternalError(format!("Failed to create Groq client: {}", e)))?;
     let completion_model = client.completion_model(model);
     execute_rig_completion(completion_model, request, provider).await
 }
@@ -895,9 +895,9 @@ async fn execute_xai_chat(
     if let Some(url) = base_url {
         builder = builder.base_url(url);
     }
-    let client: xai::Client = builder.build().map_err(|e| {
-        DaemonError::InternalError(format!("Failed to create xAI client: {}", e))
-    })?;
+    let client: xai::Client = builder
+        .build()
+        .map_err(|e| DaemonError::InternalError(format!("Failed to create xAI client: {}", e)))?;
     let completion_model = client.completion_model(model);
     execute_rig_completion(completion_model, request, provider).await
 }
@@ -1344,9 +1344,8 @@ fn merge_consecutive_same_role_messages(messages: Vec<Message>) -> Vec<Message> 
                 let existing_has_tool_result = existing
                     .iter()
                     .any(|c| matches!(c, UserContent::ToolResult(_)));
-                let new_has_tool_result = new
-                    .iter()
-                    .any(|c| matches!(c, UserContent::ToolResult(_)));
+                let new_has_tool_result =
+                    new.iter().any(|c| matches!(c, UserContent::ToolResult(_)));
                 !existing_has_tool_result && !new_has_tool_result
             }
             (Some(Message::Assistant { .. }), Message::Assistant { .. }) => true,
@@ -1718,8 +1717,16 @@ async fn execute_llm_stream_inner(
             stream_together(api_key, model, request, tx, provider, base_url).await
         }
         ProviderType::ClaudeCode | ProviderType::GeminiCli | ProviderType::OpenClaw => {
-            stream_acp_completion(api_key, model, request, tx, provider, base_url, _host_services)
-                .await
+            stream_acp_completion(
+                api_key,
+                model,
+                request,
+                tx,
+                provider,
+                base_url,
+                _host_services,
+            )
+            .await
         }
         ProviderType::KimiAgent => {
             stream_kimi_agent(api_key, model, request, tx, provider, base_url).await
@@ -1767,14 +1774,13 @@ async fn stream_openai(
 ) -> Result<()> {
     if let Some(url) = base_url {
         // Custom endpoint: use Chat Completions API (/chat/completions)
-        let client: openai::CompletionsClient =
-            openai::CompletionsClient::builder()
-                .api_key(api_key)
-                .base_url(url)
-                .build()
-                .map_err(|e| {
-                    DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
-                })?;
+        let client: openai::CompletionsClient = openai::CompletionsClient::builder()
+            .api_key(api_key)
+            .base_url(url)
+            .build()
+            .map_err(|e| {
+                DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
+            })?;
         let completion_model = client.completion_model(model);
         stream_rig_completion(completion_model, request, tx, provider).await
     } else {
@@ -1917,9 +1923,9 @@ async fn stream_groq(
     if let Some(url) = base_url {
         builder = builder.base_url(url);
     }
-    let client: groq::Client = builder.build().map_err(|e| {
-        DaemonError::InternalError(format!("Failed to create Groq client: {}", e))
-    })?;
+    let client: groq::Client = builder
+        .build()
+        .map_err(|e| DaemonError::InternalError(format!("Failed to create Groq client: {}", e)))?;
     let completion_model = client.completion_model(model);
     stream_rig_completion(completion_model, request, tx, provider).await
 }
@@ -1957,9 +1963,9 @@ async fn stream_xai(
     if let Some(url) = base_url {
         builder = builder.base_url(url);
     }
-    let client: xai::Client = builder.build().map_err(|e| {
-        DaemonError::InternalError(format!("Failed to create xAI client: {}", e))
-    })?;
+    let client: xai::Client = builder
+        .build()
+        .map_err(|e| DaemonError::InternalError(format!("Failed to create xAI client: {}", e)))?;
     let completion_model = client.completion_model(model);
     stream_rig_completion(completion_model, request, tx, provider).await
 }
@@ -2238,6 +2244,21 @@ async fn stream_acp_completion(
 ) -> Result<()> {
     let context_limit = nevoflux_llm::default_context_window_for(provider) as usize;
 
+    // For OpenClaw: ensure MCP stdio server is registered in gateway config
+    // BEFORE spawning the ACP process. Config changes trigger a gateway restart,
+    // so we must do this before connecting to avoid "gateway closed (1012)" errors.
+    if matches!(provider, ProviderType::OpenClaw) {
+        match crate::openclaw_setup::ensure_openclaw_configured() {
+            Ok(true) => {
+                tracing::info!("OpenClaw first-time setup completed, waiting for gateway restart");
+                // Give the gateway time to restart after config change
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+            Ok(false) => {} // Already configured, no restart needed
+            Err(e) => tracing::warn!("OpenClaw setup failed: {}", e),
+        }
+    }
+
     // Get or create ACP provider (lazy init, auto-reconnect on crash).
     let provider_key = format!("{:?}", provider);
 
@@ -2247,22 +2268,16 @@ async fn stream_acp_completion(
         if !providers.contains_key(&provider_key) || !providers[&provider_key].is_alive() {
             let work_dir = resolve_workspace_dir();
             let config = match provider {
-                ProviderType::ClaudeCode => {
-                    nevoflux_llm::providers::acp::claude::build_config(
-                        std::path::PathBuf::from(&work_dir),
-                    )
-                }
-                ProviderType::GeminiCli => {
-                    nevoflux_llm::providers::acp::gemini::build_config(
-                        model,
-                        std::path::PathBuf::from(&work_dir),
-                    )
-                }
-                ProviderType::OpenClaw => {
-                    nevoflux_llm::providers::acp::openclaw::build_config(
-                        std::path::PathBuf::from(&work_dir),
-                    )
-                }
+                ProviderType::ClaudeCode => nevoflux_llm::providers::acp::claude::build_config(
+                    std::path::PathBuf::from(&work_dir),
+                ),
+                ProviderType::GeminiCli => nevoflux_llm::providers::acp::gemini::build_config(
+                    model,
+                    std::path::PathBuf::from(&work_dir),
+                ),
+                ProviderType::OpenClaw => nevoflux_llm::providers::acp::openclaw::build_config(
+                    std::path::PathBuf::from(&work_dir),
+                ),
                 _ => {
                     return Err(DaemonError::InternalError(format!(
                         "ACP not supported for {:?}",
@@ -2272,9 +2287,9 @@ async fn stream_acp_completion(
             };
 
             let mut acp = AcpProvider::new(config);
-            acp.connect().await.map_err(|e| {
-                DaemonError::InternalError(format!("Failed to connect ACP: {}", e))
-            })?;
+            acp.connect()
+                .await
+                .map_err(|e| DaemonError::InternalError(format!("Failed to connect ACP: {}", e)))?;
             providers.insert(provider_key.clone(), acp);
         }
     }
@@ -2301,29 +2316,16 @@ async fn stream_acp_completion(
                 Ok((port, handle)) => {
                     let url = format!("http://127.0.0.1:{port}/mcp");
                     tracing::info!("MCP HTTP server started at {}", url);
-                    tool_bridge.set_mcp_server_url(url);
+                    tool_bridge.set_mcp_server_url(url.clone());
                     tool_bridge.set_server_handle(handle);
+                    // Write URL to state file so OpenClaw plugin can discover it
+                    if let Err(e) = crate::openclaw_setup::write_mcp_url(&url) {
+                        tracing::warn!("Failed to write MCP URL state file: {}", e);
+                    }
                 }
                 Err(e) => {
                     tracing::error!("Failed to start MCP HTTP server: {}", e);
                 }
-            }
-        }
-
-        // For OpenClaw: ensure gateway config is set up (first-time only)
-        if matches!(provider, ProviderType::OpenClaw) {
-            let mcp_port = tool_bridge
-                .mcp_server_url()
-                .and_then(|url| {
-                    url.split(':')
-                        .last()
-                        .and_then(|s| s.trim_end_matches("/mcp").parse::<u16>().ok())
-                })
-                .unwrap_or(19580);
-            match crate::openclaw_setup::ensure_openclaw_configured(mcp_port) {
-                Ok(true) => tracing::info!("OpenClaw first-time setup completed"),
-                Ok(false) => {} // Already configured
-                Err(e) => tracing::warn!("OpenClaw setup failed: {}", e),
             }
         }
 
@@ -2345,7 +2347,9 @@ async fn stream_acp_completion(
             let (tool_tx, tool_rx) = tokio::sync::mpsc::channel(32);
             tool_bridge.set_executor(tool_tx);
             tokio::spawn(crate::wasm::mcp_tool_executor::run_tool_executor(
-                tool_rx, services.clone(), tool_bridge.clone(),
+                tool_rx,
+                services.clone(),
+                tool_bridge.clone(),
             ));
 
             // Spawn permission handler — forwards permission requests to sidebar via browser_ask_user
@@ -2355,7 +2359,8 @@ async fn stream_acp_completion(
             tool_bridge.set_permission_handler(perm_tx);
             if let Some(browser_ctx) = services.browser_context() {
                 tokio::spawn(crate::wasm::mcp_tool_executor::run_permission_handler(
-                    perm_rx, browser_ctx,
+                    perm_rx,
+                    browser_ctx,
                 ));
             }
         } else {
@@ -2367,15 +2372,24 @@ async fn stream_acp_completion(
         None
     };
 
+    // OpenClaw manages tools natively via its own MCP system — don't inject
+    // tool XML into the prompt (it would bloat context by ~30KB and may exceed
+    // the model's context window).
+    let skip_tool_xml = use_mcp_bridge || matches!(provider, ProviderType::OpenClaw);
+
     // Retry with progressive compression on context length errors.
     for level in 0..=2u8 {
-        let content = if use_mcp_bridge {
-            // MCP mode: system prompt WITHOUT tool XML (tools discovered via MCP)
-            build_acp_content_mcp(&request, context_limit, match level {
-                0 => 0.30,
-                1 => 0.15,
-                _ => 0.0,
-            })
+        let content = if skip_tool_xml {
+            // MCP/OpenClaw mode: system prompt WITHOUT tool XML
+            build_acp_content_mcp(
+                &request,
+                context_limit,
+                match level {
+                    0 => 0.30,
+                    1 => 0.15,
+                    _ => 0.0,
+                },
+            )
         } else {
             match level {
                 0 => build_acp_content(&request, context_limit, 0.30),
@@ -2385,17 +2399,18 @@ async fn stream_acp_completion(
         };
 
         let providers = acp_providers().lock().await;
-        let acp = providers.get(&provider_key).ok_or_else(|| {
-            DaemonError::InternalError("ACP provider disappeared".to_string())
-        })?;
+        let acp = providers
+            .get(&provider_key)
+            .ok_or_else(|| DaemonError::InternalError("ACP provider disappeared".to_string()))?;
 
         let session_id = acp.new_session().await.map_err(|e| {
             DaemonError::InternalError(format!("Failed to create ACP session: {}", e))
         })?;
 
-        let mut response_rx = acp.prompt(session_id, content).await.map_err(|e| {
-            DaemonError::InternalError(format!("Failed to send ACP prompt: {}", e))
-        })?;
+        let mut response_rx = acp
+            .prompt(session_id, content)
+            .await
+            .map_err(|e| DaemonError::InternalError(format!("Failed to send ACP prompt: {}", e)))?;
 
         // Drop the lock before doing I/O on the receiver.
         drop(providers);
@@ -3165,10 +3180,7 @@ where
         }
     };
 
-    tracing::info!(
-        "Final: chat_history_len={}",
-        chat_history.len()
-    );
+    tracing::info!("Final: chat_history_len={}", chat_history.len());
 
     let mut builder = completion_model.completion_request(prompt_message);
 
@@ -3279,15 +3291,16 @@ where
                         // Defer tool call to final chunk processing. Update accumulated entry
                         // with metadata and COMPLETE arguments (which may be more complete
                         // than delta-accumulated content for some providers).
-                        let entry = accumulated_tool_calls.entry(tc.id.clone()).or_insert_with(|| {
-                            LlmToolCall {
-                                id: tc.id.clone(),
-                                call_id: None,
-                                name: String::new(),
-                                arguments: serde_json::Value::String(String::new()),
-                                signature: None,
-                            }
-                        });
+                        let entry =
+                            accumulated_tool_calls
+                                .entry(tc.id.clone())
+                                .or_insert_with(|| LlmToolCall {
+                                    id: tc.id.clone(),
+                                    call_id: None,
+                                    name: String::new(),
+                                    arguments: serde_json::Value::String(String::new()),
+                                    signature: None,
+                                });
                         if entry.name.is_empty() {
                             entry.name = tc.function.name.clone();
                         }
@@ -3297,7 +3310,9 @@ where
                         // Some providers send full args in COMPLETE, others only in deltas.
                         let complete_args_len = match &tc.function.arguments {
                             serde_json::Value::String(s) => s.len(),
-                            serde_json::Value::Object(o) if !o.is_empty() => tc.function.arguments.to_string().len(),
+                            serde_json::Value::Object(o) if !o.is_empty() => {
+                                tc.function.arguments.to_string().len()
+                            }
                             _ => 0,
                         };
                         let accumulated_args_len = match &entry.arguments {
@@ -3307,7 +3322,9 @@ where
                         if complete_args_len > 0 && complete_args_len >= accumulated_args_len {
                             tracing::info!(
                                 "Using COMPLETE args (len={}) over accumulated (len={}) for {}",
-                                complete_args_len, accumulated_args_len, tc.id
+                                complete_args_len,
+                                accumulated_args_len,
+                                tc.id
                             );
                             entry.arguments = tc.function.arguments.clone();
                         }

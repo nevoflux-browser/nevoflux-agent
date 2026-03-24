@@ -180,21 +180,24 @@ impl McpToolBridge {
 
     /// Check if a tool is in the session-level always-allow list.
     pub fn is_always_allowed(&self, tool_name: &str) -> bool {
-        self.always_allowed_tools.read().unwrap().contains(tool_name)
+        self.always_allowed_tools
+            .read()
+            .unwrap()
+            .contains(tool_name)
     }
 
     /// Add a tool to the session-level always-allow list.
     pub fn add_always_allowed(&self, tool_name: &str) {
-        self.always_allowed_tools.write().unwrap().insert(tool_name.to_string());
+        self.always_allowed_tools
+            .write()
+            .unwrap()
+            .insert(tool_name.to_string());
     }
 
     /// Check if a tool is low-risk (read-only) and can be auto-approved.
     fn is_low_risk_tool(tool_name: &str) -> bool {
         // Strip MCP prefix if present (e.g. "mcp__nevoflux-tools__browser_get_markdown")
-        let name = tool_name
-            .rsplit("__")
-            .next()
-            .unwrap_or(tool_name);
+        let name = tool_name.rsplit("__").next().unwrap_or(tool_name);
         // Also handle the raw title format from ACP (e.g. "{\"tab_id\":3}")
         // which means the tool name is in the request title, not parsed
         matches!(
@@ -278,7 +281,10 @@ impl McpToolBridge {
                 response
             }
             Err(_) => {
-                tracing::warn!("Permission response channel dropped, rejecting {}", tool_name);
+                tracing::warn!(
+                    "Permission response channel dropped, rejecting {}",
+                    tool_name
+                );
                 PermissionResponse::Reject
             }
         }
@@ -371,10 +377,7 @@ mod tests {
         assert!(bridge.mcp_server_url().is_none());
 
         bridge.set_mcp_server_url("http://127.0.0.1:12345/mcp".to_string());
-        assert_eq!(
-            bridge.mcp_server_url(),
-            Some("http://127.0.0.1:12345/mcp")
-        );
+        assert_eq!(bridge.mcp_server_url(), Some("http://127.0.0.1:12345/mcp"));
     }
 
     #[test]

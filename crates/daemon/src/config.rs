@@ -426,11 +426,9 @@ impl LlmConfig {
                 .api_key
                 .as_deref()
                 .or(Some("kimi-agent-cli")),
-            "openclaw" | "open_claw" | "open-claw" => self
-                .openclaw
-                .api_key
-                .as_deref()
-                .or(Some("openclaw-acp")),
+            "openclaw" | "open_claw" | "open-claw" => {
+                self.openclaw.api_key.as_deref().or(Some("openclaw-acp"))
+            }
             _ => None,
         }
     }

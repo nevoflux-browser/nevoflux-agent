@@ -331,7 +331,11 @@ fn fix_name_error_itertools(code: &str, error_type: &str, error_msg: &str) -> Op
         changed = true;
     }
 
-    if changed { Some(fixed) } else { None }
+    if changed {
+        Some(fixed)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -601,16 +605,11 @@ fn fix_name_error_open(code: &str, error_type: &str, error_msg: &str) -> Option<
                 for bline in &body_lines {
                     let bt = bline.trim();
                     if bt.starts_with(&write_prefix) && bt.ends_with(')') {
-                        let inner =
-                            &bt[write_prefix.len()..bt.len() - 1];
+                        let inner = &bt[write_prefix.len()..bt.len() - 1];
                         content_parts.push(inner.to_string());
                     } else if !bt.is_empty() {
                         // Non-write lines in the block — keep them
-                        other_lines.push(format!(
-                            "{}{}",
-                            block_indent,
-                            bt
-                        ));
+                        other_lines.push(format!("{}{}", block_indent, bt));
                     }
                 }
 
@@ -643,10 +642,8 @@ fn fix_name_error_open(code: &str, error_type: &str, error_msg: &str) -> Option<
                     let bt = bline.trim();
                     if bt.contains(&read_call) {
                         // e.g. "data = f.read()" → "data = read_file(PATH)"
-                        let replaced = bt.replace(
-                            &read_call,
-                            &format!("read_file({})", block.path_expr),
-                        );
+                        let replaced =
+                            bt.replace(&read_call, &format!("read_file({})", block.path_expr));
                         result_lines.push(format!("{}{}", block_indent, replaced));
                         found_read = true;
                     } else if !bt.is_empty() {
@@ -765,9 +762,7 @@ fn fix_name_error_tool_alias(code: &str, error_type: &str, error_msg: &str) -> O
         "write" if code.contains("write(") => {
             Some(replace_function_calls(code, "write", "write_file"))
         }
-        "read" if code.contains("read(") => {
-            Some(replace_function_calls(code, "read", "read_file"))
-        }
+        "read" if code.contains("read(") => Some(replace_function_calls(code, "read", "read_file")),
         _ => None,
     }
 }
@@ -1044,7 +1039,6 @@ fn extract_positional_args(args: &str) -> &str {
     }
     args
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1541,12 +1535,7 @@ mod tests {
     #[test]
     fn test_fix_bare_zip_longest() {
         let code = "result = zip_longest(a, b)";
-        let fixed = try_fix(
-            code,
-            "NameError",
-            "name 'zip_longest' is not defined",
-            None,
-        );
+        let fixed = try_fix(code, "NameError", "name 'zip_longest' is not defined", None);
         assert!(fixed.is_some());
         let fixed = fixed.unwrap();
         assert!(fixed.contains("def _zip_longest_fn("));
@@ -1556,12 +1545,7 @@ mod tests {
     #[test]
     fn test_fix_bare_zip_longest_no_false_positive() {
         let code = "my_zip_longest(a, b)";
-        let fixed = try_fix(
-            code,
-            "NameError",
-            "name 'zip_longest' is not defined",
-            None,
-        );
+        let fixed = try_fix(code, "NameError", "name 'zip_longest' is not defined", None);
         assert!(fixed.is_none());
     }
 
@@ -1570,12 +1554,7 @@ mod tests {
     #[test]
     fn test_fix_bare_ordered_dict() {
         let code = "d = OrderedDict()";
-        let fixed = try_fix(
-            code,
-            "NameError",
-            "name 'OrderedDict' is not defined",
-            None,
-        );
+        let fixed = try_fix(code, "NameError", "name 'OrderedDict' is not defined", None);
         assert!(fixed.is_some());
         assert_eq!(fixed.unwrap(), "d = dict()");
     }
@@ -1583,12 +1562,7 @@ mod tests {
     #[test]
     fn test_fix_ordered_dict_with_args() {
         let code = "d = OrderedDict([(\"a\", 1), (\"b\", 2)])";
-        let fixed = try_fix(
-            code,
-            "NameError",
-            "name 'OrderedDict' is not defined",
-            None,
-        );
+        let fixed = try_fix(code, "NameError", "name 'OrderedDict' is not defined", None);
         assert!(fixed.is_some());
         assert!(fixed.unwrap().contains("dict([(\"a\", 1), (\"b\", 2)])"));
     }
@@ -1598,12 +1572,7 @@ mod tests {
     #[test]
     fn test_fix_bare_deque() {
         let code = "q = deque([1, 2, 3])";
-        let fixed = try_fix(
-            code,
-            "NameError",
-            "name 'deque' is not defined",
-            None,
-        );
+        let fixed = try_fix(code, "NameError", "name 'deque' is not defined", None);
         assert!(fixed.is_some());
         assert_eq!(fixed.unwrap(), "q = list([1, 2, 3])");
     }
@@ -1611,12 +1580,7 @@ mod tests {
     #[test]
     fn test_fix_deque_empty() {
         let code = "q = deque()";
-        let fixed = try_fix(
-            code,
-            "NameError",
-            "name 'deque' is not defined",
-            None,
-        );
+        let fixed = try_fix(code, "NameError", "name 'deque' is not defined", None);
         assert!(fixed.is_some());
         assert_eq!(fixed.unwrap(), "q = list()");
     }
@@ -1681,12 +1645,7 @@ mod tests {
     #[test]
     fn test_fix_functools_prefix() {
         let code = "total = functools.reduce(lambda a, b: a + b, nums)";
-        let fixed = try_fix(
-            code,
-            "NameError",
-            "name 'functools' is not defined",
-            None,
-        );
+        let fixed = try_fix(code, "NameError", "name 'functools' is not defined", None);
         assert!(fixed.is_some());
         let fixed = fixed.unwrap();
         assert!(fixed.contains("reduce(lambda a, b: a + b, nums)"));
@@ -1696,12 +1655,7 @@ mod tests {
     #[test]
     fn test_fix_collections_prefix() {
         let code = "counts = collections.Counter(words)";
-        let fixed = try_fix(
-            code,
-            "NameError",
-            "name 'collections' is not defined",
-            None,
-        );
+        let fixed = try_fix(code, "NameError", "name 'collections' is not defined", None);
         assert!(fixed.is_some());
         let fixed = fixed.unwrap();
         assert!(fixed.contains("Counter(words)"));
@@ -1737,12 +1691,7 @@ mod tests {
     #[test]
     fn test_fix_datetime_prefix() {
         let code = "now = datetime.datetime.now()";
-        let fixed = try_fix(
-            code,
-            "NameError",
-            "name 'datetime' is not defined",
-            None,
-        );
+        let fixed = try_fix(code, "NameError", "name 'datetime' is not defined", None);
         assert!(fixed.is_some());
         // After stripping "datetime.", becomes "now = datetime.now()"
         // (second occurrence gets stripped too → "now = now()" — but auto_fixer
@@ -1754,12 +1703,7 @@ mod tests {
     fn test_fix_unknown_module_unchanged() {
         // Unknown modules should NOT be stripped (avoid breaking valid code)
         let code = "result = numpy.array([1, 2, 3])";
-        let fixed = try_fix(
-            code,
-            "NameError",
-            "name 'numpy' is not defined",
-            None,
-        );
+        let fixed = try_fix(code, "NameError", "name 'numpy' is not defined", None);
         assert!(fixed.is_none());
     }
 
@@ -1909,10 +1853,7 @@ if True:
 
     #[test]
     fn test_extract_positional_multiple_args() {
-        assert_eq!(
-            extract_positional_args("a, b, key=lambda x: x"),
-            "a, b"
-        );
+        assert_eq!(extract_positional_args("a, b, key=lambda x: x"), "a, b");
     }
 
     #[test]

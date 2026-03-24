@@ -353,7 +353,9 @@ pub async fn start_server(
         use nevoflux_mcp::{ManagerConfig, McpManager};
         Arc::new(McpManager::new(ManagerConfig::default()))
     };
-    let tool_search_index = Arc::new(tokio::sync::RwLock::new(nevoflux_mcp::ToolSearchIndex::new()));
+    let tool_search_index = Arc::new(tokio::sync::RwLock::new(
+        nevoflux_mcp::ToolSearchIndex::new(),
+    ));
 
     // Spawn background task: load MCP configs, connect servers, index tools.
     {
@@ -511,15 +513,11 @@ pub async fn start_server(
                                 None
                             }
                             Ok(Err(e)) => {
-                                warn!(
-                                    "Embedding task panicked: {e}, semantic search disabled"
-                                );
+                                warn!("Embedding task panicked: {e}, semantic search disabled");
                                 None
                             }
                             Err(_) => {
-                                warn!(
-                                    "Embedding init timed out (30s), semantic search disabled"
-                                );
+                                warn!("Embedding init timed out (30s), semantic search disabled");
                                 None
                             }
                         };
@@ -549,12 +547,7 @@ pub async fn start_server(
                         }
 
                         // Backfill entries that lack embeddings
-                        backfill_embeddings(
-                            Arc::clone(provider),
-                            backfill_storage,
-                            vi,
-                        )
-                        .await;
+                        backfill_embeddings(Arc::clone(provider), backfill_storage, vi).await;
                     }
                 });
             } else {
@@ -836,16 +829,16 @@ pub async fn start_server(
             config.llm.active_model(),
         ) {
             if let Ok(provider) = provider_str.parse::<nevoflux_llm::ProviderType>() {
-                let mut llm_config = crate::wasm::services::LlmConfig::new(
-                    provider,
-                    api_key,
-                    model,
-                );
+                let mut llm_config =
+                    crate::wasm::services::LlmConfig::new(provider, api_key, model);
                 if let Some(base_url) = config.llm.active_base_url() {
                     llm_config.base_url = Some(base_url.to_string());
                 }
                 services = services.with_llm(llm_config);
-                info!("LLM config set on services: provider={:?}, model={}", provider, model);
+                info!(
+                    "LLM config set on services: provider={:?}, model={}",
+                    provider, model
+                );
             }
         }
     }
@@ -1424,8 +1417,7 @@ fn build_soul_context(services: &HostServices) -> Option<String> {
 /// Replace the MCP Tool Inventory placeholder in TOOLS.md with actual tool data
 /// from connected MCP servers.
 fn populate_mcp_tool_inventory(mut content: String, services: &HostServices) -> String {
-    const PLACEHOLDER: &str =
-        "| (Populated at runtime from MCP registry) | | | | |";
+    const PLACEHOLDER: &str = "| (Populated at runtime from MCP registry) | | | | |";
 
     if !content.contains(PLACEHOLDER) {
         return content;
@@ -2663,13 +2655,24 @@ async fn handle_chat_message_streaming(
                 use nevoflux_llm::providers::acp::mcp_bridge::McpToolBridge;
                 let acp_providers = crate::wasm::llm::acp_providers();
                 let providers = acp_providers.lock().await;
-                info!("Checking {} ACP providers for pending artifacts", providers.len());
+                info!(
+                    "Checking {} ACP providers for pending artifacts",
+                    providers.len()
+                );
                 // Check all providers for pending artifacts
                 for (key, provider) in providers.iter() {
-                    info!("ACP provider '{}': has_tool_bridge={}", key, provider.tool_bridge().is_some());
+                    info!(
+                        "ACP provider '{}': has_tool_bridge={}",
+                        key,
+                        provider.tool_bridge().is_some()
+                    );
                     if let Some(bridge) = provider.tool_bridge() {
                         let pending = bridge.drain_artifacts();
-                        info!("ACP provider '{}': drained {} pending artifacts", key, pending.len());
+                        info!(
+                            "ACP provider '{}': drained {} pending artifacts",
+                            key,
+                            pending.len()
+                        );
                         for pa in pending {
                             let artifact = Artifact {
                                 id: pa.id,
@@ -2746,23 +2749,31 @@ async fn handle_chat_message_streaming(
                 }
             }
 
-            // Merge MCP bridge tool calls with WASM agent tool calls for sidebar display
+            // Merge MCP bridge tool calls with WASM agent tool calls for sidebar display.
+            // ACP providers with use_mcp_bridge=true handle tool calls natively via MCP —
+            // these never appear in output.tool_calls from the WASM agent. We drain them
+            // from the bridge's log so they show up in the sidebar.
             let mut all_tool_calls = output.tool_calls.clone();
             {
                 let acp_providers = crate::wasm::llm::acp_providers();
-                if let Ok(providers) = acp_providers.try_lock() {
-                    for provider in providers.values() {
-                        if let Some(bridge) = provider.tool_bridge() {
-                            let mcp_calls = bridge.drain_tool_calls();
-                            for tc in mcp_calls {
-                                all_tool_calls.push(nevoflux_builtin_wasm::ToolCall {
-                                    id: tc.id,
-                                    call_id: None,
-                                    name: tc.name,
-                                    arguments: tc.arguments,
-                                    signature: None,
-                                });
-                            }
+                let providers = acp_providers.lock().await;
+                for provider in providers.values() {
+                    if let Some(bridge) = provider.tool_bridge() {
+                        let mcp_calls = bridge.drain_tool_calls();
+                        if !mcp_calls.is_empty() {
+                            tracing::info!(
+                                "Draining {} MCP tool calls for sidebar display",
+                                mcp_calls.len()
+                            );
+                        }
+                        for tc in mcp_calls {
+                            all_tool_calls.push(nevoflux_builtin_wasm::ToolCall {
+                                id: tc.id,
+                                call_id: None,
+                                name: tc.name,
+                                arguments: tc.arguments,
+                                signature: None,
+                            });
                         }
                     }
                 }
@@ -3502,11 +3513,16 @@ async fn handle_chat_message(
                     let data = match cmd {
                         "config.openclaw.model.list" => handle_openclaw_model_list().await,
                         "config.openclaw.model.set" => handle_openclaw_model_set(&params).await,
-                        "config.openclaw.model.delete" => handle_openclaw_model_delete(&params).await,
+                        "config.openclaw.model.delete" => {
+                            handle_openclaw_model_delete(&params).await
+                        }
                         "config.openclaw.status" => handle_openclaw_status().await,
                         _ => unreachable!(),
                     };
-                    let success = data.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let success = data
+                        .get("success")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     serde_json::json!({
                         "type": "system_response",
                         "payload": {
@@ -5962,7 +5978,7 @@ async fn handle_openclaw_model_list() -> serde_json::Value {
     }
 
     // Read providers
-    let providers = Command::new("openclaw")
+    let providers = Command::new(crate::openclaw_setup::resolve_openclaw())
         .args(["config", "get", "models.providers"])
         .output()
         .ok()
@@ -5974,7 +5990,7 @@ async fn handle_openclaw_model_list() -> serde_json::Value {
         .unwrap_or(serde_json::json!({}));
 
     // Read primary model
-    let primary = Command::new("openclaw")
+    let primary = Command::new(crate::openclaw_setup::resolve_openclaw())
         .args(["config", "get", "agents.defaults.model.primary"])
         .output()
         .ok()
@@ -6013,15 +6029,39 @@ async fn handle_openclaw_model_set(params: &serde_json::Value) -> serde_json::Va
         }
     };
 
-    let base_url = params.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
+    let base_url = params
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let api_key = params.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
-    let api_type = params.get("api_type").and_then(|v| v.as_str()).unwrap_or("openai-completions");
-    let model_id = params.get("model_id").and_then(|v| v.as_str()).unwrap_or("default");
-    let model_name = params.get("model_name").and_then(|v| v.as_str()).unwrap_or(model_id);
-    let context_window = params.get("context_window").and_then(|v| v.as_u64()).unwrap_or(200000);
-    let max_tokens = params.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(32768);
-    let reasoning = params.get("reasoning").and_then(|v| v.as_bool()).unwrap_or(false);
-    let set_as_primary = params.get("set_as_primary").and_then(|v| v.as_bool()).unwrap_or(false);
+    let api_type = params
+        .get("api_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("openai-completions");
+    let model_id = params
+        .get("model_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
+    let model_name = params
+        .get("model_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(model_id);
+    let context_window = params
+        .get("context_window")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(200000);
+    let max_tokens = params
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(32768);
+    let reasoning = params
+        .get("reasoning")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let set_as_primary = params
+        .get("set_as_primary")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Build provider config JSON
     let provider_config = serde_json::json!({
@@ -6040,9 +6080,10 @@ async fn handle_openclaw_model_set(params: &serde_json::Value) -> serde_json::Va
 
     // Write provider config
     let config_path = format!("models.providers.{}", provider_name);
-    let output = Command::new("openclaw")
+    let output = Command::new(crate::openclaw_setup::resolve_openclaw())
         .args([
-            "config", "set",
+            "config",
+            "set",
             &config_path,
             &serde_json::to_string(&provider_config).unwrap(),
             "--strict-json",
@@ -6066,6 +6107,45 @@ async fn handle_openclaw_model_set(params: &serde_json::Value) -> serde_json::Va
         });
     }
 
+    // Write auth profile so OpenClaw can authenticate with this provider.
+    // OpenClaw requires an entry in ~/.openclaw/agents/main/agent/auth-profiles.json
+    // in addition to the models.json provider config.
+    if !api_key.is_empty() {
+        if let Some(home) = dirs::home_dir() {
+            let auth_path = home.join(".openclaw/agents/main/agent/auth-profiles.json");
+            let mut profiles: serde_json::Value = std::fs::read_to_string(&auth_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| serde_json::json!({"profiles": {}}));
+
+            let profile_key = format!("{}:default", provider_name);
+            if let Some(obj) = profiles.get_mut("profiles").and_then(|p| p.as_object_mut()) {
+                obj.insert(
+                    profile_key,
+                    serde_json::json!({
+                        "type": "api_key",
+                        "provider": provider_name,
+                        "key": api_key,
+                    }),
+                );
+            }
+
+            if let Some(parent) = auth_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) =
+                std::fs::write(&auth_path, serde_json::to_string_pretty(&profiles).unwrap())
+            {
+                tracing::warn!("Failed to write OpenClaw auth-profiles.json: {}", e);
+            } else {
+                tracing::info!(
+                    "Wrote OpenClaw auth profile for provider '{}'",
+                    provider_name
+                );
+            }
+        }
+    }
+
     // Set as primary model if requested
     if set_as_primary {
         // If model_id already contains provider prefix (e.g. "provider/model"), don't double it
@@ -6074,16 +6154,17 @@ async fn handle_openclaw_model_set(params: &serde_json::Value) -> serde_json::Va
         } else {
             format!("{}/{}", provider_name, model_id)
         };
-        let _ = Command::new("openclaw")
+        let _ = Command::new(crate::openclaw_setup::resolve_openclaw())
             .args(["config", "set", "agents.defaults.model.primary", &primary])
             .output();
 
         // Set alias
         let alias_path = format!("agents.defaults.models.{}", primary);
         let alias_value = serde_json::json!({"alias": provider_name});
-        let _ = Command::new("openclaw")
+        let _ = Command::new(crate::openclaw_setup::resolve_openclaw())
             .args([
-                "config", "set",
+                "config",
+                "set",
                 &alias_path,
                 &serde_json::to_string(&alias_value).unwrap(),
                 "--strict-json",
@@ -6121,7 +6202,7 @@ async fn handle_openclaw_model_delete(params: &serde_json::Value) -> serde_json:
     };
 
     let config_path = format!("models.providers.{}", provider_name);
-    let output = Command::new("openclaw")
+    let output = Command::new(crate::openclaw_setup::resolve_openclaw())
         .args(["config", "unset", &config_path])
         .output();
 
@@ -6150,13 +6231,20 @@ async fn handle_openclaw_status() -> serde_json::Value {
 
     let installed = crate::openclaw_setup::is_openclaw_installed();
     let mcp_configured = if installed {
-        crate::openclaw_setup::is_mcp_configured()
+        // Check if NevoFlux MCP server is registered in OpenClaw config
+        std::process::Command::new(crate::openclaw_setup::resolve_openclaw())
+            .args(["config", "get", "tools.mcpServers.nevoflux-tools"])
+            .output()
+            .map(|o| {
+                o.status.success() && !String::from_utf8_lossy(&o.stdout).contains("not found")
+            })
+            .unwrap_or(false)
     } else {
         false
     };
 
     let version = if installed {
-        Command::new("openclaw")
+        Command::new(crate::openclaw_setup::resolve_openclaw())
             .args(["--version"])
             .output()
             .ok()
@@ -6168,7 +6256,7 @@ async fn handle_openclaw_status() -> serde_json::Value {
     };
 
     let gateway_running = if installed {
-        Command::new("openclaw")
+        Command::new(crate::openclaw_setup::resolve_openclaw())
             .args(["health"])
             .output()
             .ok()

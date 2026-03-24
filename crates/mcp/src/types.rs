@@ -198,13 +198,13 @@ pub struct ServerInfo {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerCapabilities {
     /// Whether the server supports tools.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsCapability>,
     /// Whether the server supports resources.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourcesCapability>,
     /// Whether the server supports prompts.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompts: Option<PromptsCapability>,
 }
 

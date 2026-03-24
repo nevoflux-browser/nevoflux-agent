@@ -231,7 +231,9 @@ impl RmcpClient {
         let (transport, stderr_handle) = TokioChildProcess::builder(cmd)
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| McpError::SpawnFailed(format!("{} (resolved: {}): {}", command, resolved_cmd, e)))?;
+            .map_err(|e| {
+                McpError::SpawnFailed(format!("{} (resolved: {}): {}", command, resolved_cmd, e))
+            })?;
 
         // Drain stderr in background, collecting output for failure diagnostics
         let stderr_cmd = command.to_string();
@@ -272,7 +274,10 @@ impl RmcpClient {
                         "MCP server stderr output before failure"
                     );
                 }
-                return Err(McpError::ConnectionFailed(format!("Failed to connect: {:?}", e)));
+                return Err(McpError::ConnectionFailed(format!(
+                    "Failed to connect: {:?}",
+                    e
+                )));
             }
         };
 

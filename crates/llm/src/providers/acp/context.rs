@@ -270,7 +270,8 @@ mod tests {
 
     #[test]
     fn test_compress_tool_with_result() {
-        let content = r#"read_file("config.toml") returned: [workspace]\nmembers = ["daemon", "protocol"]"#;
+        let content =
+            r#"read_file("config.toml") returned: [workspace]\nmembers = ["daemon", "protocol"]"#;
         let result = compress_message("tool", content);
         assert!(result.starts_with("[tool:"));
         assert!(result.len() <= 120);

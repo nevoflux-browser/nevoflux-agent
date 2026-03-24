@@ -151,6 +151,7 @@ fn test_llm_response_to_json_string() {
             completion_tokens: 10,
             total_tokens: 30,
         }),
+        images: vec![],
     };
 
     let json = serde_json::to_string_pretty(&response).unwrap();
@@ -188,6 +189,7 @@ fn test_llm_types_clone() {
         finish_reason: "stop".into(),
         tool_calls: None,
         usage: Some(usage),
+        images: vec![],
     };
     let cloned_response = response.clone();
     assert_eq!(cloned_response.content, "Response");

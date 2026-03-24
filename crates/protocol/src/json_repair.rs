@@ -347,7 +347,10 @@ mod tests {
         let result = parse_tool_arguments_json(truncated);
         assert_eq!(result["title"].as_str().unwrap(), "Test Page");
         assert_eq!(result["content_type"].as_str().unwrap(), "text/html");
-        assert!(result["content"].as_str().unwrap().contains("<!DOCTYPE html>"));
+        assert!(result["content"]
+            .as_str()
+            .unwrap()
+            .contains("<!DOCTYPE html>"));
     }
 
     #[test]

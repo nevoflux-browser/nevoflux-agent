@@ -242,7 +242,8 @@ pub struct SubagentExecutor {
     /// Base services to clone for each subagent.
     base_services: Option<HostServices>,
     /// Optional sidebar stream sender from the parent agent.
-    sidebar_stream_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::agent_host::SidebarStreamChunk>>,
+    sidebar_stream_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<crate::agent_host::SidebarStreamChunk>>,
     /// Agent configuration with provider API keys for subagent LLM calls.
     agent_config: Option<Arc<crate::config::AgentConfig>>,
 }
@@ -378,7 +379,9 @@ impl SubagentExecutor {
         let executor_handle = handle.clone();
         let timeout_secs = self.config.timeout_secs;
         let base_services = self.base_services.clone();
-        let config = self.agent_config.as_ref()
+        let config = self
+            .agent_config
+            .as_ref()
             .map(|c| (**c).clone())
             .unwrap_or_default();
         let sidebar_tx = self.sidebar_stream_tx.clone();
@@ -439,7 +442,9 @@ impl SubagentExecutor {
         config: crate::config::AgentConfig,
         timeout_duration: Duration,
         handle: SubagentHandle,
-        sidebar_stream_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::agent_host::SidebarStreamChunk>>,
+        sidebar_stream_tx: Option<
+            tokio::sync::mpsc::UnboundedSender<crate::agent_host::SidebarStreamChunk>,
+        >,
     ) -> Result<AgentOutput, String> {
         let execution = Self::run_subagent_inner(
             id,
@@ -480,7 +485,9 @@ impl SubagentExecutor {
         base_services: Option<HostServices>,
         config: crate::config::AgentConfig,
         handle: SubagentHandle,
-        sidebar_stream_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::agent_host::SidebarStreamChunk>>,
+        sidebar_stream_tx: Option<
+            tokio::sync::mpsc::UnboundedSender<crate::agent_host::SidebarStreamChunk>,
+        >,
     ) -> Result<AgentOutput, String> {
         use crate::agent_host::DaemonHostFunctions;
         use nevoflux_builtin_wasm::{Agent, AgentConfig as WasmAgentConfig};
@@ -506,7 +513,10 @@ impl SubagentExecutor {
 
         // Apply provider/model override if specified
         if let (Some(provider), Some(model)) = (provider_override, model_override) {
-            debug!("Subagent {}: applying provider/model override: provider={}, model={}", id, provider, model);
+            debug!(
+                "Subagent {}: applying provider/model override: provider={}, model={}",
+                id, provider, model
+            );
             host = host.with_llm_override(provider, model);
         }
 
