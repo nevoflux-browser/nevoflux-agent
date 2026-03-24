@@ -3494,10 +3494,29 @@ async fn handle_chat_message(
                 "config.llm.get" => handle_config_llm_get(&params).await,
                 "config.llm.set" => handle_config_llm_set(&params, shared_config).await,
                 // OpenClaw model configuration commands
-                "config.openclaw.model.list" => handle_openclaw_model_list().await,
-                "config.openclaw.model.set" => handle_openclaw_model_set(&params).await,
-                "config.openclaw.model.delete" => handle_openclaw_model_delete(&params).await,
-                "config.openclaw.status" => handle_openclaw_status().await,
+                // Wrap in system_response envelope (handlers return raw data)
+                cmd @ ("config.openclaw.model.list"
+                | "config.openclaw.model.set"
+                | "config.openclaw.model.delete"
+                | "config.openclaw.status") => {
+                    let data = match cmd {
+                        "config.openclaw.model.list" => handle_openclaw_model_list().await,
+                        "config.openclaw.model.set" => handle_openclaw_model_set(&params).await,
+                        "config.openclaw.model.delete" => handle_openclaw_model_delete(&params).await,
+                        "config.openclaw.status" => handle_openclaw_status().await,
+                        _ => unreachable!(),
+                    };
+                    let success = data.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+                    serde_json::json!({
+                        "type": "system_response",
+                        "payload": {
+                            "request_id": request_id,
+                            "command": cmd,
+                            "success": success,
+                            "data": data
+                        }
+                    })
+                }
                 // Agent config file commands
                 "config.file.read" => handle_config_file_read(&params).await,
                 "config.file.write" => handle_config_file_write(&params).await,
