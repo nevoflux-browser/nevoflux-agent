@@ -101,6 +101,9 @@ hex = "0.4"
 # Native file dialog
 rfd = "0.15"
 
+# CLI detection (for OpenClaw setup)
+which = "7"
+
 # Code Mode - Python interpreter for agent code execution
 monty = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.7" }
 

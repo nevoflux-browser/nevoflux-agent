@@ -3474,6 +3474,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wat",
+ "which",
 ]
 
 [[package]]

@@ -2310,6 +2310,23 @@ async fn stream_acp_completion(
             }
         }
 
+        // For OpenClaw: ensure gateway config is set up (first-time only)
+        if matches!(provider, ProviderType::OpenClaw) {
+            let mcp_port = tool_bridge
+                .mcp_server_url()
+                .and_then(|url| {
+                    url.split(':')
+                        .last()
+                        .and_then(|s| s.trim_end_matches("/mcp").parse::<u16>().ok())
+                })
+                .unwrap_or(19580);
+            match crate::openclaw_setup::ensure_openclaw_configured(mcp_port) {
+                Ok(true) => tracing::info!("OpenClaw first-time setup completed"),
+                Ok(false) => {} // Already configured
+                Err(e) => tracing::warn!("OpenClaw setup failed: {}", e),
+            }
+        }
+
         // Update tool definitions from request
         if let Some(tools) = &request.tools {
             let mcp_tools: Vec<nevoflux_llm::providers::acp::mcp_bridge::McpToolDef> = tools

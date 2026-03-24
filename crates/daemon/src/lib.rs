@@ -31,6 +31,7 @@ pub mod file_picker;
 pub mod health;
 pub mod learning;
 pub mod mcp_config;
+pub mod openclaw_setup;
 pub mod permission;
 pub mod registry;
 pub mod retry;
