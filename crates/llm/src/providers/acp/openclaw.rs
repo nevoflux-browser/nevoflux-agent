@@ -15,7 +15,12 @@ pub fn build_config(work_dir: PathBuf) -> AcpProviderConfig {
     let command = crate::util::resolve_program(OPENCLAW_BINARY);
     AcpProviderConfig {
         command,
-        args: vec!["acp".to_string(), "--reset-session".to_string()],
+        args: vec![
+            "acp".to_string(),
+            "--session".to_string(),
+            "agent:main:nevoflux".to_string(),
+            "--reset-session".to_string(),
+        ],
         env: vec![],
         env_remove: vec![],
         work_dir,
