@@ -37,6 +37,8 @@ pub enum ProviderType {
     GeminiCli,
     /// Kimi Agent CLI (subprocess, wire mode)
     KimiAgent,
+    /// OpenClaw ACP agent (subprocess)
+    OpenClaw,
 }
 
 impl FromStr for ProviderType {
@@ -60,6 +62,7 @@ impl FromStr for ProviderType {
             "claude-code" | "claude_code" => Ok(ProviderType::ClaudeCode),
             "gemini-cli" | "gemini_cli" => Ok(ProviderType::GeminiCli),
             "kimi-agent" | "kimi_agent" | "kimi" => Ok(ProviderType::KimiAgent),
+            "openclaw" | "open_claw" | "open-claw" => Ok(ProviderType::OpenClaw),
             _ => Err(format!("Unknown provider: {}", s)),
         }
     }
@@ -137,6 +140,7 @@ pub fn default_model_for(provider: ProviderType) -> &'static str {
         ProviderType::ClaudeCode => "sonnet",
         ProviderType::GeminiCli => "gemini-2.5-pro",
         ProviderType::KimiAgent => "kimi-latest",
+        ProviderType::OpenClaw => "default",
     }
 }
 
@@ -159,6 +163,7 @@ pub fn default_context_window_for(provider: ProviderType) -> u32 {
         ProviderType::ClaudeCode => 200_000,
         ProviderType::GeminiCli => 1_000_000,
         ProviderType::KimiAgent => 128_000,
+        ProviderType::OpenClaw => 200_000,
     }
 }
 
@@ -181,6 +186,7 @@ pub fn api_key_env_var(provider: ProviderType) -> &'static str {
         ProviderType::ClaudeCode => "ANTHROPIC_API_KEY",
         ProviderType::GeminiCli => "GEMINI_API_KEY",
         ProviderType::KimiAgent => "MOONSHOT_API_KEY",
+        ProviderType::OpenClaw => "OPENCLAW_API_KEY",
     }
 }
 
@@ -383,6 +389,7 @@ mod tests {
             ProviderType::ClaudeCode,
             ProviderType::GeminiCli,
             ProviderType::KimiAgent,
+            ProviderType::OpenClaw,
         ];
 
         for provider in providers {
@@ -414,6 +421,7 @@ mod tests {
             ProviderType::ClaudeCode,
             ProviderType::GeminiCli,
             ProviderType::KimiAgent,
+            ProviderType::OpenClaw,
         ];
 
         for provider in providers {
@@ -504,6 +512,18 @@ mod tests {
         assert_eq!(
             ProviderType::from_str("kimi").unwrap(),
             ProviderType::KimiAgent
+        );
+        assert_eq!(
+            ProviderType::from_str("openclaw").unwrap(),
+            ProviderType::OpenClaw
+        );
+        assert_eq!(
+            ProviderType::from_str("open_claw").unwrap(),
+            ProviderType::OpenClaw
+        );
+        assert_eq!(
+            ProviderType::from_str("open-claw").unwrap(),
+            ProviderType::OpenClaw
         );
     }
 

@@ -338,6 +338,10 @@ pub struct LlmConfig {
     #[serde(default)]
     pub kimi_agent: ProviderConfig,
 
+    /// OpenClaw ACP-specific configuration.
+    #[serde(default)]
+    pub openclaw: ProviderConfig,
+
     /// Maximum tokens for responses.
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
@@ -422,6 +426,11 @@ impl LlmConfig {
                 .api_key
                 .as_deref()
                 .or(Some("kimi-agent-cli")),
+            "openclaw" | "open_claw" | "open-claw" => self
+                .openclaw
+                .api_key
+                .as_deref()
+                .or(Some("openclaw-acp")),
             _ => None,
         }
     }
@@ -445,6 +454,7 @@ impl LlmConfig {
             "perplexity" => self.perplexity.model.as_deref(),
             "together" => self.together.model.as_deref(),
             "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.model.as_deref(),
+            "openclaw" | "open_claw" | "open-claw" => self.openclaw.model.as_deref(),
             _ => self.default_model.as_deref(),
         }
     }
@@ -468,6 +478,7 @@ impl LlmConfig {
             "perplexity" => self.perplexity.model.as_deref(),
             "together" => self.together.model.as_deref(),
             "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.model.as_deref(),
+            "openclaw" | "open_claw" | "open-claw" => self.openclaw.model.as_deref(),
             _ => None,
         }
     }
@@ -491,6 +502,7 @@ impl LlmConfig {
             "perplexity" => self.perplexity.base_url.as_deref(),
             "together" => self.together.base_url.as_deref(),
             "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.base_url.as_deref(),
+            "openclaw" | "open_claw" | "open-claw" => self.openclaw.base_url.as_deref(),
             _ => None,
         }
     }
@@ -514,6 +526,7 @@ impl LlmConfig {
             "perplexity" => self.perplexity.base_url.as_deref(),
             "together" => self.together.base_url.as_deref(),
             "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.base_url.as_deref(),
+            "openclaw" | "open_claw" | "open-claw" => self.openclaw.base_url.as_deref(),
             _ => None,
         }
     }
@@ -545,6 +558,7 @@ impl LlmConfig {
             "perplexity" => self.perplexity.use_streaming,
             "together" => self.together.use_streaming,
             "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.use_streaming,
+            "openclaw" | "open_claw" | "open-claw" => self.openclaw.use_streaming,
             _ => None,
         }
         .unwrap_or(true)
@@ -555,7 +569,7 @@ impl LlmConfig {
     pub fn configured_providers(&self) -> Vec<(String, String)> {
         let mut result = Vec::new();
         let active = self.active_provider();
-        let providers: [(&str, &ProviderConfig); 16] = [
+        let providers: [(&str, &ProviderConfig); 17] = [
             ("anthropic", &self.anthropic),
             ("openai", &self.openai),
             ("openrouter", &self.openrouter),
@@ -572,6 +586,7 @@ impl LlmConfig {
             ("perplexity", &self.perplexity),
             ("together", &self.together),
             ("kimi-agent", &self.kimi_agent),
+            ("openclaw", &self.openclaw),
         ];
 
         for (name, config) in &providers {
@@ -618,6 +633,9 @@ impl LlmConfig {
             Some("kimi-agent") | Some("kimi_agent") | Some("kimi") => {
                 self.kimi_agent.context_window
             }
+            Some("openclaw") | Some("open_claw") | Some("open-claw") => {
+                self.openclaw.context_window
+            }
             _ => None,
         };
 
@@ -659,6 +677,7 @@ impl Default for LlmConfig {
             perplexity: ProviderConfig::default(),
             together: ProviderConfig::default(),
             kimi_agent: ProviderConfig::default(),
+            openclaw: ProviderConfig::default(),
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
             timeout_secs: default_timeout_secs(),

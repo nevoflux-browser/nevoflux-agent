@@ -22,5 +22,6 @@ pub fn build_config(model: &str, work_dir: PathBuf) -> AcpProviderConfig {
         work_dir,
         session_mode: "default".to_string(),
         use_mcp_bridge: true,
+        inject_mcp_url: true,
     }
 }

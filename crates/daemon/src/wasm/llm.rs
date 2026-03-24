@@ -360,7 +360,7 @@ pub async fn execute_llm_chat(
         ProviderType::Together => {
             execute_together_chat(api_key, model, request, provider, base_url).await
         }
-        ProviderType::ClaudeCode | ProviderType::GeminiCli => {
+        ProviderType::ClaudeCode | ProviderType::GeminiCli | ProviderType::OpenClaw => {
             Err(DaemonError::InternalError(
                 "ACP providers only support streaming mode".to_string(),
             ))
@@ -1717,7 +1717,7 @@ async fn execute_llm_stream_inner(
         ProviderType::Together => {
             stream_together(api_key, model, request, tx, provider, base_url).await
         }
-        ProviderType::ClaudeCode | ProviderType::GeminiCli => {
+        ProviderType::ClaudeCode | ProviderType::GeminiCli | ProviderType::OpenClaw => {
             stream_acp_completion(api_key, model, request, tx, provider, base_url, _host_services)
                 .await
         }
@@ -2255,6 +2255,11 @@ async fn stream_acp_completion(
                 ProviderType::GeminiCli => {
                     nevoflux_llm::providers::acp::gemini::build_config(
                         model,
+                        std::path::PathBuf::from(&work_dir),
+                    )
+                }
+                ProviderType::OpenClaw => {
+                    nevoflux_llm::providers::acp::openclaw::build_config(
                         std::path::PathBuf::from(&work_dir),
                     )
                 }

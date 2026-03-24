@@ -8,6 +8,7 @@ pub mod claude;
 pub mod context;
 pub mod gemini;
 pub mod mcp_bridge;
+pub mod openclaw;
 pub mod tools;
 
 // Re-export key schema types so downstream crates (e.g. nevoflux-daemon)
@@ -69,6 +70,9 @@ pub struct AcpProviderConfig {
     /// When true, use MCP server for native tool calling.
     /// When false, use <tool_call> XML extraction.
     pub use_mcp_bridge: bool,
+    /// Whether to inject MCP URL into NewSessionRequest.
+    /// false for OpenClaw (registers via gateway config instead).
+    pub inject_mcp_url: bool,
 }
 
 /// Internal request sent from `AcpProvider` to the background client loop.
@@ -536,13 +540,15 @@ async fn handle_requests(
                     "ACP: sending NewSessionRequest"
                 );
                 let mut request = NewSessionRequest::new(config.work_dir.clone());
-                if let Some(ref bridge) = tool_bridge {
-                    if let Some(url) = bridge.mcp_server_url() {
-                        use sacp::schema::McpServerHttp;
-                        request.mcp_servers.push(sacp::schema::McpServer::Http(
-                            McpServerHttp::new("nevoflux-tools", url),
-                        ));
-                        tracing::info!("ACP: injecting MCP server URL into session: {}", url);
+                if config.inject_mcp_url {
+                    if let Some(ref bridge) = tool_bridge {
+                        if let Some(url) = bridge.mcp_server_url() {
+                            use sacp::schema::McpServerHttp;
+                            request.mcp_servers.push(sacp::schema::McpServer::Http(
+                                McpServerHttp::new("nevoflux-tools", url),
+                            ));
+                            tracing::info!("ACP: injecting MCP server URL into session: {}", url);
+                        }
                     }
                 }
                 let session = cx
