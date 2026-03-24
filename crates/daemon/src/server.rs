@@ -5632,6 +5632,7 @@ fn get_provider_config_mut<'a>(
         "claude-code" | "claude_code" => Some(&mut llm.claude_code),
         "gemini-cli" | "gemini_cli" => Some(&mut llm.gemini_cli),
         "kimi-agent" | "kimi_agent" | "kimi" => Some(&mut llm.kimi_agent),
+        "openclaw" | "open_claw" | "open-claw" => Some(&mut llm.openclaw),
         _ => None,
     }
 }
