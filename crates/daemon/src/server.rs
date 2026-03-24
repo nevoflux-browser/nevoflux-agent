@@ -3493,6 +3493,11 @@ async fn handle_chat_message(
                 "config.llm.list" => handle_config_llm_list(&params).await,
                 "config.llm.get" => handle_config_llm_get(&params).await,
                 "config.llm.set" => handle_config_llm_set(&params, shared_config).await,
+                // OpenClaw model configuration commands
+                "config.openclaw.model.list" => handle_openclaw_model_list().await,
+                "config.openclaw.model.set" => handle_openclaw_model_set(&params).await,
+                "config.openclaw.model.delete" => handle_openclaw_model_delete(&params).await,
+                "config.openclaw.status" => handle_openclaw_status().await,
                 // Agent config file commands
                 "config.file.read" => handle_config_file_read(&params).await,
                 "config.file.write" => handle_config_file_write(&params).await,
@@ -5912,6 +5917,244 @@ async fn handle_config_llm_set(
 /// Allowlist of config filenames that can be read/written via the config.file commands.
 const CONFIG_FILE_ALLOWLIST: &[&str] =
     &["IDENTITY.md", "SOUL.md", "USER.md", "TOOLS.md", "AGENTS.md"];
+
+// ============================================================================
+// OpenClaw model configuration commands
+// ============================================================================
+
+/// Handle config.openclaw.model.list — list configured OpenClaw models/providers.
+async fn handle_openclaw_model_list() -> serde_json::Value {
+    use std::process::Command;
+
+    if !crate::openclaw_setup::is_openclaw_installed() {
+        return serde_json::json!({
+            "command": "config.openclaw.model.list",
+            "success": false,
+            "error": "OpenClaw is not installed"
+        });
+    }
+
+    // Read providers
+    let providers = Command::new("openclaw")
+        .args(["config", "get", "models.providers"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            serde_json::from_str::<serde_json::Value>(&s).ok()
+        })
+        .unwrap_or(serde_json::json!({}));
+
+    // Read primary model
+    let primary = Command::new("openclaw")
+        .args(["config", "get", "agents.defaults.model.primary"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "command": "config.openclaw.model.list",
+        "success": true,
+        "providers": providers,
+        "primary_model": primary
+    })
+}
+
+/// Handle config.openclaw.model.set — configure an OpenClaw model/provider.
+async fn handle_openclaw_model_set(params: &serde_json::Value) -> serde_json::Value {
+    use std::process::Command;
+
+    if !crate::openclaw_setup::is_openclaw_installed() {
+        return serde_json::json!({
+            "command": "config.openclaw.model.set",
+            "success": false,
+            "error": "OpenClaw is not installed"
+        });
+    }
+
+    let provider_name = match params.get("provider_name").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => {
+            return serde_json::json!({
+                "command": "config.openclaw.model.set",
+                "success": false,
+                "error": "Missing provider_name"
+            });
+        }
+    };
+
+    let base_url = params.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
+    let api_key = params.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
+    let api_type = params.get("api_type").and_then(|v| v.as_str()).unwrap_or("openai-completions");
+    let model_id = params.get("model_id").and_then(|v| v.as_str()).unwrap_or("default");
+    let model_name = params.get("model_name").and_then(|v| v.as_str()).unwrap_or(model_id);
+    let context_window = params.get("context_window").and_then(|v| v.as_u64()).unwrap_or(200000);
+    let max_tokens = params.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(32768);
+    let reasoning = params.get("reasoning").and_then(|v| v.as_bool()).unwrap_or(false);
+    let set_as_primary = params.get("set_as_primary").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Build provider config JSON
+    let provider_config = serde_json::json!({
+        "baseUrl": base_url,
+        "apiKey": api_key,
+        "api": api_type,
+        "models": [{
+            "id": model_id,
+            "name": model_name,
+            "reasoning": reasoning,
+            "input": ["text"],
+            "contextWindow": context_window,
+            "maxTokens": max_tokens
+        }]
+    });
+
+    // Write provider config
+    let config_path = format!("models.providers.{}", provider_name);
+    let output = Command::new("openclaw")
+        .args([
+            "config", "set",
+            &config_path,
+            &serde_json::to_string(&provider_config).unwrap(),
+            "--strict-json",
+        ])
+        .output();
+
+    if let Err(e) = output {
+        return serde_json::json!({
+            "command": "config.openclaw.model.set",
+            "success": false,
+            "error": format!("Failed to run openclaw config set: {}", e)
+        });
+    }
+
+    let output = output.unwrap();
+    if !output.status.success() {
+        return serde_json::json!({
+            "command": "config.openclaw.model.set",
+            "success": false,
+            "error": format!("openclaw config set failed: {}", String::from_utf8_lossy(&output.stderr))
+        });
+    }
+
+    // Set as primary model if requested
+    if set_as_primary {
+        let primary = format!("{}/{}", provider_name, model_id);
+        let _ = Command::new("openclaw")
+            .args(["config", "set", "agents.defaults.model.primary", &primary])
+            .output();
+
+        // Set alias
+        let alias_path = format!("agents.defaults.models.{}/{}", provider_name, model_id);
+        let alias_value = serde_json::json!({"alias": provider_name});
+        let _ = Command::new("openclaw")
+            .args([
+                "config", "set",
+                &alias_path,
+                &serde_json::to_string(&alias_value).unwrap(),
+                "--strict-json",
+            ])
+            .output();
+    }
+
+    info!(
+        "OpenClaw model configured: provider={}, model={}, primary={}",
+        provider_name, model_id, set_as_primary
+    );
+
+    serde_json::json!({
+        "command": "config.openclaw.model.set",
+        "success": true,
+        "provider_name": provider_name,
+        "model_id": model_id,
+        "set_as_primary": set_as_primary
+    })
+}
+
+/// Handle config.openclaw.model.delete — remove an OpenClaw model/provider.
+async fn handle_openclaw_model_delete(params: &serde_json::Value) -> serde_json::Value {
+    use std::process::Command;
+
+    let provider_name = match params.get("provider_name").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => {
+            return serde_json::json!({
+                "command": "config.openclaw.model.delete",
+                "success": false,
+                "error": "Missing provider_name"
+            });
+        }
+    };
+
+    let config_path = format!("models.providers.{}", provider_name);
+    let output = Command::new("openclaw")
+        .args(["config", "unset", &config_path])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => serde_json::json!({
+            "command": "config.openclaw.model.delete",
+            "success": true,
+            "provider_name": provider_name
+        }),
+        Ok(o) => serde_json::json!({
+            "command": "config.openclaw.model.delete",
+            "success": false,
+            "error": String::from_utf8_lossy(&o.stderr).to_string()
+        }),
+        Err(e) => serde_json::json!({
+            "command": "config.openclaw.model.delete",
+            "success": false,
+            "error": format!("Failed to run openclaw: {}", e)
+        }),
+    }
+}
+
+/// Handle config.openclaw.status — check OpenClaw installation and gateway status.
+async fn handle_openclaw_status() -> serde_json::Value {
+    use std::process::Command;
+
+    let installed = crate::openclaw_setup::is_openclaw_installed();
+    let mcp_configured = if installed {
+        crate::openclaw_setup::is_mcp_configured()
+    } else {
+        false
+    };
+
+    let version = if installed {
+        Command::new("openclaw")
+            .args(["--version"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let gateway_running = if installed {
+        Command::new("openclaw")
+            .args(["health"])
+            .output()
+            .ok()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    serde_json::json!({
+        "command": "config.openclaw.status",
+        "success": true,
+        "installed": installed,
+        "version": version,
+        "mcp_configured": mcp_configured,
+        "gateway_running": gateway_running
+    })
+}
 
 /// Handle config.file.read command.
 ///
