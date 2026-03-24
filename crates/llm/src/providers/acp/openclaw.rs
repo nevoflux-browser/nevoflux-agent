@@ -19,7 +19,7 @@ pub fn build_config(work_dir: PathBuf) -> AcpProviderConfig {
         env: vec![],
         env_remove: vec![],
         work_dir,
-        session_mode: "default".to_string(),
+        session_mode: "high".to_string(), // OpenClaw uses thinking levels: off/minimal/low/medium/high/adaptive
         use_mcp_bridge: true,
         inject_mcp_url: false, // OpenClaw registers MCP via gateway config
     }
