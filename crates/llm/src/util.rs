@@ -82,12 +82,12 @@ pub fn build_search_path() -> Option<std::ffi::OsString> {
             if fnm_bin.is_dir() {
                 extra_dirs.push(fnm_bin);
             }
+        }
 
-            // Homebrew on macOS
-            #[cfg(target_os = "macos")]
-            {
-                extra_dirs.push(std::path::PathBuf::from("/opt/homebrew/bin"));
-            }
+        // Homebrew on macOS (outside HOME block — always add for Apple Silicon + Intel)
+        #[cfg(target_os = "macos")]
+        {
+            extra_dirs.push(std::path::PathBuf::from("/opt/homebrew/bin"));
         }
         extra_dirs.push(std::path::PathBuf::from("/usr/local/bin"));
     }
