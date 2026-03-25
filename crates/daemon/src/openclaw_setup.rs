@@ -369,33 +369,112 @@ fn install_plugin() -> Result<(), String> {
     Ok(())
 }
 
-/// Run OpenClaw setup — installs NevoFlux tools plugin.
-///
-/// The plugin bridges NevoFlux tools to OpenClaw via HTTP MCP, using the same
-/// MCP server that Claude Code and Gemini CLI connect to.
-///
-/// Returns Ok(true) if first-time setup was performed, Ok(false) if already configured.
-pub fn ensure_openclaw_configured() -> Result<bool, String> {
-    if !is_openclaw_installed() {
-        return Err(
-            "OpenClaw is not installed. Install with: npm install -g openclaw@latest && openclaw onboard"
-                .to_string(),
+/// Check if OpenClaw gateway is running.
+pub fn is_gateway_running() -> bool {
+    Command::new(resolve_openclaw())
+        .args(["health"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Start OpenClaw gateway in the background.
+pub fn start_gateway() -> Result<(), String> {
+    if is_gateway_running() {
+        return Ok(()); // Already running
+    }
+    // Use `openclaw gateway` which handles daemonization internally
+    let output = Command::new(resolve_openclaw())
+        .args(["gateway", "--port", "18789"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to start gateway: {}", e))?;
+    drop(output); // Detach — gateway runs independently
+    // Wait for gateway to become healthy
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if is_gateway_running() {
+            tracing::info!("OpenClaw gateway started");
+            return Ok(());
+        }
+    }
+    Err("Gateway started but not responding after 10s".to_string())
+}
+
+/// Restart OpenClaw gateway (needed after plugin install).
+fn restart_gateway() {
+    // Kill existing gateway, let start_gateway() spawn a new one
+    let _ = Command::new(resolve_openclaw())
+        .args(["gateway", "stop"])
+        .output();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let _ = start_gateway();
+}
+
+/// Check if NevoFlux plugin is installed in OpenClaw extensions.
+pub fn is_plugin_installed() -> bool {
+    dirs::home_dir()
+        .map(|h| h.join(".openclaw/extensions/nevoflux-tools/index.ts").exists())
+        .unwrap_or(false)
+}
+
+/// Write OpenClaw auth profile for a provider.
+pub fn write_auth_profile(provider_name: &str, api_key: &str) -> Result<(), String> {
+    if api_key.is_empty() {
+        return Ok(());
+    }
+    let home = dirs::home_dir().ok_or("Cannot determine home directory")?;
+    let auth_path = home.join(".openclaw/agents/main/agent/auth-profiles.json");
+
+    let mut profiles: serde_json::Value = std::fs::read_to_string(&auth_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({"profiles": {}}));
+
+    let profile_key = format!("{}:default", provider_name);
+    if let Some(obj) = profiles.get_mut("profiles").and_then(|p| p.as_object_mut()) {
+        obj.insert(
+            profile_key,
+            serde_json::json!({
+                "type": "api_key",
+                "provider": provider_name,
+                "key": api_key,
+            }),
         );
     }
 
-    let plugin_dir = dirs::home_dir()
-        .ok_or_else(|| "Cannot determine home directory".to_string())?
-        .join(".openclaw/extensions/nevoflux-tools");
+    if let Some(parent) = auth_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&auth_path, serde_json::to_string_pretty(&profiles).unwrap())
+        .map_err(|e| format!("Failed to write auth-profiles.json: {}", e))?;
+    tracing::info!("Wrote OpenClaw auth profile for '{}'", provider_name);
+    Ok(())
+}
 
-    if plugin_dir.join("index.ts").exists() {
-        return Ok(false); // Already configured
+/// Full auto-setup: install plugin, configure permissions, start gateway.
+/// Called from handle_openclaw_model_set after saving model config.
+/// Returns (needs_browser_restart, message).
+pub fn full_auto_setup() -> (bool, String) {
+    let mut steps: Vec<String> = Vec::new();
+    let mut needs_restart = false;
+
+    // Step 1: Install plugin if needed
+    if !is_plugin_installed() {
+        match install_plugin() {
+            Ok(()) => {
+                steps.push("Installed NevoFlux tools plugin".to_string());
+                needs_restart = true;
+            }
+            Err(e) => return (false, format!("Failed to install plugin: {}", e)),
+        }
     }
 
-    // First-time setup
-    install_plugin()?;
-    let _ = disable_openclaw_browser(); // Best effort
+    // Step 2: Configure tools.deny (disable conflicting built-in tools)
+    let _ = disable_openclaw_browser();
 
-    // Enable plugin in plugins.allow (required for non-bundled extensions)
+    // Step 3: Enable plugin in plugins.allow
     let _ = Command::new(resolve_openclaw())
         .args([
             "config",
@@ -406,6 +485,44 @@ pub fn ensure_openclaw_configured() -> Result<bool, String> {
         ])
         .output();
 
-    tracing::info!("OpenClaw first-time setup complete. Restart OpenClaw gateway to load plugin.");
+    // Step 4: Start or restart gateway
+    if needs_restart || !is_gateway_running() {
+        if is_gateway_running() {
+            steps.push("Restarting gateway to load plugin".to_string());
+            restart_gateway();
+        } else {
+            match start_gateway() {
+                Ok(()) => steps.push("Started OpenClaw gateway".to_string()),
+                Err(e) => steps.push(format!("Gateway start failed: {}", e)),
+            }
+        }
+    }
+
+    if steps.is_empty() {
+        (false, "OpenClaw already configured".to_string())
+    } else {
+        (needs_restart, steps.join("; "))
+    }
+}
+
+/// Run OpenClaw setup — installs NevoFlux tools plugin.
+/// Called when OpenClaw ACP session starts (before connect).
+///
+/// Returns Ok(true) if first-time setup was performed, Ok(false) if already configured.
+pub fn ensure_openclaw_configured() -> Result<bool, String> {
+    if !is_openclaw_installed() {
+        return Err(
+            "OpenClaw is not installed. Install with: npm install -g openclaw@latest && openclaw onboard"
+                .to_string(),
+        );
+    }
+
+    if is_plugin_installed() {
+        return Ok(false); // Already configured
+    }
+
+    // First-time setup (via full_auto_setup)
+    let (_, msg) = full_auto_setup();
+    tracing::info!("OpenClaw first-time setup: {}", msg);
     Ok(true)
 }
