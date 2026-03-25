@@ -214,10 +214,6 @@ export default definePluginEntry({{
       text: Type.String(),
       tab_id: Type.Optional(Type.Number()),
     }})));
-    api.registerTool(tool("browser_get_markdown", "Read page as Markdown", Type.Object({{
-      tab_id: Type.Optional(Type.Number()),
-    }})));
-
     // Web tools
     api.registerTool(tool("web_search", "Search the web", Type.Object({{
       query: Type.String({{ description: "Search query" }}),
