@@ -386,10 +386,10 @@ async fn execute_anthropic_chat(
 
 /// Execute a chat request using the OpenAI provider.
 ///
-/// Always uses the Chat Completions API (`/chat/completions`) via `CompletionsClient`.
-/// The Responses API (`/responses`) is avoided because:
-/// - It enforces strict schema validation (all properties must be required)
-/// - It has compatibility issues on Windows (HTTP/2 + rustls transport errors)
+/// When `base_url` is empty, uses rig's standard `openai::Client` which connects
+/// to the official OpenAI API (Responses API at `/v1/responses`).
+/// When `base_url` is set, uses `openai::CompletionsClient` for OpenAI-compatible
+/// endpoints (Chat Completions API at `/chat/completions`).
 async fn execute_openai_chat(
     api_key: &str,
     model: &str,
@@ -397,15 +397,29 @@ async fn execute_openai_chat(
     provider: ProviderType,
     base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    let mut builder = openai::CompletionsClient::builder().api_key(api_key);
     if let Some(url) = base_url {
-        builder = builder.base_url(url);
+        // Custom endpoint: use Chat Completions API (/chat/completions)
+        let client: openai::CompletionsClient = openai::CompletionsClient::builder()
+            .api_key(api_key)
+            .base_url(url)
+            .build()
+            .map_err(|e| {
+                DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
+            })?;
+        let completion_model = client.completion_model(model);
+        execute_rig_completion(completion_model, request, provider).await
+    } else {
+        // Official OpenAI: use rig's standard client (Responses API)
+        let client: openai::Client =
+            openai::Client::builder()
+                .api_key(api_key)
+                .build()
+                .map_err(|e| {
+                    DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
+                })?;
+        let completion_model = client.completion_model(model);
+        execute_rig_completion(completion_model, request, provider).await
     }
-    let client: openai::CompletionsClient = builder.build().map_err(|e| {
-        DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
-    })?;
-    let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request, provider).await
 }
 
 /// Execute a chat request using the OpenRouter provider (native rig provider).
@@ -1748,7 +1762,8 @@ async fn stream_anthropic(
 
 /// Stream from OpenAI provider.
 ///
-/// Always uses the Chat Completions API (`/chat/completions`) via `CompletionsClient`.
+/// When `base_url` is empty, uses rig's standard `openai::Client` (Responses API).
+/// When `base_url` is set, uses `openai::CompletionsClient` (Chat Completions API).
 async fn stream_openai(
     api_key: &str,
     model: &str,
@@ -1757,15 +1772,29 @@ async fn stream_openai(
     provider: ProviderType,
     base_url: Option<&str>,
 ) -> Result<()> {
-    let mut builder = openai::CompletionsClient::builder().api_key(api_key);
     if let Some(url) = base_url {
-        builder = builder.base_url(url);
+        // Custom endpoint: use Chat Completions API (/chat/completions)
+        let client: openai::CompletionsClient = openai::CompletionsClient::builder()
+            .api_key(api_key)
+            .base_url(url)
+            .build()
+            .map_err(|e| {
+                DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
+            })?;
+        let completion_model = client.completion_model(model);
+        stream_rig_completion(completion_model, request, tx, provider).await
+    } else {
+        // Official OpenAI: use rig's standard client (Responses API)
+        let client: openai::Client =
+            openai::Client::builder()
+                .api_key(api_key)
+                .build()
+                .map_err(|e| {
+                    DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
+                })?;
+        let completion_model = client.completion_model(model);
+        stream_rig_completion(completion_model, request, tx, provider).await
     }
-    let client: openai::CompletionsClient = builder.build().map_err(|e| {
-        DaemonError::InternalError(format!("Failed to create OpenAI client: {}", e))
-    })?;
-    let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx, provider).await
 }
 
 /// Stream from OpenRouter provider.
