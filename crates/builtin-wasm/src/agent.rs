@@ -1673,7 +1673,16 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let metadata = tool_call
                     .arguments
                     .get("metadata")
-                    .cloned()
+                    .and_then(|v| {
+                        // Accept both object (direct JSON) and string (JSON-encoded)
+                        if v.is_object() {
+                            Some(v.clone())
+                        } else {
+                            v.as_str()
+                                .filter(|s| !s.is_empty())
+                                .and_then(|s| serde_json::from_str(s).ok())
+                        }
+                    })
                     .unwrap_or(serde_json::json!({}));
                 let id = self.host.memory_create(content, &metadata)?;
                 serde_json::json!({"id": id, "status": "created"}).to_string()
@@ -2701,8 +2710,8 @@ The following skill instructions MUST be followed exactly. These instructions ta
                             "description": "The information to remember"
                         },
                         "metadata": {
-                            "type": "object",
-                            "description": "Optional metadata (e.g., {\"category\": \"preference\", \"domain\": \"example.com\"})"
+                            "type": "string",
+                            "description": "Optional JSON metadata (e.g., \"{\\\"category\\\": \\\"preference\\\", \\\"domain\\\": \\\"example.com\\\"}\")"
                         }
                     },
                     "required": ["content"]
