@@ -1,74 +1,54 @@
-# Native Messaging Host Setup
+# Update NevoFlux Agent
 
-Setup scripts to register the NevoFlux Agent as a native messaging host for NevoFlux browser (Firefox-based).
+Scripts to update the agent binary in an existing NevoFlux browser installation, without rebuilding the browser.
 
-## Files
-
-- `setup.sh` - Setup script for Linux, macOS, and Windows (MSYS/Git Bash)
-- `setup.ps1` - Setup script for Windows (PowerShell)
-- `com.nevoflux.agent.json.template` - Manifest template
-
-## Binary Resolution
-
-Both scripts resolve the agent binary in this order:
-
-1. **Explicit path** - command line argument or `-BinaryPath` parameter
-2. **Environment variable** - `NEVOFLUX_AGENT_BIN`
-3. **PATH lookup** - `which nevoflux-agent`
-4. **Local dev build** - `../../target/release/nevoflux-agent`
-5. **GitHub release download** - latest release from `dorisgyl/nevoflux-agent`
+NevoFlux browser already handles native messaging registration automatically via `NevofluxNativeHostRegistrar`. These scripts only replace the agent binary in `distribution/bin/`.
 
 ## Usage
 
 ### Linux/macOS
 
 ```bash
-# Auto-detect binary (tries all resolution methods)
-./setup.sh
+# Auto-detect agent binary and browser location
+./update-agent.sh
 
-# Specify binary path
-./setup.sh /path/to/nevoflux-agent
+# Download latest release from GitHub
+./update-agent.sh --download
+
+# Specify paths explicitly
+./update-agent.sh --agent /path/to/nevoflux-agent --browser /path/to/nevoflux
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
-# Auto-detect binary
-.\setup.ps1
+# Auto-detect
+.\update-agent.ps1
 
-# Specify binary path
-.\setup.ps1 -BinaryPath "C:\path\to\nevoflux-agent.exe"
+# Download latest release from GitHub
+.\update-agent.ps1 -Download
+
+# Specify paths explicitly
+.\update-agent.ps1 -AgentPath "C:\path\to\nevoflux-agent.exe" -BrowserDir "C:\path\to\nevoflux"
 ```
 
-## What the Scripts Do
+## Agent Binary Resolution
 
-1. Locate or download the `nevoflux-agent` binary
-2. Create the native messaging manifest at the platform-specific location:
-   - **Linux**: `~/.mozilla/native-messaging-hosts/com.nevoflux.agent.json`
-   - **macOS**: `~/Library/Application Support/Mozilla/NativeMessagingHosts/com.nevoflux.agent.json`
-   - **Windows**: `%APPDATA%\Mozilla\NativeMessagingHosts\com.nevoflux.agent.json`
-3. **Windows only**: Register the manifest in the Windows Registry at `HKCU:\Software\Mozilla\NativeMessagingHosts\com.nevoflux.agent`
+1. Explicit path (`--agent` / `-AgentPath`)
+2. `NEVOFLUX_AGENT_BIN` environment variable
+3. Local build at `../../target/release/nevoflux-agent`
+4. GitHub release download (latest from `dorisgyl/nevoflux-agent`)
 
-## Configuration
+## Browser Directory Resolution
 
-After setup, configure API keys in:
+1. Explicit path (`--browser` / `-BrowserDir`)
+2. `NEVOFLUX_BROWSER_DIR` environment variable
+3. Dev build at `../nevoflux/engine/obj-*/dist/bin`
+4. Common install locations (`/opt/nevoflux`, `C:\Program Files\NevoFlux`, etc.)
 
-- **Linux/macOS**: `~/.config/nevoflux/config.toml`
-- **Windows**: `%APPDATA%\nevoflux\config.toml`
+## What Gets Copied
 
-## Uninstallation
+- `nevoflux-agent` binary → `<browser>/distribution/bin/`
+- `models/` directory → `<browser>/distribution/bin/models/` (if present)
 
-### Linux/macOS
-
-```bash
-rm ~/.mozilla/native-messaging-hosts/com.nevoflux.agent.json
-# or on macOS:
-rm ~/Library/Application\ Support/Mozilla/NativeMessagingHosts/com.nevoflux.agent.json
-```
-
-### Windows
-
-```powershell
-Remove-Item "$env:APPDATA\Mozilla\NativeMessagingHosts\com.nevoflux.agent.json" -Force
-Remove-Item "HKCU:\Software\Mozilla\NativeMessagingHosts\com.nevoflux.agent" -Force
-```
+Restart the browser after updating.

@@ -1,7 +1,0 @@
-{
-  "name": "com.nevoflux.agent",
-  "description": "NevoFlux AI Agent Native Messaging Host",
-  "path": "{{BINARY_PATH}}",
-  "type": "stdio",
-  "allowed_extensions": ["agent@nevoflux.com"]
-}
