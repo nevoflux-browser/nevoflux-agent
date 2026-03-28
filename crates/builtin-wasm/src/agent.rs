@@ -2100,6 +2100,16 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     // New path: serialize entire args as SpawnSubagentConfig JSON
                     // Rename "task" -> "prompt" for SpawnSubagentConfig compatibility
                     let mut config_obj = tool_call.arguments.clone();
+                    // Parse "tools" from string to JSON value if needed (OpenAI strict mode sends strings)
+                    if let Some(tools_val) = config_obj.get("tools").cloned() {
+                        if let Some(s) = tools_val.as_str() {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                                config_obj
+                                    .as_object_mut()
+                                    .map(|m| m.insert("tools".to_string(), parsed));
+                            }
+                        }
+                    }
                     if let Some(task_val) = config_obj.get("task").cloned() {
                         config_obj
                             .as_object_mut()
@@ -3872,7 +3882,8 @@ comprehensions, f-strings, lambda, asyncio.gather\n\
                         "description": "Maximum iterations before timeout"
                     },
                     "tools": {
-                        "description": "Tool access configuration. Use \"none\" to disable all tools (pure text mode), or {\"Allow\": [\"read\", \"glob\", \"browser_*\"]} for an allowlist with optional wildcard."
+                        "type": "string",
+                        "description": "Tool access configuration. Use \"none\" to disable all tools (pure text mode), or JSON like \"{\\\"Allow\\\": [\\\"read\\\", \\\"glob\\\", \\\"browser_*\\\"]}\" for an allowlist with optional wildcard."
                     }
                 },
                 "required": ["task"]
