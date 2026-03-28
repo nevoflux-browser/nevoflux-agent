@@ -1,9 +1,7 @@
 {
   "name": "com.nevoflux.agent",
-  "description": "NevoFlux Agent - AI-powered computer control",
+  "description": "NevoFlux AI Agent Native Messaging Host",
   "path": "{{BINARY_PATH}}",
   "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://{{EXTENSION_ID}}/"
-  ]
+  "allowed_extensions": ["agent@nevoflux.com"]
 }
