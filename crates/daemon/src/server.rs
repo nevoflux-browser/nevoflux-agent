@@ -1463,11 +1463,26 @@ fn build_hot_knowledge_section(database: &nevoflux_storage::Database) -> Option<
 
     for entry in &hot_entries {
         let line = entry.hot_summary.as_deref().unwrap_or(&entry.summary);
+
+        // Freshness warning for stale entries (> 1 day old)
+        let freshness =
+            if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&entry.updated_at) {
+                let days = (chrono::Utc::now() - updated.with_timezone(&chrono::Utc)).num_days();
+                if days > 1 {
+                    format!(" [{}d old, verify before acting]", days)
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
+        let formatted = format!("- {}{}", line, freshness);
         match entry.category.as_str() {
-            "site_interaction" | "siteinteraction" => site_lines.push(format!("- {}", line)),
-            "tool_optimization" | "tooloptimization" => tool_lines.push(format!("- {}", line)),
-            "user_preference" | "userpreference" => pref_lines.push(format!("- {}", line)),
-            _ => site_lines.push(format!("- {}", line)),
+            "site_interaction" | "siteinteraction" => site_lines.push(formatted),
+            "tool_optimization" | "tooloptimization" => tool_lines.push(formatted),
+            "user_preference" | "userpreference" => pref_lines.push(formatted),
+            _ => site_lines.push(formatted),
         }
     }
 
@@ -6908,6 +6923,84 @@ mod tests {
         assert!(
             section.is_none(),
             "Should return None when no hot entries exist"
+        );
+    }
+
+    #[test]
+    fn test_freshness_warning_old_entry() {
+        use nevoflux_storage::{CreateKnowledgeParams, Storage};
+
+        let storage = Storage::open_in_memory().unwrap();
+
+        let entry = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "user_preference".to_string(),
+                summary: "Old preference".to_string(),
+                details: "Old details".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        storage
+            .knowledge()
+            .update_status(&entry.id, "validated")
+            .unwrap();
+        storage
+            .knowledge()
+            .mark_hot(&entry.id, "Old preference")
+            .unwrap();
+
+        // Set updated_at to 5 days ago
+        storage
+            .database()
+            .with_connection(|conn| {
+                let five_days_ago =
+                    (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+                conn.execute(
+                    "UPDATE knowledge SET updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![five_days_ago, entry.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let section = build_hot_knowledge_section(storage.database()).unwrap();
+        assert!(
+            section.contains("old, verify before acting]"),
+            "Expected freshness warning, got: {}",
+            section
+        );
+    }
+
+    #[test]
+    fn test_freshness_no_warning_recent() {
+        use nevoflux_storage::{CreateKnowledgeParams, Storage};
+
+        let storage = Storage::open_in_memory().unwrap();
+
+        let entry = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "user_preference".to_string(),
+                summary: "Fresh preference".to_string(),
+                details: "Fresh details".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        storage
+            .knowledge()
+            .update_status(&entry.id, "validated")
+            .unwrap();
+        storage
+            .knowledge()
+            .mark_hot(&entry.id, "Fresh preference")
+            .unwrap();
+
+        let section = build_hot_knowledge_section(storage.database()).unwrap();
+        assert!(
+            !section.contains("verify before acting"),
+            "Should not have freshness warning, got: {}",
+            section
         );
     }
 }
