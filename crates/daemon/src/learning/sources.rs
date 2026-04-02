@@ -35,8 +35,8 @@ impl ToolTraceLearningSource {
         Self {
             storage,
             last_seen_id: Mutex::new(0),
-            min_calls: 3,
-            failure_threshold: 0.5,
+            min_calls: 2,
+            failure_threshold: 0.4,
         }
     }
 }
@@ -161,8 +161,8 @@ struct ToolAgg {
 /// Produces learning entries from site adaptation records that have a low
 /// success rate, indicating the agent is struggling with a particular domain.
 ///
-/// Each `collect()` call queries site_adaptations with `success_rate < 0.7`
-/// and `sample_count >= 5`, emitting a `SiteInteraction` entry for each.
+/// Each `collect()` call queries site_adaptations with `success_rate < 0.8`
+/// and `sample_count >= 3`, emitting a `SiteInteraction` entry for each.
 pub struct SiteAdaptationSource {
     storage: Arc<Storage>,
     /// Success rate threshold below which we emit a learning entry.
@@ -177,8 +177,8 @@ impl SiteAdaptationSource {
     pub fn new(storage: Arc<Storage>) -> Self {
         Self {
             storage,
-            max_success_rate: 0.7,
-            min_samples: 5,
+            max_success_rate: 0.8,
+            min_samples: 3,
             seen_ids: Mutex::new(std::collections::HashSet::new()),
         }
     }

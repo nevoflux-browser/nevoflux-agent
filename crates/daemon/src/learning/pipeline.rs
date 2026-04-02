@@ -37,9 +37,9 @@ pub struct ValidationThresholds {
 impl Default for ValidationThresholds {
     fn default() -> Self {
         Self {
-            min_occurrences: 3,
+            min_occurrences: 2,
             min_confidence: 0.6,
-            min_alive_hours: 24,
+            min_alive_hours: 12,
         }
     }
 }
@@ -82,17 +82,17 @@ impl Default for PromotionThresholds {
     fn default() -> Self {
         Self {
             batch_size: 50,
-            min_alive_days: 7,
+            min_alive_days: 3,
             site_interaction: CategoryPromotionThresholds {
-                min_hits: 10,
+                min_hits: 3,
                 min_effectiveness: 0.6,
             },
             tool_optimization: CategoryPromotionThresholds {
-                min_hits: 10,
-                min_effectiveness: 0.7,
+                min_hits: 5,
+                min_effectiveness: 0.6,
             },
             user_preference: CategoryPromotionThresholds {
-                min_hits: 5,
+                min_hits: 2,
                 min_effectiveness: 0.5,
             },
             hot_limit_site_interaction: 15,
@@ -836,9 +836,9 @@ mod tests {
     #[test]
     fn validation_thresholds_default_values() {
         let thresholds = ValidationThresholds::default();
-        assert_eq!(thresholds.min_occurrences, 3);
+        assert_eq!(thresholds.min_occurrences, 2);
         assert!((thresholds.min_confidence - 0.6).abs() < f64::EPSILON);
-        assert_eq!(thresholds.min_alive_hours, 24);
+        assert_eq!(thresholds.min_alive_hours, 12);
     }
 
     #[test]
@@ -1178,13 +1178,13 @@ mod tests {
     fn promotion_thresholds_default_values() {
         let thresholds = PromotionThresholds::default();
         assert_eq!(thresholds.batch_size, 50);
-        assert_eq!(thresholds.min_alive_days, 7);
+        assert_eq!(thresholds.min_alive_days, 3);
         assert!((thresholds.site_interaction.min_effectiveness - 0.6).abs() < f64::EPSILON);
-        assert_eq!(thresholds.site_interaction.min_hits, 10);
-        assert!((thresholds.tool_optimization.min_effectiveness - 0.7).abs() < f64::EPSILON);
-        assert_eq!(thresholds.tool_optimization.min_hits, 10);
+        assert_eq!(thresholds.site_interaction.min_hits, 3);
+        assert!((thresholds.tool_optimization.min_effectiveness - 0.6).abs() < f64::EPSILON);
+        assert_eq!(thresholds.tool_optimization.min_hits, 5);
         assert!((thresholds.user_preference.min_effectiveness - 0.5).abs() < f64::EPSILON);
-        assert_eq!(thresholds.user_preference.min_hits, 5);
+        assert_eq!(thresholds.user_preference.min_hits, 2);
     }
 
     #[test]

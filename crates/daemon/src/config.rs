@@ -1071,8 +1071,8 @@ pub struct ValidationConfig {
 impl Default for ValidationConfig {
     fn default() -> Self {
         Self {
-            min_alive_hours: 24,
-            min_occurrences: 3,
+            min_alive_hours: 12,
+            min_occurrences: 2,
             min_confidence: 0.6,
         }
     }
@@ -1101,12 +1101,12 @@ pub struct PromotionConfig {
 impl Default for PromotionConfig {
     fn default() -> Self {
         Self {
-            site_interaction_min_hits: 10,
+            site_interaction_min_hits: 3,
             site_interaction_min_effectiveness: 0.6,
-            tool_optimization_min_hits: 10,
-            tool_optimization_min_effectiveness: 0.7,
-            user_preference_min_hits: 5,
-            min_alive_days: 7,
+            tool_optimization_min_hits: 5,
+            tool_optimization_min_effectiveness: 0.6,
+            user_preference_min_hits: 2,
+            min_alive_days: 3,
         }
     }
 }
@@ -1689,11 +1689,11 @@ denied_commands = ["sudo *"]
         assert!(config.enabled);
         assert_eq!(config.flush_threshold, 20);
         assert_eq!(config.flush_interval_secs, 30);
-        assert_eq!(config.validation.min_alive_hours, 24);
-        assert_eq!(config.validation.min_occurrences, 3);
+        assert_eq!(config.validation.min_alive_hours, 12);
+        assert_eq!(config.validation.min_occurrences, 2);
         assert_eq!(config.validation.min_confidence, 0.6);
-        assert_eq!(config.promotion.site_interaction_min_hits, 10);
-        assert_eq!(config.promotion.min_alive_days, 7);
+        assert_eq!(config.promotion.site_interaction_min_hits, 3);
+        assert_eq!(config.promotion.min_alive_days, 3);
     }
 
     #[test]
