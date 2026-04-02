@@ -1446,59 +1446,28 @@ impl HostFunctions for DaemonHostFunctions {
 
     fn memory_create(&self, content: &str, metadata: &serde_json::Value) -> HostResult<String> {
         self.check_tool_permission("memory_create", content)?;
-        let services = self.services.as_ref().ok_or_else(|| HostError {
-            code: 1,
-            message: "Services not available".into(),
-        })?;
 
-        debug!(
-            "memory_create: content_len={}, metadata={}",
-            content.len(),
-            metadata
-        );
+        // Resolve category from metadata or default
+        let category = metadata
+            .get("category")
+            .and_then(|v| v.as_str())
+            .unwrap_or("user_preference");
 
-        // Create a new memory chunk using the storage crate
-        let chunk = nevoflux_storage::MemoryChunk::new(content).with_metadata(metadata.clone());
-        let chunk_id = chunk.id.clone();
+        let domain = metadata.get("domain").and_then(|v| v.as_str());
 
-        services
-            .database
-            .memory()
-            .create(&chunk)
-            .map_err(|e| HostError {
-                code: 100,
-                message: format!("Memory create failed: {}", e),
-            })?;
+        // Build summary: truncate content to 120 chars for hot_summary
+        let summary = if content.len() > 120 {
+            let boundary = content.floor_char_boundary(117);
+            format!("{}...", &content[..boundary])
+        } else {
+            content.to_string()
+        };
 
-        // Generate embedding and update vector index if provider is available
-        if let Some(provider) = crate::wasm::services::get_embedding(&services.embedding) {
-            let runtime = self.runtime.clone();
-            let content_owned = content.to_string();
-            let embed_result = tokio::task::block_in_place(|| {
-                runtime.block_on(async { provider.embed(&content_owned).await })
-            });
-            match embed_result {
-                Ok(embedding) => {
-                    // Persist embedding in storage
-                    if let Err(e) = services
-                        .database
-                        .memory()
-                        .update_embedding(&chunk_id, &embedding)
-                    {
-                        warn!("Failed to persist embedding for chunk {}: {}", chunk_id, e);
-                    }
-                    // Add to in-memory vector index
-                    if let Ok(mut idx) = services.vector_index.write() {
-                        idx.add(&chunk_id, embedding);
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to generate embedding for chunk {}: {}", chunk_id, e);
-                }
-            }
-        }
-
-        Ok(chunk_id)
+        // Delegate to knowledge_teach which handles:
+        // - Creating knowledge entry (source_type="manual", priority="high")
+        // - Setting status to "validated"
+        // - Marking as hot (hot=1) for immediate system prompt injection
+        self.knowledge_teach(category, &summary, content, domain)
     }
 
     fn memory_update(&self, id: &str, content: &str) -> HostResult<()> {
