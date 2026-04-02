@@ -168,8 +168,7 @@ pub async fn extract_session_memories(
 
     // Get provider configuration
     let model = config.llm.active_model().unwrap_or("gpt-4o-mini");
-    let (provider, api_key) =
-        crate::context::get_summarization_provider(&config, model)?;
+    let (provider, api_key) = crate::context::get_summarization_provider(&config, model)?;
     let base_url = config.llm.active_base_url();
 
     // Gather existing hot knowledge to avoid duplicates

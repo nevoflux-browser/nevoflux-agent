@@ -202,7 +202,10 @@ Be concise (2-4 sentences)."#;
 }
 
 /// Get the appropriate provider and API key for summarization.
-pub fn get_summarization_provider(config: &AgentConfig, model: &str) -> Result<(ProviderType, String)> {
+pub fn get_summarization_provider(
+    config: &AgentConfig,
+    model: &str,
+) -> Result<(ProviderType, String)> {
     // Try to infer provider from model name
     let provider = if model.starts_with("gpt-") || model.starts_with("o1") {
         ProviderType::OpenAi

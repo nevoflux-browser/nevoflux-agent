@@ -180,7 +180,8 @@ pub struct DaemonHostFunctions {
     /// Current browser URL (set on successful navigate).
     current_browser_url: Mutex<Option<String>>,
     /// Session memory extractor — tracks user message count for auto-extraction.
-    pub session_extractor: std::sync::Arc<crate::learning::session_extractor::SessionMemoryExtractor>,
+    pub session_extractor:
+        std::sync::Arc<crate::learning::session_extractor::SessionMemoryExtractor>,
     // Note: always_allowed_tools is on HostServices (shared across requests),
     // not here (per-request DaemonHostFunctions).
 }
