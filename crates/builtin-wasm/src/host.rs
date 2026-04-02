@@ -79,6 +79,9 @@ pub trait HostFunctions {
         domain: Option<&str>,
     ) -> HostResult<String>;
 
+    /// List hot knowledge entries (active memories).
+    fn memory_view(&self, limit: usize) -> HostResult<Vec<crate::types::KnowledgeViewEntry>>;
+
     // =========================================================================
     // Skills Functions
     // =========================================================================
@@ -625,6 +628,10 @@ impl HostFunctions for MockHostFunctions {
         _domain: Option<&str>,
     ) -> HostResult<String> {
         Ok("K-test01".into())
+    }
+
+    fn memory_view(&self, _limit: usize) -> HostResult<Vec<crate::types::KnowledgeViewEntry>> {
+        Ok(vec![])
     }
 
     fn skill_list(&self) -> HostResult<Vec<SkillSummary>> {

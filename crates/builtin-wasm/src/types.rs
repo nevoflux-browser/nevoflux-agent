@@ -364,6 +364,22 @@ pub struct MemoryChunk {
     pub score: f32,
 }
 
+/// Entry returned by memory_view, representing a hot knowledge item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeViewEntry {
+    /// Knowledge entry ID.
+    pub id: String,
+    /// Category: user_preference, site_interaction, or tool_optimization.
+    pub category: String,
+    /// One-line summary.
+    pub summary: String,
+    /// Associated domain (if any).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// When the entry was created.
+    pub created_at: String,
+}
+
 /// Attachment for multimodal messages (images, files, etc.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
