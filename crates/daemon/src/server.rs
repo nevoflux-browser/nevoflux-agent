@@ -1472,18 +1472,18 @@ fn build_hot_knowledge_section(database: &nevoflux_storage::Database) -> Option<
     }
 
     let mut parts = Vec::new();
-    parts.push("## Learned Knowledge (auto-updated)".to_string());
+    parts.push("## Learned Knowledge / 已学习的知识".to_string());
 
     if !site_lines.is_empty() {
-        parts.push("### Site Interactions".to_string());
+        parts.push("### Site Interactions / 网站交互".to_string());
         parts.extend(site_lines);
     }
     if !tool_lines.is_empty() {
-        parts.push("### Tool Optimizations".to_string());
+        parts.push("### Tool Optimizations / 工具优化".to_string());
         parts.extend(tool_lines);
     }
     if !pref_lines.is_empty() {
-        parts.push("### User Preferences".to_string());
+        parts.push("### User Preferences / 用户偏好".to_string());
         parts.extend(pref_lines);
     }
 
@@ -6748,22 +6748,22 @@ mod tests {
 
         // Verify section header
         assert!(
-            section.contains("## Learned Knowledge (auto-updated)"),
+            section.contains("## Learned Knowledge / 已学习的知识"),
             "Should have main header. Got:\n{}",
             section
         );
 
         // Verify all 3 category subsections
         assert!(
-            section.contains("### Site Interactions"),
+            section.contains("### Site Interactions / 网站交互"),
             "Should have Site Interactions section"
         );
         assert!(
-            section.contains("### Tool Optimizations"),
+            section.contains("### Tool Optimizations / 工具优化"),
             "Should have Tool Optimizations section"
         );
         assert!(
-            section.contains("### User Preferences"),
+            section.contains("### User Preferences / 用户偏好"),
             "Should have User Preferences section"
         );
 
