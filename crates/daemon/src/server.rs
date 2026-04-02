@@ -795,21 +795,16 @@ pub async fn start_server(
                         ),
                     ];
 
-                    if let Some((category, limit)) =
-                        consolidator.category_needing_consolidation(
-                            shared_storage_clone.database(),
-                            &hot_limits,
-                        )
-                    {
+                    if let Some((category, limit)) = consolidator.category_needing_consolidation(
+                        shared_storage_clone.database(),
+                        &hot_limits,
+                    ) {
                         let target =
                             crate::learning::consolidator::KnowledgeConsolidator::target_count(
                                 limit,
                             );
-                        let cons_config =
-                            agent_config_clone.read().unwrap().clone();
-                        let cons_db = std::sync::Arc::new(
-                            shared_storage_clone.database().clone(),
-                        );
+                        let cons_config = agent_config_clone.read().unwrap().clone();
+                        let cons_db = std::sync::Arc::new(shared_storage_clone.database().clone());
                         let cons_category = category.clone();
                         tokio::spawn(async move {
                             match crate::learning::consolidator::consolidate_category(
