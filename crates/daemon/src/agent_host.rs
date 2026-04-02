@@ -1000,8 +1000,7 @@ impl HostFunctions for DaemonHostFunctions {
                         .into(),
                 }
             } else {
-                let compressor =
-                    ContextCompressor::new(self.config.clone(), self.runtime.clone());
+                let compressor = ContextCompressor::new(self.config.clone(), self.runtime.clone());
                 let result = compressor.compress_if_needed(
                     &context_messages,
                     estimated_tokens,
