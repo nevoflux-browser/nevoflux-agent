@@ -4105,12 +4105,8 @@ impl DaemonHostFunctions {
                     self.config.daemon.context.compression_cooldown_secs,
                 ),
             ),
-            recent_file_paths: Mutex::new(
-                self.recent_file_paths.lock().unwrap().clone(),
-            ),
-            current_browser_url: Mutex::new(
-                self.current_browser_url.lock().unwrap().clone(),
-            ),
+            recent_file_paths: Mutex::new(self.recent_file_paths.lock().unwrap().clone()),
+            current_browser_url: Mutex::new(self.current_browser_url.lock().unwrap().clone()),
         }
     }
 
@@ -6599,8 +6595,7 @@ mod tests {
             .lock()
             .unwrap()
             .push("/src/lib.rs".to_string());
-        *host.current_browser_url.lock().unwrap() =
-            Some("https://docs.rs/tokio".to_string());
+        *host.current_browser_url.lock().unwrap() = Some("https://docs.rs/tokio".to_string());
 
         let hint = host.build_reinjection_hint();
         assert!(hint.contains("[Context from before compression]"));
