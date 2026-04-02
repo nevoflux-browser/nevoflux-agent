@@ -1465,17 +1465,17 @@ fn build_hot_knowledge_section(database: &nevoflux_storage::Database) -> Option<
         let line = entry.hot_summary.as_deref().unwrap_or(&entry.summary);
 
         // Freshness warning for stale entries (> 1 day old)
-        let freshness =
-            if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&entry.updated_at) {
-                let days = (chrono::Utc::now() - updated.with_timezone(&chrono::Utc)).num_days();
-                if days > 1 {
-                    format!(" [{}d old, verify before acting]", days)
-                } else {
-                    String::new()
-                }
+        let freshness = if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&entry.updated_at)
+        {
+            let days = (chrono::Utc::now() - updated.with_timezone(&chrono::Utc)).num_days();
+            if days > 1 {
+                format!(" [{}d old, verify before acting]", days)
             } else {
                 String::new()
-            };
+            }
+        } else {
+            String::new()
+        };
 
         let formatted = format!("- {}{}", line, freshness);
         match entry.category.as_str() {
@@ -6954,8 +6954,7 @@ mod tests {
         storage
             .database()
             .with_connection(|conn| {
-                let five_days_ago =
-                    (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
+                let five_days_ago = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
                 conn.execute(
                     "UPDATE knowledge SET updated_at = ?1 WHERE id = ?2",
                     rusqlite::params![five_days_ago, entry.id],

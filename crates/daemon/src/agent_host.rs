@@ -1041,9 +1041,7 @@ impl HostFunctions for DaemonHostFunctions {
                         .lock()
                         .ok()
                         .and_then(|g| {
-                            g.map(|t| {
-                                t.elapsed() > std::time::Duration::from_secs(gap_mins * 60)
-                            })
+                            g.map(|t| t.elapsed() > std::time::Duration::from_secs(gap_mins * 60))
                         })
                         .unwrap_or(false)
                 } else {
