@@ -1716,6 +1716,11 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 self.host.memory_delete(id)?;
                 serde_json::json!({"id": id, "status": "deleted"}).to_string()
             }
+            "memory_view" => {
+                let limit = tool_call.arguments["limit"].as_u64().unwrap_or(20) as usize;
+                let entries = self.host.memory_view(limit)?;
+                serde_json::to_string_pretty(&entries).unwrap_or_default()
+            }
             "skill_load" => {
                 let name = tool_call.arguments["name"].as_str().unwrap_or("");
                 // Prevent redundant re-loading of already loaded skills.
@@ -2771,6 +2776,19 @@ The following skill instructions MUST be followed exactly. These instructions ta
                         }
                     },
                     "required": ["id"]
+                }),
+            },
+            ToolDefinition {
+                name: "memory_view".into(),
+                description: "View all saved memories. Returns a list of all active knowledge entries that are automatically included in conversations.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum entries to return (default 20)"
+                        }
+                    }
                 }),
             },
             ToolDefinition {

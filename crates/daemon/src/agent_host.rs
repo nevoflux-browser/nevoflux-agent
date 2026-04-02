@@ -1526,12 +1526,31 @@ impl HostFunctions for DaemonHostFunctions {
         Ok(())
     }
 
-    fn memory_view(
-        &self,
-        _limit: usize,
-    ) -> HostResult<Vec<nevoflux_builtin_wasm::types::KnowledgeViewEntry>> {
-        // TODO: implement in Task 7
-        Ok(vec![])
+    fn memory_view(&self, limit: usize) -> HostResult<Vec<nevoflux_builtin_wasm::types::KnowledgeViewEntry>> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+
+        let knowledge_repo = nevoflux_storage::KnowledgeRepository::new(&services.database);
+        let hot_entries = knowledge_repo.list_hot().map_err(|e| HostError {
+            code: 100,
+            message: format!("Memory view failed: {}", e),
+        })?;
+
+        let entries: Vec<nevoflux_builtin_wasm::types::KnowledgeViewEntry> = hot_entries
+            .into_iter()
+            .take(limit)
+            .map(|e| nevoflux_builtin_wasm::types::KnowledgeViewEntry {
+                id: e.id,
+                category: e.category,
+                summary: e.hot_summary.unwrap_or(e.summary),
+                domain: e.domain,
+                created_at: e.created_at,
+            })
+            .collect();
+
+        Ok(entries)
     }
 
     fn knowledge_teach(
@@ -4899,6 +4918,30 @@ mod tests {
         let result = host.memory_delete("nonexistent-id");
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, 404);
+    }
+
+    #[test]
+    fn test_memory_view_empty() {
+        let (host, _rt) = setup_host_with_services();
+        let entries = host.memory_view(20).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_memory_view_after_create() {
+        let (host, _rt) = setup_host_with_services();
+
+        // Create a knowledge entry via knowledge_teach (same path as memory_create)
+        let id = host
+            .knowledge_teach("user_preference", "prefers dark theme", "User prefers dark theme for all UIs", None)
+            .unwrap();
+        assert!(!id.is_empty());
+
+        // View should return it
+        let entries = host.memory_view(20).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].category, "user_preference");
+        assert!(entries[0].summary.contains("dark theme"));
     }
 
     // ==================== Skill Tests ====================
