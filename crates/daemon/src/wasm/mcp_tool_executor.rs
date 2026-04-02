@@ -12,7 +12,7 @@ use nevoflux_llm::providers::acp::mcp_bridge::{
     McpToolBridge, PendingArtifact, PermissionRequest, PermissionResponse, ToolCallRequest,
 };
 use nevoflux_protocol::BrowserToolAction;
-use nevoflux_storage::{CreateKnowledgeParams, KnowledgeRepository, MemoryChunk};
+use nevoflux_storage::{CreateKnowledgeParams, KnowledgeRepository};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -801,13 +801,50 @@ fn execute_memory_create(
         .get("metadata")
         .cloned()
         .unwrap_or(serde_json::json!({}));
-    let chunk = MemoryChunk::new(content).with_metadata(metadata);
-    let id = chunk.id.clone();
-    services
-        .database
-        .memory()
-        .create(&chunk)
+
+    let category = args["category"]
+        .as_str()
+        .or_else(|| metadata.get("category").and_then(|v| v.as_str()))
+        .unwrap_or("user_preference");
+    let domain = args["domain"]
+        .as_str()
+        .or_else(|| metadata.get("domain").and_then(|v| v.as_str()));
+
+    let summary = if content.len() > 120 {
+        let boundary = content.floor_char_boundary(117);
+        format!("{}...", &content[..boundary])
+    } else {
+        content.to_string()
+    };
+
+    // Create knowledge entry directly (same as knowledge_teach path)
+    let params = nevoflux_storage::CreateKnowledgeParams {
+        category: category.to_string(),
+        domain: domain.map(|d| d.to_string()),
+        summary: summary.clone(),
+        details: content.to_string(),
+        source_type: Some("manual".to_string()),
+        priority: Some("high".to_string()),
+        tags: Some("[\"user_taught\"]".to_string()),
+        privacy_level: Some("internal".to_string()),
+        ..Default::default()
+    };
+
+    let knowledge_repo = nevoflux_storage::KnowledgeRepository::new(&services.database);
+    let entry = knowledge_repo
+        .create(params)
         .map_err(|e| format!("memory create failed: {e}"))?;
+    let id = entry.id.clone();
+
+    knowledge_repo
+        .update_status(&id, "validated")
+        .map_err(|e| format!("status update failed: {e}"))?;
+
+    let hot_summary = summary;
+    knowledge_repo
+        .mark_hot(&id, &hot_summary)
+        .map_err(|e| format!("mark_hot failed: {e}"))?;
+
     Ok(serde_json::json!({"id": id, "status": "created"}).to_string())
 }
 
