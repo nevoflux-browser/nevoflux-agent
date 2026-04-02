@@ -894,6 +894,12 @@ pub struct ContextConfig {
     /// Max tokens for summary output.
     #[serde(default = "default_summary_max_tokens")]
     pub summary_max_tokens: u32,
+    /// Maximum consecutive compression failures before circuit breaker opens.
+    #[serde(default = "default_max_compression_failures")]
+    pub max_compression_failures: u32,
+    /// Cooldown in seconds before circuit breaker allows a probe attempt.
+    #[serde(default = "default_compression_cooldown_secs")]
+    pub compression_cooldown_secs: u64,
 }
 
 impl Default for ContextConfig {
@@ -909,6 +915,8 @@ impl Default for ContextConfig {
             keep_recent_messages: default_keep_recent(),
             summarization_model: None,
             summary_max_tokens: default_summary_max_tokens(),
+            max_compression_failures: default_max_compression_failures(),
+            compression_cooldown_secs: default_compression_cooldown_secs(),
         }
     }
 }
@@ -927,6 +935,14 @@ fn default_keep_recent() -> u32 {
 
 fn default_summary_max_tokens() -> u32 {
     500
+}
+
+fn default_max_compression_failures() -> u32 {
+    3
+}
+
+fn default_compression_cooldown_secs() -> u64 {
+    300
 }
 
 // ==================== Subagent Configuration ====================
