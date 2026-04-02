@@ -1,6 +1,7 @@
 pub mod buffer;
 pub mod collector;
 pub mod conflict;
+pub mod consolidator;
 pub mod crypto;
 pub mod decay;
 pub mod export;
