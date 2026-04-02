@@ -525,7 +525,6 @@ pub const ASYNC_SAFE_TOOLS: &[&str] = &[
     "memory_update",
     "memory_delete",
     "memory_view",
-    "knowledge_teach",
     // MCP
     "mcp_list_tools",
     "mcp_call",
@@ -1674,7 +1673,6 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     .arguments
                     .get("metadata")
                     .and_then(|v| {
-                        // Accept both object (direct JSON) and string (JSON-encoded)
                         if v.is_object() {
                             Some(v.clone())
                         } else {
@@ -1684,7 +1682,27 @@ The following skill instructions MUST be followed exactly. These instructions ta
                         }
                     })
                     .unwrap_or(serde_json::json!({}));
-                let id = self.host.memory_create(content, &metadata)?;
+
+                // Resolve category: explicit arg > metadata field > default
+                let category = tool_call.arguments["category"]
+                    .as_str()
+                    .or_else(|| metadata.get("category").and_then(|v| v.as_str()))
+                    .unwrap_or("user_preference");
+
+                // Resolve domain: explicit arg > metadata field
+                let domain = tool_call.arguments["domain"]
+                    .as_str()
+                    .or_else(|| metadata.get("domain").and_then(|v| v.as_str()));
+
+                // Build summary (truncate to 120 chars, char-boundary safe)
+                let summary = if content.len() > 120 {
+                    let boundary = content.floor_char_boundary(117);
+                    format!("{}...", &content[..boundary])
+                } else {
+                    content.to_string()
+                };
+
+                let id = self.host.knowledge_teach(category, &summary, content, domain)?;
                 serde_json::json!({"id": id, "status": "created"}).to_string()
             }
             "memory_update" => {
@@ -1697,18 +1715,6 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let id = tool_call.arguments["id"].as_str().unwrap_or("");
                 self.host.memory_delete(id)?;
                 serde_json::json!({"id": id, "status": "deleted"}).to_string()
-            }
-            "knowledge_teach" => {
-                let category = tool_call.arguments["category"]
-                    .as_str()
-                    .unwrap_or("user_preference");
-                let summary = tool_call.arguments["summary"].as_str().unwrap_or("");
-                let details = tool_call.arguments["details"].as_str().unwrap_or("");
-                let domain = tool_call.arguments.get("domain").and_then(|v| v.as_str());
-                let id = self
-                    .host
-                    .knowledge_teach(category, summary, details, domain)?;
-                serde_json::json!({"id": id, "status": "taught"}).to_string()
             }
             "skill_load" => {
                 let name = tool_call.arguments["name"].as_str().unwrap_or("");
@@ -2217,7 +2223,6 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 | "memory_create"
                 | "memory_update"
                 | "memory_delete"
-                | "knowledge_teach"
                 | "skill_load"
                 | "tool_search"
                 | "tool_call_dynamic"
@@ -2711,7 +2716,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             },
             ToolDefinition {
                 name: "memory_create".into(),
-                description: "Save information to your long-term memory. Use this to remember important facts, user preferences, patterns, or anything you want to recall in future conversations.".into(),
+                description: "Save information to memory for future conversations. Stored knowledge is automatically available in all subsequent conversations. Use for: user preferences, important facts, behavioral rules, site-specific knowledge, or anything worth remembering long-term.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -2719,9 +2724,18 @@ The following skill instructions MUST be followed exactly. These instructions ta
                             "type": "string",
                             "description": "The information to remember"
                         },
+                        "category": {
+                            "type": "string",
+                            "enum": ["user_preference", "site_interaction", "tool_optimization"],
+                            "description": "Knowledge category (default: user_preference)"
+                        },
+                        "domain": {
+                            "type": "string",
+                            "description": "Associated domain if applicable (e.g., github.com)"
+                        },
                         "metadata": {
                             "type": "string",
-                            "description": "Optional JSON metadata (e.g., \"{\\\"category\\\": \\\"preference\\\", \\\"domain\\\": \\\"example.com\\\"}\")"
+                            "description": "Optional JSON metadata"
                         }
                     },
                     "required": ["content"]
@@ -2757,33 +2771,6 @@ The following skill instructions MUST be followed exactly. These instructions ta
                         }
                     },
                     "required": ["id"]
-                }),
-            },
-            ToolDefinition {
-                name: "knowledge_teach".into(),
-                description: "Store knowledge explicitly taught by the user. Use when the user asks you to remember, learn, or always do something a certain way.".into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "category": {
-                            "type": "string",
-                            "enum": ["user_preference", "site_interaction", "tool_optimization"],
-                            "description": "Knowledge category"
-                        },
-                        "summary": {
-                            "type": "string",
-                            "description": "One-line summary of the knowledge"
-                        },
-                        "details": {
-                            "type": "string",
-                            "description": "Full details of the knowledge"
-                        },
-                        "domain": {
-                            "type": "string",
-                            "description": "Site domain if applicable (e.g., github.com)"
-                        }
-                    },
-                    "required": ["category", "summary", "details"]
                 }),
             },
             ToolDefinition {
