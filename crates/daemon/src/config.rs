@@ -900,6 +900,12 @@ pub struct ContextConfig {
     /// Cooldown in seconds before circuit breaker allows a probe attempt.
     #[serde(default = "default_compression_cooldown_secs")]
     pub compression_cooldown_secs: u64,
+    /// Number of recent large tool results to keep during microcompaction.
+    #[serde(default = "default_microcompact_keep_recent")]
+    pub microcompact_keep_recent: usize,
+    /// Minimum content length (chars) for a tool result to be eligible for clearing.
+    #[serde(default = "default_microcompact_content_threshold")]
+    pub microcompact_content_threshold: usize,
 }
 
 impl Default for ContextConfig {
@@ -917,6 +923,8 @@ impl Default for ContextConfig {
             summary_max_tokens: default_summary_max_tokens(),
             max_compression_failures: default_max_compression_failures(),
             compression_cooldown_secs: default_compression_cooldown_secs(),
+            microcompact_keep_recent: default_microcompact_keep_recent(),
+            microcompact_content_threshold: default_microcompact_content_threshold(),
         }
     }
 }
@@ -943,6 +951,14 @@ fn default_max_compression_failures() -> u32 {
 
 fn default_compression_cooldown_secs() -> u64 {
     300
+}
+
+fn default_microcompact_keep_recent() -> usize {
+    5
+}
+
+fn default_microcompact_content_threshold() -> usize {
+    1000
 }
 
 // ==================== Subagent Configuration ====================
