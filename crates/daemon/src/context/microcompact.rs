@@ -127,8 +127,7 @@ mod tests {
             msg("user", "read another"),
             msg("tool", "another small result"),
         ];
-        let original_contents: Vec<String> =
-            messages.iter().map(|m| m.content.clone()).collect();
+        let original_contents: Vec<String> = messages.iter().map(|m| m.content.clone()).collect();
         let compactor = MicroCompactor::new(5, 1000);
         let result = compactor.compact(&mut messages);
 
@@ -188,10 +187,7 @@ mod tests {
     #[test]
     fn test_microcompact_placeholder_format() {
         let content = format!("PREFIX_{}", "y".repeat(2000));
-        let mut messages = vec![
-            msg("tool", &content),
-            msg("tool", "recent small"),
-        ];
+        let mut messages = vec![msg("tool", &content), msg("tool", "recent small")];
         let compactor = MicroCompactor::new(0, 1000);
         let result = compactor.compact(&mut messages);
 
@@ -208,10 +204,7 @@ mod tests {
     #[test]
     fn test_microcompact_returns_stats() {
         let large = large_content(4000);
-        let mut messages = vec![
-            msg("tool", &large),
-            msg("tool", &large),
-        ];
+        let mut messages = vec![msg("tool", &large), msg("tool", &large)];
         let compactor = MicroCompactor::new(0, 1000);
         let result = compactor.compact(&mut messages);
 
