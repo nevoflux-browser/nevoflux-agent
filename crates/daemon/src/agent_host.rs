@@ -963,7 +963,7 @@ impl HostFunctions for DaemonHostFunctions {
         );
 
         // Convert request messages to ContextMessage for compression check
-        let context_messages: Vec<ContextMessage> = request
+        let mut context_messages: Vec<ContextMessage> = request
             .messages
             .iter()
             .map(|m| {
@@ -979,6 +979,21 @@ impl HostFunctions for DaemonHostFunctions {
                 }
             })
             .collect();
+
+        // Microcompact: clear old large tool results before compression
+        {
+            let compactor = crate::context::MicroCompactor::new(
+                self.config.daemon.context.microcompact_keep_recent,
+                self.config.daemon.context.microcompact_content_threshold,
+            );
+            let mc_result = compactor.compact(&mut context_messages);
+            if mc_result.cleared_count > 0 {
+                debug!(
+                    "Microcompact: cleared {} tool results, freed ~{} tokens",
+                    mc_result.cleared_count, mc_result.tokens_freed
+                );
+            }
+        }
 
         // Estimate tokens and calculate budget
         let estimated_tokens = ContextCompressor::estimate_tokens(&context_messages);
