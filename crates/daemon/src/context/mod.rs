@@ -7,5 +7,5 @@ mod microcompact;
 
 pub use builder::{Context, ContextBuilder, ContextMessage, TokenBudget};
 pub use circuit_breaker::{CircuitState, CompressionCircuitBreaker};
-pub use compressor::{CompressionResult, ContextCompressor};
+pub use compressor::{get_summarization_provider, CompressionResult, ContextCompressor};
 pub use microcompact::{MicroCompactResult, MicroCompactor};

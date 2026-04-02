@@ -147,6 +147,124 @@ pub fn build_extraction_user_prompt(
     parts.join("\n")
 }
 
+use crate::config::AgentConfig;
+use crate::context::ContextMessage;
+use crate::error::Result;
+use nevoflux_storage::{Database, KnowledgeRepository};
+use std::sync::Arc;
+use tracing::{debug, info, warn};
+
+/// Execute session memory extraction using the current LLM provider.
+///
+/// Spawned as a background task — errors are logged, not propagated to the user.
+pub async fn extract_session_memories(
+    config: Arc<AgentConfig>,
+    database: Arc<Database>,
+    recent_messages: Vec<ContextMessage>,
+) -> Result<usize> {
+    if recent_messages.is_empty() {
+        return Ok(0);
+    }
+
+    // Get provider configuration
+    let model = config.llm.active_model().unwrap_or("gpt-4o-mini");
+    let (provider, api_key) =
+        crate::context::get_summarization_provider(&config, model)?;
+    let base_url = config.llm.active_base_url();
+
+    // Gather existing hot knowledge to avoid duplicates
+    let knowledge_repo = KnowledgeRepository::new(&database);
+    let existing: Vec<String> = knowledge_repo
+        .list_hot()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.hot_summary.unwrap_or(e.summary))
+        .collect();
+
+    // Format messages for the prompt
+    let msg_pairs: Vec<(String, String)> = recent_messages
+        .iter()
+        .filter(|m| m.role != "system")
+        .map(|m| (m.role.clone(), m.content.clone()))
+        .collect();
+
+    let user_prompt = build_extraction_user_prompt(&existing, &msg_pairs);
+
+    // Call LLM
+    let request = crate::wasm::llm::LlmChatRequest {
+        messages: vec![crate::wasm::llm::LlmMessage::user(user_prompt)],
+        system: Some(EXTRACTION_SYSTEM_PROMPT.into()),
+        temperature: Some(0.3),
+        max_tokens: Some(500),
+        tools: None,
+    };
+
+    debug!(
+        "Extracting session memories using model={}, provider={:?}",
+        model, provider
+    );
+
+    let response =
+        crate::wasm::llm::execute_llm_chat(provider, &api_key, model, request, base_url).await?;
+
+    // Parse response
+    let items = parse_extraction_response(&response.content);
+    if items.is_empty() {
+        debug!("Session extraction: nothing worth extracting");
+        return Ok(0);
+    }
+
+    // Write each item to knowledge table (hot=1)
+    let mut written = 0;
+    for item in &items {
+        if item.content.trim().is_empty() {
+            continue;
+        }
+
+        let summary = if item.content.len() > 120 {
+            let boundary = item.content.floor_char_boundary(117);
+            format!("{}...", &item.content[..boundary])
+        } else {
+            item.content.clone()
+        };
+
+        let params = nevoflux_storage::CreateKnowledgeParams {
+            category: item.category.clone(),
+            summary: summary.clone(),
+            details: item.content.clone(),
+            source_type: Some("auto_extraction".into()),
+            priority: Some("medium".into()),
+            tags: Some("[\"auto_extracted\"]".into()),
+            privacy_level: Some("internal".into()),
+            ..Default::default()
+        };
+
+        match knowledge_repo.create(params) {
+            Ok(entry) => {
+                let id = entry.id.clone();
+                if let Err(e) = knowledge_repo.update_status(&id, "validated") {
+                    warn!("Failed to validate extracted knowledge {}: {}", id, e);
+                    continue;
+                }
+                if let Err(e) = knowledge_repo.mark_hot(&id, &summary) {
+                    warn!("Failed to mark extracted knowledge hot {}: {}", id, e);
+                    continue;
+                }
+                written += 1;
+            }
+            Err(e) => {
+                warn!("Failed to create extracted knowledge: {}", e);
+            }
+        }
+    }
+
+    if written > 0 {
+        info!("Session extraction: wrote {} knowledge entries", written);
+    }
+
+    Ok(written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
