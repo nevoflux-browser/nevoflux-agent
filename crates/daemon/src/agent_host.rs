@@ -182,6 +182,8 @@ pub struct DaemonHostFunctions {
     /// Session memory extractor — tracks user message count for auto-extraction.
     pub session_extractor:
         std::sync::Arc<crate::learning::session_extractor::SessionMemoryExtractor>,
+    /// Timestamp of the last successful LLM response (for time-gap detection).
+    last_response_at: Mutex<Option<std::time::Instant>>,
     // Note: always_allowed_tools is on HostServices (shared across requests),
     // not here (per-request DaemonHostFunctions).
 }
@@ -220,6 +222,7 @@ impl DaemonHostFunctions {
             recent_file_paths: Mutex::new(Vec::new()),
             current_browser_url: Mutex::new(None),
             session_extractor,
+            last_response_at: Mutex::new(None),
         }
     }
 
@@ -1030,8 +1033,33 @@ impl HostFunctions for DaemonHostFunctions {
 
         // Microcompact: clear old large tool results before compression
         {
+            // Check time gap: if > threshold, force clearing ALL large tool results
+            let force_clear_all = {
+                let gap_mins = self.config.daemon.context.time_gap_threshold_minutes;
+                if gap_mins > 0 {
+                    self.last_response_at
+                        .lock()
+                        .ok()
+                        .and_then(|g| {
+                            g.map(|t| {
+                                t.elapsed() > std::time::Duration::from_secs(gap_mins * 60)
+                            })
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            };
+
+            let keep_recent = if force_clear_all {
+                debug!("Time gap exceeded threshold, forcing full microcompact");
+                0
+            } else {
+                self.config.daemon.context.microcompact_keep_recent
+            };
+
             let compactor = crate::context::MicroCompactor::new(
-                self.config.daemon.context.microcompact_keep_recent,
+                keep_recent,
                 self.config.daemon.context.microcompact_content_threshold,
             );
             let mc_result = compactor.compact(&mut context_messages);
@@ -1164,6 +1192,11 @@ impl HostFunctions for DaemonHostFunctions {
                         trace_request_value,
                         full_response,
                     );
+                }
+
+                // Update last response timestamp for time-gap detection
+                if let Ok(mut t) = self.last_response_at.lock() {
+                    *t = Some(std::time::Instant::now());
                 }
 
                 // Convert tool calls, preserving call_id for OpenAI Responses API compatibility
@@ -4121,6 +4154,7 @@ impl DaemonHostFunctions {
             recent_file_paths: Mutex::new(self.recent_file_paths.lock().unwrap().clone()),
             current_browser_url: Mutex::new(self.current_browser_url.lock().unwrap().clone()),
             session_extractor: self.session_extractor.clone(),
+            last_response_at: Mutex::new(self.last_response_at.lock().unwrap().clone()),
         }
     }
 
@@ -6617,5 +6651,32 @@ mod tests {
         assert!(hint.contains("- /src/lib.rs"));
         assert!(hint.contains("Current browser page: https://docs.rs/tokio"));
         assert!(hint.contains("Use read_file"));
+    }
+
+    #[test]
+    fn test_time_gap_forces_full_microcompact() {
+        let mut config = AgentConfig::default();
+        config.daemon.context.time_gap_threshold_minutes = 1;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(Arc::new(config), rt.handle().clone());
+
+        // Set last_response_at to 2 minutes ago
+        *host.last_response_at.lock().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
+
+        let elapsed = host.last_response_at.lock().unwrap().unwrap().elapsed();
+        assert!(elapsed > std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_time_gap_zero_disabled() {
+        let mut config = AgentConfig::default();
+        config.daemon.context.time_gap_threshold_minutes = 0;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _host = DaemonHostFunctions::new(Arc::new(config.clone()), rt.handle().clone());
+
+        assert_eq!(config.daemon.context.time_gap_threshold_minutes, 0);
     }
 }

@@ -906,6 +906,9 @@ pub struct ContextConfig {
     /// Minimum content length (chars) for a tool result to be eligible for clearing.
     #[serde(default = "default_microcompact_content_threshold")]
     pub microcompact_content_threshold: usize,
+    /// Minutes of inactivity before forcing full microcompact (0 = disabled).
+    #[serde(default = "default_time_gap_threshold_minutes")]
+    pub time_gap_threshold_minutes: u64,
 }
 
 impl Default for ContextConfig {
@@ -925,6 +928,7 @@ impl Default for ContextConfig {
             compression_cooldown_secs: default_compression_cooldown_secs(),
             microcompact_keep_recent: default_microcompact_keep_recent(),
             microcompact_content_threshold: default_microcompact_content_threshold(),
+            time_gap_threshold_minutes: default_time_gap_threshold_minutes(),
         }
     }
 }
@@ -959,6 +963,10 @@ fn default_microcompact_keep_recent() -> usize {
 
 fn default_microcompact_content_threshold() -> usize {
     1000
+}
+
+fn default_time_gap_threshold_minutes() -> u64 {
+    30
 }
 
 // ==================== Subagent Configuration ====================
