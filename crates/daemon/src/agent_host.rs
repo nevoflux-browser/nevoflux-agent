@@ -173,6 +173,8 @@ pub struct DaemonHostFunctions {
     current_thinking_id: Arc<Mutex<Option<String>>>,
     /// Domain from the most recent successful browser_navigate.
     last_navigated_domain: Arc<Mutex<Option<String>>>,
+    /// Circuit breaker for context compression — prevents infinite retries.
+    compression_circuit_breaker: crate::context::CompressionCircuitBreaker,
     // Note: always_allowed_tools is on HostServices (shared across requests),
     // not here (per-request DaemonHostFunctions).
 }
@@ -180,6 +182,10 @@ pub struct DaemonHostFunctions {
 impl DaemonHostFunctions {
     /// Create a new DaemonHostFunctions with the given configuration.
     pub fn new(config: Arc<AgentConfig>, runtime: Handle) -> Self {
+        let compression_circuit_breaker = crate::context::CompressionCircuitBreaker::new(
+            config.daemon.context.max_compression_failures,
+            std::time::Duration::from_secs(config.daemon.context.compression_cooldown_secs),
+        );
         Self {
             config,
             runtime,
@@ -198,6 +204,7 @@ impl DaemonHostFunctions {
             is_subagent: false,
             current_thinking_id: Arc::new(Mutex::new(None)),
             last_navigated_domain: Arc::new(Mutex::new(None)),
+            compression_circuit_breaker,
         }
     }
 
@@ -981,13 +988,39 @@ impl HostFunctions for DaemonHostFunctions {
             &self.config.daemon.context,
         );
 
-        // Attempt compression if needed
-        let compressor = ContextCompressor::new(self.config.clone(), self.runtime.clone());
-        let compression_result = compressor.compress_if_needed(
-            &context_messages,
-            estimated_tokens,
-            token_budget.for_history,
-        );
+        // Attempt compression if needed (with circuit breaker protection)
+        let compression_result = {
+            use crate::context::CircuitState;
+
+            let cb_state = self.compression_circuit_breaker.state();
+            if cb_state == CircuitState::Open {
+                warn!("Compression circuit breaker is open, skipping compression");
+                CompressionResult::Skipped {
+                    reason: "Circuit breaker open — too many consecutive compression failures"
+                        .into(),
+                }
+            } else {
+                let compressor =
+                    ContextCompressor::new(self.config.clone(), self.runtime.clone());
+                let result = compressor.compress_if_needed(
+                    &context_messages,
+                    estimated_tokens,
+                    token_budget.for_history,
+                );
+                match &result {
+                    CompressionResult::Compressed { .. } => {
+                        self.compression_circuit_breaker.record_success();
+                    }
+                    CompressionResult::Skipped { reason }
+                        if reason.contains("failed") || reason.contains("Failed") =>
+                    {
+                        self.compression_circuit_breaker.record_failure();
+                    }
+                    _ => {}
+                }
+                result
+            }
+        };
 
         // Convert to daemon request
         // IMPORTANT: When no compression happens, use convert_request_to_daemon() to preserve
@@ -3992,6 +4025,12 @@ impl DaemonHostFunctions {
             is_subagent: self.is_subagent,
             current_thinking_id: Arc::new(Mutex::new(None)),
             last_navigated_domain: self.last_navigated_domain.clone(),
+            compression_circuit_breaker: crate::context::CompressionCircuitBreaker::new(
+                self.config.daemon.context.max_compression_failures,
+                std::time::Duration::from_secs(
+                    self.config.daemon.context.compression_cooldown_secs,
+                ),
+            ),
         }
     }
 
@@ -6350,5 +6389,24 @@ mod tests {
         let result = host.subagent_wait(999);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code, 404);
+    }
+
+    #[test]
+    fn test_compress_skipped_when_circuit_open() {
+        let mut config = AgentConfig::default();
+        config.daemon.context.max_compression_failures = 2;
+        config.daemon.context.compression_cooldown_secs = 300;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(Arc::new(config), rt.handle().clone());
+
+        // Simulate 2 failures to trip the breaker
+        host.compression_circuit_breaker.record_failure();
+        host.compression_circuit_breaker.record_failure();
+
+        assert_eq!(
+            host.compression_circuit_breaker.state(),
+            crate::context::CircuitState::Open
+        );
     }
 }
