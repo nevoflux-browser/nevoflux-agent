@@ -727,6 +727,8 @@ pub async fn start_server(
         let pipeline_clone = Arc::clone(&pipeline);
         let buffer_clone = Arc::clone(&buffer);
         let collector_clone = Arc::clone(&collector);
+        let shared_storage_clone = Arc::clone(&shared_storage);
+        let agent_config_clone = agent_config.clone();
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(flush_interval));
@@ -773,6 +775,65 @@ pub async fn start_server(
                         }
                         Err(e) => warn!("Learning pipeline promote error: {}", e),
                         _ => {}
+                    }
+
+                    // Check if any category needs consolidation (Auto-Dream)
+                    let consolidator =
+                        crate::learning::consolidator::KnowledgeConsolidator::new(0.8);
+                    let hot_limits = vec![
+                        (
+                            "user_preference".to_string(),
+                            promotion_thresholds.hot_limit_user_preference,
+                        ),
+                        (
+                            "tool_optimization".to_string(),
+                            promotion_thresholds.hot_limit_tool_optimization,
+                        ),
+                        (
+                            "site_interaction".to_string(),
+                            promotion_thresholds.hot_limit_site_interaction,
+                        ),
+                    ];
+
+                    if let Some((category, limit)) =
+                        consolidator.category_needing_consolidation(
+                            shared_storage_clone.database(),
+                            &hot_limits,
+                        )
+                    {
+                        let target =
+                            crate::learning::consolidator::KnowledgeConsolidator::target_count(
+                                limit,
+                            );
+                        let cons_config =
+                            agent_config_clone.read().unwrap().clone();
+                        let cons_db = std::sync::Arc::new(
+                            shared_storage_clone.database().clone(),
+                        );
+                        let cons_category = category.clone();
+                        tokio::spawn(async move {
+                            match crate::learning::consolidator::consolidate_category(
+                                cons_config,
+                                cons_db,
+                                &cons_category,
+                                target,
+                            )
+                            .await
+                            {
+                                Ok(r) => {
+                                    info!(
+                                        "Consolidated '{}': {} → {} entries",
+                                        r.category, r.original_count, r.consolidated_count
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Knowledge consolidation failed for '{}': {}",
+                                        cons_category, e
+                                    );
+                                }
+                            }
+                        });
                     }
                 }
             }
