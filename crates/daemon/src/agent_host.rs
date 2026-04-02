@@ -1884,6 +1884,17 @@ impl HostFunctions for DaemonHostFunctions {
             path, offset, limit
         );
 
+        // Record file path for post-compression reinjection
+        if let Ok(mut paths) = self.recent_file_paths.lock() {
+            // Remove if already present (LRU: move to end)
+            paths.retain(|p| p != path);
+            paths.push(path.to_string());
+            // Keep max 20
+            if paths.len() > 20 {
+                paths.remove(0);
+            }
+        }
+
         let resolved_path = self
             .resolve_skill_path(path, true)
             .unwrap_or_else(|| std::path::PathBuf::from(path));
@@ -4333,10 +4344,17 @@ impl DaemonHostFunctions {
                                 *g = Some(domain);
                             }
                         }
+                        // Record full URL for post-compression reinjection
+                        if let Ok(mut g) = self.current_browser_url.lock() {
+                            *g = Some(url.to_string());
+                        }
                     }
                 }
                 BrowserToolAction::GoBack | BrowserToolAction::GoForward => {
                     if let Ok(mut g) = self.last_navigated_domain.lock() {
+                        *g = None;
+                    }
+                    if let Ok(mut g) = self.current_browser_url.lock() {
                         *g = None;
                     }
                 }
@@ -6434,5 +6452,50 @@ mod tests {
             host.compression_circuit_breaker.state(),
             crate::context::CircuitState::Open
         );
+    }
+
+    #[test]
+    fn test_recent_file_paths_dedup() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        // Record same path twice
+        {
+            let mut paths = host.recent_file_paths.lock().unwrap();
+            paths.retain(|p| p != "/test/file.rs");
+            paths.push("/test/file.rs".to_string());
+            paths.retain(|p| p != "/test/file.rs");
+            paths.push("/test/file.rs".to_string());
+        }
+
+        let paths = host.recent_file_paths.lock().unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], "/test/file.rs");
+    }
+
+    #[test]
+    fn test_recent_file_paths_limit() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        {
+            let mut paths = host.recent_file_paths.lock().unwrap();
+            for i in 0..25 {
+                let path = format!("/test/file_{}.rs", i);
+                paths.retain(|p| p != &path);
+                paths.push(path);
+                if paths.len() > 20 {
+                    paths.remove(0);
+                }
+            }
+        }
+
+        let paths = host.recent_file_paths.lock().unwrap();
+        assert_eq!(paths.len(), 20);
+        // Oldest (0-4) should be gone, newest (5-24) should remain
+        assert_eq!(paths[0], "/test/file_5.rs");
+        assert_eq!(paths[19], "/test/file_24.rs");
     }
 }
