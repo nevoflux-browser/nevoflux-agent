@@ -175,6 +175,10 @@ pub struct DaemonHostFunctions {
     last_navigated_domain: Arc<Mutex<Option<String>>>,
     /// Circuit breaker for context compression — prevents infinite retries.
     compression_circuit_breaker: crate::context::CompressionCircuitBreaker,
+    /// File paths read during this session (deduped, max 20, FIFO).
+    recent_file_paths: Mutex<Vec<String>>,
+    /// Current browser URL (set on successful navigate).
+    current_browser_url: Mutex<Option<String>>,
     // Note: always_allowed_tools is on HostServices (shared across requests),
     // not here (per-request DaemonHostFunctions).
 }
@@ -205,6 +209,8 @@ impl DaemonHostFunctions {
             current_thinking_id: Arc::new(Mutex::new(None)),
             last_navigated_domain: Arc::new(Mutex::new(None)),
             compression_circuit_breaker,
+            recent_file_paths: Mutex::new(Vec::new()),
+            current_browser_url: Mutex::new(None),
         }
     }
 
@@ -4044,6 +4050,12 @@ impl DaemonHostFunctions {
                 std::time::Duration::from_secs(
                     self.config.daemon.context.compression_cooldown_secs,
                 ),
+            ),
+            recent_file_paths: Mutex::new(
+                self.recent_file_paths.lock().unwrap().clone(),
+            ),
+            current_browser_url: Mutex::new(
+                self.current_browser_url.lock().unwrap().clone(),
             ),
         }
     }
