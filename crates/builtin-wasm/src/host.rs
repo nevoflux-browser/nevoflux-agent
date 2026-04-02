@@ -1352,6 +1352,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            os_platform: None,
         };
 
         let chat_output = mock.builtin_chat(&input).unwrap();

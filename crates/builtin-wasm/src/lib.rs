@@ -132,6 +132,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            os_platform: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -166,6 +167,7 @@ mod tests {
                 mcp_servers: vec![],
                 soul_context: None,
                 tools_config: None,
+                os_platform: None,
             };
 
             let output = agent.run(&input);
@@ -193,6 +195,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            os_platform: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -225,6 +228,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            os_platform: None,
         };
 
         let output = agent.run(&input);

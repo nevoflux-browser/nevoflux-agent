@@ -559,6 +559,7 @@ impl SubagentExecutor {
             mcp_servers: vec![],
             soul_context: None,
             tools_config,
+            os_platform: Some(std::env::consts::OS.to_string()),
         };
 
         // Check for kill before running

@@ -1997,6 +1997,7 @@ async fn handle_chat_message_streaming(
             sc
         },
         tools_config: None,
+        os_platform: Some(std::env::consts::OS.to_string()),
     };
 
     // Create cancellation token for this streaming session
@@ -2334,6 +2335,7 @@ async fn handle_chat_message_streaming(
                             mcp_servers: mcp_servers.clone(),
                             soul_context: build_soul_context(&services),
                             tools_config: None,
+                            os_platform: Some(std::env::consts::OS.to_string()),
                         };
 
                         // Spawn stream forwarder for re-run
@@ -3361,6 +3363,7 @@ async fn handle_chat_message(
                 mcp_servers,
                 soul_context: build_soul_context(&services),
                 tools_config: None,
+                os_platform: Some(std::env::consts::OS.to_string()),
             };
 
             // Run agent

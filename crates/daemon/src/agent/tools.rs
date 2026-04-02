@@ -646,7 +646,8 @@ impl ToolExecutor for ListFilesTool {
 /// Used by AutoFixer-injected helpers to bridge missing stdlib modules
 /// (re, datetime, random) by running `python3 -c "..."` or shell commands.
 ///
-/// Safety: commands are timeout-limited (30s) and output-size-limited (1MB).
+/// Safety: commands are timeout-limited (120s) and output-size-limited (1MB).
+/// On Windows, commands run via PowerShell; on Unix, via sh.
 pub struct RunCommandTool;
 
 #[async_trait]
@@ -673,13 +674,22 @@ impl ToolExecutor for RunCommandTool {
 
         use tokio::process::Command;
 
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            Command::new("sh").arg("-c").arg(command).output(),
-        )
-        .await
-        .map_err(|_| DaemonError::InternalError("Command timed out after 30 seconds".to_string()))?
-        .map_err(|e| DaemonError::InternalError(format!("Failed to execute command: {}", e)))?;
+        let mut cmd = if cfg!(target_os = "windows") {
+            let mut c = Command::new("powershell");
+            c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", command]);
+            c
+        };
+
+        let output = tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output())
+            .await
+            .map_err(|_| {
+                DaemonError::InternalError("Command timed out after 120 seconds".to_string())
+            })?
+            .map_err(|e| DaemonError::InternalError(format!("Failed to execute command: {}", e)))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);

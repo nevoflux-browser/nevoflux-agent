@@ -644,7 +644,13 @@ impl<H: HostFunctions> Agent<H> {
             None => {
                 let skills = self.host.skill_list().unwrap_or_default();
                 let cu_flags = self.computer_use_flags(mode);
-                Self::build_system_prompt(mode, &skills, &input.available_models, cu_flags)
+                Self::build_system_prompt(
+                    mode,
+                    &skills,
+                    &input.available_models,
+                    cu_flags,
+                    input.os_platform.as_deref(),
+                )
             }
         };
 
@@ -795,8 +801,22 @@ The following skill instructions MUST be followed exactly. These instructions ta
         skills: &[SkillSummary],
         models: &[(String, String)],
         computer_use: ComputerUseFlags,
+        os_platform: Option<&str>,
     ) -> String {
         let mut prompt = Self::base_prompt_for_mode(mode).to_string();
+
+        // Inject platform info so LLM uses correct shell syntax
+        if let Some(os) = os_platform {
+            let shell_hint = match os {
+                "windows" => "Windows (PowerShell). Use PowerShell syntax for commands.",
+                "macos" => "macOS (zsh/bash). Use POSIX shell syntax for commands.",
+                _ => "Linux (bash). Use POSIX shell syntax for commands.",
+            };
+            prompt.push_str(&format!(
+                "\n\n# System Environment\n\nOperating System: {}\n",
+                shell_hint
+            ));
+        }
 
         // Append computer use prompt layers based on flags
         if computer_use.inject_overview {
@@ -4349,6 +4369,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            os_platform: None,
         };
 
         // Should run successfully with custom prompt
@@ -4360,16 +4381,26 @@ mod tests {
     fn test_build_system_prompt() {
         let no_cu = ComputerUseFlags::default();
         let prompt =
-            Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Chat, &[], &[], no_cu);
+            Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Chat, &[], &[], no_cu, None);
         assert!(!prompt.is_empty());
         assert_eq!(prompt, CHAT_PROMPT);
 
-        let prompt =
-            Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Browser, &[], &[], no_cu);
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
+            AgentMode::Browser,
+            &[],
+            &[],
+            no_cu,
+            None,
+        );
         assert_eq!(prompt, BROWSER_PROMPT);
 
-        let prompt =
-            Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Agent, &[], &[], no_cu);
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
+            AgentMode::Agent,
+            &[],
+            &[],
+            no_cu,
+            None,
+        );
         assert_eq!(prompt, AGENT_PROMPT);
     }
 
@@ -4549,6 +4580,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            os_platform: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -4575,6 +4607,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            os_platform: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -4601,6 +4634,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            os_platform: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -4648,6 +4682,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            os_platform: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -4714,6 +4749,7 @@ mod tests {
             &skills,
             &[],
             ComputerUseFlags::default(),
+            None,
         );
         assert!(prompt.contains("web-tools"));
         assert!(prompt.contains("# Skills"));
@@ -4727,6 +4763,7 @@ mod tests {
             &[],
             &models,
             ComputerUseFlags::default(),
+            None,
         );
         assert!(prompt.contains("claude-sonnet"));
         assert!(prompt.contains("# Available models"));
@@ -4739,6 +4776,7 @@ mod tests {
             &[],
             &[],
             ComputerUseFlags::default(),
+            None,
         );
         // Should be exactly the static prompt, no extras
         assert_eq!(prompt, CHAT_PROMPT);
@@ -4833,8 +4871,13 @@ mod tests {
             inject_guide: false,
             inject_examples: false,
         };
-        let prompt =
-            Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Browser, &[], &[], flags);
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
+            AgentMode::Browser,
+            &[],
+            &[],
+            flags,
+            None,
+        );
         assert!(prompt.contains("# Computer Use"));
         assert!(prompt.contains("Browser Use"));
         assert!(!prompt.contains("# Computer Use Guide"));
@@ -4848,8 +4891,13 @@ mod tests {
             inject_guide: true,
             inject_examples: true,
         };
-        let prompt =
-            Agent::<MockHostFunctions>::build_system_prompt(AgentMode::Agent, &[], &[], flags);
+        let prompt = Agent::<MockHostFunctions>::build_system_prompt(
+            AgentMode::Agent,
+            &[],
+            &[],
+            flags,
+            None,
+        );
         assert!(prompt.contains("# Computer Use"));
         assert!(prompt.contains("# Computer Use Guide"));
         assert!(prompt.contains("# Computer Use Examples"));
@@ -5272,6 +5320,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            os_platform: None,
         };
 
         // Should complete normally
@@ -5302,6 +5351,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            os_platform: None,
         };
 
         // Should exit early due to interrupt

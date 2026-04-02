@@ -4626,6 +4626,7 @@ impl DaemonHostFunctions {
                     mcp_servers: vec![],
                     soul_context: None,
                     tools_config,
+                    os_platform: Some(std::env::consts::OS.to_string()),
                 };
 
                 // Run the appropriate builtin mode
