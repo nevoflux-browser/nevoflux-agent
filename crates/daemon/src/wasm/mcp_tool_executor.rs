@@ -1377,7 +1377,10 @@ mod tests {
         let result = execute_memory_view(&serde_json::json!({"limit": 10}), &services);
         assert!(result.is_ok());
         let viewed: Vec<serde_json::Value> = serde_json::from_str(&result.unwrap()).unwrap();
-        assert!(!viewed.is_empty(), "memory_view should return the created entry");
+        assert!(
+            !viewed.is_empty(),
+            "memory_view should return the created entry"
+        );
     }
 
     #[test]
@@ -1389,7 +1392,9 @@ mod tests {
         // Create a chunk directly in memory_chunks (not via memory_create which now uses knowledge)
         let chunk = nevoflux_storage::MemoryChunk::new("searchable chunk content");
         let chunk_id = chunk.id.clone();
-        nevoflux_storage::MemoryRepository::new(&db).create(&chunk).unwrap();
+        nevoflux_storage::MemoryRepository::new(&db)
+            .create(&chunk)
+            .unwrap();
 
         // Search
         let result = execute_memory_search(
@@ -1408,10 +1413,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Delete
-        let result = execute_memory_delete(
-            &serde_json::json!({"id": chunk_id}),
-            &services,
-        );
+        let result = execute_memory_delete(&serde_json::json!({"id": chunk_id}), &services);
         assert!(result.is_ok());
     }
 

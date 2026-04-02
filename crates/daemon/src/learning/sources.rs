@@ -601,7 +601,11 @@ mod tests {
         storage.database().memory().create(&chunk).unwrap();
 
         let entries = source.collect();
-        assert_eq!(entries.len(), 1, "Mixed language preference should be detected");
+        assert_eq!(
+            entries.len(),
+            1,
+            "Mixed language preference should be detected"
+        );
     }
 
     #[test]

@@ -6034,15 +6034,39 @@ async fn handle_openclaw_model_set(params: &serde_json::Value) -> serde_json::Va
         }
     };
 
-    let base_url = params.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
+    let base_url = params
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let api_key = params.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
-    let api_type = params.get("api_type").and_then(|v| v.as_str()).unwrap_or("openai-completions");
-    let model_id = params.get("model_id").and_then(|v| v.as_str()).unwrap_or("default");
-    let model_name = params.get("model_name").and_then(|v| v.as_str()).unwrap_or(model_id);
-    let context_window = params.get("context_window").and_then(|v| v.as_u64()).unwrap_or(200000);
-    let max_tokens = params.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(32768);
-    let reasoning = params.get("reasoning").and_then(|v| v.as_bool()).unwrap_or(false);
-    let set_as_primary = params.get("set_as_primary").and_then(|v| v.as_bool()).unwrap_or(false);
+    let api_type = params
+        .get("api_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("openai-completions");
+    let model_id = params
+        .get("model_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
+    let model_name = params
+        .get("model_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(model_id);
+    let context_window = params
+        .get("context_window")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(200000);
+    let max_tokens = params
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(32768);
+    let reasoning = params
+        .get("reasoning")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let set_as_primary = params
+        .get("set_as_primary")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // --- Step 1: Write model provider config ---
     let provider_config = serde_json::json!({
@@ -6062,7 +6086,9 @@ async fn handle_openclaw_model_set(params: &serde_json::Value) -> serde_json::Va
     let config_path = format!("models.providers.{}", provider_name);
     let output = Command::new(crate::openclaw_setup::resolve_openclaw())
         .args([
-            "config", "set", &config_path,
+            "config",
+            "set",
+            &config_path,
             &serde_json::to_string(&provider_config).unwrap(),
             "--strict-json",
         ])
@@ -6104,7 +6130,9 @@ async fn handle_openclaw_model_set(params: &serde_json::Value) -> serde_json::Va
         let alias_value = serde_json::json!({"alias": provider_name});
         let _ = Command::new(crate::openclaw_setup::resolve_openclaw())
             .args([
-                "config", "set", &alias_path,
+                "config",
+                "set",
+                &alias_path,
                 &serde_json::to_string(&alias_value).unwrap(),
                 "--strict-json",
             ])
@@ -6198,11 +6226,17 @@ async fn handle_openclaw_status() -> serde_json::Value {
 
     // Determine current setup step
     let (setup_step, message) = if !gateway_running && !plugin_installed {
-        ("setup", "OpenClaw needs initial setup. Save a model configuration to auto-configure.")
+        (
+            "setup",
+            "OpenClaw needs initial setup. Save a model configuration to auto-configure.",
+        )
     } else if !gateway_running {
         ("gateway", "OpenClaw gateway is not running.")
     } else if !plugin_installed {
-        ("plugin", "NevoFlux tools plugin not installed. Save a model configuration to auto-configure.")
+        (
+            "plugin",
+            "NevoFlux tools plugin not installed. Save a model configuration to auto-configure.",
+        )
     } else {
         ("ready", "OpenClaw is ready.")
     };

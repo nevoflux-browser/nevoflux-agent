@@ -391,7 +391,7 @@ pub fn start_gateway() -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("Failed to start gateway: {}", e))?;
     drop(output); // Detach — gateway runs independently
-    // Wait for gateway to become healthy
+                  // Wait for gateway to become healthy
     for _ in 0..10 {
         std::thread::sleep(std::time::Duration::from_secs(1));
         if is_gateway_running() {
@@ -415,7 +415,10 @@ fn restart_gateway() {
 /// Check if NevoFlux plugin is installed in OpenClaw extensions.
 pub fn is_plugin_installed() -> bool {
     dirs::home_dir()
-        .map(|h| h.join(".openclaw/extensions/nevoflux-tools/index.ts").exists())
+        .map(|h| {
+            h.join(".openclaw/extensions/nevoflux-tools/index.ts")
+                .exists()
+        })
         .unwrap_or(false)
 }
 

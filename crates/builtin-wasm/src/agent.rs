@@ -1702,7 +1702,9 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     content.to_string()
                 };
 
-                let id = self.host.knowledge_teach(category, &summary, content, domain)?;
+                let id = self
+                    .host
+                    .knowledge_teach(category, &summary, content, domain)?;
                 serde_json::json!({"id": id, "status": "created"}).to_string()
             }
             "memory_update" => {

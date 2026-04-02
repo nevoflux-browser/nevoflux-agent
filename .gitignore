@@ -23,6 +23,7 @@ target
 CLAUDE.md
 .claude
 docs/plans/
+docs/superpowers/
 docs/testing/
 *.plan
 *_plan.md

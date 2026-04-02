@@ -1526,7 +1526,10 @@ impl HostFunctions for DaemonHostFunctions {
         Ok(())
     }
 
-    fn memory_view(&self, limit: usize) -> HostResult<Vec<nevoflux_builtin_wasm::types::KnowledgeViewEntry>> {
+    fn memory_view(
+        &self,
+        limit: usize,
+    ) -> HostResult<Vec<nevoflux_builtin_wasm::types::KnowledgeViewEntry>> {
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
             message: "Services not available".into(),
@@ -4933,7 +4936,12 @@ mod tests {
 
         // Create a knowledge entry via knowledge_teach (same path as memory_create)
         let id = host
-            .knowledge_teach("user_preference", "prefers dark theme", "User prefers dark theme for all UIs", None)
+            .knowledge_teach(
+                "user_preference",
+                "prefers dark theme",
+                "User prefers dark theme for all UIs",
+                None,
+            )
             .unwrap();
         assert!(!id.is_empty());
 
