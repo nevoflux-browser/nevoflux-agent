@@ -1526,6 +1526,14 @@ impl HostFunctions for DaemonHostFunctions {
         Ok(())
     }
 
+    fn memory_view(
+        &self,
+        _limit: usize,
+    ) -> HostResult<Vec<nevoflux_builtin_wasm::types::KnowledgeViewEntry>> {
+        // TODO: implement in Task 7
+        Ok(vec![])
+    }
+
     fn knowledge_teach(
         &self,
         category: &str,
@@ -4803,30 +4811,49 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_create_and_search() {
+    fn test_memory_create_writes_to_knowledge() {
         let (host, _rt) = setup_host_with_services();
 
-        // Create a memory chunk
         let metadata = serde_json::json!({"source": "test"});
         let id = host
-            .memory_create("hello world searchable content", &metadata)
+            .memory_create("user prefers dark theme for all interfaces", &metadata)
             .unwrap();
         assert!(!id.is_empty());
+        // knowledge_teach returns IDs starting with "K-"
+        assert!(id.starts_with("K-"), "Expected knowledge ID, got: {}", id);
+    }
 
-        // Search for it
-        let results = host.memory_search("searchable", 10).unwrap();
-        assert_eq!(results.len(), 1);
-        assert!(results[0].content.contains("searchable"));
+    #[test]
+    fn test_memory_create_with_category() {
+        let (host, _rt) = setup_host_with_services();
+
+        let metadata = serde_json::json!({"category": "site_interaction", "domain": "github.com"});
+        let id = host
+            .memory_create("GitHub uses dynamic loading for code views", &metadata)
+            .unwrap();
+        assert!(id.starts_with("K-"));
+    }
+
+    #[test]
+    fn test_memory_create_default_category() {
+        let (host, _rt) = setup_host_with_services();
+
+        let metadata = serde_json::json!({});
+        let id = host
+            .memory_create("I prefer concise responses", &metadata)
+            .unwrap();
+        assert!(id.starts_with("K-"));
     }
 
     #[test]
     fn test_memory_update() {
         let (host, _rt) = setup_host_with_services();
 
-        // Create a memory chunk
-        let id = host
-            .memory_create("original content", &serde_json::json!({}))
-            .unwrap();
+        // Create a memory chunk directly in the database (memory_update operates on memory_chunks)
+        let db = &host.services.as_ref().unwrap().database;
+        let chunk = nevoflux_storage::MemoryChunk::new("original content");
+        let id = chunk.id.clone();
+        db.memory().create(&chunk).unwrap();
 
         // Update it
         let result = host.memory_update(&id, "updated content");
@@ -4851,10 +4878,12 @@ mod tests {
     fn test_memory_delete() {
         let (host, _rt) = setup_host_with_services();
 
-        // Create and then delete
-        let id = host
-            .memory_create("to be deleted", &serde_json::json!({}))
-            .unwrap();
+        // Create a memory chunk directly in the database (memory_delete operates on memory_chunks)
+        let db = &host.services.as_ref().unwrap().database;
+        let chunk = nevoflux_storage::MemoryChunk::new("to be deleted");
+        let id = chunk.id.clone();
+        db.memory().create(&chunk).unwrap();
+
         let result = host.memory_delete(&id);
         assert!(result.is_ok());
 
