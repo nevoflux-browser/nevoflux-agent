@@ -1070,6 +1070,12 @@ pub struct LearningConfig {
     pub validation: ValidationConfig,
     /// Promotion thresholds for graduating patterns.
     pub promotion: PromotionConfig,
+    /// Enable automatic session memory extraction via LLM.
+    #[serde(default = "default_enable_session_extraction")]
+    pub enable_session_extraction: bool,
+    /// Extract knowledge every N user messages.
+    #[serde(default = "default_extraction_interval")]
+    pub extraction_interval: u32,
 }
 
 impl Default for LearningConfig {
@@ -1082,6 +1088,8 @@ impl Default for LearningConfig {
             soul_dir: None,
             validation: ValidationConfig::default(),
             promotion: PromotionConfig::default(),
+            enable_session_extraction: default_enable_session_extraction(),
+            extraction_interval: default_extraction_interval(),
         }
     }
 }
@@ -1141,6 +1149,14 @@ impl Default for PromotionConfig {
             min_alive_days: 3,
         }
     }
+}
+
+fn default_enable_session_extraction() -> bool {
+    true
+}
+
+fn default_extraction_interval() -> u32 {
+    5
 }
 
 // ==================== EmbeddingConfig ====================
