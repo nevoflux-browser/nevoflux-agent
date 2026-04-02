@@ -886,11 +886,23 @@ fn execute_memory_view(
     services: &HostServices,
 ) -> Result<String, String> {
     let limit = args["limit"].as_u64().unwrap_or(20) as usize;
-    let entries = services
-        .database
-        .memory()
-        .list(Some(limit))
+    let knowledge_repo = nevoflux_storage::KnowledgeRepository::new(&services.database);
+    let hot_entries = knowledge_repo
+        .list_hot()
         .map_err(|e| format!("memory view failed: {e}"))?;
+    let entries: Vec<serde_json::Value> = hot_entries
+        .into_iter()
+        .take(limit)
+        .map(|e| {
+            serde_json::json!({
+                "id": e.id,
+                "category": e.category,
+                "summary": e.hot_summary.unwrap_or(e.summary),
+                "domain": e.domain,
+                "created_at": e.created_at,
+            })
+        })
+        .collect();
     serde_json::to_string_pretty(&entries).map_err(|e| format!("serialize failed: {e}"))
 }
 
@@ -1351,18 +1363,37 @@ mod tests {
         let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
         let services = HostServices::new(db);
 
-        // Create
+        // Create (now writes to knowledge table as hot entry)
         let result = execute_memory_create(
-            &serde_json::json!({"content": "test memory content"}),
+            &serde_json::json!({"content": "test memory content for roundtrip"}),
             &services,
         );
         assert!(result.is_ok(), "create failed: {:?}", result);
         let created: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
         let id = created["id"].as_str().unwrap().to_string();
+        assert!(id.starts_with("K-"), "Expected knowledge ID, got: {}", id);
+
+        // View (should find the hot entry)
+        let result = execute_memory_view(&serde_json::json!({"limit": 10}), &services);
+        assert!(result.is_ok());
+        let viewed: Vec<serde_json::Value> = serde_json::from_str(&result.unwrap()).unwrap();
+        assert!(!viewed.is_empty(), "memory_view should return the created entry");
+    }
+
+    #[test]
+    fn test_memory_search_and_update_on_chunks() {
+        // memory_search/update/delete still operate on memory_chunks table
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let services = HostServices::new(db.clone());
+
+        // Create a chunk directly in memory_chunks (not via memory_create which now uses knowledge)
+        let chunk = nevoflux_storage::MemoryChunk::new("searchable chunk content");
+        let chunk_id = chunk.id.clone();
+        nevoflux_storage::MemoryRepository::new(&db).create(&chunk).unwrap();
 
         // Search
         let result = execute_memory_search(
-            &serde_json::json!({"query": "test memory", "limit": 5}),
+            &serde_json::json!({"query": "searchable", "limit": 5}),
             &services,
         );
         assert!(result.is_ok());
@@ -1371,17 +1402,16 @@ mod tests {
 
         // Update
         let result = execute_memory_update(
-            &serde_json::json!({"id": id, "content": "updated content"}),
+            &serde_json::json!({"id": chunk_id, "content": "updated content"}),
             &services,
         );
         assert!(result.is_ok());
 
-        // View
-        let result = execute_memory_view(&serde_json::json!({"limit": 10}), &services);
-        assert!(result.is_ok());
-
         // Delete
-        let result = execute_memory_delete(&serde_json::json!({"id": id}), &services);
+        let result = execute_memory_delete(
+            &serde_json::json!({"id": chunk_id}),
+            &services,
+        );
         assert!(result.is_ok());
     }
 
