@@ -297,6 +297,7 @@ impl LearningSource for MemoryChunkPreferenceSource {
 
         // Filter for preference-like chunks via metadata or keyword heuristics
         let preference_keywords = [
+            // English
             "prefer",
             "always",
             "never",
@@ -308,6 +309,23 @@ impl LearningSource for MemoryChunkPreferenceSource {
             "style",
             "mode",
             "format",
+            // Chinese
+            "喜欢",
+            "偏好",
+            "总是",
+            "始终",
+            "永远不",
+            "不要",
+            "不喜欢",
+            "习惯",
+            "风格",
+            "模式",
+            "语言",
+            "格式",
+            "主题",
+            "每次都",
+            "一定要",
+            "记住",
         ];
 
         let mut entries = Vec::new();
@@ -559,6 +577,31 @@ mod tests {
         // Second collect without new chunks should return empty
         let entries2 = source.collect();
         assert!(entries2.is_empty());
+    }
+
+    #[test]
+    fn test_memory_chunk_preference_source_chinese() {
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let source = MemoryChunkPreferenceSource::new(Arc::clone(&storage));
+
+        // Create a Chinese preference chunk
+        let chunk = nevoflux_storage::MemoryChunk::new("我喜欢暗色主题");
+        storage.database().memory().create(&chunk).unwrap();
+
+        let entries = source.collect();
+        assert_eq!(entries.len(), 1, "Chinese preference should be detected");
+    }
+
+    #[test]
+    fn test_memory_chunk_preference_source_mixed() {
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let source = MemoryChunkPreferenceSource::new(Arc::clone(&storage));
+
+        let chunk = nevoflux_storage::MemoryChunk::new("I prefer 暗色模式");
+        storage.database().memory().create(&chunk).unwrap();
+
+        let entries = source.collect();
+        assert_eq!(entries.len(), 1, "Mixed language preference should be detected");
     }
 
     #[test]
