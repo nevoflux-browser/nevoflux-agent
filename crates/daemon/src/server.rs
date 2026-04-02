@@ -1951,6 +1951,16 @@ async fn handle_chat_message_streaming(
         }
     }
 
+    // Track user message for session extraction
+    host.session_extractor.on_user_message();
+    host.session_extractor.reset_turn_flags();
+
+    // Clone extractor Arc before host is moved into Agent
+    let session_extractor = host.session_extractor.clone();
+    let extraction_config = config.clone();
+    let extraction_database = services.database.clone();
+    let extraction_user_message = message_content.to_string();
+
     // Create agent with host functions
     let agent = Agent::new(host);
 
@@ -2733,6 +2743,52 @@ async fn handle_chat_message_streaming(
                         error!("Failed to save assistant message to {}: {}", session_id, e);
                     }
                 }
+            }
+
+            // Session memory extraction (background, non-blocking)
+            if extraction_config.learning.enable_session_extraction
+                && session_extractor.should_extract()
+            {
+                let ext_config = extraction_config.clone();
+                let ext_db = extraction_database.clone();
+                let ext_session_id = session_id.clone();
+                // Build context messages from the user message and assistant response
+                let mut ext_messages: Vec<crate::context::ContextMessage> = Vec::new();
+                ext_messages.push(crate::context::ContextMessage {
+                    role: "user".to_string(),
+                    content: extraction_user_message.clone(),
+                });
+                if !final_text.is_empty() {
+                    ext_messages.push(crate::context::ContextMessage {
+                        role: "assistant".to_string(),
+                        content: final_text.clone(),
+                    });
+                }
+                tokio::spawn(async move {
+                    match crate::learning::session_extractor::extract_session_memories(
+                        ext_config,
+                        ext_db,
+                        ext_messages,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(
+                                session_id = %ext_session_id,
+                                count = n,
+                                "Session memory extraction completed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %ext_session_id,
+                                error = %e,
+                                "Session memory extraction failed"
+                            );
+                        }
+                        _ => {}
+                    }
+                });
             }
 
             // Save tool calls to session history
