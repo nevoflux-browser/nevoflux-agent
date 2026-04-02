@@ -270,6 +270,39 @@ impl DaemonHostFunctions {
         self
     }
 
+    /// Build a lightweight context hint for post-compression reinjection.
+    ///
+    /// Returns an empty string if there's nothing to reinject.
+    fn build_reinjection_hint(&self) -> String {
+        let mut parts = Vec::new();
+
+        if let Ok(paths) = self.recent_file_paths.lock() {
+            if !paths.is_empty() {
+                parts.push("Files previously read in this session:".to_string());
+                for p in paths.iter() {
+                    parts.push(format!("- {}", p));
+                }
+            }
+        }
+
+        if let Ok(url) = self.current_browser_url.lock() {
+            if let Some(ref u) = *url {
+                parts.push(format!("Current browser page: {}", u));
+            }
+        }
+
+        if parts.is_empty() {
+            return String::new();
+        }
+
+        parts.insert(0, "[Context from before compression]".to_string());
+        parts.push(
+            "Note: File contents may have changed. Use read_file to get current content if needed."
+                .to_string(),
+        );
+        parts.join("\n")
+    }
+
     /// Check if a tool requires user permission (API mode).
     /// Low-risk read-only tools are auto-approved. Others prompt via browser_ask_user.
     /// Session-level "Always Allow" decisions are cached.
@@ -1058,6 +1091,16 @@ impl HostFunctions for DaemonHostFunctions {
                     role: "system".into(),
                     content: format!("[Conversation summary]\n{}", summary),
                 }];
+
+                // Reinjection: insert context hint after summary
+                let hint = self.build_reinjection_hint();
+                if !hint.is_empty() {
+                    final_messages.push(ContextMessage {
+                        role: "system".into(),
+                        content: hint,
+                    });
+                }
+
                 final_messages.extend(recent);
                 // Use convert_request_with_messages for compressed messages
                 // Note: This will lose tool_calls - compression and tool calling are incompatible
@@ -6497,5 +6540,72 @@ mod tests {
         // Oldest (0-4) should be gone, newest (5-24) should remain
         assert_eq!(paths[0], "/test/file_5.rs");
         assert_eq!(paths[19], "/test/file_24.rs");
+    }
+
+    #[test]
+    fn test_reinjection_hint_empty() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        let hint = host.build_reinjection_hint();
+        assert!(hint.is_empty());
+    }
+
+    #[test]
+    fn test_reinjection_hint_with_files() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        host.recent_file_paths
+            .lock()
+            .unwrap()
+            .push("/src/main.rs".to_string());
+        host.recent_file_paths
+            .lock()
+            .unwrap()
+            .push("/Cargo.toml".to_string());
+
+        let hint = host.build_reinjection_hint();
+        assert!(hint.contains("[Context from before compression]"));
+        assert!(hint.contains("- /src/main.rs"));
+        assert!(hint.contains("- /Cargo.toml"));
+        assert!(hint.contains("Use read_file"));
+        assert!(!hint.contains("browser page"));
+    }
+
+    #[test]
+    fn test_reinjection_hint_with_browser() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        *host.current_browser_url.lock().unwrap() =
+            Some("https://github.com/user/repo".to_string());
+
+        let hint = host.build_reinjection_hint();
+        assert!(hint.contains("Current browser page: https://github.com/user/repo"));
+        assert!(!hint.contains("Files previously read"));
+    }
+
+    #[test]
+    fn test_reinjection_hint_combined() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        host.recent_file_paths
+            .lock()
+            .unwrap()
+            .push("/src/lib.rs".to_string());
+        *host.current_browser_url.lock().unwrap() =
+            Some("https://docs.rs/tokio".to_string());
+
+        let hint = host.build_reinjection_hint();
+        assert!(hint.contains("[Context from before compression]"));
+        assert!(hint.contains("- /src/lib.rs"));
+        assert!(hint.contains("Current browser page: https://docs.rs/tokio"));
+        assert!(hint.contains("Use read_file"));
     }
 }
