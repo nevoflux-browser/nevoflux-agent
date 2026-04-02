@@ -179,6 +179,8 @@ pub struct DaemonHostFunctions {
     recent_file_paths: Mutex<Vec<String>>,
     /// Current browser URL (set on successful navigate).
     current_browser_url: Mutex<Option<String>>,
+    /// Session memory extractor — tracks user message count for auto-extraction.
+    pub session_extractor: std::sync::Arc<crate::learning::session_extractor::SessionMemoryExtractor>,
     // Note: always_allowed_tools is on HostServices (shared across requests),
     // not here (per-request DaemonHostFunctions).
 }
@@ -189,6 +191,11 @@ impl DaemonHostFunctions {
         let compression_circuit_breaker = crate::context::CompressionCircuitBreaker::new(
             config.daemon.context.max_compression_failures,
             std::time::Duration::from_secs(config.daemon.context.compression_cooldown_secs),
+        );
+        let session_extractor = std::sync::Arc::new(
+            crate::learning::session_extractor::SessionMemoryExtractor::new(
+                config.learning.extraction_interval,
+            ),
         );
         Self {
             config,
@@ -211,6 +218,7 @@ impl DaemonHostFunctions {
             compression_circuit_breaker,
             recent_file_paths: Mutex::new(Vec::new()),
             current_browser_url: Mutex::new(None),
+            session_extractor,
         }
     }
 
@@ -1563,7 +1571,11 @@ impl HostFunctions for DaemonHostFunctions {
         // - Creating knowledge entry (source_type="manual", priority="high")
         // - Setting status to "validated"
         // - Marking as hot (hot=1) for immediate system prompt injection
-        self.knowledge_teach(category, &summary, content, domain)
+        let result = self.knowledge_teach(category, &summary, content, domain);
+        if result.is_ok() {
+            self.session_extractor.mark_manual_create();
+        }
+        result
     }
 
     fn memory_update(&self, id: &str, content: &str) -> HostResult<()> {
@@ -4107,6 +4119,7 @@ impl DaemonHostFunctions {
             ),
             recent_file_paths: Mutex::new(self.recent_file_paths.lock().unwrap().clone()),
             current_browser_url: Mutex::new(self.current_browser_url.lock().unwrap().clone()),
+            session_extractor: self.session_extractor.clone(),
         }
     }
 
