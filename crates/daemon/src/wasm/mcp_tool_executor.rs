@@ -88,7 +88,10 @@ pub async fn run_permission_handler(
 
 /// Describe a tool action in natural language for the permission dialog.
 pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
+    // args_summary may be JSON (from MCP path) or a raw string (from agent_host path).
+    // Parse as JSON; if it fails, use the raw string as fallback for field lookups.
     let args: serde_json::Value = serde_json::from_str(args_summary).unwrap_or_default();
+    let raw = args_summary;
 
     match tool_name {
         // Browser navigation
@@ -112,12 +115,18 @@ pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
             format!("Click on element '{}'", target)
         }
         "browser_type" | "browser_type_by_id" => {
-            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("...");
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or(raw);
             let short_text = if text.len() > 50 { &text[..50] } else { text };
             format!("Type text: \"{}\"", short_text)
         }
         "browser_fill" | "browser_fill_by_id" => {
-            let value = args.get("value").and_then(|v| v.as_str()).unwrap_or("...");
+            let value = args
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or(raw);
             let short_val = if value.len() > 50 {
                 &value[..50]
             } else {
@@ -126,7 +135,10 @@ pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
             format!("Fill a form field with: \"{}\"", short_val)
         }
         "browser_key_press" => {
-            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("a key");
+            let key = args
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or(raw);
             format!("Press key: {}", key)
         }
         "browser_eval_js" => "Execute JavaScript code on the current page".to_string(),
@@ -143,22 +155,31 @@ pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
 
         // Computer control
         n if n.starts_with("computer_") => match n {
-            "computer_mouse_move" => format!("Move the mouse cursor"),
-            "computer_mouse_click" | "computer_click" => format!("Click the mouse"),
-            "computer_mouse_down" => format!("Press mouse button down"),
-            "computer_mouse_up" => format!("Release mouse button"),
-            "computer_mouse_drag" | "computer_drag" => format!("Drag with the mouse"),
+            "computer_mouse_move" => "Move the mouse cursor".to_string(),
+            "computer_mouse_click" | "computer_click" => "Click the mouse".to_string(),
+            "computer_mouse_down" => "Press mouse button down".to_string(),
+            "computer_mouse_up" => "Release mouse button".to_string(),
+            "computer_mouse_drag" | "computer_drag" => "Drag with the mouse".to_string(),
             "computer_type_text" => {
-                let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("...");
+                let text = args
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(raw);
                 let short = if text.len() > 50 { &text[..50] } else { text };
                 format!("Type on keyboard: \"{}\"", short)
             }
             "computer_key_press" | "computer_key" => {
-                let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("a key");
+                let key = args
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(raw);
                 format!("Press keyboard key: {}", key)
             }
             "computer_hold_key" => {
-                let key = args.get("key").and_then(|v| v.as_str()).unwrap_or("a key");
+                let key = args
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(raw);
                 format!("Hold keyboard key: {}", key)
             }
             _ => format!(
@@ -178,21 +199,21 @@ pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
             let path = args
                 .get("path")
                 .and_then(|v| v.as_str())
-                .unwrap_or("a file");
+                .unwrap_or(raw);
             format!("Write to file: {}", path)
         }
         "edit_file" => {
             let path = args
                 .get("path")
                 .and_then(|v| v.as_str())
-                .unwrap_or("a file");
+                .unwrap_or(raw);
             format!("Edit file: {}", path)
         }
         "run_command" => {
             let cmd = args
                 .get("command")
                 .and_then(|v| v.as_str())
-                .unwrap_or("...");
+                .unwrap_or(raw);
             let short = if cmd.len() > 80 { &cmd[..80] } else { cmd };
             format!("Run command: {}", short)
         }
@@ -202,7 +223,7 @@ pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
             let task = args
                 .get("task")
                 .and_then(|v| v.as_str())
-                .unwrap_or("a task");
+                .unwrap_or(raw);
             let short = if task.len() > 80 { &task[..80] } else { task };
             format!("Start a sub-agent: \"{}\"", short)
         }
