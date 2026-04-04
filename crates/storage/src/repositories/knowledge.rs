@@ -300,6 +300,38 @@ impl<'a> KnowledgeRepository<'a> {
     }
 
     /// Find a duplicate entry by category + domain + summary (exact match).
+    /// Find a hot knowledge entry for a specific tool name within a category.
+    ///
+    /// Used to deduplicate tool_optimization entries: when a newer stat for
+    /// the same tool arrives, we update the existing hot entry instead of
+    /// creating a duplicate.
+    pub fn find_hot_by_tool_name(
+        &self,
+        category: &str,
+        tool_name: &str,
+    ) -> Result<Option<Knowledge>> {
+        let pattern = format!("Tool '{}'%", tool_name);
+        self.db.with_connection(|conn| {
+            let result = conn
+                .query_row(
+                    "SELECT id, category, subcategory, domain, summary, details,
+                            resolution, confidence, hit_count, success_count, fail_count,
+                            effectiveness, priority, status, source_ids, related_ids, tags,
+                            privacy_level, promotion_target, promoted_section,
+                            source_type, created_at, updated_at, last_hit_at, promoted_at,
+                            embedding, hot, hot_summary
+                     FROM knowledge
+                     WHERE category = ?1 AND hot = 1 AND summary LIKE ?2
+                     ORDER BY updated_at DESC
+                     LIMIT 1",
+                    params![category, pattern],
+                    row_to_knowledge,
+                )
+                .optional()?;
+            Ok(result)
+        })
+    }
+
     pub fn find_duplicate(
         &self,
         category: &str,

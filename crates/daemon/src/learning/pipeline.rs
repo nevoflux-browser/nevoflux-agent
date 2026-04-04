@@ -264,18 +264,55 @@ impl LearningPipeline {
                     entry.occurrence_count,
                     entry.confidence,
                 )?;
-            } else {
-                // New entry: create as before
+            } else if category_str == "tooloptimization" {
+                // For tool_optimization entries, check if there's an existing hot entry
+                // for the same tool_name. If so, update it rather than creating a duplicate.
+                // This prevents "Tool 'X' has 75% failure (6/8)" and "Tool 'X' has 100%
+                // failure (2/2)" from coexisting as separate hot entries.
+                if let Some(ref tool_name) = entry.context.tool_name {
+                    let existing_for_tool = self
+                        .storage
+                        .knowledge()
+                        .find_hot_by_tool_name(&category_str, tool_name)?;
+
+                    if let Some(old) = existing_for_tool {
+                        // Update existing entry's content with new stats
+                        let summary = &entry.summary;
+                        let details = entry.details.as_deref().unwrap_or("");
+                        self.storage
+                            .knowledge()
+                            .update_content(&old.id, details, summary)?;
+
+                        // Update hot_summary
+                        let domain_tag = entry.context.domain.as_deref().unwrap_or("universal");
+                        let hot_summary = format!("[{}] {}", domain_tag, summary);
+                        self.storage.knowledge().mark_hot(&old.id, &hot_summary)?;
+
+                        // Merge hit counts
+                        self.storage.knowledge().merge_entry(
+                            &old.id,
+                            entry.occurrence_count,
+                            entry.confidence,
+                        )?;
+
+                        tracing::debug!(
+                            "Updated existing tool_optimization for '{}': {}",
+                            tool_name,
+                            summary
+                        );
+                        written += 1;
+                        continue;
+                    }
+                }
+                // No existing hot entry for this tool — create new (fall through)
                 let mut params = Self::entry_to_knowledge_params(entry);
 
-                // Generate embedding for the new entry when a provider is available
                 if let Some(ref provider) = get_embedding(&self.embedding) {
                     let text = format!(
                         "{} {}",
                         entry.summary,
                         entry.details.as_deref().unwrap_or("")
                     );
-                    // Bridge from sync flush() into the async embedding provider
                     let emb_result = tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(provider.embed(&text))
                     });
@@ -290,7 +327,40 @@ impl LearningPipeline {
                     }
                 }
 
-                // Encrypt sensitive fields when an encryption service is available
+                if let Some(ref enc) = self.encryption {
+                    let privacy = params.privacy_level.as_deref().unwrap_or("internal");
+                    if privacy == "sensitive" {
+                        params.summary = enc.encrypt_if_sensitive(&params.summary, privacy)?;
+                        params.details = enc.encrypt_if_sensitive(&params.details, privacy)?;
+                    }
+                }
+
+                self.storage.knowledge().create(params)?;
+                written += 1;
+            } else {
+                // New entry: create as before
+                let mut params = Self::entry_to_knowledge_params(entry);
+
+                if let Some(ref provider) = get_embedding(&self.embedding) {
+                    let text = format!(
+                        "{} {}",
+                        entry.summary,
+                        entry.details.as_deref().unwrap_or("")
+                    );
+                    let emb_result = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(provider.embed(&text))
+                    });
+                    match emb_result {
+                        Ok(vec) => params.embedding = Some(vec),
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "Embedding generation failed for new knowledge entry, skipping"
+                            );
+                        }
+                    }
+                }
+
                 if let Some(ref enc) = self.encryption {
                     let privacy = params.privacy_level.as_deref().unwrap_or("internal");
                     if privacy == "sensitive" {
