@@ -2578,7 +2578,19 @@ fn build_acp_content(
     let messages: Vec<(String, String)> = request
         .messages
         .iter()
-        .map(|m| (m.role.clone(), m.content.clone()))
+        .map(|m| {
+            let mut content = m.content.clone();
+            // Preserve tool call markers so ACP agent can see what tools were used
+            if m.role == "assistant" {
+                if let Some(ref calls) = m.tool_calls {
+                    let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+                    if !names.is_empty() {
+                        content.push_str(&format!(" [called: {}]", names.join(", ")));
+                    }
+                }
+            }
+            (m.role.clone(), content)
+        })
         .collect();
 
     let budget = (context_limit as f32 * budget_ratio) as usize;

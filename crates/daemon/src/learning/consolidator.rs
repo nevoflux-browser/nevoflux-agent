@@ -138,10 +138,28 @@ pub async fn consolidate_category(
         entries_list.join("\n")
     );
 
-    // 3. Call LLM
-    let model = config.llm.active_model().unwrap_or("gpt-4o-mini");
-    let (provider, api_key) = crate::context::get_summarization_provider(&config, model)?;
-    let base_url = config.llm.active_base_url();
+    // 3. Call LLM (with ACP fallback — same logic as session_extractor)
+    let active_model = config.llm.active_model().unwrap_or("gpt-4o-mini");
+    let (provider, api_key) =
+        crate::context::get_summarization_provider(&config, active_model)?;
+
+    let active_provider = config
+        .llm
+        .active_provider()
+        .and_then(|p| p.parse::<nevoflux_llm::ProviderType>().ok());
+    let is_fallback = active_provider
+        .map(|ap| ap != provider)
+        .unwrap_or(false);
+    let model = if is_fallback {
+        nevoflux_llm::default_model_for(provider)
+    } else {
+        active_model
+    };
+    let base_url = if is_fallback {
+        None
+    } else {
+        config.llm.active_base_url()
+    };
 
     let request = crate::wasm::llm::LlmChatRequest {
         messages: vec![crate::wasm::llm::LlmMessage::user(user_prompt)],

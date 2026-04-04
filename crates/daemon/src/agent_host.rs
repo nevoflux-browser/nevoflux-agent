@@ -271,6 +271,15 @@ impl DaemonHostFunctions {
         self
     }
 
+    /// Use an externally-managed session extractor (shared across messages in the same session).
+    pub fn with_session_extractor(
+        mut self,
+        extractor: std::sync::Arc<crate::learning::session_extractor::SessionMemoryExtractor>,
+    ) -> Self {
+        self.session_extractor = extractor;
+        self
+    }
+
     /// Set provider/model override for this host instance.
     ///
     /// Unlike `set_model_override` (which validates API key), this method
@@ -280,6 +289,43 @@ impl DaemonHostFunctions {
         *self.model_override_provider.lock().unwrap() = Some(provider.into());
         *self.model_override_model.lock().unwrap() = Some(model.into());
         self
+    }
+
+    /// Check if content is similar to an existing hot knowledge entry.
+    ///
+    /// Returns `Some(existing_id)` if a match with cosine similarity > 0.92 is found.
+    /// Falls back to `None` if embedding provider is unavailable or on error.
+    fn find_similar_hot_knowledge(
+        &self,
+        services: &HostServices,
+        content: &str,
+    ) -> Option<String> {
+        let provider = crate::wasm::services::get_embedding(&services.embedding)?;
+        let runtime = self.runtime.clone();
+        let content_owned = content.to_string();
+
+        // Generate embedding for the new content
+        let query_emb = match tokio::task::block_in_place(|| {
+            runtime.block_on(async { provider.embed(&content_owned).await })
+        }) {
+            Ok(emb) => emb,
+            Err(_) => return None,
+        };
+
+        // Load hot entries and compare
+        let knowledge_repo = nevoflux_storage::KnowledgeRepository::new(&services.database);
+        let hot_entries = knowledge_repo.list_hot().ok()?;
+
+        for entry in &hot_entries {
+            if let Some(ref entry_emb) = entry.embedding {
+                let sim = nevoflux_storage::cosine_similarity(&query_emb, entry_emb);
+                if sim > 0.92 {
+                    return Some(entry.id.clone());
+                }
+            }
+        }
+
+        None
     }
 
     /// Build a lightweight context hint for post-compression reinjection.
@@ -539,6 +585,10 @@ impl DaemonHostFunctions {
         if let Some(tc) = &self.trace_collector {
             let session_id = self.session_id.as_deref().unwrap_or("unknown");
             let iteration = self.current_iteration.load(Ordering::Relaxed);
+            debug!(
+                "record_tool: tool={}, success={}, session={}, iteration={}",
+                tool_name, success, session_id, iteration
+            );
             tc.record_tool_exec(
                 session_id,
                 iteration,
@@ -729,15 +779,26 @@ impl DaemonHostFunctions {
         request: &LlmRequest,
         context_messages: &[ContextMessage],
     ) -> LlmChatRequest {
-        // Convert context messages to daemon messages
+        // Convert context messages to daemon messages.
+        // After compression, tool_calls/tool_call_id are lost. Convert orphaned
+        // "tool" role messages to "user" role to avoid API errors (e.g., DeepSeek
+        // requires tool messages to follow an assistant message with tool_calls).
         let messages: Vec<DaemonLlmMessage> = context_messages
             .iter()
-            .map(|m| DaemonLlmMessage {
-                role: m.role.clone(),
-                content: m.content.clone(),
-                tool_calls: None,
-                tool_call_id: None,
-                attachments: Vec::new(),
+            .map(|m| {
+                let role = if m.role == "tool" {
+                    "user".to_string()
+                } else {
+                    m.role.clone()
+                };
+                // Strip tool_calls from assistant messages (they're orphaned after compression)
+                DaemonLlmMessage {
+                    role,
+                    content: m.content.clone(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    attachments: Vec::new(),
+                }
             })
             .collect();
 
@@ -1069,16 +1130,22 @@ impl HostFunctions for DaemonHostFunctions {
             }
         }
 
-        // Estimate tokens and calculate budget
-        let estimated_tokens = ContextCompressor::estimate_tokens(&context_messages);
-        let token_budget = TokenBudget::for_model(
-            self.config.llm.context_window(),
-            self.config.llm.max_tokens,
-            &self.config.daemon.context,
-        );
+        // Skip compression when agent is mid-loop (tool results present) —
+        // compression destroys the tool_call/tool_result chain.
+        let has_tool_results = context_messages.iter().any(|m| m.role == "tool");
 
-        // Attempt compression if needed (with circuit breaker protection)
-        let compression_result = {
+        let compression_result = if has_tool_results {
+            debug!("Skipping compression: tool results present (agent mid-loop)");
+            CompressionResult::NotNeeded
+        } else {
+            // Estimate tokens and calculate budget
+            let estimated_tokens = ContextCompressor::estimate_tokens(&context_messages);
+            let token_budget = TokenBudget::for_model(
+                self.config.llm.context_window(),
+                self.config.llm.max_tokens,
+                &self.config.daemon.context,
+            );
+
             use crate::context::CircuitState;
 
             let cb_state = self.compression_circuit_breaker.state();
@@ -1124,7 +1191,7 @@ impl HostFunctions for DaemonHostFunctions {
                 // Prepend summary to recent messages
                 let mut final_messages = vec![ContextMessage {
                     role: "system".into(),
-                    content: format!("[Conversation summary]\n{}", summary),
+                    content: format!("This conversation is being continued from a previous context that was compressed. The summary below covers the earlier portion.\n\n{}", summary),
                 }];
 
                 // Reinjection: insert context hint after summary
@@ -1261,8 +1328,145 @@ impl HostFunctions for DaemonHostFunctions {
             use_streaming
         );
 
-        // Convert request to daemon format
-        let daemon_request = self.convert_request_to_daemon(request);
+        // Microcompact + Compression: process messages before sending to LLM
+        let mut mutable_request = request.clone();
+
+        // Convert to ContextMessage (used by both microcompact and compression)
+        let mut context_messages: Vec<ContextMessage> = mutable_request
+            .messages
+            .iter()
+            .map(|m| {
+                let role = match m.role {
+                    nevoflux_builtin_wasm::MessageRole::System => "system",
+                    nevoflux_builtin_wasm::MessageRole::User => "user",
+                    nevoflux_builtin_wasm::MessageRole::Assistant => "assistant",
+                    nevoflux_builtin_wasm::MessageRole::Tool => "tool",
+                };
+                ContextMessage {
+                    role: role.to_string(),
+                    content: m.content.clone(),
+                }
+            })
+            .collect();
+
+        // Microcompact: clear old large tool results
+        {
+            let force_clear_all = {
+                let gap_mins = self.config.daemon.context.time_gap_threshold_minutes;
+                if gap_mins > 0 {
+                    self.last_response_at
+                        .lock()
+                        .ok()
+                        .and_then(|g| {
+                            g.map(|t| t.elapsed() > std::time::Duration::from_secs(gap_mins * 60))
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                }
+            };
+
+            let keep_recent = if force_clear_all {
+                debug!("Time gap exceeded threshold, forcing full microcompact");
+                0
+            } else {
+                self.config.daemon.context.microcompact_keep_recent
+            };
+
+            let compactor = crate::context::MicroCompactor::new(
+                keep_recent,
+                self.config.daemon.context.microcompact_content_threshold,
+            );
+            let mc_result = compactor.compact(&mut context_messages);
+            if mc_result.cleared_count > 0 {
+                debug!(
+                    "Microcompact: cleared {} tool results, freed ~{} tokens",
+                    mc_result.cleared_count, mc_result.tokens_freed
+                );
+                // Write cleared content back to request messages
+                for (i, cm) in context_messages.iter().enumerate() {
+                    if i < mutable_request.messages.len() {
+                        mutable_request.messages[i].content = cm.content.clone();
+                    }
+                }
+            }
+        }
+
+        // Estimate tokens and attempt compression (same logic as llm_chat).
+        // Skip compression when agent is mid-loop (tool results present) —
+        // compression destroys the tool_call/tool_result chain, causing the LLM
+        // to lose track of the current task. Microcompact already handles size.
+        let has_tool_results = context_messages.iter().any(|m| m.role == "tool");
+
+        let compression_result = if has_tool_results {
+            debug!("Skipping compression: tool results present (agent mid-loop)");
+            CompressionResult::NotNeeded
+        } else {
+            let estimated_tokens = ContextCompressor::estimate_tokens(&context_messages);
+            let token_budget = TokenBudget::for_model(
+                self.config.llm.context_window(),
+                self.config.llm.max_tokens,
+                &self.config.daemon.context,
+            );
+
+            use crate::context::CircuitState;
+
+            let cb_state = self.compression_circuit_breaker.state();
+            if cb_state == CircuitState::Open {
+                warn!("Compression circuit breaker is open, skipping compression");
+                CompressionResult::Skipped {
+                    reason: "Circuit breaker open — too many consecutive compression failures"
+                        .into(),
+                }
+            } else {
+                let compressor = ContextCompressor::new(self.config.clone(), self.runtime.clone());
+                let result = compressor.compress_if_needed(
+                    &context_messages,
+                    estimated_tokens,
+                    token_budget.for_history,
+                );
+                match &result {
+                    CompressionResult::Compressed { .. } => {
+                        self.compression_circuit_breaker.record_success();
+                    }
+                    CompressionResult::Skipped { reason }
+                        if reason.contains("failed") || reason.contains("Failed") =>
+                    {
+                        self.compression_circuit_breaker.record_failure();
+                    }
+                    _ => {}
+                }
+                result
+            }
+        };
+
+        let daemon_request = match compression_result {
+            CompressionResult::Compressed {
+                summary,
+                recent,
+                saved,
+            } => {
+                debug!("Compressed context (stream), saved {} tokens", saved);
+                let mut final_messages = vec![ContextMessage {
+                    role: "system".into(),
+                    content: format!("This conversation is being continued from a previous context that was compressed. The summary below covers the earlier portion.\n\n{}", summary),
+                }];
+
+                let hint = self.build_reinjection_hint();
+                if !hint.is_empty() {
+                    final_messages.push(ContextMessage {
+                        role: "system".into(),
+                        content: hint,
+                    });
+                }
+
+                final_messages.extend(recent);
+                self.convert_request_with_messages(&mutable_request, &final_messages)
+            }
+            CompressionResult::NotNeeded | CompressionResult::Skipped { .. } => {
+                self.convert_request_to_daemon(&mutable_request)
+            }
+        };
 
         // Serialize request for trace recording before it's consumed
         let trace_request_value = self
@@ -1619,23 +1823,44 @@ impl HostFunctions for DaemonHostFunctions {
 
         debug!("memory_update: id={}, content_len={}", id, content.len());
 
-        let updated = services
-            .database
-            .memory()
-            .update(id, content)
-            .map_err(|e| HostError {
-                code: 100,
-                message: format!("Memory update failed: {}", e),
-            })?;
+        // Route to the correct table based on ID prefix
+        if id.starts_with("K-") {
+            // Knowledge table entry
+            let knowledge_repo =
+                nevoflux_storage::KnowledgeRepository::new(&services.database);
+            let summary = if content.len() > 120 {
+                let boundary = content.floor_char_boundary(117);
+                format!("{}...", &content[..boundary])
+            } else {
+                content.to_string()
+            };
+            knowledge_repo
+                .update_content(id, content, &summary)
+                .map_err(|e| HostError {
+                    code: 100,
+                    message: format!("Knowledge update failed: {}", e),
+                })?;
+            Ok(())
+        } else {
+            // Legacy memory_chunks table
+            let updated = services
+                .database
+                .memory()
+                .update(id, content)
+                .map_err(|e| HostError {
+                    code: 100,
+                    message: format!("Memory update failed: {}", e),
+                })?;
 
-        if !updated {
-            return Err(HostError {
-                code: 404,
-                message: format!("Memory chunk not found: {}", id),
-            });
+            if !updated {
+                return Err(HostError {
+                    code: 404,
+                    message: format!("Memory chunk not found: {}", id),
+                });
+            }
+
+            Ok(())
         }
-
-        Ok(())
     }
 
     fn memory_delete(&self, id: &str) -> HostResult<()> {
@@ -1647,19 +1872,28 @@ impl HostFunctions for DaemonHostFunctions {
 
         debug!("memory_delete: id={}", id);
 
-        let deleted = services
-            .database
-            .memory()
-            .delete(id)
-            .map_err(|e| HostError {
-                code: 100,
-                message: format!("Memory delete failed: {}", e),
-            })?;
+        let deleted = if id.starts_with("K-") {
+            nevoflux_storage::KnowledgeRepository::new(&services.database)
+                .delete(id)
+                .map_err(|e| HostError {
+                    code: 100,
+                    message: format!("Knowledge delete failed: {}", e),
+                })?
+        } else {
+            services
+                .database
+                .memory()
+                .delete(id)
+                .map_err(|e| HostError {
+                    code: 100,
+                    message: format!("Memory delete failed: {}", e),
+                })?
+        };
 
         if !deleted {
             return Err(HostError {
                 code: 404,
-                message: format!("Memory chunk not found: {}", id),
+                message: format!("Memory entry not found: {}", id),
             });
         }
 
@@ -1717,6 +1951,17 @@ impl HostFunctions for DaemonHostFunctions {
         );
 
         let start = std::time::Instant::now();
+
+        // 0. Dedup: check if similar hot knowledge already exists
+        if let Some(existing_id) =
+            self.find_similar_hot_knowledge(services, details)
+        {
+            debug!(
+                "knowledge_teach: skipping duplicate, similar to {}",
+                existing_id
+            );
+            return Ok(existing_id);
+        }
 
         // 1. Create the knowledge entry
         let params = nevoflux_storage::CreateKnowledgeParams {

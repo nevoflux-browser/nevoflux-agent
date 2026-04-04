@@ -810,6 +810,26 @@ fn execute_memory_create(
         .as_str()
         .or_else(|| metadata.get("domain").and_then(|v| v.as_str()));
 
+    tracing::debug!(
+        category = category,
+        domain = ?domain,
+        content_len = content.len(),
+        "knowledge_teach(via memory_create): creating knowledge entry"
+    );
+
+    let start = std::time::Instant::now();
+
+    // Dedup: check if similar hot knowledge already exists
+    if let Some(existing_id) = find_similar_hot_knowledge(services, content) {
+        tracing::debug!(
+            existing_id = %existing_id,
+            "memory_create: skipping duplicate"
+        );
+        return Ok(
+            serde_json::json!({"id": existing_id, "status": "already_exists"}).to_string(),
+        );
+    }
+
     let summary = if content.len() > 120 {
         let boundary = content.floor_char_boundary(117);
         format!("{}...", &content[..boundary])
@@ -845,7 +865,49 @@ fn execute_memory_create(
         .mark_hot(&id, &hot_summary)
         .map_err(|e| format!("mark_hot failed: {e}"))?;
 
+    // Suppress auto-extraction this turn (same as agent_host.rs path)
+    if let Some(ref extractor) = services.session_extractor {
+        extractor.mark_manual_create();
+    }
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    tracing::info!(
+        id = %id,
+        category = category,
+        duration_ms = duration_ms,
+        "Knowledge taught and marked hot (via memory_create)"
+    );
+
     Ok(serde_json::json!({"id": id, "status": "created"}).to_string())
+}
+
+/// Check if content is similar to an existing hot knowledge entry (cosine > 0.92).
+fn find_similar_hot_knowledge(services: &HostServices, content: &str) -> Option<String> {
+    use crate::wasm::services::get_embedding;
+
+    let provider = get_embedding(&services.embedding)?;
+    let content_owned = content.to_string();
+
+    let query_emb = match tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async { provider.embed(&content_owned).await })
+    }) {
+        Ok(emb) => emb,
+        Err(_) => return None,
+    };
+
+    let knowledge_repo = KnowledgeRepository::new(&services.database);
+    let hot_entries = knowledge_repo.list_hot().ok()?;
+
+    for entry in &hot_entries {
+        if let Some(ref entry_emb) = entry.embedding {
+            let sim = nevoflux_storage::cosine_similarity(&query_emb, entry_emb);
+            if sim > 0.92 {
+                return Some(entry.id.clone());
+            }
+        }
+    }
+
+    None
 }
 
 fn execute_memory_update(
@@ -858,11 +920,27 @@ fn execute_memory_update(
     let content = args["content"]
         .as_str()
         .ok_or_else(|| "missing 'content' argument".to_string())?;
-    services
-        .database
-        .memory()
-        .update(id, content)
-        .map_err(|e| format!("memory update failed: {e}"))?;
+
+    if id.starts_with("K-") {
+        // Knowledge table entry
+        let summary = if content.len() > 120 {
+            let boundary = content.floor_char_boundary(117);
+            format!("{}...", &content[..boundary])
+        } else {
+            content.to_string()
+        };
+        KnowledgeRepository::new(&services.database)
+            .update_content(id, content, &summary)
+            .map_err(|e| format!("knowledge update failed: {e}"))?;
+    } else {
+        // Legacy memory_chunks table
+        services
+            .database
+            .memory()
+            .update(id, content)
+            .map_err(|e| format!("memory update failed: {e}"))?;
+    }
+
     Ok(serde_json::json!({"id": id, "status": "updated"}).to_string())
 }
 
@@ -873,11 +951,19 @@ fn execute_memory_delete(
     let id = args["id"]
         .as_str()
         .ok_or_else(|| "missing 'id' argument".to_string())?;
-    services
-        .database
-        .memory()
-        .delete(id)
-        .map_err(|e| format!("memory delete failed: {e}"))?;
+
+    if id.starts_with("K-") {
+        KnowledgeRepository::new(&services.database)
+            .delete(id)
+            .map_err(|e| format!("knowledge delete failed: {e}"))?;
+    } else {
+        services
+            .database
+            .memory()
+            .delete(id)
+            .map_err(|e| format!("memory delete failed: {e}"))?;
+    }
+
     Ok(serde_json::json!({"id": id, "status": "deleted"}).to_string())
 }
 
@@ -925,11 +1011,20 @@ fn execute_knowledge_teach(
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    tracing::debug!(
+        category = %category,
+        summary_len = summary.len(),
+        domain = ?domain,
+        "knowledge_teach: creating knowledge entry"
+    );
+
+    let start = std::time::Instant::now();
+
     let params = CreateKnowledgeParams {
-        category,
-        summary,
+        category: category.clone(),
+        summary: summary.clone(),
         details,
-        domain,
+        domain: domain.clone(),
         ..Default::default()
     };
 
@@ -937,6 +1032,14 @@ fn execute_knowledge_teach(
     let entry = repo
         .create(params)
         .map_err(|e| format!("knowledge teach failed: {e}"))?;
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    tracing::info!(
+        id = %entry.id,
+        category = %category,
+        duration_ms = duration_ms,
+        "Knowledge taught (via knowledge_teach)"
+    );
 
     Ok(serde_json::json!({"id": entry.id, "status": "taught"}).to_string())
 }

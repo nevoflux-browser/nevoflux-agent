@@ -51,7 +51,16 @@ impl LearningSource for ToolTraceLearningSource {
 
         // Query recent tool_exec spans with id > last_seen_id
         let spans = match self.storage.traces().tool_spans_since(last_id, 500) {
-            Ok(rows) => rows,
+            Ok(rows) => {
+                if !rows.is_empty() {
+                    tracing::debug!(
+                        "ToolTraceLearningSource: found {} spans after id={}",
+                        rows.len(),
+                        last_id
+                    );
+                }
+                rows
+            }
             Err(e) => {
                 tracing::warn!("ToolTraceLearningSource: query failed: {}", e);
                 return Vec::new();

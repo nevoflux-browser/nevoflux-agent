@@ -1181,7 +1181,20 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     "[AGENT] Executing tool: name={}, id={}, call_id={:?}, args={}",
                     tool_call.name, tool_call.id, tool_call.call_id, tool_call.arguments
                 );
-                let result = self.execute_tool(tool_call)?;
+                let result = match self.execute_tool(tool_call) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!(
+                            "[AGENT] Tool execution failed: name={}, error={}",
+                            tool_call.name, e.message
+                        );
+                        ToolResult {
+                            tool_call_id: tool_call.call_id.clone().unwrap_or(tool_call.id.clone()),
+                            content: format!("Error: {}", e.message),
+                            success: false,
+                        }
+                    }
+                };
                 eprintln!(
                     "[AGENT] Tool result will use tool_call_id={}",
                     result.tool_call_id
@@ -1689,7 +1702,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             }
             "memory_create" => {
                 let content = tool_call.arguments["content"].as_str().unwrap_or("");
-                let metadata = tool_call
+                let mut metadata = tool_call
                     .arguments
                     .get("metadata")
                     .and_then(|v| {
@@ -1703,28 +1716,19 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     })
                     .unwrap_or(serde_json::json!({}));
 
-                // Resolve category: explicit arg > metadata field > default
-                let category = tool_call.arguments["category"]
-                    .as_str()
-                    .or_else(|| metadata.get("category").and_then(|v| v.as_str()))
-                    .unwrap_or("user_preference");
+                // Merge explicit category/domain args into metadata so
+                // host.memory_create() can read them uniformly.
+                if let Some(cat) = tool_call.arguments["category"].as_str() {
+                    metadata["category"] = serde_json::json!(cat);
+                }
+                if let Some(dom) = tool_call.arguments["domain"].as_str() {
+                    metadata["domain"] = serde_json::json!(dom);
+                }
 
-                // Resolve domain: explicit arg > metadata field
-                let domain = tool_call.arguments["domain"]
-                    .as_str()
-                    .or_else(|| metadata.get("domain").and_then(|v| v.as_str()));
-
-                // Build summary (truncate to 120 chars, char-boundary safe)
-                let summary = if content.len() > 120 {
-                    let boundary = content.floor_char_boundary(117);
-                    format!("{}...", &content[..boundary])
-                } else {
-                    content.to_string()
-                };
-
-                let id = self
-                    .host
-                    .knowledge_teach(category, &summary, content, domain)?;
+                // Delegate to host.memory_create() which handles:
+                // - knowledge_teach (create + validate + mark hot)
+                // - mark_manual_create (suppress auto-extraction this turn)
+                let id = self.host.memory_create(content, &metadata)?;
                 serde_json::json!({"id": id, "status": "created"}).to_string()
             }
             "memory_update" => {

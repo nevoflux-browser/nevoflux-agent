@@ -160,28 +160,97 @@ impl ContextCompressor {
 
 /// Generate a summary of messages using the configured summarization model.
 async fn generate_summary(config: &AgentConfig, messages: &[ContextMessage]) -> Result<String> {
-    // Get provider configuration for summarization
-    // Default to OpenAI for gpt-4o-mini if no provider is set
+    // Get provider configuration for summarization.
+    // Use the active provider's default model rather than hardcoded "gpt-4o-mini",
+    // since the active provider may not support OpenAI model names.
+    let (provider, api_key) = get_summarization_provider(config, "")?;
     let summarization_model = config
         .daemon
         .context
         .summarization_model
         .as_deref()
-        .unwrap_or("gpt-4o-mini");
-
-    // Determine provider based on model name
-    let (provider, api_key) = get_summarization_provider(config, summarization_model)?;
+        .unwrap_or_else(|| {
+            // Use active model if same provider, otherwise provider's default
+            let active_model = config.llm.active_model().unwrap_or("gpt-4o-mini");
+            let active_provider = config
+                .llm
+                .active_provider()
+                .and_then(|p| p.parse::<nevoflux_llm::ProviderType>().ok());
+            if active_provider == Some(provider) {
+                active_model
+            } else {
+                nevoflux_llm::default_model_for(provider)
+            }
+        });
 
     // Build the summarization request
     let conversation_text = format_messages_for_summary(messages);
 
-    let system_prompt = r#"You are a conversation summarizer. Create a brief summary that captures:
-1. Main topics discussed
-2. Decisions or outcomes reached
-3. Key facts the assistant needs to remember
-Be concise (2-4 sentences)."#;
+    let system_prompt = r#"You are a conversation summarizer for an AI assistant. Create a detailed summary that preserves all information needed to continue the conversation without losing context.
 
-    let user_prompt = format!("Summarize this conversation:\n\n{}", conversation_text);
+Before providing your final summary, wrap your analysis in <analysis> tags to organize your thoughts. In your analysis:
+1. Chronologically review each message. For each, identify:
+   - The user's explicit requests and intents
+   - Your approach to addressing those requests
+   - Key decisions, technical concepts and code patterns
+   - Specific details: file names, code snippets, function signatures, file edits
+   - Errors encountered and how they were fixed
+   - User feedback, especially corrections ("do it differently", "not that")
+2. Double-check for technical accuracy and completeness.
+
+Your summary should include the following sections:
+
+1. Primary Request and Intent: Capture the user's explicit requests and intents in detail.
+2. Key Technical Concepts: List all important technical concepts, technologies, and frameworks discussed.
+3. Files and Code Sections: Enumerate specific files and code sections examined, modified, or created. Use exact file paths. Include a summary of why each file is important and what changes were made.
+4. Errors and Fixes: List all errors encountered and how they were fixed. Include user feedback on errors if any.
+5. All User Messages: List ALL user messages that are not tool results. These are critical for understanding the user's feedback and changing intent.
+6. Pending Tasks: Outline any pending tasks that have been explicitly requested.
+7. Current Work: Describe precisely what was being worked on immediately before this summary. Include file names and specific details.
+8. Next Step: List the next step related to the most recent work. Include direct quotes from the conversation showing exactly what task was in progress.
+
+Output format:
+
+<analysis>
+[Your detailed thought process]
+</analysis>
+
+<summary>
+1. Primary Request and Intent:
+   [Detailed description]
+
+2. Key Technical Concepts:
+   - [Concept 1]
+   - [Concept 2]
+
+3. Files and Code Sections:
+   - [Exact file path]
+     - [Why this file is important]
+     - [Changes made or content read]
+
+4. Errors and Fixes:
+   - [Error]: [How it was fixed]
+
+5. All User Messages:
+   - [User message 1]
+   - [User message 2]
+
+6. Pending Tasks:
+   - [Task 1]
+
+7. Current Work:
+   [Precise description]
+
+8. Next Step:
+   [Next step with direct quotes]
+</summary>
+
+Do NOT call any tools. Respond with plain text only."#;
+
+    let user_prompt = format!(
+        "Summarize this conversation thoroughly, preserving all specific details:\n\n{}",
+        conversation_text
+    );
 
     let request = LlmChatRequest {
         messages: vec![LlmMessage::user(user_prompt)],
@@ -198,7 +267,39 @@ Be concise (2-4 sentences)."#;
 
     let response = execute_llm_chat(provider, &api_key, summarization_model, request, None).await?;
 
-    Ok(response.content)
+    Ok(format_compact_summary(&response.content))
+}
+
+/// Strip the `<analysis>` drafting scratchpad and extract `<summary>` content.
+///
+/// The LLM produces `<analysis>...</analysis>` as a thinking step (improves
+/// summary quality but has no value once the summary is written), followed by
+/// `<summary>...</summary>` with the actual summary.
+fn format_compact_summary(raw: &str) -> String {
+    let mut result = raw.to_string();
+
+    // Strip analysis section
+    if let Some(start) = result.find("<analysis>") {
+        if let Some(end) = result.find("</analysis>") {
+            let end = end + "</analysis>".len();
+            result = format!("{}{}", &result[..start], &result[end..]);
+        }
+    }
+
+    // Extract summary content if wrapped in <summary> tags
+    if let Some(start) = result.find("<summary>") {
+        if let Some(end) = result.find("</summary>") {
+            let content_start = start + "<summary>".len();
+            result = result[content_start..end].to_string();
+        }
+    }
+
+    // Clean up extra whitespace
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+
+    result.trim().to_string()
 }
 
 /// Get the appropriate provider and API key for summarization.
@@ -206,32 +307,54 @@ pub fn get_summarization_provider(
     config: &AgentConfig,
     model: &str,
 ) -> Result<(ProviderType, String)> {
-    // Try to infer provider from model name
-    let provider = if model.starts_with("gpt-") || model.starts_with("o1") {
-        ProviderType::OpenAi
-    } else if model.starts_with("claude-") {
-        ProviderType::Anthropic
-    } else if model.starts_with("qwen") {
-        ProviderType::Qwen
-    } else if model.starts_with("deepseek") {
-        ProviderType::DeepSeek
-    } else if model.starts_with("gemini") {
-        ProviderType::Gemini
-    } else {
-        // Fall back to configured provider
-        config
-            .llm
-            .active_provider()
-            .and_then(|p| ProviderType::from_str(p).ok())
-            .ok_or_else(|| {
-                DaemonError::InternalError(
-                    "No provider configured and cannot infer from model name".into(),
-                )
-            })?
-    };
+    // Use the active provider directly; only infer from model name as fallback.
+    // Model names like "qwen/qwen3.6-plus:free" are OpenRouter IDs, not native
+    // provider indicators — inferring from the prefix gives the wrong provider.
+    let provider = config
+        .llm
+        .active_provider()
+        .and_then(|p| ProviderType::from_str(p).ok())
+        .unwrap_or_else(|| {
+            // Fallback: infer from model name (only when no active provider)
+            if model.starts_with("gpt-") || model.starts_with("o1") {
+                ProviderType::OpenAi
+            } else if model.starts_with("claude-") {
+                ProviderType::Anthropic
+            } else if model.starts_with("deepseek") {
+                ProviderType::DeepSeek
+            } else {
+                ProviderType::OpenAi // safe default
+            }
+        });
+
+    // ACP providers (ClaudeCode, GeminiCli, OpenClaw) only support streaming mode.
+    // Summarization/extraction uses non-streaming calls, so we must fallback to
+    // a provider with an API key that supports non-streaming.
+    let is_acp = matches!(
+        provider,
+        ProviderType::ClaudeCode | ProviderType::GeminiCli | ProviderType::OpenClaw
+    );
+
+    if is_acp {
+        return find_fallback_provider(config);
+    }
 
     // Get API key for the provider
-    let api_key = match provider {
+    let api_key = get_api_key_for_provider(config, provider);
+
+    let api_key = api_key.ok_or_else(|| {
+        DaemonError::InternalError(format!(
+            "No API key configured for summarization provider {:?}",
+            provider
+        ))
+    })?;
+
+    Ok((provider, api_key))
+}
+
+/// Get the API key for a specific provider from config or environment.
+fn get_api_key_for_provider(config: &AgentConfig, provider: ProviderType) -> Option<String> {
+    match provider {
         ProviderType::OpenAi => config
             .llm
             .openai
@@ -244,6 +367,12 @@ pub fn get_summarization_provider(
             .api_key
             .clone()
             .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok()),
+        ProviderType::OpenRouter => config
+            .llm
+            .openrouter
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("OPENROUTER_API_KEY").ok()),
         ProviderType::Qwen => config
             .llm
             .qwen
@@ -257,16 +386,34 @@ pub fn get_summarization_provider(
             .clone()
             .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok()),
         _ => config.llm.active_api_key().map(|s| s.to_string()),
-    };
+    }
+}
 
-    let api_key = api_key.ok_or_else(|| {
-        DaemonError::InternalError(format!(
-            "No API key configured for summarization provider {:?}",
-            provider
-        ))
-    })?;
+/// Find a non-ACP provider with an available API key for summarization fallback.
+fn find_fallback_provider(config: &AgentConfig) -> Result<(ProviderType, String)> {
+    // Try providers in order of preference for lightweight summarization tasks
+    let candidates = [
+        ProviderType::OpenRouter,
+        ProviderType::OpenAi,
+        ProviderType::Anthropic,
+        ProviderType::DeepSeek,
+        ProviderType::Qwen,
+        ProviderType::Gemini,
+    ];
 
-    Ok((provider, api_key))
+    for provider in candidates {
+        if let Some(key) = get_api_key_for_provider(config, provider) {
+            tracing::debug!(
+                "ACP provider active, falling back to {:?} for summarization",
+                provider
+            );
+            return Ok((provider, key));
+        }
+    }
+
+    Err(DaemonError::InternalError(
+        "No non-ACP provider with API key available for summarization".to_string(),
+    ))
 }
 
 /// Format messages for the summary prompt.

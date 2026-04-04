@@ -105,6 +105,27 @@ impl<'a> KnowledgeRepository<'a> {
         })
     }
 
+    /// Update the content (details, summary, hot_summary) of a knowledge entry.
+    pub fn update_content(&self, id: &str, details: &str, summary: &str) -> Result<()> {
+        let now = rfc3339_now();
+
+        self.db.with_connection(|conn| {
+            let rows_affected = conn.execute(
+                "UPDATE knowledge SET details = ?1, summary = ?2, hot_summary = ?3, updated_at = ?4 WHERE id = ?5",
+                params![details, summary, summary, now, id],
+            )?;
+
+            if rows_affected == 0 {
+                return Err(crate::error::StorageError::NotFound {
+                    entity: "knowledge".to_string(),
+                    id: id.to_string(),
+                });
+            }
+
+            Ok(())
+        })
+    }
+
     /// Update the status of a knowledge entry.
     pub fn update_status(&self, id: &str, status: &str) -> Result<()> {
         let now = rfc3339_now();

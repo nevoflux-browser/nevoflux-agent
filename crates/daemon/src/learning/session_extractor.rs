@@ -98,22 +98,41 @@ pub fn parse_extraction_response(response: &str) -> Vec<ExtractionItem> {
 }
 
 /// The system prompt for knowledge extraction.
-pub const EXTRACTION_SYSTEM_PROMPT: &str = r#"You are a knowledge extraction assistant. Analyze the recent conversation and extract information worth remembering for future conversations.
+pub const EXTRACTION_SYSTEM_PROMPT: &str = r#"You are a knowledge extraction assistant. Analyze the recent conversation and extract information worth remembering across future sessions.
 
-Extract ONLY:
-- User preferences (language, style, tools they like/dislike)
-- Important facts about the user's project or workflow
-- Behavioral rules the user has stated ("always do X", "never do Y")
-- Site-specific knowledge (how a particular website works)
+Extract these types of durable knowledge:
+
+1. **user_preference** — User preferences and working style
+   - Language, response style, tool preferences
+   - Behavioral rules ("always do X", "never do Y")
+   - Corrections the user made ("not that way, do it like this")
+
+2. **workspace_context** — Facts about the user's environment and workflow
+   - Tools, services, and platforms the user regularly uses
+   - Team practices and processes (bug tracking, deployment, CI)
+   - Important accounts, URLs, or resource locations
+
+3. **tool_optimization** — Tool usage patterns learned
+   - Which tools work/fail on which sites
+   - Effective command patterns or workarounds
+   - Site-specific selectors or interaction strategies
+
+4. **error_pattern** — Recurring errors and proven fixes
+   - Errors that were fixed with a specific approach
+   - Approaches that failed and should not be tried again
+   - User corrections on how to handle specific situations
 
 Do NOT extract:
-- Temporary task details (current bug being fixed, specific file being edited)
+- Temporary task details (the specific bug being fixed right now)
 - Information already in the existing knowledge list below
 - Greetings, small talk, or routine exchanges
+- One-off facts unlikely to be useful in future sessions
+
+Each extracted item must be a self-contained sentence that is useful without the original conversation context.
 
 Return a JSON array. Each element has:
-- "content": the knowledge to remember (one clear sentence)
-- "category": one of "user_preference", "site_interaction", "tool_optimization"
+- "content": the knowledge to remember (one clear, specific sentence)
+- "category": one of "user_preference", "workspace_context", "tool_optimization", "error_pattern"
 
 If nothing is worth extracting, return an empty array: []"#;
 
@@ -166,10 +185,31 @@ pub async fn extract_session_memories(
         return Ok(0);
     }
 
-    // Get provider configuration
-    let model = config.llm.active_model().unwrap_or("gpt-4o-mini");
-    let (provider, api_key) = crate::context::get_summarization_provider(&config, model)?;
-    let base_url = config.llm.active_base_url();
+    // Get provider configuration.
+    // If the active provider is ACP (GeminiCli, ClaudeCode), get_summarization_provider
+    // falls back to a non-ACP provider. In that case, use the fallback provider's default
+    // model instead of the active model (which belongs to the ACP provider).
+    let active_model = config.llm.active_model().unwrap_or("gpt-4o-mini");
+    let (provider, api_key) = crate::context::get_summarization_provider(&config, active_model)?;
+
+    let active_provider = config
+        .llm
+        .active_provider()
+        .and_then(|p| p.parse::<nevoflux_llm::ProviderType>().ok());
+    let is_fallback = active_provider
+        .map(|ap| ap != provider)
+        .unwrap_or(false);
+    let model = if is_fallback {
+        nevoflux_llm::default_model_for(provider)
+    } else {
+        active_model
+    };
+    let base_url = if is_fallback {
+        // Don't use active provider's base_url when falling back
+        None
+    } else {
+        config.llm.active_base_url()
+    };
 
     // Gather existing hot knowledge to avoid duplicates
     let knowledge_repo = KnowledgeRepository::new(&database);

@@ -305,9 +305,9 @@ Do NOT switch models unless a plan step explicitly requests it.
 
 ## Memory
 
-You have persistent memory that survives across sessions. Use it to become more helpful over time.
+You have persistent memory that survives across sessions.
 
 - **memory_search**: Search memory for relevant past context before answering.
-- **memory_create**: Save user preferences, project patterns, tool configurations, and important decisions.
+- **memory_create**: Save information ONLY when the user explicitly asks to remember something ("记住/remember/记一下"). Do NOT call proactively for general conversation content — background auto-learning handles that.
 - **memory_update**: Update existing memories when information changes (use id from search).
 - **memory_delete**: Remove outdated memories (use id from search).

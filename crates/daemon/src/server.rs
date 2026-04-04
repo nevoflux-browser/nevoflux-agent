@@ -46,6 +46,20 @@ type InterruptRegistry = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 /// Maps tool_id to the response sender.
 type ToolAuthRegistry = Arc<Mutex<HashMap<String, oneshot::Sender<ToolAuthResponse>>>>;
 
+/// Registry for session-level memory extractors.
+/// Maps session_id to a shared SessionMemoryExtractor so message counts accumulate across turns.
+type ExtractionRegistry = Arc<
+    Mutex<
+        HashMap<
+            String,
+            (
+                std::time::Instant,
+                Arc<crate::learning::session_extractor::SessionMemoryExtractor>,
+            ),
+        >,
+    >,
+>;
+
 /// Shared mutable agent config that can be updated at runtime (e.g. when changing active LLM provider).
 type SharedAgentConfig = Arc<RwLock<Arc<AgentConfig>>>;
 
@@ -346,6 +360,9 @@ pub async fn start_server(
 
     // Create tool auth registry for pending tool authorization requests
     let tool_auth_registry: ToolAuthRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+    // Create extraction registry for session-level memory extractors
+    let extraction_registry: ExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
 
     // Initialize MCP manager (empty) and tool search index.
     // Actual connections happen in a background task so the daemon starts fast.
@@ -1099,6 +1116,29 @@ pub async fn start_server(
         }
     });
 
+    // Periodic cleanup for extraction registry.
+    // Remove extractors for sessions idle longer than 1 hour.
+    let cleanup_extraction_registry = extraction_registry.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(120));
+        loop {
+            interval.tick().await;
+            let mut registry = cleanup_extraction_registry.lock().await;
+            let before = registry.len();
+            registry.retain(|_id, (last_access, _)| {
+                last_access.elapsed() < std::time::Duration::from_secs(3600)
+            });
+            let removed = before - registry.len();
+            if removed > 0 {
+                info!(
+                    "Extraction registry cleanup: removed {} stale entries, {} remaining",
+                    removed,
+                    registry.len()
+                );
+            }
+        }
+    });
+
     // Spawn message processing loop
     let process_router = router.clone();
     let process_response_tx = response_tx.clone();
@@ -1111,6 +1151,7 @@ pub async fn start_server(
     let process_interrupt_registry = interrupt_registry.clone();
     let process_plan_registry = plan_registry.clone();
     let process_tool_auth_registry = tool_auth_registry.clone();
+    let process_extraction_registry = extraction_registry.clone();
     let process_trace_enabled = config.trace_enabled;
     tokio::spawn(async move {
         while let Some((identity, envelope)) = msg_rx.recv().await {
@@ -1312,6 +1353,7 @@ pub async fn start_server(
                     let interrupt_registry = process_interrupt_registry.clone();
                     let plan_registry = process_plan_registry.clone();
                     let trace_enabled = process_trace_enabled;
+                    let extraction_registry = process_extraction_registry.clone();
                     tokio::spawn(async move {
                         handle_chat_message_streaming(
                             &payload,
@@ -1329,6 +1371,7 @@ pub async fn start_server(
                             interrupt_registry,
                             plan_registry,
                             trace_enabled,
+                            extraction_registry,
                         )
                         .await;
                     });
@@ -1516,6 +1559,8 @@ fn build_hot_knowledge_section(database: &nevoflux_storage::Database) -> Option<
     let mut site_lines = Vec::new();
     let mut tool_lines = Vec::new();
     let mut pref_lines = Vec::new();
+    let mut project_lines = Vec::new();
+    let mut error_lines = Vec::new();
 
     for entry in &hot_entries {
         let line = entry.hot_summary.as_deref().unwrap_or(&entry.summary);
@@ -1538,7 +1583,9 @@ fn build_hot_knowledge_section(database: &nevoflux_storage::Database) -> Option<
             "site_interaction" | "siteinteraction" => site_lines.push(formatted),
             "tool_optimization" | "tooloptimization" => tool_lines.push(formatted),
             "user_preference" | "userpreference" => pref_lines.push(formatted),
-            _ => site_lines.push(formatted),
+            "workspace_context" | "workspacecontext" | "project_context" | "projectcontext" => project_lines.push(formatted),
+            "error_pattern" | "errorpattern" => error_lines.push(formatted),
+            _ => pref_lines.push(formatted),
         }
     }
 
@@ -1556,6 +1603,14 @@ fn build_hot_knowledge_section(database: &nevoflux_storage::Database) -> Option<
     if !pref_lines.is_empty() {
         parts.push("### User Preferences / 用户偏好".to_string());
         parts.extend(pref_lines);
+    }
+    if !project_lines.is_empty() {
+        parts.push("### Workspace Context / 工作环境".to_string());
+        parts.extend(project_lines);
+    }
+    if !error_lines.is_empty() {
+        parts.push("### Error Patterns / 错误模式".to_string());
+        parts.extend(error_lines);
     }
 
     Some(parts.join("\n"))
@@ -1632,6 +1687,7 @@ async fn handle_chat_message_streaming(
     interrupt_registry: InterruptRegistry,
     plan_registry: PlanRequestRegistry,
     trace_enabled: bool,
+    extraction_registry: ExtractionRegistry,
 ) {
     let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -2009,11 +2065,35 @@ async fn handle_chat_message_streaming(
         debug!("Registered interrupt flag for session: {}", session_id);
     }
 
+    // Get or create session-level extractor from registry
+    let session_extractor = {
+        let mut registry = extraction_registry.lock().await;
+        let entry = registry
+            .entry(session_id.clone())
+            .or_insert_with(|| {
+                (
+                    std::time::Instant::now(),
+                    Arc::new(
+                        crate::learning::session_extractor::SessionMemoryExtractor::new(
+                            config.learning.extraction_interval,
+                        ),
+                    ),
+                )
+            });
+        // Update last-accessed timestamp
+        entry.0 = std::time::Instant::now();
+        entry.1.clone()
+    };
+
+    // Share session extractor with HostServices so MCP tool executor can use it
+    services_with_context.session_extractor = Some(session_extractor.clone());
+
     let mut host = DaemonHostFunctions::new(config.clone(), runtime.clone())
         .with_services(services_with_context)
         .with_sidebar_stream(stream_tx)
         .with_session_id(session_id.clone())
-        .with_trace_collector(trace_collector.clone());
+        .with_trace_collector(trace_collector.clone())
+        .with_session_extractor(session_extractor.clone());
 
     // Pass skill base path to host for relative path resolution
     if let Some(ref ctx) = skill_context {
@@ -2023,11 +2103,9 @@ async fn handle_chat_message_streaming(
     }
 
     // Track user message for session extraction
-    host.session_extractor.on_user_message();
-    host.session_extractor.reset_turn_flags();
+    session_extractor.on_user_message();
+    session_extractor.reset_turn_flags();
 
-    // Clone extractor Arc before host is moved into Agent
-    let session_extractor = host.session_extractor.clone();
     let extraction_config = config.clone();
     let extraction_database = services.database.clone();
     let extraction_user_message = message_content.to_string();
@@ -2315,8 +2393,10 @@ async fn handle_chat_message_streaming(
         debug!("Removed interrupt flag for session: {}", session_id);
     }
 
-    // Cleanup trace collector session data
-    trace_collector.cleanup_session(&session_id);
+    // Note: Do NOT call trace_collector.cleanup_session() here —
+    // it deletes trace_spans from SQLite, preventing the learning
+    // collector from reading tool failure data. Trace spans are
+    // cleaned up by the learning collector after processing.
 
     // If cancelled, don't send final response (stop_generation handler already did)
     if was_cancelled {
@@ -2391,7 +2471,8 @@ async fn handle_chat_message_streaming(
                             .with_services(rerun_services)
                             .with_sidebar_stream(rerun_stream_tx)
                             .with_session_id(session_id.clone())
-                            .with_trace_collector(trace_collector.clone());
+                            .with_trace_collector(trace_collector.clone())
+                            .with_session_extractor(session_extractor.clone());
 
                         let rerun_agent = Agent::new(rerun_host);
 

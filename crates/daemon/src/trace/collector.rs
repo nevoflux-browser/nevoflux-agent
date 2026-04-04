@@ -47,7 +47,7 @@ impl TraceCollector {
         full_result: Option<serde_json::Value>,
     ) {
         // SQLite track (always)
-        let _ = self.storage.traces().create(CreateTraceSpanParams {
+        match self.storage.traces().create(CreateTraceSpanParams {
             session_id: session_id.to_string(),
             iteration,
             span_type: "tool_exec".to_string(),
@@ -57,7 +57,17 @@ impl TraceCollector {
             error_code: error_code.clone(),
             error_msg: error_msg.clone(),
             duration_ms: Some(duration_ms),
-        });
+        }) {
+            Ok(id) => {
+                tracing::debug!(
+                    "Trace span written: id={}, tool={}, success={}",
+                    id, tool_name, success
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Failed to write trace span to SQLite: {}", e);
+            }
+        }
 
         // JSONL track (if enabled)
         if let Some(writer) = &self.file_writer {

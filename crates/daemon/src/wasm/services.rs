@@ -186,6 +186,9 @@ pub struct HostServices {
     pub embedding: SharedEmbedding,
     /// In-memory vector index for semantic similarity search.
     pub vector_index: Arc<std::sync::RwLock<SimpleVectorIndex>>,
+    /// Session-level memory extractor for marking manual creates.
+    pub session_extractor:
+        Option<Arc<crate::learning::session_extractor::SessionMemoryExtractor>>,
 }
 
 impl HostServices {
@@ -237,6 +240,7 @@ impl HostServices {
             computer_controller: None,
             embedding: Arc::new(std::sync::RwLock::new(None)),
             vector_index: Arc::new(std::sync::RwLock::new(SimpleVectorIndex::new())),
+            session_extractor: None,
         }
     }
 
@@ -267,6 +271,7 @@ impl HostServices {
             computer_controller: None,
             embedding: Arc::new(std::sync::RwLock::new(None)),
             vector_index: Arc::new(std::sync::RwLock::new(SimpleVectorIndex::new())),
+            session_extractor: None,
         }
     }
 
@@ -568,6 +573,10 @@ impl std::fmt::Debug for HostServices {
                 },
             )
             .field("vector_index", &"Arc<RwLock<SimpleVectorIndex>>")
+            .field(
+                "session_extractor",
+                &self.session_extractor.as_ref().map(|_| "Some(...)"),
+            )
             .finish()
     }
 }
