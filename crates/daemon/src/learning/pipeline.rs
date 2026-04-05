@@ -2364,23 +2364,23 @@ mod tests {
 
     #[test]
     fn validate_flags_high_value_conflict_for_user() {
+        // Both entries must be manual for arbitration (manual vs system hits ManualEditProtected first)
         let (pipeline, storage) = setup();
         let repo = storage.knowledge();
 
-        // Create a high-confidence, high-hit existing entry
+        // Create a high-confidence, high-hit MANUAL entry
         let old = repo
             .create(CreateKnowledgeParams {
                 category: "tooloptimization".into(),
                 domain: Some("example.com".into()),
                 summary: "High value approach".into(),
                 details: "Well-tested strategy".into(),
-                source_type: Some("system".into()),
+                source_type: Some("manual".into()),
                 ..Default::default()
             })
             .unwrap();
         repo.update_status(&old.id, "validated").unwrap();
 
-        // Give the old entry very high confidence and hit count
         storage
             .database()
             .with_connection(|conn| {
@@ -2392,14 +2392,14 @@ mod tests {
             })
             .unwrap();
 
-        // Create a low-confidence pending entry that contradicts
+        // Create a low-confidence pending MANUAL entry that contradicts
         let new_entry = repo
             .create(CreateKnowledgeParams {
                 category: "tooloptimization".into(),
                 domain: Some("example.com".into()),
                 summary: "Low value approach".into(),
                 details: "New untested strategy".into(),
-                source_type: Some("system".into()),
+                source_type: Some("manual".into()),
                 ..Default::default()
             })
             .unwrap();
@@ -2428,7 +2428,7 @@ mod tests {
         let entry = repo.get(&new_entry.id).unwrap().unwrap();
         assert_eq!(entry.status, "pending");
 
-        // Old entry should be untouched
+        // Old manual entry should be untouched
         let old_entry = repo.get(&old.id).unwrap().unwrap();
         assert_eq!(old_entry.status, "validated");
     }

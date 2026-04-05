@@ -117,14 +117,18 @@ pub fn detect_conflict(existing: &Knowledge, incoming: &Knowledge) -> Option<Con
         let new_score = incoming.confidence * incoming.hit_count as f64;
 
         // Safeguard: if old confidence*hits > new*2, flag for user arbitration.
-        if old_score > new_score * 2.0 {
+        // Exception: auto-generated entries (system, auto_extraction, consolidation)
+        // should always let new data win — the latest observation is more relevant.
+        // Only manually created entries ("manual") warrant user protection.
+        let is_manual = existing.source_type == "manual";
+        if is_manual && old_score > new_score * 2.0 {
             return Some(Conflict {
                 conflict_type: ConflictType::DirectContradiction,
                 existing_id: existing.id.clone(),
                 incoming_id: incoming.id.clone(),
                 resolution: Resolution::RequiresArbitration,
                 reason: format!(
-                    "Old entry score ({:.2}) significantly exceeds new ({:.2}); requires user review",
+                    "Old manual entry score ({:.2}) significantly exceeds new ({:.2}); requires user review",
                     old_score, new_score
                 ),
             });
@@ -353,16 +357,48 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // 3. Direct contradiction safeguard: high-value old triggers arbitration
+    // 3. Direct contradiction safeguard: high-value manual entry triggers arbitration
     // ------------------------------------------------------------------
     #[test]
     fn high_value_old_entry_triggers_arbitration() {
+        // Both entries must be manual for arbitration to trigger
+        // (manual vs system is caught earlier by ManualEditProtected)
         let existing = make_knowledge(KnowledgeOverrides {
             id: Some("K-existing".into()),
             subcategory: Some(Some("login".into())),
             details: Some("Use selector .btn-old".into()),
             confidence: Some(0.9),
             hit_count: Some(100),
+            source_type: Some("manual".into()),
+            ..Default::default()
+        });
+        let incoming = make_knowledge(KnowledgeOverrides {
+            id: Some("K-incoming".into()),
+            subcategory: Some(Some("login".into())),
+            details: Some("Use selector .btn-new".into()),
+            confidence: Some(0.5),
+            hit_count: Some(1),
+            source_type: Some("manual".into()),
+            ..Default::default()
+        });
+
+        let conflict = detect_conflict(&existing, &incoming);
+        assert!(conflict.is_some());
+        let c = conflict.unwrap();
+        assert_eq!(c.conflict_type, ConflictType::DirectContradiction);
+        assert_eq!(c.resolution, Resolution::RequiresArbitration);
+    }
+
+    #[test]
+    fn high_value_system_entry_does_not_trigger_arbitration() {
+        // Auto-generated (system) entries should let new data win
+        let existing = make_knowledge(KnowledgeOverrides {
+            id: Some("K-existing".into()),
+            subcategory: Some(Some("login".into())),
+            details: Some("Use selector .btn-old".into()),
+            confidence: Some(0.9),
+            hit_count: Some(100),
+            source_type: Some("system".into()),
             ..Default::default()
         });
         let incoming = make_knowledge(KnowledgeOverrides {
@@ -378,7 +414,7 @@ mod tests {
         assert!(conflict.is_some());
         let c = conflict.unwrap();
         assert_eq!(c.conflict_type, ConflictType::DirectContradiction);
-        assert_eq!(c.resolution, Resolution::RequiresArbitration);
+        assert_eq!(c.resolution, Resolution::NewOverwritesOld);
     }
 
     // ------------------------------------------------------------------
