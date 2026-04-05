@@ -537,9 +537,11 @@ impl LlmConfig {
         }
     }
 
-    /// Get use_streaming for a specific provider. Defaults to true.
+    /// Get use_streaming for a specific provider.
+    /// Defaults to `false` for providers that don't support streaming (Qwen, Ollama),
+    /// `true` for all others.
     pub fn use_streaming_for_provider(&self, provider: &str) -> bool {
-        match provider {
+        let value = match provider {
             "anthropic" => self.anthropic.use_streaming,
             "openai" => self.openai.use_streaming,
             "qwen" => self.qwen.use_streaming,
@@ -558,8 +560,10 @@ impl LlmConfig {
             "kimi-agent" | "kimi_agent" | "kimi" => self.kimi_agent.use_streaming,
             "openclaw" | "open_claw" | "open-claw" => self.openclaw.use_streaming,
             _ => None,
-        }
-        .unwrap_or(true)
+        };
+        // Providers that don't support streaming default to false
+        let default = !matches!(provider, "qwen" | "ollama");
+        value.unwrap_or(default)
     }
 
     /// Get list of configured providers with their model names.
