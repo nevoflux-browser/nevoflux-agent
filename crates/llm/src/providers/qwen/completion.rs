@@ -529,13 +529,25 @@ impl completion::CompletionModel for QwenCompletionModel {
             messages.push(QwenMessage::user(user_prompt));
         }
 
-        let request = json!({
-            "model": self.model,
-            "messages": messages,
-            "temperature": completion_request.temperature,
-            "max_tokens": completion_request.max_tokens,
-            "stream": true,
-        });
+        let request = if completion_request.tools.is_empty() {
+            json!({
+                "model": self.model,
+                "messages": messages,
+                "temperature": completion_request.temperature,
+                "max_tokens": completion_request.max_tokens,
+                "stream": true,
+            })
+        } else {
+            json!({
+                "model": self.model,
+                "messages": messages,
+                "temperature": completion_request.temperature,
+                "max_tokens": completion_request.max_tokens,
+                "stream": true,
+                "tools": completion_request.tools.iter().cloned().map(QwenToolDefinition::from).collect::<Vec<_>>(),
+                "tool_choice": "auto",
+            })
+        };
 
         let final_request = if let Some(params) = completion_request.additional_params {
             merge_json(request, params)
