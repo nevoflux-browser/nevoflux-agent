@@ -562,7 +562,7 @@ impl LlmConfig {
             _ => None,
         };
         // Providers that don't support streaming default to false
-        let default = !matches!(provider, "qwen" | "ollama");
+        let default = !matches!(provider, "ollama");
         value.unwrap_or(default)
     }
 

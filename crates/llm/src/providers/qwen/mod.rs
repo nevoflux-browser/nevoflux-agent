@@ -15,5 +15,5 @@ mod completion;
 mod types;
 
 pub use client::{QwenClient, QWEN_BASE_URL};
-pub use completion::QwenCompletionModel;
+pub use completion::{QwenCompletionModel, QwenMessage};
 pub use types::*;

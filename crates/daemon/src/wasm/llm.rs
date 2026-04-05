@@ -1732,8 +1732,9 @@ async fn execute_llm_stream_inner(
         ProviderType::KimiAgent => {
             stream_kimi_agent(api_key, model, request, tx, provider, base_url).await
         }
-        // Qwen and Ollama don't support streaming in rig yet
-        ProviderType::Qwen | ProviderType::Ollama => Err(DaemonError::InternalError(format!(
+        ProviderType::Qwen => stream_qwen(api_key, model, request, tx, provider, base_url).await,
+        // Ollama doesn't support streaming in rig yet
+        ProviderType::Ollama => Err(DaemonError::InternalError(format!(
             "Streaming not supported for provider {:?}",
             provider
         ))),
@@ -1888,6 +1889,78 @@ async fn stream_deepseek(
     })?;
     let completion_model = client.completion_model(model);
     stream_rig_completion(completion_model, request, tx, provider).await
+}
+
+/// Stream from Qwen provider using QwenCompletionModel::stream_chat.
+async fn stream_qwen(
+    api_key: &str,
+    model: &str,
+    request: LlmChatRequest,
+    tx: mpsc::Sender<LlmStreamChunk>,
+    _provider: ProviderType,
+    base_url: Option<&str>,
+) -> Result<()> {
+    use futures::StreamExt;
+    use nevoflux_llm::providers::qwen::QwenMessage;
+
+    let mut client = QwenClient::new(api_key);
+    if let Some(url) = base_url {
+        client = client.with_base_url(url);
+    }
+    let completion_model = client.completion_model(model);
+
+    // Convert LlmChatRequest messages to QwenMessage
+    let mut qwen_messages = Vec::new();
+    if let Some(system) = &request.system {
+        qwen_messages.push(QwenMessage::system(system.clone()));
+    }
+    for msg in &request.messages {
+        match msg.role.as_str() {
+            "user" => qwen_messages.push(QwenMessage::user(&msg.content)),
+            "assistant" => qwen_messages.push(QwenMessage::assistant(&msg.content)),
+            "system" => qwen_messages.push(QwenMessage::system(&msg.content)),
+            _ => qwen_messages.push(QwenMessage::user(&msg.content)),
+        }
+    }
+
+    let mut stream = completion_model
+        .stream_chat(qwen_messages)
+        .await
+        .map_err(|e| DaemonError::InternalError(format!("Qwen stream error: {}", e)))?;
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(text) => {
+                let chunk = LlmStreamChunk {
+                    text: Some(text),
+                    tool_calls: vec![],
+                    done: false,
+                    reasoning: None,
+                    images: vec![],
+                };
+                if tx.send(chunk).await.is_err() {
+                    break; // Receiver dropped
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Qwen stream chunk error: {}", e);
+                break;
+            }
+        }
+    }
+
+    // Send final done chunk
+    let _ = tx
+        .send(LlmStreamChunk {
+            text: None,
+            tool_calls: vec![],
+            done: true,
+            reasoning: None,
+            images: vec![],
+        })
+        .await;
+
+    Ok(())
 }
 
 /// Stream from Gemini provider.
