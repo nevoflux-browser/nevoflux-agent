@@ -1891,21 +1891,230 @@ async fn stream_deepseek(
     stream_rig_completion(completion_model, request, tx, provider).await
 }
 
-/// Stream from Qwen provider via rig CompletionModel (includes tools support).
+/// Stream from Qwen provider using raw HTTP + SSE parsing.
+///
+/// We bypass rig's streaming trait because Qwen's rig `stream()` implementation
+/// doesn't handle tool_calls in deltas. This raw implementation sends tools
+/// in the request and parses both content and tool_calls from the SSE stream.
 async fn stream_qwen(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
-    provider: ProviderType,
+    _provider: ProviderType,
     base_url: Option<&str>,
 ) -> Result<()> {
+    use futures::StreamExt;
+    use nevoflux_llm::providers::qwen::QwenMessage;
+
     let mut client = QwenClient::new(api_key);
     if let Some(url) = base_url {
         client = client.with_base_url(url);
     }
-    let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx, provider).await
+
+    // Convert messages to QwenMessage format
+    let mut qwen_messages = Vec::new();
+    if let Some(system) = &request.system {
+        qwen_messages.push(QwenMessage::system(system.clone()));
+    }
+    for msg in &request.messages {
+        match msg.role.as_str() {
+            "user" => qwen_messages.push(QwenMessage::user(&msg.content)),
+            "assistant" => qwen_messages.push(QwenMessage::assistant(&msg.content)),
+            "system" => qwen_messages.push(QwenMessage::system(&msg.content)),
+            "tool" => {
+                let tool_msg = QwenMessage::tool(
+                    msg.tool_call_id.as_deref().unwrap_or(""),
+                    &msg.content,
+                );
+                qwen_messages.push(tool_msg);
+            }
+            _ => qwen_messages.push(QwenMessage::user(&msg.content)),
+        }
+    }
+
+    // Build request JSON with optional tools
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": qwen_messages,
+        "stream": true,
+    });
+    if let Some(tools) = &request.tools {
+        if !tools.is_empty() {
+            let qwen_tools: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters
+                        }
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::json!(qwen_tools);
+            body["tool_choice"] = serde_json::json!("auto");
+        }
+    }
+    if let Some(temp) = request.temperature {
+        body["temperature"] = serde_json::json!(temp);
+    }
+    if let Some(max) = request.max_tokens {
+        body["max_tokens"] = serde_json::json!(max);
+    }
+
+    let base = base_url.unwrap_or("https://dashscope.aliyuncs.com/compatible-mode/v1");
+    let http_client = reqwest::Client::new();
+    let response = http_client
+        .post(format!("{}/chat/completions", base))
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| DaemonError::InternalError(format!("Qwen stream request failed: {}", e)))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(DaemonError::InternalError(format!(
+            "Qwen stream HTTP {}: {}",
+            status, text
+        )));
+    }
+
+    let mut byte_stream = response.bytes_stream();
+    // Accumulate streaming tool call deltas (arguments come in fragments)
+    struct ToolCallAccum {
+        id: String,
+        name: String,
+        arguments: String,
+    }
+    let mut accumulated_tool_calls: HashMap<i64, ToolCallAccum> = HashMap::new();
+
+    while let Some(result) = byte_stream.next().await {
+        match result {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                for line in text.lines() {
+                    let data = match line.strip_prefix("data: ") {
+                        Some(d) if d != "[DONE]" => d,
+                        _ => continue,
+                    };
+
+                    let chunk: serde_json::Value = match serde_json::from_str(data) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    let choice = match chunk["choices"].get(0) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    let delta = &choice["delta"];
+
+                    // Handle text content
+                    if let Some(content) = delta["content"].as_str() {
+                        if !content.is_empty() {
+                            let _ = tx
+                                .send(LlmStreamChunk {
+                                    text: Some(content.to_string()),
+                                    tool_calls: vec![],
+                                    done: false,
+                                    reasoning: None,
+                                    images: vec![],
+                                })
+                                .await;
+                        }
+                    }
+
+                    // Handle tool calls in delta
+                    if let Some(tool_calls) = delta["tool_calls"].as_array() {
+                        for tc in tool_calls {
+                            let index = tc["index"].as_i64().unwrap_or(0);
+                            let entry = accumulated_tool_calls
+                                .entry(index)
+                                .or_insert_with(|| ToolCallAccum {
+                                    id: String::new(),
+                                    name: String::new(),
+                                    arguments: String::new(),
+                                });
+
+                            if let Some(id) = tc["id"].as_str() {
+                                entry.id = id.to_string();
+                            }
+                            if let Some(func) = tc.get("function") {
+                                if let Some(name) = func["name"].as_str() {
+                                    entry.name = name.to_string();
+                                }
+                                if let Some(args) = func["arguments"].as_str() {
+                                    entry.arguments.push_str(args);
+                                }
+                            }
+                        }
+                    }
+
+                    // Handle reasoning/thinking content
+                    if let Some(reasoning) = delta["reasoning_content"].as_str() {
+                        if !reasoning.is_empty() {
+                            let _ = tx
+                                .send(LlmStreamChunk {
+                                    text: None,
+                                    tool_calls: vec![],
+                                    done: false,
+                                    reasoning: Some(reasoning.to_string()),
+                                    images: vec![],
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Qwen stream chunk error: {}", e);
+                break;
+            }
+        }
+    }
+
+    // Send accumulated tool calls if any
+    if !accumulated_tool_calls.is_empty() {
+        let mut tool_calls: Vec<LlmToolCall> = accumulated_tool_calls
+            .into_values()
+            .map(|tc| LlmToolCall {
+                id: tc.id.clone(),
+                call_id: Some(tc.id),
+                name: tc.name,
+                arguments: serde_json::from_str(&tc.arguments)
+                    .unwrap_or(serde_json::Value::Object(Default::default())),
+                signature: None,
+            })
+            .collect();
+        tool_calls.sort_by_key(|tc| tc.id.clone());
+        let _ = tx
+            .send(LlmStreamChunk {
+                text: None,
+                tool_calls,
+                done: false,
+                reasoning: None,
+                images: vec![],
+            })
+            .await;
+    }
+
+    // Send final done chunk
+    let _ = tx
+        .send(LlmStreamChunk {
+            text: None,
+            tool_calls: vec![],
+            done: true,
+            reasoning: None,
+            images: vec![],
+        })
+        .await;
+
+    Ok(())
 }
 
 /// Stream from Gemini provider.

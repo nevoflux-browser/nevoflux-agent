@@ -118,6 +118,9 @@ impl QwenCompletionModel {
 pub struct QwenMessage {
     pub role: String,
     pub content: String,
+    /// Tool call ID for tool result messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl QwenMessage {
@@ -125,6 +128,7 @@ impl QwenMessage {
         Self {
             role: "system".into(),
             content: content.into(),
+            tool_call_id: None,
         }
     }
 
@@ -132,6 +136,7 @@ impl QwenMessage {
         Self {
             role: "user".into(),
             content: content.into(),
+            tool_call_id: None,
         }
     }
 
@@ -139,6 +144,15 @@ impl QwenMessage {
         Self {
             role: "assistant".into(),
             content: content.into(),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".into(),
+            content: content.into(),
+            tool_call_id: Some(tool_call_id.into()),
         }
     }
 }
