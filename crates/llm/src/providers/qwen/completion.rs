@@ -445,25 +445,22 @@ impl completion::CompletionModel for QwenCompletionModel {
         }
 
         // Build the request JSON
-        let request = if completion_request.tools.is_empty() {
-            json!({
-                "model": self.model,
-                "messages": messages,
-                "temperature": completion_request.temperature,
-                "max_tokens": completion_request.max_tokens,
-                "stream": false,
-            })
-        } else {
-            json!({
-                "model": self.model,
-                "messages": messages,
-                "temperature": completion_request.temperature,
-                "max_tokens": completion_request.max_tokens,
-                "stream": false,
-                "tools": completion_request.tools.iter().cloned().map(QwenToolDefinition::from).collect::<Vec<_>>(),
-                "tool_choice": "auto",
-            })
-        };
+        // Note: Qwen API rejects null for temperature/max_tokens, so only include when Some.
+        let mut request = json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": false,
+        });
+        if let Some(temp) = completion_request.temperature {
+            request["temperature"] = json!(temp);
+        }
+        if let Some(max) = completion_request.max_tokens {
+            request["max_tokens"] = json!(max);
+        }
+        if !completion_request.tools.is_empty() {
+            request["tools"] = json!(completion_request.tools.iter().cloned().map(QwenToolDefinition::from).collect::<Vec<_>>());
+            request["tool_choice"] = json!("auto");
+        }
 
         // Merge additional params if provided
         let final_request = if let Some(params) = completion_request.additional_params {
@@ -529,25 +526,22 @@ impl completion::CompletionModel for QwenCompletionModel {
             messages.push(QwenMessage::user(user_prompt));
         }
 
-        let request = if completion_request.tools.is_empty() {
-            json!({
-                "model": self.model,
-                "messages": messages,
-                "temperature": completion_request.temperature,
-                "max_tokens": completion_request.max_tokens,
-                "stream": true,
-            })
-        } else {
-            json!({
-                "model": self.model,
-                "messages": messages,
-                "temperature": completion_request.temperature,
-                "max_tokens": completion_request.max_tokens,
-                "stream": true,
-                "tools": completion_request.tools.iter().cloned().map(QwenToolDefinition::from).collect::<Vec<_>>(),
-                "tool_choice": "auto",
-            })
-        };
+        // Note: Qwen API rejects null for temperature/max_tokens, so only include when Some.
+        let mut request = json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": true,
+        });
+        if let Some(temp) = completion_request.temperature {
+            request["temperature"] = json!(temp);
+        }
+        if let Some(max) = completion_request.max_tokens {
+            request["max_tokens"] = json!(max);
+        }
+        if !completion_request.tools.is_empty() {
+            request["tools"] = json!(completion_request.tools.iter().cloned().map(QwenToolDefinition::from).collect::<Vec<_>>());
+            request["tool_choice"] = json!("auto");
+        }
 
         let final_request = if let Some(params) = completion_request.additional_params {
             merge_json(request, params)
