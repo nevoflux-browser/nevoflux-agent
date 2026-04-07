@@ -175,32 +175,45 @@ pub async fn launch_daemon(executable: &Path, config: &BridgeConfig) -> Result<u
 
     info!("Launching daemon: {}", executable.display());
 
-    let mut cmd = Command::new(executable);
-    cmd.arg("--daemon");
+    // On Windows, launch via powershell.exe so the daemon inherits the user's
+    // PowerShell profile environment (e.g. API keys set in $PROFILE).
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
 
-    // Pass port range so spawned daemon uses the correct ports
-    cmd.arg("--port-start")
-        .arg(config.port_range_start.to_string());
-    cmd.arg("--port-end").arg(config.port_range_end.to_string());
+        let powershell_cmd = format!(
+            "& '{}' --daemon --port-start {} --port-end {} --managed",
+            executable.display(),
+            config.port_range_start,
+            config.port_range_end,
+        );
 
-    // Mark as managed so daemon self-terminates on idle
-    cmd.arg("--managed");
+        let mut c = Command::new("powershell.exe");
+        c.arg("-NoLogo")
+            .arg("-Command")
+            .arg(&powershell_cmd);
+
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        c
+    };
+
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = Command::new(executable);
+        c.arg("--daemon");
+        c.arg("--port-start")
+            .arg(config.port_range_start.to_string());
+        c.arg("--port-end").arg(config.port_range_end.to_string());
+        c.arg("--managed");
+        c
+    };
 
     // CRITICAL: redirect stdout/stderr to null so daemon output does not
     // pollute the proxy's Native Messaging channel (stdout = protocol wire).
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
-
-    // On Windows, detach the daemon so it survives proxy shutdown.
-    // CREATE_NEW_PROCESS_GROUP (0x0000_0200) detaches from parent's console group.
-    // CREATE_NO_WINDOW (0x0800_0000) prevents a console window from appearing.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-    }
 
     let child = cmd
         .spawn()
@@ -254,30 +267,48 @@ pub async fn launch_daemon_with_port(
         executable.display()
     );
 
-    let mut cmd = Command::new(executable);
-    cmd.arg("--daemon")
-        .arg("--managed")
-        .arg("--port")
-        .arg(port.to_string());
+    // On Windows, launch via powershell.exe so the daemon inherits the user's
+    // PowerShell profile environment (e.g. API keys set in $PROFILE).
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
 
-    // Pass port range so daemon config is consistent
-    cmd.arg("--port-start")
-        .arg(config.port_range_start.to_string());
-    cmd.arg("--port-end").arg(config.port_range_end.to_string());
+        let powershell_cmd = format!(
+            "& '{}' --daemon --managed --port {} --port-start {} --port-end {}",
+            executable.display(),
+            port,
+            config.port_range_start,
+            config.port_range_end,
+        );
+
+        let mut c = Command::new("powershell.exe");
+        c.arg("-NoLogo")
+            .arg("-Command")
+            .arg(&powershell_cmd);
+
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        c
+    };
+
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = Command::new(executable);
+        c.arg("--daemon")
+            .arg("--managed")
+            .arg("--port")
+            .arg(port.to_string());
+        c.arg("--port-start")
+            .arg(config.port_range_start.to_string());
+        c.arg("--port-end").arg(config.port_range_end.to_string());
+        c
+    };
 
     // Redirect stdout/stderr to null so daemon output does not
     // pollute the proxy's Native Messaging channel.
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
-
-    // On Windows, detach the daemon so it survives proxy shutdown.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-    }
 
     let child = cmd
         .spawn()
