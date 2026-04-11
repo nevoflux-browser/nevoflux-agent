@@ -35,7 +35,7 @@ When the user message includes attached images, files, or directories, prioritiz
 | General question | Answer directly |
 | Research a topic | `plan` then `web_search` x N then synthesize |
 | Research + compare/rank/filter results | `orchestrate`: web_search → loop fetch → build summary |
-| Click / fill / submit on page | `browser_click_by_id` / `browser_fill_by_id` / `browser_type_by_id` |
+| Click / fill / submit on page | `browser_click_by_id` / `browser_input` (rich text) / `browser_fill_by_id` |
 | Parallel independent tasks | `spawn_subagent` with role config then `wait_all_subagents` |
 | Parallel file processing | `spawn_subagent` per file (sandbox write) then main agent writes final |
 | Batch file operations (3+ files) | `orchestrate`: loop over files with read/write/transform |
@@ -74,7 +74,10 @@ When the user message includes attached images, files, or directories, prioritiz
 
 - **Element IDs are ephemeral.** Only use IDs from the MOST RECENT page state snapshot. All older IDs are invalid.
 - **One action per turn.** Perform one interaction (click, fill, type), then observe the updated snapshot before the next action.
-- **Prefer `browser_fill_by_id`** for form fields. Fall back to `browser_type_by_id` only when fill does not work (e.g., custom input components).
+- **Text input decision tree**:
+  - **Rich text editors** (Twitter/X compose, Facebook/Threads compose, LinkedIn post, Discord message, Reddit new compose, Bluesky compose, any ProseMirror/Slate/Draft.js/Lexical editor): **use `browser_input`** with a CSS selector. It probes the target, detects the editor framework, and uses the correct strategy (execCommand-based insertion that works with React/state-managed editors). Legacy `browser_fill_by_id` silently fails on these — the call returns success but no text is inserted.
+  - **Plain form fields** (`<input>`, `<textarea>`): prefer `browser_fill_by_id` for speed. Fall back to `browser_type_by_id` only when fill does not work (rare).
+  - **Unsure about the element?** Call `browser_probe` first to get a Fingerprint (`is_content_editable`, `editor_framework`, `innermost_editable_selector`). Then decide.
 - **Scroll to find elements.** If the target element is not in the current snapshot, use `browser_scroll("down")` or `browser_scroll("up")` to reveal it. Do NOT guess element IDs.
 
 ## Navigation strategy

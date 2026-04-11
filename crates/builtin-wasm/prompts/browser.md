@@ -30,7 +30,7 @@ In browser/agent mode, a **page state snapshot** is appended to the user message
 | Compare these tabs | `browser_get_markdown` per tab |
 | General question | Answer directly |
 | Research a topic | `plan` then `web_search` x N then synthesize |
-| Click / fill / submit on page | `browser_click_by_id` / `browser_fill_by_id` / `browser_type_by_id` |
+| Click / fill / submit on page | `browser_click_by_id` / `browser_input` (rich text) / `browser_fill_by_id` |
 | Parallel independent tasks | `subagent_spawn` then `subagent_wait_all` |
 | File or system task | Suggest switching to Agent mode |
 
@@ -38,7 +38,10 @@ In browser/agent mode, a **page state snapshot** is appended to the user message
 
 - **Element IDs are ephemeral.** Only use IDs from the MOST RECENT page state snapshot. All older IDs are invalid.
 - **One action per turn.** Perform one interaction (click, fill, type), then observe the updated snapshot before the next action.
-- **Prefer `browser_fill_by_id`** for form fields. Fall back to `browser_type_by_id` only when fill does not work (e.g., custom input components).
+- **Text input decision tree**:
+  - **Rich text editors** (Twitter/X compose, Facebook/Threads, LinkedIn, Discord, Reddit new compose, ProseMirror/Slate/Draft.js/Lexical): **use `browser_input`** with a CSS selector. It detects the editor framework and uses the correct insertion strategy. Legacy `browser_fill_by_id` silently fails on these (returns success, inserts nothing).
+  - **Plain form fields** (`<input>`, `<textarea>`): use `browser_fill_by_id` for speed, fall back to `browser_type_by_id` only when fill does not work.
+  - **Unsure?** Call `browser_probe` first to get a Fingerprint with `is_content_editable` and `editor_framework`, then decide.
 - **Scroll to find elements.** If the target element is not in the current snapshot, use `browser_scroll("down")` or `browser_scroll("up")` to reveal it. Do NOT guess element IDs.
 
 ## Navigation strategy
@@ -71,7 +74,8 @@ After each interaction:
 |---|---|
 | Element not found in snapshot | Scroll down/up to find it |
 | Click had no visible effect | Try a different element or verify the action in the snapshot |
-| `browser_fill_by_id` did not work | Fall back to `browser_type_by_id` |
+| `browser_fill_by_id` did not work | On a rich text editor? Use `browser_input` instead. Otherwise fall back to `browser_type_by_id`. |
+| `browser_input` verification shows mismatch | Check `verify.possible_causes` in the result for diagnostic hints. |
 | Page did not load | Wait briefly, then `browser_screenshot` to check |
 | Unexpected page (redirect, popup) | Assess new snapshot, adapt or go back |
 
