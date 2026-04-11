@@ -251,6 +251,16 @@ pub enum BrowserToolAction {
     /// - `lines`: new line count (on success)
     /// - `error`: error message (on failure)
     EditArtifact,
+    /// Probe an element and return a Fingerprint (PR #2, browser_input strategy engine)
+    Probe,
+    /// High-level structured input tool (PR #2, browser_input)
+    Input,
+    /// Paste text into a contentEditable target via synthetic ClipboardEvent + execCommand
+    /// (PR #1 Actor method, dispatched by strategy engine Executor)
+    Paste,
+    /// Replace contentEditable content (clear + paste). (PR #1 Actor method)
+    #[serde(rename = "fillRichText")]
+    FillRichText,
 }
 
 /// File attachment
