@@ -15,7 +15,7 @@
 //! async runtime required.
 
 use crate::agent::browser_input::fingerprint::Fingerprint;
-use crate::agent::browser_input::plan::{ExecutionPlan, InputMode};
+use crate::agent::browser_input::plan::{Action, ExecutionPlan, InputMode};
 use crate::agent::browser_input::platform_adapter::Recipe;
 
 /// Input to the strategy decision.
@@ -32,6 +32,47 @@ pub struct StrategyInput<'a> {
     /// Platform recipe for this hostname, if one is registered.
     /// `None` means "no recipe applies; fall through to generic strategy".
     pub adapter: Option<&'a Recipe>,
+}
+
+/// Try to produce a platform-specific plan from the active recipe.
+///
+/// Returns `Some(ExecutionPlan::Sequence(..))` if the recipe has a
+/// mention config AND the input text contains a match for the
+/// mention pattern. Otherwise returns `None` so `decide()` falls
+/// through to the generic strategy branches.
+///
+/// Hashtag handling is intentionally deferred to a future PR; the
+/// recipe field is parsed but ignored here.
+fn apply_recipe(recipe: &Recipe, input: &StrategyInput) -> Option<ExecutionPlan> {
+    let mention_cfg = recipe.mention.as_ref()?;
+    // Cheap contains check first so we avoid compiling the regex on
+    // every call when the text obviously has no trigger character.
+    if !input.text.contains(&mention_cfg.trigger_char) {
+        return None;
+    }
+    let regex = regex::Regex::new(&mention_cfg.pattern).ok()?;
+    if !regex.is_match(input.text) {
+        return None;
+    }
+    Some(build_mention_sequence(input, mention_cfg, &regex))
+}
+
+fn build_mention_sequence(
+    input: &StrategyInput,
+    _mention: &crate::agent::browser_input::platform_adapter::MentionConfig,
+    _regex: &regex::Regex,
+) -> ExecutionPlan {
+    // Placeholder (Task 8 replaces this with the full sequence builder).
+    let target = input
+        .fingerprint
+        .innermost_editable_selector
+        .as_deref()
+        .unwrap_or(input.selector)
+        .to_string();
+    ExecutionPlan::Sequence(vec![Action::Paste {
+        selector: target,
+        text: input.text.to_string(),
+    }])
 }
 
 /// Pure strategy decision.
@@ -51,6 +92,14 @@ pub fn decide(input: &StrategyInput) -> ExecutionPlan {
             reason: "Element is not visible".into(),
             recoverable: true,
         };
+    }
+
+    // Platform adapter first: mention flows and other recipe-driven
+    // special cases override the generic branches.
+    if let Some(recipe) = input.adapter {
+        if let Some(plan) = apply_recipe(recipe, input) {
+            return plan;
+        }
     }
 
     // contentEditable branch: different plan per input mode.
@@ -436,5 +485,24 @@ mod tests {
                 text: "hi".into(),
             }
         );
+    }
+
+    // ===== apply_recipe fall-through tests (Task 7) =====
+
+    #[test]
+    fn no_adapter_matches_existing_behavior() {
+        let fp = draft_js_fp();
+        let input = StrategyInput {
+            selector: "#c",
+            text: "Hello world",
+            mode: InputMode::Fill,
+            fingerprint: &fp,
+            hostname: "x.com",
+            adapter: None,
+        };
+        assert!(matches!(
+            decide(&input),
+            ExecutionPlan::RichTextFill { .. }
+        ));
     }
 }
