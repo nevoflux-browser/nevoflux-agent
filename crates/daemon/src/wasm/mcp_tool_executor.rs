@@ -377,6 +377,9 @@ fn tool_name_to_browser_action(name: &str) -> Option<BrowserToolAction> {
         "ask_user" => Some(BrowserToolAction::AskUser),
         "web_search" => Some(BrowserToolAction::WebSearch),
         "fetch_page" => Some(BrowserToolAction::WebFetch),
+        // Browser input strategy engine (PR #2 + #2.5)
+        "input" => Some(BrowserToolAction::Input),
+        "probe" => Some(BrowserToolAction::Probe),
         _ => None,
     }
 }
@@ -388,6 +391,17 @@ async fn execute_browser_tool(
     browser_ctx: &BrowserContext,
 ) -> Result<String, String> {
     use tokio::sync::oneshot;
+
+    // Intercept PR #2 orchestrated tools (browser_input, browser_probe) before
+    // the standard single-call dispatch. These run multi-step pipelines in the
+    // daemon (probe → decide → execute → verify) rather than forwarding a
+    // single request to the browser extension.
+    if matches!(
+        action,
+        BrowserToolAction::Input | BrowserToolAction::Probe
+    ) {
+        return execute_browser_input_orchestrated(action, arguments, browser_ctx).await;
+    }
 
     let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
 
@@ -434,6 +448,75 @@ async fn execute_browser_tool(
             .error
             .map(|e| format!("{}: {}", e.code, e.message))
             .unwrap_or_else(|| "unknown tool error".to_string()))
+    }
+}
+
+/// Dispatch PR #2 orchestrated browser tools (browser_input / browser_probe).
+///
+/// Unlike single-call browser tools, these run a multi-step pipeline inside
+/// the daemon: probe the target, run the pure `decide()` strategy function,
+/// execute the chosen plan via Actor methods, and verify the result. The
+/// WASM guest only sees one tool call return — the daemon expands it into
+/// the full orchestration internally.
+async fn execute_browser_input_orchestrated(
+    action: BrowserToolAction,
+    arguments: &serde_json::Value,
+    browser_ctx: &BrowserContext,
+) -> Result<String, String> {
+    use crate::agent::browser_input::bridge::RealBrowserBridge;
+    use crate::agent::browser_input::{run_browser_input, run_browser_probe, InputMode};
+    use std::sync::Arc;
+
+    // Wrap the BrowserContext in an Arc so RealBrowserBridge can hold onto
+    // it; the bridge only needs read access so a clone is sufficient.
+    let bridge = RealBrowserBridge::new(Arc::new(browser_ctx.clone()));
+
+    match action {
+        BrowserToolAction::Input => {
+            let selector = arguments
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "browser_input: selector required".to_string())?;
+            let text = arguments
+                .get("text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "browser_input: text required".to_string())?;
+            let mode = arguments
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .map(|s| {
+                    if s == "type" {
+                        InputMode::Type
+                    } else {
+                        InputMode::Fill
+                    }
+                })
+                .unwrap_or(InputMode::Fill);
+            let verify_enabled = arguments
+                .get("verify")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
+
+            let result =
+                run_browser_input(&bridge, selector, text, mode, tab_id, verify_enabled)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            Ok(serde_json::to_string(&result).unwrap_or_default())
+        }
+        BrowserToolAction::Probe => {
+            let selector = arguments
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "browser_probe: selector required".to_string())?;
+            let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
+
+            let fingerprint = run_browser_probe(&bridge, selector, tab_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(serde_json::to_string(&fingerprint).unwrap_or_default())
+        }
+        _ => unreachable!("execute_browser_input_orchestrated called with non-orchestrated action"),
     }
 }
 
