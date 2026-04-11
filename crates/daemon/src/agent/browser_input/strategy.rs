@@ -57,22 +57,87 @@ fn apply_recipe(recipe: &Recipe, input: &StrategyInput) -> Option<ExecutionPlan>
     Some(build_mention_sequence(input, mention_cfg, &regex))
 }
 
+/// Build the action sequence for a mention-containing text.
+///
+/// The algorithm walks `input.text` via the compiled regex and splits
+/// it into alternating literal-text and mention segments. Each
+/// mention expands into:
+///   Paste(mention)
+///   WaitFor(candidate_list_selector, timeout)
+///   SendKey("Enter")  or  Click(candidate_item_selector)
+///
+/// Empty prefix/suffix text segments are skipped to avoid
+/// redundant no-op Paste actions.
 fn build_mention_sequence(
     input: &StrategyInput,
-    _mention: &crate::agent::browser_input::platform_adapter::MentionConfig,
-    _regex: &regex::Regex,
+    mention: &crate::agent::browser_input::platform_adapter::MentionConfig,
+    regex: &regex::Regex,
 ) -> ExecutionPlan {
-    // Placeholder (Task 8 replaces this with the full sequence builder).
+    use crate::agent::browser_input::platform_adapter::ConfirmMethod;
+
     let target = input
         .fingerprint
         .innermost_editable_selector
         .as_deref()
         .unwrap_or(input.selector)
         .to_string();
-    ExecutionPlan::Sequence(vec![Action::Paste {
-        selector: target,
-        text: input.text.to_string(),
-    }])
+
+    let text = input.text;
+    let mut actions: Vec<Action> = Vec::new();
+    let mut last_end = 0usize;
+
+    for m in regex.find_iter(text) {
+        let prefix = &text[last_end..m.start()];
+        if !prefix.is_empty() {
+            actions.push(Action::Paste {
+                selector: target.clone(),
+                text: prefix.to_string(),
+            });
+        }
+
+        // Paste the raw mention token (e.g. "@nevoflux").
+        let mention_text = m.as_str().to_string();
+        actions.push(Action::Paste {
+            selector: target.clone(),
+            text: mention_text,
+        });
+
+        // Wait for the candidate list to appear.
+        actions.push(Action::WaitFor {
+            selector: mention.candidate_list_selector.clone(),
+            timeout_ms: mention.candidate_list_timeout_ms,
+        });
+
+        // Confirm per the recipe's confirm_method.
+        match mention.confirm_method {
+            ConfirmMethod::EnterKey => {
+                actions.push(Action::SendKey {
+                    key: "Enter".to_string(),
+                });
+            }
+            ConfirmMethod::ClickFirst => {
+                let selector = mention
+                    .candidate_item_selector
+                    .clone()
+                    .unwrap_or_else(|| {
+                        format!("{} :first-child", mention.candidate_list_selector)
+                    });
+                actions.push(Action::Click { selector });
+            }
+        }
+
+        last_end = m.end();
+    }
+
+    let suffix = &text[last_end..];
+    if !suffix.is_empty() {
+        actions.push(Action::Paste {
+            selector: target,
+            text: suffix.to_string(),
+        });
+    }
+
+    ExecutionPlan::Sequence(actions)
 }
 
 /// Pure strategy decision.
@@ -504,5 +569,216 @@ mod tests {
             decide(&input),
             ExecutionPlan::RichTextFill { .. }
         ));
+    }
+
+    // ===== Mention flow tests (Task 8) =====
+
+    use crate::agent::browser_input::platform_adapter::Recipe;
+
+    /// Build a minimal Recipe whose mention config matches x.com's
+    /// default, for use in strategy tests.
+    fn x_com_test_recipe() -> Recipe {
+        const YAML: &str = r#"
+name: x_com
+hostname_patterns: ["x.com"]
+version: 1
+compose:
+  selector: '[data-testid="tweetTextarea_0"]'
+submit:
+  selector: '[data-testid="tweetButtonInline"]'
+mention:
+  trigger_char: "@"
+  pattern: '@([A-Za-z0-9_]{1,15})'
+  candidate_list_selector: 'div[role="listbox"]'
+  candidate_list_timeout_ms: 2000
+  confirm_method: "enter_key"
+  pause_between_segments_ms: 150
+"#;
+        Recipe::from_yaml("<test>", YAML).unwrap()
+    }
+
+    #[test]
+    fn text_without_mention_falls_through_to_rich_text_fill() {
+        let fp = draft_js_fp();
+        let recipe = x_com_test_recipe();
+        let input = StrategyInput {
+            selector: "[data-testid='tweetTextarea_0']",
+            text: "Just a regular tweet",
+            mode: InputMode::Fill,
+            fingerprint: &fp,
+            hostname: "x.com",
+            adapter: Some(&recipe),
+        };
+        assert!(matches!(decide(&input), ExecutionPlan::RichTextFill { .. }));
+    }
+
+    #[test]
+    fn single_mention_produces_sequence_with_wait_and_enter() {
+        let fp = draft_js_fp();
+        let recipe = x_com_test_recipe();
+        let input = StrategyInput {
+            selector: "[data-testid='tweetTextarea_0']",
+            text: "Hi @nevoflux good morning",
+            mode: InputMode::Fill,
+            fingerprint: &fp,
+            hostname: "x.com",
+            adapter: Some(&recipe),
+        };
+        let plan = decide(&input);
+        let actions = match plan {
+            ExecutionPlan::Sequence(a) => a,
+            other => panic!("expected Sequence, got {:?}", other),
+        };
+
+        // Expected sequence (roughly):
+        //   Paste "Hi "           — prefix before the first mention
+        //   Paste "@nevoflux"     — the mention itself
+        //   WaitFor listbox
+        //   SendKey "Enter"
+        //   Paste " good morning" — suffix
+        assert_eq!(actions.len(), 5);
+
+        match &actions[0] {
+            Action::Paste { text, .. } => assert_eq!(text, "Hi "),
+            other => panic!("action 0: expected Paste, got {:?}", other),
+        }
+        match &actions[1] {
+            Action::Paste { text, .. } => assert_eq!(text, "@nevoflux"),
+            other => panic!("action 1: expected Paste, got {:?}", other),
+        }
+        match &actions[2] {
+            Action::WaitFor {
+                selector,
+                timeout_ms,
+            } => {
+                assert_eq!(selector, "div[role=\"listbox\"]");
+                assert_eq!(*timeout_ms, 2000);
+            }
+            other => panic!("action 2: expected WaitFor, got {:?}", other),
+        }
+        match &actions[3] {
+            Action::SendKey { key } => assert_eq!(key, "Enter"),
+            other => panic!("action 3: expected SendKey(Enter), got {:?}", other),
+        }
+        match &actions[4] {
+            Action::Paste { text, .. } => assert_eq!(text, " good morning"),
+            other => panic!("action 4: expected Paste, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn multiple_mentions_produces_segmented_sequence() {
+        let fp = draft_js_fp();
+        let recipe = x_com_test_recipe();
+        let input = StrategyInput {
+            selector: "[data-testid='tweetTextarea_0']",
+            text: "@alice and @bob say hi",
+            mode: InputMode::Fill,
+            fingerprint: &fp,
+            hostname: "x.com",
+            adapter: Some(&recipe),
+        };
+        let plan = decide(&input);
+        let actions = match plan {
+            ExecutionPlan::Sequence(a) => a,
+            other => panic!("expected Sequence, got {:?}", other),
+        };
+        // Pattern for two mentions with interstitial text:
+        //   Paste "@alice", WaitFor, SendKey Enter,
+        //   Paste " and ",
+        //   Paste "@bob",   WaitFor, SendKey Enter,
+        //   Paste " say hi"
+        assert_eq!(actions.len(), 8);
+
+        // Only assert on the high-signal landmarks; full shape is
+        // covered by the single-mention test.
+        let pastes: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Paste { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pastes, vec!["@alice", " and ", "@bob", " say hi"]);
+        let wait_count = actions
+            .iter()
+            .filter(|a| matches!(a, Action::WaitFor { .. }))
+            .count();
+        assert_eq!(wait_count, 2);
+        let enter_count = actions
+            .iter()
+            .filter(|a| matches!(a, Action::SendKey { key } if key == "Enter"))
+            .count();
+        assert_eq!(enter_count, 2);
+    }
+
+    #[test]
+    fn mention_at_start_has_no_empty_prefix_paste() {
+        let fp = draft_js_fp();
+        let recipe = x_com_test_recipe();
+        let input = StrategyInput {
+            selector: "[data-testid='tweetTextarea_0']",
+            text: "@nevoflux hi",
+            mode: InputMode::Fill,
+            fingerprint: &fp,
+            hostname: "x.com",
+            adapter: Some(&recipe),
+        };
+        if let ExecutionPlan::Sequence(actions) = decide(&input) {
+            // Should not have an empty Paste as the first action.
+            for a in &actions {
+                if let Action::Paste { text, .. } = a {
+                    assert!(!text.is_empty(), "no empty Paste allowed: {:?}", actions);
+                }
+            }
+            // First non-WaitFor action should be the mention.
+            match &actions[0] {
+                Action::Paste { text, .. } => assert_eq!(text, "@nevoflux"),
+                other => panic!("expected Paste @nevoflux, got {:?}", other),
+            }
+        } else {
+            panic!("expected Sequence");
+        }
+    }
+
+    #[test]
+    fn mention_uses_click_first_when_recipe_says_so() {
+        let fp = draft_js_fp();
+        let yaml = r##"
+name: click_first_site
+hostname_patterns: ["click.example"]
+version: 1
+compose: {selector: '#c'}
+submit: {selector: '#s'}
+mention:
+  trigger_char: "@"
+  pattern: '@([A-Za-z0-9_]+)'
+  candidate_list_selector: '.list'
+  candidate_list_timeout_ms: 1000
+  confirm_method: "click_first"
+  candidate_item_selector: '.list .option'
+"##;
+        let recipe = Recipe::from_yaml("<t>", yaml).unwrap();
+        let input = StrategyInput {
+            selector: "#c",
+            text: "Hello @bob",
+            mode: InputMode::Fill,
+            fingerprint: &fp,
+            hostname: "click.example",
+            adapter: Some(&recipe),
+        };
+        if let ExecutionPlan::Sequence(actions) = decide(&input) {
+            assert!(
+                actions.iter().any(|a| matches!(a, Action::Click { selector } if selector == ".list .option")),
+                "expected a Click action on the candidate_item_selector, got {:?}",
+                actions
+            );
+            // Should NOT contain a SendKey Enter when click_first is set.
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, Action::SendKey { key } if key == "Enter")));
+        } else {
+            panic!("expected Sequence");
+        }
     }
 }
