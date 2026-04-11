@@ -494,4 +494,42 @@ extra_field_that_does_not_exist: true
         reg.insert(Recipe::from_yaml("<t>", VALID_YAML).unwrap());
         assert_eq!(reg.len(), 1);
     }
+
+    #[test]
+    fn load_standard_user_dir_overrides_compiled_in() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("x_com.yaml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Same recipe name, but with a sentinel submit selector so
+        // we can tell the files apart.
+        let overriding = VALID_YAML.replace("name: test_site", "name: x_com").replace(
+            r#"selector: '[data-testid="submit"]'"#,
+            r#"selector: '#overridden-by-user'"#,
+        );
+        f.write_all(overriding.as_bytes()).unwrap();
+        drop(f);
+
+        let reg = AdapterRegistry::load_standard(Some(tmp.path()), None);
+        let r = reg
+            .lookup("example.com")
+            .expect("user-provided recipe should load");
+        assert_eq!(r.name, "x_com");
+        assert_eq!(r.submit.selector, "#overridden-by-user");
+
+        // The compiled-in x_com recipe should have been skipped
+        // because a recipe named "x_com" was already inserted.
+        // Therefore x.com (the compiled-in pattern) is NOT matched.
+        assert!(reg.lookup("x.com").is_none());
+    }
+
+    #[test]
+    fn load_standard_compiled_in_only_has_x_com() {
+        let reg = AdapterRegistry::load_standard(None, None);
+        assert!(!reg.is_empty());
+        assert!(reg.lookup("x.com").is_some());
+        assert!(reg.lookup("twitter.com").is_some());
+        assert!(reg.lookup("mobile.x.com").is_some());
+        assert!(reg.lookup("random.org").is_none());
+    }
 }
