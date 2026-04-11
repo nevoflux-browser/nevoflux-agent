@@ -22,6 +22,7 @@ pub mod error;
 pub mod executor;
 pub mod fingerprint;
 pub mod plan;
+pub mod platform_adapter;
 pub mod strategy;
 pub mod verifier;
 
@@ -29,6 +30,9 @@ pub use bridge::{BrowserBridge, RealBrowserBridge};
 pub use error::BrowserInputError;
 pub use fingerprint::{EditorFramework, Fingerprint};
 pub use plan::{Action, ExecutionPlan, InputMode};
+pub use platform_adapter::{
+    AdapterRegistry, ComposeConfig, MentionConfig, Recipe, SubmitConfig, UploadConfig,
+};
 pub use strategy::{decide, StrategyInput};
 pub use verifier::{verify, VerifyReport};
 
