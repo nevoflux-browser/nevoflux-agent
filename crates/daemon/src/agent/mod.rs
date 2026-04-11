@@ -2,6 +2,7 @@
 
 pub mod abi;
 pub mod auth;
+pub mod browser_input;
 pub mod code_mode;
 pub mod computer_tools;
 pub mod roles;

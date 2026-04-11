@@ -1014,6 +1014,13 @@ impl BrowserTool {
                 }
                 p
             }
+            BrowserToolAction::Probe
+            | BrowserToolAction::Input
+            | BrowserToolAction::Paste
+            | BrowserToolAction::FillRichText => {
+                // TODO: Implemented in Task 12 (browser_input orchestration)
+                serde_json::json!({})
+            }
         };
 
         (params, tab_id)
