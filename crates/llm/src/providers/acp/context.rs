@@ -29,19 +29,23 @@ pub fn compress_message(role: &str, content: &str) -> String {
             if content.len() <= 200 {
                 format!("[user] {}", content)
             } else {
-                format!("[user] {}...", &content[..200])
+                let end = content.floor_char_boundary(200);
+                format!("[user] {}...", &content[..end])
             }
         }
         "assistant" => {
             if content.len() <= 200 {
                 format!("[assistant] {}", content)
             } else {
-                let head = &content[..100];
-                // Tail: last 100 chars. Guard against non-char boundaries by
-                // working on byte length, which is safe for ASCII-dominated
-                // LLM output. For multibyte sequences we clamp to a char
-                // boundary using char_indices.
-                let tail_start = content.len().saturating_sub(100);
+                let head_end = content.floor_char_boundary(100);
+                let head = &content[..head_end];
+                // Tail: last ~100 bytes, clamped up to the next char boundary
+                // so multi-byte UTF-8 (CJK, emoji) is not split mid-character.
+                let tail_start_raw = content.len().saturating_sub(100);
+                let mut tail_start = tail_start_raw;
+                while tail_start < content.len() && !content.is_char_boundary(tail_start) {
+                    tail_start += 1;
+                }
                 let tail = &content[tail_start..];
                 format!("[assistant] {}...{}", head, tail)
             }
@@ -50,14 +54,16 @@ pub fn compress_message(role: &str, content: &str) -> String {
             if content.len() <= 80 {
                 format!("[tool: {}]", content)
             } else {
-                format!("[tool: {}...]", &content[..80])
+                let end = content.floor_char_boundary(80);
+                format!("[tool: {}...]", &content[..end])
             }
         }
         _ => {
             if content.len() <= 200 {
                 format!("[{}] {}", role, content)
             } else {
-                format!("[{}] {}...", role, &content[..200])
+                let end = content.floor_char_boundary(200);
+                format!("[{}] {}...", role, &content[..end])
             }
         }
     }
@@ -68,7 +74,8 @@ fn compress_message_short(role: &str, content: &str) -> String {
     if content.len() <= 80 {
         format!("[{}] {}", role, content)
     } else {
-        format!("[{}] {}...", role, &content[..80])
+        let end = content.floor_char_boundary(80);
+        format!("[{}] {}...", role, &content[..end])
     }
 }
 
@@ -331,5 +338,37 @@ mod tests {
         // compressed output is substantially smaller than the original.
         let original: String = messages.iter().map(|(r, c)| format_msg(r, c)).collect();
         assert!(result.len() < original.len());
+    }
+
+    #[test]
+    fn compress_message_user_chinese_does_not_panic() {
+        let content = "你".repeat(500); // 500 chinese chars = 1500 bytes
+        let _r = compress_message("user", &content);
+    }
+
+    #[test]
+    fn compress_message_assistant_chinese_does_not_panic() {
+        let content = "测试".repeat(500);
+        let _r = compress_message("assistant", &content);
+    }
+
+    #[test]
+    fn compress_message_tool_chinese_does_not_panic() {
+        let content = "工具输出".repeat(100);
+        let _r = compress_message("tool", &content);
+    }
+
+    #[test]
+    fn compress_message_emoji_does_not_panic() {
+        let content = "🎉".repeat(200); // 4-byte emoji
+        let _r = compress_message("user", &content);
+        let _r = compress_message("assistant", &content);
+        let _r = compress_message("tool", &content);
+    }
+
+    #[test]
+    fn compress_message_short_chinese_does_not_panic() {
+        let content = "短消息".repeat(200);
+        let _r = compress_message_short("user", &content);
     }
 }

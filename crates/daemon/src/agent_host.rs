@@ -295,11 +295,7 @@ impl DaemonHostFunctions {
     ///
     /// Returns `Some(existing_id)` if a match with cosine similarity > 0.92 is found.
     /// Falls back to `None` if embedding provider is unavailable or on error.
-    fn find_similar_hot_knowledge(
-        &self,
-        services: &HostServices,
-        content: &str,
-    ) -> Option<String> {
+    fn find_similar_hot_knowledge(&self, services: &HostServices, content: &str) -> Option<String> {
         let provider = crate::wasm::services::get_embedding(&services.embedding)?;
         let runtime = self.runtime.clone();
         let content_owned = content.to_string();
@@ -1826,8 +1822,7 @@ impl HostFunctions for DaemonHostFunctions {
         // Route to the correct table based on ID prefix
         if id.starts_with("K-") {
             // Knowledge table entry
-            let knowledge_repo =
-                nevoflux_storage::KnowledgeRepository::new(&services.database);
+            let knowledge_repo = nevoflux_storage::KnowledgeRepository::new(&services.database);
             let summary = if content.len() > 120 {
                 let boundary = content.floor_char_boundary(117);
                 format!("{}...", &content[..boundary])
@@ -1953,9 +1948,7 @@ impl HostFunctions for DaemonHostFunctions {
         let start = std::time::Instant::now();
 
         // 0. Dedup: check if similar hot knowledge already exists
-        if let Some(existing_id) =
-            self.find_similar_hot_knowledge(services, details)
-        {
+        if let Some(existing_id) = self.find_similar_hot_knowledge(services, details) {
             debug!(
                 "knowledge_teach: skipping duplicate, similar to {}",
                 existing_id
@@ -2492,8 +2485,10 @@ impl HostFunctions for DaemonHostFunctions {
                 let mut truncated = false;
                 let stdout = if raw_stdout.len() > max_bytes {
                     truncated = true;
-                    // Find the last newline within max_bytes to avoid cutting mid-line
-                    let truncated_str = &raw_stdout[..max_bytes];
+                    // Clamp to char boundary to avoid panicking on multi-byte UTF-8
+                    let safe_end = raw_stdout.floor_char_boundary(max_bytes);
+                    // Find the last newline within safe_end to avoid cutting mid-line
+                    let truncated_str = &raw_stdout[..safe_end];
                     match truncated_str.rfind('\n') {
                         Some(pos) => truncated_str[..pos].to_string(),
                         None => truncated_str.to_string(),

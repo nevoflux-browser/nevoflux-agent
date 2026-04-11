@@ -115,30 +115,25 @@ pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
             format!("Click on element '{}'", target)
         }
         "browser_type" | "browser_type_by_id" => {
-            let text = args
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or(raw);
-            let short_text = if text.len() > 50 { &text[..50] } else { text };
+            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or(raw);
+            let short_text = if text.len() > 50 {
+                &text[..text.floor_char_boundary(50)]
+            } else {
+                text
+            };
             format!("Type text: \"{}\"", short_text)
         }
         "browser_fill" | "browser_fill_by_id" => {
-            let value = args
-                .get("value")
-                .and_then(|v| v.as_str())
-                .unwrap_or(raw);
+            let value = args.get("value").and_then(|v| v.as_str()).unwrap_or(raw);
             let short_val = if value.len() > 50 {
-                &value[..50]
+                &value[..value.floor_char_boundary(50)]
             } else {
                 value
             };
             format!("Fill a form field with: \"{}\"", short_val)
         }
         "browser_key_press" => {
-            let key = args
-                .get("key")
-                .and_then(|v| v.as_str())
-                .unwrap_or(raw);
+            let key = args.get("key").and_then(|v| v.as_str()).unwrap_or(raw);
             format!("Press key: {}", key)
         }
         "browser_eval_js" => "Execute JavaScript code on the current page".to_string(),
@@ -161,25 +156,20 @@ pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
             "computer_mouse_up" => "Release mouse button".to_string(),
             "computer_mouse_drag" | "computer_drag" => "Drag with the mouse".to_string(),
             "computer_type_text" => {
-                let text = args
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(raw);
-                let short = if text.len() > 50 { &text[..50] } else { text };
+                let text = args.get("text").and_then(|v| v.as_str()).unwrap_or(raw);
+                let short = if text.len() > 50 {
+                    &text[..text.floor_char_boundary(50)]
+                } else {
+                    text
+                };
                 format!("Type on keyboard: \"{}\"", short)
             }
             "computer_key_press" | "computer_key" => {
-                let key = args
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(raw);
+                let key = args.get("key").and_then(|v| v.as_str()).unwrap_or(raw);
                 format!("Press keyboard key: {}", key)
             }
             "computer_hold_key" => {
-                let key = args
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(raw);
+                let key = args.get("key").and_then(|v| v.as_str()).unwrap_or(raw);
                 format!("Hold keyboard key: {}", key)
             }
             _ => format!(
@@ -196,35 +186,31 @@ pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
 
         // File operations
         "write_file" => {
-            let path = args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(raw);
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(raw);
             format!("Write to file: {}", path)
         }
         "edit_file" => {
-            let path = args
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(raw);
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(raw);
             format!("Edit file: {}", path)
         }
         "run_command" => {
-            let cmd = args
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or(raw);
-            let short = if cmd.len() > 80 { &cmd[..80] } else { cmd };
+            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or(raw);
+            let short = if cmd.len() > 80 {
+                &cmd[..cmd.floor_char_boundary(80)]
+            } else {
+                cmd
+            };
             format!("Run command: {}", short)
         }
 
         // Subagent
         "subagent_spawn" => {
-            let task = args
-                .get("task")
-                .and_then(|v| v.as_str())
-                .unwrap_or(raw);
-            let short = if task.len() > 80 { &task[..80] } else { task };
+            let task = args.get("task").and_then(|v| v.as_str()).unwrap_or(raw);
+            let short = if task.len() > 80 {
+                &task[..task.floor_char_boundary(80)]
+            } else {
+                task
+            };
             format!("Start a sub-agent: \"{}\"", short)
         }
 
@@ -846,9 +832,7 @@ fn execute_memory_create(
             existing_id = %existing_id,
             "memory_create: skipping duplicate"
         );
-        return Ok(
-            serde_json::json!({"id": existing_id, "status": "already_exists"}).to_string(),
-        );
+        return Ok(serde_json::json!({"id": existing_id, "status": "already_exists"}).to_string());
     }
 
     let summary = if content.len() > 120 {
@@ -1586,5 +1570,48 @@ mod tests {
             &bridge,
         ));
         assert_eq!(result, Err("browser not available".to_string()));
+    }
+
+    #[test]
+    fn browser_fill_with_long_chinese_text_does_not_panic() {
+        // This is the exact tweet that caused the production panic
+        let value = "Anthropic 封禁 OpenClaw 的 API key，连 e2e 测试都不放过。AI 公司一边鼓励开发者构建 agent 生态，一边收紧 API 权限——这种矛盾迟早会反噬。开源和本地化才是出路。";
+        let args = serde_json::json!({ "element_id": "e0", "value": value });
+        let _desc = describe_tool_action("browser_fill_by_id", &args.to_string());
+    }
+
+    #[test]
+    fn browser_type_with_long_chinese_text_does_not_panic() {
+        let text = "你好世界，这是一段测试用的长中文文本，用来验证字符串截断不会崩溃。".repeat(3);
+        let args = serde_json::json!({ "element_id": "e0", "text": text });
+        let _desc = describe_tool_action("browser_type_by_id", &args.to_string());
+    }
+
+    #[test]
+    fn browser_fill_with_emoji_does_not_panic() {
+        let value = "Hello 👋🌍 from NevoFlux 🚀! This has emojis 🎉🎊 that are 4-byte UTF-8 characters.";
+        let args = serde_json::json!({ "element_id": "e0", "value": value });
+        let _desc = describe_tool_action("browser_fill_by_id", &args.to_string());
+    }
+
+    #[test]
+    fn run_command_with_chinese_does_not_panic() {
+        let cmd = "echo '这是一个很长的中文命令，长度超过八十字节限制，用来触发 truncation 代码路径'";
+        let args = serde_json::json!({ "command": cmd });
+        let _desc = describe_tool_action("run_command", &args.to_string());
+    }
+
+    #[test]
+    fn subagent_spawn_with_chinese_task_does_not_panic() {
+        let task = "请帮我分析这个超长的中文任务描述，看看截断逻辑是否会因为多字节字符而崩溃。".repeat(2);
+        let args = serde_json::json!({ "task": task });
+        let _desc = describe_tool_action("subagent_spawn", &args.to_string());
+    }
+
+    #[test]
+    fn computer_type_text_with_chinese_does_not_panic() {
+        let text = "键盘输入测试：这段文本超过 50 字节，应该被安全截断。";
+        let args = serde_json::json!({ "text": text });
+        let _desc = describe_tool_action("computer_type_text", &args.to_string());
     }
 }

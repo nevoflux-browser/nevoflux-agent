@@ -699,7 +699,8 @@ impl ToolExecutor for RunCommandTool {
 
         if output.status.success() {
             let result = if stdout.len() > max_size {
-                format!("{}... (truncated)", &stdout[..max_size])
+                let safe_end = stdout.as_ref().floor_char_boundary(max_size);
+                format!("{}... (truncated)", &stdout[..safe_end])
             } else {
                 stdout.to_string()
             };
@@ -711,7 +712,8 @@ impl ToolExecutor for RunCommandTool {
                     output.status.code().unwrap_or(-1)
                 )
             } else if stderr.len() > max_size {
-                format!("{}... (truncated)", &stderr[..max_size])
+                let safe_end = stderr.as_ref().floor_char_boundary(max_size);
+                format!("{}... (truncated)", &stderr[..safe_end])
             } else {
                 stderr.to_string()
             };
