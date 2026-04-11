@@ -69,6 +69,11 @@ pub async fn run_browser_input(
     tab_id: Option<i64>,
     verify_enabled: bool,
 ) -> Result<BrowserInputResult, BrowserInputError> {
+    // Step 0: resolve hostname via ListTabs so we can look up a
+    // matching platform adapter recipe. Failures fall back to an
+    // empty hostname, which means no adapter is selected.
+    let hostname = resolve_hostname(bridge, tab_id).await;
+
     // Step 1: probe
     let probe_response = bridge
         .call_action(
@@ -95,8 +100,8 @@ pub async fn run_browser_input(
         text,
         mode,
         fingerprint: &fingerprint,
-        hostname: "",  // PR #3 fills this in via tab_id lookup
-        adapter: None, // PR #3 registers recipes
+        hostname: &hostname,
+        adapter: None, // Task 10 wires the real lookup
     };
     let plan = decide(&strategy_input);
 
@@ -173,6 +178,91 @@ fn framework_name(framework: EditorFramework) -> String {
         EditorFramework::Quill => "quill".into(),
         EditorFramework::TinyMce => "tinymce".into(),
         EditorFramework::Unknown => "unknown".into(),
+    }
+}
+
+/// Look up the hostname for the given tab (or the active tab) via
+/// a `ListTabs` bridge call. Returns an empty string on any error —
+/// the strategy engine then treats the page as having no adapter.
+async fn resolve_hostname(bridge: &dyn BrowserBridge, tab_id: Option<i64>) -> String {
+    let response = match bridge
+        .call_action(BrowserToolAction::ListTabs, json!({}), None)
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+
+    let tabs = response
+        .get("tabs")
+        .or_else(|| response.get("result").and_then(|r| r.get("tabs")))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let tab = match tab_id {
+        Some(id) => tabs
+            .into_iter()
+            .find(|t| t.get("id").and_then(|v| v.as_i64()) == Some(id)),
+        None => tabs
+            .into_iter()
+            .find(|t| t.get("active").and_then(|v| v.as_bool()).unwrap_or(false)),
+    };
+
+    let url = tab
+        .as_ref()
+        .and_then(|t| t.get("url"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    parse_hostname(url)
+}
+
+/// Tiny hostname extractor. Accepts inputs like:
+///   "https://x.com/home" → "x.com"
+///   "https://mobile.x.com:443/path" → "mobile.x.com"
+///   "about:blank" → ""
+fn parse_hostname(url: &str) -> String {
+    let after_scheme = match url.find("://") {
+        Some(i) => &url[i + 3..],
+        None => return String::new(),
+    };
+    let end = after_scheme
+        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .unwrap_or(after_scheme.len());
+    let host_port = &after_scheme[..end];
+    // Strip :port if present; browser URLs won't include IPv6 brackets.
+    match host_port.rsplit_once(':') {
+        Some((host, _port)) if !host.is_empty() => host.to_string(),
+        _ => host_port.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod hostname_parser_tests {
+    use super::parse_hostname;
+
+    #[test]
+    fn plain_host() {
+        assert_eq!(parse_hostname("https://x.com/home"), "x.com");
+    }
+
+    #[test]
+    fn subdomain_with_port() {
+        assert_eq!(
+            parse_hostname("https://mobile.x.com:443/path"),
+            "mobile.x.com"
+        );
+    }
+
+    #[test]
+    fn empty_on_non_url() {
+        assert_eq!(parse_hostname("about:blank"), "");
+    }
+
+    #[test]
+    fn http_scheme() {
+        assert_eq!(parse_hostname("http://example.com"), "example.com");
     }
 }
 
@@ -258,9 +348,16 @@ mod tests {
         })
     }
 
+    /// Canned response for the ListTabs call that `run_browser_input`
+    /// now makes before probing.
+    fn empty_tabs_response() -> Value {
+        json!({ "tabs": [] })
+    }
+
     #[tokio::test]
     async fn run_browser_input_standard_input_fill_path() {
         let bridge = SeqBridge::new(vec![
+            Ok(empty_tabs_response()),        // hostname resolve
             Ok(standard_input_probe_value()), // probe
             Ok(json!({"success": true})),     // execute (Fill)
             Ok(json!({"text": "Hello"})),     // verify (GetContent)
@@ -283,17 +380,19 @@ mod tests {
         assert!(result.verify.is_some());
         assert!(result.verify.as_ref().unwrap().matched);
 
-        // 3 bridge calls expected: probe, Fill, GetContent
+        // 4 bridge calls expected: ListTabs, Probe, Fill, GetContent
         let calls = bridge.calls.lock().unwrap();
-        assert_eq!(calls.len(), 3);
-        assert!(matches!(calls[0].0, BrowserToolAction::Probe));
-        assert!(matches!(calls[1].0, BrowserToolAction::Fill));
-        assert!(matches!(calls[2].0, BrowserToolAction::GetContent));
+        assert_eq!(calls.len(), 4);
+        assert!(matches!(calls[0].0, BrowserToolAction::ListTabs));
+        assert!(matches!(calls[1].0, BrowserToolAction::Probe));
+        assert!(matches!(calls[2].0, BrowserToolAction::Fill));
+        assert!(matches!(calls[3].0, BrowserToolAction::GetContent));
     }
 
     #[tokio::test]
     async fn run_browser_input_draft_js_fill_path() {
         let bridge = SeqBridge::new(vec![
+            Ok(empty_tabs_response()),          // hostname resolve
             Ok(draft_js_probe_value()),         // probe
             Ok(json!({"success": true})),       // execute (FillRichText)
             Ok(json!({"text": "Hello Draft"})), // verify
@@ -315,10 +414,10 @@ mod tests {
         assert_eq!(result.framework_detected.as_deref(), Some("draft.js"));
 
         let calls = bridge.calls.lock().unwrap();
-        assert!(matches!(calls[1].0, BrowserToolAction::FillRichText));
+        assert!(matches!(calls[2].0, BrowserToolAction::FillRichText));
         // The innermost selector should have been used, not the caller one
         assert_eq!(
-            calls[1].1["selector"],
+            calls[2].1["selector"],
             serde_json::Value::String("div.public-DraftEditor-content".into())
         );
     }
@@ -326,6 +425,7 @@ mod tests {
     #[tokio::test]
     async fn run_browser_input_verify_disabled_skips_get_content() {
         let bridge = SeqBridge::new(vec![
+            Ok(empty_tabs_response()),
             Ok(standard_input_probe_value()),
             Ok(json!({"success": true})),
         ]);
@@ -338,14 +438,17 @@ mod tests {
         assert!(result.verify.is_none());
 
         let calls = bridge.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2); // probe + Fill only
+        assert_eq!(calls.len(), 3); // ListTabs + probe + Fill only
     }
 
     #[tokio::test]
     async fn run_browser_input_probe_failure_surfaces_error() {
-        let bridge = SeqBridge::new(vec![Err(BrowserInputError::ElementNotFound {
-            selector: "#missing".into(),
-        })]);
+        let bridge = SeqBridge::new(vec![
+            Ok(empty_tabs_response()),
+            Err(BrowserInputError::ElementNotFound {
+                selector: "#missing".into(),
+            }),
+        ]);
 
         let err = run_browser_input(&bridge, "#missing", "Hello", InputMode::Fill, None, true)
             .await
