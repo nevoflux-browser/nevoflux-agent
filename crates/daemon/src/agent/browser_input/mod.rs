@@ -492,4 +492,109 @@ mod tests {
         assert!(fp.is_content_editable);
         assert_eq!(fp.editor_framework, Some(EditorFramework::DraftJs));
     }
+
+    // ===== Task 12: end-to-end integration through the bridge =====
+
+    #[tokio::test]
+    async fn run_browser_input_x_com_mention_flow() {
+        // Build a registry from the compiled-in recipe only.
+        let registry = AdapterRegistry::load_standard(None, None);
+        assert!(
+            registry.lookup("x.com").is_some(),
+            "x_com recipe must be loaded"
+        );
+
+        // Canned responses, in call order:
+        //   1. ListTabs        → active tab on x.com
+        //   2. Probe           → Draft.js fingerprint
+        //   3. Paste "Hello "  (prefix)
+        //   4. Paste "@nevoflux"
+        //   5. WaitFor listbox
+        //   6. KeyPress Enter
+        //   7. Paste " welcome" (suffix)
+        //   8. GetContent      → verify
+        let bridge = SeqBridge::new(vec![
+            Ok(json!({
+                "tabs": [{ "id": 1, "url": "https://x.com/home", "active": true }]
+            })),
+            Ok(draft_js_probe_value()),
+            Ok(json!({"success": true})),
+            Ok(json!({"success": true})),
+            Ok(json!({"success": true})),
+            Ok(json!({"success": true})),
+            Ok(json!({"success": true})),
+            Ok(json!({"text": "Hello @nevoflux welcome"})),
+        ]);
+
+        let result = run_browser_input(
+            &bridge,
+            &registry,
+            "[data-testid='tweetTextarea_0']",
+            "Hello @nevoflux welcome",
+            InputMode::Fill,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.strategy_used, "sequence");
+        assert_eq!(result.framework_detected.as_deref(), Some("draft.js"));
+
+        let calls = bridge.calls.lock().unwrap();
+        let action_names: Vec<_> = calls.iter().map(|(a, _)| format!("{:?}", a)).collect();
+        // Expected: ListTabs, Probe, Paste, Paste, WaitFor, KeyPress, Paste, GetContent
+        assert_eq!(
+            calls.len(),
+            8,
+            "unexpected call sequence: {:?}",
+            action_names
+        );
+        assert!(matches!(calls[0].0, BrowserToolAction::ListTabs));
+        assert!(matches!(calls[1].0, BrowserToolAction::Probe));
+        assert!(matches!(calls[2].0, BrowserToolAction::Paste));
+        assert!(matches!(calls[3].0, BrowserToolAction::Paste));
+        assert!(matches!(calls[4].0, BrowserToolAction::WaitFor));
+        assert!(matches!(calls[5].0, BrowserToolAction::KeyPress));
+        assert!(matches!(calls[6].0, BrowserToolAction::Paste));
+        assert!(matches!(calls[7].0, BrowserToolAction::GetContent));
+
+        // Each Paste targets the innermost editable selector from the fp.
+        for i in [2usize, 3, 6] {
+            assert_eq!(
+                calls[i].1["selector"],
+                serde_json::Value::String("div.public-DraftEditor-content".into())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_browser_input_no_mention_uses_rich_text_fill_on_x_com() {
+        let registry = AdapterRegistry::load_standard(None, None);
+        let bridge = SeqBridge::new(vec![
+            Ok(json!({
+                "tabs": [{ "id": 1, "url": "https://x.com/home", "active": true }]
+            })),
+            Ok(draft_js_probe_value()),
+            Ok(json!({"success": true})),
+            Ok(json!({"text": "Just a regular tweet"})),
+        ]);
+
+        let result = run_browser_input(
+            &bridge,
+            &registry,
+            "[data-testid='tweetTextarea_0']",
+            "Just a regular tweet",
+            InputMode::Fill,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.strategy_used, "rich_text_fill");
+        let calls = bridge.calls.lock().unwrap();
+        assert_eq!(calls.len(), 4); // ListTabs, Probe, FillRichText, GetContent
+        assert!(matches!(calls[2].0, BrowserToolAction::FillRichText));
+    }
 }
