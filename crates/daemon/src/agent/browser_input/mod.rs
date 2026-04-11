@@ -63,6 +63,7 @@ pub struct BrowserInputResult {
 /// 5. Return a BrowserInputResult with everything the LLM needs.
 pub async fn run_browser_input(
     bridge: &dyn BrowserBridge,
+    adapter_registry: &AdapterRegistry,
     selector: &str,
     text: &str,
     mode: InputMode,
@@ -73,6 +74,7 @@ pub async fn run_browser_input(
     // matching platform adapter recipe. Failures fall back to an
     // empty hostname, which means no adapter is selected.
     let hostname = resolve_hostname(bridge, tab_id).await;
+    let adapter = adapter_registry.lookup(&hostname);
 
     // Step 1: probe
     let probe_response = bridge
@@ -101,7 +103,7 @@ pub async fn run_browser_input(
         mode,
         fingerprint: &fingerprint,
         hostname: &hostname,
-        adapter: None, // Task 10 wires the real lookup
+        adapter,
     };
     let plan = decide(&strategy_input);
 
@@ -273,6 +275,10 @@ mod tests {
     use serde_json::Value;
     use std::sync::Mutex;
 
+    fn empty_registry() -> AdapterRegistry {
+        AdapterRegistry::new()
+    }
+
     /// Multi-response fake that pops responses from a FIFO queue,
     /// allowing distinct answers for probe vs execute vs verify.
     struct SeqBridge {
@@ -363,8 +369,10 @@ mod tests {
             Ok(json!({"text": "Hello"})),     // verify (GetContent)
         ]);
 
+        let registry = empty_registry();
         let result = run_browser_input(
             &bridge,
+            &registry,
             "#tgt",
             "Hello",
             InputMode::Fill,
@@ -398,8 +406,10 @@ mod tests {
             Ok(json!({"text": "Hello Draft"})), // verify
         ]);
 
+        let registry = empty_registry();
         let result = run_browser_input(
             &bridge,
+            &registry,
             "[data-testid='tweetTextarea_0']",
             "Hello Draft",
             InputMode::Fill,
@@ -430,9 +440,18 @@ mod tests {
             Ok(json!({"success": true})),
         ]);
 
-        let result = run_browser_input(&bridge, "#tgt", "Hello", InputMode::Fill, Some(1), false)
-            .await
-            .unwrap();
+        let registry = empty_registry();
+        let result = run_browser_input(
+            &bridge,
+            &registry,
+            "#tgt",
+            "Hello",
+            InputMode::Fill,
+            Some(1),
+            false,
+        )
+        .await
+        .unwrap();
 
         assert!(result.success);
         assert!(result.verify.is_none());
@@ -450,9 +469,18 @@ mod tests {
             }),
         ]);
 
-        let err = run_browser_input(&bridge, "#missing", "Hello", InputMode::Fill, None, true)
-            .await
-            .unwrap_err();
+        let registry = empty_registry();
+        let err = run_browser_input(
+            &bridge,
+            &registry,
+            "#missing",
+            "Hello",
+            InputMode::Fill,
+            None,
+            true,
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(err, BrowserInputError::ElementNotFound { .. }));
     }

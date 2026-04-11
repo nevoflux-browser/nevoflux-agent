@@ -1150,10 +1150,20 @@ impl BrowserTool {
             .unwrap_or(true);
         let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
 
+        let adapter_registry =
+            crate::agent::browser_input::AdapterRegistry::load_standard(None, None);
         let bridge = RealBrowserBridge::new(self.ctx.clone());
-        let result = run_browser_input(&bridge, selector, text, mode, tab_id, verify_enabled)
-            .await
-            .map_err(|e| DaemonError::InternalError(e.to_string()))?;
+        let result = run_browser_input(
+            &bridge,
+            &adapter_registry,
+            selector,
+            text,
+            mode,
+            tab_id,
+            verify_enabled,
+        )
+        .await
+        .map_err(|e| DaemonError::InternalError(e.to_string()))?;
 
         Ok(serde_json::to_string(&result).unwrap_or_else(|_| "{\"success\":true}".to_string()))
     }

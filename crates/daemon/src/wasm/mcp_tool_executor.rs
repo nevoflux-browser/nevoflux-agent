@@ -505,10 +505,19 @@ pub async fn execute_browser_input_orchestrated(
                 .unwrap_or(true);
             let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
 
-            let result =
-                run_browser_input(&bridge, selector, text, mode, tab_id, verify_enabled)
-                    .await
-                    .map_err(|e| e.to_string())?;
+            let adapter_registry =
+                crate::agent::browser_input::AdapterRegistry::load_standard(None, None);
+            let result = run_browser_input(
+                &bridge,
+                &adapter_registry,
+                selector,
+                text,
+                mode,
+                tab_id,
+                verify_enabled,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
             Ok(serde_json::to_string(&result).unwrap_or_default())
         }
         BrowserToolAction::Probe => {
