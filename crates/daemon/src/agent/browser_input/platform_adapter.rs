@@ -503,10 +503,12 @@ extra_field_that_does_not_exist: true
         let mut f = std::fs::File::create(&path).unwrap();
         // Same recipe name, but with a sentinel submit selector so
         // we can tell the files apart.
-        let overriding = VALID_YAML.replace("name: test_site", "name: x_com").replace(
-            r#"selector: '[data-testid="submit"]'"#,
-            r#"selector: '#overridden-by-user'"#,
-        );
+        let overriding = VALID_YAML
+            .replace("name: test_site", "name: x_com")
+            .replace(
+                r#"selector: '[data-testid="submit"]'"#,
+                r#"selector: '#overridden-by-user'"#,
+            );
         f.write_all(overriding.as_bytes()).unwrap();
         drop(f);
 

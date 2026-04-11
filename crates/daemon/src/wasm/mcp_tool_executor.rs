@@ -396,10 +396,7 @@ async fn execute_browser_tool(
     // the standard single-call dispatch. These run multi-step pipelines in the
     // daemon (probe → decide → execute → verify) rather than forwarding a
     // single request to the browser extension.
-    if matches!(
-        action,
-        BrowserToolAction::Input | BrowserToolAction::Probe
-    ) {
+    if matches!(action, BrowserToolAction::Input | BrowserToolAction::Probe) {
         return execute_browser_input_orchestrated(action, arguments, browser_ctx).await;
     }
 

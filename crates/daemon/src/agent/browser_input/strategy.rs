@@ -119,9 +119,7 @@ fn build_mention_sequence(
                 let selector = mention
                     .candidate_item_selector
                     .clone()
-                    .unwrap_or_else(|| {
-                        format!("{} :first-child", mention.candidate_list_selector)
-                    });
+                    .unwrap_or_else(|| format!("{} :first-child", mention.candidate_list_selector));
                 actions.push(Action::Click { selector });
             }
         }
@@ -565,10 +563,7 @@ mod tests {
             hostname: "x.com",
             adapter: None,
         };
-        assert!(matches!(
-            decide(&input),
-            ExecutionPlan::RichTextFill { .. }
-        ));
+        assert!(matches!(decide(&input), ExecutionPlan::RichTextFill { .. }));
     }
 
     // ===== Mention flow tests (Task 8) =====
@@ -769,7 +764,9 @@ mention:
         };
         if let ExecutionPlan::Sequence(actions) = decide(&input) {
             assert!(
-                actions.iter().any(|a| matches!(a, Action::Click { selector } if selector == ".list .option")),
+                actions.iter().any(
+                    |a| matches!(a, Action::Click { selector } if selector == ".list .option")
+                ),
                 "expected a Click action on the candidate_item_selector, got {:?}",
                 actions
             );
