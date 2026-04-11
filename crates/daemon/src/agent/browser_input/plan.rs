@@ -10,10 +10,13 @@
 //! `ExecutionPlan`, only leaf `Action`s — to keep the executor simple
 //! and plans easy to snapshot-test.
 
+use serde::Serialize;
+
 /// Semantic mode of a browser_input call.
 ///
 /// Matches the `mode` string parameter of the LLM tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InputMode {
     /// Replace existing content (like `browser_fill_by_id`).
     Fill,

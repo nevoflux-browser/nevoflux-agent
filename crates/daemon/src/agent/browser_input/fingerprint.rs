@@ -8,10 +8,10 @@
 //! section 5.2 and the Actor code at
 //! `src/nevoflux/engine-overlays/browser/actors/NevofluxChild.sys.mjs::probe()`.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Rich text editor framework detected by ancestor CSS pattern matching.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EditorFramework {
     #[serde(rename = "draft.js")]
@@ -36,7 +36,7 @@ pub enum EditorFramework {
 ///
 /// All fields are strictly mirrored from the JS implementation at
 /// `NevofluxChild.sys.mjs::probe()`. The spec table is in section 5.2.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Fingerprint {
     pub tag: String,
 

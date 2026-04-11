@@ -9,6 +9,7 @@
 //! Returns a VerifyReport with a match boolean and diagnostic causes.
 
 use nevoflux_protocol::BrowserToolAction;
+use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::agent::browser_input::bridge::BrowserBridge;
@@ -16,7 +17,7 @@ use crate::agent::browser_input::error::BrowserInputError;
 use crate::agent::browser_input::plan::InputMode;
 
 /// Report produced by `verify()`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct VerifyReport {
     pub matched: bool,
     pub expected_text: String,
