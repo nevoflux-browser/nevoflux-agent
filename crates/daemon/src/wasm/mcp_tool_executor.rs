@@ -1589,21 +1589,24 @@ mod tests {
 
     #[test]
     fn browser_fill_with_emoji_does_not_panic() {
-        let value = "Hello 👋🌍 from NevoFlux 🚀! This has emojis 🎉🎊 that are 4-byte UTF-8 characters.";
+        let value =
+            "Hello 👋🌍 from NevoFlux 🚀! This has emojis 🎉🎊 that are 4-byte UTF-8 characters.";
         let args = serde_json::json!({ "element_id": "e0", "value": value });
         let _desc = describe_tool_action("browser_fill_by_id", &args.to_string());
     }
 
     #[test]
     fn run_command_with_chinese_does_not_panic() {
-        let cmd = "echo '这是一个很长的中文命令，长度超过八十字节限制，用来触发 truncation 代码路径'";
+        let cmd =
+            "echo '这是一个很长的中文命令，长度超过八十字节限制，用来触发 truncation 代码路径'";
         let args = serde_json::json!({ "command": cmd });
         let _desc = describe_tool_action("run_command", &args.to_string());
     }
 
     #[test]
     fn subagent_spawn_with_chinese_task_does_not_panic() {
-        let task = "请帮我分析这个超长的中文任务描述，看看截断逻辑是否会因为多字节字符而崩溃。".repeat(2);
+        let task =
+            "请帮我分析这个超长的中文任务描述，看看截断逻辑是否会因为多字节字符而崩溃。".repeat(2);
         let args = serde_json::json!({ "task": task });
         let _desc = describe_tool_action("subagent_spawn", &args.to_string());
     }

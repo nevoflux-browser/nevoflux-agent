@@ -61,7 +61,9 @@ impl TraceCollector {
             Ok(id) => {
                 tracing::debug!(
                     "Trace span written: id={}, tool={}, success={}",
-                    id, tool_name, success
+                    id,
+                    tool_name,
+                    success
                 );
             }
             Err(e) => {

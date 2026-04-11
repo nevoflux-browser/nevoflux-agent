@@ -1923,10 +1923,8 @@ async fn stream_qwen(
             "assistant" => qwen_messages.push(QwenMessage::assistant(&msg.content)),
             "system" => qwen_messages.push(QwenMessage::system(&msg.content)),
             "tool" => {
-                let tool_msg = QwenMessage::tool(
-                    msg.tool_call_id.as_deref().unwrap_or(""),
-                    &msg.content,
-                );
+                let tool_msg =
+                    QwenMessage::tool(msg.tool_call_id.as_deref().unwrap_or(""), &msg.content);
                 qwen_messages.push(tool_msg);
             }
             _ => qwen_messages.push(QwenMessage::user(&msg.content)),
@@ -2033,13 +2031,13 @@ async fn stream_qwen(
                     if let Some(tool_calls) = delta["tool_calls"].as_array() {
                         for tc in tool_calls {
                             let index = tc["index"].as_i64().unwrap_or(0);
-                            let entry = accumulated_tool_calls
-                                .entry(index)
-                                .or_insert_with(|| ToolCallAccum {
+                            let entry = accumulated_tool_calls.entry(index).or_insert_with(|| {
+                                ToolCallAccum {
                                     id: String::new(),
                                     name: String::new(),
                                     arguments: String::new(),
-                                });
+                                }
+                            });
 
                             if let Some(id) = tc["id"].as_str() {
                                 entry.id = id.to_string();

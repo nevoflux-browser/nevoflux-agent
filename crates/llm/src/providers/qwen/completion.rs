@@ -472,7 +472,12 @@ impl completion::CompletionModel for QwenCompletionModel {
             request["max_tokens"] = json!(max);
         }
         if !completion_request.tools.is_empty() {
-            request["tools"] = json!(completion_request.tools.iter().cloned().map(QwenToolDefinition::from).collect::<Vec<_>>());
+            request["tools"] = json!(completion_request
+                .tools
+                .iter()
+                .cloned()
+                .map(QwenToolDefinition::from)
+                .collect::<Vec<_>>());
             request["tool_choice"] = json!("auto");
         }
 
@@ -553,7 +558,12 @@ impl completion::CompletionModel for QwenCompletionModel {
             request["max_tokens"] = json!(max);
         }
         if !completion_request.tools.is_empty() {
-            request["tools"] = json!(completion_request.tools.iter().cloned().map(QwenToolDefinition::from).collect::<Vec<_>>());
+            request["tools"] = json!(completion_request
+                .tools
+                .iter()
+                .cloned()
+                .map(QwenToolDefinition::from)
+                .collect::<Vec<_>>());
             request["tool_choice"] = json!("auto");
         }
 

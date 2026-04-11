@@ -1055,10 +1055,7 @@ impl BrowserTool {
                     .get("selector")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let text = arguments
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let text = arguments.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 serde_json::json!({ "selector": selector, "text": text })
             }
         };
@@ -1122,10 +1119,7 @@ impl BrowserTool {
     /// engine orchestration. Constructs a RealBrowserBridge from the
     /// shared context and calls run_browser_input, returning the
     /// serialized BrowserInputResult.
-    async fn run_browser_input_from_args(
-        &self,
-        arguments: &serde_json::Value,
-    ) -> Result<String> {
+    async fn run_browser_input_from_args(&self, arguments: &serde_json::Value) -> Result<String> {
         use crate::agent::browser_input::bridge::RealBrowserBridge;
         use crate::agent::browser_input::{run_browser_input, InputMode};
 
@@ -1161,16 +1155,12 @@ impl BrowserTool {
             .await
             .map_err(|e| DaemonError::InternalError(e.to_string()))?;
 
-        Ok(serde_json::to_string(&result)
-            .unwrap_or_else(|_| "{\"success\":true}".to_string()))
+        Ok(serde_json::to_string(&result).unwrap_or_else(|_| "{\"success\":true}".to_string()))
     }
 
     /// Dispatch the LLM-facing `browser_probe` tool. Calls run_browser_probe
     /// and returns the Fingerprint as serialized JSON.
-    async fn run_browser_probe_from_args(
-        &self,
-        arguments: &serde_json::Value,
-    ) -> Result<String> {
+    async fn run_browser_probe_from_args(&self, arguments: &serde_json::Value) -> Result<String> {
         use crate::agent::browser_input::bridge::RealBrowserBridge;
         use crate::agent::browser_input::run_browser_probe;
 

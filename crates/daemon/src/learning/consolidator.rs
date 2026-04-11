@@ -140,16 +140,13 @@ pub async fn consolidate_category(
 
     // 3. Call LLM (with ACP fallback — same logic as session_extractor)
     let active_model = config.llm.active_model().unwrap_or("gpt-4o-mini");
-    let (provider, api_key) =
-        crate::context::get_summarization_provider(&config, active_model)?;
+    let (provider, api_key) = crate::context::get_summarization_provider(&config, active_model)?;
 
     let active_provider = config
         .llm
         .active_provider()
         .and_then(|p| p.parse::<nevoflux_llm::ProviderType>().ok());
-    let is_fallback = active_provider
-        .map(|ap| ap != provider)
-        .unwrap_or(false);
+    let is_fallback = active_provider.map(|ap| ap != provider).unwrap_or(false);
     let model = if is_fallback {
         nevoflux_llm::default_model_for(provider)
     } else {

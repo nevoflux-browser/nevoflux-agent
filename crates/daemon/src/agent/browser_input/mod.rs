@@ -79,12 +79,11 @@ pub async fn run_browser_input(
         .get("result")
         .cloned()
         .unwrap_or(probe_response);
-    let fingerprint: Fingerprint = serde_json::from_value(fp_value.clone()).map_err(|e| {
-        BrowserInputError::ProbeFailed {
+    let fingerprint: Fingerprint =
+        serde_json::from_value(fp_value.clone()).map_err(|e| BrowserInputError::ProbeFailed {
             code: -1,
             message: format!("failed to parse Fingerprint: {}", e),
-        }
-    })?;
+        })?;
 
     // Step 2: decide
     let strategy_input = StrategyInput {
@@ -207,9 +206,7 @@ mod tests {
             self.calls.lock().unwrap().push((action, params));
             let mut vec = self.responses.lock().unwrap();
             if vec.is_empty() {
-                return Err(BrowserInputError::Bridge(
-                    "no more canned responses".into(),
-                ));
+                return Err(BrowserInputError::Bridge("no more canned responses".into()));
             }
             vec.remove(0)
         }
@@ -293,9 +290,9 @@ mod tests {
     #[tokio::test]
     async fn run_browser_input_draft_js_fill_path() {
         let bridge = SeqBridge::new(vec![
-            Ok(draft_js_probe_value()),          // probe
-            Ok(json!({"success": true})),        // execute (FillRichText)
-            Ok(json!({"text": "Hello Draft"})),  // verify
+            Ok(draft_js_probe_value()),         // probe
+            Ok(json!({"success": true})),       // execute (FillRichText)
+            Ok(json!({"text": "Hello Draft"})), // verify
         ]);
 
         let result = run_browser_input(
@@ -329,10 +326,9 @@ mod tests {
             Ok(json!({"success": true})),
         ]);
 
-        let result =
-            run_browser_input(&bridge, "#tgt", "Hello", InputMode::Fill, Some(1), false)
-                .await
-                .unwrap();
+        let result = run_browser_input(&bridge, "#tgt", "Hello", InputMode::Fill, Some(1), false)
+            .await
+            .unwrap();
 
         assert!(result.success);
         assert!(result.verify.is_none());

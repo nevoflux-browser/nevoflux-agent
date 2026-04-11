@@ -1583,7 +1583,9 @@ fn build_hot_knowledge_section(database: &nevoflux_storage::Database) -> Option<
             "site_interaction" | "siteinteraction" => site_lines.push(formatted),
             "tool_optimization" | "tooloptimization" => tool_lines.push(formatted),
             "user_preference" | "userpreference" => pref_lines.push(formatted),
-            "workspace_context" | "workspacecontext" | "project_context" | "projectcontext" => project_lines.push(formatted),
+            "workspace_context" | "workspacecontext" | "project_context" | "projectcontext" => {
+                project_lines.push(formatted)
+            }
             "error_pattern" | "errorpattern" => error_lines.push(formatted),
             _ => pref_lines.push(formatted),
         }
@@ -2068,18 +2070,16 @@ async fn handle_chat_message_streaming(
     // Get or create session-level extractor from registry
     let session_extractor = {
         let mut registry = extraction_registry.lock().await;
-        let entry = registry
-            .entry(session_id.clone())
-            .or_insert_with(|| {
-                (
-                    std::time::Instant::now(),
-                    Arc::new(
-                        crate::learning::session_extractor::SessionMemoryExtractor::new(
-                            config.learning.extraction_interval,
-                        ),
+        let entry = registry.entry(session_id.clone()).or_insert_with(|| {
+            (
+                std::time::Instant::now(),
+                Arc::new(
+                    crate::learning::session_extractor::SessionMemoryExtractor::new(
+                        config.learning.extraction_interval,
                     ),
-                )
-            });
+                ),
+            )
+        });
         // Update last-accessed timestamp
         entry.0 = std::time::Instant::now();
         entry.1.clone()

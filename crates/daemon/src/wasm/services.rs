@@ -187,8 +187,7 @@ pub struct HostServices {
     /// In-memory vector index for semantic similarity search.
     pub vector_index: Arc<std::sync::RwLock<SimpleVectorIndex>>,
     /// Session-level memory extractor for marking manual creates.
-    pub session_extractor:
-        Option<Arc<crate::learning::session_extractor::SessionMemoryExtractor>>,
+    pub session_extractor: Option<Arc<crate::learning::session_extractor::SessionMemoryExtractor>>,
 }
 
 impl HostServices {

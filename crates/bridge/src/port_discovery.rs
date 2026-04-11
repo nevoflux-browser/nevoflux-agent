@@ -189,9 +189,7 @@ pub async fn launch_daemon(executable: &Path, config: &BridgeConfig) -> Result<u
         );
 
         let mut c = Command::new("powershell.exe");
-        c.arg("-NoLogo")
-            .arg("-Command")
-            .arg(&powershell_cmd);
+        c.arg("-NoLogo").arg("-Command").arg(&powershell_cmd);
 
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -282,9 +280,7 @@ pub async fn launch_daemon_with_port(
         );
 
         let mut c = Command::new("powershell.exe");
-        c.arg("-NoLogo")
-            .arg("-Command")
-            .arg(&powershell_cmd);
+        c.arg("-NoLogo").arg("-Command").arg(&powershell_cmd);
 
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;

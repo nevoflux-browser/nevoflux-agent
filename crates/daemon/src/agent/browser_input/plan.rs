@@ -30,28 +30,12 @@ pub enum InputMode {
 /// call. Sequences are built from these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    Fill {
-        selector: String,
-        text: String,
-    },
-    RichTextFill {
-        selector: String,
-        text: String,
-    },
-    Paste {
-        selector: String,
-        text: String,
-    },
-    SendKey {
-        key: String,
-    },
-    WaitFor {
-        selector: String,
-        timeout_ms: u64,
-    },
-    Click {
-        selector: String,
-    },
+    Fill { selector: String, text: String },
+    RichTextFill { selector: String, text: String },
+    Paste { selector: String, text: String },
+    SendKey { key: String },
+    WaitFor { selector: String, timeout_ms: u64 },
+    Click { selector: String },
 }
 
 /// Output of the strategy engine: the full plan to execute.
@@ -75,10 +59,7 @@ pub enum ExecutionPlan {
 
     /// Strategy refused to produce a plan. `recoverable` indicates
     /// whether the caller should retry after page mutation.
-    Abort {
-        reason: String,
-        recoverable: bool,
-    },
+    Abort { reason: String, recoverable: bool },
 }
 
 #[cfg(test)]
