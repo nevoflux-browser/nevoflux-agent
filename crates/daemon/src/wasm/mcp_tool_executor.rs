@@ -458,7 +458,14 @@ async fn execute_browser_tool(
 /// execute the chosen plan via Actor methods, and verify the result. The
 /// WASM guest only sees one tool call return — the daemon expands it into
 /// the full orchestration internally.
-async fn execute_browser_input_orchestrated(
+///
+/// Called from two paths:
+/// 1. `execute_browser_tool` when dispatching via the standard MCP executor
+///    loop (for tools that come through mcp_tool_executor::execute_mcp_tool)
+/// 2. `agent_host::tool_call_dynamic` when the WASM guest dispatches via the
+///    generic tool_call_dynamic host function (the default path for PR #2
+///    tools in Agent / Browser mode)
+pub async fn execute_browser_input_orchestrated(
     action: BrowserToolAction,
     arguments: &serde_json::Value,
     browser_ctx: &BrowserContext,

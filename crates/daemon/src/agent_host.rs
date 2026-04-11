@@ -3051,6 +3051,83 @@ impl HostFunctions for DaemonHostFunctions {
             tool_name, arguments
         );
 
+        // Intercept PR #2 browser input strategy engine tools.
+        //
+        // browser_input and browser_probe are built-in tools (not MCP) that
+        // the WASM agent dispatches via tool_call_dynamic. The default MCP
+        // fallthrough at the bottom of this function would fail with
+        // "No server provides tool" because they are not MCP-provided.
+        //
+        // Route them to the daemon-side orchestration
+        // (execute_browser_input_orchestrated in mcp_tool_executor) so the
+        // full probe → decide → execute → verify pipeline runs in-daemon
+        // instead of forwarding a single request to the browser extension.
+        if tool_name == "browser_input" || tool_name == "browser_probe" {
+            let services = self.services.as_ref().ok_or_else(|| HostError {
+                code: 1,
+                message: "Services not available".into(),
+            })?;
+            let browser_ctx = services.browser_context().ok_or_else(|| HostError {
+                code: 2,
+                message: "browser not available".into(),
+            })?;
+
+            // The orchestration helper is async, so block_in_place + block_on
+            // is required — same pattern as the MCP fallthrough below.
+            let runtime = self.runtime.clone();
+            let action = if tool_name == "browser_input" {
+                nevoflux_protocol::BrowserToolAction::Input
+            } else {
+                nevoflux_protocol::BrowserToolAction::Probe
+            };
+            let args = arguments.clone();
+
+            let result = tokio::task::block_in_place(|| {
+                runtime.block_on(async move {
+                    crate::wasm::mcp_tool_executor::execute_browser_input_orchestrated(
+                        action,
+                        &args,
+                        &browser_ctx,
+                    )
+                    .await
+                })
+            });
+
+            let duration_ms = start.elapsed().as_millis() as u64;
+            let traced_name = format!("dynamic:{}", tool_name);
+            match result {
+                Ok(json) => {
+                    self.record_tool(
+                        &traced_name,
+                        Some(arguments.to_string()),
+                        true,
+                        None,
+                        None,
+                        duration_ms,
+                        Some(arguments.clone()),
+                        None,
+                    );
+                    return Ok(json);
+                }
+                Err(e) => {
+                    self.record_tool(
+                        &traced_name,
+                        Some(arguments.to_string()),
+                        false,
+                        Some("100".into()),
+                        Some(e.clone()),
+                        duration_ms,
+                        Some(arguments.clone()),
+                        None,
+                    );
+                    return Err(HostError {
+                        code: 100,
+                        message: e,
+                    });
+                }
+            }
+        }
+
         // Intercept "orchestrate" (sandboxed Python script for multi-tool orchestration).
         // Execute via the Monty interpreter with LLM-powered error recovery when possible.
         if tool_name == "orchestrate" {
