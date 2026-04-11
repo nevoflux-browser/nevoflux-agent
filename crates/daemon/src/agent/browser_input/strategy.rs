@@ -16,20 +16,22 @@
 
 use crate::agent::browser_input::fingerprint::Fingerprint;
 use crate::agent::browser_input::plan::{ExecutionPlan, InputMode};
+use crate::agent::browser_input::platform_adapter::Recipe;
 
 /// Input to the strategy decision.
 ///
-/// `adapter` is always None in PR #2 (platform adapter is PR #3).
-/// The field is present so the signature is stable — PR #3 just
-/// swaps None for Some(recipe) in `BrowserInputTool::execute`.
+/// `adapter` is the platform recipe for the current page's hostname,
+/// if one is registered. PR #3 introduced this; callers resolve
+/// hostname and look up the recipe before calling `decide()`.
 pub struct StrategyInput<'a> {
     pub selector: &'a str,
     pub text: &'a str,
     pub mode: InputMode,
     pub fingerprint: &'a Fingerprint,
     pub hostname: &'a str,
-    /// Placeholder for PR #3 platform adapter. Always None in PR #2.
-    pub adapter: Option<&'a ()>,
+    /// Platform recipe for this hostname, if one is registered.
+    /// `None` means "no recipe applies; fall through to generic strategy".
+    pub adapter: Option<&'a Recipe>,
 }
 
 /// Pure strategy decision.
