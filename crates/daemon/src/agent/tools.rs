@@ -117,6 +117,9 @@ impl ToolRegistry {
             ("browser_key_press", BrowserToolAction::KeyPress),
             ("browser_get_element", BrowserToolAction::GetElement),
             ("browser_query_all", BrowserToolAction::QueryAll),
+            // Browser input strategy engine (PR #2)
+            ("browser_input", BrowserToolAction::Input),
+            ("browser_probe", BrowserToolAction::Probe),
             // Artifact tools
             ("browser_read_artifact", BrowserToolAction::ReadArtifact),
             ("browser_edit_artifact", BrowserToolAction::EditArtifact),
@@ -283,6 +286,22 @@ impl ToolRegistry {
                  WARNING: Many sites block eval() via CSP. For reading page content, prefer \
                  browser_get_markdown. Only use eval_js for DOM interactions that other \
                  browser tools cannot handle.",
+            ),
+            "browser_input" => (
+                "selector: str, text: str, mode: str = 'fill', verify: bool = true, tab_id: int = None",
+                "High-level text input tool. Probes the target, selects a strategy based \
+                 on its type (standard input, Draft.js, Lexical, ProseMirror, Slate, \
+                 generic contentEditable), executes, and optionally verifies by reading \
+                 back. Handles the 'silent success' bugs that plague legacy browser_fill_by_id \
+                 on rich text editors. mode='fill' replaces content, mode='type' appends.",
+            ),
+            "browser_probe" => (
+                "selector: str, tab_id: int = None",
+                "Return a rich Fingerprint (tag, input_type, is_content_editable, \
+                 editor_framework, react_fiber_present, visibility, focusability, shadow \
+                 DOM depth, iframe context, innermost_editable_selector) for the element \
+                 matching the selector. Useful for reasoning about page structure before \
+                 choosing an input strategy manually.",
             ),
             "browser_wait_for" => (
                 "selector: str, timeout_ms: int = 30000, tab_id: int = None",
@@ -1014,12 +1033,33 @@ impl BrowserTool {
                 }
                 p
             }
-            BrowserToolAction::Probe
-            | BrowserToolAction::Input
-            | BrowserToolAction::Paste
-            | BrowserToolAction::FillRichText => {
-                // TODO: Implemented in Task 12 (browser_input orchestration)
-                serde_json::json!({})
+            BrowserToolAction::Input => {
+                // browser_input is dispatched via run_browser_input in the
+                // execute() override — params do not need to be translated.
+                // Passing the raw arguments through is sufficient.
+                arguments.clone()
+            }
+            BrowserToolAction::Probe => {
+                let selector = arguments
+                    .get("selector")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                serde_json::json!({ "selector": selector })
+            }
+            BrowserToolAction::Paste | BrowserToolAction::FillRichText => {
+                // Internal variants dispatched by browser_input executor.
+                // Build params the same way as Fill so they can be sent
+                // directly if someone ever reaches this arm via the
+                // standard execute path.
+                let selector = arguments
+                    .get("selector")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let text = arguments
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                serde_json::json!({ "selector": selector, "text": text })
             }
         };
 
@@ -1077,11 +1117,96 @@ impl BrowserTool {
             _ => val.to_string(),
         }
     }
+
+    /// Dispatch the LLM-facing `browser_input` tool via the strategy
+    /// engine orchestration. Constructs a RealBrowserBridge from the
+    /// shared context and calls run_browser_input, returning the
+    /// serialized BrowserInputResult.
+    async fn run_browser_input_from_args(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        use crate::agent::browser_input::bridge::RealBrowserBridge;
+        use crate::agent::browser_input::{run_browser_input, InputMode};
+
+        let selector = arguments
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                DaemonError::InvalidRequest("browser_input: selector required".into())
+            })?;
+        let text = arguments
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DaemonError::InvalidRequest("browser_input: text required".into()))?;
+        let mode = arguments
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .map(|s| {
+                if s == "type" {
+                    InputMode::Type
+                } else {
+                    InputMode::Fill
+                }
+            })
+            .unwrap_or(InputMode::Fill);
+        let verify_enabled = arguments
+            .get("verify")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
+
+        let bridge = RealBrowserBridge::new(self.ctx.clone());
+        let result = run_browser_input(&bridge, selector, text, mode, tab_id, verify_enabled)
+            .await
+            .map_err(|e| DaemonError::InternalError(e.to_string()))?;
+
+        Ok(serde_json::to_string(&result)
+            .unwrap_or_else(|_| "{\"success\":true}".to_string()))
+    }
+
+    /// Dispatch the LLM-facing `browser_probe` tool. Calls run_browser_probe
+    /// and returns the Fingerprint as serialized JSON.
+    async fn run_browser_probe_from_args(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        use crate::agent::browser_input::bridge::RealBrowserBridge;
+        use crate::agent::browser_input::run_browser_probe;
+
+        let selector = arguments
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                DaemonError::InvalidRequest("browser_probe: selector required".into())
+            })?;
+        let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
+
+        let bridge = RealBrowserBridge::new(self.ctx.clone());
+        let fingerprint = run_browser_probe(&bridge, selector, tab_id)
+            .await
+            .map_err(|e| DaemonError::InternalError(e.to_string()))?;
+
+        Ok(serde_json::to_string(&fingerprint).unwrap_or_else(|_| "{}".to_string()))
+    }
 }
 
 #[async_trait]
 impl ToolExecutor for BrowserTool {
     async fn execute(&self, _name: &str, arguments: &serde_json::Value) -> Result<String> {
+        // PR #2 tools (browser_input, browser_probe) are orchestrated via
+        // the strategy engine, not single-call, so they short-circuit out
+        // of the standard request/response path.
+        match self.action {
+            BrowserToolAction::Input => {
+                return self.run_browser_input_from_args(arguments).await;
+            }
+            BrowserToolAction::Probe => {
+                return self.run_browser_probe_from_args(arguments).await;
+            }
+            _ => {}
+        }
+
         let (params, tab_id) = Self::build_params(self.action, arguments);
 
         let request = BrowserRequest {
@@ -1115,6 +1240,24 @@ impl ToolExecutor for BrowserTool {
             }
         } else {
             let error_msg = match &response.error {
+                // browser_input / browser_probe error code hints (spec §5.8)
+                Some(e)
+                    if (1001..=1014).contains(&e.code)
+                        && matches!(
+                            self.action,
+                            BrowserToolAction::Input | BrowserToolAction::Probe
+                        ) =>
+                {
+                    let hint = match e.code {
+                        1001 => " — Element not found. Try browser_query_all with a broader selector.",
+                        1002 => " — Could not focus target. Try browser_click first then retry.",
+                        1007 => " — Invalid CSS selector syntax. Double-check the selector string.",
+                        1008 => " — Element is disabled or readonly; input not possible.",
+                        1014 => " — Verification mismatch: the content was not updated as expected. The framework may have rejected the input.",
+                        _ => " — Browser input failed.",
+                    };
+                    format!("{}{}", e.message, hint)
+                }
                 Some(e) if e.code == 9001 && self.action == BrowserToolAction::EvalJs => {
                     format!(
                         "{} — This site blocks eval() via Content Security Policy. \
