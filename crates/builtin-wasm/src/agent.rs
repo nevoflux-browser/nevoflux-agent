@@ -1929,6 +1929,26 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 let result_str = serde_json::to_string(&result).unwrap_or_default();
                 self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
             }
+            // PR #2 / #2.5: browser input strategy engine tools.
+            //
+            // These dispatch through tool_call_dynamic (generic host function)
+            // instead of a typed host method. The daemon's mcp_tool_executor
+            // intercepts Input/Probe actions and runs the orchestration pipeline
+            // (probe → decide → execute → verify) via run_browser_input.
+            //
+            // browser_input is an interaction tool → auto_snapshot is desirable.
+            // browser_probe is read-only → no auto_snapshot needed.
+            "browser_input" => {
+                let tab_id = tool_call.arguments["tab_id"].as_i64();
+                let result_str = self
+                    .host
+                    .tool_call_dynamic("browser_input", &tool_call.arguments)?;
+                self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
+            }
+            "browser_probe" => {
+                self.host
+                    .tool_call_dynamic("browser_probe", &tool_call.arguments)?
+            }
             "browser_get_content" => {
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_get_content(tab_id)?;
@@ -3120,6 +3140,78 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     }
                 },
                 "required": ["element_id", "value"]
+            }),
+        });
+
+        // PR #2 / #2.5: Browser input strategy engine tools
+        //
+        // browser_input is the high-level orchestrated text input tool that
+        // automatically handles rich text editors (Draft.js, Lexical,
+        // ProseMirror, Slate) where legacy browser_fill_by_id silently fails.
+        // Daemon intercepts the action and runs a full probe → decide →
+        // execute → verify pipeline.
+        //
+        // browser_probe is the escape-hatch inspection tool that returns a
+        // rich Fingerprint (tag, is_content_editable, editor_framework, etc.)
+        // for LLM-driven custom strategy selection.
+        tools.push(ToolDefinition {
+            name: "browser_input".into(),
+            description: "High-level text input tool. **PREFER this over browser_fill_by_id \
+and browser_type_by_id when targeting rich text editors** (Twitter/X compose, \
+Facebook/Threads, LinkedIn, Discord, Reddit new compose, ProseMirror/Slate/Draft.js/Lexical). \
+Probes the element, picks a strategy based on framework detection, executes, and verifies. \
+Fixes 'silent success' on contentEditable div editors where legacy fill_by_id did nothing. \
+Use mode='fill' to replace content, mode='type' to append. Use a CSS selector (not element_id).".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector for the target input / contentEditable element"
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text to insert"
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["fill", "type"],
+                        "description": "'fill' replaces existing content; 'type' appends. Default: 'fill'."
+                    },
+                    "verify": {
+                        "type": "boolean",
+                        "description": "If true (default), read back the content after execution and report match/mismatch"
+                    },
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "Optional tab ID"
+                    }
+                },
+                "required": ["selector", "text"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "browser_probe".into(),
+            description: "Probe an element and return its Fingerprint: tag, input_type, \
+is_content_editable, editor_framework (draft.js/lexical/prosemirror/slate/etc.), \
+react_fiber_present, visibility, focusability, shadow DOM depth, iframe context, \
+innermost_editable_selector, computed_role. Useful when you need to reason about \
+page structure before choosing an input strategy, or when debugging why browser_input \
+picked a particular path.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector for the element to probe"
+                    },
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "Optional tab ID"
+                    }
+                },
+                "required": ["selector"]
             }),
         });
 
@@ -5296,11 +5388,14 @@ mod tests {
 
         let browser_tools = agent.get_browser_tools();
         let chat_tools = agent.get_chat_tools();
-        // Browser tools = chat tools + 19 browser-specific tools
-        // (15 browser interaction tools + 1 load_computer_use_tools meta-tool + 1 orchestrate
-        //  + 2 MCP dynamic tools: tool_search, tool_call_dynamic)
-        // (browser_get_content, browser_get_markdown, browser_screenshot are already in chat tools)
-        assert_eq!(browser_tools.len(), chat_tools.len() + 19);
+        // Browser tools = chat tools + 21 browser-specific tools
+        // (15 browser interaction tools + 2 PR #2.5 strategy engine tools
+        //  (browser_input + browser_probe) + 1 load_computer_use_tools
+        //  meta-tool + 1 orchestrate + 2 MCP dynamic tools: tool_search,
+        //  tool_call_dynamic)
+        // (browser_get_content, browser_get_markdown, browser_screenshot are
+        //  already in chat tools)
+        assert_eq!(browser_tools.len(), chat_tools.len() + 21);
     }
 
     #[test]
