@@ -72,6 +72,9 @@ directories = "5"
 # Glob patterns
 glob = "0.3"
 
+# Regex engine (recipe pattern validation)
+regex = "1.10"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 

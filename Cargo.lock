@@ -3457,6 +3457,7 @@ dependencies = [
  "proptest",
  "pulldown-cmark",
  "rand 0.8.5",
+ "regex",
  "reqwest",
  "rfd",
  "rig-core",
