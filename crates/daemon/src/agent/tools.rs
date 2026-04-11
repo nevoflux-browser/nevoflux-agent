@@ -11,6 +11,7 @@ use nevoflux_protocol::BrowserToolAction;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -1123,6 +1124,8 @@ impl BrowserTool {
         use crate::agent::browser_input::bridge::RealBrowserBridge;
         use crate::agent::browser_input::{run_browser_input, InputMode};
 
+        let adapter_registry = browser_input_adapter_registry();
+
         let selector = arguments
             .get("selector")
             .and_then(|v| v.as_str())
@@ -1150,12 +1153,10 @@ impl BrowserTool {
             .unwrap_or(true);
         let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
 
-        let adapter_registry =
-            crate::agent::browser_input::AdapterRegistry::load_standard(None, None);
         let bridge = RealBrowserBridge::new(self.ctx.clone());
         let result = run_browser_input(
             &bridge,
-            &adapter_registry,
+            adapter_registry,
             selector,
             text,
             mode,
@@ -1189,6 +1190,22 @@ impl BrowserTool {
 
         Ok(serde_json::to_string(&fingerprint).unwrap_or_else(|_| "{}".to_string()))
     }
+}
+
+/// Process-global AdapterRegistry. Parses the compiled-in x_com.yaml
+/// (plus any user/share dir recipes if the daemon config is extended
+/// in a future PR) on first access.
+fn browser_input_adapter_registry() -> &'static crate::agent::browser_input::AdapterRegistry {
+    use crate::agent::browser_input::AdapterRegistry;
+    static REGISTRY: OnceLock<AdapterRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let reg = AdapterRegistry::load_standard(None, None);
+        tracing::info!(
+            loaded = reg.len(),
+            "browser_input: adapter registry initialized"
+        );
+        reg
+    })
 }
 
 #[async_trait]
