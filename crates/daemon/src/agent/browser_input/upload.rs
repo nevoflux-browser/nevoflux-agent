@@ -191,36 +191,79 @@ pub fn validate_workspace_path(
 /// they fall inside the workspace. Prevents accidental credential /
 /// key / config leakage when the user sets a broad workspace_dir
 /// (e.g. their home directory).
+///
+/// Cross-platform: covers Linux, macOS, and Windows sensitive paths.
 const SENSITIVE_DIRS: &[&str] = &[
+    // Unix / cross-platform
     ".ssh",
     ".gnupg",
     ".gpg",
-    ".config/nevoflux", // contains config.toml with API keys
     ".aws",
     ".docker",
     ".kube",
+    ".config",     // covers .config/nevoflux/config.toml, .config/gcloud, etc.
+    ".local",      // covers .local/share/keyrings, etc.
+    // macOS
+    "Keychains",   // ~/Library/Keychains
+    "Cookies",     // ~/Library/Cookies
+    "MobileDevice",// ~/Library/MobileDevice (iOS backups)
+    // Windows (canonicalized paths use backslash, but component matching
+    // works on individual directory names regardless of separator)
+    "Vault",       // %LOCALAPPDATA%/Microsoft/Vault
+    "Credentials", // %LOCALAPPDATA%/Microsoft/Credentials
+    "Crypto",      // %APPDATA%/Microsoft/Crypto
+    ".azure",      // Azure CLI credentials
+    ".oci",        // Oracle Cloud credentials
 ];
 
 const SENSITIVE_NAMES: &[&str] = &[
+    // Unix shell config / history
     ".env",
     ".env.local",
     ".env.production",
+    ".env.development",
     ".bashrc",
     ".zshrc",
+    ".bash_profile",
+    ".profile",
     ".bash_history",
     ".zsh_history",
+    ".sh_history",
+    // Git / package manager credentials
     ".gitconfig",
+    ".git-credentials",
     ".npmrc",
     ".pypirc",
     ".netrc",
+    "_netrc",              // Windows equivalent of .netrc
+    // Cloud / service credentials
     "credentials",
     "credentials.json",
     "service-account.json",
     "config.toml",
+    // macOS
+    "login.keychain",
+    "login.keychain-db",
+    // Windows
+    "ntuser.dat",          // Windows registry hive
+    "sam",                 // Windows SAM database
+    "system",              // Windows SYSTEM registry
+    "security",            // Windows SECURITY registry
+    "web credentials",     // Windows Credential Manager export
+    "desktop.ini",         // can reveal folder structure
 ];
 
 const SENSITIVE_EXTENSIONS: &[&str] = &[
-    "pem", "key", "p12", "pfx", "jks", "keystore",
+    // Keys and certificates
+    "pem", "key", "p12", "pfx", "jks", "keystore", "cer", "crt",
+    // macOS keychain
+    "keychain", "keychain-db",
+    // Windows DPAPI
+    "rdp",   // contains saved credentials
+    // Password manager databases
+    "kdbx",  // KeePass
+    "1pux",  // 1Password export
+    "psafe3",// Password Safe
 ];
 
 /// Reject files that match known sensitive patterns.
@@ -709,6 +752,84 @@ mod tests {
             Err(UploadError::SensitiveFile { .. })
         ));
     }
+
+    // --- macOS sensitive paths ---
+
+    #[test]
+    fn sensitive_macos_keychain_blocked() {
+        let path = Path::new("/Users/user/Library/Keychains/login.keychain-db");
+        assert!(matches!(
+            check_sensitive_path(path),
+            Err(UploadError::SensitiveFile { .. })
+        ));
+    }
+
+    #[test]
+    fn sensitive_macos_keychain_ext_blocked() {
+        let path = Path::new("/Users/user/backup/exported.keychain");
+        assert!(matches!(
+            check_sensitive_path(path),
+            Err(UploadError::SensitiveFile { .. })
+        ));
+    }
+
+    // --- Windows sensitive paths ---
+
+    #[test]
+    fn sensitive_windows_vault_blocked() {
+        let path = Path::new("C:/Users/user/AppData/Local/Microsoft/Vault/data.vcrd");
+        assert!(matches!(
+            check_sensitive_path(path),
+            Err(UploadError::SensitiveFile { .. })
+        ));
+    }
+
+    #[test]
+    fn sensitive_windows_credentials_dir_blocked() {
+        let path = Path::new("C:/Users/user/AppData/Local/Microsoft/Credentials/token");
+        assert!(matches!(
+            check_sensitive_path(path),
+            Err(UploadError::SensitiveFile { .. })
+        ));
+    }
+
+    #[test]
+    fn sensitive_windows_rdp_blocked() {
+        let path = Path::new("C:/Users/user/Desktop/server.rdp");
+        assert!(matches!(
+            check_sensitive_path(path),
+            Err(UploadError::SensitiveFile { .. })
+        ));
+    }
+
+    #[test]
+    fn sensitive_keepass_db_blocked() {
+        let path = Path::new("/home/user/passwords.kdbx");
+        assert!(matches!(
+            check_sensitive_path(path),
+            Err(UploadError::SensitiveFile { .. })
+        ));
+    }
+
+    #[test]
+    fn sensitive_git_credentials_blocked() {
+        let path = Path::new("/home/user/.git-credentials");
+        assert!(matches!(
+            check_sensitive_path(path),
+            Err(UploadError::SensitiveFile { .. })
+        ));
+    }
+
+    #[test]
+    fn sensitive_certificate_blocked() {
+        let path = Path::new("/home/user/certs/server.crt");
+        assert!(matches!(
+            check_sensitive_path(path),
+            Err(UploadError::SensitiveFile { .. })
+        ));
+    }
+
+    // --- Positive cases (should pass through) ---
 
     #[test]
     fn normal_pdf_allowed() {
