@@ -310,10 +310,11 @@ impl ToolRegistry {
                  choosing an input strategy manually.",
             ),
             "browser_upload_file" => (
-                "selector: str, file_path: str, tab_id: int = None",
+                "selector: str, file_path: str, workspace_dir: str = None, tab_id: int = None",
                 "Upload a file to an <input type=\"file\"> element. \
-                 The file must be in the workspace directory (~/.local/share/nevoflux/workspace/). \
-                 Detects MIME type automatically from file contents.",
+                 file_path must be inside workspace_dir (default: ~/.local/share/nevoflux/workspace/). \
+                 Set workspace_dir to the directory containing the file (e.g. '/home/user/Documents') \
+                 to allow uploads from other locations. Detects MIME type automatically.",
             ),
             "browser_wait_for" => (
                 "selector: str, timeout_ms: int = 30000, tab_id: int = None",
@@ -1235,16 +1236,23 @@ impl BrowserTool {
         let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
 
         // Resolve the workspace directory.
-        let workspace_dir = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("nevoflux")
-            .join("workspace");
+        // If the caller supplies workspace_dir (e.g. from user prompt: "upload from ~/Documents"),
+        // use it. Otherwise fall back to the default workspace.
+        let workspace_dir = match arguments.get("workspace_dir").and_then(|v| v.as_str()) {
+            Some(dir) => PathBuf::from(dir),
+            None => dirs::data_local_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join("nevoflux")
+                .join("workspace"),
+        };
 
-        std::fs::create_dir_all(&workspace_dir).map_err(|e| {
-            DaemonError::InternalError(format!(
-                "browser_upload_file: cannot create workspace dir: {e}"
-            ))
-        })?;
+        if !workspace_dir.exists() {
+            std::fs::create_dir_all(&workspace_dir).map_err(|e| {
+                DaemonError::InternalError(format!(
+                    "browser_upload_file: cannot create workspace dir: {e}"
+                ))
+            })?;
+        }
 
         // Validate path containment and canonicalize.
         let canonical = validate_workspace_path(
