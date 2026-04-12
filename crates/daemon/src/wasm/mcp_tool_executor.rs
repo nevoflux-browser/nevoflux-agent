@@ -550,7 +550,8 @@ async fn execute_browser_upload_orchestrated(
 ) -> Result<String, String> {
     use crate::agent::browser_input::file_server::get_or_start_file_server;
     use crate::agent::browser_input::upload::{
-        check_file_size, detect_mime, validate_workspace_path, TokenEntry, DEFAULT_MAX_SIZE,
+        check_file_size, check_sensitive_path, detect_mime, validate_workspace_path, TokenEntry,
+        DEFAULT_MAX_SIZE,
         TOKEN_TTL,
     };
     use std::path::PathBuf;
@@ -583,6 +584,8 @@ async fn execute_browser_upload_orchestrated(
 
     let canonical = validate_workspace_path(std::path::Path::new(file_path_str), &workspace_dir)
         .map_err(|e| e.to_string())?;
+
+    check_sensitive_path(&canonical).map_err(|e| e.to_string())?;
 
     let size = check_file_size(&canonical, DEFAULT_MAX_SIZE).map_err(|e| e.to_string())?;
 

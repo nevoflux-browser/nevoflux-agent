@@ -42,6 +42,9 @@ pub enum UploadError {
     #[error("File too large: {size} bytes exceeds {max} byte limit")]
     FileTooLarge { size: u64, max: u64 },
 
+    #[error("Sensitive file blocked: {path} ({reason})")]
+    SensitiveFile { path: String, reason: &'static str },
+
     #[error("I/O error on {path}: {source}")]
     Io {
         path: String,
@@ -55,11 +58,13 @@ impl UploadError {
     ///
     /// - `1011` — path traversal / not-in-workspace
     /// - `1010` — file too large
+    /// - `1012` — sensitive file blocked
     /// - `1005` — I/O error
     pub fn code(&self) -> u32 {
         match self {
             Self::PathNotAllowed { .. } => 1011,
             Self::FileTooLarge { .. } => 1010,
+            Self::SensitiveFile { .. } => 1012,
             Self::Io { .. } => 1005,
         }
     }
@@ -176,6 +181,105 @@ pub fn validate_workspace_path(
     }
 
     Ok(canonical_file)
+}
+
+// ---------------------------------------------------------------------------
+// Sensitive file check
+// ---------------------------------------------------------------------------
+
+/// Directories and file patterns that must never be uploaded, even if
+/// they fall inside the workspace. Prevents accidental credential /
+/// key / config leakage when the user sets a broad workspace_dir
+/// (e.g. their home directory).
+const SENSITIVE_DIRS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".gpg",
+    ".config/nevoflux", // contains config.toml with API keys
+    ".aws",
+    ".docker",
+    ".kube",
+];
+
+const SENSITIVE_NAMES: &[&str] = &[
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".bashrc",
+    ".zshrc",
+    ".bash_history",
+    ".zsh_history",
+    ".gitconfig",
+    ".npmrc",
+    ".pypirc",
+    ".netrc",
+    "credentials",
+    "credentials.json",
+    "service-account.json",
+    "config.toml",
+];
+
+const SENSITIVE_EXTENSIONS: &[&str] = &[
+    "pem", "key", "p12", "pfx", "jks", "keystore",
+];
+
+/// Reject files that match known sensitive patterns.
+///
+/// Called after `validate_workspace_path` (so `path` is already
+/// canonical). Checks:
+/// 1. Any path component matches a sensitive directory name
+/// 2. File name matches a sensitive name exactly
+/// 3. File extension matches a sensitive extension
+pub fn check_sensitive_path(path: &Path) -> Result<(), UploadError> {
+    let path_str = path.display().to_string();
+
+    // Check directory components
+    for component in path.components() {
+        let s = component.as_os_str().to_string_lossy();
+        for dir in SENSITIVE_DIRS {
+            if s == *dir {
+                return Err(UploadError::SensitiveFile {
+                    path: path_str,
+                    reason: "path contains a sensitive directory (credentials/keys)",
+                });
+            }
+        }
+    }
+
+    // Check file name
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        let name_lower = name.to_lowercase();
+        for sensitive in SENSITIVE_NAMES {
+            if name_lower == *sensitive {
+                return Err(UploadError::SensitiveFile {
+                    path: path_str,
+                    reason: "file name matches a known sensitive file pattern",
+                });
+            }
+        }
+        // Also catch patterns like "secret_key.txt", "*_credentials.json"
+        if name_lower.contains("secret") || name_lower.contains("private_key") {
+            return Err(UploadError::SensitiveFile {
+                path: path_str,
+                reason: "file name contains 'secret' or 'private_key'",
+            });
+        }
+    }
+
+    // Check extension
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let ext_lower = ext.to_lowercase();
+        for sensitive_ext in SENSITIVE_EXTENSIONS {
+            if ext_lower == *sensitive_ext {
+                return Err(UploadError::SensitiveFile {
+                    path: path_str,
+                    reason: "file extension indicates a key/certificate file",
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -520,5 +624,107 @@ mod tests {
             .code(),
             1005
         );
+        assert_eq!(
+            UploadError::SensitiveFile {
+                path: "x".into(),
+                reason: "test"
+            }
+            .code(),
+            1012
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sensitive file check
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sensitive_ssh_key_blocked() {
+        let path = Path::new("/home/user/.ssh/id_rsa");
+        assert!(matches!(
+            check_sensitive_path(path),
+            Err(UploadError::SensitiveFile { .. })
+        ));
+    }
+
+    #[test]
+    fn sensitive_env_file_blocked() {
+        let path = Path::new("/home/user/project/.env");
+        assert!(matches!(
+            check_sensitive_path(path),
+            Err(UploadError::SensitiveFile { .. })
+        ));
+    }
+
+    #[test]
+    fn sensitive_pem_extension_blocked() {
+        let path = Path::new("/home/user/certs/server.pem");
+        assert!(matches!(
+            check_sensitive_path(path),
+            Err(UploadError::SensitiveFile { .. })
+        ));
+    }
+
+    #[test]
+    fn sensitive_key_extension_blocked() {
+        let path = Path::new("/home/user/keys/deploy.key");
+        assert!(matches!(
+            check_sensitive_path(path),
+            Err(UploadError::SensitiveFile { .. })
+        ));
+    }
+
+    #[test]
+    fn sensitive_gnupg_dir_blocked() {
+        let path = Path::new("/home/user/.gnupg/secring.gpg");
+        assert!(matches!(
+            check_sensitive_path(path),
+            Err(UploadError::SensitiveFile { .. })
+        ));
+    }
+
+    #[test]
+    fn sensitive_aws_credentials_blocked() {
+        let path = Path::new("/home/user/.aws/credentials");
+        assert!(matches!(
+            check_sensitive_path(path),
+            Err(UploadError::SensitiveFile { .. })
+        ));
+    }
+
+    #[test]
+    fn sensitive_secret_in_name_blocked() {
+        let path = Path::new("/home/user/docs/my_secret_config.json");
+        assert!(matches!(
+            check_sensitive_path(path),
+            Err(UploadError::SensitiveFile { .. })
+        ));
+    }
+
+    #[test]
+    fn sensitive_bashrc_blocked() {
+        let path = Path::new("/home/user/.bashrc");
+        assert!(matches!(
+            check_sensitive_path(path),
+            Err(UploadError::SensitiveFile { .. })
+        ));
+    }
+
+    #[test]
+    fn normal_pdf_allowed() {
+        let path = Path::new("/home/user/Documents/resume.pdf");
+        assert!(check_sensitive_path(path).is_ok());
+    }
+
+    #[test]
+    fn normal_image_allowed() {
+        let path = Path::new("/home/user/photos/vacation.jpg");
+        assert!(check_sensitive_path(path).is_ok());
+    }
+
+    #[test]
+    fn normal_docx_allowed() {
+        let path = Path::new("/home/user/work/report.docx");
+        assert!(check_sensitive_path(path).is_ok());
     }
 }

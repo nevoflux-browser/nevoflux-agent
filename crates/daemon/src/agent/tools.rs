@@ -1215,8 +1215,8 @@ impl BrowserTool {
     ) -> Result<String> {
         use crate::agent::browser_input::file_server::get_or_start_file_server;
         use crate::agent::browser_input::upload::{
-            check_file_size, detect_mime, validate_workspace_path, TokenEntry, DEFAULT_MAX_SIZE,
-            TOKEN_TTL,
+            check_file_size, check_sensitive_path, detect_mime, validate_workspace_path,
+            TokenEntry, DEFAULT_MAX_SIZE, TOKEN_TTL,
         };
         use std::path::PathBuf;
         use std::time::Instant;
@@ -1260,6 +1260,10 @@ impl BrowserTool {
             &workspace_dir,
         )
         .map_err(|e| DaemonError::InternalError(e.to_string()))?;
+
+        // Block sensitive files (keys, credentials, env, etc.)
+        check_sensitive_path(&canonical)
+            .map_err(|e| DaemonError::InternalError(e.to_string()))?;
 
         // Check size limit.
         let size = check_file_size(&canonical, DEFAULT_MAX_SIZE)
