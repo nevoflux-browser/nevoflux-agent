@@ -265,6 +265,9 @@ pub enum BrowserToolAction {
     /// (PR #5 browser input file upload)
     #[serde(rename = "uploadFile")]
     UploadFile,
+    /// Activate (switch to) a specific tab by ID.
+    #[serde(rename = "activateTab")]
+    ActivateTab,
 }
 
 /// File attachment

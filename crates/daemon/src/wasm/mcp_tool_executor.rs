@@ -350,6 +350,7 @@ fn tool_name_to_browser_action(name: &str) -> Option<BrowserToolAction> {
     let key = name.strip_prefix("browser_").unwrap_or(name);
     match key {
         "navigate" => Some(BrowserToolAction::Navigate),
+        "activate_tab" => Some(BrowserToolAction::ActivateTab),
         "go_back" => Some(BrowserToolAction::GoBack),
         "go_forward" => Some(BrowserToolAction::GoForward),
         "click" => Some(BrowserToolAction::Click),
@@ -1581,6 +1582,7 @@ mod tests {
             ("browser_get_elements", BrowserToolAction::GetElements),
             ("browser_query_all", BrowserToolAction::QueryAll),
             ("browser_query_tabs", BrowserToolAction::QueryTabs),
+            ("browser_activate_tab", BrowserToolAction::ActivateTab),
             ("browser_key_press", BrowserToolAction::KeyPress),
             ("browser_read_artifact", BrowserToolAction::ReadArtifact),
             ("browser_edit_artifact", BrowserToolAction::EditArtifact),

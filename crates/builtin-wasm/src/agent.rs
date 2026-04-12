@@ -1869,8 +1869,23 @@ The following skill instructions MUST be followed exactly. These instructions ta
             "browser_navigate" => {
                 let url = tool_call.arguments["url"].as_str().unwrap_or("");
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
-                let result = self.host.browser_navigate(url, tab_id)?;
-                let result_str = serde_json::to_string(&result).unwrap_or_default();
+                let new_tab = tool_call.arguments["new_tab"].as_bool().unwrap_or(false);
+                let result_str = if new_tab {
+                    // new_tab mode: use tool_call_dynamic so the new_tab param
+                    // reaches background.js via the standard BrowserRequest path.
+                    self.host
+                        .tool_call_dynamic("browser_navigate", &tool_call.arguments)?
+                } else {
+                    let result = self.host.browser_navigate(url, tab_id)?;
+                    serde_json::to_string(&result).unwrap_or_default()
+                };
+                self.auto_snapshot_after_action(&result_str, "navigation", tab_id)
+            }
+            "browser_activate_tab" => {
+                let tab_id = tool_call.arguments["tab_id"].as_i64();
+                let result_str = self
+                    .host
+                    .tool_call_dynamic("browser_activate_tab", &tool_call.arguments)?;
                 self.auto_snapshot_after_action(&result_str, "navigation", tab_id)
             }
             "browser_go_back" => {
@@ -2967,7 +2982,8 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // Browser navigation
         tools.push(ToolDefinition {
             name: "browser_navigate".into(),
-            description: "Navigate to a specific URL. For returning to previous page, prefer browser_go_back. NEVER use navigate to 'go back'.".into(),
+            description: "Navigate to a specific URL. Set new_tab=true to open in a new tab. \
+For returning to previous page, prefer browser_go_back. NEVER use navigate to 'go back'.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2975,12 +2991,32 @@ The following skill instructions MUST be followed exactly. These instructions ta
                         "type": "string",
                         "description": "The URL to navigate to"
                     },
+                    "new_tab": {
+                        "type": "boolean",
+                        "description": "If true, open URL in a new tab instead of navigating the current tab. Default: false."
+                    },
                     "tab_id": {
                         "type": "integer",
                         "description": "Optional tab ID (uses active tab if not specified)"
                     }
                 },
                 "required": ["url"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "browser_activate_tab".into(),
+            description: "Switch to (activate) a specific browser tab. Use browser_get_tabs \
+first to find the tab ID you want to switch to.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "The tab ID to activate (from browser_get_tabs)"
+                    }
+                },
+                "required": ["tab_id"]
             }),
         });
 

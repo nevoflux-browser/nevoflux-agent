@@ -105,6 +105,7 @@ impl ToolRegistry {
             ("browser_scroll", BrowserToolAction::Scroll),
             ("browser_get_tabs", BrowserToolAction::ListTabs),
             ("browser_query_tabs", BrowserToolAction::QueryTabs),
+            ("browser_activate_tab", BrowserToolAction::ActivateTab),
             ("browser_get_elements", BrowserToolAction::GetElements),
             // Lower-level browser tools
             ("browser_click", BrowserToolAction::Click),
@@ -232,8 +233,9 @@ impl ToolRegistry {
                  (Deprecated 2026-04; prefer browser_input which handles rich text editors.)",
             ),
             "browser_navigate" => (
-                "url: str, tab_id: int = None",
-                "Navigate the browser to a URL.",
+                "url: str, new_tab: bool = false, tab_id: int = None",
+                "Navigate the browser to a URL. Set new_tab=true to open in a new tab \
+                 instead of navigating the current tab.",
             ),
             "browser_scroll" => (
                 "direction: str, amount: int = 3, tab_id: int = None",
@@ -242,6 +244,11 @@ impl ToolRegistry {
             "browser_get_tabs" => (
                 "",
                 "List all open browser tabs. Returns list of dicts with keys: id, url, title, active.",
+            ),
+            "browser_activate_tab" => (
+                "tab_id: int",
+                "Switch to (activate) a specific browser tab by its tab ID. \
+                 Use browser_get_tabs first to find the tab ID.",
             ),
             "browser_fill_by_id" => (
                 "element_id: str, value: str, tab_id: int = None",
@@ -881,7 +888,18 @@ impl BrowserTool {
             }
             BrowserToolAction::Navigate => {
                 let url = arguments.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                serde_json::json!({ "url": url })
+                let new_tab = arguments
+                    .get("new_tab")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                serde_json::json!({ "url": url, "new_tab": new_tab })
+            }
+            BrowserToolAction::ActivateTab => {
+                let target_tab = arguments
+                    .get("tab_id")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                serde_json::json!({ "tab_id": target_tab })
             }
             BrowserToolAction::Scroll => {
                 let direction = arguments
