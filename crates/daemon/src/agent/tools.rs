@@ -121,6 +121,7 @@ impl ToolRegistry {
             // Browser input strategy engine (PR #2)
             ("browser_input", BrowserToolAction::Input),
             ("browser_probe", BrowserToolAction::Probe),
+            ("browser_upload_file", BrowserToolAction::UploadFile),
             // Artifact tools
             ("browser_read_artifact", BrowserToolAction::ReadArtifact),
             ("browser_edit_artifact", BrowserToolAction::EditArtifact),
@@ -307,6 +308,12 @@ impl ToolRegistry {
                  DOM depth, iframe context, innermost_editable_selector) for the element \
                  matching the selector. Useful for reasoning about page structure before \
                  choosing an input strategy manually.",
+            ),
+            "browser_upload_file" => (
+                "selector: str, file_path: str, tab_id: int = None",
+                "Upload a file to an <input type=\"file\"> element. \
+                 The file must be in the workspace directory (~/.local/share/nevoflux/workspace/). \
+                 Detects MIME type automatically from file contents.",
             ),
             "browser_wait_for" => (
                 "selector: str, timeout_ms: int = 30000, tab_id: int = None",
@@ -1200,6 +1207,136 @@ impl BrowserTool {
 
         Ok(serde_json::to_string(&fingerprint).unwrap_or_else(|_| "{}".to_string()))
     }
+
+    async fn run_browser_upload_from_args(
+        &self,
+        arguments: &serde_json::Value,
+    ) -> Result<String> {
+        use crate::agent::browser_input::file_server::get_or_start_file_server;
+        use crate::agent::browser_input::upload::{
+            check_file_size, detect_mime, validate_workspace_path, TokenEntry, DEFAULT_MAX_SIZE,
+            TOKEN_TTL,
+        };
+        use std::path::PathBuf;
+        use std::time::Instant;
+
+        let selector = arguments
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                DaemonError::InvalidRequest("browser_upload_file: selector required".into())
+            })?;
+        let file_path_str = arguments
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                DaemonError::InvalidRequest("browser_upload_file: file_path required".into())
+            })?;
+        let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
+
+        // Resolve the workspace directory.
+        let workspace_dir = dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("nevoflux")
+            .join("workspace");
+
+        std::fs::create_dir_all(&workspace_dir).map_err(|e| {
+            DaemonError::InternalError(format!(
+                "browser_upload_file: cannot create workspace dir: {e}"
+            ))
+        })?;
+
+        // Validate path containment and canonicalize.
+        let canonical = validate_workspace_path(
+            std::path::Path::new(file_path_str),
+            &workspace_dir,
+        )
+        .map_err(|e| DaemonError::InternalError(e.to_string()))?;
+
+        // Check size limit.
+        let size = check_file_size(&canonical, DEFAULT_MAX_SIZE)
+            .map_err(|e| DaemonError::InternalError(e.to_string()))?;
+
+        // Detect MIME type from magic bytes.
+        let mime_type = detect_mime(&canonical)
+            .map_err(|e| DaemonError::InternalError(e.to_string()))?;
+
+        // Derive file name.
+        let file_name = canonical
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".to_string());
+
+        // Start (or reuse) the localhost file server.
+        let (port, store) = get_or_start_file_server()
+            .await
+            .map_err(|e| DaemonError::InternalError(e))?;
+
+        // Issue a short-lived token.
+        store.sweep_expired();
+        let token = store.insert(TokenEntry {
+            path: canonical,
+            mime_type: mime_type.clone(),
+            file_name: file_name.clone(),
+            size,
+            expires_at: Instant::now() + TOKEN_TTL,
+        });
+
+        let file_url = format!("http://127.0.0.1:{}/file/{}", port, token);
+
+        // Build and dispatch the browser request.
+        let params = serde_json::json!({
+            "selector": selector,
+            "fileUrl": file_url,
+            "fileName": file_name,
+            "mimeType": mime_type,
+        });
+
+        let request = BrowserRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            session_id: "browser-upload".to_string(),
+            tab_id,
+            action: BrowserToolAction::UploadFile,
+            params,
+            timeout_ms: 120_000,
+            client_identity: self.ctx.client_identity.clone(),
+            proxy_id: self.ctx.proxy_id.clone(),
+        };
+
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.ctx
+            .sender
+            .send((request, response_tx))
+            .await
+            .map_err(|_| DaemonError::InternalError("Failed to send browser request".into()))?;
+
+        let response: BrowserResponse =
+            tokio::time::timeout(Duration::from_secs(120), response_rx)
+                .await
+                .map_err(|_| {
+                    DaemonError::InternalError("browser_upload_file: request timed out".into())
+                })?
+                .map_err(|_| {
+                    DaemonError::InternalError("browser_upload_file: response channel closed".into())
+                })?;
+
+        if response.success {
+            Ok(serde_json::json!({
+                "success": true,
+                "file_name": file_name,
+                "mime_type": mime_type,
+                "size": size,
+            })
+            .to_string())
+        } else {
+            let msg = response
+                .error
+                .map(|e| e.message)
+                .unwrap_or_else(|| "browser_upload_file failed".to_string());
+            Err(DaemonError::InternalError(msg))
+        }
+    }
 }
 
 /// Process-global AdapterRegistry. Parses the compiled-in x_com.yaml
@@ -1230,6 +1367,9 @@ impl ToolExecutor for BrowserTool {
             }
             BrowserToolAction::Probe => {
                 return self.run_browser_probe_from_args(arguments).await;
+            }
+            BrowserToolAction::UploadFile => {
+                return self.run_browser_upload_from_args(arguments).await;
             }
             _ => {}
         }
