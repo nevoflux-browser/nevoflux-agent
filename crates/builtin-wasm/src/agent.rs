@@ -2982,7 +2982,9 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // Browser navigation
         tools.push(ToolDefinition {
             name: "browser_navigate".into(),
-            description: "Navigate to a specific URL. Set new_tab=true to open in a new tab. \
+            description: "Navigate to a specific URL in the CURRENT tab. \
+Only set new_tab=true when the user EXPLICITLY asks to open in a new tab. \
+Default behavior: navigate the current tab (new_tab=false). \
 For returning to previous page, prefer browser_go_back. NEVER use navigate to 'go back'.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -2993,7 +2995,7 @@ For returning to previous page, prefer browser_go_back. NEVER use navigate to 'g
                     },
                     "new_tab": {
                         "type": "boolean",
-                        "description": "If true, open URL in a new tab instead of navigating the current tab. Default: false."
+                        "description": "ONLY set to true when the user explicitly asks for a new tab. Default: false (navigate current tab)."
                     },
                     "tab_id": {
                         "type": "integer",

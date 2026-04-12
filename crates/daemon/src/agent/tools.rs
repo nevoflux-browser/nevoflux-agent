@@ -234,8 +234,9 @@ impl ToolRegistry {
             ),
             "browser_navigate" => (
                 "url: str, new_tab: bool = false, tab_id: int = None",
-                "Navigate the browser to a URL. Set new_tab=true to open in a new tab \
-                 instead of navigating the current tab.",
+                "Navigate the browser to a URL in the CURRENT tab. \
+                 Only set new_tab=true when the user explicitly asks for a new tab. \
+                 Default: navigates the current tab (new_tab=false).",
             ),
             "browser_scroll" => (
                 "direction: str, amount: int = 3, tab_id: int = None",
