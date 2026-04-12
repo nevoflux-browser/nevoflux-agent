@@ -284,9 +284,11 @@ impl ToolRegistry {
             "browser_eval_js" => (
                 "expression: str, tab_id: int = None",
                 "Evaluate a JavaScript expression in the page context. Returns the result. \
-                 WARNING: Many sites block eval() via CSP. For reading page content, prefer \
-                 browser_get_markdown. Only use eval_js for DOM interactions that other \
-                 browser tools cannot handle.",
+                 ⚠ Runs inside a content-principal sandbox; still subject to page CSP. \
+                 Strict sites (Twitter/X, GitHub, banking) will reject eval. \
+                 PREFER structured tools: browser_input, browser_probe, browser_query_all, \
+                 browser_get_content, browser_click/scroll/navigate. \
+                 Use browser_eval_js ONLY when no structured tool covers the case.",
             ),
             "browser_input" => (
                 "selector: str, text: str, mode: str = 'fill', verify: bool = true, tab_id: int = None",
@@ -1276,10 +1278,17 @@ impl ToolExecutor for BrowserTool {
                     format!("{}{}", e.message, hint)
                 }
                 Some(e) if e.code == 9001 && self.action == BrowserToolAction::EvalJs => {
+                    let script = arguments
+                        .get("expression")
+                        .or_else(|| arguments.get("script"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    format!("{} — {}", e.message, eval_csp_hint(script))
+                }
+                Some(e) if e.code == 9004 && self.action == BrowserToolAction::EvalJs => {
                     format!(
-                        "{} — This site blocks eval() via Content Security Policy. \
-                         Use browser_get_markdown to read page content instead, \
-                         or use browser_click_by_id/browser_type_by_id for interactions.",
+                        "{} — JS runtime/syntax error (code 9004, recoverable). \
+                         Review the script and retry with a fix.",
                         e.message
                     )
                 }
@@ -1304,6 +1313,35 @@ impl ToolExecutor for BrowserTool {
             Err(DaemonError::InternalError(error_msg))
         }
     }
+}
+
+/// Heuristic hint for CSP-blocked eval: suggests a structured tool
+/// based on what the rejected script was trying to do (spec §9.3).
+fn eval_csp_hint(script: &str) -> String {
+    let s = script.to_lowercase();
+    let suggestion = if s.contains(".value =") || s.contains(".value=") {
+        "Use browser_input instead."
+    } else if s.contains("queryselectorall") {
+        "Use browser_query_all instead."
+    } else if s.contains("queryselector") {
+        "Use browser_probe or browser_get_element instead."
+    } else if s.contains("click(") {
+        "Use browser_click instead."
+    } else if s.contains("textcontent") || s.contains("innertext") {
+        "Use browser_get_content instead."
+    } else if s.contains("scroll") {
+        "Use browser_scroll instead."
+    } else if s.contains("window.location") {
+        "Use browser_navigate or browser_get_tabs instead."
+    } else {
+        "If no structured tool covers this use case, CSP blocks this eval; \
+         only workaround is asking a human to add a dedicated primitive."
+    };
+    format!(
+        "CSP blocked eval(). {} Structured tools bypass CSP because they \
+         are chrome-privileged DOM operations.",
+        suggestion
+    )
 }
 
 // ============================================================================
