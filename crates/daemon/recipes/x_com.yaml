@@ -2,6 +2,9 @@
 #
 # IMPORTANT: selectors must be manually re-verified against live x.com
 # DOM before every merge. See spec §11.3 item 5.
+#
+# Last verified: 2026-04-12 — all primary selectors confirmed working.
+# submit_fallback [data-testid="tweetButton"] not found (primary OK).
 
 name: x_com
 hostname_patterns:
