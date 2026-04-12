@@ -20,6 +20,7 @@
 pub mod bridge;
 pub mod error;
 pub mod executor;
+pub mod file_server;
 pub mod fingerprint;
 pub mod plan;
 pub mod platform_adapter;
