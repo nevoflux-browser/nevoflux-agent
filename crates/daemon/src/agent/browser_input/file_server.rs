@@ -179,12 +179,7 @@ mod tests {
         TokenEntry {
             path: f.path().to_path_buf(),
             mime_type: mime.to_string(),
-            file_name: f
-                .path()
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
+            file_name: f.path().file_name().unwrap().to_string_lossy().into_owned(),
             size: f.path().metadata().map(|m| m.len()).unwrap_or(0),
             expires_at: Instant::now() + TOKEN_TTL,
         }
@@ -231,9 +226,7 @@ mod tests {
         let store = Arc::new(TokenStore::new());
         let port = start_file_server(store.clone()).await.unwrap();
 
-        let url = format!(
-            "http://127.0.0.1:{port}/file/00000000-0000-0000-0000-000000000000"
-        );
+        let url = format!("http://127.0.0.1:{port}/file/00000000-0000-0000-0000-000000000000");
         let resp = test_client().get(&url).send().await.unwrap();
         assert_eq!(resp.status(), 404);
     }

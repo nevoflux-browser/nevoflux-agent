@@ -158,13 +158,10 @@ pub fn validate_workspace_path(
     file_path: &Path,
     workspace_dir: &Path,
 ) -> Result<PathBuf, UploadError> {
-    let canonical_workspace =
-        workspace_dir
-            .canonicalize()
-            .map_err(|e| UploadError::Io {
-                path: workspace_dir.display().to_string(),
-                source: e,
-            })?;
+    let canonical_workspace = workspace_dir.canonicalize().map_err(|e| UploadError::Io {
+        path: workspace_dir.display().to_string(),
+        source: e,
+    })?;
 
     let canonical_file = file_path.canonicalize().map_err(|e| UploadError::Io {
         path: file_path.display().to_string(),
@@ -201,7 +198,10 @@ pub fn check_file_size(path: &Path, max_size: u64) -> Result<u64, UploadError> {
 
     let size = meta.len();
     if size > max_size {
-        return Err(UploadError::FileTooLarge { size, max: max_size });
+        return Err(UploadError::FileTooLarge {
+            size,
+            max: max_size,
+        });
     }
 
     Ok(size)
@@ -374,7 +374,11 @@ mod tests {
         std::fs::write(&file_path, b"content").unwrap();
 
         let result = validate_workspace_path(&file_path, workspace.path());
-        assert!(result.is_ok(), "should accept file inside workspace: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "should accept file inside workspace: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -430,7 +434,13 @@ mod tests {
         let f = make_file_with_bytes(&[0u8; 1024]);
         let result = check_file_size(f.path(), 512);
         assert!(
-            matches!(result, Err(UploadError::FileTooLarge { size: 1024, max: 512 })),
+            matches!(
+                result,
+                Err(UploadError::FileTooLarge {
+                    size: 1024,
+                    max: 512
+                })
+            ),
             "unexpected result: {:?}",
             result
         );
@@ -501,10 +511,7 @@ mod tests {
             .code(),
             1011
         );
-        assert_eq!(
-            UploadError::FileTooLarge { size: 1, max: 0 }.code(),
-            1010
-        );
+        assert_eq!(UploadError::FileTooLarge { size: 1, max: 0 }.code(), 1010);
         assert_eq!(
             UploadError::Io {
                 path: "x".into(),
