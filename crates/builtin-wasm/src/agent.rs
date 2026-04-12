@@ -3073,7 +3073,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // Type by ID
         tools.push(ToolDefinition {
             name: "browser_type_by_id".into(),
-            description: "Type text character by character into an element. Use ONLY for autocomplete, search boxes, or real-time validation. For normal form fields, prefer browser_fill_by_id.".into(),
+            description: "Type text character by character into an element. Use ONLY for autocomplete, search boxes, or real-time validation. For normal form fields, prefer browser_fill_by_id. (Deprecated 2026-04; prefer browser_input which handles rich text editors.)".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -3122,7 +3122,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // Fill by ID
         tools.push(ToolDefinition {
             name: "browser_fill_by_id".into(),
-            description: "Set a form field's value by element ID. DEFAULT for form filling. Faster than type_by_id. If fill doesn't trigger expected behavior, fall back to type_by_id.".into(),
+            description: "Set a form field's value by element ID. DEFAULT for form filling. Faster than type_by_id. If fill doesn't trigger expected behavior, fall back to type_by_id. (Deprecated 2026-04; prefer browser_input which handles rich text editors.)".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {

@@ -227,7 +227,8 @@ impl ToolRegistry {
             ),
             "browser_type_by_id" => (
                 "element_id: str, text: str, tab_id: int = None",
-                "Type text into an element by its snapshot ID.",
+                "Type text into an element by its snapshot ID. \
+                 (Deprecated 2026-04; prefer browser_input which handles rich text editors.)",
             ),
             "browser_navigate" => (
                 "url: str, tab_id: int = None",
@@ -243,7 +244,8 @@ impl ToolRegistry {
             ),
             "browser_fill_by_id" => (
                 "element_id: str, value: str, tab_id: int = None",
-                "Fill a form field by its snapshot ID (clears existing value first).",
+                "Fill a form field by its snapshot ID (clears existing value first). \
+                 (Deprecated 2026-04; prefer browser_input which handles rich text editors.)",
             ),
             "browser_go_back" => (
                 "tab_id: int = None",
