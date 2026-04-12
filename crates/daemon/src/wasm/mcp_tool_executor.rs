@@ -402,12 +402,9 @@ async fn execute_browser_tool(
         return execute_browser_input_orchestrated(action, arguments, browser_ctx).await;
     }
 
-    // Intercept PR #5 upload tool — not yet supported in WASM agent mode.
+    // Intercept PR #5 upload tool — orchestrated like browser_input.
     if matches!(action, BrowserToolAction::UploadFile) {
-        return Err(
-            "browser_upload_file is not yet supported in WASM agent mode. Use Code Mode."
-                .to_string(),
-        );
+        return execute_browser_upload_orchestrated(arguments, browser_ctx).await;
     }
 
     let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
@@ -540,6 +537,122 @@ pub async fn execute_browser_input_orchestrated(
             Ok(serde_json::to_string(&fingerprint).unwrap_or_default())
         }
         _ => unreachable!("execute_browser_input_orchestrated called with non-orchestrated action"),
+    }
+}
+
+/// Execute `browser_upload_file` in WASM/MCP mode.
+///
+/// Mirrors the logic in `BrowserTool::run_browser_upload_from_args` (tools.rs)
+/// but operates on the BrowserContext available in the MCP executor path.
+async fn execute_browser_upload_orchestrated(
+    arguments: &serde_json::Value,
+    browser_ctx: &BrowserContext,
+) -> Result<String, String> {
+    use crate::agent::browser_input::file_server::get_or_start_file_server;
+    use crate::agent::browser_input::upload::{
+        check_file_size, detect_mime, validate_workspace_path, TokenEntry, DEFAULT_MAX_SIZE,
+        TOKEN_TTL,
+    };
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let selector = arguments
+        .get("selector")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "browser_upload_file: selector required".to_string())?;
+    let file_path_str = arguments
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "browser_upload_file: file_path required".to_string())?;
+    let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
+
+    // Resolve workspace directory (supports custom workspace_dir parameter).
+    let workspace_dir = match arguments.get("workspace_dir").and_then(|v| v.as_str()) {
+        Some(dir) => PathBuf::from(dir),
+        None => dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("nevoflux")
+            .join("workspace"),
+    };
+
+    if !workspace_dir.exists() {
+        std::fs::create_dir_all(&workspace_dir)
+            .map_err(|e| format!("browser_upload_file: cannot create workspace dir: {e}"))?;
+    }
+
+    let canonical = validate_workspace_path(std::path::Path::new(file_path_str), &workspace_dir)
+        .map_err(|e| e.to_string())?;
+
+    let size = check_file_size(&canonical, DEFAULT_MAX_SIZE).map_err(|e| e.to_string())?;
+
+    let mime_type = detect_mime(&canonical).map_err(|e| e.to_string())?;
+
+    let file_name = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+
+    let (port, store) = get_or_start_file_server()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    store.sweep_expired();
+    let token = store.insert(TokenEntry {
+        path: canonical,
+        mime_type: mime_type.clone(),
+        file_name: file_name.clone(),
+        size,
+        expires_at: Instant::now() + TOKEN_TTL,
+    });
+
+    let file_url = format!("http://127.0.0.1:{}/file/{}", port, token);
+
+    // Send to Actor via BrowserContext channel.
+    let params = serde_json::json!({
+        "selector": selector,
+        "fileUrl": file_url,
+        "fileName": file_name,
+        "mimeType": mime_type,
+    });
+
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    let request = BrowserRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        session_id: String::new(),
+        tab_id,
+        action: BrowserToolAction::UploadFile,
+        params,
+        timeout_ms: 120_000,
+        client_identity: browser_ctx.client_identity.clone(),
+        proxy_id: browser_ctx.proxy_id.clone(),
+    };
+
+    browser_ctx
+        .sender
+        .send((request, response_tx))
+        .await
+        .map_err(|_| "browser_upload_file: channel closed".to_string())?;
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(120), response_rx)
+        .await
+        .map_err(|_| "browser_upload_file: request timed out".to_string())?
+        .map_err(|_| "browser_upload_file: response channel closed".to_string())?;
+
+    if response.success {
+        Ok(serde_json::json!({
+            "success": true,
+            "file_name": file_name,
+            "mime_type": mime_type,
+            "size": size,
+        })
+        .to_string())
+    } else {
+        let msg = response
+            .error
+            .map(|e| e.message)
+            .unwrap_or_else(|| "Upload failed".to_string());
+        Err(msg)
     }
 }
 

@@ -1949,6 +1949,13 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 self.host
                     .tool_call_dynamic("browser_probe", &tool_call.arguments)?
             }
+            "browser_upload_file" => {
+                let tab_id = tool_call.arguments["tab_id"].as_i64();
+                let result_str = self
+                    .host
+                    .tool_call_dynamic("browser_upload_file", &tool_call.arguments)?;
+                self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
+            }
             "browser_get_content" => {
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result = self.host.browser_get_content(tab_id)?;
@@ -3212,6 +3219,37 @@ picked a particular path.".into(),
                     }
                 },
                 "required": ["selector"]
+            }),
+        });
+
+        // PR #5: File upload tool
+        tools.push(ToolDefinition {
+            name: "browser_upload_file".into(),
+            description: "Upload a file to an <input type=\"file\"> element. \
+REQUIRED for file uploads — do NOT use browser_fill or browser_input on file inputs. \
+The file is served via a localhost HTTP bridge to bypass the native messaging size limit. \
+Set workspace_dir to the directory containing the file to allow uploads from any location.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector for the <input type=\"file\"> element"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute path to the file to upload"
+                    },
+                    "workspace_dir": {
+                        "type": "string",
+                        "description": "Directory containing the file (file_path must be inside this dir). Defaults to ~/.local/share/nevoflux/workspace/"
+                    },
+                    "tab_id": {
+                        "type": "integer",
+                        "description": "Optional tab ID"
+                    }
+                },
+                "required": ["selector", "file_path"]
             }),
         });
 
