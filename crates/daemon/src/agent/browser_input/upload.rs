@@ -1,0 +1,517 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+//! File upload support: token management, workspace path validation, and
+//! MIME type detection via magic bytes.
+//!
+//! # Token lifecycle
+//!
+//! 1. Caller validates a file path with `validate_workspace_path` and
+//!    checks its size with `check_file_size`.
+//! 2. Caller constructs a `TokenEntry` and registers it via
+//!    `TokenStore::insert`, receiving a short-lived UUID token string.
+//! 3. The bridge hands the token to the Actor. The Actor calls back
+//!    with the token to retrieve the path via `TokenStore::take`.
+//! 4. Expired tokens are silently dropped on `take`; `sweep_expired`
+//!    removes all stale entries.
+
+use dashmap::DashMap;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use thiserror::Error;
+use uuid::Uuid;
+
+/// Maximum file size allowed for upload (500 MiB).
+pub const DEFAULT_MAX_SIZE: u64 = 500 * 1024 * 1024;
+
+/// How long a token remains valid after insertion.
+pub const TOKEN_TTL: Duration = Duration::from_secs(60);
+
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+/// Errors produced by upload validation helpers.
+#[derive(Debug, Error)]
+pub enum UploadError {
+    #[error("File path not in allowed workspace: {path} (workspace: {workspace})")]
+    PathNotAllowed { path: String, workspace: String },
+
+    #[error("File too large: {size} bytes exceeds {max} byte limit")]
+    FileTooLarge { size: u64, max: u64 },
+
+    #[error("I/O error on {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl UploadError {
+    /// Numeric error code matching the spec.
+    ///
+    /// - `1011` — path traversal / not-in-workspace
+    /// - `1010` — file too large
+    /// - `1005` — I/O error
+    pub fn code(&self) -> u32 {
+        match self {
+            Self::PathNotAllowed { .. } => 1011,
+            Self::FileTooLarge { .. } => 1010,
+            Self::Io { .. } => 1005,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Token store
+// ---------------------------------------------------------------------------
+
+/// Metadata stored alongside each upload token.
+#[derive(Debug, Clone)]
+pub struct TokenEntry {
+    /// Canonical, validated file path.
+    pub path: PathBuf,
+    /// MIME type string (e.g. `"image/jpeg"`).
+    pub mime_type: String,
+    /// Original file name (last path component).
+    pub file_name: String,
+    /// File size in bytes.
+    pub size: u64,
+    /// Absolute instant at which the token expires.
+    pub expires_at: Instant,
+}
+
+/// Thread-safe, lock-free store for short-lived upload tokens.
+///
+/// Tokens are UUID v4 strings. Each token is valid for [`TOKEN_TTL`]
+/// from the time of insertion. `take` performs an atomic remove: the
+/// entry is gone from the map whether it was expired or not, preventing
+/// double-use.
+#[derive(Debug, Default)]
+pub struct TokenStore {
+    inner: DashMap<String, TokenEntry>,
+}
+
+impl TokenStore {
+    /// Create an empty store.
+    pub fn new() -> Self {
+        Self {
+            inner: DashMap::new(),
+        }
+    }
+
+    /// Insert an entry and return the generated token string.
+    pub fn insert(&self, entry: TokenEntry) -> String {
+        let token = Uuid::new_v4().to_string();
+        self.inner.insert(token.clone(), entry);
+        token
+    }
+
+    /// Atomically remove and return an entry.
+    ///
+    /// Returns `None` if the token is unknown **or** if it has expired.
+    /// Either way the entry is removed from the map (no second chance).
+    pub fn take(&self, token: &str) -> Option<TokenEntry> {
+        let (_, entry) = self.inner.remove(token)?;
+        if Instant::now() > entry.expires_at {
+            return None;
+        }
+        Some(entry)
+    }
+
+    /// Remove all entries whose `expires_at` is in the past.
+    pub fn sweep_expired(&self) {
+        let now = Instant::now();
+        self.inner.retain(|_, entry| entry.expires_at > now);
+    }
+
+    /// Number of entries currently in the store (including expired ones
+    /// not yet swept).
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Returns `true` if the store has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Path validation
+// ---------------------------------------------------------------------------
+
+/// Ensure `file_path` is contained within `workspace_dir`.
+///
+/// Both paths are canonicalized before comparison to resolve `..` and
+/// symlinks. Returns the canonical `file_path` on success.
+///
+/// # Errors
+///
+/// - [`UploadError::PathNotAllowed`] if the file is outside the workspace.
+/// - [`UploadError::Io`] if either path cannot be canonicalized (e.g. the
+///   file does not exist).
+pub fn validate_workspace_path(
+    file_path: &Path,
+    workspace_dir: &Path,
+) -> Result<PathBuf, UploadError> {
+    let canonical_workspace =
+        workspace_dir
+            .canonicalize()
+            .map_err(|e| UploadError::Io {
+                path: workspace_dir.display().to_string(),
+                source: e,
+            })?;
+
+    let canonical_file = file_path.canonicalize().map_err(|e| UploadError::Io {
+        path: file_path.display().to_string(),
+        source: e,
+    })?;
+
+    if !canonical_file.starts_with(&canonical_workspace) {
+        return Err(UploadError::PathNotAllowed {
+            path: canonical_file.display().to_string(),
+            workspace: canonical_workspace.display().to_string(),
+        });
+    }
+
+    Ok(canonical_file)
+}
+
+// ---------------------------------------------------------------------------
+// Size check
+// ---------------------------------------------------------------------------
+
+/// Stat `path` and reject it if the file size exceeds `max_size`.
+///
+/// Returns the file size in bytes on success.
+///
+/// # Errors
+///
+/// - [`UploadError::FileTooLarge`] if `size > max_size`.
+/// - [`UploadError::Io`] on any I/O failure.
+pub fn check_file_size(path: &Path, max_size: u64) -> Result<u64, UploadError> {
+    let meta = std::fs::metadata(path).map_err(|e| UploadError::Io {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+
+    let size = meta.len();
+    if size > max_size {
+        return Err(UploadError::FileTooLarge { size, max: max_size });
+    }
+
+    Ok(size)
+}
+
+// ---------------------------------------------------------------------------
+// MIME detection
+// ---------------------------------------------------------------------------
+
+/// Detect the MIME type of `path` by reading its first 12 bytes and
+/// matching against known magic byte sequences.
+///
+/// Supported types:
+///
+/// | MIME | Magic |
+/// |------|-------|
+/// | `image/jpeg` | `FF D8 FF` |
+/// | `image/png` | `89 50 4E 47` |
+/// | `image/gif` | `47 49 46 38` |
+/// | `image/webp` | `RIFF....WEBP` (bytes 0-3 + 8-11) |
+/// | `video/mp4` | `ftyp` at bytes 4-7 |
+/// | `application/pdf` | `25 50 44 46` |
+/// | everything else | `application/octet-stream` |
+///
+/// # Errors
+///
+/// - [`UploadError::Io`] if the file cannot be opened or read.
+pub fn detect_mime(path: &Path) -> Result<String, UploadError> {
+    let mut f = std::fs::File::open(path).map_err(|e| UploadError::Io {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+
+    let mut buf = [0u8; 12];
+    // Read up to 12 bytes; fewer bytes for small files is fine — the
+    // slice indexing below uses `get()` which returns None on short reads.
+    let n = f.read(&mut buf).map_err(|e| UploadError::Io {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+    let buf = &buf[..n];
+
+    let mime = if buf.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else if buf.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        "image/png"
+    } else if buf.starts_with(&[0x47, 0x49, 0x46, 0x38]) {
+        "image/gif"
+    } else if buf.get(0..4) == Some(b"RIFF") && buf.get(8..12) == Some(b"WEBP") {
+        "image/webp"
+    } else if buf.get(4..8) == Some(b"ftyp") {
+        "video/mp4"
+    } else if buf.starts_with(&[0x25, 0x50, 0x44, 0x46]) {
+        "application/pdf"
+    } else {
+        "application/octet-stream"
+    };
+
+    Ok(mime.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    // --- helpers ---
+
+    fn make_file_with_bytes(bytes: &[u8]) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    fn make_entry(path: &Path) -> TokenEntry {
+        TokenEntry {
+            path: path.to_path_buf(),
+            mime_type: "image/jpeg".to_string(),
+            file_name: "test.jpg".to_string(),
+            size: 1024,
+            expires_at: Instant::now() + TOKEN_TTL,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // TokenStore
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn token_insert_and_take() {
+        let store = TokenStore::new();
+        let f = make_file_with_bytes(b"hello");
+        let entry = make_entry(f.path());
+        let expected_path = entry.path.clone();
+
+        let token = store.insert(entry);
+        assert!(!token.is_empty());
+
+        let retrieved = store.take(&token).expect("should retrieve inserted token");
+        assert_eq!(retrieved.path, expected_path);
+        // Map should now be empty
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn take_unknown_token_returns_none() {
+        let store = TokenStore::new();
+        assert!(store.take("00000000-0000-0000-0000-000000000000").is_none());
+    }
+
+    #[test]
+    fn take_expired_token_returns_none() {
+        let store = TokenStore::new();
+        let f = make_file_with_bytes(b"data");
+
+        // Insert an entry that is already expired.
+        let entry = TokenEntry {
+            path: f.path().to_path_buf(),
+            mime_type: "application/octet-stream".to_string(),
+            file_name: "data.bin".to_string(),
+            size: 4,
+            expires_at: Instant::now() - Duration::from_secs(1),
+        };
+        let token = store.insert(entry);
+        assert!(store.take(&token).is_none());
+    }
+
+    #[test]
+    fn sweep_removes_expired_entries() {
+        let store = TokenStore::new();
+        let f = make_file_with_bytes(b"x");
+
+        // Insert one expired and one live entry.
+        let expired_entry = TokenEntry {
+            path: f.path().to_path_buf(),
+            mime_type: "application/octet-stream".to_string(),
+            file_name: "x".to_string(),
+            size: 1,
+            expires_at: Instant::now() - Duration::from_secs(1),
+        };
+        let live_entry = TokenEntry {
+            expires_at: Instant::now() + TOKEN_TTL,
+            ..expired_entry.clone()
+        };
+
+        store.insert(expired_entry);
+        let live_token = store.insert(live_entry);
+
+        assert_eq!(store.len(), 2);
+        store.sweep_expired();
+        assert_eq!(store.len(), 1);
+        // The live token should still be retrievable.
+        assert!(store.take(&live_token).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_workspace_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn workspace_path_accepts_file_inside_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let file_path = workspace.path().join("document.txt");
+        std::fs::write(&file_path, b"content").unwrap();
+
+        let result = validate_workspace_path(&file_path, workspace.path());
+        assert!(result.is_ok(), "should accept file inside workspace: {:?}", result);
+    }
+
+    #[test]
+    fn workspace_path_rejects_file_outside_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let file_path = outside.path().join("secret.txt");
+        std::fs::write(&file_path, b"secret").unwrap();
+
+        let result = validate_workspace_path(&file_path, workspace.path());
+        assert!(
+            matches!(result, Err(UploadError::PathNotAllowed { .. })),
+            "should reject file outside workspace: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_path_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let real_file = outside.path().join("real.txt");
+        std::fs::write(&real_file, b"real").unwrap();
+
+        // Create a symlink inside the workspace that points outside.
+        let link_path = workspace.path().join("escape.txt");
+        symlink(&real_file, &link_path).unwrap();
+
+        let result = validate_workspace_path(&link_path, workspace.path());
+        assert!(
+            matches!(result, Err(UploadError::PathNotAllowed { .. })),
+            "should reject symlink escape: {:?}",
+            result
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // check_file_size
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn file_size_accepts_small_file() {
+        let f = make_file_with_bytes(&[0u8; 1024]);
+        let size = check_file_size(f.path(), DEFAULT_MAX_SIZE).unwrap();
+        assert_eq!(size, 1024);
+    }
+
+    #[test]
+    fn file_size_rejects_oversized_file() {
+        let f = make_file_with_bytes(&[0u8; 1024]);
+        let result = check_file_size(f.path(), 512);
+        assert!(
+            matches!(result, Err(UploadError::FileTooLarge { size: 1024, max: 512 })),
+            "unexpected result: {:?}",
+            result
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_mime
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mime_jpeg() {
+        let f = make_file_with_bytes(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]);
+        assert_eq!(detect_mime(f.path()).unwrap(), "image/jpeg");
+    }
+
+    #[test]
+    fn mime_png() {
+        let f = make_file_with_bytes(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+        assert_eq!(detect_mime(f.path()).unwrap(), "image/png");
+    }
+
+    #[test]
+    fn mime_gif() {
+        // GIF89a
+        let f = make_file_with_bytes(&[0x47, 0x49, 0x46, 0x38, 0x39, 0x61]);
+        assert_eq!(detect_mime(f.path()).unwrap(), "image/gif");
+    }
+
+    #[test]
+    fn mime_webp() {
+        // RIFF....WEBP
+        let mut bytes = [0u8; 12];
+        bytes[0..4].copy_from_slice(b"RIFF");
+        bytes[4..8].copy_from_slice(&[0x24, 0x00, 0x00, 0x00]); // file size LE
+        bytes[8..12].copy_from_slice(b"WEBP");
+        let f = make_file_with_bytes(&bytes);
+        assert_eq!(detect_mime(f.path()).unwrap(), "image/webp");
+    }
+
+    #[test]
+    fn mime_mp4() {
+        // ftyp box at offset 4
+        let mut bytes = [0u8; 12];
+        bytes[0..4].copy_from_slice(&[0x00, 0x00, 0x00, 0x20]); // box size
+        bytes[4..8].copy_from_slice(b"ftyp");
+        bytes[8..12].copy_from_slice(b"isom");
+        let f = make_file_with_bytes(&bytes);
+        assert_eq!(detect_mime(f.path()).unwrap(), "video/mp4");
+    }
+
+    #[test]
+    fn mime_unknown_fallback() {
+        let f = make_file_with_bytes(b"hello, world!");
+        assert_eq!(detect_mime(f.path()).unwrap(), "application/octet-stream");
+    }
+
+    // -----------------------------------------------------------------------
+    // Error codes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_codes_match_spec() {
+        assert_eq!(
+            UploadError::PathNotAllowed {
+                path: "a".into(),
+                workspace: "b".into()
+            }
+            .code(),
+            1011
+        );
+        assert_eq!(
+            UploadError::FileTooLarge { size: 1, max: 0 }.code(),
+            1010
+        );
+        assert_eq!(
+            UploadError::Io {
+                path: "x".into(),
+                source: std::io::Error::new(std::io::ErrorKind::Other, "oops")
+            }
+            .code(),
+            1005
+        );
+    }
+}

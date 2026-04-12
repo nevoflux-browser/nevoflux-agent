@@ -1063,6 +1063,12 @@ impl BrowserTool {
                 let text = arguments.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 serde_json::json!({ "selector": selector, "text": text })
             }
+            BrowserToolAction::UploadFile => {
+                // Dispatched via the browser_upload_file tool (Task 4).
+                // Pass arguments through unchanged; the orchestration layer
+                // handles token issuance and file serving.
+                arguments.clone()
+            }
         };
 
         (params, tab_id)
