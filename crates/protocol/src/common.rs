@@ -261,6 +261,10 @@ pub enum BrowserToolAction {
     /// Replace contentEditable content (clear + paste). (PR #1 Actor method)
     #[serde(rename = "fillRichText")]
     FillRichText,
+    /// Upload a file to an <input type="file"> element via HTTP bridge.
+    /// (PR #5 browser input file upload)
+    #[serde(rename = "uploadFile")]
+    UploadFile,
 }
 
 /// File attachment

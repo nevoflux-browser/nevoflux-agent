@@ -380,6 +380,8 @@ fn tool_name_to_browser_action(name: &str) -> Option<BrowserToolAction> {
         // Browser input strategy engine (PR #2 + #2.5)
         "input" => Some(BrowserToolAction::Input),
         "probe" => Some(BrowserToolAction::Probe),
+        // File upload (PR #5)
+        "upload_file" => Some(BrowserToolAction::UploadFile),
         _ => None,
     }
 }
@@ -398,6 +400,14 @@ async fn execute_browser_tool(
     // single request to the browser extension.
     if matches!(action, BrowserToolAction::Input | BrowserToolAction::Probe) {
         return execute_browser_input_orchestrated(action, arguments, browser_ctx).await;
+    }
+
+    // Intercept PR #5 upload tool — not yet supported in WASM agent mode.
+    if matches!(action, BrowserToolAction::UploadFile) {
+        return Err(
+            "browser_upload_file is not yet supported in WASM agent mode. Use Code Mode."
+                .to_string(),
+        );
     }
 
     let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
@@ -1460,6 +1470,7 @@ mod tests {
             ("browser_edit_artifact", BrowserToolAction::EditArtifact),
             ("browser_ask_user", BrowserToolAction::AskUser),
             ("fetch_page", BrowserToolAction::WebFetch),
+            ("browser_upload_file", BrowserToolAction::UploadFile),
         ];
         for (name, expected) in cases {
             assert_eq!(
