@@ -23,6 +23,7 @@
 //!
 //! All types support both JSON and MessagePack serialization via serde.
 
+pub mod canvas_tools;
 pub mod channel;
 pub mod chat;
 pub mod common;
@@ -32,6 +33,12 @@ pub mod events;
 pub mod json_repair;
 pub mod mcp;
 pub mod subagent;
+
+// Re-export canvas tool types
+pub use canvas_tools::{
+    CanvasToolEvent, CanvasToolInvokeRequest, CanvasToolInvokeResponse, CanvasToolListRequest,
+    CanvasToolListResponse, CanvasToolSummary,
+};
 
 // Re-export main types at crate root
 pub use channel::Channel;
