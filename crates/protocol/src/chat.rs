@@ -4,6 +4,10 @@
 //!
 //! Messages exchanged between Chat Sidebar and Agent via the Chat channel.
 
+use crate::canvas_tools::{
+    CanvasToolEvent, CanvasToolInvokeRequest, CanvasToolInvokeResponse, CanvasToolListRequest,
+    CanvasToolListResponse,
+};
 use crate::common::*;
 use crate::events::{EventBusDelivery, EventBusRequest, EventBusResponse};
 use serde::{Deserialize, Serialize};
@@ -470,6 +474,10 @@ pub enum SidebarMessage {
     ToolAuthResponse(ToolAuthResponse),
     /// EventBus request (subscribe/unsubscribe/publish/history)
     EventsRequest(EventBusRequest),
+    /// Canvas tool invocation request
+    CanvasToolInvoke(CanvasToolInvokeRequest),
+    /// Canvas tool list request
+    CanvasToolList(CanvasToolListRequest),
 }
 
 /// All messages from Agent to Sidebar
@@ -493,6 +501,12 @@ pub enum AgentMessage {
     EventsResponse(EventBusResponse),
     /// EventBus push delivery (async event)
     EventsDelivery(EventBusDelivery),
+    /// Canvas tool invocation response
+    CanvasToolInvokeResponse(CanvasToolInvokeResponse),
+    /// Canvas tool list response
+    CanvasToolListResponse(CanvasToolListResponse),
+    /// Canvas tool streaming event
+    CanvasToolEvent(CanvasToolEvent),
 }
 
 #[cfg(test)]
@@ -1175,5 +1189,237 @@ mod tests {
         assert!(json.contains("\"type\":\"events_delivery\""));
         let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    // ====================================================================
+    // Canvas Tool Whitelist tests
+    // ====================================================================
+
+    #[test]
+    fn test_canvas_tool_invoke_request_roundtrip() {
+        use std::collections::HashMap;
+        let mut params = HashMap::new();
+        params.insert("file".to_string(), "main.rs".to_string());
+        let req = CanvasToolInvokeRequest {
+            tool_name: "cargo_test".into(),
+            params,
+            args: Some(vec!["--verbose".into()]),
+            session_id: "sess-100".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: CanvasToolInvokeRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, decoded);
+    }
+
+    #[test]
+    fn test_canvas_tool_list_request_roundtrip() {
+        let req = CanvasToolListRequest {
+            include_disabled: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: CanvasToolListRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, decoded);
+    }
+
+    #[test]
+    fn test_canvas_tool_invoke_response_roundtrip() {
+        let resp = CanvasToolInvokeResponse {
+            tool_name: "cargo_test".into(),
+            success: true,
+            stdout: Some("test result: ok".into()),
+            stderr: None,
+            exit_code: Some(0),
+            error: None,
+            duration_ms: 1500,
+            invocation_id: "inv-001".into(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: CanvasToolInvokeResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, decoded);
+    }
+
+    #[test]
+    fn test_canvas_tool_list_response_roundtrip() {
+        use crate::canvas_tools::CanvasToolSummary;
+        let resp = CanvasToolListResponse {
+            tools: vec![
+                CanvasToolSummary {
+                    name: "cargo_test".into(),
+                    description: Some("Run cargo tests".into()),
+                    kind: "shell".into(),
+                    args_mode: Some("params".into()),
+                    enabled: true,
+                    source: "builtin".into(),
+                },
+                CanvasToolSummary {
+                    name: "eslint".into(),
+                    description: None,
+                    kind: "shell".into(),
+                    args_mode: None,
+                    enabled: false,
+                    source: "user".into(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: CanvasToolListResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, decoded);
+        assert_eq!(decoded.tools.len(), 2);
+    }
+
+    #[test]
+    fn test_canvas_tool_event_variants_roundtrip() {
+        // Started
+        let started = CanvasToolEvent::Started {
+            invocation_id: "inv-200".into(),
+            tool_name: "build".into(),
+        };
+        let json = serde_json::to_string(&started).unwrap();
+        assert!(json.contains("\"event\":\"started\""));
+        let decoded: CanvasToolEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(started, decoded);
+
+        // Output (stdout)
+        let output = CanvasToolEvent::Output {
+            invocation_id: "inv-200".into(),
+            stream: "stdout".into(),
+            data: "Compiling...\n".into(),
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(json.contains("\"event\":\"output\""));
+        let decoded: CanvasToolEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(output, decoded);
+
+        // Output (stderr)
+        let stderr = CanvasToolEvent::Output {
+            invocation_id: "inv-200".into(),
+            stream: "stderr".into(),
+            data: "warning: unused variable\n".into(),
+        };
+        let json = serde_json::to_string(&stderr).unwrap();
+        let decoded: CanvasToolEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(stderr, decoded);
+
+        // Completed (success)
+        let completed = CanvasToolEvent::Completed {
+            invocation_id: "inv-200".into(),
+            success: true,
+            duration_ms: 5000,
+        };
+        let json = serde_json::to_string(&completed).unwrap();
+        assert!(json.contains("\"event\":\"completed\""));
+        let decoded: CanvasToolEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(completed, decoded);
+
+        // Completed (failure)
+        let failed = CanvasToolEvent::Completed {
+            invocation_id: "inv-200".into(),
+            success: false,
+            duration_ms: 100,
+        };
+        let json = serde_json::to_string(&failed).unwrap();
+        let decoded: CanvasToolEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(failed, decoded);
+
+        // Error
+        let error = CanvasToolEvent::Error {
+            invocation_id: "inv-200".into(),
+            message: "Process killed by signal 9".into(),
+        };
+        let json = serde_json::to_string(&error).unwrap();
+        assert!(json.contains("\"event\":\"error\""));
+        let decoded: CanvasToolEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(error, decoded);
+    }
+
+    #[test]
+    fn test_sidebar_message_canvas_tool_invoke_tagged() {
+        use std::collections::HashMap;
+        let msg = SidebarMessage::CanvasToolInvoke(CanvasToolInvokeRequest {
+            tool_name: "run_tests".into(),
+            params: HashMap::new(),
+            args: None,
+            session_id: "sess-200".into(),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"canvas_tool_invoke\""));
+        assert!(json.contains("\"payload\""));
+        let decoded: SidebarMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, SidebarMessage::CanvasToolInvoke(_)));
+    }
+
+    #[test]
+    fn test_sidebar_message_canvas_tool_list_tagged() {
+        let msg = SidebarMessage::CanvasToolList(CanvasToolListRequest {
+            include_disabled: false,
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"canvas_tool_list\""));
+        assert!(json.contains("\"payload\""));
+        let decoded: SidebarMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, SidebarMessage::CanvasToolList(_)));
+    }
+
+    #[test]
+    fn test_agent_message_canvas_tool_event_tagged() {
+        let msg = AgentMessage::CanvasToolEvent(CanvasToolEvent::Started {
+            invocation_id: "inv-300".into(),
+            tool_name: "lint".into(),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"canvas_tool_event\""));
+        assert!(json.contains("\"payload\""));
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, AgentMessage::CanvasToolEvent(_)));
+    }
+
+    #[test]
+    fn test_agent_message_canvas_tool_invoke_response_tagged() {
+        let msg = AgentMessage::CanvasToolInvokeResponse(CanvasToolInvokeResponse {
+            tool_name: "build".into(),
+            success: false,
+            stdout: None,
+            stderr: Some("error[E0308]: mismatched types".into()),
+            exit_code: Some(1),
+            error: Some("Compilation failed".into()),
+            duration_ms: 3200,
+            invocation_id: "inv-301".into(),
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"canvas_tool_invoke_response\""));
+        assert!(json.contains("\"payload\""));
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            AgentMessage::CanvasToolInvokeResponse(_)
+        ));
+        if let AgentMessage::CanvasToolInvokeResponse(r) = decoded {
+            assert_eq!(r.success, false);
+            assert_eq!(r.exit_code, Some(1));
+        }
+    }
+
+    #[test]
+    fn test_agent_message_canvas_tool_list_response_tagged() {
+        use crate::canvas_tools::CanvasToolSummary;
+        let msg = AgentMessage::CanvasToolListResponse(CanvasToolListResponse {
+            tools: vec![CanvasToolSummary {
+                name: "cargo_test".into(),
+                description: Some("Run cargo tests".into()),
+                kind: "shell".into(),
+                args_mode: Some("params".into()),
+                enabled: true,
+                source: "builtin".into(),
+            }],
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"canvas_tool_list_response\""));
+        assert!(json.contains("\"payload\""));
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, AgentMessage::CanvasToolListResponse(_)));
+        if let AgentMessage::CanvasToolListResponse(r) = decoded {
+            assert_eq!(r.tools.len(), 1);
+            assert_eq!(r.tools[0].name, "cargo_test");
+        }
     }
 }
