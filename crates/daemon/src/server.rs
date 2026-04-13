@@ -1127,7 +1127,7 @@ pub async fn start_server(
 
     // Spawn periodic cleanup task for stale browser request registry entries.
     // Removes entries where the receiver has been dropped (agent cancelled) or
-    // entries older than 5 minutes (response lost / sidebar disconnected).
+    // entries older than 10 minutes (response lost / sidebar disconnected).
     let cleanup_browser_registry = browser_registry.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -1136,7 +1136,7 @@ pub async fn start_server(
             let mut registry = cleanup_browser_registry.lock().await;
             let before = registry.len();
             registry.retain(|_id, (created_at, sender)| {
-                !sender.is_closed() && created_at.elapsed() < std::time::Duration::from_secs(300)
+                !sender.is_closed() && created_at.elapsed() < std::time::Duration::from_secs(600)
             });
             let removed = before - registry.len();
             if removed > 0 {
