@@ -56,7 +56,7 @@ pub enum EventBusRequest {
 pub struct SubscribeRequest {
     /// Client-generated request ID for correlation.
     pub request_id: String,
-    /// Topic or pattern to subscribe to (e.g. `"agent.status"` or `"agent.*"`).
+    /// Topic or pattern to subscribe to (e.g. `"agent:status"` or `"agent:*"`).
     pub pattern: String,
     /// Whether `pattern` contains wildcards (`*`).
     #[serde(default)]
@@ -80,7 +80,7 @@ pub struct UnsubscribeRequest {
 /// Request to publish an event to a topic.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PublishRequest {
-    /// Topic to publish to (e.g. `"agent.status.changed"`).
+    /// Topic to publish to (e.g. `"agent:status:changed"`).
     pub topic: String,
     /// Event payload (arbitrary JSON).
     pub payload: Value,
@@ -229,7 +229,7 @@ mod tests {
     fn test_subscribe_request_serialization() {
         let req = EventBusRequest::Subscribe(SubscribeRequest {
             request_id: "req-1".into(),
-            pattern: "agent.status".into(),
+            pattern: "agent:status".into(),
             is_wildcard: false,
             buffer_size: 128,
             backpressure: "drop_newest".into(),
@@ -237,7 +237,7 @@ mod tests {
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["type"], "subscribe");
         assert_eq!(json["payload"]["request_id"], "req-1");
-        assert_eq!(json["payload"]["pattern"], "agent.status");
+        assert_eq!(json["payload"]["pattern"], "agent:status");
         assert_eq!(json["payload"]["is_wildcard"], false);
         assert_eq!(json["payload"]["buffer_size"], 128);
         assert_eq!(json["payload"]["backpressure"], "drop_newest");
@@ -252,14 +252,14 @@ mod tests {
             "type": "subscribe",
             "payload": {
                 "request_id": "req-2",
-                "pattern": "agent.*"
+                "pattern": "agent:*"
             }
         }"#;
         let req: EventBusRequest = serde_json::from_str(json_str).unwrap();
         match req {
             EventBusRequest::Subscribe(sub) => {
                 assert_eq!(sub.request_id, "req-2");
-                assert_eq!(sub.pattern, "agent.*");
+                assert_eq!(sub.pattern, "agent:*");
                 assert!(!sub.is_wildcard);
                 assert_eq!(sub.buffer_size, 256);
                 assert_eq!(sub.backpressure, "drop_oldest");
@@ -271,14 +271,14 @@ mod tests {
     #[test]
     fn test_publish_request_serialization() {
         let req = EventBusRequest::Publish(PublishRequest {
-            topic: "agent.status.changed".into(),
+            topic: "agent:status:changed".into(),
             payload: json!({"state": "idle"}),
             delivery: "persistent".into(),
             ttl_secs: Some(3600),
         });
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["type"], "publish");
-        assert_eq!(json["payload"]["topic"], "agent.status.changed");
+        assert_eq!(json["payload"]["topic"], "agent:status:changed");
         assert_eq!(json["payload"]["payload"]["state"], "idle");
         assert_eq!(json["payload"]["delivery"], "persistent");
         assert_eq!(json["payload"]["ttl_secs"], 3600);
@@ -292,14 +292,14 @@ mod tests {
         let json_str = r#"{
             "type": "publish",
             "payload": {
-                "topic": "test.topic",
+                "topic": "test:topic",
                 "payload": {"key": "value"}
             }
         }"#;
         let req: EventBusRequest = serde_json::from_str(json_str).unwrap();
         match req {
             EventBusRequest::Publish(pub_req) => {
-                assert_eq!(pub_req.topic, "test.topic");
+                assert_eq!(pub_req.topic, "test:topic");
                 assert_eq!(pub_req.delivery, "ephemeral");
                 assert!(pub_req.ttl_secs.is_none());
             }
@@ -324,14 +324,14 @@ mod tests {
     fn test_history_request_serialization() {
         let req = EventBusRequest::History(HistoryRequest {
             request_id: "hist-1".into(),
-            topic: "agent.status".into(),
+            topic: "agent:status".into(),
             limit: 25,
             after: Some(1700000000000),
         });
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["type"], "history");
         assert_eq!(json["payload"]["request_id"], "hist-1");
-        assert_eq!(json["payload"]["topic"], "agent.status");
+        assert_eq!(json["payload"]["topic"], "agent:status");
         assert_eq!(json["payload"]["limit"], 25);
         assert_eq!(json["payload"]["after"], 1700000000000_i64);
 
@@ -359,7 +359,7 @@ mod tests {
         let resp = EventBusResponse::EventDelivery(EventDelivery {
             subscription_id: "sub-456".into(),
             event_id: "evt-789".into(),
-            topic: "agent.status.changed".into(),
+            topic: "agent:status:changed".into(),
             payload: json!({"state": "busy"}),
             publisher_kind: "extension".into(),
             timestamp: 1700000000000,
@@ -368,7 +368,7 @@ mod tests {
         assert_eq!(json["type"], "event_delivery");
         assert_eq!(json["payload"]["subscription_id"], "sub-456");
         assert_eq!(json["payload"]["event_id"], "evt-789");
-        assert_eq!(json["payload"]["topic"], "agent.status.changed");
+        assert_eq!(json["payload"]["topic"], "agent:status:changed");
         assert_eq!(json["payload"]["payload"]["state"], "busy");
         assert_eq!(json["payload"]["publisher_kind"], "extension");
         assert_eq!(json["payload"]["timestamp"], 1700000000000_i64);
@@ -384,7 +384,7 @@ mod tests {
             events: vec![
                 HistoryEvent {
                     id: "evt-1".into(),
-                    topic: "agent.status".into(),
+                    topic: "agent:status".into(),
                     payload: json!({"state": "idle"}),
                     publisher_kind: "wasm".into(),
                     publisher_id: "plugin-abc".into(),
@@ -393,7 +393,7 @@ mod tests {
                 },
                 HistoryEvent {
                     id: "evt-2".into(),
-                    topic: "agent.status".into(),
+                    topic: "agent:status".into(),
                     payload: json!({"state": "busy"}),
                     publisher_kind: "extension".into(),
                     publisher_id: "ext-xyz".into(),
@@ -450,7 +450,7 @@ mod tests {
         let requests = vec![
             EventBusRequest::Subscribe(SubscribeRequest {
                 request_id: "r1".into(),
-                pattern: "test.*".into(),
+                pattern: "test:*".into(),
                 is_wildcard: true,
                 buffer_size: 64,
                 backpressure: "block".into(),
@@ -459,14 +459,14 @@ mod tests {
                 subscription_id: "sub-1".into(),
             }),
             EventBusRequest::Publish(PublishRequest {
-                topic: "test.event".into(),
+                topic: "test:event".into(),
                 payload: json!({"data": 42}),
                 delivery: "persistent".into(),
                 ttl_secs: Some(120),
             }),
             EventBusRequest::History(HistoryRequest {
                 request_id: "h1".into(),
-                topic: "test.event".into(),
+                topic: "test:event".into(),
                 limit: 10,
                 after: None,
             }),
@@ -491,12 +491,12 @@ mod tests {
             }),
             EventBusResponse::Published(PublishedResponse {
                 event_id: "evt-1".into(),
-                topic: "test.event".into(),
+                topic: "test:event".into(),
             }),
             EventBusResponse::EventDelivery(EventDelivery {
                 subscription_id: "sub-1".into(),
                 event_id: "evt-1".into(),
-                topic: "test.event".into(),
+                topic: "test:event".into(),
                 payload: json!(null),
                 publisher_kind: "mcp".into(),
                 timestamp: 0,

@@ -30,6 +30,7 @@ impl PersistentWriterHandle {
     /// Try to enqueue an event for persistence.
     ///
     /// Returns `Err(event)` if the channel is full (back-pressure).
+    #[allow(clippy::result_large_err)]
     pub fn send(&self, event: BusEvent) -> Result<(), BusEvent> {
         self.tx.try_send(event).map_err(|e| match e {
             mpsc::error::TrySendError::Full(ev) => ev,

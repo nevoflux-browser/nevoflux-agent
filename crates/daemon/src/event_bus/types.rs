@@ -145,18 +145,13 @@ impl TopicPattern {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackpressurePolicy {
+    #[default]
     DropOldest,
     DropNewest,
     Block,
-}
-
-impl Default for BackpressurePolicy {
-    fn default() -> Self {
-        Self::DropOldest
-    }
 }
 
 #[derive(Debug, Clone)]
