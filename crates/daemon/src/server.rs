@@ -909,6 +909,28 @@ pub async fn start_server(
         Arc::new(registry)
     };
 
+    // Canvas Tool Whitelist registry
+    let canvas_tool_registry = {
+        use crate::canvas_tools::ToolWhitelistRegistry;
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("nevoflux");
+        let builtin_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("canvas-tools");
+        let user_dir = config_dir.join("canvas-tools");
+        let reg = Arc::new(ToolWhitelistRegistry::with_dirs(builtin_dir, user_dir));
+        // Load tools from disk in a background task
+        let bg_reg = Arc::clone(&reg);
+        tokio::spawn(async move {
+            bg_reg.load_from_disk().await;
+            info!(
+                "Canvas tool registry loaded: {} tools ({} enabled)",
+                bg_reg.list_all().len(),
+                bg_reg.list_enabled().len(),
+            );
+        });
+        reg
+    };
+
     let mut services = HostServices::new(Arc::new(db))
         .with_browser_sender(browser_tx)
         .with_mcp_manager(mcp_manager)
@@ -1188,6 +1210,7 @@ pub async fn start_server(
     let process_event_bus = event_bus.clone();
     let process_subscription_router = subscription_router.clone();
     let process_trace_enabled = config.trace_enabled;
+    let process_canvas_tool_registry = canvas_tool_registry.clone();
     tokio::spawn(async move {
         while let Some((identity, envelope)) = msg_rx.recv().await {
             let proxy_id = envelope.proxy_id.clone();
@@ -1340,6 +1363,186 @@ pub async fn start_server(
                             let _ = tx.send(response);
                         } else {
                             warn!("No pending tool auth request for tool_id: {}", tool_id);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // Handle canvas_tool_list requests
+            if msg_type == "canvas_tool_list" {
+                info!("Processing canvas_tool_list message");
+                let include_disabled = envelope
+                    .payload
+                    .get("payload")
+                    .and_then(|p| {
+                        serde_json::from_value::<nevoflux_protocol::CanvasToolListRequest>(
+                            p.clone(),
+                        )
+                        .ok()
+                    })
+                    .map(|req| req.include_disabled)
+                    .unwrap_or(false);
+
+                let tools = if include_disabled {
+                    process_canvas_tool_registry.list_all()
+                } else {
+                    process_canvas_tool_registry.list_enabled()
+                };
+
+                let summaries: Vec<nevoflux_protocol::CanvasToolSummary> = tools
+                    .iter()
+                    .map(|t| nevoflux_protocol::CanvasToolSummary {
+                        name: t.name.clone(),
+                        description: Some(t.description.clone()),
+                        kind: format!("{:?}", t.kind).to_lowercase(),
+                        args_mode: Some(format!("{:?}", t.args_mode).to_lowercase()),
+                        enabled: t.enabled,
+                        source: format!("{:?}", t.source).to_lowercase(),
+                    })
+                    .collect();
+
+                let resp = nevoflux_protocol::AgentMessage::CanvasToolListResponse(
+                    nevoflux_protocol::CanvasToolListResponse { tools: summaries },
+                );
+                let payload = serde_json::to_value(&resp).unwrap_or_default();
+                let response = DaemonEnvelope::new(&proxy_id, channel, payload)
+                    .with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_tool_invoke requests (spawned as async task)
+            if msg_type == "canvas_tool_invoke" {
+                info!("Processing canvas_tool_invoke message");
+                if let Some(inner) = envelope.payload.get("payload") {
+                    match serde_json::from_value::<nevoflux_protocol::CanvasToolInvokeRequest>(
+                        inner.clone(),
+                    ) {
+                        Ok(req) => {
+                            let registry = process_canvas_tool_registry.clone();
+                            let resp_tx = process_response_tx.clone();
+                            let ident = identity.clone();
+                            let pid = proxy_id.clone();
+                            let rid = request_id.clone();
+                            let invocation_id = format!(
+                                "inv-{}",
+                                uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0")
+                            );
+
+                            tokio::spawn(async move {
+                                // Look up tool in registry
+                                let tool = match registry.get(&req.tool_name) {
+                                    Some(t) => t,
+                                    None => {
+                                        let resp = nevoflux_protocol::AgentMessage::CanvasToolInvokeResponse(
+                                            nevoflux_protocol::CanvasToolInvokeResponse {
+                                                tool_name: req.tool_name.clone(),
+                                                success: false,
+                                                stdout: None,
+                                                stderr: None,
+                                                exit_code: None,
+                                                error: Some(format!("Tool not found or disabled: {}", req.tool_name)),
+                                                duration_ms: 0,
+                                                invocation_id: invocation_id.clone(),
+                                            },
+                                        );
+                                        let payload = serde_json::to_value(&resp).unwrap_or_default();
+                                        let env = DaemonEnvelope::new(&pid, Channel::Chat, payload)
+                                            .with_request_id(&rid);
+                                        let _ = resp_tx.send((ident, env)).await;
+                                        return;
+                                    }
+                                };
+
+                                // Send Started event
+                                let started = nevoflux_protocol::AgentMessage::CanvasToolEvent(
+                                    nevoflux_protocol::CanvasToolEvent::Started {
+                                        invocation_id: invocation_id.clone(),
+                                        tool_name: req.tool_name.clone(),
+                                    },
+                                );
+                                let payload = serde_json::to_value(&started).unwrap_or_default();
+                                let env = DaemonEnvelope::new(&pid, Channel::Chat, payload);
+                                let _ = resp_tx.send((ident.clone(), env)).await;
+
+                                // Execute tool
+                                let free_args = req.args.as_deref().unwrap_or(&[]);
+                                let session_dir = std::env::temp_dir().join(format!(
+                                    "nevoflux-canvas-{}",
+                                    req.session_id
+                                ));
+                                // Ensure session dir exists
+                                let _ = tokio::fs::create_dir_all(&session_dir).await;
+
+                                let result =
+                                    crate::canvas_tools::executor::execute_whitelisted_tool(
+                                        &tool,
+                                        &req.params,
+                                        free_args,
+                                        &session_dir,
+                                    )
+                                    .await;
+
+                                // Build and send response
+                                let response = match result {
+                                    Ok(exec_result) => {
+                                        nevoflux_protocol::CanvasToolInvokeResponse {
+                                            tool_name: req.tool_name.clone(),
+                                            success: exec_result.success,
+                                            stdout: if exec_result.stdout.is_empty() {
+                                                None
+                                            } else {
+                                                Some(exec_result.stdout)
+                                            },
+                                            stderr: if exec_result.stderr.is_empty() {
+                                                None
+                                            } else {
+                                                Some(exec_result.stderr)
+                                            },
+                                            exit_code: exec_result.exit_code,
+                                            error: exec_result.error,
+                                            duration_ms: exec_result.duration_ms,
+                                            invocation_id: invocation_id.clone(),
+                                        }
+                                    }
+                                    Err(e) => nevoflux_protocol::CanvasToolInvokeResponse {
+                                        tool_name: req.tool_name.clone(),
+                                        success: false,
+                                        stdout: None,
+                                        stderr: None,
+                                        exit_code: None,
+                                        error: Some(e.to_string()),
+                                        duration_ms: 0,
+                                        invocation_id: invocation_id.clone(),
+                                    },
+                                };
+
+                                // Send Completed event
+                                let completed = nevoflux_protocol::AgentMessage::CanvasToolEvent(
+                                    nevoflux_protocol::CanvasToolEvent::Completed {
+                                        invocation_id: invocation_id.clone(),
+                                        success: response.success,
+                                        duration_ms: response.duration_ms,
+                                    },
+                                );
+                                let payload =
+                                    serde_json::to_value(&completed).unwrap_or_default();
+                                let env = DaemonEnvelope::new(&pid, Channel::Chat, payload);
+                                let _ = resp_tx.send((ident.clone(), env)).await;
+
+                                // Send the final response
+                                let resp = nevoflux_protocol::AgentMessage::CanvasToolInvokeResponse(
+                                    response,
+                                );
+                                let payload = serde_json::to_value(&resp).unwrap_or_default();
+                                let env = DaemonEnvelope::new(&pid, Channel::Chat, payload)
+                                    .with_request_id(&rid);
+                                let _ = resp_tx.send((ident, env)).await;
+                            });
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse CanvasToolInvokeRequest: {}", e);
                         }
                     }
                 }
