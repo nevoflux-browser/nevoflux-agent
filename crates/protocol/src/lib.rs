@@ -56,9 +56,8 @@ pub use mcp::{
 
 // Re-export EventBus types
 pub use events::{
-    EventBusErrorResponse, EventBusRequest, EventBusResponse, EventDelivery, HistoryEvent,
-    HistoryRequest, HistoryResult, PublishRequest, PublishedResponse, SubscribeRequest,
-    SubscribedResponse, UnsubscribeRequest, UnsubscribedResponse,
+    BusEventPayload, DeliveryMode, EventBusDelivery, EventBusRequest, EventBusResponse,
+    HistoryQuery, PublishOptions, SubscribeOptions,
 };
 
 // Re-export common types

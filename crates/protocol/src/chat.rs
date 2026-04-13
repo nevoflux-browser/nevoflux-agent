@@ -5,6 +5,7 @@
 //! Messages exchanged between Chat Sidebar and Agent via the Chat channel.
 
 use crate::common::*;
+use crate::events::{EventBusDelivery, EventBusRequest, EventBusResponse};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -467,6 +468,8 @@ pub enum SidebarMessage {
     BrowserToolResponse(BrowserToolResponse),
     PlanResponse(PlanResponse),
     ToolAuthResponse(ToolAuthResponse),
+    /// EventBus request (subscribe/unsubscribe/publish/history)
+    EventsRequest(EventBusRequest),
 }
 
 /// All messages from Agent to Sidebar
@@ -486,6 +489,10 @@ pub enum AgentMessage {
     ArtifactStart(ArtifactStart),
     ArtifactDelta(ArtifactDelta),
     ArtifactComplete(ArtifactComplete),
+    /// EventBus response (one-shot reply)
+    EventsResponse(EventBusResponse),
+    /// EventBus push delivery (async event)
+    EventsDelivery(EventBusDelivery),
 }
 
 #[cfg(test)]
@@ -1116,5 +1123,57 @@ mod tests {
         if let AgentMessage::ArtifactComplete(c) = decoded {
             assert_eq!(c.id, "art-002");
         }
+    }
+
+    // ====================================================================
+    // EventBus integration tests
+    // ====================================================================
+
+    #[test]
+    fn test_sidebar_message_events_request_serialization() {
+        use crate::events::*;
+        let msg = SidebarMessage::EventsRequest(EventBusRequest::Subscribe(SubscribeOptions {
+            patterns: vec!["session:*:notification".into()],
+            replay_sticky: true,
+            buffer_size: 256,
+        }));
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"events_request\""));
+        assert!(json.contains("\"action\":\"subscribe\""));
+        let decoded: SidebarMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_agent_message_events_response_serialization() {
+        use crate::events::*;
+        let msg = AgentMessage::EventsResponse(EventBusResponse::Subscribed {
+            subscription_id: "sub-001".into(),
+            patterns: vec!["session:*:notification".into()],
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"events_response\""));
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_agent_message_events_delivery_serialization() {
+        use crate::events::*;
+        let msg = AgentMessage::EventsDelivery(EventBusDelivery {
+            subscription_id: "sub-001".into(),
+            event: BusEventPayload {
+                event_id: "evt-001".into(),
+                topic: "task:status".into(),
+                payload: serde_json::json!({"done": true}),
+                delivery: DeliveryMode::Ephemeral,
+                publisher: "agent:planner".into(),
+                timestamp_ms: 1700000000000,
+            },
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"events_delivery\""));
+        let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, decoded);
     }
 }
