@@ -1,9 +1,11 @@
 //! Canvas Tool Whitelist system.
+pub mod audit;
 pub mod executor;
 pub mod param_validator;
 pub mod registry;
 pub mod toml_parser;
 pub mod types;
+pub use audit::AuditLogger;
 pub use executor::{
     check_free_mode_subcommand, execute_command_tool, execute_whitelisted_tool,
     render_template_args, ToolExecResult,
