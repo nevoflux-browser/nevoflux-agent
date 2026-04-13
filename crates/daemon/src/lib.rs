@@ -45,6 +45,7 @@ pub mod validation;
 pub mod wasm;
 pub mod event_bus;
 pub mod canvas_tools;
+pub mod share;
 
 pub use config::{
     AgentConfig, AuthConfig, ConfigError, ContextConfig, DaemonConfig, LlmConfig, LoggingConfig,
