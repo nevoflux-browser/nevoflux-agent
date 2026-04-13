@@ -352,4 +352,24 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "valid_tool");
     }
+
+    // 12. Parse the shipped example TOML files from examples/canvas-tools/
+    #[tokio::test]
+    async fn test_parse_example_tools_directory() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/canvas-tools");
+        if dir.exists() {
+            let tools = parse_tool_directory(&dir).await;
+            assert!(
+                tools.len() >= 4,
+                "Expected at least 4 example tools, got {}",
+                tools.len()
+            );
+            let names: Vec<_> = tools.iter().map(|t| t.name.as_str()).collect();
+            assert!(names.contains(&"ffmpeg.trim"));
+            assert!(names.contains(&"ffmpeg.probe"));
+            assert!(names.contains(&"git"));
+            assert!(names.contains(&"fs.read"));
+        }
+    }
 }
