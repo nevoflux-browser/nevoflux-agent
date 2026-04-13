@@ -81,6 +81,9 @@ dirs = "5.0"
 directories = { workspace = true }
 toml = "0.8"
 
+# SQLite (needed by event_bus persistent writer for params!)
+rusqlite = { workspace = true }
+
 # Date/time utilities
 chrono = { version = "0.4", features = ["serde"] }
 

@@ -25,6 +25,14 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "008_message_index",
         include_str!("migrations/008_message_index.sql"),
     ),
+    (
+        "009_fts_trigram",
+        include_str!("migrations/009_fts_trigram.sql"),
+    ),
+    (
+        "010_event_bus",
+        include_str!("migrations/010_event_bus.sql"),
+    ),
 ];
 
 /// Run all pending migrations on the given connection.
@@ -77,7 +85,7 @@ mod tests {
         let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 8);
+        assert_eq!(count, 10);
     }
 
     #[test]
@@ -159,5 +167,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1, "View knowledge_health should exist");
+    }
+
+    #[test]
+    fn migration_010_creates_event_bus_persistent_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_all(&mut conn).unwrap();
+
+        // Verify table exists
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='event_bus_persistent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "Table event_bus_persistent should exist");
+
+        // Verify indexes exist
+        for idx in &[
+            "idx_ebp_topic",
+            "idx_ebp_expires_at",
+            "idx_ebp_created_at",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='{}'",
+                        idx
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "Index {} should exist", idx);
+        }
+
+        // Verify we can INSERT and SELECT
+        conn.execute(
+            "INSERT INTO event_bus_persistent (id, topic, payload, publisher_kind, publisher_id, created_at, expires_at)
+             VALUES ('evt-001', 'task:status', '{\"status\":\"done\"}', 'agent', 'agent-1', strftime('%s','now'), strftime('%s','now') + 3600)",
+            [],
+        )
+        .unwrap();
+
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM event_bus_persistent WHERE id = 'evt-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(payload.contains("done"));
     }
 }
