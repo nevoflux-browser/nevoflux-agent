@@ -60,6 +60,16 @@ type ExtractionRegistry = Arc<
     >,
 >;
 
+/// Tracks EventBus subscription-to-proxy mappings for delivery routing.
+#[allow(dead_code)]
+struct SubscriptionEntry {
+    proxy_id: String,
+    identity: Vec<u8>,
+    cancel_token: tokio_util::sync::CancellationToken,
+}
+
+type SubscriptionRouter = Arc<Mutex<HashMap<String, SubscriptionEntry>>>;
+
 /// Shared mutable agent config that can be updated at runtime (e.g. when changing active LLM provider).
 type SharedAgentConfig = Arc<RwLock<Arc<AgentConfig>>>;
 
@@ -238,6 +248,17 @@ async fn handle_proxy_connection(
 
     // Clean up writer
     writers.lock().await.remove(&proxy_id);
+
+    // Notify the message loop about the disconnect so EventBus subscriptions
+    // belonging to this proxy can be cleaned up.
+    let disconnect_payload = serde_json::json!({
+        "type": "_proxy_disconnected",
+        "proxy_id": proxy_id,
+    });
+    let disconnect_envelope =
+        ProxyEnvelope::new(&proxy_id, "", Channel::Chat, disconnect_payload);
+    let _ = msg_tx.send((identity.clone(), disconnect_envelope)).await;
+
     info!("Proxy {} cleaned up", proxy_id);
 }
 
@@ -363,6 +384,18 @@ pub async fn start_server(
 
     // Create extraction registry for session-level memory extractors
     let extraction_registry: ExtractionRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+    // Initialize EventBus with persistence
+    let event_bus = {
+        use crate::event_bus::{EventBus, PersistentCleaner, PersistentWriter};
+        let storage_arc = session_manager.shared_storage();
+        let (writer_handle, writer) = PersistentWriter::new(storage_arc.clone());
+        tokio::spawn(writer.run());
+        let cleaner = PersistentCleaner::new(storage_arc);
+        tokio::spawn(cleaner.run());
+        Arc::new(EventBus::with_persistence(writer_handle))
+    };
+    let subscription_router: SubscriptionRouter = Arc::new(Mutex::new(HashMap::new()));
 
     // Initialize MCP manager (empty) and tool search index.
     // Actual connections happen in a background task so the daemon starts fast.
@@ -1152,6 +1185,8 @@ pub async fn start_server(
     let process_plan_registry = plan_registry.clone();
     let process_tool_auth_registry = tool_auth_registry.clone();
     let process_extraction_registry = extraction_registry.clone();
+    let process_event_bus = event_bus.clone();
+    let process_subscription_router = subscription_router.clone();
     let process_trace_enabled = config.trace_enabled;
     tokio::spawn(async move {
         while let Some((identity, envelope)) = msg_rx.recv().await {
@@ -1307,6 +1342,64 @@ pub async fn start_server(
                             warn!("No pending tool auth request for tool_id: {}", tool_id);
                         }
                     }
+                }
+                continue;
+            }
+
+            // Check for EventBus request messages from frontend
+            if msg_type == "events_request" {
+                info!("Processing events_request message");
+                if let Some(payload) = envelope.payload.get("payload") {
+                    match serde_json::from_value::<nevoflux_protocol::EventBusRequest>(
+                        payload.clone(),
+                    ) {
+                        Ok(request) => {
+                            let eb = process_event_bus.clone();
+                            let sub_router = process_subscription_router.clone();
+                            let resp_tx = process_response_tx.clone();
+                            let pid = proxy_id.clone();
+                            let rid = request_id.clone();
+                            let ident = identity.clone();
+
+                            tokio::spawn(async move {
+                                let response = handle_event_bus_request(
+                                    request,
+                                    &eb,
+                                    &sub_router,
+                                    &pid,
+                                    &ident,
+                                    resp_tx.clone(),
+                                )
+                                .await;
+                                let msg =
+                                    nevoflux_protocol::AgentMessage::EventsResponse(response);
+                                let payload = serde_json::to_value(&msg).unwrap_or_default();
+                                let envelope = DaemonEnvelope::new(&pid, Channel::Chat, payload)
+                                    .with_request_id(&rid);
+                                let _ = resp_tx.send((ident, envelope)).await;
+                            });
+                        }
+                        Err(e) => warn!("Failed to parse EventBusRequest: {}", e),
+                    }
+                }
+                continue;
+            }
+
+            // Handle internal proxy disconnect notification for EventBus cleanup
+            if msg_type == "_proxy_disconnected" {
+                let disconnected_id = envelope
+                    .payload
+                    .get("proxy_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !disconnected_id.is_empty() {
+                    cleanup_proxy_subscriptions(
+                        &disconnected_id,
+                        &process_subscription_router,
+                        &process_event_bus,
+                    )
+                    .await;
                 }
                 continue;
             }
@@ -1470,6 +1563,194 @@ async fn backfill_embeddings(
             }
         }
         Err(e) => warn!(error = %e, "Failed to query knowledge for backfill"),
+    }
+}
+
+/// Handle an EventBus request from a proxy and return the corresponding response.
+///
+/// Dispatches Subscribe, Unsubscribe, Publish, and History requests.
+/// For subscriptions, spawns a delivery forwarder task that relays events
+/// back to the originating proxy.
+async fn handle_event_bus_request(
+    request: nevoflux_protocol::EventBusRequest,
+    event_bus: &Arc<crate::event_bus::EventBus>,
+    subscription_router: &SubscriptionRouter,
+    proxy_id: &str,
+    identity: &[u8],
+    response_tx: mpsc::Sender<(Vec<u8>, DaemonEnvelope)>,
+) -> nevoflux_protocol::EventBusResponse {
+    use crate::event_bus::*;
+    use nevoflux_protocol::events::*;
+
+    match request {
+        EventBusRequest::Subscribe(opts) => {
+            let pattern_str = opts.patterns.first().cloned().unwrap_or_default();
+            let pattern = if pattern_str.contains('*') {
+                TopicPattern::wildcard(&pattern_str)
+            } else {
+                TopicPattern::exact(&pattern_str)
+            };
+            let subscriber = SubscriberIdentity::Extension {
+                proxy_id: proxy_id.to_string(),
+            };
+
+            match event_bus.subscribe(
+                pattern,
+                subscriber,
+                BackpressurePolicy::DropOldest,
+                opts.buffer_size,
+            ) {
+                Ok(mut sub_handle) => {
+                    let sub_id = sub_handle.id.clone();
+                    let cancel_token = tokio_util::sync::CancellationToken::new();
+                    let token_clone = cancel_token.clone();
+                    let fwd_proxy_id = proxy_id.to_string();
+                    let fwd_identity = identity.to_vec();
+                    let fwd_response_tx = response_tx.clone();
+                    let fwd_sub_id = sub_id.clone();
+
+                    // Spawn delivery forwarder that relays BusEvents to the proxy
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::select! {
+                                _ = token_clone.cancelled() => break,
+                                event = sub_handle.rx.recv() => {
+                                    match event {
+                                        Some(bus_event) => {
+                                            let delivery = EventBusDelivery {
+                                                subscription_id: fwd_sub_id.clone(),
+                                                event: BusEventPayload {
+                                                    event_id: bus_event.id.clone(),
+                                                    topic: bus_event.topic.clone(),
+                                                    payload: bus_event.payload.clone(),
+                                                    delivery: match bus_event.delivery {
+                                                        Delivery::Ephemeral => DeliveryMode::Ephemeral,
+                                                        Delivery::Sticky => DeliveryMode::Sticky,
+                                                        Delivery::Persistent => DeliveryMode::Persistent {
+                                                            ttl_secs: bus_event.ttl.map(|d| d.as_secs()),
+                                                        },
+                                                    },
+                                                    publisher: format!("{:?}", bus_event.publisher),
+                                                    timestamp_ms: bus_event.created_at.timestamp_millis() as u64,
+                                                },
+                                            };
+                                            let msg = nevoflux_protocol::AgentMessage::EventsDelivery(delivery);
+                                            let payload = serde_json::to_value(&msg).unwrap_or_default();
+                                            let env = DaemonEnvelope::new(
+                                                &fwd_proxy_id,
+                                                Channel::Chat,
+                                                payload,
+                                            );
+                                            if fwd_response_tx
+                                                .send((fwd_identity.clone(), env))
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        None => break,
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    // Register in subscription router for cleanup on disconnect
+                    subscription_router.lock().await.insert(
+                        sub_id.clone(),
+                        SubscriptionEntry {
+                            proxy_id: proxy_id.to_string(),
+                            identity: identity.to_vec(),
+                            cancel_token,
+                        },
+                    );
+
+                    EventBusResponse::Subscribed {
+                        subscription_id: sub_id,
+                        patterns: opts.patterns,
+                    }
+                }
+                Err(e) => EventBusResponse::Error {
+                    code: "SUBSCRIBE_FAILED".into(),
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        EventBusRequest::Unsubscribe { subscription_id } => {
+            if let Some(entry) = subscription_router.lock().await.remove(&subscription_id) {
+                entry.cancel_token.cancel();
+            }
+            event_bus.unsubscribe(&subscription_id);
+            EventBusResponse::Unsubscribed { subscription_id }
+        }
+
+        EventBusRequest::Publish(opts) => {
+            let publisher = PublisherIdentity::Extension {
+                proxy_id: proxy_id.to_string(),
+            };
+            let event = match opts.delivery {
+                DeliveryMode::Ephemeral => {
+                    BusEvent::ephemeral(opts.topic.clone(), opts.payload, publisher)
+                }
+                DeliveryMode::Sticky => {
+                    BusEvent::sticky(opts.topic.clone(), opts.payload, publisher)
+                }
+                DeliveryMode::Persistent { ttl_secs } => BusEvent::persistent(
+                    opts.topic.clone(),
+                    opts.payload,
+                    publisher,
+                    ttl_secs.map(std::time::Duration::from_secs),
+                ),
+            };
+            let event_id = event.id.clone();
+            match event_bus.publish(event).await {
+                Ok(()) => EventBusResponse::Published { event_id },
+                Err(e) => EventBusResponse::Error {
+                    code: "PUBLISH_FAILED".into(),
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        EventBusRequest::History(_query) => {
+            // History queries require direct SQLite access -- defer to v2
+            EventBusResponse::Error {
+                code: "NOT_IMPLEMENTED".into(),
+                message: "History queries not yet implemented".into(),
+            }
+        }
+    }
+}
+
+/// Clean up all EventBus subscriptions belonging to a disconnected proxy.
+///
+/// Cancels the delivery forwarder tasks and removes the subscriptions from
+/// both the router and the EventBus itself.
+async fn cleanup_proxy_subscriptions(
+    proxy_id: &str,
+    subscription_router: &SubscriptionRouter,
+    event_bus: &Arc<crate::event_bus::EventBus>,
+) {
+    let mut router = subscription_router.lock().await;
+    let to_remove: Vec<String> = router
+        .iter()
+        .filter(|(_, entry)| entry.proxy_id == proxy_id)
+        .map(|(sub_id, _)| sub_id.clone())
+        .collect();
+    for sub_id in &to_remove {
+        if let Some(entry) = router.remove(sub_id) {
+            entry.cancel_token.cancel();
+        }
+        event_bus.unsubscribe(sub_id);
+    }
+    if !to_remove.is_empty() {
+        info!(
+            "Cleaned up {} EventBus subscriptions for proxy {}",
+            to_remove.len(),
+            proxy_id
+        );
     }
 }
 
