@@ -5,12 +5,14 @@
 //! - Sticky: retained in memory, replayed to new subscribers
 //! - Persistent: written to SQLite for durability and history queries
 
+pub mod bus;
 pub mod permissions;
 pub mod persistent;
 pub mod ring_buffer;
 pub mod topic;
 pub mod types;
 
+pub use bus::{EventBus, EventBusError, SubscriptionHandle};
 pub use permissions::{PermissionChecker, PermissionResult};
 pub use persistent::{PersistentCleaner, PersistentWriter, PersistentWriterHandle};
 pub use ring_buffer::BoundedRingBuffer;
