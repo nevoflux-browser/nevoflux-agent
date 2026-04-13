@@ -2982,10 +2982,10 @@ The following skill instructions MUST be followed exactly. These instructions ta
         // Browser navigation
         tools.push(ToolDefinition {
             name: "browser_navigate".into(),
-            description: "Navigate to a specific URL in the CURRENT tab. \
-Only set new_tab=true when the user EXPLICITLY asks to open in a new tab. \
-Default behavior: navigate the current tab (new_tab=false). \
-For returning to previous page, prefer browser_go_back. NEVER use navigate to 'go back'.".into(),
+            description: "Navigate to a URL in the CURRENT tab. \
+If the site is ALREADY OPEN in another tab, use browser_activate_tab instead. \
+Only set new_tab=true when the user EXPLICITLY says 'new tab'. \
+For going back, use browser_go_back. NEVER use navigate to 'go back'.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -3009,8 +3009,10 @@ For returning to previous page, prefer browser_go_back. NEVER use navigate to 'g
 
         tools.push(ToolDefinition {
             name: "browser_activate_tab".into(),
-            description: "Switch to (activate) a specific browser tab. Use browser_get_tabs \
-first to find the tab ID you want to switch to.".into(),
+            description: "Switch to (activate) an already-open browser tab. \
+When the user says 'activate', 'switch to', 'go to [site]' and that site is already open, \
+use browser_get_tabs first to find the tab, then activate it. \
+Do NOT use browser_navigate when the tab is already open — activate it instead.".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
