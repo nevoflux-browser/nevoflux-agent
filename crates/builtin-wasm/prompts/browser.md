@@ -30,6 +30,7 @@ In browser/agent mode, a **page state snapshot** is appended to the user message
 | Compare these tabs | `browser_get_markdown` per tab |
 | General question | Answer directly |
 | Research a topic | `plan` then `web_search` x N then synthesize |
+| Activate / switch to / go to [already-open site] | `browser_get_tabs` → find tab → `browser_activate_tab(tab_id)` |
 | Click / fill / submit on page | `browser_click_by_id` / `browser_input` (rich text) / `browser_fill_by_id` |
 | Parallel independent tasks | `subagent_spawn` then `subagent_wait_all` |
 | File or system task | Suggest switching to Agent mode |
@@ -49,6 +50,12 @@ In browser/agent mode, a **page state snapshot** is appended to the user message
 - Prefer clicking links visible in the snapshot over calling `browser_navigate`.
 - Use `browser_go_back` to return to the previous page. Do NOT call `browser_navigate` with the previous URL.
 - Use `browser_navigate` only when you need to go to a URL not present in the current page.
+
+## Tab management
+
+- When the user says "activate", "switch to", or "go to [site]", **always call `browser_get_tabs` first**. If the site is already open in another tab, use `browser_activate_tab(tab_id)` to switch to it. Do NOT call `browser_navigate` — that replaces the current page content.
+- `browser_navigate` navigates the **current** tab by default. Only pass `new_tab=true` when the user explicitly says "new tab" or "open in new tab".
+- Use `browser_activate_tab` whenever you need to switch between existing tabs.
 
 ## After-action flow
 
