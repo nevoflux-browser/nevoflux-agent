@@ -2995,7 +2995,8 @@ For returning to previous page, prefer browser_go_back. NEVER use navigate to 'g
                     },
                     "new_tab": {
                         "type": "boolean",
-                        "description": "ONLY set to true when the user explicitly asks for a new tab. Default: false (navigate current tab)."
+                        "default": false,
+                        "description": "Default false. Do NOT set this unless the user says 'new tab' or 'open in new tab'. When omitted or false, navigates the current tab."
                     },
                     "tab_id": {
                         "type": "integer",
