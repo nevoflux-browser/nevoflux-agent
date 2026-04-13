@@ -28,6 +28,7 @@ pub mod chat;
 pub mod common;
 pub mod envelope;
 mod error;
+pub mod events;
 pub mod json_repair;
 pub mod mcp;
 pub mod subagent;
@@ -51,6 +52,13 @@ pub use chat::{
 pub use mcp::{
     JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpMessage, McpRequest, McpResponse,
     McpSource,
+};
+
+// Re-export EventBus types
+pub use events::{
+    EventBusErrorResponse, EventBusRequest, EventBusResponse, EventDelivery, HistoryEvent,
+    HistoryRequest, HistoryResult, PublishRequest, PublishedResponse, SubscribeRequest,
+    SubscribedResponse, UnsubscribeRequest, UnsubscribedResponse,
 };
 
 // Re-export common types
