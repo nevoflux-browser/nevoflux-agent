@@ -33,6 +33,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "010_event_bus",
         include_str!("migrations/010_event_bus.sql"),
     ),
+    (
+        "011_canvas_tool_audit",
+        include_str!("migrations/011_canvas_tool_audit.sql"),
+    ),
 ];
 
 /// Run all pending migrations on the given connection.
@@ -85,7 +89,7 @@ mod tests {
         let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 10);
+        assert_eq!(count, 11);
     }
 
     #[test]
@@ -219,5 +223,60 @@ mod tests {
             )
             .unwrap();
         assert!(payload.contains("done"));
+    }
+
+    #[test]
+    fn migration_011_creates_canvas_tool_invocations_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_all(&mut conn).unwrap();
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='canvas_tool_invocations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "Table canvas_tool_invocations should exist");
+
+        // Verify INSERT works
+        conn.execute(
+            "INSERT INTO canvas_tool_invocations (id, session_id, tool_name, backend_kind, args_json, status, started_at)
+             VALUES ('inv-001', 'sess-001', 'ffmpeg.trim', 'command', '[]', 'started', strftime('%s','now'))",
+            [],
+        )
+        .unwrap();
+
+        let row_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM canvas_tool_invocations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row_count, 1);
+    }
+
+    #[test]
+    fn migration_011_indexes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_all(&mut conn).unwrap();
+
+        for idx in &[
+            "idx_canvas_invocations_session",
+            "idx_canvas_invocations_tool",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='{}'",
+                        idx
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "Index {} should exist", idx);
+        }
     }
 }
