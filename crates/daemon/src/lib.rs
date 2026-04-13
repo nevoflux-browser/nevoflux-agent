@@ -43,6 +43,7 @@ pub mod skills;
 pub mod trace;
 pub mod validation;
 pub mod wasm;
+pub mod event_bus;
 
 pub use config::{
     AgentConfig, AuthConfig, ConfigError, ContextConfig, DaemonConfig, LlmConfig, LoggingConfig,
