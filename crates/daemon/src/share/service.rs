@@ -7,7 +7,8 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use chrono::{DateTime, Utc};
 use nevoflux_storage::{Storage, StorageError};
 
 use super::binary_format::{deserialize, serialize};
@@ -24,6 +25,14 @@ use crate::error::{DaemonError, Result};
 
 /// Default TTL: 30 days.
 pub const DEFAULT_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// Parse an ISO 8601 / RFC 3339 timestamp into a Unix timestamp. On parse
+/// failure returns `0` so callers can at least store a row.
+fn parse_iso8601_to_unix(s: &str) -> i64 {
+    DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.timestamp())
+        .unwrap_or(0)
+}
 
 /// Info about an active share (what `list()` returns).
 #[derive(Debug, Clone)]
@@ -125,8 +134,12 @@ impl CanvasShareService {
         // 5. Upload to the CF Worker.
         let upload_resp = self
             .http
-            .upload(&nfeb_bytes, &owner_token_hash, ttl)
+            .upload(&share_id, &nfeb_bytes, &owner_token_hash, ttl)
             .await?;
+
+        // The CF Worker returns `expires_at` as an ISO 8601 string; convert to
+        // a Unix timestamp for internal/on-disk use.
+        let expires_at_ts = parse_iso8601_to_unix(&upload_resp.expires_at);
 
         // 6. Store credentials locally, encrypted at rest.
         let enc_password = encrypt_for_storage(&password, &self.master_key)?;
@@ -134,8 +147,8 @@ impl CanvasShareService {
         let now = Utc::now().timestamp();
 
         let share_id_db = upload_resp.share_id.clone();
-        let share_url_db = upload_resp.share_url.clone();
-        let expires_at_db = upload_resp.expires_at;
+        let share_url_db = upload_resp.url.clone();
+        let expires_at_db = expires_at_ts;
         let artifact_id_db = artifact_id.to_string();
 
         self.storage.database().with_connection(|conn| {
@@ -157,9 +170,9 @@ impl CanvasShareService {
 
         Ok(ShareResult {
             share_id: upload_resp.share_id,
-            share_url: upload_resp.share_url,
+            share_url: upload_resp.url,
             password,
-            expires_at: upload_resp.expires_at,
+            expires_at: expires_at_ts,
         })
     }
 
@@ -219,23 +232,25 @@ impl CanvasShareService {
         })
     }
 
-    /// Extend a share's TTL by `extend_secs` seconds. Returns the new expiry.
+    /// Extend a share's TTL by `extend_secs` seconds. Returns the new expiry
+    /// as a Unix timestamp.
     pub async fn extend(&self, share_id: &str, extend_secs: u64) -> Result<i64> {
         // 1. Load the encrypted owner token.
         let enc_token = self.load_encrypted_owner_token(share_id)?;
 
-        // 2. Decrypt to get the raw owner token.
+        // 2. Decrypt to get the raw owner token, then base64url-encode it for
+        //    the CF Worker (which expects `owner_token` as base64url-no-pad).
         let owner_token = decrypt_bytes_from_storage(&enc_token, &self.master_key)?;
-        let owner_token_hex = hex::encode(&owner_token);
+        let owner_token_b64 = URL_SAFE_NO_PAD.encode(&owner_token);
 
         // 3. Ask the server to extend.
         let resp = self
             .http
-            .extend(share_id, &owner_token_hex, extend_secs)
+            .extend(share_id, &owner_token_b64, extend_secs)
             .await?;
 
-        // 4. Update the local expires_at.
-        let new_expires_at = resp.expires_at;
+        // 4. Update the local expires_at (Unix timestamp).
+        let new_expires_at = parse_iso8601_to_unix(&resp.expires_at);
         let share_id_db = share_id.to_string();
         self.storage.database().with_connection(|conn| {
             conn.execute(
@@ -245,7 +260,7 @@ impl CanvasShareService {
             Ok(())
         })?;
 
-        Ok(resp.expires_at)
+        Ok(new_expires_at)
     }
 
     /// Delete a share. Removes server-side and moves the local record to
@@ -254,10 +269,10 @@ impl CanvasShareService {
         // 1. Load and decrypt the owner token.
         let enc_token = self.load_encrypted_owner_token(share_id)?;
         let owner_token = decrypt_bytes_from_storage(&enc_token, &self.master_key)?;
-        let owner_token_hex = hex::encode(&owner_token);
+        let owner_token_b64 = URL_SAFE_NO_PAD.encode(&owner_token);
 
-        // 2. Delete on the server.
-        self.http.delete(share_id, &owner_token_hex).await?;
+        // 2. Delete on the server (expects base64url-encoded owner token).
+        self.http.delete(share_id, &owner_token_b64).await?;
 
         // 3. Move to history + delete the active-share row.
         let share_id_db = share_id.to_string();

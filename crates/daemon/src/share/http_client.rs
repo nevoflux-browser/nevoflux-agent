@@ -16,32 +16,57 @@ pub struct ShareHttpClient {
 }
 
 /// Upload response from the CF Worker.
+///
+/// Matches the deployed CF Worker's `UploadResponse` TypeScript interface:
+/// `{ share_id, expires_at (ISO 8601), size_bytes, url }`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UploadResponse {
     pub share_id: String,
-    pub share_url: String,
-    pub expires_at: i64,
+    /// ISO 8601 timestamp string (not a Unix timestamp).
+    pub expires_at: String,
+    pub size_bytes: u64,
+    pub url: String,
 }
 
 /// Metadata response.
+///
+/// Matches the deployed CF Worker's `MetaResponse` TypeScript interface.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetaResponse {
     pub share_id: String,
-    pub expires_at: i64,
-    pub view_count: u64,
+    /// ISO 8601 timestamp string.
+    pub created_at: String,
+    /// ISO 8601 timestamp string.
+    pub expires_at: String,
     pub size_bytes: u64,
+    pub view_count: u64,
 }
 
 /// Extend request body.
 #[derive(Debug, Clone, Serialize)]
-pub struct ExtendRequest {
-    pub extend_secs: u64,
+struct ExtendRequestBody<'a> {
+    owner_token: &'a str,
+    extend_secs: u64,
+}
+
+/// Delete request body.
+#[derive(Debug, Clone, Serialize)]
+struct DeleteRequestBody<'a> {
+    owner_token: &'a str,
 }
 
 /// Extend response.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExtendResponse {
-    pub expires_at: i64,
+    pub share_id: String,
+    /// ISO 8601 timestamp string.
+    pub expires_at: String,
+}
+
+/// Delete response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeleteResponse {
+    pub deleted: bool,
 }
 
 impl ShareHttpClient {
@@ -69,22 +94,25 @@ impl ShareHttpClient {
 
     /// Upload an encrypted NFEB bundle.
     ///
+    /// - `share_id`: 10-char Crockford base32 share ID (caller-generated)
     /// - `nfeb_bytes`: serialized encrypted bundle
     /// - `owner_token_hash`: hex-encoded SHA-256 hash of the owner token (for later auth)
     /// - `ttl_secs`: requested TTL in seconds (server may cap)
     pub async fn upload(
         &self,
+        share_id: &str,
         nfeb_bytes: &[u8],
         owner_token_hash: &str,
         ttl_secs: u64,
     ) -> Result<UploadResponse> {
-        let url = format!("{}/api/share", self.base_url);
+        let url = format!(
+            "{}/api/share?share_id={}&owner_token_hash={}&expiry_secs={}",
+            self.base_url, share_id, owner_token_hash, ttl_secs,
+        );
         let response = self
             .client
             .post(&url)
             .header("Content-Type", "application/octet-stream")
-            .header("X-Owner-Token-Hash", owner_token_hash)
-            .header("X-TTL-Secs", ttl_secs.to_string())
             .body(nfeb_bytes.to_vec())
             .send()
             .await
@@ -165,19 +193,24 @@ impl ShareHttpClient {
             .map_err(|e| DaemonError::InternalError(format!("Meta parse: {}", e)))
     }
 
-    /// Extend share TTL. `owner_token_hex` is the raw hex-encoded owner token.
+    /// Extend share TTL.
+    ///
+    /// `owner_token_b64url` must be the base64url-encoded (no padding) 32-byte
+    /// owner token, as expected by the CF Worker.
     pub async fn extend(
         &self,
         share_id: &str,
-        owner_token_hex: &str,
+        owner_token_b64url: &str,
         extend_secs: u64,
     ) -> Result<ExtendResponse> {
         let url = format!("{}/api/share/{}", self.base_url, share_id);
-        let body = ExtendRequest { extend_secs };
+        let body = ExtendRequestBody {
+            owner_token: owner_token_b64url,
+            extend_secs,
+        };
         let response = self
             .client
             .patch(&url)
-            .header("X-Owner-Token", owner_token_hex)
             .json(&body)
             .send()
             .await
@@ -188,10 +221,18 @@ impl ShareHttpClient {
                 "Unauthorized (wrong owner token)".into(),
             ));
         }
+        if response.status() == 404 {
+            return Err(DaemonError::InvalidRequest(format!(
+                "Share not found: {}",
+                share_id
+            )));
+        }
         if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
             return Err(DaemonError::InternalError(format!(
-                "Extend failed: {}",
-                response.status()
+                "Extend failed: {} - {}",
+                status, body
             )));
         }
 
@@ -201,13 +242,19 @@ impl ShareHttpClient {
             .map_err(|e| DaemonError::InternalError(format!("Extend parse: {}", e)))
     }
 
-    /// Delete a share. `owner_token_hex` is the raw hex-encoded owner token.
-    pub async fn delete(&self, share_id: &str, owner_token_hex: &str) -> Result<()> {
+    /// Delete a share.
+    ///
+    /// `owner_token_b64url` must be the base64url-encoded (no padding) 32-byte
+    /// owner token, as expected by the CF Worker.
+    pub async fn delete(&self, share_id: &str, owner_token_b64url: &str) -> Result<()> {
         let url = format!("{}/api/share/{}", self.base_url, share_id);
+        let body = DeleteRequestBody {
+            owner_token: owner_token_b64url,
+        };
         let response = self
             .client
             .delete(&url)
-            .header("X-Owner-Token", owner_token_hex)
+            .json(&body)
             .send()
             .await
             .map_err(|e| DaemonError::InternalError(format!("Delete request failed: {}", e)))?;
@@ -215,11 +262,30 @@ impl ShareHttpClient {
         if response.status() == 403 {
             return Err(DaemonError::InvalidRequest("Unauthorized".into()));
         }
-        if !response.status().is_success() && response.status() != 204 {
-            return Err(DaemonError::InternalError(format!(
-                "Delete failed: {}",
-                response.status()
+        if response.status() == 404 {
+            return Err(DaemonError::InvalidRequest(format!(
+                "Share not found: {}",
+                share_id
             )));
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(DaemonError::InternalError(format!(
+                "Delete failed: {} - {}",
+                status, body
+            )));
+        }
+
+        // The CF Worker returns `{ deleted: true }` with 200. Parse and verify.
+        let resp = response
+            .json::<DeleteResponse>()
+            .await
+            .map_err(|e| DaemonError::InternalError(format!("Delete parse: {}", e)))?;
+        if !resp.deleted {
+            return Err(DaemonError::InternalError(
+                "Server reported delete did not succeed".into(),
+            ));
         }
         Ok(())
     }
@@ -249,35 +315,58 @@ mod tests {
     }
 
     #[test]
-    fn test_extend_request_serialization() {
-        let req = ExtendRequest { extend_secs: 3600 };
-        let json = serde_json::to_string(&req).unwrap();
-        assert_eq!(json, r#"{"extend_secs":3600}"#);
+    fn test_extend_request_body_serialization() {
+        let body = ExtendRequestBody {
+            owner_token: "abc",
+            extend_secs: 3600,
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert_eq!(json, r#"{"owner_token":"abc","extend_secs":3600}"#);
+    }
+
+    #[test]
+    fn test_delete_request_body_serialization() {
+        let body = DeleteRequestBody {
+            owner_token: "abc",
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        assert_eq!(json, r#"{"owner_token":"abc"}"#);
     }
 
     #[test]
     fn test_upload_response_deserialization() {
-        let json = r#"{"share_id":"abc123","share_url":"https://example.com/s/abc123","expires_at":1234567890}"#;
+        let json = r#"{"share_id":"abc123","expires_at":"2026-04-13T12:00:00.000Z","size_bytes":1024,"url":"https://share.nevoflux.app/c/abc123"}"#;
         let resp: UploadResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.share_id, "abc123");
-        assert_eq!(resp.share_url, "https://example.com/s/abc123");
-        assert_eq!(resp.expires_at, 1234567890);
+        assert_eq!(resp.expires_at, "2026-04-13T12:00:00.000Z");
+        assert_eq!(resp.size_bytes, 1024);
+        assert_eq!(resp.url, "https://share.nevoflux.app/c/abc123");
     }
 
     #[test]
     fn test_meta_response_deserialization() {
-        let json = r#"{"share_id":"abc123","expires_at":1234567890,"view_count":42,"size_bytes":1024}"#;
+        let json = r#"{"share_id":"abc123","created_at":"2026-04-13T10:00:00.000Z","expires_at":"2026-04-13T12:00:00.000Z","size_bytes":1024,"view_count":42}"#;
         let resp: MetaResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.share_id, "abc123");
+        assert_eq!(resp.created_at, "2026-04-13T10:00:00.000Z");
+        assert_eq!(resp.expires_at, "2026-04-13T12:00:00.000Z");
         assert_eq!(resp.view_count, 42);
         assert_eq!(resp.size_bytes, 1024);
     }
 
     #[test]
     fn test_extend_response_deserialization() {
-        let json = r#"{"expires_at":1234567890}"#;
+        let json = r#"{"share_id":"abc123","expires_at":"2026-04-13T12:00:00.000Z"}"#;
         let resp: ExtendResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.expires_at, 1234567890);
+        assert_eq!(resp.share_id, "abc123");
+        assert_eq!(resp.expires_at, "2026-04-13T12:00:00.000Z");
+    }
+
+    #[test]
+    fn test_delete_response_deserialization() {
+        let json = r#"{"deleted":true}"#;
+        let resp: DeleteResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.deleted);
     }
 
     /// Network-hitting smoke test; ignored by default.
