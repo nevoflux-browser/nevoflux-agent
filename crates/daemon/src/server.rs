@@ -937,7 +937,7 @@ pub async fn start_server(
         let storage_arc = session_manager.shared_storage();
         let http = ShareHttpClient::with_default_url().unwrap_or_else(|_| {
             // Fallback: use a dummy URL if construction fails
-            ShareHttpClient::new("https://share.nevoflux.com").expect("valid fallback URL")
+            ShareHttpClient::new("https://share.nevoflux.app").expect("valid fallback URL")
         });
         // Master key for local credential encryption — derived from config or
         // random fallback. For now, use a stable placeholder; production

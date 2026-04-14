@@ -103,7 +103,7 @@ export async function handleUpload(c: Context<{ Bindings: Env }>): Promise<Respo
     share_id: shareId,
     expires_at: expiresAt.toISOString(),
     size_bytes: body.byteLength,
-    url: `https://share.nevoflux.com/c/${shareId}`,
+    url: `https://share.nevoflux.app/c/${shareId}`,
   };
 
   return jsonOk(response, 201);

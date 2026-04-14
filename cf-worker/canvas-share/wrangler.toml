@@ -9,7 +9,7 @@ bucket_name = "nevoflux-canvas-share"
 
 [[kv_namespaces]]
 binding = "SHARE_KV"
-id = "placeholder-kv-id"
+id = "e76d074de96e456ca6d36b10bca1f778"
 
 [triggers]
 crons = ["0 */6 * * *"]

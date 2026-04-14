@@ -146,7 +146,7 @@ function renderSharePage(shareId: string, meta: ShareKVMeta): string {
     </a>
     <p class="note">
       You will need the share password to decrypt this canvas.<br>
-      Don't have NevoFlux? <a href="https://nevoflux.com/download">Download it here</a>.
+      Don't have NevoFlux? <a href="https://nevoflux.app/download">Download it here</a>.
     </p>
   </div>
 </body>

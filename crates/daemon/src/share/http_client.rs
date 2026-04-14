@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{DaemonError, Result};
 
 /// Default base URL for the CF Worker (can be overridden).
-pub const DEFAULT_BASE_URL: &str = "https://share.nevoflux.com";
+pub const DEFAULT_BASE_URL: &str = "https://share.nevoflux.app";
 
 /// HTTP client for the Canvas Share API.
 #[derive(Clone)]
