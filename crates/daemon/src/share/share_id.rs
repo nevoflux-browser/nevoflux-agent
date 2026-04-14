@@ -155,12 +155,15 @@ pub fn crockford_decode(encoded: &str) -> Option<Vec<u8>> {
 ///
 /// The ID is generated from 6 cryptographically random bytes, producing a
 /// uniform distribution over the 48-bit space (281 trillion possible IDs).
+///
+/// Output is lowercase — this matches the canonical wire format expected by
+/// the deployed CF Worker API. (Decoders are case-insensitive.)
 pub fn generate_share_id() -> String {
     let mut rng = rand::thread_rng();
     let mut bytes = [0u8; 6];
     rng.fill(&mut bytes);
     // 6 bytes = 48 bits, ceil(48/5) = 10 characters
-    crockford_encode(&bytes)
+    crockford_encode(&bytes).to_ascii_lowercase()
 }
 
 /// Validate that a string is a well-formed share ID.
