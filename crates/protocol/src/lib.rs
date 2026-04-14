@@ -23,6 +23,7 @@
 //!
 //! All types support both JSON and MessagePack serialization via serde.
 
+pub mod canvas_share;
 pub mod canvas_tools;
 pub mod channel;
 pub mod chat;
@@ -33,6 +34,14 @@ pub mod events;
 pub mod json_repair;
 pub mod mcp;
 pub mod subagent;
+
+// Re-export canvas share types
+pub use canvas_share::{
+    CanvasImportRequest, CanvasImportResponse, CanvasShareDeleteRequest,
+    CanvasShareDeleteResponse, CanvasShareExtendRequest, CanvasShareExtendResponse,
+    CanvasShareInfo, CanvasShareListRequest, CanvasShareListResponse, CanvasShareRequest,
+    CanvasShareResponse,
+};
 
 // Re-export canvas tool types
 pub use canvas_tools::{

@@ -931,6 +931,25 @@ pub async fn start_server(
         reg
     };
 
+    // Canvas Share Service
+    let canvas_share_service = {
+        use crate::share::{CanvasShareService, ShareHttpClient};
+        let storage_arc = session_manager.shared_storage();
+        let http = ShareHttpClient::with_default_url().unwrap_or_else(|_| {
+            // Fallback: use a dummy URL if construction fails
+            ShareHttpClient::new("https://share.nevoflux.com").expect("valid fallback URL")
+        });
+        // Master key for local credential encryption — derived from config or
+        // random fallback. For now, use a stable placeholder; production
+        // should derive from user config.
+        let master_key: [u8; 32] = {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&[0x42u8; 32]); // TODO: derive from config
+            k
+        };
+        Arc::new(CanvasShareService::new(storage_arc, http, master_key))
+    };
+
     let mut services = HostServices::new(Arc::new(db))
         .with_browser_sender(browser_tx)
         .with_mcp_manager(mcp_manager)
@@ -1211,6 +1230,7 @@ pub async fn start_server(
     let process_subscription_router = subscription_router.clone();
     let process_trace_enabled = config.trace_enabled;
     let process_canvas_tool_registry = canvas_tool_registry.clone();
+    let process_canvas_share_service = canvas_share_service.clone();
     tokio::spawn(async move {
         while let Some((identity, envelope)) = msg_rx.recv().await {
             let proxy_id = envelope.proxy_id.clone();
@@ -1544,6 +1564,230 @@ pub async fn start_server(
                         Err(e) => {
                             warn!("Failed to parse CanvasToolInvokeRequest: {}", e);
                         }
+                    }
+                }
+                continue;
+            }
+
+            // Handle canvas_share message: share an artifact.
+            if msg_type == "canvas_share" {
+                info!("Processing canvas_share message");
+                if let Some(inner) = envelope.payload.get("payload") {
+                    match serde_json::from_value::<nevoflux_protocol::CanvasShareRequest>(
+                        inner.clone(),
+                    ) {
+                        Ok(req) => {
+                            let svc = process_canvas_share_service.clone();
+                            let resp_tx = process_response_tx.clone();
+                            let ident = identity.clone();
+                            let pid = proxy_id.clone();
+                            let rid = request_id.clone();
+                            tokio::spawn(async move {
+                                let result = svc
+                                    .share(&req.session_id, &req.artifact_id, req.ttl_secs)
+                                    .await;
+                                let resp_msg = match result {
+                                    Ok(r) => serde_json::json!({
+                                        "type": "canvas_share_response",
+                                        "payload": {
+                                            "share_id": r.share_id,
+                                            "share_url": r.share_url,
+                                            "password": r.password,
+                                            "expires_at": r.expires_at,
+                                        }
+                                    }),
+                                    Err(e) => serde_json::json!({
+                                        "type": "error",
+                                        "payload": {
+                                            "code": "SHARE_FAILED",
+                                            "message": e.to_string()
+                                        }
+                                    }),
+                                };
+                                let env = DaemonEnvelope::new(&pid, Channel::Chat, resp_msg)
+                                    .with_request_id(&rid);
+                                let _ = resp_tx.send((ident, env)).await;
+                            });
+                        }
+                        Err(e) => warn!("Failed to parse CanvasShareRequest: {}", e),
+                    }
+                }
+                continue;
+            }
+
+            // Handle canvas_import message: import a shared canvas.
+            if msg_type == "canvas_import" {
+                info!("Processing canvas_import message");
+                if let Some(inner) = envelope.payload.get("payload") {
+                    match serde_json::from_value::<nevoflux_protocol::CanvasImportRequest>(
+                        inner.clone(),
+                    ) {
+                        Ok(req) => {
+                            let svc = process_canvas_share_service.clone();
+                            let resp_tx = process_response_tx.clone();
+                            let ident = identity.clone();
+                            let pid = proxy_id.clone();
+                            let rid = request_id.clone();
+                            tokio::spawn(async move {
+                                let result = svc
+                                    .import(&req.session_id, &req.share_id, &req.password)
+                                    .await;
+                                let resp_msg = match result {
+                                    Ok(r) => serde_json::json!({
+                                        "type": "canvas_import_response",
+                                        "payload": {
+                                            "artifact_id": r.artifact_id,
+                                            "artifact_name": r.artifact_name,
+                                            "artifact_type": r.artifact_type,
+                                            "imported_from_share_id": r.share_id,
+                                        }
+                                    }),
+                                    Err(e) => serde_json::json!({
+                                        "type": "error",
+                                        "payload": {
+                                            "code": "IMPORT_FAILED",
+                                            "message": e.to_string()
+                                        }
+                                    }),
+                                };
+                                let env = DaemonEnvelope::new(&pid, Channel::Chat, resp_msg)
+                                    .with_request_id(&rid);
+                                let _ = resp_tx.send((ident, env)).await;
+                            });
+                        }
+                        Err(e) => warn!("Failed to parse CanvasImportRequest: {}", e),
+                    }
+                }
+                continue;
+            }
+
+            // Handle canvas_share_extend message: extend a share's TTL.
+            if msg_type == "canvas_share_extend" {
+                info!("Processing canvas_share_extend message");
+                if let Some(inner) = envelope.payload.get("payload") {
+                    match serde_json::from_value::<nevoflux_protocol::CanvasShareExtendRequest>(
+                        inner.clone(),
+                    ) {
+                        Ok(req) => {
+                            let svc = process_canvas_share_service.clone();
+                            let resp_tx = process_response_tx.clone();
+                            let ident = identity.clone();
+                            let pid = proxy_id.clone();
+                            let rid = request_id.clone();
+                            tokio::spawn(async move {
+                                let result = svc.extend(&req.share_id, req.extend_secs).await;
+                                let resp_msg = match result {
+                                    Ok(expires_at) => serde_json::json!({
+                                        "type": "canvas_share_extend_response",
+                                        "payload": {
+                                            "share_id": req.share_id,
+                                            "expires_at": expires_at,
+                                        }
+                                    }),
+                                    Err(e) => serde_json::json!({
+                                        "type": "error",
+                                        "payload": {
+                                            "code": "EXTEND_FAILED",
+                                            "message": e.to_string()
+                                        }
+                                    }),
+                                };
+                                let env = DaemonEnvelope::new(&pid, Channel::Chat, resp_msg)
+                                    .with_request_id(&rid);
+                                let _ = resp_tx.send((ident, env)).await;
+                            });
+                        }
+                        Err(e) => warn!("Failed to parse CanvasShareExtendRequest: {}", e),
+                    }
+                }
+                continue;
+            }
+
+            // Handle canvas_share_delete message: delete a share.
+            if msg_type == "canvas_share_delete" {
+                info!("Processing canvas_share_delete message");
+                if let Some(inner) = envelope.payload.get("payload") {
+                    match serde_json::from_value::<nevoflux_protocol::CanvasShareDeleteRequest>(
+                        inner.clone(),
+                    ) {
+                        Ok(req) => {
+                            let svc = process_canvas_share_service.clone();
+                            let resp_tx = process_response_tx.clone();
+                            let ident = identity.clone();
+                            let pid = proxy_id.clone();
+                            let rid = request_id.clone();
+                            tokio::spawn(async move {
+                                let result = svc.delete(&req.share_id).await;
+                                let resp_msg = match result {
+                                    Ok(()) => serde_json::json!({
+                                        "type": "canvas_share_delete_response",
+                                        "payload": {
+                                            "share_id": req.share_id,
+                                            "success": true,
+                                        }
+                                    }),
+                                    Err(e) => serde_json::json!({
+                                        "type": "error",
+                                        "payload": {
+                                            "code": "DELETE_FAILED",
+                                            "message": e.to_string()
+                                        }
+                                    }),
+                                };
+                                let env = DaemonEnvelope::new(&pid, Channel::Chat, resp_msg)
+                                    .with_request_id(&rid);
+                                let _ = resp_tx.send((ident, env)).await;
+                            });
+                        }
+                        Err(e) => warn!("Failed to parse CanvasShareDeleteRequest: {}", e),
+                    }
+                }
+                continue;
+            }
+
+            // Handle canvas_share_list message: list active shares (sync).
+            if msg_type == "canvas_share_list" {
+                info!("Processing canvas_share_list message");
+                if let Some(inner) = envelope.payload.get("payload") {
+                    match serde_json::from_value::<nevoflux_protocol::CanvasShareListRequest>(
+                        inner.clone(),
+                    ) {
+                        Ok(req) => {
+                            let result = process_canvas_share_service.list(&req.session_id);
+                            let resp_msg = match result {
+                                Ok(shares) => {
+                                    let infos: Vec<nevoflux_protocol::CanvasShareInfo> = shares
+                                        .into_iter()
+                                        .map(|s| nevoflux_protocol::CanvasShareInfo {
+                                            artifact_id: s.artifact_id,
+                                            share_id: s.share_id,
+                                            share_url: s.share_url,
+                                            expires_at: s.expires_at,
+                                            view_count: s.view_count,
+                                            created_at: s.created_at,
+                                        })
+                                        .collect();
+                                    serde_json::json!({
+                                        "type": "canvas_share_list_response",
+                                        "payload": {
+                                            "shares": infos,
+                                        }
+                                    })
+                                }
+                                Err(e) => serde_json::json!({
+                                    "type": "error",
+                                    "payload": {
+                                        "code": "LIST_FAILED",
+                                        "message": e.to_string()
+                                    }
+                                }),
+                            };
+                            let env =
+                                DaemonEnvelope::new(&proxy_id, Channel::Chat, resp_msg)
+                                    .with_request_id(&request_id);
+                            let _ = process_response_tx.send((identity.clone(), env)).await;
+                        }
+                        Err(e) => warn!("Failed to parse CanvasShareListRequest: {}", e),
                     }
                 }
                 continue;

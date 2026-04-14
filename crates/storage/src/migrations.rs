@@ -37,6 +37,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "011_canvas_tool_audit",
         include_str!("migrations/011_canvas_tool_audit.sql"),
     ),
+    (
+        "012_canvas_share",
+        include_str!("migrations/012_canvas_share.sql"),
+    ),
 ];
 
 /// Run all pending migrations on the given connection.
@@ -89,7 +93,7 @@ mod tests {
         let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 11);
+        assert_eq!(count, 12);
     }
 
     #[test]
@@ -272,6 +276,55 @@ mod tests {
                         "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='{}'",
                         idx
                     ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "Index {} should exist", idx);
+        }
+    }
+
+    #[test]
+    fn migration_012_creates_canvas_share_tables() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_all(&mut conn).unwrap();
+
+        // Verify tables
+        for table in &["artifact_shares", "artifact_share_history"] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{}'", table),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "Table {} should exist", table);
+        }
+
+        // Verify new columns on artifacts - INSERT should work
+        conn.execute(
+            "INSERT INTO sessions (id, created_at, updated_at) VALUES ('test-sess', strftime('%s','now'), strftime('%s','now'))",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO artifacts (id, session_id, title, content_type, content, imported_from_url, imported_from_share_id, imported_at)
+             VALUES ('art-test', 'test-sess', 'Test', 'text/html', '<h1>Hi</h1>', 'https://share.nevoflux.com/abc', 'abc', strftime('%s','now'))",
+            [],
+        ).unwrap();
+
+        // Verify INSERT into artifact_shares works
+        conn.execute(
+            "INSERT INTO artifact_shares (artifact_id, share_id, share_url, encrypted_password, encrypted_owner_token, expires_at, view_count, created_at)
+             VALUES ('art-test', 'share-001', 'https://share.nevoflux.com/share-001', 'enc-pw', 'enc-tok', strftime('%s','now') + 2592000, 0, strftime('%s','now'))",
+            [],
+        ).unwrap();
+
+        // Verify indexes
+        for idx in &["idx_artifact_shares_artifact_id", "idx_artifact_shares_share_id",
+                     "idx_artifact_shares_expires_at", "idx_artifact_share_history_artifact_id"] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='{}'", idx),
                     [],
                     |row| row.get(0),
                 )
