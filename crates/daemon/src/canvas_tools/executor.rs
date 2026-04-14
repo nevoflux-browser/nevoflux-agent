@@ -13,12 +13,30 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
+use tokio::io::{AsyncReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::canvas_tools::param_validator::{expand_session_dir, validate_params};
 use crate::canvas_tools::types::{ArgsMode, BackendKind, CanvasTool};
 use crate::error::{DaemonError, Result};
+
+// ---------------------------------------------------------------------------
+// Streaming events
+// ---------------------------------------------------------------------------
+
+/// An event emitted while a tool is running.
+///
+/// The streaming executor sends these as stdout / stderr data arrives so the
+/// caller can forward them to the client without buffering the whole run.
+#[derive(Debug, Clone)]
+pub enum ExecutionEvent {
+    /// A chunk of stdout (UTF-8 lossy converted from raw bytes).
+    Stdout(String),
+    /// A chunk of stderr.
+    Stderr(String),
+}
 
 // ---------------------------------------------------------------------------
 // ToolExecResult
@@ -254,6 +272,228 @@ fn truncate_output(raw: &[u8], max_bytes: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming command execution
+// ---------------------------------------------------------------------------
+
+/// Execute an external command and stream stdout/stderr chunks via `event_tx`.
+///
+/// Behaves like [`execute_command_tool`] (timeout, output truncation, exit code)
+/// but emits each chunk of output through the supplied channel as it arrives,
+/// instead of buffering until completion. The returned [`ToolExecResult`] still
+/// contains the full captured output for callers that want both — useful for
+/// the audit log and the final response message.
+///
+/// Channel send failures are silently ignored: if the consumer dropped the
+/// receiver, output is still captured into the result.
+pub async fn execute_command_tool_streaming(
+    tool: &CanvasTool,
+    args: &[String],
+    session_dir: &Path,
+    event_tx: mpsc::Sender<ExecutionEvent>,
+) -> Result<ToolExecResult> {
+    let binary = tool.binary.as_deref().ok_or_else(|| {
+        DaemonError::InvalidRequest(format!(
+            "tool '{}': command backend requires a 'binary' field",
+            tool.name
+        ))
+    })?;
+
+    let binary_path = which::which(binary).map_err(|e| {
+        DaemonError::InvalidRequest(format!(
+            "tool '{}': binary '{}' not found: {}",
+            tool.name, binary, e
+        ))
+    })?;
+
+    debug!(
+        tool = %tool.name,
+        binary = %binary_path.display(),
+        args = ?args,
+        "Executing command tool (streaming)"
+    );
+
+    let mut cmd = Command::new(&binary_path);
+    cmd.args(args);
+
+    if let Some(ref cwd) = tool.constraints.cwd {
+        let expanded_cwd = expand_session_dir(cwd, session_dir);
+        cmd.current_dir(&expanded_cwd);
+    }
+
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let start = Instant::now();
+    let timeout_duration = std::time::Duration::from_secs(tool.constraints.timeout_seconds);
+    let max_stdout = tool.constraints.max_stdout_bytes;
+    let max_stderr = tool.constraints.max_stderr_bytes;
+
+    // Spawn the child.
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(io_err) => {
+            return Ok(ToolExecResult {
+                stdout: String::new(),
+                stderr: io_err.to_string(),
+                exit_code: None,
+                success: false,
+                error: Some(format!("failed to spawn process: {io_err}")),
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+    };
+
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+
+    // Spawn readers that emit events and accumulate the full buffer.
+    let stdout_tx = event_tx.clone();
+    let stdout_handle = tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout);
+        let mut buf = [0u8; 4096];
+        let mut accumulated = Vec::new();
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    accumulated.extend_from_slice(&buf[..n]);
+                    let _ = stdout_tx.send(ExecutionEvent::Stdout(chunk)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        accumulated
+    });
+
+    let stderr_tx = event_tx.clone();
+    let stderr_handle = tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr);
+        let mut buf = [0u8; 4096];
+        let mut accumulated = Vec::new();
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    accumulated.extend_from_slice(&buf[..n]);
+                    let _ = stderr_tx.send(ExecutionEvent::Stderr(chunk)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        accumulated
+    });
+
+    // Drop the original sender so readers can finish even if no chunks remain.
+    drop(event_tx);
+
+    // Await child + reader tasks under the overall timeout.
+    let wait_result = tokio::time::timeout(timeout_duration, async {
+        let status = child.wait().await?;
+        let stdout_buf = stdout_handle.await.unwrap_or_default();
+        let stderr_buf = stderr_handle.await.unwrap_or_default();
+        Ok::<_, std::io::Error>((status, stdout_buf, stderr_buf))
+    })
+    .await;
+
+    let elapsed = start.elapsed();
+
+    let (status, stdout_buf, stderr_buf) = match wait_result {
+        Ok(Ok(triple)) => triple,
+        Ok(Err(io_err)) => {
+            return Ok(ToolExecResult {
+                stdout: String::new(),
+                stderr: io_err.to_string(),
+                exit_code: None,
+                success: false,
+                error: Some(format!("io error during execution: {io_err}")),
+                duration_ms: elapsed.as_millis() as u64,
+            });
+        }
+        Err(_elapsed) => {
+            // Timeout — kill the child if still running.
+            let _ = child.start_kill();
+            return Err(DaemonError::Timeout(format!(
+                "tool '{}': exceeded {}s timeout",
+                tool.name, tool.constraints.timeout_seconds
+            )));
+        }
+    };
+
+    let stdout = truncate_output(&stdout_buf, max_stdout);
+    let stderr = truncate_output(&stderr_buf, max_stderr);
+
+    let exit_code = status.code();
+    let success = status.success();
+    let error = if !success {
+        Some(format!(
+            "process exited with status {}",
+            exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_string())
+        ))
+    } else {
+        None
+    };
+
+    Ok(ToolExecResult {
+        stdout,
+        stderr,
+        exit_code,
+        success,
+        error,
+        duration_ms: elapsed.as_millis() as u64,
+    })
+}
+
+/// Streaming variant of [`execute_whitelisted_tool`].
+///
+/// Internal tools still return the same instant-stub result (no events emitted).
+/// Command tools dispatch to [`execute_command_tool_streaming`].
+pub async fn execute_whitelisted_tool_streaming(
+    tool: &CanvasTool,
+    params: &HashMap<String, String>,
+    free_args: &[String],
+    session_dir: &Path,
+    event_tx: mpsc::Sender<ExecutionEvent>,
+) -> Result<ToolExecResult> {
+    if tool.kind == BackendKind::Internal {
+        // Drop the channel — internal tools have no streaming output.
+        drop(event_tx);
+        return Ok(ToolExecResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: Some(0),
+            success: true,
+            error: None,
+            duration_ms: 0,
+        });
+    }
+
+    match tool.args_mode {
+        ArgsMode::Template => {
+            validate_params(&tool.params, params, session_dir)?;
+            let mut effective = params.clone();
+            for (name, spec) in &tool.params {
+                if !effective.contains_key(name) {
+                    if let Some(ref default) = spec.default {
+                        effective.insert(name.clone(), default.clone());
+                    }
+                }
+            }
+            let args = render_template_args(&tool.args, &effective)?;
+            execute_command_tool_streaming(tool, &args, session_dir, event_tx).await
+        }
+        ArgsMode::Free => {
+            check_free_mode_subcommand(free_args, &tool.allowed_subcommands, &tool.name)?;
+            execute_command_tool_streaming(tool, free_args, session_dir, event_tx).await
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Top-level dispatch
 // ---------------------------------------------------------------------------
 
@@ -327,6 +567,64 @@ mod tests {
 
     fn session_dir() -> PathBuf {
         PathBuf::from("/tmp/nevoflux-test-session")
+    }
+
+    /// Verify that the streaming executor emits stdout chunks via the channel
+    /// AND returns the same buffered output in the result.
+    #[tokio::test]
+    async fn streaming_emits_stdout_chunks() {
+        let tool = CanvasTool {
+            name: "echo_stream".into(),
+            description: "echo for streaming test".into(),
+            kind: BackendKind::Command,
+            binary: Some("echo".into()),
+            api: None,
+            args_mode: ArgsMode::Template,
+            args: vec!["streaming-test-output".into()],
+            allowed_subcommands: vec![],
+            params: HashMap::new(),
+            constraints: ExecutionConstraints::default(),
+            enabled: true,
+            source: ToolSource::Builtin,
+        };
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ExecutionEvent>(16);
+        let result = tokio::spawn(async move {
+            execute_command_tool_streaming(&tool, &["streaming-test-output".into()], &session_dir(), tx).await
+        });
+
+        // Collect events until channel closes.
+        let mut chunks = Vec::new();
+        while let Some(evt) = rx.recv().await {
+            chunks.push(evt);
+        }
+        let res = result.await.unwrap().unwrap();
+
+        assert!(res.success, "echo should succeed");
+        assert!(res.stdout.contains("streaming-test-output"));
+        // At least one stdout chunk should have been emitted on the channel.
+        let stdout_chunks: Vec<_> = chunks
+            .iter()
+            .filter_map(|e| match e {
+                ExecutionEvent::Stdout(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!stdout_chunks.is_empty(), "expected ≥1 stdout chunk via channel");
+        let joined = stdout_chunks.join("");
+        assert!(joined.contains("streaming-test-output"));
+    }
+
+    /// Verify that the streaming executor's high-level dispatch (template mode)
+    /// validates params before spawning anything.
+    #[tokio::test]
+    async fn streaming_validates_params_in_template_mode() {
+        let tool = make_echo_tool();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ExecutionEvent>(8);
+        let params = HashMap::new(); // missing required 'message'
+        let res =
+            execute_whitelisted_tool_streaming(&tool, &params, &[], &session_dir(), tx).await;
+        assert!(res.is_err(), "should reject missing required param");
     }
 
     /// Helper: build a minimal command tool.
