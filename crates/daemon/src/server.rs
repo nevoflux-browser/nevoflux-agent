@@ -1445,10 +1445,18 @@ pub async fn start_server(
                             let ident = identity.clone();
                             let pid = proxy_id.clone();
                             let rid = request_id.clone();
-                            let invocation_id = format!(
-                                "inv-{}",
-                                uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0")
-                            );
+                            // Echo caller's call_id when supplied so they can correlate
+                            // events back without owning the daemon's tracking.
+                            let call_id = req.call_id.clone().unwrap_or_else(|| {
+                                format!(
+                                    "inv-{}",
+                                    uuid::Uuid::new_v4()
+                                        .to_string()
+                                        .split('-')
+                                        .next()
+                                        .unwrap_or("0")
+                                )
+                            });
 
                             tokio::spawn(async move {
                                 // Look up tool in registry
@@ -1464,7 +1472,7 @@ pub async fn start_server(
                                                 exit_code: None,
                                                 error: Some(format!("Tool not found or disabled: {}", req.tool_name)),
                                                 duration_ms: 0,
-                                                invocation_id: invocation_id.clone(),
+                                                call_id: call_id.clone(),
                                             },
                                         );
                                         let payload = serde_json::to_value(&resp).unwrap_or_default();
@@ -1478,7 +1486,7 @@ pub async fn start_server(
                                 // Send Started event
                                 let started = nevoflux_protocol::AgentMessage::CanvasToolEvent(
                                     nevoflux_protocol::CanvasToolEvent::Started {
-                                        invocation_id: invocation_id.clone(),
+                                        call_id: call_id.clone(),
                                         tool_name: req.tool_name.clone(),
                                     },
                                 );
@@ -1504,9 +1512,35 @@ pub async fn start_server(
                                     )
                                     .await;
 
-                                // Build and send response
+                                // Build response, then emit any captured stdout/stderr as
+                                // streaming events so SDK consumers see the data BEFORE the
+                                // Finished event (mirrors what a streaming executor would do).
                                 let response = match result {
                                     Ok(exec_result) => {
+                                        // Emit captured stdout chunk (if any) as a Stdout event
+                                        if !exec_result.stdout.is_empty() {
+                                            let evt = nevoflux_protocol::AgentMessage::CanvasToolEvent(
+                                                nevoflux_protocol::CanvasToolEvent::Stdout {
+                                                    call_id: call_id.clone(),
+                                                    data: exec_result.stdout.clone(),
+                                                },
+                                            );
+                                            let payload = serde_json::to_value(&evt).unwrap_or_default();
+                                            let env = DaemonEnvelope::new(&pid, Channel::Chat, payload);
+                                            let _ = resp_tx.send((ident.clone(), env)).await;
+                                        }
+                                        if !exec_result.stderr.is_empty() {
+                                            let evt = nevoflux_protocol::AgentMessage::CanvasToolEvent(
+                                                nevoflux_protocol::CanvasToolEvent::Stderr {
+                                                    call_id: call_id.clone(),
+                                                    data: exec_result.stderr.clone(),
+                                                },
+                                            );
+                                            let payload = serde_json::to_value(&evt).unwrap_or_default();
+                                            let env = DaemonEnvelope::new(&pid, Channel::Chat, payload);
+                                            let _ = resp_tx.send((ident.clone(), env)).await;
+                                        }
+
                                         nevoflux_protocol::CanvasToolInvokeResponse {
                                             tool_name: req.tool_name.clone(),
                                             success: exec_result.success,
@@ -1523,7 +1557,7 @@ pub async fn start_server(
                                             exit_code: exec_result.exit_code,
                                             error: exec_result.error,
                                             duration_ms: exec_result.duration_ms,
-                                            invocation_id: invocation_id.clone(),
+                                            call_id: call_id.clone(),
                                         }
                                     }
                                     Err(e) => nevoflux_protocol::CanvasToolInvokeResponse {
@@ -1534,20 +1568,21 @@ pub async fn start_server(
                                         exit_code: None,
                                         error: Some(e.to_string()),
                                         duration_ms: 0,
-                                        invocation_id: invocation_id.clone(),
+                                        call_id: call_id.clone(),
                                     },
                                 };
 
-                                // Send Completed event
-                                let completed = nevoflux_protocol::AgentMessage::CanvasToolEvent(
-                                    nevoflux_protocol::CanvasToolEvent::Completed {
-                                        invocation_id: invocation_id.clone(),
+                                // Send Finished event
+                                let finished = nevoflux_protocol::AgentMessage::CanvasToolEvent(
+                                    nevoflux_protocol::CanvasToolEvent::Finished {
+                                        call_id: call_id.clone(),
                                         success: response.success,
+                                        exit_code: response.exit_code,
                                         duration_ms: response.duration_ms,
                                     },
                                 );
                                 let payload =
-                                    serde_json::to_value(&completed).unwrap_or_default();
+                                    serde_json::to_value(&finished).unwrap_or_default();
                                 let env = DaemonEnvelope::new(&pid, Channel::Chat, payload);
                                 let _ = resp_tx.send((ident.clone(), env)).await;
 

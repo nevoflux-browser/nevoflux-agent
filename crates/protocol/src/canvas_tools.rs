@@ -15,6 +15,14 @@ pub struct CanvasToolInvokeRequest {
     #[serde(default)]
     pub args: Option<Vec<String>>,
     pub session_id: String,
+    /// Caller-supplied call ID. The daemon echoes this in events and the
+    /// response so the caller can correlate without owning the daemon's
+    /// internal invocation tracking.
+    #[serde(default)]
+    pub call_id: Option<String>,
+    /// Optional timeout override in milliseconds.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// Response from a canvas tool invocation.
@@ -31,7 +39,8 @@ pub struct CanvasToolInvokeResponse {
     #[serde(default)]
     pub error: Option<String>,
     pub duration_ms: u64,
-    pub invocation_id: String,
+    /// Echoes the caller's call_id (or daemon-generated id when none supplied).
+    pub call_id: String,
 }
 
 /// Request to list available tools.
@@ -60,26 +69,49 @@ pub struct CanvasToolListResponse {
 }
 
 /// Canvas tool event (streamed during execution).
+///
+/// Wire format uses tag `event_type` so JSON looks like:
+///   `{ "event_type": "stdout", "call_id": "...", "data": "..." }`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
+#[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum CanvasToolEvent {
+    /// Tool execution has started.
     Started {
-        invocation_id: String,
+        call_id: String,
         tool_name: String,
     },
-    Output {
-        invocation_id: String,
-        stream: String,
+    /// A chunk of stdout output.
+    Stdout {
+        call_id: String,
         data: String,
     },
-    Completed {
-        invocation_id: String,
+    /// A chunk of stderr output.
+    Stderr {
+        call_id: String,
+        data: String,
+    },
+    /// Optional progress update (0.0 ..= 1.0). Currently emitted only by
+    /// tools whose executor knows how to parse their progress markers.
+    Progress {
+        call_id: String,
+        progress: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// Tool execution finished. Carries the final disposition.
+    Finished {
+        call_id: String,
         success: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
         duration_ms: u64,
     },
+    /// Fatal error during execution (binary missing, spawn failed, timeout, etc).
+    /// On a successful spawn that produced a non-zero exit, prefer `Finished` with
+    /// `success: false` instead.
     Error {
-        invocation_id: String,
-        message: String,
+        call_id: String,
+        error: String,
     },
 }
 
@@ -99,6 +131,8 @@ mod tests {
             params,
             args: Some(vec!["--verbose".to_string(), "--nocapture".to_string()]),
             session_id: "sess-abc123".to_string(),
+            call_id: Some("call-001".to_string()),
+            timeout_ms: Some(60000),
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -114,6 +148,8 @@ mod tests {
         assert!(req.params.is_empty());
         assert!(req.args.is_none());
         assert_eq!(req.session_id, "s1");
+        assert!(req.call_id.is_none());
+        assert!(req.timeout_ms.is_none());
     }
 
     #[test]
@@ -126,7 +162,7 @@ mod tests {
             exit_code: Some(0),
             error: None,
             duration_ms: 1500,
-            invocation_id: "inv-001".to_string(),
+            call_id: "call-001".to_string(),
         };
 
         let json = serde_json::to_string(&resp).unwrap();
@@ -144,12 +180,12 @@ mod tests {
             exit_code: Some(1),
             error: Some("Compilation failed".to_string()),
             duration_ms: 3200,
-            invocation_id: "inv-002".to_string(),
+            call_id: "call-002".to_string(),
         };
 
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: CanvasToolInvokeResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.success, false);
+        assert!(!decoded.success);
         assert_eq!(decoded.error.as_deref(), Some("Compilation failed"));
         assert_eq!(decoded.exit_code, Some(1));
     }
@@ -169,7 +205,7 @@ mod tests {
     fn test_list_request_default() {
         let json = r#"{}"#;
         let req: CanvasToolListRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.include_disabled, false);
+        assert!(!req.include_disabled);
     }
 
     #[test]
@@ -201,46 +237,74 @@ mod tests {
         assert_eq!(decoded.tools.len(), 2);
         assert_eq!(decoded.tools[0].name, "cargo_test");
         assert!(decoded.tools[0].description.is_some());
-        assert_eq!(decoded.tools[1].enabled, false);
+        assert!(!decoded.tools[1].enabled);
     }
 
     #[test]
     fn test_event_started_roundtrip() {
         let event = CanvasToolEvent::Started {
-            invocation_id: "inv-100".to_string(),
+            call_id: "call-100".to_string(),
             tool_name: "build".to_string(),
         };
 
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains(r#""event":"started"#));
+        assert!(json.contains(r#""event_type":"started"#));
+        assert!(json.contains(r#""call_id":"call-100"#));
         let decoded: CanvasToolEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, decoded);
     }
 
     #[test]
-    fn test_event_output_roundtrip() {
-        let event = CanvasToolEvent::Output {
-            invocation_id: "inv-100".to_string(),
-            stream: "stdout".to_string(),
+    fn test_event_stdout_roundtrip() {
+        let event = CanvasToolEvent::Stdout {
+            call_id: "call-100".to_string(),
             data: "Compiling nevoflux v0.1.0\n".to_string(),
         };
 
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains(r#""event":"output"#));
+        assert!(json.contains(r#""event_type":"stdout"#));
         let decoded: CanvasToolEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, decoded);
     }
 
     #[test]
-    fn test_event_completed_roundtrip() {
-        let event = CanvasToolEvent::Completed {
-            invocation_id: "inv-100".to_string(),
+    fn test_event_stderr_roundtrip() {
+        let event = CanvasToolEvent::Stderr {
+            call_id: "call-100".to_string(),
+            data: "warning: unused import\n".to_string(),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""event_type":"stderr"#));
+        let decoded: CanvasToolEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_event_progress_roundtrip() {
+        let event = CanvasToolEvent::Progress {
+            call_id: "call-100".to_string(),
+            progress: 0.42,
+            message: Some("Encoding frame 1234".to_string()),
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""event_type":"progress"#));
+        let decoded: CanvasToolEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_event_finished_roundtrip() {
+        let event = CanvasToolEvent::Finished {
+            call_id: "call-100".to_string(),
             success: true,
+            exit_code: Some(0),
             duration_ms: 5432,
         };
 
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains(r#""event":"completed"#));
+        assert!(json.contains(r#""event_type":"finished"#));
         let decoded: CanvasToolEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, decoded);
     }
@@ -248,12 +312,12 @@ mod tests {
     #[test]
     fn test_event_error_roundtrip() {
         let event = CanvasToolEvent::Error {
-            invocation_id: "inv-100".to_string(),
-            message: "Process killed by signal 9".to_string(),
+            call_id: "call-100".to_string(),
+            error: "Process killed by signal 9".to_string(),
         };
 
         let json = serde_json::to_string(&event).unwrap();
-        assert!(json.contains(r#""event":"error"#));
+        assert!(json.contains(r#""event_type":"error"#));
         let decoded: CanvasToolEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, decoded);
     }
@@ -261,21 +325,26 @@ mod tests {
     #[test]
     fn test_event_tag_based_deserialization() {
         // Verify that the serde tag-based dispatch works correctly
-        let started_json = r#"{"event":"started","invocation_id":"x","tool_name":"t"}"#;
-        let output_json =
-            r#"{"event":"output","invocation_id":"x","stream":"stderr","data":"warn"}"#;
-        let completed_json =
-            r#"{"event":"completed","invocation_id":"x","success":false,"duration_ms":0}"#;
-        let error_json = r#"{"event":"error","invocation_id":"x","message":"boom"}"#;
+        let started_json = r#"{"event_type":"started","call_id":"x","tool_name":"t"}"#;
+        let stdout_json = r#"{"event_type":"stdout","call_id":"x","data":"out"}"#;
+        let stderr_json = r#"{"event_type":"stderr","call_id":"x","data":"warn"}"#;
+        let progress_json = r#"{"event_type":"progress","call_id":"x","progress":0.5}"#;
+        let finished_json =
+            r#"{"event_type":"finished","call_id":"x","success":false,"duration_ms":0}"#;
+        let error_json = r#"{"event_type":"error","call_id":"x","error":"boom"}"#;
 
         let started: CanvasToolEvent = serde_json::from_str(started_json).unwrap();
-        let output: CanvasToolEvent = serde_json::from_str(output_json).unwrap();
-        let completed: CanvasToolEvent = serde_json::from_str(completed_json).unwrap();
+        let stdout: CanvasToolEvent = serde_json::from_str(stdout_json).unwrap();
+        let stderr: CanvasToolEvent = serde_json::from_str(stderr_json).unwrap();
+        let progress: CanvasToolEvent = serde_json::from_str(progress_json).unwrap();
+        let finished: CanvasToolEvent = serde_json::from_str(finished_json).unwrap();
         let error: CanvasToolEvent = serde_json::from_str(error_json).unwrap();
 
         assert!(matches!(started, CanvasToolEvent::Started { .. }));
-        assert!(matches!(output, CanvasToolEvent::Output { .. }));
-        assert!(matches!(completed, CanvasToolEvent::Completed { .. }));
+        assert!(matches!(stdout, CanvasToolEvent::Stdout { .. }));
+        assert!(matches!(stderr, CanvasToolEvent::Stderr { .. }));
+        assert!(matches!(progress, CanvasToolEvent::Progress { .. }));
+        assert!(matches!(finished, CanvasToolEvent::Finished { .. }));
         assert!(matches!(error, CanvasToolEvent::Error { .. }));
     }
 }
