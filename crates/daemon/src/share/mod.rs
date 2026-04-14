@@ -7,6 +7,7 @@ pub mod http_client;
 pub mod local_store;
 pub mod owner_token;
 pub mod password;
+pub mod service;
 pub mod share_id;
 pub mod types;
 
@@ -21,5 +22,8 @@ pub use local_store::{
 };
 pub use owner_token::{generate_owner_token, hash_owner_token};
 pub use password::{format_password, generate_password, parse_password};
+pub use service::{
+    CanvasShareService, ImportResult, ShareInfo, ShareResult, DEFAULT_TTL_SECS,
+};
 pub use share_id::{generate_share_id, validate_share_id};
 pub use types::{EncryptedShareBundle, KdfParams, ShareBundle, ShareMetadata};

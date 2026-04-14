@@ -1,0 +1,428 @@
+//! CanvasShareService - orchestrates Canvas Share lifecycle.
+//!
+//! Coordinates share creation, import, extension, deletion, and listing by
+//! composing the lower-level primitives in this module: ID/password/token
+//! generation, encryption, binary serialization, HTTP transport, and local
+//! encrypted storage of owner credentials in SQLite.
+
+use std::sync::Arc;
+
+use chrono::Utc;
+use nevoflux_storage::{Storage, StorageError};
+
+use super::binary_format::{deserialize, serialize};
+use super::crypto::{decrypt_share_bundle, encrypt_share_bundle};
+use super::http_client::ShareHttpClient;
+use super::local_store::{
+    decrypt_bytes_from_storage, encrypt_bytes_for_storage, encrypt_for_storage,
+};
+use super::owner_token::{generate_owner_token, hash_owner_token};
+use super::password::generate_password;
+use super::share_id::generate_share_id;
+use super::types::{ShareBundle, ShareMetadata};
+use crate::error::{DaemonError, Result};
+
+/// Default TTL: 30 days.
+pub const DEFAULT_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// Info about an active share (what `list()` returns).
+#[derive(Debug, Clone)]
+pub struct ShareInfo {
+    pub artifact_id: String,
+    pub share_id: String,
+    pub share_url: String,
+    pub expires_at: i64,
+    pub view_count: u64,
+    pub created_at: i64,
+}
+
+/// Result of a `share()` operation. The password is returned only once —
+/// the raw plaintext is never persisted; only a local encrypted copy is kept.
+#[derive(Debug, Clone)]
+pub struct ShareResult {
+    pub share_id: String,
+    pub share_url: String,
+    /// Shown once to the user — never stored in plaintext.
+    pub password: String,
+    pub expires_at: i64,
+}
+
+/// Result of an `import()` operation.
+#[derive(Debug, Clone)]
+pub struct ImportResult {
+    pub artifact_id: String,
+    pub artifact_name: String,
+    pub artifact_type: String,
+    pub share_id: String,
+}
+
+/// Row helper for reading an artifact from SQLite.
+#[derive(Debug)]
+struct ArtifactRow {
+    #[allow(dead_code)]
+    id: String,
+    title: String,
+    content_type: String,
+    content: String,
+}
+
+/// Orchestrates the Canvas Share lifecycle.
+pub struct CanvasShareService {
+    storage: Arc<Storage>,
+    http: ShareHttpClient,
+    /// 32-byte master key used to encrypt passwords and owner tokens at rest.
+    master_key: [u8; 32],
+}
+
+impl CanvasShareService {
+    /// Create a new `CanvasShareService`.
+    pub fn new(storage: Arc<Storage>, http: ShareHttpClient, master_key: [u8; 32]) -> Self {
+        Self {
+            storage,
+            http,
+            master_key,
+        }
+    }
+
+    /// Share an artifact: encrypt, upload to CF Worker, record credentials locally.
+    ///
+    /// Returns a [`ShareResult`] with the generated share ID, URL, password
+    /// (shown to the user exactly once), and expiry timestamp.
+    pub async fn share(
+        &self,
+        session_id: &str,
+        artifact_id: &str,
+        ttl_secs: Option<u64>,
+    ) -> Result<ShareResult> {
+        let ttl = ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
+
+        // 1. Load the artifact content from SQLite.
+        let artifact = self.load_artifact(session_id, artifact_id)?;
+
+        // 2. Build the plaintext ShareBundle.
+        let bundle = ShareBundle {
+            artifact_id: artifact_id.to_string(),
+            artifact_name: artifact.title.clone(),
+            artifact_type: artifact.content_type.clone(),
+            content: serde_json::Value::String(artifact.content.clone()),
+            metadata: ShareMetadata {
+                created_at: Utc::now().to_rfc3339(),
+                version: "1.0".into(),
+                author: None,
+            },
+        };
+
+        // 3. Generate credentials.
+        let share_id = generate_share_id();
+        let password = generate_password();
+        let owner_token = generate_owner_token();
+        let owner_token_hash = hash_owner_token(&share_id, &owner_token);
+
+        // 4. Encrypt + serialize to NFEB binary format.
+        let encrypted = encrypt_share_bundle(&bundle, &password, &share_id)?;
+        let nfeb_bytes = serialize(&encrypted)?;
+
+        // 5. Upload to the CF Worker.
+        let upload_resp = self
+            .http
+            .upload(&nfeb_bytes, &owner_token_hash, ttl)
+            .await?;
+
+        // 6. Store credentials locally, encrypted at rest.
+        let enc_password = encrypt_for_storage(&password, &self.master_key)?;
+        let enc_token = encrypt_bytes_for_storage(&owner_token, &self.master_key)?;
+        let now = Utc::now().timestamp();
+
+        let share_id_db = upload_resp.share_id.clone();
+        let share_url_db = upload_resp.share_url.clone();
+        let expires_at_db = upload_resp.expires_at;
+        let artifact_id_db = artifact_id.to_string();
+
+        self.storage.database().with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO artifact_shares (artifact_id, share_id, share_url, encrypted_password, encrypted_owner_token, expires_at, view_count, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+                rusqlite::params![
+                    artifact_id_db,
+                    share_id_db,
+                    share_url_db,
+                    enc_password,
+                    enc_token,
+                    expires_at_db,
+                    now,
+                ],
+            )?;
+            Ok(())
+        })?;
+
+        Ok(ShareResult {
+            share_id: upload_resp.share_id,
+            share_url: upload_resp.share_url,
+            password,
+            expires_at: upload_resp.expires_at,
+        })
+    }
+
+    /// Import a shared canvas: fetch bundle, decrypt, write as a new local artifact.
+    pub async fn import(
+        &self,
+        session_id: &str,
+        share_id: &str,
+        password: &str,
+    ) -> Result<ImportResult> {
+        // 1. Download the encrypted bundle.
+        let nfeb_bytes = self.http.fetch_bundle(share_id).await?;
+
+        // 2. Deserialize NFEB and decrypt with the provided password.
+        let encrypted = deserialize(&nfeb_bytes)?;
+        let bundle = decrypt_share_bundle(&encrypted, password)?;
+
+        // 3. Generate a new local artifact ID.
+        let new_artifact_id = uuid::Uuid::new_v4().to_string();
+        let share_url = format!("{}/{}", self.http.base_url(), share_id);
+        let now = Utc::now().timestamp();
+        let content_str = match &bundle.content {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+
+        // 4. Insert into artifacts with imported_from_* provenance columns.
+        let session_id_db = session_id.to_string();
+        let artifact_id_db = new_artifact_id.clone();
+        let title_db = bundle.artifact_name.clone();
+        let content_type_db = bundle.artifact_type.clone();
+        let share_id_db = share_id.to_string();
+
+        self.storage.database().with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO artifacts (id, session_id, title, content_type, content, imported_from_url, imported_from_share_id, imported_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    artifact_id_db,
+                    session_id_db,
+                    title_db,
+                    content_type_db,
+                    content_str,
+                    share_url,
+                    share_id_db,
+                    now,
+                ],
+            )?;
+            Ok(())
+        })?;
+
+        Ok(ImportResult {
+            artifact_id: new_artifact_id,
+            artifact_name: bundle.artifact_name,
+            artifact_type: bundle.artifact_type,
+            share_id: share_id.to_string(),
+        })
+    }
+
+    /// Extend a share's TTL by `extend_secs` seconds. Returns the new expiry.
+    pub async fn extend(&self, share_id: &str, extend_secs: u64) -> Result<i64> {
+        // 1. Load the encrypted owner token.
+        let enc_token = self.load_encrypted_owner_token(share_id)?;
+
+        // 2. Decrypt to get the raw owner token.
+        let owner_token = decrypt_bytes_from_storage(&enc_token, &self.master_key)?;
+        let owner_token_hex = hex::encode(&owner_token);
+
+        // 3. Ask the server to extend.
+        let resp = self
+            .http
+            .extend(share_id, &owner_token_hex, extend_secs)
+            .await?;
+
+        // 4. Update the local expires_at.
+        let new_expires_at = resp.expires_at;
+        let share_id_db = share_id.to_string();
+        self.storage.database().with_connection(|conn| {
+            conn.execute(
+                "UPDATE artifact_shares SET expires_at = ?1 WHERE share_id = ?2",
+                rusqlite::params![new_expires_at, share_id_db],
+            )?;
+            Ok(())
+        })?;
+
+        Ok(resp.expires_at)
+    }
+
+    /// Delete a share. Removes server-side and moves the local record to
+    /// `artifact_share_history` with reason `deleted`.
+    pub async fn delete(&self, share_id: &str) -> Result<()> {
+        // 1. Load and decrypt the owner token.
+        let enc_token = self.load_encrypted_owner_token(share_id)?;
+        let owner_token = decrypt_bytes_from_storage(&enc_token, &self.master_key)?;
+        let owner_token_hex = hex::encode(&owner_token);
+
+        // 2. Delete on the server.
+        self.http.delete(share_id, &owner_token_hex).await?;
+
+        // 3. Move to history + delete the active-share row.
+        let share_id_db = share_id.to_string();
+        self.storage.database().with_connection(|conn| {
+            let artifact_id: Option<String> = conn
+                .query_row(
+                    "SELECT artifact_id FROM artifact_shares WHERE share_id = ?1",
+                    rusqlite::params![share_id_db],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            if let Some(aid) = artifact_id {
+                conn.execute(
+                    "INSERT INTO artifact_share_history (artifact_id, share_id, reason) \
+                     VALUES (?1, ?2, 'deleted')",
+                    rusqlite::params![aid, share_id_db],
+                )?;
+            }
+
+            conn.execute(
+                "DELETE FROM artifact_shares WHERE share_id = ?1",
+                rusqlite::params![share_id_db],
+            )?;
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
+    /// List all active shares, newest first.
+    ///
+    /// `_session_id` is currently unused (the `artifact_shares` table is not
+    /// scoped by session), but kept for API stability.
+    pub fn list(&self, _session_id: &str) -> Result<Vec<ShareInfo>> {
+        let rows = self.storage.database().with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT artifact_id, share_id, share_url, expires_at, view_count, created_at \
+                 FROM artifact_shares ORDER BY created_at DESC",
+            )?;
+            let iter = stmt.query_map([], |row| {
+                Ok(ShareInfo {
+                    artifact_id: row.get(0)?,
+                    share_id: row.get(1)?,
+                    share_url: row.get(2)?,
+                    expires_at: row.get(3)?,
+                    view_count: row.get::<_, i64>(4)? as u64,
+                    created_at: row.get(5)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in iter {
+                out.push(r?);
+            }
+            Ok(out)
+        })?;
+        Ok(rows)
+    }
+
+    // ---- internal helpers ----
+
+    fn load_artifact(&self, _session_id: &str, artifact_id: &str) -> Result<ArtifactRow> {
+        let artifact_id_db = artifact_id.to_string();
+        let row = self
+            .storage
+            .database()
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT id, title, content_type, content FROM artifacts WHERE id = ?1",
+                    rusqlite::params![artifact_id_db],
+                    |row| {
+                        Ok(ArtifactRow {
+                            id: row.get(0)?,
+                            title: row.get(1)?,
+                            content_type: row.get(2)?,
+                            content: row.get(3)?,
+                        })
+                    },
+                )
+                .map_err(StorageError::from)
+            })
+            .map_err(|e| match e {
+                StorageError::Sqlite(rusqlite::Error::QueryReturnedNoRows) => {
+                    DaemonError::InvalidRequest(format!("Artifact not found: {}", artifact_id))
+                }
+                other => DaemonError::from(other),
+            })?;
+        Ok(row)
+    }
+
+    fn load_encrypted_owner_token(&self, share_id: &str) -> Result<String> {
+        let share_id_db = share_id.to_string();
+        self.storage
+            .database()
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT encrypted_owner_token FROM artifact_shares WHERE share_id = ?1",
+                    rusqlite::params![share_id_db],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(StorageError::from)
+            })
+            .map_err(|e| match e {
+                StorageError::Sqlite(rusqlite::Error::QueryReturnedNoRows) => {
+                    DaemonError::InvalidRequest(format!("Share not found: {}", share_id))
+                }
+                other => DaemonError::from(other),
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_key() -> [u8; 32] {
+        let mut k = [0u8; 32];
+        for (i, b) in k.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        k
+    }
+
+    fn make_service() -> CanvasShareService {
+        let storage = Arc::new(Storage::open_in_memory().expect("open storage"));
+        let http = ShareHttpClient::new("https://example.test").expect("http client");
+        CanvasShareService::new(storage, http, test_key())
+    }
+
+    #[test]
+    fn list_empty_returns_empty_vec() {
+        let svc = make_service();
+        let shares = svc.list("any-session").expect("list");
+        assert!(shares.is_empty());
+    }
+
+    #[test]
+    fn load_artifact_missing_returns_error() {
+        let svc = make_service();
+        let err = svc
+            .load_artifact("sess-1", "nonexistent-artifact")
+            .unwrap_err();
+        match err {
+            DaemonError::InvalidRequest(msg) => assert!(msg.contains("Artifact not found")),
+            other => panic!("expected InvalidRequest, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn load_encrypted_owner_token_missing_returns_error() {
+        let svc = make_service();
+        let err = svc
+            .load_encrypted_owner_token("nonexistent-share")
+            .unwrap_err();
+        match err {
+            DaemonError::InvalidRequest(msg) => assert!(msg.contains("Share not found")),
+            other => panic!("expected InvalidRequest, got {:?}", other),
+        }
+    }
+
+    // Network-dependent smoke test; ignored by default.
+    #[tokio::test]
+    #[ignore]
+    async fn share_roundtrip_requires_network() {
+        // Placeholder: a full share -> import roundtrip needs a running CF
+        // Worker or a stub server. Kept here to document intent.
+    }
+}
