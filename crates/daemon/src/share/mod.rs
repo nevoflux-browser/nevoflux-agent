@@ -3,6 +3,7 @@
 
 pub mod binary_format;
 pub mod crypto;
+pub mod http_client;
 pub mod local_store;
 pub mod owner_token;
 pub mod password;
@@ -11,6 +12,9 @@ pub mod types;
 
 pub use binary_format::{deserialize, serialize, NfebHeader, MAGIC, VERSION};
 pub use crypto::{decrypt_share_bundle, derive_key, encrypt_share_bundle};
+pub use http_client::{
+    ExtendResponse, MetaResponse, ShareHttpClient, UploadResponse, DEFAULT_BASE_URL,
+};
 pub use local_store::{
     decrypt_bytes_from_storage, decrypt_from_storage, encrypt_bytes_for_storage,
     encrypt_for_storage,
