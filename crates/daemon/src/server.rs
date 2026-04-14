@@ -1503,44 +1503,64 @@ pub async fn start_server(
                                 // Ensure session dir exists
                                 let _ = tokio::fs::create_dir_all(&session_dir).await;
 
+                                // Set up a streaming channel and forwarder task that converts
+                                // executor events into CanvasToolEvent::Stdout / Stderr messages
+                                // and pushes them through the proxy as data arrives.
+                                let (exec_evt_tx, mut exec_evt_rx) =
+                                    tokio::sync::mpsc::channel::<
+                                        crate::canvas_tools::executor::ExecutionEvent,
+                                    >(64);
+
+                                let fwd_call_id = call_id.clone();
+                                let fwd_pid = pid.clone();
+                                let fwd_resp_tx = resp_tx.clone();
+                                let fwd_ident = ident.clone();
+                                let forwarder = tokio::spawn(async move {
+                                    while let Some(evt) = exec_evt_rx.recv().await {
+                                        let cte = match evt {
+                                            crate::canvas_tools::executor::ExecutionEvent::Stdout(data) => {
+                                                nevoflux_protocol::CanvasToolEvent::Stdout {
+                                                    call_id: fwd_call_id.clone(),
+                                                    data,
+                                                }
+                                            }
+                                            crate::canvas_tools::executor::ExecutionEvent::Stderr(data) => {
+                                                nevoflux_protocol::CanvasToolEvent::Stderr {
+                                                    call_id: fwd_call_id.clone(),
+                                                    data,
+                                                }
+                                            }
+                                        };
+                                        let msg =
+                                            nevoflux_protocol::AgentMessage::CanvasToolEvent(cte);
+                                        let payload =
+                                            serde_json::to_value(&msg).unwrap_or_default();
+                                        let env =
+                                            DaemonEnvelope::new(&fwd_pid, Channel::Chat, payload);
+                                        if fwd_resp_tx.send((fwd_ident.clone(), env)).await.is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                });
+
                                 let result =
-                                    crate::canvas_tools::executor::execute_whitelisted_tool(
+                                    crate::canvas_tools::executor::execute_whitelisted_tool_streaming(
                                         &tool,
                                         &req.params,
                                         free_args,
                                         &session_dir,
+                                        exec_evt_tx,
                                     )
                                     .await;
 
-                                // Build response, then emit any captured stdout/stderr as
-                                // streaming events so SDK consumers see the data BEFORE the
-                                // Finished event (mirrors what a streaming executor would do).
+                                // Wait for the forwarder to drain remaining events before we send
+                                // the Finished event, so consumers see ordering: stdout/stderr
+                                // chunks → finished.
+                                let _ = forwarder.await;
+
                                 let response = match result {
                                     Ok(exec_result) => {
-                                        // Emit captured stdout chunk (if any) as a Stdout event
-                                        if !exec_result.stdout.is_empty() {
-                                            let evt = nevoflux_protocol::AgentMessage::CanvasToolEvent(
-                                                nevoflux_protocol::CanvasToolEvent::Stdout {
-                                                    call_id: call_id.clone(),
-                                                    data: exec_result.stdout.clone(),
-                                                },
-                                            );
-                                            let payload = serde_json::to_value(&evt).unwrap_or_default();
-                                            let env = DaemonEnvelope::new(&pid, Channel::Chat, payload);
-                                            let _ = resp_tx.send((ident.clone(), env)).await;
-                                        }
-                                        if !exec_result.stderr.is_empty() {
-                                            let evt = nevoflux_protocol::AgentMessage::CanvasToolEvent(
-                                                nevoflux_protocol::CanvasToolEvent::Stderr {
-                                                    call_id: call_id.clone(),
-                                                    data: exec_result.stderr.clone(),
-                                                },
-                                            );
-                                            let payload = serde_json::to_value(&evt).unwrap_or_default();
-                                            let env = DaemonEnvelope::new(&pid, Channel::Chat, payload);
-                                            let _ = resp_tx.send((ident.clone(), env)).await;
-                                        }
-
                                         nevoflux_protocol::CanvasToolInvokeResponse {
                                             tool_name: req.tool_name.clone(),
                                             success: exec_result.success,
