@@ -24,6 +24,114 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, warn};
 
+/// Mirror a ContentStore write for a `canvas:{id}` key into the `artifacts`
+/// table so downstream readers (canvas.share in particular) see the user's
+/// latest edits.
+///
+/// Background: canvas artifacts live in two places — the `artifacts` SQL
+/// table (populated by `save_artifact` at create time) and the ContentStore
+/// key-value config table under key `canvas:{id}` (rewritten on every
+/// in-browser edit). Without this mirror the two diverge: the table freezes
+/// at creation-time state while ContentStore tracks latest, so `canvas.share`
+/// (which reads the table via `load_artifact`) uploads a stale snapshot.
+///
+/// Best-effort: failures are logged, never propagated — the ContentStore
+/// write itself has already succeeded and the caller must not be penalized.
+fn mirror_canvas_to_artifacts_table(
+    session_manager: &SessionManager,
+    key: &str,
+    value: &serde_json::Value,
+) {
+    let id = match key.strip_prefix("canvas:") {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return,
+    };
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => {
+            warn!("ContentStore canvas value for {} is not an object, skipping artifacts mirror", key);
+            return;
+        }
+    };
+
+    let title = obj
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Untitled")
+        .to_string();
+    let content_type = obj
+        .get("content_type")
+        .or_else(|| obj.get("contentType"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("text/html")
+        .to_string();
+    let content = obj
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let description = obj
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let files = obj.get("files").and_then(|v| v.as_object()).map(|m| {
+        m.iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect::<HashMap<String, String>>()
+    });
+    let entry = obj
+        .get("entry")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Resolve session_id, preserving the existing row's FK when the caller
+    // didn't send one. If there is no existing row and no session_id in the
+    // value, skip the mirror — creating an orphan row would violate the FK.
+    let session_id_from_value = obj
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let session_id = match session_id_from_value {
+        Some(s) => s,
+        None => match session_manager.get_artifact(&id) {
+            Ok(Some(existing)) => existing.session_id,
+            Ok(None) => {
+                debug!(
+                    "ContentStore canvas {} has no session_id and no existing row; skipping artifacts mirror",
+                    id
+                );
+                return;
+            }
+            Err(e) => {
+                warn!("get_artifact({}) failed during mirror: {:#}", id, e);
+                return;
+            }
+        },
+    };
+
+    let mut params = nevoflux_storage::CreateArtifactParams::new(
+        &id,
+        &session_id,
+        &title,
+        &content_type,
+    )
+    .with_content(&content);
+    if let Some(d) = description {
+        params = params.with_description(&d);
+    }
+    if let Some(f) = files {
+        params = params.with_files(f);
+    }
+    if let Some(e) = entry {
+        params = params.with_entry(&e);
+    }
+
+    if let Err(e) = session_manager.save_artifact(params) {
+        warn!("save_artifact mirror for canvas {} failed: {:#}", id, e);
+    }
+}
+
 /// Registry for pending browser tool requests.
 /// Maps request_id to (created_at, response_sender).
 /// Entries are cleaned up periodically to prevent unbounded growth.
@@ -1404,6 +1512,14 @@ pub async fn start_server(
                     .map(|req| req.include_disabled)
                     .unwrap_or(false);
 
+                // Rescan canvas-tools directories so TOML files added after
+                // daemon startup are picked up. This is what makes the
+                // "I added it — Retry" button in canvas dialogs actually
+                // work: the retry re-issues canvas_tool_list and the daemon
+                // sees the newly-added file. Session-registered tools are
+                // preserved by load_from_disk.
+                process_canvas_tool_registry.load_from_disk().await;
+
                 let tools = if include_disabled {
                     process_canvas_tool_registry.list_all()
                 } else {
@@ -1697,13 +1813,20 @@ pub async fn start_server(
                                             "imported_from_share_id": r.share_id,
                                         }
                                     }),
-                                    Err(e) => serde_json::json!({
-                                        "type": "error",
-                                        "payload": {
-                                            "code": "IMPORT_FAILED",
-                                            "message": e.to_string()
-                                        }
-                                    }),
+                                    Err(e) => {
+                                        warn!(
+                                            share_id = %req.share_id,
+                                            "canvas_import failed: {:#}",
+                                            e
+                                        );
+                                        serde_json::json!({
+                                            "type": "error",
+                                            "payload": {
+                                                "code": "IMPORT_FAILED",
+                                                "message": e.to_string()
+                                            }
+                                        })
+                                    }
                                 };
                                 let env = DaemonEnvelope::new(&pid, Channel::Chat, resp_msg)
                                     .with_request_id(&rid);
@@ -4554,16 +4677,30 @@ async fn handle_chat_message(
                             .get("value")
                             .cloned()
                             .unwrap_or(serde_json::Value::Null);
-                        match session_manager.set_config(key, value) {
-                            Ok(()) => serde_json::json!({
-                                "type": "system_response",
-                                "payload": {
-                                    "request_id": request_id,
-                                    "command": "content_store.set",
-                                    "success": true,
-                                    "data": { "key": key }
+                        match session_manager.set_config(key, value.clone()) {
+                            Ok(()) => {
+                                // Mirror canvas ContentStore writes into the
+                                // artifacts table so canvas.share picks up the
+                                // latest edits instead of the creation-time
+                                // snapshot. Best-effort; failures are logged
+                                // inside the helper and never fail the write.
+                                if key.starts_with("canvas:") {
+                                    mirror_canvas_to_artifacts_table(
+                                        session_manager,
+                                        key,
+                                        &value,
+                                    );
                                 }
-                            }),
+                                serde_json::json!({
+                                    "type": "system_response",
+                                    "payload": {
+                                        "request_id": request_id,
+                                        "command": "content_store.set",
+                                        "success": true,
+                                        "data": { "key": key }
+                                    }
+                                })
+                            }
                             Err(e) => serde_json::json!({
                                 "type": "system_response",
                                 "payload": {
