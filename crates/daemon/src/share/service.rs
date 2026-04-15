@@ -10,6 +10,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use nevoflux_storage::{Storage, StorageError};
+use rusqlite::OptionalExtension;
 
 use super::binary_format::{deserialize, serialize};
 use super::crypto::{decrypt_share_bundle, encrypt_share_bundle};
@@ -25,6 +26,46 @@ use crate::error::{DaemonError, Result};
 
 /// Default TTL: 30 days.
 pub const DEFAULT_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// Stable id for the archive session that holds canvases imported via shared
+/// links. Using a well-known id means every import lands in the same bucket
+/// regardless of how many times the row is re-created or the daemon restarts.
+const IMPORTED_CANVASES_SESSION_ID: &str = "imported-canvases";
+
+/// Resolve the effective session_id for an imported artifact.
+///
+/// If the caller supplied a non-empty session_id that already exists in
+/// `sessions`, use it as-is. Otherwise fall back to a dedicated "Imported
+/// Canvases" archive session, creating that row lazily on first use. This
+/// keeps the NOT NULL FK on artifacts.session_id satisfied in import flows
+/// that originate from standalone share pages with no active chat session.
+fn resolve_import_session_id(
+    conn: &rusqlite::Connection,
+    requested: &str,
+    now: i64,
+) -> rusqlite::Result<String> {
+    if !requested.is_empty() {
+        let exists: bool = conn.query_row(
+            "SELECT 1 FROM sessions WHERE id = ?1",
+            rusqlite::params![requested],
+            |_| Ok(true),
+        ).optional()?.unwrap_or(false);
+        if exists {
+            return Ok(requested.to_string());
+        }
+    }
+
+    conn.execute(
+        "INSERT OR IGNORE INTO sessions (id, title, mode, created_at, updated_at) \
+         VALUES (?1, ?2, 'chat', ?3, ?3)",
+        rusqlite::params![
+            IMPORTED_CANVASES_SESSION_ID,
+            "Imported Canvases",
+            now,
+        ],
+    )?;
+    Ok(IMPORTED_CANVASES_SESSION_ID.to_string())
+}
 
 /// Parse an ISO 8601 / RFC 3339 timestamp into a Unix timestamp. On parse
 /// failure returns `0` so callers can at least store a row.
@@ -200,13 +241,21 @@ impl CanvasShareService {
         };
 
         // 4. Insert into artifacts with imported_from_* provenance columns.
-        let session_id_db = session_id.to_string();
+        //
+        // artifacts.session_id is a NOT NULL FK to sessions(id). When the
+        // client invokes import from a standalone nevoflux://import/... page
+        // (no active chat session), session_id arrives empty and the INSERT
+        // would violate the FK. Resolve it to a stable "Imported Canvases"
+        // archive session, creating it on first use.
+        let session_id_db_source = session_id.to_string();
         let artifact_id_db = new_artifact_id.clone();
         let title_db = bundle.artifact_name.clone();
         let content_type_db = bundle.artifact_type.clone();
         let share_id_db = share_id.to_string();
 
         self.storage.database().with_connection(|conn| {
+            let session_id_db =
+                resolve_import_session_id(conn, &session_id_db_source, now)?;
             conn.execute(
                 "INSERT INTO artifacts (id, session_id, title, content_type, content, imported_from_url, imported_from_share_id, imported_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
