@@ -100,19 +100,24 @@ impl PermissionChecker {
 
     /// Check whether `subscriber` may subscribe to `pattern`.
     ///
-    /// # Permission matrix (subscribe)
+    /// Uses prefix-based permission uniformly across Exact / Wildcard /
+    /// DoubleWildcard: whoever can subscribe to `ui:foo` exactly may also
+    /// subscribe to `ui:*` or `ui:**`. Bare-wildcard patterns without a
+    /// leading prefix segment (e.g. `*` or `**`) remain Internal-only —
+    /// they cross permission boundaries.
     ///
-    /// | Pattern type           | Allowed subscribers              |
-    /// |------------------------|----------------------------------|
-    /// | `task:*`               | Agent + Internal                 |
-    /// | `agent:*`              | Agent + Internal                 |
-    /// | `ui:*`                 | Extension + Internal             |
-    /// | `system:*`             | All                              |
-    /// | `mcp:*`                | Agent + Internal                 |
-    /// | `wasm:*`               | Agent + Internal                 |
-    /// | (unknown prefix)       | Internal only                    |
-    /// | Wildcard (`*` segment) | Internal only                    |
-    /// | DoubleWildcard         | Internal only                    |
+    /// # Permission matrix (subscribe, by leading prefix)
+    ///
+    /// | Prefix     | Allowed subscribers              |
+    /// |------------|----------------------------------|
+    /// | `task`     | Agent + Internal                 |
+    /// | `agent`    | Agent + Internal                 |
+    /// | `ui`       | Extension + Internal             |
+    /// | `system`   | All                              |
+    /// | `mcp`      | Agent + Internal                 |
+    /// | `wasm`     | Agent + Internal                 |
+    /// | (unknown)  | Internal only                    |
+    /// | empty      | Internal only (bare `*`/`**`)    |
     pub fn check_subscribe(
         pattern: &TopicPattern,
         subscriber: &SubscriberIdentity,
@@ -122,46 +127,42 @@ impl PermissionChecker {
             return PermissionResult::Allowed;
         }
 
-        match pattern {
-            // Wildcard patterns (containing `*` segment) — Daemon only.
-            TopicPattern::Wildcard(pat) => PermissionResult::Denied(format!(
-                "{} may not subscribe to wildcard pattern '{pat}'",
-                subscriber_label(subscriber),
-            )),
-            // DoubleWildcard patterns — Internal only.
-            TopicPattern::DoubleWildcard(prefix) => PermissionResult::Denied(format!(
-                "{} may not subscribe to double-wildcard pattern '{}:**'",
-                subscriber_label(subscriber),
-                prefix,
-            )),
-            // Exact topic — check prefix rules.
-            TopicPattern::Exact(topic) => {
-                let prefix = topic_prefix(topic);
-                match prefix {
-                    "system" => {
-                        // All identities may subscribe to system topics.
-                        PermissionResult::Allowed
-                    }
-                    "task" | "agent" | "mcp" | "wasm" => match subscriber {
-                        SubscriberIdentity::Agent { .. } => PermissionResult::Allowed,
-                        _ => PermissionResult::Denied(format!(
-                            "{} may not subscribe to '{prefix}:*' topics",
-                            subscriber_label(subscriber),
-                        )),
-                    },
-                    "ui" => match subscriber {
-                        SubscriberIdentity::Extension { .. } => PermissionResult::Allowed,
-                        _ => PermissionResult::Denied(format!(
-                            "{} may not subscribe to 'ui:*' topics",
-                            subscriber_label(subscriber),
-                        )),
-                    },
-                    _ => PermissionResult::Denied(format!(
-                        "{} may not subscribe to unknown prefix '{prefix}:*' topics",
-                        subscriber_label(subscriber),
-                    )),
-                }
+        // Extract the leading prefix segment (everything before the first ':').
+        // For Wildcard/DoubleWildcard this is the first segment of the pattern;
+        // for a bare wildcard like "*" / "**" the prefix is empty.
+        let prefix = match pattern {
+            TopicPattern::Exact(t) => topic_prefix(t),
+            TopicPattern::Wildcard(pat) => {
+                let first = pat.split(':').next().unwrap_or("");
+                if first == "*" { "" } else { first }
             }
+            TopicPattern::DoubleWildcard(p) => p.as_str(),
+        };
+
+        match prefix {
+            "" => PermissionResult::Denied(format!(
+                "{} may not subscribe to cross-prefix wildcard patterns",
+                subscriber_label(subscriber),
+            )),
+            "system" => PermissionResult::Allowed,
+            "task" | "agent" | "mcp" | "wasm" => match subscriber {
+                SubscriberIdentity::Agent { .. } => PermissionResult::Allowed,
+                _ => PermissionResult::Denied(format!(
+                    "{} may not subscribe to '{prefix}:*' topics",
+                    subscriber_label(subscriber),
+                )),
+            },
+            "ui" => match subscriber {
+                SubscriberIdentity::Extension { .. } => PermissionResult::Allowed,
+                _ => PermissionResult::Denied(format!(
+                    "{} may not subscribe to 'ui:*' topics",
+                    subscriber_label(subscriber),
+                )),
+            },
+            _ => PermissionResult::Denied(format!(
+                "{} may not subscribe to unknown prefix '{prefix}:*' topics",
+                subscriber_label(subscriber),
+            )),
         }
     }
 }

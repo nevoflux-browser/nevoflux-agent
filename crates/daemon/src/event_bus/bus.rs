@@ -166,19 +166,34 @@ impl EventBus {
         Ok(())
     }
 
-    /// Subscribe to events matching `pattern`.
+    /// Subscribe to events matching `pattern`. Always replays sticky events.
     ///
-    /// 1. Validates the pattern.
-    /// 2. Checks subscribe permissions.
-    /// 3. Creates an mpsc channel with the requested buffer size.
-    /// 4. Replays any matching sticky events.
-    /// 5. Registers the subscription.
+    /// Kept as-is for backward compatibility and tests. Callers that want to
+    /// opt out of sticky replay should use [`subscribe_with_options`].
     pub fn subscribe(
         &self,
         pattern: TopicPattern,
         subscriber: SubscriberIdentity,
         policy: BackpressurePolicy,
         buffer_size: usize,
+    ) -> Result<SubscriptionHandle, EventBusError> {
+        self.subscribe_with_options(pattern, subscriber, policy, buffer_size, true)
+    }
+
+    /// Subscribe to events matching `pattern`, optionally skipping sticky replay.
+    ///
+    /// 1. Validates the pattern.
+    /// 2. Checks subscribe permissions.
+    /// 3. Creates an mpsc channel with the requested buffer size.
+    /// 4. Replays any matching sticky events (only if `replay_sticky`).
+    /// 5. Registers the subscription.
+    pub fn subscribe_with_options(
+        &self,
+        pattern: TopicPattern,
+        subscriber: SubscriberIdentity,
+        policy: BackpressurePolicy,
+        buffer_size: usize,
+        replay_sticky: bool,
     ) -> Result<SubscriptionHandle, EventBusError> {
         // 1. Validate pattern.
         match &pattern {
@@ -212,8 +227,10 @@ impl EventBus {
             .with_buffer_size(buf);
         let id = sub.id.clone();
 
-        // 4. Replay sticky events.
-        self.replay_sticky(&sub.pattern, &tx);
+        // 4. Replay sticky events (if requested).
+        if replay_sticky {
+            self.replay_sticky(&sub.pattern, &tx);
+        }
 
         // 5. Register.
         {

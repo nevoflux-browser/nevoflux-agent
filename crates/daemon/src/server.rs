@@ -1146,7 +1146,7 @@ pub async fn start_server(
 
                     match result {
                         Ok(()) => {
-                            debug!("Sent to proxy {}: type={}", proxy_id, msg_type);
+                            info!("Sent to proxy {}: type={}", proxy_id, msg_type);
                         }
                         Err(e) => {
                             error!("Failed to send to proxy {}: {}", proxy_id, e);
@@ -1157,6 +1157,11 @@ pub async fn start_server(
                 } else {
                     warn!("No writer for proxy {}, dropping message", proxy_id);
                 }
+            } else {
+                error!(
+                    "serde_json::to_vec failed for response to proxy {}: type={}",
+                    proxy_id, msg_type
+                );
             }
         }
     });
@@ -2219,11 +2224,12 @@ async fn handle_event_bus_request(
                 proxy_id: proxy_id.to_string(),
             };
 
-            match event_bus.subscribe(
+            match event_bus.subscribe_with_options(
                 pattern,
                 subscriber,
                 BackpressurePolicy::DropOldest,
                 opts.buffer_size,
+                opts.replay_sticky,
             ) {
                 Ok(mut sub_handle) => {
                     let sub_id = sub_handle.id.clone();
@@ -3911,8 +3917,15 @@ async fn handle_chat_message_streaming(
 
             let response =
                 DaemonEnvelope::new(&proxy_id, channel, final_payload).with_request_id(&request_id);
+            info!(
+                "Sending final stream_chunk: tool_calls={}, has_title={}",
+                all_tool_calls.len(),
+                response.payload.get("payload").and_then(|p| p.get("session_title")).is_some()
+            );
             if let Err(e) = response_tx.send((identity, response)).await {
                 error!("Failed to send final response: {}", e);
+            } else {
+                info!("Final stream_chunk queued for writer");
             }
         }
         Ok(Err(e)) => {
