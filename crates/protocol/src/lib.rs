@@ -45,8 +45,11 @@ pub use canvas_share::{
 
 // Re-export canvas tool types
 pub use canvas_tools::{
-    CanvasToolEvent, CanvasToolInvokeRequest, CanvasToolInvokeResponse, CanvasToolListRequest,
-    CanvasToolListResponse, CanvasToolSummary,
+    CanvasToolDeleteRequest, CanvasToolDeleteResponse, CanvasToolError, CanvasToolEvent,
+    CanvasToolGetRawRequest, CanvasToolGetRawResponse, CanvasToolInvokeRequest,
+    CanvasToolInvokeResponse, CanvasToolListRequest, CanvasToolListResponse,
+    CanvasToolSaveRequest, CanvasToolSaveResponse, CanvasToolSummary,
+    CanvasToolValidateRequest, CanvasToolValidateResponse,
 };
 
 // Re-export main types at crate root
