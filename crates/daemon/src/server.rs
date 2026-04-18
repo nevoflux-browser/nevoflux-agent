@@ -1343,6 +1343,12 @@ pub async fn start_server(
     let process_subscription_router = subscription_router.clone();
     let process_trace_enabled = config.trace_enabled;
     let process_canvas_tool_registry = canvas_tool_registry.clone();
+    let process_canvas_user_dir = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("nevoflux")
+        .join("canvas-tools");
+    let process_canvas_builtin_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("canvas-tools");
     let process_canvas_share_service = canvas_share_service.clone();
     tokio::spawn(async move {
         while let Some((identity, envelope)) = msg_rx.recv().await {
@@ -1554,6 +1560,351 @@ pub async fn start_server(
                     nevoflux_protocol::CanvasToolListResponse { tools: summaries },
                 );
                 let payload = serde_json::to_value(&resp).unwrap_or_default();
+                let response = DaemonEnvelope::new(&proxy_id, channel, payload)
+                    .with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_tool_get_raw — return the raw TOML text for the named tool.
+            // Looks in the user dir first (for User/override entries), falls back to
+            // the builtin dir. Session-source tools have no on-disk source; we report
+            // `no_raw_for_session` in that case.
+            if msg_type == "canvas_tool_get_raw" {
+                info!("Processing canvas_tool_get_raw message");
+                let req: Option<nevoflux_protocol::CanvasToolGetRawRequest> = envelope
+                    .payload
+                    .get("payload")
+                    .and_then(|p| serde_json::from_value(p.clone()).ok());
+
+                let resp = match req {
+                    Some(r) => {
+                        let name = r.name;
+                        let source = process_canvas_tool_registry
+                            .get_any(&name)
+                            .map(|t| t.source);
+
+                        match source {
+                            None => nevoflux_protocol::CanvasToolGetRawResponse {
+                                success: false,
+                                toml_text: None,
+                                origin_source: None,
+                                error: Some(nevoflux_protocol::CanvasToolError {
+                                    code: "not_found".into(),
+                                    message: format!("no tool named '{}'", name),
+                                    field: None,
+                                }),
+                            },
+                            Some(crate::canvas_tools::types::ToolSource::Session) => {
+                                nevoflux_protocol::CanvasToolGetRawResponse {
+                                    success: false,
+                                    toml_text: None,
+                                    origin_source: None,
+                                    error: Some(nevoflux_protocol::CanvasToolError {
+                                        code: "no_raw_for_session".into(),
+                                        message: "session tools have no on-disk source".into(),
+                                        field: None,
+                                    }),
+                                }
+                            }
+                            Some(src) => {
+                                let dir = match src {
+                                    crate::canvas_tools::types::ToolSource::User => {
+                                        &process_canvas_user_dir
+                                    }
+                                    _ => &process_canvas_builtin_dir,
+                                };
+                                let path = dir.join(format!("{name}.toml"));
+                                match std::fs::read_to_string(&path) {
+                                    Ok(text) => nevoflux_protocol::CanvasToolGetRawResponse {
+                                        success: true,
+                                        toml_text: Some(text),
+                                        origin_source: Some(format!("{:?}", src).to_lowercase()),
+                                        error: None,
+                                    },
+                                    Err(e) => nevoflux_protocol::CanvasToolGetRawResponse {
+                                        success: false,
+                                        toml_text: None,
+                                        origin_source: None,
+                                        error: Some(nevoflux_protocol::CanvasToolError {
+                                            code: "io".into(),
+                                            message: format!("{}: {}", path.display(), e),
+                                            field: None,
+                                        }),
+                                    },
+                                }
+                            }
+                        }
+                    }
+                    None => nevoflux_protocol::CanvasToolGetRawResponse {
+                        success: false,
+                        toml_text: None,
+                        origin_source: None,
+                        error: Some(nevoflux_protocol::CanvasToolError {
+                            code: "validation".into(),
+                            message: "missing or malformed payload".into(),
+                            field: None,
+                        }),
+                    },
+                };
+
+                let msg = nevoflux_protocol::AgentMessage::CanvasToolGetRawResponse(resp);
+                let payload = serde_json::to_value(&msg).unwrap_or_default();
+                let response = DaemonEnvelope::new(&proxy_id, channel, payload)
+                    .with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            if msg_type == "canvas_tool_save" {
+                info!("Processing canvas_tool_save message");
+                let req: Option<nevoflux_protocol::CanvasToolSaveRequest> = envelope
+                    .payload
+                    .get("payload")
+                    .and_then(|p| serde_json::from_value(p.clone()).ok());
+
+                let resp = (|| -> nevoflux_protocol::CanvasToolSaveResponse {
+                    let req = match req {
+                        Some(r) => r,
+                        None => {
+                            return nevoflux_protocol::CanvasToolSaveResponse {
+                                success: false,
+                                error: Some(nevoflux_protocol::CanvasToolError {
+                                    code: "validation".into(),
+                                    message: "missing or malformed payload".into(),
+                                    field: None,
+                                }),
+                            }
+                        }
+                    };
+
+                    // 1. Parse TOML.
+                    let tool: crate::canvas_tools::types::CanvasTool =
+                        match toml::from_str(&req.toml_text) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                return nevoflux_protocol::CanvasToolSaveResponse {
+                                    success: false,
+                                    error: Some(nevoflux_protocol::CanvasToolError {
+                                        code: "toml_parse".into(),
+                                        message: e.to_string(),
+                                        field: None,
+                                    }),
+                                }
+                            }
+                        };
+
+                    // 2. Validate semantics.
+                    if let Err(ve) = crate::canvas_tools::validator::validate(&tool) {
+                        return nevoflux_protocol::CanvasToolSaveResponse {
+                            success: false,
+                            error: Some(nevoflux_protocol::CanvasToolError {
+                                code: ve.code.into(),
+                                message: ve.message,
+                                field: ve.field,
+                            }),
+                        };
+                    }
+
+                    // 3. Enforce expected_name (edit mode).
+                    if let Some(expected) = &req.expected_name {
+                        if expected != &tool.name {
+                            return nevoflux_protocol::CanvasToolSaveResponse {
+                                success: false,
+                                error: Some(nevoflux_protocol::CanvasToolError {
+                                    code: "name_changed".into(),
+                                    message: format!(
+                                        "renaming is not supported; expected '{expected}', found '{}'",
+                                        tool.name
+                                    ),
+                                    field: Some("name".into()),
+                                }),
+                            };
+                        }
+                    } else {
+                        // 4. New-mode only: reject collision with existing User tool.
+                        // (A collision with a Builtin is allowed — that's the override path.)
+                        if let Some(existing) = process_canvas_tool_registry.get_any(&tool.name) {
+                            if existing.source == crate::canvas_tools::types::ToolSource::User {
+                                return nevoflux_protocol::CanvasToolSaveResponse {
+                                    success: false,
+                                    error: Some(nevoflux_protocol::CanvasToolError {
+                                        code: "name_conflict".into(),
+                                        message: format!(
+                                            "a user tool '{}' already exists",
+                                            tool.name
+                                        ),
+                                        field: Some("name".into()),
+                                    }),
+                                };
+                            }
+                        }
+                    }
+
+                    // 5. Atomic write.
+                    if let Err(e) = crate::canvas_tools::user_writer::write_user_tool_atomic(
+                        &process_canvas_user_dir,
+                        &tool.name,
+                        &req.toml_text,
+                    ) {
+                        return nevoflux_protocol::CanvasToolSaveResponse {
+                            success: false,
+                            error: Some(nevoflux_protocol::CanvasToolError {
+                                code: "io".into(),
+                                message: e.to_string(),
+                                field: None,
+                            }),
+                        };
+                    }
+
+                    // 6. Register in-memory as User source (shadowing any Builtin).
+                    process_canvas_tool_registry.register_user_tool(tool);
+
+                    nevoflux_protocol::CanvasToolSaveResponse {
+                        success: true,
+                        error: None,
+                    }
+                })();
+
+                let msg = nevoflux_protocol::AgentMessage::CanvasToolSaveResponse(resp);
+                let payload = serde_json::to_value(&msg).unwrap_or_default();
+                let response = DaemonEnvelope::new(&proxy_id, channel, payload)
+                    .with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            if msg_type == "canvas_tool_delete" {
+                info!("Processing canvas_tool_delete message");
+                let req: Option<nevoflux_protocol::CanvasToolDeleteRequest> = envelope
+                    .payload
+                    .get("payload")
+                    .and_then(|p| serde_json::from_value(p.clone()).ok());
+
+                let resp = match req {
+                    None => nevoflux_protocol::CanvasToolDeleteResponse {
+                        success: false,
+                        was_override: false,
+                        error: Some(nevoflux_protocol::CanvasToolError {
+                            code: "validation".into(),
+                            message: "missing or malformed payload".into(),
+                            field: None,
+                        }),
+                    },
+                    Some(r) => {
+                        let name = r.name;
+                        let live = process_canvas_tool_registry.get_any(&name);
+                        match live {
+                            None => nevoflux_protocol::CanvasToolDeleteResponse {
+                                success: false,
+                                was_override: false,
+                                error: Some(nevoflux_protocol::CanvasToolError {
+                                    code: "not_found".into(),
+                                    message: format!("no tool named '{}'", name),
+                                    field: None,
+                                }),
+                            },
+                            Some(t)
+                                if t.source != crate::canvas_tools::types::ToolSource::User =>
+                            {
+                                nevoflux_protocol::CanvasToolDeleteResponse {
+                                    success: false,
+                                    was_override: false,
+                                    error: Some(nevoflux_protocol::CanvasToolError {
+                                        code: "invalid_source".into(),
+                                        message: "only user tools can be deleted".into(),
+                                        field: None,
+                                    }),
+                                }
+                            }
+                            Some(_) => {
+                                if let Err(e) =
+                                    crate::canvas_tools::user_writer::delete_user_tool_file(
+                                        &process_canvas_user_dir,
+                                        &name,
+                                    )
+                                {
+                                    nevoflux_protocol::CanvasToolDeleteResponse {
+                                        success: false,
+                                        was_override: false,
+                                        error: Some(nevoflux_protocol::CanvasToolError {
+                                            code: "io".into(),
+                                            message: e.to_string(),
+                                            field: None,
+                                        }),
+                                    }
+                                } else {
+                                    let outcome = process_canvas_tool_registry
+                                        .remove_user_tool_with_restore(&name);
+                                    nevoflux_protocol::CanvasToolDeleteResponse {
+                                        success: true,
+                                        was_override: outcome.restored_builtin,
+                                        error: None,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+
+                let msg = nevoflux_protocol::AgentMessage::CanvasToolDeleteResponse(resp);
+                let payload = serde_json::to_value(&msg).unwrap_or_default();
+                let response = DaemonEnvelope::new(&proxy_id, channel, payload)
+                    .with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            if msg_type == "canvas_tool_validate" {
+                info!("Processing canvas_tool_validate message");
+                let req: Option<nevoflux_protocol::CanvasToolValidateRequest> = envelope
+                    .payload
+                    .get("payload")
+                    .and_then(|p| serde_json::from_value(p.clone()).ok());
+
+                let resp = match req {
+                    None => nevoflux_protocol::CanvasToolValidateResponse {
+                        success: false,
+                        error: Some(nevoflux_protocol::CanvasToolError {
+                            code: "validation".into(),
+                            message: "missing or malformed payload".into(),
+                            field: None,
+                        }),
+                    },
+                    Some(r) => {
+                        match toml::from_str::<crate::canvas_tools::types::CanvasTool>(
+                            &r.toml_text,
+                        ) {
+                            Err(e) => nevoflux_protocol::CanvasToolValidateResponse {
+                                success: false,
+                                error: Some(nevoflux_protocol::CanvasToolError {
+                                    code: "toml_parse".into(),
+                                    message: e.to_string(),
+                                    field: None,
+                                }),
+                            },
+                            Ok(tool) => {
+                                match crate::canvas_tools::validator::validate(&tool) {
+                                    Err(ve) => nevoflux_protocol::CanvasToolValidateResponse {
+                                        success: false,
+                                        error: Some(nevoflux_protocol::CanvasToolError {
+                                            code: ve.code.into(),
+                                            message: ve.message,
+                                            field: ve.field,
+                                        }),
+                                    },
+                                    Ok(()) => nevoflux_protocol::CanvasToolValidateResponse {
+                                        success: true,
+                                        error: None,
+                                    },
+                                }
+                            }
+                        }
+                    }
+                };
+
+                let msg = nevoflux_protocol::AgentMessage::CanvasToolValidateResponse(resp);
+                let payload = serde_json::to_value(&msg).unwrap_or_default();
                 let response = DaemonEnvelope::new(&proxy_id, channel, payload)
                     .with_request_id(&request_id);
                 let _ = process_response_tx.send((identity, response)).await;
