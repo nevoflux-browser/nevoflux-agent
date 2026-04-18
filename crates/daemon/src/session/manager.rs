@@ -138,6 +138,7 @@ impl SessionManager {
     }
 
     /// Delete a session.
+    #[allow(deprecated)] // Task 11 will replace delete_by_session with delete_non_persistent_by_session
     pub async fn delete_session(&self, session_id: &str) -> Result<bool> {
         // Delete related data first
         self.storage.artifacts().delete_by_session(session_id)?;

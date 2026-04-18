@@ -95,7 +95,18 @@ fn mirror_canvas_to_artifacts_table(
     let session_id = match session_id_from_value {
         Some(s) => s,
         None => match session_manager.get_artifact(&id) {
-            Ok(Some(existing)) => existing.session_id,
+            Ok(Some(existing)) => match existing.session_id {
+                Some(sid) => sid,
+                // Persistent artifact with no session (FK SET NULL after migration 014);
+                // cannot mirror without a session context — skip.
+                None => {
+                    debug!(
+                        "ContentStore canvas {} has no session_id (persistent orphan); skipping artifacts mirror",
+                        id
+                    );
+                    return;
+                }
+            },
             Ok(None) => {
                 debug!(
                     "ContentStore canvas {} has no session_id and no existing row; skipping artifacts mirror",
