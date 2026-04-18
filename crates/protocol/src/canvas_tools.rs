@@ -60,6 +60,13 @@ pub struct CanvasToolSummary {
     pub args_mode: Option<String>,
     pub enabled: bool,
     pub source: String,
+    /// Same string as `source`, but named for semantic clarity. Kept
+    /// alongside `source` for backward compatibility.
+    #[serde(default)]
+    pub origin_source: String,
+    /// `true` if this User-source entry shadows a Builtin of the same name.
+    #[serde(default)]
+    pub is_override: bool,
 }
 
 /// Response listing available tools.
@@ -113,6 +120,102 @@ pub enum CanvasToolEvent {
         call_id: String,
         error: String,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Error payload shared by save / delete / get_raw / validate
+// ---------------------------------------------------------------------------
+
+/// Machine-readable error codes returned by Canvas Tool CRUD commands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanvasToolError {
+    /// Stable identifier used by the UI to branch on failure cause.
+    /// Known values: `toml_parse`, `validation`, `name_changed`,
+    /// `name_conflict`, `io`, `not_found`, `invalid_source`,
+    /// `no_raw_for_session`.
+    pub code: String,
+    /// Human-readable description.
+    pub message: String,
+    /// Optional dotted path to the offending field (e.g. `params.foo.pattern`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// canvas.tool.get_raw
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanvasToolGetRawRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanvasToolGetRawResponse {
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toml_text: Option<String>,
+    /// Source the text was read from: `"builtin"` or `"user"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<CanvasToolError>,
+}
+
+// ---------------------------------------------------------------------------
+// canvas.tool.save
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanvasToolSaveRequest {
+    pub toml_text: String,
+    /// When present (edit mode), the daemon enforces that the parsed
+    /// `name` equals this value — prevents accidental rename.
+    #[serde(default)]
+    pub expected_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanvasToolSaveResponse {
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<CanvasToolError>,
+}
+
+// ---------------------------------------------------------------------------
+// canvas.tool.delete
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanvasToolDeleteRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanvasToolDeleteResponse {
+    pub success: bool,
+    /// `true` if deleting the User file restored a shadowed Builtin
+    /// (tells the UI to phrase confirmation as "revert" vs "delete").
+    #[serde(default)]
+    pub was_override: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<CanvasToolError>,
+}
+
+// ---------------------------------------------------------------------------
+// canvas.tool.validate
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanvasToolValidateRequest {
+    pub toml_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanvasToolValidateResponse {
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<CanvasToolError>,
 }
 
 #[cfg(test)]

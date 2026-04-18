@@ -6,7 +6,9 @@
 
 use crate::canvas_tools::{
     CanvasToolEvent, CanvasToolInvokeRequest, CanvasToolInvokeResponse, CanvasToolListRequest,
-    CanvasToolListResponse,
+    CanvasToolListResponse, CanvasToolSummary,
+    CanvasToolDeleteResponse, CanvasToolGetRawResponse,
+    CanvasToolSaveResponse, CanvasToolValidateResponse,
 };
 use crate::common::*;
 use crate::events::{EventBusDelivery, EventBusRequest, EventBusResponse};
@@ -505,6 +507,10 @@ pub enum AgentMessage {
     CanvasToolInvokeResponse(CanvasToolInvokeResponse),
     /// Canvas tool list response
     CanvasToolListResponse(CanvasToolListResponse),
+    CanvasToolGetRawResponse(CanvasToolGetRawResponse),
+    CanvasToolSaveResponse(CanvasToolSaveResponse),
+    CanvasToolDeleteResponse(CanvasToolDeleteResponse),
+    CanvasToolValidateResponse(CanvasToolValidateResponse),
     /// Canvas tool streaming event
     CanvasToolEvent(CanvasToolEvent),
 }
