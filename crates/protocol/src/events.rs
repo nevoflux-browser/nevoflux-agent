@@ -29,8 +29,12 @@ pub struct SubscribeOptions {
     pub buffer_size: usize,
 }
 
-fn default_true() -> bool { true }
-fn default_buffer_size() -> usize { 256 }
+fn default_true() -> bool {
+    true
+}
+fn default_buffer_size() -> usize {
+    256
+}
 
 /// Options for publishing an event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,7 +54,9 @@ pub struct HistoryQuery {
     pub since_ms: Option<u64>,
 }
 
-fn default_limit() -> usize { 100 }
+fn default_limit() -> usize {
+    100
+}
 
 /// A single event delivered to a subscriber or returned from history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,11 +83,24 @@ pub enum EventBusRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum EventBusResponse {
-    Subscribed { subscription_id: String, patterns: Vec<String> },
-    Unsubscribed { subscription_id: String },
-    Published { event_id: String },
-    HistoryResult { topic: String, events: Vec<BusEventPayload> },
-    Error { code: String, message: String },
+    Subscribed {
+        subscription_id: String,
+        patterns: Vec<String>,
+    },
+    Unsubscribed {
+        subscription_id: String,
+    },
+    Published {
+        event_id: String,
+    },
+    HistoryResult {
+        topic: String,
+        events: Vec<BusEventPayload>,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
 }
 
 /// Daemon -> Sidebar EventBus push delivery (async, not request-response).
@@ -113,7 +132,9 @@ mod tests {
         let req = EventBusRequest::Publish(PublishOptions {
             topic: "task:progress".into(),
             payload: serde_json::json!({"percent": 42}),
-            delivery: DeliveryMode::Persistent { ttl_secs: Some(3600) },
+            delivery: DeliveryMode::Persistent {
+                ttl_secs: Some(3600),
+            },
         });
         let json = serde_json::to_string(&req).unwrap();
         let decoded: EventBusRequest = serde_json::from_str(&json).unwrap();
@@ -190,7 +211,9 @@ mod tests {
         let sticky: DeliveryMode = serde_json::from_str(r#""sticky""#).unwrap();
         assert_eq!(sticky, DeliveryMode::Sticky);
 
-        let persistent = DeliveryMode::Persistent { ttl_secs: Some(3600) };
+        let persistent = DeliveryMode::Persistent {
+            ttl_secs: Some(3600),
+        };
         let json = serde_json::to_string(&persistent).unwrap();
         let decoded: DeliveryMode = serde_json::from_str(&json).unwrap();
         assert_eq!(persistent, decoded);

@@ -83,20 +83,11 @@ pub struct CanvasToolListResponse {
 #[serde(tag = "event_type", rename_all = "snake_case")]
 pub enum CanvasToolEvent {
     /// Tool execution has started.
-    Started {
-        call_id: String,
-        tool_name: String,
-    },
+    Started { call_id: String, tool_name: String },
     /// A chunk of stdout output.
-    Stdout {
-        call_id: String,
-        data: String,
-    },
+    Stdout { call_id: String, data: String },
     /// A chunk of stderr output.
-    Stderr {
-        call_id: String,
-        data: String,
-    },
+    Stderr { call_id: String, data: String },
     /// Optional progress update (0.0 ..= 1.0). Currently emitted only by
     /// tools whose executor knows how to parse their progress markers.
     Progress {
@@ -116,10 +107,7 @@ pub enum CanvasToolEvent {
     /// Fatal error during execution (binary missing, spawn failed, timeout, etc).
     /// On a successful spawn that produced a non-zero exit, prefer `Finished` with
     /// `success: false` instead.
-    Error {
-        call_id: String,
-        error: String,
-    },
+    Error { call_id: String, error: String },
 }
 
 // ---------------------------------------------------------------------------

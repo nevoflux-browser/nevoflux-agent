@@ -4127,6 +4127,7 @@ async fn handle_chat_message_streaming(
                                 content: pa.content,
                                 files: pa.files,
                                 entry: pa.entry,
+                                is_persistent: false,
                             };
                             info!(
                                 "MCP bridge: sending artifact '{}' to sidebar for session {}",
@@ -4433,6 +4434,7 @@ async fn send_artifact_stream(
         description: artifact.description.clone(),
         files: artifact.files.clone(),
         entry: artifact.entry.clone(),
+        is_persistent: artifact.is_persistent,
     });
     let payload = serde_json::to_value(&start_msg).unwrap();
     let envelope = DaemonEnvelope::new(proxy_id, channel, payload).with_request_id(request_id);

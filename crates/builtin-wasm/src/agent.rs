@@ -1597,6 +1597,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     content,
                     files,
                     entry,
+                    is_persistent: false,
                 });
 
                 format!("Artifact created and sent to canvas: {}", id)
