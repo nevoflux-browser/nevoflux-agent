@@ -1,17 +1,26 @@
 //! CanvasPersistService — persistence management for My Canvas artifacts.
 //!
-//! Provides listing of artifacts that have been marked `is_persistent = 1`
-//! in the local SQLite database. Additional CRUD methods (save, rename, delete)
-//! will be added by subsequent tasks.
+//! Provides listing, saving, renaming, and deleting of artifacts that have
+//! been marked `is_persistent = 1` in the local SQLite database.
+//!
+//! ## Dynamic query binding
+//!
+//! Methods that build parameterized WHERE clauses use `Vec<Box<dyn ToSql>>`
+//! because the `rusqlite::params![]` macro requires compile-time arity.
+//! This is idiomatic for variable-length bind sequences.
 
 use std::sync::Arc;
 
+use chrono::Utc;
 use nevoflux_protocol::canvas_persist::{
-    CanvasPersistListRequest, CanvasPersistListResponse, CanvasPersistSortKey, CanvasPersistSource,
-    CanvasPersistSourceFilter, CanvasPersistSummary,
+    CanvasPersistDeleteRequest, CanvasPersistDeleteResponse, CanvasPersistError,
+    CanvasPersistListRequest, CanvasPersistListResponse, CanvasPersistRenameRequest,
+    CanvasPersistRenameResponse, CanvasPersistSaveRequest, CanvasPersistSaveResponse,
+    CanvasPersistSortKey, CanvasPersistSource, CanvasPersistSourceFilter, CanvasPersistSummary,
 };
 use nevoflux_storage::Storage;
 use rusqlite::types::ToSql;
+use rusqlite::OptionalExtension;
 
 use crate::error::Result;
 
@@ -25,6 +34,8 @@ impl CanvasPersistService {
     pub fn new(storage: Arc<Storage>) -> Self {
         Self { storage }
     }
+
+    // --- Listing ---
 
     /// List persistent canvas artifacts matching the given filters.
     ///
@@ -152,4 +163,151 @@ impl CanvasPersistService {
 
         Ok(CanvasPersistListResponse { items, total })
     }
+
+    // --- Persistence ---
+
+    /// Promote an artifact to persistent ("save to My Canvas").
+    ///
+    /// Idempotent: if the artifact is already persistent, returns success with
+    /// the original `persisted_at` timestamp unchanged.
+    pub fn save(&self, req: CanvasPersistSaveRequest) -> Result<CanvasPersistSaveResponse> {
+        let now = Utc::now().timestamp();
+
+        let outcome = self.storage.database().with_connection(|conn| {
+            // Read current state.
+            let row: Option<(i64, Option<i64>)> = conn
+                .query_row(
+                    "SELECT is_persistent, persisted_at FROM artifacts WHERE id = ?1",
+                    rusqlite::params![req.canvas_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+
+            match row {
+                None => Ok::<SaveOutcome, nevoflux_storage::StorageError>(SaveOutcome::NotFound),
+                Some((is_p, persisted_at)) if is_p != 0 => {
+                    Ok(SaveOutcome::AlreadyPersistent(persisted_at.unwrap_or(now)))
+                }
+                Some(_) => {
+                    conn.execute(
+                        "UPDATE artifacts
+                         SET is_persistent = 1,
+                             persisted_at  = ?1,
+                             updated_at    = ?1
+                         WHERE id = ?2",
+                        rusqlite::params![now, req.canvas_id],
+                    )?;
+                    Ok(SaveOutcome::Promoted(now))
+                }
+            }
+        })?;
+
+        Ok(match outcome {
+            SaveOutcome::NotFound => CanvasPersistSaveResponse {
+                success: false,
+                persisted_at: None,
+                error: Some(CanvasPersistError::NotFound),
+            },
+            SaveOutcome::AlreadyPersistent(ts) | SaveOutcome::Promoted(ts) => {
+                CanvasPersistSaveResponse {
+                    success: true,
+                    persisted_at: Some(ts),
+                    error: None,
+                }
+            }
+        })
+    }
+
+    /// Rename a persistent canvas artifact.
+    ///
+    /// Validates that the new title is non-empty. Only affects rows where
+    /// `is_persistent = 1`; a non-persistent artifact returns `NotFound`.
+    pub fn rename(&self, req: CanvasPersistRenameRequest) -> Result<CanvasPersistRenameResponse> {
+        let title = req.new_title.trim();
+        if title.is_empty() {
+            return Ok(CanvasPersistRenameResponse {
+                success: false,
+                error: Some(CanvasPersistError::InvalidTitle {
+                    message: "Title must not be empty".into(),
+                }),
+            });
+        }
+        let now = Utc::now().timestamp();
+
+        let rows = self.storage.database().with_connection(|conn| {
+            let r = conn.execute(
+                "UPDATE artifacts
+                 SET title = ?1, updated_at = ?2
+                 WHERE id = ?3 AND is_persistent = 1",
+                rusqlite::params![title, now, req.canvas_id],
+            )?;
+            Ok::<u32, nevoflux_storage::StorageError>(r as u32)
+        })?;
+
+        Ok(if rows == 0 {
+            CanvasPersistRenameResponse {
+                success: false,
+                error: Some(CanvasPersistError::NotFound),
+            }
+        } else {
+            CanvasPersistRenameResponse {
+                success: true,
+                error: None,
+            }
+        })
+    }
+
+    /// Delete a persistent canvas artifact.
+    ///
+    /// Only deletes rows where `is_persistent = 1`. After the SQL DELETE
+    /// succeeds, also removes the corresponding `canvas:{id}` key from the
+    /// config store (the "ContentStore" mirror used by the browser canvas
+    /// editor). The config removal is best-effort — its result is ignored so
+    /// that a missing key does not cause the overall operation to fail.
+    ///
+    /// Note: there is no separate `ContentStore` type; the config table
+    /// (accessed via `Storage::config()`) serves as the key-value store for
+    /// canvas content written by the browser. The underlying
+    /// `ConfigRepository::delete` is synchronous, so this method is also
+    /// synchronous.
+    pub fn delete(&self, req: CanvasPersistDeleteRequest) -> Result<CanvasPersistDeleteResponse> {
+        let rows = self.storage.database().with_connection(|conn| {
+            let r = conn.execute(
+                "DELETE FROM artifacts WHERE id = ?1 AND is_persistent = 1",
+                rusqlite::params![req.canvas_id],
+            )?;
+            Ok::<u32, nevoflux_storage::StorageError>(r as u32)
+        })?;
+
+        if rows == 0 {
+            return Ok(CanvasPersistDeleteResponse {
+                success: false,
+                error: Some(CanvasPersistError::NotFound),
+            });
+        }
+
+        // Best-effort config store cleanup: remove the `canvas:{id}` key that
+        // the browser canvas editor writes on every edit. Ignore errors
+        // (e.g., key was never written or already gone).
+        let _ = self
+            .storage
+            .config()
+            .delete(&format!("canvas:{}", req.canvas_id));
+
+        Ok(CanvasPersistDeleteResponse {
+            success: true,
+            error: None,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+/// Internal outcome of a `save` attempt, used to build the response.
+enum SaveOutcome {
+    NotFound,
+    AlreadyPersistent(i64),
+    Promoted(i64),
 }
