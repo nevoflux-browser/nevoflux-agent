@@ -32,6 +32,10 @@ use crate::canvas_tools::types::{CanvasTool, ToolSource};
 #[derive(Debug)]
 pub struct ToolWhitelistRegistry {
     tools: DashMap<String, CanvasTool>,
+    /// Builtin tools that have been overridden by a same-named User entry.
+    /// Populated during `load_from_disk`; consulted by `list_all` to set
+    /// `is_override` and by `remove_user_tool_with_restore` to revert.
+    shadowed_builtins: DashMap<String, CanvasTool>,
     builtin_dir: Option<PathBuf>,
     user_dir: Option<PathBuf>,
 }
@@ -51,6 +55,7 @@ impl ToolWhitelistRegistry {
     pub fn new() -> Self {
         Self {
             tools: DashMap::new(),
+            shadowed_builtins: DashMap::new(),
             builtin_dir: None,
             user_dir: None,
         }
@@ -60,6 +65,7 @@ impl ToolWhitelistRegistry {
     pub fn with_dirs(builtin_dir: impl Into<PathBuf>, user_dir: impl Into<PathBuf>) -> Self {
         Self {
             tools: DashMap::new(),
+            shadowed_builtins: DashMap::new(),
             builtin_dir: Some(builtin_dir.into()),
             user_dir: Some(user_dir.into()),
         }
@@ -88,6 +94,7 @@ impl ToolWhitelistRegistry {
 
         // 2. Clear the map entirely, then re-insert session tools.
         self.tools.clear();
+        self.shadowed_builtins.clear();
         for tool in &session_tools {
             self.tools.insert(tool.name.clone(), tool.clone());
         }
@@ -111,7 +118,6 @@ impl ToolWhitelistRegistry {
         for tool in &mut tools {
             tool.source = source;
 
-            // Never overwrite a Session tool.
             if let Some(existing) = self.tools.get(&tool.name) {
                 if existing.source == ToolSource::Session {
                     debug!(
@@ -120,9 +126,15 @@ impl ToolWhitelistRegistry {
                     );
                     continue;
                 }
+                // If a User tool is about to evict a Builtin, preserve the
+                // Builtin in the shadow map so Revert can restore it without
+                // another disk reload.
+                if source == ToolSource::User && existing.source == ToolSource::Builtin {
+                    self.shadowed_builtins
+                        .insert(tool.name.clone(), existing.value().clone());
+                }
             }
 
-            // User overrides Builtin; same-source overwrites.
             self.tools.insert(tool.name.clone(), tool.clone());
         }
     }
@@ -164,6 +176,23 @@ impl ToolWhitelistRegistry {
     /// Look up a tool by name regardless of its `enabled` flag.
     pub fn get_any(&self, name: &str) -> Option<CanvasTool> {
         self.tools.get(name).map(|entry| entry.value().clone())
+    }
+
+    /// Peek at a Builtin that is being shadowed by a same-named User entry.
+    /// Returns `None` when there is no shadow (no Builtin existed, or the
+    /// live entry is itself a Builtin / Session).
+    pub fn shadowed_builtin(&self, name: &str) -> Option<CanvasTool> {
+        self.shadowed_builtins.get(name).map(|e| e.value().clone())
+    }
+
+    /// True iff the live entry for `name` is a User tool that shadows a Builtin.
+    pub fn is_override(&self, name: &str) -> bool {
+        self.shadowed_builtins.contains_key(name)
+            && self
+                .tools
+                .get(name)
+                .map(|e| e.value().source == ToolSource::User)
+                .unwrap_or(false)
     }
 
     /// Return all **enabled** tools, sorted by name for deterministic output.
@@ -210,6 +239,44 @@ impl ToolWhitelistRegistry {
         self.tools.insert(tool.name.clone(), tool);
     }
 
+    /// Remove the User entry `name` and, if a Builtin of the same name was
+    /// shadowed, restore it. No-op when the live entry is not User.
+    pub fn remove_user_tool_with_restore(&self, name: &str) -> DeleteOutcome {
+        let removed = self
+            .tools
+            .remove_if(name, |_, v| v.source == ToolSource::User)
+            .is_some();
+        if !removed {
+            return DeleteOutcome::default();
+        }
+
+        let restored = if let Some((_, builtin)) = self.shadowed_builtins.remove(name) {
+            self.tools.insert(name.to_string(), builtin);
+            true
+        } else {
+            false
+        };
+
+        DeleteOutcome {
+            removed: true,
+            restored_builtin: restored,
+        }
+    }
+
+    /// Insert a tool as the User-source entry, moving any existing Builtin
+    /// of the same name into the shadow map. Used by the save command after
+    /// a successful write to disk.
+    pub fn register_user_tool(&self, mut tool: CanvasTool) {
+        tool.source = ToolSource::User;
+        if let Some(existing) = self.tools.get(&tool.name) {
+            if existing.source == ToolSource::Builtin {
+                self.shadowed_builtins
+                    .insert(tool.name.clone(), existing.value().clone());
+            }
+        }
+        self.tools.insert(tool.name.clone(), tool);
+    }
+
     // -----------------------------------------------------------------
     // Size helpers
     // -----------------------------------------------------------------
@@ -223,6 +290,17 @@ impl ToolWhitelistRegistry {
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
+}
+
+// ---------------------------------------------------------------------------
+// DeleteOutcome
+// ---------------------------------------------------------------------------
+
+/// Result of `remove_user_tool_with_restore`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeleteOutcome {
+    pub removed: bool,
+    pub restored_builtin: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -456,5 +534,85 @@ mod tests {
         // cat_tool (Builtin) + grep_tool (Session) = 2.
         // The user-dir grep_tool was skipped because session takes priority.
         assert_eq!(reg.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_user_shadows_builtin_on_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let builtin_dir = tmp.path().join("builtin");
+        let user_dir = tmp.path().join("user");
+        std::fs::create_dir_all(&builtin_dir).unwrap();
+        std::fs::create_dir_all(&user_dir).unwrap();
+
+        let builtin_toml = r#"
+name = "echo"
+description = "BUILTIN echo"
+kind = "internal"
+api = "builtin://echo"
+"#;
+        let user_toml = r#"
+name = "echo"
+description = "USER echo"
+kind = "internal"
+api = "builtin://echo"
+"#;
+        std::fs::write(builtin_dir.join("echo.toml"), builtin_toml).unwrap();
+        std::fs::write(user_dir.join("echo.toml"), user_toml).unwrap();
+
+        let reg = ToolWhitelistRegistry::with_dirs(&builtin_dir, &user_dir);
+        reg.load_from_disk().await;
+
+        let live = reg.get("echo").unwrap();
+        assert_eq!(live.description, "USER echo");
+        assert_eq!(live.source, ToolSource::User);
+
+        let shadowed = reg.shadowed_builtin("echo").unwrap();
+        assert_eq!(shadowed.description, "BUILTIN echo");
+        assert_eq!(shadowed.source, ToolSource::Builtin);
+    }
+
+    #[test]
+    fn test_remove_user_tool_with_restore_reverts_builtin() {
+        let reg = ToolWhitelistRegistry::new();
+        let mut builtin = make_tool("echo", ToolSource::Builtin);
+        builtin.description = "BUILTIN".into();
+        let mut user = make_tool("echo", ToolSource::User);
+        user.description = "USER".into();
+
+        reg.tools.insert("echo".into(), user);
+        reg.shadowed_builtins.insert("echo".into(), builtin);
+
+        let outcome = reg.remove_user_tool_with_restore("echo");
+        assert!(outcome.removed);
+        assert!(outcome.restored_builtin);
+
+        let live = reg.get_any("echo").unwrap();
+        assert_eq!(live.description, "BUILTIN");
+        assert_eq!(live.source, ToolSource::Builtin);
+        assert!(reg.shadowed_builtin("echo").is_none());
+    }
+
+    #[test]
+    fn test_remove_user_tool_without_shadow() {
+        let reg = ToolWhitelistRegistry::new();
+        reg.tools
+            .insert("solo".into(), make_tool("solo", ToolSource::User));
+
+        let outcome = reg.remove_user_tool_with_restore("solo");
+        assert!(outcome.removed);
+        assert!(!outcome.restored_builtin);
+        assert!(reg.get_any("solo").is_none());
+    }
+
+    #[test]
+    fn test_remove_user_tool_refuses_builtin() {
+        let reg = ToolWhitelistRegistry::new();
+        reg.tools
+            .insert("b".into(), make_tool("b", ToolSource::Builtin));
+
+        let outcome = reg.remove_user_tool_with_restore("b");
+        assert!(!outcome.removed);
+        assert!(!outcome.restored_builtin);
+        assert!(reg.get_any("b").is_some());
     }
 }

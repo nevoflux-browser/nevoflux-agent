@@ -1533,13 +1533,20 @@ pub async fn start_server(
 
                 let summaries: Vec<nevoflux_protocol::CanvasToolSummary> = tools
                     .iter()
-                    .map(|t| nevoflux_protocol::CanvasToolSummary {
-                        name: t.name.clone(),
-                        description: Some(t.description.clone()),
-                        kind: format!("{:?}", t.kind).to_lowercase(),
-                        args_mode: Some(format!("{:?}", t.args_mode).to_lowercase()),
-                        enabled: t.enabled,
-                        source: format!("{:?}", t.source).to_lowercase(),
+                    .map(|t| {
+                        let source_str = format!("{:?}", t.source).to_lowercase();
+                        let is_override =
+                            process_canvas_tool_registry.is_override(&t.name);
+                        nevoflux_protocol::CanvasToolSummary {
+                            name: t.name.clone(),
+                            description: Some(t.description.clone()),
+                            kind: format!("{:?}", t.kind).to_lowercase(),
+                            args_mode: Some(format!("{:?}", t.args_mode).to_lowercase()),
+                            enabled: t.enabled,
+                            source: source_str.clone(),
+                            origin_source: source_str,
+                            is_override,
+                        }
                     })
                     .collect();
 
