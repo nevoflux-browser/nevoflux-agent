@@ -41,6 +41,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "012_canvas_share",
         include_str!("migrations/012_canvas_share.sql"),
     ),
+    // Note: 013 was reserved and abandoned; 014 follows 012 intentionally.
     (
         "014_artifacts_persistent",
         include_str!("migrations/014_artifacts_persistent.sql"),
@@ -67,9 +68,19 @@ pub fn run_all(conn: &mut Connection) -> Result<()> {
         )?;
 
         if !already_applied {
-            conn.execute_batch(sql).map_err(|e| {
-                StorageError::Migration(format!("Migration {} failed: {}", name, e))
-            })?;
+            // Some migrations (e.g. table rebuilds) toggle foreign_keys OFF;
+            // reassert ON after every migration to recover from any failure path.
+            let result = conn
+                .execute_batch(sql)
+                .map_err(|e| StorageError::Migration(format!("Migration {} failed: {}", name, e)));
+            conn.execute_batch("PRAGMA foreign_keys = ON;")
+                .map_err(|e| {
+                    StorageError::Migration(format!(
+                        "Migration {} failed to restore foreign_keys: {}",
+                        name, e
+                    ))
+                })?;
+            result?;
 
             conn.execute(
                 "INSERT INTO _migrations (name, applied_at) VALUES (?, strftime('%s', 'now'))",
@@ -282,9 +293,15 @@ mod tests {
         }
     }
 
-    /// Run only the first N migrations (by index in MIGRATIONS slice).
-    #[cfg(test)]
-    fn run_migrations_up_to(conn: &mut Connection, count: usize) -> Result<()> {
+    /// Run migrations up to (but not including) the migration named `stop_before`.
+    /// Uses name-based lookup so that inserting a new migration before the stop
+    /// point does not silently slice at the wrong index.
+    fn run_migrations_up_to(conn: &mut Connection, stop_before: &str) -> Result<()> {
+        let count = MIGRATIONS
+            .iter()
+            .position(|(name, _)| *name == stop_before)
+            .unwrap_or_else(|| panic!("stop_before migration {stop_before:?} not found"));
+
         conn.execute(
             "CREATE TABLE IF NOT EXISTS _migrations (
                 name TEXT PRIMARY KEY,
@@ -301,9 +318,19 @@ mod tests {
             )?;
 
             if !already_applied {
-                conn.execute_batch(sql).map_err(|e| {
+                // Some migrations (e.g. table rebuilds) toggle foreign_keys OFF;
+                // reassert ON after every migration to recover from any failure path.
+                let result = conn.execute_batch(sql).map_err(|e| {
                     StorageError::Migration(format!("Migration {} failed: {}", name, e))
-                })?;
+                });
+                conn.execute_batch("PRAGMA foreign_keys = ON;")
+                    .map_err(|e| {
+                        StorageError::Migration(format!(
+                            "Migration {} failed to restore foreign_keys: {}",
+                            name, e
+                        ))
+                    })?;
+                result?;
 
                 conn.execute(
                     "INSERT INTO _migrations (name, applied_at) VALUES (?, strftime('%s', 'now'))",
@@ -319,9 +346,8 @@ mod tests {
     fn migration_014_artifacts_persistent() {
         let mut conn = Connection::open_in_memory().unwrap();
 
-        // Run only the first 12 migrations (001-012) to set up the pre-014 schema.
-        // MIGRATIONS[..12] covers indices 0-11, i.e., "001_initial" through "012_canvas_share".
-        run_migrations_up_to(&mut conn, 12).unwrap();
+        // Run all migrations up to (but not including) 014 to set up the pre-014 schema.
+        run_migrations_up_to(&mut conn, "014_artifacts_persistent").unwrap();
 
         // Insert a session to attach artifacts to.
         conn.execute(
@@ -370,9 +396,10 @@ mod tests {
             Some(2000),
             "persisted_at should equal imported_at (2000)"
         );
-        assert!(
-            updated_at.is_some(),
-            "updated_at should be set for imported artifact"
+        assert_eq!(
+            updated_at,
+            Some(2000),
+            "updated_at should equal imported_at (2000)"
         );
 
         // --- (b) regular artifact should NOT be persistent ---
