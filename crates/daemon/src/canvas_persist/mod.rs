@@ -7,4 +7,5 @@
 pub mod handlers;
 pub mod service;
 
+pub use handlers::handle;
 pub use service::CanvasPersistService;
