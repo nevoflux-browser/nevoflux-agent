@@ -6,17 +6,12 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CanvasPersistSortKey {
+    #[default]
     UpdatedAt,
     PersistedAt,
-}
-
-impl Default for CanvasPersistSortKey {
-    fn default() -> Self {
-        Self::UpdatedAt
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

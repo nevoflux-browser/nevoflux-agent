@@ -5,10 +5,9 @@
 //! Messages exchanged between Chat Sidebar and Agent via the Chat channel.
 
 use crate::canvas_tools::{
-    CanvasToolEvent, CanvasToolInvokeRequest, CanvasToolInvokeResponse, CanvasToolListRequest,
-    CanvasToolListResponse, CanvasToolSummary,
-    CanvasToolDeleteResponse, CanvasToolGetRawResponse,
-    CanvasToolSaveResponse, CanvasToolValidateResponse,
+    CanvasToolDeleteResponse, CanvasToolEvent, CanvasToolGetRawResponse, CanvasToolInvokeRequest,
+    CanvasToolInvokeResponse, CanvasToolListRequest, CanvasToolListResponse, CanvasToolSaveResponse,
+    CanvasToolValidateResponse,
 };
 use crate::common::*;
 use crate::events::{EventBusDelivery, EventBusRequest, EventBusResponse};
@@ -1258,6 +1257,8 @@ mod tests {
                     args_mode: Some("params".into()),
                     enabled: true,
                     source: "builtin".into(),
+                    origin_source: "builtin".into(),
+                    is_override: false,
                 },
                 CanvasToolSummary {
                     name: "eslint".into(),
@@ -1266,6 +1267,8 @@ mod tests {
                     args_mode: None,
                     enabled: false,
                     source: "user".into(),
+                    origin_source: "user".into(),
+                    is_override: false,
                 },
             ],
         };
@@ -1432,6 +1435,8 @@ mod tests {
                 args_mode: Some("params".into()),
                 enabled: true,
                 source: "builtin".into(),
+                origin_source: "builtin".into(),
+                is_override: false,
             }],
         });
         let json = serde_json::to_string(&msg).unwrap();

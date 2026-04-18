@@ -322,6 +322,8 @@ mod tests {
                     args_mode: Some("params".to_string()),
                     enabled: true,
                     source: "builtin".to_string(),
+                    origin_source: "builtin".to_string(),
+                    is_override: false,
                 },
                 CanvasToolSummary {
                     name: "eslint".to_string(),
@@ -330,6 +332,8 @@ mod tests {
                     args_mode: None,
                     enabled: false,
                     source: "user".to_string(),
+                    origin_source: "user".to_string(),
+                    is_override: false,
                 },
             ],
         };
