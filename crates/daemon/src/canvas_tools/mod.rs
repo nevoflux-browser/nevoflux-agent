@@ -5,6 +5,7 @@ pub mod param_validator;
 pub mod registry;
 pub mod toml_parser;
 pub mod types;
+pub mod user_writer;
 pub use audit::AuditLogger;
 pub use executor::{
     check_free_mode_subcommand, execute_command_tool, execute_whitelisted_tool,
