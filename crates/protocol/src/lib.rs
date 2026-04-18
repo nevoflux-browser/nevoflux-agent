@@ -23,6 +23,7 @@
 //!
 //! All types support both JSON and MessagePack serialization via serde.
 
+pub mod canvas_persist;
 pub mod canvas_share;
 pub mod canvas_tools;
 pub mod channel;
