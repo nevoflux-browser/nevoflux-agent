@@ -126,7 +126,7 @@ impl<'a> ArtifactRepository<'a> {
                         imported_from_url: None,
                         imported_from_share_id: None,
                         imported_at: None,
-                        is_persistent: row.get::<_, i64>(6).map(|v| v != 0).unwrap_or(false),
+                        is_persistent: row.get::<_, i64>(6)? != 0,
                         persisted_at: row.get(7)?,
                         updated_at: updated_at.unwrap_or(created_at),
                     })
@@ -143,21 +143,26 @@ impl<'a> ArtifactRepository<'a> {
     /// corresponding ContentStore mirror entries.  Returns an empty Vec
     /// (never panics / never None) when there are no matching rows.
     pub fn delete_non_persistent_by_session(&self, session_id: &str) -> Result<Vec<String>> {
-        self.db.with_connection(|conn| {
-            // Collect the IDs we are about to delete.
-            let mut stmt = conn
-                .prepare("SELECT id FROM artifacts WHERE session_id = ?1 AND is_persistent = 0")?;
-            let ids: Vec<String> = stmt
-                .query_map(params![session_id], |row| row.get(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-
+        self.db.with_connection_mut(|conn| {
+            let tx = conn.transaction()?;
+            let ids: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM artifacts \
+                     WHERE session_id = ?1 AND is_persistent = 0",
+                )?;
+                let collected = stmt
+                    .query_map(params![session_id], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                collected
+            };
             if !ids.is_empty() {
-                conn.execute(
-                    "DELETE FROM artifacts WHERE session_id = ?1 AND is_persistent = 0",
+                tx.execute(
+                    "DELETE FROM artifacts \
+                     WHERE session_id = ?1 AND is_persistent = 0",
                     params![session_id],
                 )?;
             }
-
+            tx.commit()?;
             Ok(ids)
         })
     }
@@ -545,9 +550,8 @@ mod tests {
         let repo = ArtifactRepository::new(storage.database());
 
         // No session needed — session_id IS NULL.
-        let mut params =
-            CreateArtifactParams::new_orphan("orphan-1", "Orphan Artifact", "text/html");
-        params.content = "<p>orphan</p>".to_string();
+        let params = CreateArtifactParams::new_orphan("orphan-1", "Orphan Artifact", "text/html")
+            .with_content("<p>orphan</p>");
 
         repo.create(params).unwrap();
 
