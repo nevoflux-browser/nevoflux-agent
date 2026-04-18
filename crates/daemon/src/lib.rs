@@ -23,10 +23,13 @@
 
 pub mod agent;
 pub mod agent_host;
+pub mod canvas_persist;
+pub mod canvas_tools;
 pub mod config;
 pub mod config_watcher;
 pub mod context;
 pub mod error;
+pub mod event_bus;
 pub mod file_picker;
 pub mod health;
 pub mod learning;
@@ -39,13 +42,11 @@ pub mod router;
 pub mod secrets;
 pub mod server;
 pub mod session;
+pub mod share;
 pub mod skills;
 pub mod trace;
 pub mod validation;
 pub mod wasm;
-pub mod event_bus;
-pub mod canvas_tools;
-pub mod share;
 
 pub use config::{
     AgentConfig, AuthConfig, ConfigError, ContextConfig, DaemonConfig, LlmConfig, LoggingConfig,
