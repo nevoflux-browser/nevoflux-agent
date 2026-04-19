@@ -18,3 +18,43 @@ fn test_resolve_ffmpeg_succeeds() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("ffmpeg version"), "stdout missing version line");
 }
+
+#[test]
+fn test_frame_chunks_reassemble_in_order() {
+    use nevoflux_daemon::canvas_video::frame_chunks::ChunkBuffer;
+
+    let mut buf = ChunkBuffer::new();
+
+    // Simulated 2-chunk frame for frame_idx=0
+    let r1 = buf.add_chunk(0, 0, 2, false, vec![0xDE, 0xAD]);
+    assert!(r1.is_none(), "partial chunk should not complete");
+
+    let r2 = buf.add_chunk(0, 1, 2, true, vec![0xBE, 0xEF]);
+    assert_eq!(r2, Some(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+
+    // Frame 0 should be gone
+    assert!(!buf.has_frame(0));
+}
+
+#[test]
+fn test_frame_chunks_reassemble_out_of_order() {
+    use nevoflux_daemon::canvas_video::frame_chunks::ChunkBuffer;
+
+    let mut buf = ChunkBuffer::new();
+    // Arrive out of order: chunk 1 first, chunk 0 second.
+    let r1 = buf.add_chunk(5, 1, 2, true, vec![0xCC, 0xDD]);
+    assert!(r1.is_none());
+    let r2 = buf.add_chunk(5, 0, 2, false, vec![0xAA, 0xBB]);
+    assert_eq!(r2, Some(vec![0xAA, 0xBB, 0xCC, 0xDD]));
+}
+
+#[test]
+fn test_frame_chunks_rejects_mismatched_total() {
+    use nevoflux_daemon::canvas_video::frame_chunks::ChunkBuffer;
+
+    let mut buf = ChunkBuffer::new();
+    let _ = buf.add_chunk(7, 0, 3, false, vec![0x01]);
+    // Second chunk declares total=2 which contradicts first chunk's total=3.
+    let r = buf.add_chunk(7, 1, 2, false, vec![0x02]);
+    assert!(r.is_none(), "mismatched total silently rejected (or could panic; at minimum must not corrupt)");
+}
