@@ -100,6 +100,9 @@ pulldown-cmark = "0.12"
 aes-gcm = "0.10"
 base64 = "0.22"
 
+# ffmpeg subprocess management (video skill render pipeline)
+ffmpeg-sidecar = "1.1"
+
 # Hashing for domain anonymization in knowledge export
 sha2 = "0.10"
 hex = "0.4"
