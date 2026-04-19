@@ -52,10 +52,7 @@ impl fmt::Display for TopicError {
                 )
             }
             TopicError::InvalidCharacter { position, ch } => {
-                write!(
-                    f,
-                    "segment {position} contains invalid character '{ch}'"
-                )
+                write!(f, "segment {position} contains invalid character '{ch}'")
             }
         }
     }
@@ -120,9 +117,7 @@ pub fn validate_pattern(pattern: &str) -> Result<(), TopicError> {
         return Err(TopicError::Empty);
     }
     if pattern.len() > MAX_TOPIC_LEN {
-        return Err(TopicError::TooLong {
-            len: pattern.len(),
-        });
+        return Err(TopicError::TooLong { len: pattern.len() });
     }
 
     let segments: Vec<&str> = pattern.split(':').collect();
@@ -147,7 +142,10 @@ pub fn validate_pattern(pattern: &str) -> Result<(), TopicError> {
             continue;
         }
         if *seg == "**" {
-            return Err(TopicError::InvalidCharacter { position: i, ch: '*' });
+            return Err(TopicError::InvalidCharacter {
+                position: i,
+                ch: '*',
+            });
         }
         for ch in seg.chars() {
             if !is_valid_segment_char(ch) {
@@ -238,11 +236,17 @@ mod tests {
     fn invalid_bad_chars() {
         assert!(matches!(
             validate_topic("foo:bar baz"),
-            Err(TopicError::InvalidCharacter { position: 1, ch: ' ' })
+            Err(TopicError::InvalidCharacter {
+                position: 1,
+                ch: ' '
+            })
         ));
         assert!(matches!(
             validate_topic("foo:b@r"),
-            Err(TopicError::InvalidCharacter { position: 1, ch: '@' })
+            Err(TopicError::InvalidCharacter {
+                position: 1,
+                ch: '@'
+            })
         ));
     }
 
@@ -259,7 +263,10 @@ mod tests {
     fn pattern_rejects_double_wildcard() {
         assert!(matches!(
             validate_pattern("task:**"),
-            Err(TopicError::InvalidCharacter { position: 1, ch: '*' })
+            Err(TopicError::InvalidCharacter {
+                position: 1,
+                ch: '*'
+            })
         ));
     }
 
@@ -268,7 +275,10 @@ mod tests {
         // `fo*` is not a bare `*`, so the `*` is an invalid char
         assert!(matches!(
             validate_pattern("fo*:bar"),
-            Err(TopicError::InvalidCharacter { position: 0, ch: '*' })
+            Err(TopicError::InvalidCharacter {
+                position: 0,
+                ch: '*'
+            })
         ));
     }
 

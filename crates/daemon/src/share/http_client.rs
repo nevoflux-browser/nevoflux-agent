@@ -326,9 +326,7 @@ mod tests {
 
     #[test]
     fn test_delete_request_body_serialization() {
-        let body = DeleteRequestBody {
-            owner_token: "abc",
-        };
+        let body = DeleteRequestBody { owner_token: "abc" };
         let json = serde_json::to_string(&body).unwrap();
         assert_eq!(json, r#"{"owner_token":"abc"}"#);
     }

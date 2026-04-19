@@ -62,7 +62,9 @@ pub fn validate_single_param(
     session_dir: &Path,
 ) -> Result<()> {
     match param_type {
-        ParamType::Path { allowed_prefix } => validate_path(name, value, allowed_prefix.as_deref(), session_dir),
+        ParamType::Path { allowed_prefix } => {
+            validate_path(name, value, allowed_prefix.as_deref(), session_dir)
+        }
         ParamType::Duration => validate_duration(name, value),
         ParamType::Int { min, max } => validate_int(name, value, *min, *max),
         ParamType::Float { min, max } => validate_float(name, value, *min, *max),
@@ -169,9 +171,7 @@ fn validate_int(name: &str, value: &str, min: Option<i64>, max: Option<i64>) -> 
 /// Validate a float parameter with optional min/max bounds.
 fn validate_float(name: &str, value: &str, min: Option<f64>, max: Option<f64>) -> Result<()> {
     let n: f64 = value.parse().map_err(|_| {
-        DaemonError::InvalidRequest(format!(
-            "parameter '{name}': expected float, got '{value}'"
-        ))
+        DaemonError::InvalidRequest(format!("parameter '{name}': expected float, got '{value}'"))
     })?;
 
     if let Some(lo) = min {
@@ -338,7 +338,9 @@ mod tests {
         )]);
         let values = make_values(vec![]);
         let err = validate_params(&params, &values, &session_dir()).unwrap_err();
-        assert!(err.to_string().contains("missing required parameter: input"));
+        assert!(err
+            .to_string()
+            .contains("missing required parameter: input"));
     }
 
     #[test]
@@ -360,7 +362,10 @@ mod tests {
         let params = make_params(vec![(
             "count",
             ParamSpec {
-                param_type: ParamType::Int { min: None, max: None },
+                param_type: ParamType::Int {
+                    min: None,
+                    max: None,
+                },
                 optional: false,
                 default: Some("10".into()),
             },
@@ -393,7 +398,9 @@ mod tests {
         let err = validate_single_param(
             "file",
             "../etc/passwd",
-            &ParamType::Path { allowed_prefix: None },
+            &ParamType::Path {
+                allowed_prefix: None,
+            },
             &session_dir(),
         )
         .unwrap_err();
@@ -405,7 +412,9 @@ mod tests {
         validate_single_param(
             "file",
             "output/result.txt",
-            &ParamType::Path { allowed_prefix: None },
+            &ParamType::Path {
+                allowed_prefix: None,
+            },
             &session_dir(),
         )
         .unwrap();
@@ -473,9 +482,13 @@ mod tests {
 
     #[test]
     fn test_validate_duration_invalid() {
-        let err =
-            validate_single_param("dur", "not-a-duration", &ParamType::Duration, &session_dir())
-                .unwrap_err();
+        let err = validate_single_param(
+            "dur",
+            "not-a-duration",
+            &ParamType::Duration,
+            &session_dir(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("invalid duration"));
     }
 
@@ -536,7 +549,10 @@ mod tests {
         let err = validate_single_param(
             "count",
             "abc",
-            &ParamType::Int { min: None, max: None },
+            &ParamType::Int {
+                min: None,
+                max: None,
+            },
             &session_dir(),
         )
         .unwrap_err();
@@ -548,7 +564,10 @@ mod tests {
         validate_single_param(
             "count",
             "-999999",
-            &ParamType::Int { min: None, max: None },
+            &ParamType::Int {
+                min: None,
+                max: None,
+            },
             &session_dir(),
         )
         .unwrap();
@@ -604,7 +623,10 @@ mod tests {
         let err = validate_single_param(
             "ratio",
             "not-a-number",
-            &ParamType::Float { min: None, max: None },
+            &ParamType::Float {
+                min: None,
+                max: None,
+            },
             &session_dir(),
         )
         .unwrap_err();
@@ -617,7 +639,9 @@ mod tests {
 
     #[test]
     fn test_validate_bool_variants() {
-        for val in &["true", "false", "1", "0", "yes", "no", "True", "FALSE", "Yes", "NO"] {
+        for val in &[
+            "true", "false", "1", "0", "yes", "no", "True", "FALSE", "Yes", "NO",
+        ] {
             validate_single_param("flag", val, &ParamType::Bool, &session_dir()).unwrap();
         }
     }

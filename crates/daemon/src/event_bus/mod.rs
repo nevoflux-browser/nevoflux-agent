@@ -16,8 +16,8 @@ pub use bus::{EventBus, EventBusError, SubscriptionHandle};
 pub use permissions::{PermissionChecker, PermissionResult};
 pub use persistent::{PersistentCleaner, PersistentWriter, PersistentWriterHandle};
 pub use ring_buffer::BoundedRingBuffer;
-pub use topic::{validate_topic, validate_pattern, TopicError};
+pub use topic::{validate_pattern, validate_topic, TopicError};
 pub use types::{
-    BackpressurePolicy, BusEvent, Delivery, PublisherIdentity, Subscription,
-    SubscriberIdentity, TopicPattern,
+    BackpressurePolicy, BusEvent, Delivery, PublisherIdentity, SubscriberIdentity, Subscription,
+    TopicPattern,
 };

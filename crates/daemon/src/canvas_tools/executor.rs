@@ -160,15 +160,12 @@ pub async fn execute_command_tool(
     args: &[String],
     session_dir: &Path,
 ) -> Result<ToolExecResult> {
-    let binary = tool
-        .binary
-        .as_deref()
-        .ok_or_else(|| {
-            DaemonError::InvalidRequest(format!(
-                "tool '{}': command backend requires a 'binary' field",
-                tool.name
-            ))
-        })?;
+    let binary = tool.binary.as_deref().ok_or_else(|| {
+        DaemonError::InvalidRequest(format!(
+            "tool '{}': command backend requires a 'binary' field",
+            tool.name
+        ))
+    })?;
 
     // Resolve binary on $PATH.
     let binary_path = which::which(binary).map_err(|e| {
@@ -200,8 +197,7 @@ pub async fn execute_command_tool(
     cmd.stderr(std::process::Stdio::piped());
 
     let start = Instant::now();
-    let timeout_duration =
-        std::time::Duration::from_secs(tool.constraints.timeout_seconds);
+    let timeout_duration = std::time::Duration::from_secs(tool.constraints.timeout_seconds);
 
     // Spawn and wait with timeout.
     let output = match tokio::time::timeout(timeout_duration, cmd.output()).await {
@@ -267,7 +263,11 @@ fn truncate_output(raw: &[u8], max_bytes: usize) -> String {
         String::from_utf8_lossy(raw).into_owned()
     } else {
         let truncated = String::from_utf8_lossy(&raw[..max_bytes]).into_owned();
-        format!("{truncated}\n... [truncated, {}/{} bytes shown]", max_bytes, raw.len())
+        format!(
+            "{truncated}\n... [truncated, {}/{} bytes shown]",
+            max_bytes,
+            raw.len()
+        )
     }
 }
 
@@ -590,7 +590,13 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ExecutionEvent>(16);
         let result = tokio::spawn(async move {
-            execute_command_tool_streaming(&tool, &["streaming-test-output".into()], &session_dir(), tx).await
+            execute_command_tool_streaming(
+                &tool,
+                &["streaming-test-output".into()],
+                &session_dir(),
+                tx,
+            )
+            .await
         });
 
         // Collect events until channel closes.
@@ -610,7 +616,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(!stdout_chunks.is_empty(), "expected ≥1 stdout chunk via channel");
+        assert!(
+            !stdout_chunks.is_empty(),
+            "expected ≥1 stdout chunk via channel"
+        );
         let joined = stdout_chunks.join("");
         assert!(joined.contains("streaming-test-output"));
     }
@@ -622,8 +631,7 @@ mod tests {
         let tool = make_echo_tool();
         let (tx, _rx) = tokio::sync::mpsc::channel::<ExecutionEvent>(8);
         let params = HashMap::new(); // missing required 'message'
-        let res =
-            execute_whitelisted_tool_streaming(&tool, &params, &[], &session_dir(), tx).await;
+        let res = execute_whitelisted_tool_streaming(&tool, &params, &[], &session_dir(), tx).await;
         assert!(res.is_err(), "should reject missing required param");
     }
 
@@ -662,7 +670,12 @@ mod tests {
 
     #[test]
     fn test_render_template_basic() {
-        let template = vec!["--input".into(), "{{file}}".into(), "--count".into(), "{{n}}".into()];
+        let template = vec![
+            "--input".into(),
+            "{{file}}".into(),
+            "--count".into(),
+            "{{n}}".into(),
+        ];
         let mut values = HashMap::new();
         values.insert("file".into(), "test.txt".into());
         values.insert("n".into(), "5".into());

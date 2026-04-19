@@ -201,12 +201,12 @@ const SENSITIVE_DIRS: &[&str] = &[
     ".aws",
     ".docker",
     ".kube",
-    ".config",     // covers .config/nevoflux/config.toml, .config/gcloud, etc.
-    ".local",      // covers .local/share/keyrings, etc.
+    ".config", // covers .config/nevoflux/config.toml, .config/gcloud, etc.
+    ".local",  // covers .local/share/keyrings, etc.
     // macOS
-    "Keychains",   // ~/Library/Keychains
-    "Cookies",     // ~/Library/Cookies
-    "MobileDevice",// ~/Library/MobileDevice (iOS backups)
+    "Keychains",    // ~/Library/Keychains
+    "Cookies",      // ~/Library/Cookies
+    "MobileDevice", // ~/Library/MobileDevice (iOS backups)
     // Windows (canonicalized paths use backslash, but component matching
     // works on individual directory names regardless of separator)
     "Vault",       // %LOCALAPPDATA%/Microsoft/Vault
@@ -235,7 +235,7 @@ const SENSITIVE_NAMES: &[&str] = &[
     ".npmrc",
     ".pypirc",
     ".netrc",
-    "_netrc",              // Windows equivalent of .netrc
+    "_netrc", // Windows equivalent of .netrc
     // Cloud / service credentials
     "credentials",
     "credentials.json",
@@ -245,25 +245,33 @@ const SENSITIVE_NAMES: &[&str] = &[
     "login.keychain",
     "login.keychain-db",
     // Windows
-    "ntuser.dat",          // Windows registry hive
-    "sam",                 // Windows SAM database
-    "system",              // Windows SYSTEM registry
-    "security",            // Windows SECURITY registry
-    "web credentials",     // Windows Credential Manager export
-    "desktop.ini",         // can reveal folder structure
+    "ntuser.dat",      // Windows registry hive
+    "sam",             // Windows SAM database
+    "system",          // Windows SYSTEM registry
+    "security",        // Windows SECURITY registry
+    "web credentials", // Windows Credential Manager export
+    "desktop.ini",     // can reveal folder structure
 ];
 
 const SENSITIVE_EXTENSIONS: &[&str] = &[
     // Keys and certificates
-    "pem", "key", "p12", "pfx", "jks", "keystore", "cer", "crt",
+    "pem",
+    "key",
+    "p12",
+    "pfx",
+    "jks",
+    "keystore",
+    "cer",
+    "crt",
     // macOS keychain
-    "keychain", "keychain-db",
+    "keychain",
+    "keychain-db",
     // Windows DPAPI
-    "rdp",   // contains saved credentials
+    "rdp", // contains saved credentials
     // Password manager databases
-    "kdbx",  // KeePass
-    "1pux",  // 1Password export
-    "psafe3",// Password Safe
+    "kdbx",   // KeePass
+    "1pux",   // 1Password export
+    "psafe3", // Password Safe
 ];
 
 /// Reject files that match known sensitive patterns.

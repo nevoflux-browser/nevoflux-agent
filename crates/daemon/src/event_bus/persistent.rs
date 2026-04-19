@@ -173,11 +173,10 @@ mod tests {
         storage
             .database()
             .with_connection(|conn| {
-                let count: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM event_bus_persistent",
-                    [],
-                    |row| row.get(0),
-                )?;
+                let count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM event_bus_persistent", [], |row| {
+                        row.get(0)
+                    })?;
                 Ok(count)
             })
             .unwrap()
@@ -269,11 +268,8 @@ mod tests {
         let remaining_id: String = storage
             .database()
             .with_connection(|conn| {
-                let id: String = conn.query_row(
-                    "SELECT id FROM event_bus_persistent",
-                    [],
-                    |row| row.get(0),
-                )?;
+                let id: String =
+                    conn.query_row("SELECT id FROM event_bus_persistent", [], |row| row.get(0))?;
                 Ok(id)
             })
             .unwrap();
@@ -286,8 +282,12 @@ mod tests {
         let (handle, writer) = PersistentWriter::new(Arc::clone(&storage));
 
         let handle2 = handle.clone();
-        handle.send(make_event("a:b", None)).expect("send via handle");
-        handle2.send(make_event("c:d", None)).expect("send via clone");
+        handle
+            .send(make_event("a:b", None))
+            .expect("send via handle");
+        handle2
+            .send(make_event("c:d", None))
+            .expect("send via clone");
 
         drop(handle);
         drop(handle2);
