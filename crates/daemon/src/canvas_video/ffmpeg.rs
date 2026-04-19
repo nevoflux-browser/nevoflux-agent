@@ -59,12 +59,10 @@ pub fn resolve_ffmpeg() -> Result<PathBuf> {
 /// an absolute, verifiable path.
 fn resolved_path() -> Result<PathBuf> {
     let p = ffmpeg_path();
-    // A non-trivial parent directory means p is already a meaningful path
-    // (sidecar absolute path or a relative path with a directory component).
-    if p.is_absolute() || p.parent().map(|pp| !pp.as_os_str().is_empty()).unwrap_or(false) {
+    if p.is_absolute() && p.exists() {
         return Ok(p);
     }
-    // p is the bare "ffmpeg" string — resolve via PATH.
+    // p is the bare "ffmpeg" string (or a non-existent absolute path) — resolve via PATH.
     which::which("ffmpeg")
         .map_err(|e| DaemonError::InternalError(format!("which ffmpeg failed: {}", e)))
 }

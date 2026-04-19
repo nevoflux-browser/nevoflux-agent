@@ -1,4 +1,7 @@
-//! Phase A PoC: validate drawSnapshot + ffmpeg round-trip.
+//! Phase A PoC test suite.
+//!
+//! Task 1: binary resolution (this file — current coverage).
+//! Later tasks (8, 16) add drawSnapshot + encode round-trip tests.
 
 #[test]
 fn test_resolve_ffmpeg_succeeds() {
