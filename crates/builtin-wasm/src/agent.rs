@@ -1597,6 +1597,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     content,
                     files,
                     entry,
+                    is_persistent: false,
                 });
 
                 format!("Artifact created and sent to canvas: {}", id)
@@ -1960,10 +1961,9 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     .tool_call_dynamic("browser_input", &tool_call.arguments)?;
                 self.auto_snapshot_after_action(&result_str, "interaction", tab_id)
             }
-            "browser_probe" => {
-                self.host
-                    .tool_call_dynamic("browser_probe", &tool_call.arguments)?
-            }
+            "browser_probe" => self
+                .host
+                .tool_call_dynamic("browser_probe", &tool_call.arguments)?,
             "browser_upload_file" => {
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
                 let result_str = self
@@ -3012,7 +3012,8 @@ For going back, use browser_go_back. NEVER use navigate to 'go back'.".into(),
             description: "Switch to (activate) an already-open browser tab. \
 When the user says 'activate', 'switch to', 'go to [site]' and that site is already open, \
 use browser_get_tabs first to find the tab, then activate it. \
-Do NOT use browser_navigate when the tab is already open — activate it instead.".into(),
+Do NOT use browser_navigate when the tab is already open — activate it instead."
+                .into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -3246,7 +3247,8 @@ is_content_editable, editor_framework (draft.js/lexical/prosemirror/slate/etc.),
 react_fiber_present, visibility, focusability, shadow DOM depth, iframe context, \
 innermost_editable_selector, computed_role. Useful when you need to reason about \
 page structure before choosing an input strategy, or when debugging why browser_input \
-picked a particular path.".into(),
+picked a particular path."
+                .into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {

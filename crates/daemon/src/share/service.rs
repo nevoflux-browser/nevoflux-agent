@@ -45,11 +45,14 @@ fn resolve_import_session_id(
     now: i64,
 ) -> rusqlite::Result<String> {
     if !requested.is_empty() {
-        let exists: bool = conn.query_row(
-            "SELECT 1 FROM sessions WHERE id = ?1",
-            rusqlite::params![requested],
-            |_| Ok(true),
-        ).optional()?.unwrap_or(false);
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sessions WHERE id = ?1",
+                rusqlite::params![requested],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
         if exists {
             return Ok(requested.to_string());
         }
@@ -58,11 +61,7 @@ fn resolve_import_session_id(
     conn.execute(
         "INSERT OR IGNORE INTO sessions (id, title, mode, created_at, updated_at) \
          VALUES (?1, ?2, 'chat', ?3, ?3)",
-        rusqlite::params![
-            IMPORTED_CANVASES_SESSION_ID,
-            "Imported Canvases",
-            now,
-        ],
+        rusqlite::params![IMPORTED_CANVASES_SESSION_ID, "Imported Canvases", now,],
     )?;
     Ok(IMPORTED_CANVASES_SESSION_ID.to_string())
 }
@@ -257,8 +256,8 @@ impl CanvasShareService {
             let session_id_db =
                 resolve_import_session_id(conn, &session_id_db_source, now)?;
             conn.execute(
-                "INSERT INTO artifacts (id, session_id, title, content_type, content, imported_from_url, imported_from_share_id, imported_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO artifacts (id, session_id, title, content_type, content, imported_from_url, imported_from_share_id, imported_at, is_persistent, persisted_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     artifact_id_db,
                     session_id_db,
@@ -268,6 +267,9 @@ impl CanvasShareService {
                     share_url,
                     share_id_db,
                     now,
+                    true,   // is_persistent
+                    now,    // persisted_at
+                    now,    // updated_at
                 ],
             )?;
             Ok(())

@@ -29,7 +29,10 @@ impl ValidationError {
 pub fn validate(tool: &CanvasTool) -> Result<(), ValidationError> {
     validate_name(&tool.name)?;
     validate_backend(tool)?;
-    if matches!(tool.args_mode, crate::canvas_tools::types::ArgsMode::Template) {
+    if matches!(
+        tool.args_mode,
+        crate::canvas_tools::types::ArgsMode::Template
+    ) {
         validate_template_placeholders(tool)?;
     }
     validate_params(&tool.params)?;
@@ -267,7 +270,9 @@ mod tests {
         t.params.insert(
             "path".into(),
             ParamSpec {
-                param_type: ParamType::Path { allowed_prefix: None },
+                param_type: ParamType::Path {
+                    allowed_prefix: None,
+                },
                 optional: false,
                 default: None,
             },
@@ -311,7 +316,10 @@ mod tests {
         t.params.insert(
             "n".into(),
             ParamSpec {
-                param_type: ParamType::Int { min: Some(10), max: Some(1) },
+                param_type: ParamType::Int {
+                    min: Some(10),
+                    max: Some(1),
+                },
                 optional: true,
                 default: None,
             },

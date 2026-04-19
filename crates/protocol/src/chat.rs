@@ -5,9 +5,8 @@
 //! Messages exchanged between Chat Sidebar and Agent via the Chat channel.
 
 use crate::canvas_tools::{
-    CanvasToolEvent, CanvasToolInvokeRequest, CanvasToolInvokeResponse, CanvasToolListRequest,
-    CanvasToolListResponse, CanvasToolSummary,
-    CanvasToolDeleteResponse, CanvasToolGetRawResponse,
+    CanvasToolDeleteResponse, CanvasToolEvent, CanvasToolGetRawResponse, CanvasToolInvokeRequest,
+    CanvasToolInvokeResponse, CanvasToolListRequest, CanvasToolListResponse,
     CanvasToolSaveResponse, CanvasToolValidateResponse,
 };
 use crate::common::*;
@@ -333,6 +332,10 @@ pub struct Artifact {
     /// Multi-file project: entry point file path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
+    /// Whether the artifact has been saved to My Canvas.
+    /// Defaults to `false` for wire-compat with older senders.
+    #[serde(default)]
+    pub is_persistent: bool,
 }
 
 /// Sent when an artifact begins streaming.
@@ -353,6 +356,10 @@ pub struct ArtifactStart {
     /// Multi-file project: entry point file path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
+    /// Whether the artifact has been saved to My Canvas.
+    /// Defaults to `false` for wire-compat with older senders.
+    #[serde(default)]
+    pub is_persistent: bool,
 }
 
 /// A chunk of artifact content.
@@ -1074,6 +1081,7 @@ mod tests {
             content: "<html><body><h1>Hello</h1></body></html>".into(),
             files: None,
             entry: None,
+            is_persistent: false,
         };
 
         let json = serde_json::to_string(&artifact).unwrap();
@@ -1093,6 +1101,7 @@ mod tests {
             description: None,
             files: None,
             entry: None,
+            is_persistent: false,
         });
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -1258,6 +1267,8 @@ mod tests {
                     args_mode: Some("params".into()),
                     enabled: true,
                     source: "builtin".into(),
+                    origin_source: "builtin".into(),
+                    is_override: false,
                 },
                 CanvasToolSummary {
                     name: "eslint".into(),
@@ -1266,6 +1277,8 @@ mod tests {
                     args_mode: None,
                     enabled: false,
                     source: "user".into(),
+                    origin_source: "user".into(),
+                    is_override: false,
                 },
             ],
         };
@@ -1411,10 +1424,7 @@ mod tests {
         assert!(json.contains("\"type\":\"canvas_tool_invoke_response\""));
         assert!(json.contains("\"payload\""));
         let decoded: AgentMessage = serde_json::from_str(&json).unwrap();
-        assert!(matches!(
-            decoded,
-            AgentMessage::CanvasToolInvokeResponse(_)
-        ));
+        assert!(matches!(decoded, AgentMessage::CanvasToolInvokeResponse(_)));
         if let AgentMessage::CanvasToolInvokeResponse(r) = decoded {
             assert_eq!(r.success, false);
             assert_eq!(r.exit_code, Some(1));
@@ -1432,6 +1442,8 @@ mod tests {
                 args_mode: Some("params".into()),
                 enabled: true,
                 source: "builtin".into(),
+                origin_source: "builtin".into(),
+                is_override: false,
             }],
         });
         let json = serde_json::to_string(&msg).unwrap();

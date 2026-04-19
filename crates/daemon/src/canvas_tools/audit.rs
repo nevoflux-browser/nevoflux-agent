@@ -122,7 +122,16 @@ impl AuditLogger {
                  SET status = ?1, exit_code = ?2, stdout_len = ?3, stderr_len = ?4, \
                      error_msg = ?5, duration_ms = ?6, finished_at = ?7 \
                  WHERE id = ?8",
-                params![status, exit_code, stdout_len, stderr_len, error_msg, duration_ms, now, id],
+                params![
+                    status,
+                    exit_code,
+                    stdout_len,
+                    stderr_len,
+                    error_msg,
+                    duration_ms,
+                    now,
+                    id
+                ],
             )?;
             Ok(())
         })
@@ -194,11 +203,20 @@ mod tests {
         let logger = test_logger();
 
         let id = logger
-            .log_start("sess-1", "ffmpeg.trim", "command", r#"["--ss","10"]"#, Some("/tmp"))
+            .log_start(
+                "sess-1",
+                "ffmpeg.trim",
+                "command",
+                r#"["--ss","10"]"#,
+                Some("/tmp"),
+            )
             .unwrap();
 
         // id should be a valid UUID
-        assert!(Uuid::parse_str(&id).is_ok(), "returned id should be a valid UUID");
+        assert!(
+            Uuid::parse_str(&id).is_ok(),
+            "returned id should be a valid UUID"
+        );
 
         // Query the record back
         let records = logger.query_by_session("sess-1", 10).unwrap();
@@ -230,7 +248,15 @@ mod tests {
             .unwrap();
 
         logger
-            .log_complete(&id, "success", Some(0), Some(1024), Some(0), None, Some(150))
+            .log_complete(
+                &id,
+                "success",
+                Some(0),
+                Some(1024),
+                Some(0),
+                None,
+                Some(150),
+            )
             .unwrap();
 
         let records = logger.query_by_session("sess-1", 10).unwrap();

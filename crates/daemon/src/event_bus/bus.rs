@@ -234,7 +234,10 @@ impl EventBus {
 
         // 5. Register.
         {
-            let mut subs = self.subscriptions.write().expect("subscriptions lock poisoned");
+            let mut subs = self
+                .subscriptions
+                .write()
+                .expect("subscriptions lock poisoned");
             subs.push(ActiveSubscription { sub, tx });
         }
 
@@ -243,7 +246,10 @@ impl EventBus {
 
     /// Remove a subscription by its id. Returns `true` if found and removed.
     pub fn unsubscribe(&self, subscription_id: &str) -> bool {
-        let mut subs = self.subscriptions.write().expect("subscriptions lock poisoned");
+        let mut subs = self
+            .subscriptions
+            .write()
+            .expect("subscriptions lock poisoned");
         let before = subs.len();
         subs.retain(|a| a.sub.id != subscription_id);
         subs.len() < before
@@ -253,7 +259,10 @@ impl EventBus {
 
     /// Number of active subscriptions.
     pub fn subscription_count(&self) -> usize {
-        self.subscriptions.read().expect("subscriptions lock poisoned").len()
+        self.subscriptions
+            .read()
+            .expect("subscriptions lock poisoned")
+            .len()
     }
 
     /// Total events published since the bus was created.
@@ -279,7 +288,10 @@ impl EventBus {
         // before any `.await` to avoid holding a std RwLockReadGuard across an
         // await point.
         let targets: Vec<(mpsc::Sender<BusEvent>, BackpressurePolicy)> = {
-            let subs = self.subscriptions.read().expect("subscriptions lock poisoned");
+            let subs = self
+                .subscriptions
+                .read()
+                .expect("subscriptions lock poisoned");
             subs.iter()
                 .filter(|a| a.sub.pattern.matches(&event.topic))
                 .map(|a| (a.tx.clone(), a.sub.policy))
@@ -293,11 +305,10 @@ impl EventBus {
                     // because we cannot pop from the sender side.
                     tx.try_send(event.clone()).is_ok()
                 }
-                BackpressurePolicy::Block => {
-                    tx.send_timeout(event.clone(), Duration::from_millis(100))
-                        .await
-                        .is_ok()
-                }
+                BackpressurePolicy::Block => tx
+                    .send_timeout(event.clone(), Duration::from_millis(100))
+                    .await
+                    .is_ok(),
             };
             if !sent {
                 self.events_dropped.fetch_add(1, Ordering::Relaxed);
@@ -331,11 +342,13 @@ impl EventBus {
         if queue.len() >= STICKY_MAX_PER_TOPIC {
             if let Some(old) = queue.pop_front() {
                 let old_bytes = Self::estimate_event_bytes(&old);
-                self.sticky_cache_bytes.fetch_sub(old_bytes, Ordering::Relaxed);
+                self.sticky_cache_bytes
+                    .fetch_sub(old_bytes, Ordering::Relaxed);
             }
         }
 
-        self.sticky_cache_bytes.fetch_add(event_bytes, Ordering::Relaxed);
+        self.sticky_cache_bytes
+            .fetch_add(event_bytes, Ordering::Relaxed);
         queue.push_back(event.clone());
     }
 
@@ -469,7 +482,10 @@ mod tests {
         );
         let result = bus.publish(event).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EventBusError::PermissionDenied(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            EventBusError::PermissionDenied(_)
+        ));
     }
 
     #[tokio::test]
@@ -486,21 +502,23 @@ mod tests {
             16,
         );
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EventBusError::PermissionDenied(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            EventBusError::PermissionDenied(_)
+        ));
     }
 
     #[tokio::test]
     async fn test_invalid_topic_rejected() {
         let bus = EventBus::new();
 
-        let event = BusEvent::ephemeral(
-            "bad topic!",
-            json!(null),
-            PublisherIdentity::Internal,
-        );
+        let event = BusEvent::ephemeral("bad topic!", json!(null), PublisherIdentity::Internal);
         let result = bus.publish(event).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EventBusError::InvalidTopic(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            EventBusError::InvalidTopic(_)
+        ));
     }
 
     #[tokio::test]
@@ -638,7 +656,10 @@ mod tests {
             16,
         );
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EventBusError::PermissionDenied(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            EventBusError::PermissionDenied(_)
+        ));
     }
 
     #[test]

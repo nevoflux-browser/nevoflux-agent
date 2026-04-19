@@ -31,8 +31,13 @@ pub fn derive_key(password: &str, share_id: &str, params: &KdfParams) -> Result<
     let argon2 = Argon2::new(
         argon2::Algorithm::Argon2id,
         argon2::Version::V0x13,
-        argon2::Params::new(params.memory_kib, params.iterations, params.parallelism, Some(32))
-            .map_err(|e| DaemonError::InternalError(format!("Argon2 params error: {e}")))?,
+        argon2::Params::new(
+            params.memory_kib,
+            params.iterations,
+            params.parallelism,
+            Some(32),
+        )
+        .map_err(|e| DaemonError::InternalError(format!("Argon2 params error: {e}")))?,
     );
 
     let mut key = [0u8; 32];
@@ -106,7 +111,10 @@ pub fn encrypt_share_bundle(
 ///
 /// Returns [`DaemonError::InvalidRequest`] when decryption fails (wrong
 /// password or corrupted data).
-pub fn decrypt_share_bundle(encrypted: &EncryptedShareBundle, password: &str) -> Result<ShareBundle> {
+pub fn decrypt_share_bundle(
+    encrypted: &EncryptedShareBundle,
+    password: &str,
+) -> Result<ShareBundle> {
     let mut key = derive_key(password, &encrypted.share_id, &encrypted.kdf_params)?;
 
     let nonce = Nonce::from_slice(&encrypted.nonce);
@@ -120,9 +128,7 @@ pub fn decrypt_share_bundle(encrypted: &EncryptedShareBundle, password: &str) ->
     combined.extend_from_slice(&encrypted.auth_tag);
 
     let plaintext = cipher.decrypt(nonce, combined.as_ref()).map_err(|_| {
-        DaemonError::InvalidRequest(
-            "Decryption failed: wrong password or corrupted data".into(),
-        )
+        DaemonError::InvalidRequest("Decryption failed: wrong password or corrupted data".into())
     })?;
 
     // Zeroize key material.
@@ -187,7 +193,10 @@ mod tests {
         let params = fast_kdf_params();
         let key_a = derive_key("alpha", "ABCDEFGHJK", &params).unwrap();
         let key_b = derive_key("bravo", "ABCDEFGHJK", &params).unwrap();
-        assert_ne!(key_a, key_b, "Different passwords must produce different keys");
+        assert_ne!(
+            key_a, key_b,
+            "Different passwords must produce different keys"
+        );
     }
 
     #[test]
@@ -195,7 +204,10 @@ mod tests {
         let params = fast_kdf_params();
         let key_a = derive_key("password", "ABCDEFGHJK", &params).unwrap();
         let key_b = derive_key("password", "ZZZZZZZZZZ", &params).unwrap();
-        assert_ne!(key_a, key_b, "Different share IDs must produce different keys");
+        assert_ne!(
+            key_a, key_b,
+            "Different share IDs must produce different keys"
+        );
     }
 
     #[test]
@@ -281,7 +293,11 @@ mod tests {
         let encrypted = encrypt_share_bundle(&bundle, "pw", "ABCDEFGHJK").unwrap();
 
         assert_eq!(encrypted.nonce.len(), NONCE_LEN, "Nonce must be 12 bytes");
-        assert_eq!(encrypted.auth_tag.len(), TAG_LEN, "Auth tag must be 16 bytes");
+        assert_eq!(
+            encrypted.auth_tag.len(),
+            TAG_LEN,
+            "Auth tag must be 16 bytes"
+        );
         assert!(
             !encrypted.ciphertext.is_empty(),
             "Ciphertext must not be empty"

@@ -258,8 +258,14 @@ mod tests {
             assert_eq!(kind, back);
         }
         // Verify snake_case serialization
-        assert_eq!(serde_json::to_string(&BackendKind::Command).unwrap(), "\"command\"");
-        assert_eq!(serde_json::to_string(&BackendKind::Internal).unwrap(), "\"internal\"");
+        assert_eq!(
+            serde_json::to_string(&BackendKind::Command).unwrap(),
+            "\"command\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BackendKind::Internal).unwrap(),
+            "\"internal\""
+        );
     }
 
     // 2. ArgsMode serde roundtrip
@@ -270,7 +276,10 @@ mod tests {
             let back: ArgsMode = serde_json::from_str(&json).unwrap();
             assert_eq!(mode, back);
         }
-        assert_eq!(serde_json::to_string(&ArgsMode::Template).unwrap(), "\"template\"");
+        assert_eq!(
+            serde_json::to_string(&ArgsMode::Template).unwrap(),
+            "\"template\""
+        );
         assert_eq!(serde_json::to_string(&ArgsMode::Free).unwrap(), "\"free\"");
     }
 
@@ -278,13 +287,25 @@ mod tests {
     #[test]
     fn test_param_type_all_variants_roundtrip() {
         let variants: Vec<ParamType> = vec![
-            ParamType::Path { allowed_prefix: Some("/home".into()) },
+            ParamType::Path {
+                allowed_prefix: Some("/home".into()),
+            },
             ParamType::Duration,
-            ParamType::Int { min: Some(-10), max: Some(100) },
-            ParamType::Float { min: Some(0.0), max: Some(1.0) },
+            ParamType::Int {
+                min: Some(-10),
+                max: Some(100),
+            },
+            ParamType::Float {
+                min: Some(0.0),
+                max: Some(1.0),
+            },
             ParamType::Bool,
-            ParamType::Enum { values: vec!["a".into(), "b".into()] },
-            ParamType::Text { pattern: Some(r"^\w+$".into()) },
+            ParamType::Enum {
+                values: vec!["a".into(), "b".into()],
+            },
+            ParamType::Text {
+                pattern: Some(r"^\w+$".into()),
+            },
             ParamType::Identifier,
         ];
 
@@ -299,7 +320,10 @@ mod tests {
     #[test]
     fn test_param_spec_serde_flattened() {
         let spec = ParamSpec {
-            param_type: ParamType::Int { min: Some(1), max: Some(10) },
+            param_type: ParamType::Int {
+                min: Some(1),
+                max: Some(10),
+            },
             optional: true,
             default: Some("5".into()),
         };
@@ -390,7 +414,10 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         // "source" should NOT appear in serialized output
-        assert!(value.get("source").is_none(), "source field should be skipped");
+        assert!(
+            value.get("source").is_none(),
+            "source field should be skipped"
+        );
 
         // Deserializing gives the default (Builtin), not Session
         let back: CanvasTool = serde_json::from_str(&json).unwrap();

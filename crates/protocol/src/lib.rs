@@ -23,6 +23,7 @@
 //!
 //! All types support both JSON and MessagePack serialization via serde.
 
+pub mod canvas_persist;
 pub mod canvas_share;
 pub mod canvas_tools;
 pub mod channel;
@@ -37,19 +38,18 @@ pub mod subagent;
 
 // Re-export canvas share types
 pub use canvas_share::{
-    CanvasImportRequest, CanvasImportResponse, CanvasShareDeleteRequest,
-    CanvasShareDeleteResponse, CanvasShareExtendRequest, CanvasShareExtendResponse,
-    CanvasShareInfo, CanvasShareListRequest, CanvasShareListResponse, CanvasShareRequest,
-    CanvasShareResponse,
+    CanvasImportRequest, CanvasImportResponse, CanvasShareDeleteRequest, CanvasShareDeleteResponse,
+    CanvasShareExtendRequest, CanvasShareExtendResponse, CanvasShareInfo, CanvasShareListRequest,
+    CanvasShareListResponse, CanvasShareRequest, CanvasShareResponse,
 };
 
 // Re-export canvas tool types
 pub use canvas_tools::{
     CanvasToolDeleteRequest, CanvasToolDeleteResponse, CanvasToolError, CanvasToolEvent,
     CanvasToolGetRawRequest, CanvasToolGetRawResponse, CanvasToolInvokeRequest,
-    CanvasToolInvokeResponse, CanvasToolListRequest, CanvasToolListResponse,
-    CanvasToolSaveRequest, CanvasToolSaveResponse, CanvasToolSummary,
-    CanvasToolValidateRequest, CanvasToolValidateResponse,
+    CanvasToolInvokeResponse, CanvasToolListRequest, CanvasToolListResponse, CanvasToolSaveRequest,
+    CanvasToolSaveResponse, CanvasToolSummary, CanvasToolValidateRequest,
+    CanvasToolValidateResponse,
 };
 
 // Re-export main types at crate root

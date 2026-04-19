@@ -41,6 +41,11 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "012_canvas_share",
         include_str!("migrations/012_canvas_share.sql"),
     ),
+    // Note: 013 was reserved and abandoned; 014 follows 012 intentionally.
+    (
+        "014_artifacts_persistent",
+        include_str!("migrations/014_artifacts_persistent.sql"),
+    ),
 ];
 
 /// Run all pending migrations on the given connection.
@@ -63,9 +68,19 @@ pub fn run_all(conn: &mut Connection) -> Result<()> {
         )?;
 
         if !already_applied {
-            conn.execute_batch(sql).map_err(|e| {
-                StorageError::Migration(format!("Migration {} failed: {}", name, e))
-            })?;
+            // Some migrations (e.g. table rebuilds) toggle foreign_keys OFF;
+            // reassert ON after every migration to recover from any failure path.
+            let result = conn
+                .execute_batch(sql)
+                .map_err(|e| StorageError::Migration(format!("Migration {} failed: {}", name, e)));
+            conn.execute_batch("PRAGMA foreign_keys = ON;")
+                .map_err(|e| {
+                    StorageError::Migration(format!(
+                        "Migration {} failed to restore foreign_keys: {}",
+                        name, e
+                    ))
+                })?;
+            result?;
 
             conn.execute(
                 "INSERT INTO _migrations (name, applied_at) VALUES (?, strftime('%s', 'now'))",
@@ -93,7 +108,7 @@ mod tests {
         let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 12);
+        assert_eq!(count, 13);
     }
 
     #[test]
@@ -193,11 +208,7 @@ mod tests {
         assert_eq!(count, 1, "Table event_bus_persistent should exist");
 
         // Verify indexes exist
-        for idx in &[
-            "idx_ebp_topic",
-            "idx_ebp_expires_at",
-            "idx_ebp_created_at",
-        ] {
+        for idx in &["idx_ebp_topic", "idx_ebp_expires_at", "idx_ebp_created_at"] {
             let count: i64 = conn
                 .query_row(
                     &format!(
@@ -252,11 +263,9 @@ mod tests {
         .unwrap();
 
         let row_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM canvas_tool_invocations",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM canvas_tool_invocations", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(row_count, 1);
     }
@@ -284,6 +293,179 @@ mod tests {
         }
     }
 
+    /// Run migrations up to (but not including) the migration named `stop_before`.
+    /// Uses name-based lookup so that inserting a new migration before the stop
+    /// point does not silently slice at the wrong index.
+    fn run_migrations_up_to(conn: &mut Connection, stop_before: &str) -> Result<()> {
+        let count = MIGRATIONS
+            .iter()
+            .position(|(name, _)| *name == stop_before)
+            .unwrap_or_else(|| panic!("stop_before migration {stop_before:?} not found"));
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _migrations (
+                name TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
+        for (name, sql) in &MIGRATIONS[..count] {
+            let already_applied: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM _migrations WHERE name = ?)",
+                [name],
+                |row| row.get(0),
+            )?;
+
+            if !already_applied {
+                // Some migrations (e.g. table rebuilds) toggle foreign_keys OFF;
+                // reassert ON after every migration to recover from any failure path.
+                let result = conn.execute_batch(sql).map_err(|e| {
+                    StorageError::Migration(format!("Migration {} failed: {}", name, e))
+                });
+                conn.execute_batch("PRAGMA foreign_keys = ON;")
+                    .map_err(|e| {
+                        StorageError::Migration(format!(
+                            "Migration {} failed to restore foreign_keys: {}",
+                            name, e
+                        ))
+                    })?;
+                result?;
+
+                conn.execute(
+                    "INSERT INTO _migrations (name, applied_at) VALUES (?, strftime('%s', 'now'))",
+                    [name],
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn migration_014_artifacts_persistent() {
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // Run all migrations up to (but not including) 014 to set up the pre-014 schema.
+        run_migrations_up_to(&mut conn, "014_artifacts_persistent").unwrap();
+
+        // Insert a session to attach artifacts to.
+        conn.execute(
+            "INSERT INTO sessions (id, created_at, updated_at) VALUES ('sess-a', 1000, 1000)",
+            [],
+        )
+        .unwrap();
+
+        // Insert an imported artifact (has imported_from_share_id, so should become persistent).
+        conn.execute(
+            "INSERT INTO artifacts
+             (id, session_id, title, content_type, content, imported_from_share_id, imported_at, created_at)
+             VALUES ('art-imported', 'sess-a', 'Imported', 'text/html', '<h1/>', 'share-001', 2000, 1500)",
+            [],
+        )
+        .unwrap();
+
+        // Insert a regular (non-imported) artifact.
+        conn.execute(
+            "INSERT INTO artifacts
+             (id, session_id, title, content_type, content, created_at)
+             VALUES ('art-regular', 'sess-a', 'Regular', 'text/html', '<p/>', 3000)",
+            [],
+        )
+        .unwrap();
+
+        // Apply migration 014 directly by running its SQL — this exercises the backfill.
+        let sql_014 = include_str!("migrations/014_artifacts_persistent.sql");
+        conn.execute_batch(sql_014).unwrap();
+
+        // --- (a) imported artifact should be persistent ---
+        let (is_persistent, persisted_at, updated_at): (i32, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT is_persistent, persisted_at, updated_at FROM artifacts WHERE id = 'art-imported'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            is_persistent, 1,
+            "imported artifact should have is_persistent=1"
+        );
+        assert_eq!(
+            persisted_at,
+            Some(2000),
+            "persisted_at should equal imported_at (2000)"
+        );
+        assert_eq!(
+            updated_at,
+            Some(2000),
+            "updated_at should equal imported_at (2000)"
+        );
+
+        // --- (b) regular artifact should NOT be persistent ---
+        let (is_persistent2, persisted_at2, updated_at2): (i32, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT is_persistent, persisted_at, updated_at FROM artifacts WHERE id = 'art-regular'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            is_persistent2, 0,
+            "regular artifact should have is_persistent=0"
+        );
+        assert!(
+            persisted_at2.is_none(),
+            "regular artifact should have persisted_at IS NULL"
+        );
+        assert_eq!(
+            updated_at2,
+            Some(3000),
+            "regular artifact updated_at should equal created_at (3000)"
+        );
+
+        // --- (c) session_id becomes nullable; FK is now SET NULL ---
+        // After migration 014, deleting a session should set artifact.session_id to NULL
+        // rather than cascade-delete the artifact.
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        conn.execute("DELETE FROM sessions WHERE id = 'sess-a'", [])
+            .unwrap();
+
+        // The imported persistent artifact should still exist with session_id = NULL.
+        let session_id: Option<String> = conn
+            .query_row(
+                "SELECT session_id FROM artifacts WHERE id = 'art-imported'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(
+            session_id.is_none(),
+            "persistent artifact should survive session deletion with session_id = NULL"
+        );
+
+        // --- (d) indexes exist ---
+        for idx in &[
+            "idx_artifacts_persistent",
+            "idx_artifacts_session",
+            "idx_artifacts_imported",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='{}'",
+                        idx
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "Index {} should exist", idx);
+        }
+    }
+
     #[test]
     fn migration_012_creates_canvas_share_tables() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -293,7 +475,10 @@ mod tests {
         for table in &["artifact_shares", "artifact_share_history"] {
             let count: i64 = conn
                 .query_row(
-                    &format!("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{}'", table),
+                    &format!(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{}'",
+                        table
+                    ),
                     [],
                     |row| row.get(0),
                 )
@@ -320,11 +505,18 @@ mod tests {
         ).unwrap();
 
         // Verify indexes
-        for idx in &["idx_artifact_shares_artifact_id", "idx_artifact_shares_share_id",
-                     "idx_artifact_shares_expires_at", "idx_artifact_share_history_artifact_id"] {
+        for idx in &[
+            "idx_artifact_shares_artifact_id",
+            "idx_artifact_shares_share_id",
+            "idx_artifact_shares_expires_at",
+            "idx_artifact_share_history_artifact_id",
+        ] {
             let count: i64 = conn
                 .query_row(
-                    &format!("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='{}'", idx),
+                    &format!(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='{}'",
+                        idx
+                    ),
                     [],
                     |row| row.get(0),
                 )

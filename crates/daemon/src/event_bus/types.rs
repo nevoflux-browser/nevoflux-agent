@@ -18,7 +18,11 @@ pub struct BusEvent {
 }
 
 impl BusEvent {
-    pub fn ephemeral(topic: impl Into<String>, payload: serde_json::Value, publisher: PublisherIdentity) -> Self {
+    pub fn ephemeral(
+        topic: impl Into<String>,
+        payload: serde_json::Value,
+        publisher: PublisherIdentity,
+    ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             topic: topic.into(),
@@ -30,7 +34,11 @@ impl BusEvent {
         }
     }
 
-    pub fn sticky(topic: impl Into<String>, payload: serde_json::Value, publisher: PublisherIdentity) -> Self {
+    pub fn sticky(
+        topic: impl Into<String>,
+        payload: serde_json::Value,
+        publisher: PublisherIdentity,
+    ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             topic: topic.into(),
@@ -207,7 +215,9 @@ mod tests {
         let evt = BusEvent::persistent(
             "log:error",
             serde_json::json!({"msg": "oops"}),
-            PublisherIdentity::Agent { session_id: "s1".into() },
+            PublisherIdentity::Agent {
+                session_id: "s1".into(),
+            },
             Some(Duration::from_secs(3600)),
         );
         assert_eq!(evt.delivery, Delivery::Persistent);
@@ -236,7 +246,9 @@ mod tests {
 
     #[test]
     fn test_publisher_identity_serde_roundtrip() {
-        let publisher = PublisherIdentity::Agent { session_id: "sess-001".into() };
+        let publisher = PublisherIdentity::Agent {
+            session_id: "sess-001".into(),
+        };
         let json = serde_json::to_string(&publisher).unwrap();
         assert!(json.contains("\"kind\":\"agent\""));
         assert!(json.contains("\"session_id\":\"sess-001\""));
@@ -248,9 +260,15 @@ mod tests {
     fn test_subscriber_identity_hash_and_eq() {
         use std::collections::HashSet;
         let mut set = HashSet::new();
-        let sub1 = SubscriberIdentity::Agent { session_id: "s1".into() };
-        let sub2 = SubscriberIdentity::Agent { session_id: "s1".into() };
-        let sub3 = SubscriberIdentity::Extension { proxy_id: "p1".into() };
+        let sub1 = SubscriberIdentity::Agent {
+            session_id: "s1".into(),
+        };
+        let sub2 = SubscriberIdentity::Agent {
+            session_id: "s1".into(),
+        };
+        let sub3 = SubscriberIdentity::Extension {
+            proxy_id: "p1".into(),
+        };
         set.insert(sub1.clone());
         set.insert(sub2);
         set.insert(sub3);
@@ -272,7 +290,9 @@ mod tests {
     fn test_subscription_builder_custom() {
         let sub = Subscription::new(
             TopicPattern::wildcard("task:*"),
-            SubscriberIdentity::Agent { session_id: "s1".into() },
+            SubscriberIdentity::Agent {
+                session_id: "s1".into(),
+            },
         )
         .with_policy(BackpressurePolicy::Block)
         .with_buffer_size(1024);

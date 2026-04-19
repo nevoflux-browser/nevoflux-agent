@@ -138,11 +138,31 @@ impl SessionManager {
     }
 
     /// Delete a session.
+    ///
+    /// Splits artifact cleanup by `is_persistent`:
+    /// - Non-persistent artifacts are deleted together with the session (plus
+    ///   their corresponding `canvas:{id}` config-store mirrors).
+    /// - Persistent artifacts have their `session_id` set to NULL via the
+    ///   `ON DELETE SET NULL` FK (migration 014) when the session row is
+    ///   deleted.
     pub async fn delete_session(&self, session_id: &str) -> Result<bool> {
-        // Delete related data first
-        self.storage.artifacts().delete_by_session(session_id)?;
+        // 1) Drop non-persistent artifacts and get back their IDs.
+        let dropped = self
+            .storage
+            .artifacts()
+            .delete_non_persistent_by_session(session_id)?;
+
+        // 2) Best-effort cleanup of their config-store mirrors ("ContentStore").
+        //    Ignore errors (a missing key is fine).
+        for id in &dropped {
+            let _ = self.storage.config().delete(&format!("canvas:{id}"));
+        }
+
+        // 3) Drop messages (unchanged).
         self.storage.messages().delete_by_session(session_id)?;
-        // Then delete the session
+
+        // 4) Delete the session row. FK ON DELETE SET NULL detaches any remaining
+        //    (persistent) artifacts from this session automatically.
         Ok(self.storage.sessions().delete(session_id)?)
     }
 

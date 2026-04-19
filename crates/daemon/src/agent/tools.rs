@@ -1228,10 +1228,7 @@ impl BrowserTool {
         Ok(serde_json::to_string(&fingerprint).unwrap_or_else(|_| "{}".to_string()))
     }
 
-    async fn run_browser_upload_from_args(
-        &self,
-        arguments: &serde_json::Value,
-    ) -> Result<String> {
+    async fn run_browser_upload_from_args(&self, arguments: &serde_json::Value) -> Result<String> {
         use crate::agent::browser_input::file_server::get_or_start_file_server;
         use crate::agent::browser_input::upload::{
             check_file_size, check_sensitive_path, detect_mime, validate_workspace_path,
@@ -1274,23 +1271,20 @@ impl BrowserTool {
         }
 
         // Validate path containment and canonicalize.
-        let canonical = validate_workspace_path(
-            std::path::Path::new(file_path_str),
-            &workspace_dir,
-        )
-        .map_err(|e| DaemonError::InternalError(e.to_string()))?;
+        let canonical =
+            validate_workspace_path(std::path::Path::new(file_path_str), &workspace_dir)
+                .map_err(|e| DaemonError::InternalError(e.to_string()))?;
 
         // Block sensitive files (keys, credentials, env, etc.)
-        check_sensitive_path(&canonical)
-            .map_err(|e| DaemonError::InternalError(e.to_string()))?;
+        check_sensitive_path(&canonical).map_err(|e| DaemonError::InternalError(e.to_string()))?;
 
         // Check size limit.
         let size = check_file_size(&canonical, DEFAULT_MAX_SIZE)
             .map_err(|e| DaemonError::InternalError(e.to_string()))?;
 
         // Detect MIME type from magic bytes.
-        let mime_type = detect_mime(&canonical)
-            .map_err(|e| DaemonError::InternalError(e.to_string()))?;
+        let mime_type =
+            detect_mime(&canonical).map_err(|e| DaemonError::InternalError(e.to_string()))?;
 
         // Derive file name.
         let file_name = canonical
@@ -1342,15 +1336,14 @@ impl BrowserTool {
             .await
             .map_err(|_| DaemonError::InternalError("Failed to send browser request".into()))?;
 
-        let response: BrowserResponse =
-            tokio::time::timeout(Duration::from_secs(120), response_rx)
-                .await
-                .map_err(|_| {
-                    DaemonError::InternalError("browser_upload_file: request timed out".into())
-                })?
-                .map_err(|_| {
-                    DaemonError::InternalError("browser_upload_file: response channel closed".into())
-                })?;
+        let response: BrowserResponse = tokio::time::timeout(Duration::from_secs(120), response_rx)
+            .await
+            .map_err(|_| {
+                DaemonError::InternalError("browser_upload_file: request timed out".into())
+            })?
+            .map_err(|_| {
+                DaemonError::InternalError("browser_upload_file: response channel closed".into())
+            })?;
 
         if response.success {
             Ok(serde_json::json!({

@@ -134,7 +134,11 @@ impl PermissionChecker {
             TopicPattern::Exact(t) => topic_prefix(t),
             TopicPattern::Wildcard(pat) => {
                 let first = pat.split(':').next().unwrap_or("");
-                if first == "*" { "" } else { first }
+                if first == "*" {
+                    ""
+                } else {
+                    first
+                }
             }
             TopicPattern::DoubleWildcard(p) => p.as_str(),
         };

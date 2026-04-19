@@ -49,7 +49,10 @@ fn mirror_canvas_to_artifacts_table(
     let obj = match value.as_object() {
         Some(o) => o,
         None => {
-            warn!("ContentStore canvas value for {} is not an object, skipping artifacts mirror", key);
+            warn!(
+                "ContentStore canvas value for {} is not an object, skipping artifacts mirror",
+                key
+            );
             return;
         }
     };
@@ -95,7 +98,18 @@ fn mirror_canvas_to_artifacts_table(
     let session_id = match session_id_from_value {
         Some(s) => s,
         None => match session_manager.get_artifact(&id) {
-            Ok(Some(existing)) => existing.session_id,
+            Ok(Some(existing)) => match existing.session_id {
+                Some(sid) => sid,
+                // Persistent artifact with no session (FK SET NULL after migration 014);
+                // cannot mirror without a session context — skip.
+                None => {
+                    debug!(
+                        "ContentStore canvas {} has no session_id (persistent orphan); skipping artifacts mirror",
+                        id
+                    );
+                    return;
+                }
+            },
             Ok(None) => {
                 debug!(
                     "ContentStore canvas {} has no session_id and no existing row; skipping artifacts mirror",
@@ -110,13 +124,9 @@ fn mirror_canvas_to_artifacts_table(
         },
     };
 
-    let mut params = nevoflux_storage::CreateArtifactParams::new(
-        &id,
-        &session_id,
-        &title,
-        &content_type,
-    )
-    .with_content(&content);
+    let mut params =
+        nevoflux_storage::CreateArtifactParams::new(&id, &session_id, &title, &content_type)
+            .with_content(&content);
     if let Some(d) = description {
         params = params.with_description(&d);
     }
@@ -363,8 +373,7 @@ async fn handle_proxy_connection(
         "type": "_proxy_disconnected",
         "proxy_id": proxy_id,
     });
-    let disconnect_envelope =
-        ProxyEnvelope::new(&proxy_id, "", Channel::Chat, disconnect_payload);
+    let disconnect_envelope = ProxyEnvelope::new(&proxy_id, "", Channel::Chat, disconnect_payload);
     let _ = msg_tx.send((identity.clone(), disconnect_envelope)).await;
 
     info!("Proxy {} cleaned up", proxy_id);
@@ -1058,6 +1067,14 @@ pub async fn start_server(
         Arc::new(CanvasShareService::new(storage_arc, http, master_key))
     };
 
+    // Canvas Persist Service (My Canvas)
+    let canvas_persist_service = {
+        let storage_arc = session_manager.shared_storage();
+        Arc::new(crate::canvas_persist::CanvasPersistService::new(
+            storage_arc,
+        ))
+    };
+
     let mut services = HostServices::new(Arc::new(db))
         .with_browser_sender(browser_tx)
         .with_mcp_manager(mcp_manager)
@@ -1350,6 +1367,7 @@ pub async fn start_server(
     let process_canvas_builtin_dir =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("canvas-tools");
     let process_canvas_share_service = canvas_share_service.clone();
+    let process_canvas_persist_service = canvas_persist_service.clone();
     tokio::spawn(async move {
         while let Some((identity, envelope)) = msg_rx.recv().await {
             let proxy_id = envelope.proxy_id.clone();
@@ -1541,8 +1559,7 @@ pub async fn start_server(
                     .iter()
                     .map(|t| {
                         let source_str = format!("{:?}", t.source).to_lowercase();
-                        let is_override =
-                            process_canvas_tool_registry.is_override(&t.name);
+                        let is_override = process_canvas_tool_registry.is_override(&t.name);
                         nevoflux_protocol::CanvasToolSummary {
                             name: t.name.clone(),
                             description: Some(t.description.clone()),
@@ -1560,8 +1577,8 @@ pub async fn start_server(
                     nevoflux_protocol::CanvasToolListResponse { tools: summaries },
                 );
                 let payload = serde_json::to_value(&resp).unwrap_or_default();
-                let response = DaemonEnvelope::new(&proxy_id, channel, payload)
-                    .with_request_id(&request_id);
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, payload).with_request_id(&request_id);
                 let _ = process_response_tx.send((identity, response)).await;
                 continue;
             }
@@ -1650,8 +1667,8 @@ pub async fn start_server(
 
                 let msg = nevoflux_protocol::AgentMessage::CanvasToolGetRawResponse(resp);
                 let payload = serde_json::to_value(&msg).unwrap_or_default();
-                let response = DaemonEnvelope::new(&proxy_id, channel, payload)
-                    .with_request_id(&request_id);
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, payload).with_request_id(&request_id);
                 let _ = process_response_tx.send((identity, response)).await;
                 continue;
             }
@@ -1768,8 +1785,8 @@ pub async fn start_server(
 
                 let msg = nevoflux_protocol::AgentMessage::CanvasToolSaveResponse(resp);
                 let payload = serde_json::to_value(&msg).unwrap_or_default();
-                let response = DaemonEnvelope::new(&proxy_id, channel, payload)
-                    .with_request_id(&request_id);
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, payload).with_request_id(&request_id);
                 let _ = process_response_tx.send((identity, response)).await;
                 continue;
             }
@@ -1804,9 +1821,7 @@ pub async fn start_server(
                                     field: None,
                                 }),
                             },
-                            Some(t)
-                                if t.source != crate::canvas_tools::types::ToolSource::User =>
-                            {
+                            Some(t) if t.source != crate::canvas_tools::types::ToolSource::User => {
                                 nevoflux_protocol::CanvasToolDeleteResponse {
                                     success: false,
                                     was_override: false,
@@ -1849,8 +1864,8 @@ pub async fn start_server(
 
                 let msg = nevoflux_protocol::AgentMessage::CanvasToolDeleteResponse(resp);
                 let payload = serde_json::to_value(&msg).unwrap_or_default();
-                let response = DaemonEnvelope::new(&proxy_id, channel, payload)
-                    .with_request_id(&request_id);
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, payload).with_request_id(&request_id);
                 let _ = process_response_tx.send((identity, response)).await;
                 continue;
             }
@@ -1872,9 +1887,8 @@ pub async fn start_server(
                         }),
                     },
                     Some(r) => {
-                        match toml::from_str::<crate::canvas_tools::types::CanvasTool>(
-                            &r.toml_text,
-                        ) {
+                        match toml::from_str::<crate::canvas_tools::types::CanvasTool>(&r.toml_text)
+                        {
                             Err(e) => nevoflux_protocol::CanvasToolValidateResponse {
                                 success: false,
                                 error: Some(nevoflux_protocol::CanvasToolError {
@@ -1883,30 +1897,28 @@ pub async fn start_server(
                                     field: None,
                                 }),
                             },
-                            Ok(tool) => {
-                                match crate::canvas_tools::validator::validate(&tool) {
-                                    Err(ve) => nevoflux_protocol::CanvasToolValidateResponse {
-                                        success: false,
-                                        error: Some(nevoflux_protocol::CanvasToolError {
-                                            code: ve.code.into(),
-                                            message: ve.message,
-                                            field: ve.field,
-                                        }),
-                                    },
-                                    Ok(()) => nevoflux_protocol::CanvasToolValidateResponse {
-                                        success: true,
-                                        error: None,
-                                    },
-                                }
-                            }
+                            Ok(tool) => match crate::canvas_tools::validator::validate(&tool) {
+                                Err(ve) => nevoflux_protocol::CanvasToolValidateResponse {
+                                    success: false,
+                                    error: Some(nevoflux_protocol::CanvasToolError {
+                                        code: ve.code.into(),
+                                        message: ve.message,
+                                        field: ve.field,
+                                    }),
+                                },
+                                Ok(()) => nevoflux_protocol::CanvasToolValidateResponse {
+                                    success: true,
+                                    error: None,
+                                },
+                            },
                         }
                     }
                 };
 
                 let msg = nevoflux_protocol::AgentMessage::CanvasToolValidateResponse(resp);
                 let payload = serde_json::to_value(&msg).unwrap_or_default();
-                let response = DaemonEnvelope::new(&proxy_id, channel, payload)
-                    .with_request_id(&request_id);
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, payload).with_request_id(&request_id);
                 let _ = process_response_tx.send((identity, response)).await;
                 continue;
             }
@@ -1954,7 +1966,8 @@ pub async fn start_server(
                                                 call_id: call_id.clone(),
                                             },
                                         );
-                                        let payload = serde_json::to_value(&resp).unwrap_or_default();
+                                        let payload =
+                                            serde_json::to_value(&resp).unwrap_or_default();
                                         let env = DaemonEnvelope::new(&pid, Channel::Chat, payload)
                                             .with_request_id(&rid);
                                         let _ = resp_tx.send((ident, env)).await;
@@ -1975,10 +1988,8 @@ pub async fn start_server(
 
                                 // Execute tool
                                 let free_args = req.args.as_deref().unwrap_or(&[]);
-                                let session_dir = std::env::temp_dir().join(format!(
-                                    "nevoflux-canvas-{}",
-                                    req.session_id
-                                ));
+                                let session_dir = std::env::temp_dir()
+                                    .join(format!("nevoflux-canvas-{}", req.session_id));
                                 // Ensure session dir exists
                                 let _ = tokio::fs::create_dir_all(&session_dir).await;
 
@@ -2080,15 +2091,15 @@ pub async fn start_server(
                                         duration_ms: response.duration_ms,
                                     },
                                 );
-                                let payload =
-                                    serde_json::to_value(&finished).unwrap_or_default();
+                                let payload = serde_json::to_value(&finished).unwrap_or_default();
                                 let env = DaemonEnvelope::new(&pid, Channel::Chat, payload);
                                 let _ = resp_tx.send((ident.clone(), env)).await;
 
                                 // Send the final response
-                                let resp = nevoflux_protocol::AgentMessage::CanvasToolInvokeResponse(
-                                    response,
-                                );
+                                let resp =
+                                    nevoflux_protocol::AgentMessage::CanvasToolInvokeResponse(
+                                        response,
+                                    );
                                 let payload = serde_json::to_value(&resp).unwrap_or_default();
                                 let env = DaemonEnvelope::new(&pid, Channel::Chat, payload)
                                     .with_request_id(&rid);
@@ -2323,14 +2334,137 @@ pub async fn start_server(
                                     }
                                 }),
                             };
-                            let env =
-                                DaemonEnvelope::new(&proxy_id, Channel::Chat, resp_msg)
-                                    .with_request_id(&request_id);
+                            let env = DaemonEnvelope::new(&proxy_id, Channel::Chat, resp_msg)
+                                .with_request_id(&request_id);
                             let _ = process_response_tx.send((identity.clone(), env)).await;
                         }
                         Err(e) => warn!("Failed to parse CanvasShareListRequest: {}", e),
                     }
                 }
+                continue;
+            }
+
+            // Handle canvas_persist_list request: list My Canvas artifacts.
+            if msg_type == "canvas_persist_list" {
+                info!("Processing canvas_persist_list message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match crate::canvas_persist::handle(
+                    &process_canvas_persist_service,
+                    msg_type,
+                    payload,
+                ) {
+                    Ok(resp_json) => serde_json::json!({
+                        "type": "canvas_persist_list_response",
+                        "payload": resp_json
+                    }),
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_PERSIST_ERROR",
+                            "message": e.to_string()
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_persist_save request: promote an artifact to persistent.
+            if msg_type == "canvas_persist_save" {
+                info!("Processing canvas_persist_save message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match crate::canvas_persist::handle(
+                    &process_canvas_persist_service,
+                    msg_type,
+                    payload,
+                ) {
+                    Ok(resp_json) => serde_json::json!({
+                        "type": "canvas_persist_save_response",
+                        "payload": resp_json
+                    }),
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_PERSIST_ERROR",
+                            "message": e.to_string()
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_persist_rename request: rename a persistent artifact.
+            if msg_type == "canvas_persist_rename" {
+                info!("Processing canvas_persist_rename message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match crate::canvas_persist::handle(
+                    &process_canvas_persist_service,
+                    msg_type,
+                    payload,
+                ) {
+                    Ok(resp_json) => serde_json::json!({
+                        "type": "canvas_persist_rename_response",
+                        "payload": resp_json
+                    }),
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_PERSIST_ERROR",
+                            "message": e.to_string()
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_persist_delete request: delete a persistent artifact.
+            if msg_type == "canvas_persist_delete" {
+                info!("Processing canvas_persist_delete message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match crate::canvas_persist::handle(
+                    &process_canvas_persist_service,
+                    msg_type,
+                    payload,
+                ) {
+                    Ok(resp_json) => serde_json::json!({
+                        "type": "canvas_persist_delete_response",
+                        "payload": resp_json
+                    }),
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_PERSIST_ERROR",
+                            "message": e.to_string()
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
                 continue;
             }
 
@@ -2359,8 +2493,7 @@ pub async fn start_server(
                                     resp_tx.clone(),
                                 )
                                 .await;
-                                let msg =
-                                    nevoflux_protocol::AgentMessage::EventsResponse(response);
+                                let msg = nevoflux_protocol::AgentMessage::EventsResponse(response);
                                 let payload = serde_json::to_value(&msg).unwrap_or_default();
                                 let envelope = DaemonEnvelope::new(&pid, Channel::Chat, payload)
                                     .with_request_id(&rid);
@@ -4116,6 +4249,7 @@ async fn handle_chat_message_streaming(
                                 content: pa.content,
                                 files: pa.files,
                                 entry: pa.entry,
+                                is_persistent: false,
                             };
                             info!(
                                 "MCP bridge: sending artifact '{}' to sidebar for session {}",
@@ -4278,7 +4412,11 @@ async fn handle_chat_message_streaming(
             info!(
                 "Sending final stream_chunk: tool_calls={}, has_title={}",
                 all_tool_calls.len(),
-                response.payload.get("payload").and_then(|p| p.get("session_title")).is_some()
+                response
+                    .payload
+                    .get("payload")
+                    .and_then(|p| p.get("session_title"))
+                    .is_some()
             );
             if let Err(e) = response_tx.send((identity, response)).await {
                 error!("Failed to send final response: {}", e);
@@ -4422,6 +4560,7 @@ async fn send_artifact_stream(
         description: artifact.description.clone(),
         files: artifact.files.clone(),
         entry: artifact.entry.clone(),
+        is_persistent: artifact.is_persistent,
     });
     let payload = serde_json::to_value(&start_msg).unwrap();
     let envelope = DaemonEnvelope::new(proxy_id, channel, payload).with_request_id(request_id);
@@ -5056,11 +5195,7 @@ async fn handle_chat_message(
                                 // snapshot. Best-effort; failures are logged
                                 // inside the helper and never fail the write.
                                 if key.starts_with("canvas:") {
-                                    mirror_canvas_to_artifacts_table(
-                                        session_manager,
-                                        key,
-                                        &value,
-                                    );
+                                    mirror_canvas_to_artifacts_table(session_manager, key, &value);
                                 }
                                 serde_json::json!({
                                     "type": "system_response",

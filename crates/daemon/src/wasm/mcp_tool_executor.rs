@@ -552,8 +552,7 @@ async fn execute_browser_upload_orchestrated(
     use crate::agent::browser_input::file_server::get_or_start_file_server;
     use crate::agent::browser_input::upload::{
         check_file_size, check_sensitive_path, detect_mime, validate_workspace_path, TokenEntry,
-        DEFAULT_MAX_SIZE,
-        TOKEN_TTL,
+        DEFAULT_MAX_SIZE, TOKEN_TTL,
     };
     use std::path::PathBuf;
     use std::sync::Arc;

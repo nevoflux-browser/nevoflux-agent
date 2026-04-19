@@ -17,17 +17,43 @@ impl<'a> ArtifactRepository<'a> {
         Self { db }
     }
 
-    /// Create or replace an artifact.
+    /// Idempotent upsert for an artifact.
+    ///
+    /// On INSERT: writes all mutable fields plus `created_at` and `updated_at` (both set to now).
+    /// `is_persistent`, `persisted_at`, `imported_from_*` are left at their column defaults (0 / NULL).
+    ///
+    /// On CONFLICT (same `id`): updates only the content-carrying fields
+    /// (`session_id`, `title`, `description`, `content_type`, `content`, `files`, `entry`,
+    /// `updated_at`). The persistence fields (`is_persistent`, `persisted_at`, `created_at`,
+    /// `imported_from_url`, `imported_from_share_id`, `imported_at`) are intentionally
+    /// EXCLUDED from the DO UPDATE clause so they are never overwritten by a re-render.
+    ///
+    /// Returns the authoritative row re-read from the database so that the caller always
+    /// sees the preserved field values on update.
     pub fn create(&self, params: CreateArtifactParams) -> Result<ArtifactRecord> {
         let files_json = params
             .files
             .as_ref()
             .map(|f| serde_json::to_string(f).unwrap_or_default());
 
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
         self.db.with_connection(|conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO artifacts (id, session_id, title, description, content_type, content, files, entry)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO artifacts (id, session_id, title, description, content_type, content, files, entry, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+                 ON CONFLICT(id) DO UPDATE SET
+                     session_id   = excluded.session_id,
+                     title        = excluded.title,
+                     description  = excluded.description,
+                     content_type = excluded.content_type,
+                     content      = excluded.content,
+                     files        = excluded.files,
+                     entry        = excluded.entry,
+                     updated_at   = excluded.updated_at",
                 params![
                     params.id,
                     params.session_id,
@@ -37,26 +63,21 @@ impl<'a> ArtifactRepository<'a> {
                     params.content,
                     files_json,
                     params.entry,
+                    now,
                 ],
             )?;
 
-            let created_at: i64 = conn.query_row(
-                "SELECT created_at FROM artifacts WHERE id = ?1",
+            // Re-read the authoritative row so preserved fields are visible on update.
+            let record = conn.query_row(
+                "SELECT id, session_id, title, description, content_type, content, files, entry,
+                        created_at, imported_from_url, imported_from_share_id, imported_at,
+                        is_persistent, persisted_at, updated_at
+                 FROM artifacts WHERE id = ?1",
                 params![params.id],
-                |row| row.get(0),
+                row_to_artifact,
             )?;
 
-            Ok(ArtifactRecord {
-                id: params.id,
-                session_id: params.session_id,
-                title: params.title,
-                description: params.description,
-                content_type: params.content_type,
-                content: params.content,
-                files: params.files,
-                entry: params.entry,
-                created_at,
-            })
+            Ok(record)
         })
     }
 
@@ -64,7 +85,9 @@ impl<'a> ArtifactRepository<'a> {
     pub fn get(&self, id: &str) -> Result<Option<ArtifactRecord>> {
         self.db.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, session_id, title, description, content_type, content, files, entry, created_at
+                "SELECT id, session_id, title, description, content_type, content, files, entry,
+                        created_at, imported_from_url, imported_from_share_id, imported_at,
+                        is_persistent, persisted_at, updated_at
                  FROM artifacts WHERE id = ?1",
             )?;
 
@@ -81,12 +104,15 @@ impl<'a> ArtifactRepository<'a> {
     pub fn list_by_session(&self, session_id: &str) -> Result<Vec<ArtifactRecord>> {
         self.db.with_connection(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, session_id, title, description, content_type, created_at
+                "SELECT id, session_id, title, description, content_type, created_at,
+                        is_persistent, persisted_at, updated_at
                  FROM artifacts WHERE session_id = ?1 ORDER BY created_at ASC",
             )?;
 
             let rows = stmt
                 .query_map(params![session_id], |row| {
+                    let updated_at: Option<i64> = row.get(8)?;
+                    let created_at: i64 = row.get(5)?;
                     Ok(ArtifactRecord {
                         id: row.get(0)?,
                         session_id: row.get(1)?,
@@ -96,7 +122,13 @@ impl<'a> ArtifactRepository<'a> {
                         content: String::new(),
                         files: None,
                         entry: None,
-                        created_at: row.get(5)?,
+                        created_at,
+                        imported_from_url: None,
+                        imported_from_share_id: None,
+                        imported_at: None,
+                        is_persistent: row.get::<_, i64>(6)? != 0,
+                        persisted_at: row.get(7)?,
+                        updated_at: updated_at.unwrap_or(created_at),
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -105,7 +137,48 @@ impl<'a> ArtifactRepository<'a> {
         })
     }
 
+    /// Delete only non-persistent artifacts for a session.
+    ///
+    /// Returns the IDs of the deleted rows so the caller can clean any
+    /// corresponding ContentStore mirror entries.  Returns an empty Vec
+    /// (never panics / never None) when there are no matching rows.
+    pub fn delete_non_persistent_by_session(&self, session_id: &str) -> Result<Vec<String>> {
+        self.db.with_connection_mut(|conn| {
+            let tx = conn.transaction()?;
+            let ids: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM artifacts \
+                     WHERE session_id = ?1 AND is_persistent = 0",
+                )?;
+                let collected = stmt
+                    .query_map(params![session_id], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                collected
+            };
+            if !ids.is_empty() {
+                tx.execute(
+                    "DELETE FROM artifacts \
+                     WHERE session_id = ?1 AND is_persistent = 0",
+                    params![session_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(ids)
+        })
+    }
+
     /// Delete all artifacts for a session.
+    ///
+    /// # Deprecated
+    ///
+    /// Use [`delete_non_persistent_by_session`] for session cleanup after migration 014.
+    /// Persistent artifacts now survive session deletion via the FK `ON DELETE SET NULL`
+    /// rule; calling this method would incorrectly remove them.
+    /// The method is kept for the existing `test_delete_by_session` test and any callers
+    /// that have not yet been migrated.  It will be removed when Task 11 lands.
+    #[deprecated(
+        note = "Use `delete_non_persistent_by_session` + session FK SET NULL for persistent rows (see migration 014)"
+    )]
     pub fn delete_by_session(&self, session_id: &str) -> Result<u32> {
         self.db.with_connection(|conn| {
             let rows_affected = conn.execute(
@@ -118,9 +191,28 @@ impl<'a> ArtifactRepository<'a> {
 }
 
 /// Convert a full database row to an ArtifactRecord.
+///
+/// Column order must match the SELECT lists in [`ArtifactRepository::create`] and
+/// [`ArtifactRepository::get`]:
+///
+/// 0  id
+/// 1  session_id
+/// 2  title
+/// 3  description
+/// 4  content_type
+/// 5  content
+/// 6  files
+/// 7  entry
+/// 8  created_at
+/// 9  imported_from_url
+/// 10 imported_from_share_id
+/// 11 imported_at
+/// 12 is_persistent
+/// 13 persisted_at
+/// 14 updated_at
 fn row_to_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRecord> {
     let id: String = row.get(0)?;
-    let session_id: String = row.get(1)?;
+    let session_id: Option<String> = row.get(1)?;
     let title: String = row.get(2)?;
     let description: Option<String> = row.get(3)?;
     let content_type: String = row.get(4)?;
@@ -128,8 +220,16 @@ fn row_to_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRecord> 
     let files_json: Option<String> = row.get(6)?;
     let entry: Option<String> = row.get(7)?;
     let created_at: i64 = row.get(8)?;
+    let imported_from_url: Option<String> = row.get(9)?;
+    let imported_from_share_id: Option<String> = row.get(10)?;
+    let imported_at: Option<i64> = row.get(11)?;
+    let is_persistent_raw: i64 = row.get(12)?;
+    let persisted_at: Option<i64> = row.get(13)?;
+    let updated_at_opt: Option<i64> = row.get(14)?;
 
     let files = files_json.and_then(|j| serde_json::from_str(&j).ok());
+    let is_persistent = is_persistent_raw != 0;
+    let updated_at = updated_at_opt.unwrap_or(created_at);
 
     Ok(ArtifactRecord {
         id,
@@ -141,6 +241,12 @@ fn row_to_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRecord> 
         files,
         entry,
         created_at,
+        imported_from_url,
+        imported_from_share_id,
+        imported_at,
+        is_persistent,
+        persisted_at,
+        updated_at,
     })
 }
 
@@ -261,6 +367,7 @@ mod tests {
         assert_eq!(list2.len(), 1);
     }
 
+    #[allow(deprecated)]
     #[test]
     fn test_delete_by_session() {
         let storage = Storage::open_in_memory().unwrap();
@@ -323,5 +430,136 @@ mod tests {
         // Should still be only one artifact
         let list = repo.list_by_session("sess-1").unwrap();
         assert_eq!(list.len(), 1);
+    }
+
+    // ----- Task 2+3 TDD tests -----
+
+    /// Verifies that `create()` upsert does NOT overwrite `is_persistent` / `persisted_at`
+    /// when the artifact already exists and those fields have been set externally.
+    #[test]
+    fn create_upsert_preserves_is_persistent_and_persisted_at() {
+        let storage = Storage::open_in_memory().unwrap();
+        let repo = ArtifactRepository::new(storage.database());
+
+        storage
+            .sessions()
+            .create(crate::CreateSessionParams::new().with_id("s1"))
+            .unwrap();
+
+        // First create — should be non-persistent
+        repo.create(
+            CreateArtifactParams::new("art-p", "s1", "Title", "text/html").with_content("v1"),
+        )
+        .unwrap();
+
+        let initial = repo.get("art-p").unwrap().unwrap();
+        assert!(
+            !initial.is_persistent,
+            "newly created artifact must not be persistent"
+        );
+
+        // Simulate the persist service flipping the flag directly in SQL.
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE artifacts SET is_persistent = 1, persisted_at = 999 WHERE id = 'art-p'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Upsert with updated content — persistence fields must be preserved.
+        repo.create(
+            CreateArtifactParams::new("art-p", "s1", "Title", "text/html").with_content("v2"),
+        )
+        .unwrap();
+
+        let after = repo.get("art-p").unwrap().unwrap();
+        assert_eq!(after.content, "v2", "content must be updated");
+        assert!(
+            after.is_persistent,
+            "is_persistent must be preserved across upsert"
+        );
+        assert_eq!(
+            after.persisted_at,
+            Some(999),
+            "persisted_at must be preserved across upsert"
+        );
+    }
+
+    /// Verifies that `delete_non_persistent_by_session` removes only non-persistent rows
+    /// and returns the deleted IDs.
+    #[test]
+    fn delete_non_persistent_by_session_returns_ids_and_leaves_persistent() {
+        let storage = Storage::open_in_memory().unwrap();
+        let repo = ArtifactRepository::new(storage.database());
+
+        storage
+            .sessions()
+            .create(crate::CreateSessionParams::new().with_id("s1"))
+            .unwrap();
+
+        // Create two artifacts.
+        repo.create(
+            CreateArtifactParams::new("p", "s1", "Persistent", "text/html").with_content("keep"),
+        )
+        .unwrap();
+        repo.create(
+            CreateArtifactParams::new("n", "s1", "Non-persistent", "text/html")
+                .with_content("gone"),
+        )
+        .unwrap();
+
+        // Flip "p" to persistent via direct SQL.
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE artifacts SET is_persistent = 1, persisted_at = 1000 WHERE id = 'p'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let deleted = repo.delete_non_persistent_by_session("s1").unwrap();
+        assert_eq!(
+            deleted,
+            vec!["n".to_string()],
+            "only the non-persistent ID must be returned"
+        );
+
+        // Persistent row must survive.
+        assert!(
+            repo.get("p").unwrap().is_some(),
+            "persistent artifact must not be deleted"
+        );
+        // Non-persistent row must be gone.
+        assert!(
+            repo.get("n").unwrap().is_none(),
+            "non-persistent artifact must be deleted"
+        );
+    }
+
+    /// Verifies that creating an artifact with `session_id = None` succeeds and round-trips correctly.
+    #[test]
+    fn create_with_none_session_id_succeeds() {
+        let storage = Storage::open_in_memory().unwrap();
+        let repo = ArtifactRepository::new(storage.database());
+
+        // No session needed — session_id IS NULL.
+        let params = CreateArtifactParams::new_orphan("orphan-1", "Orphan Artifact", "text/html")
+            .with_content("<p>orphan</p>");
+
+        repo.create(params).unwrap();
+
+        let fetched = repo.get("orphan-1").unwrap().unwrap();
+        assert_eq!(
+            fetched.session_id, None,
+            "session_id must be None for an orphan artifact"
+        );
+        assert_eq!(fetched.content, "<p>orphan</p>");
     }
 }

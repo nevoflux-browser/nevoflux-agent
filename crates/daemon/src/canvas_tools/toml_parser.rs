@@ -287,10 +287,7 @@ mod tests {
 
         let err = parse_tool_toml(toml).unwrap_err();
         let msg = err.to_string();
-        assert!(
-            msg.contains("name"),
-            "expected name error, got: {msg}"
-        );
+        assert!(msg.contains("name"), "expected name error, got: {msg}");
     }
 
     // 9. Default enabled is true
