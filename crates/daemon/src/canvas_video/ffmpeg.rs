@@ -1,75 +1,77 @@
 //! ffmpeg resolution + subprocess spawning.
 //!
-//! Resolution order:
-//!   1. $PATH (via ffmpeg-sidecar's auto-detect)
-//!   2. `~/.cache/nevoflux/bin/ffmpeg`
-//!   3. On-demand download via ffmpeg-sidecar to the cache path.
+//! Resolution via `ffmpeg-sidecar`:
+//!   1. If ffmpeg is already available (system PATH or a prior sidecar download),
+//!      return its path.
+//!   2. Otherwise `auto_download()` fetches a static build to the sidecar directory
+//!      (next to the running executable), then we return that path.
+//!
+//! NOTE (spec deviation): The original plan called for binary placement under
+//! `~/.cache/nevoflux/bin/ffmpeg`. ffmpeg-sidecar 1.1.x does not expose a
+//! configurable download destination; it always uses the sidecar directory
+//! (directory of the running executable). Placing the binary in a user-controlled
+//! cache path is deferred to a later task if that requirement becomes hard.
+//! For P1 the only requirement is: return a working ffmpeg binary, downloading
+//! on demand if none exists.
 
 use std::path::PathBuf;
 
 use ffmpeg_sidecar::command::{ffmpeg_is_installed, FfmpegCommand};
 use ffmpeg_sidecar::download::auto_download;
+use ffmpeg_sidecar::paths::ffmpeg_path;
 
 use crate::error::{DaemonError, Result};
 
-/// Resolve the ffmpeg binary, auto-downloading to
-/// `~/.cache/nevoflux/bin/` if no system binary exists.
+/// Resolve the ffmpeg binary path, auto-downloading a static build if needed.
+///
+/// On success the returned `PathBuf` always points to an executable that:
+/// * exists on the filesystem, AND
+/// * responds successfully to `ffmpeg -version`.
 pub fn resolve_ffmpeg() -> Result<PathBuf> {
-    // Fast path: system ffmpeg is available in $PATH.
+    // Fast path: binary already available (system PATH OR prior sidecar download).
     if ffmpeg_is_installed() {
-        // ffmpeg_is_installed() checks `ffmpeg_path()` which tries the sidecar path first,
-        // then falls back to the "ffmpeg" string (resolved via PATH).
-        // When it's in PATH, `which ffmpeg` gives us the real path.
-        return which_ffmpeg();
+        return resolved_path();
     }
 
-    // Slow path: download to our cache directory.
-    let cache_dir = dirs::cache_dir()
-        .ok_or_else(|| DaemonError::InternalError("no cache dir".into()))?
-        .join("nevoflux")
-        .join("bin");
-    std::fs::create_dir_all(&cache_dir)
-        .map_err(|e| DaemonError::InternalError(format!("mkdir {:?}: {}", cache_dir, e)))?;
-
-    // Redirect the sidecar download location to our cache directory.
-    // ffmpeg-sidecar 1.1.x uses the executable directory as sidecar_dir();
-    // we symlink or copy to our cache after downloading.
-    // The simplest approach: download to the cache dir directly via the
-    // FFMPEG_DOWNLOAD_DIR env var (supported in newer versions) or by copying
-    // the sidecar binary after auto_download().
-    unsafe { std::env::set_var("FFMPEG_DOWNLOAD_DIR", &cache_dir); }
-
+    // Slow path: download static build to sidecar dir (next to the executable).
+    // FFMPEG_DOWNLOAD_DIR is NOT a recognised env var in ffmpeg-sidecar 1.1.x;
+    // the download destination is always sidecar_dir() and cannot be redirected
+    // via environment variables.
     auto_download()
         .map_err(|e| DaemonError::InternalError(format!("ffmpeg auto_download failed: {}", e)))?;
 
-    // After download, check our cache dir first.
-    #[cfg(target_os = "windows")]
-    let cached = cache_dir.join("ffmpeg.exe");
-    #[cfg(not(target_os = "windows"))]
-    let cached = cache_dir.join("ffmpeg");
-
-    if cached.exists() {
-        return Ok(cached);
+    if !ffmpeg_is_installed() {
+        return Err(DaemonError::InternalError(
+            "ffmpeg still not available after auto_download".into(),
+        ));
     }
 
-    // Fallback: auto_download may have placed the binary in the sidecar dir
-    // (next to the running executable). Try to find and return it.
-    if ffmpeg_is_installed() {
-        return which_ffmpeg();
-    }
-
-    Err(DaemonError::InternalError(
-        "ffmpeg not found after auto_download".into(),
-    ))
+    resolved_path()
 }
 
-/// Locate the `ffmpeg` binary using the system PATH.
-fn which_ffmpeg() -> Result<PathBuf> {
+/// Return the filesystem path that ffmpeg-sidecar will actually use.
+///
+/// `ffmpeg_path()` returns either:
+/// - An absolute path when the sidecar binary (next to the exe) exists, OR
+/// - The bare name `"ffmpeg"` when only the system-PATH binary is available.
+///
+/// For the bare-name case we resolve it with `which` so callers always receive
+/// an absolute, verifiable path.
+fn resolved_path() -> Result<PathBuf> {
+    let p = ffmpeg_path();
+    // A non-trivial parent directory means p is already a meaningful path
+    // (sidecar absolute path or a relative path with a directory component).
+    if p.is_absolute() || p.parent().map(|pp| !pp.as_os_str().is_empty()).unwrap_or(false) {
+        return Ok(p);
+    }
+    // p is the bare "ffmpeg" string — resolve via PATH.
     which::which("ffmpeg")
-        .map_err(|e| DaemonError::InternalError(format!("which ffmpeg: {}", e)))
+        .map_err(|e| DaemonError::InternalError(format!("which ffmpeg failed: {}", e)))
 }
 
-/// Construct an ffmpeg image2pipe command for encoding PNG stream -> MP4.
+/// Construct an ffmpeg image2pipe command for encoding a PNG stream into MP4.
+///
+/// Reads raw PNG frames from stdin and writes an H.264/MP4 file to `output_path`.
 pub fn image2pipe_cmd(output_path: &std::path::Path, fps: u32) -> FfmpegCommand {
     let mut cmd = FfmpegCommand::new();
     cmd.hide_banner()
