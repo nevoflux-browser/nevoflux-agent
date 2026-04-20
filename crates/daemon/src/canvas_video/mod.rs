@@ -9,5 +9,6 @@ pub mod handlers;
 pub mod job;
 pub mod render;
 pub mod service;
+pub mod tool;
 
 pub use service::CanvasVideoService;
