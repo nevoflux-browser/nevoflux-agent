@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use nevoflux_protocol::canvas_video::{
-    CreateCompositionRequest, RenderCancelRequest, RenderFrameChunk, RenderReady,
-    RenderStartRequest,
+    CreateCompositionRequest, RenderCancelRequest, RenderDone, RenderFailed, RenderFrameChunk,
+    RenderReady, RenderStartRequest,
 };
 use serde_json::Value;
 
@@ -38,15 +38,29 @@ pub async fn handle(
             Ok(serde_json::json!({ "cancelled": cancelled }))
         }
         "canvas_video_ready" => {
-            let m: RenderReady = serde_json::from_value(payload)
+            // Retained for backward compat with the old push-model page; the
+            // current page-driven loop doesn't require a ready handshake
+            // (the first frame chunk implicitly signals "in progress").
+            let _m: RenderReady = serde_json::from_value(payload)
                 .map_err(|e| DaemonError::InvalidRequest(format!("parse: {}", e)))?;
-            svc.on_render_ready(&m.job_id).await;
             Ok(Value::Null)
         }
         "canvas_video_frame_chunk" => {
             let chunk: RenderFrameChunk = serde_json::from_value(payload)
                 .map_err(|e| DaemonError::InvalidRequest(format!("parse: {}", e)))?;
             svc.on_frame_chunk(chunk).await?;
+            Ok(Value::Null)
+        }
+        "canvas_video_render_done" => {
+            let m: RenderDone = serde_json::from_value(payload)
+                .map_err(|e| DaemonError::InvalidRequest(format!("parse: {}", e)))?;
+            svc.on_render_done(&m.job_id, m.frames_emitted).await;
+            Ok(Value::Null)
+        }
+        "canvas_video_render_failed" => {
+            let m: RenderFailed = serde_json::from_value(payload)
+                .map_err(|e| DaemonError::InvalidRequest(format!("parse: {}", e)))?;
+            svc.on_render_failed(&m.job_id, &m.error).await;
             Ok(Value::Null)
         }
         other => Err(DaemonError::InvalidRequest(format!(

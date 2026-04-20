@@ -57,9 +57,22 @@ pub struct RenderFrameChunk {
 }
 
 /// Ready ack from render page once composition is loaded + patched.
+///
+/// Retained for backward compat; the page-driven render loop (post-actor
+/// rework) ignores this message — the first frame chunk implicitly signals
+/// that rendering is in progress.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderReady {
     pub job_id: String,
+}
+
+/// Page -> daemon: "all frames sent, close the pipe and finalize."
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenderDone {
+    pub job_id: String,
+    /// Total frames the page actually emitted (for sanity checks).
+    #[serde(default)]
+    pub frames_emitted: u32,
 }
 
 /// Progress event (pushed on EventBus).

@@ -2607,6 +2607,40 @@ pub async fn start_server(
                 continue;
             }
 
+            // Page-driven render complete (extension -> daemon).
+            if msg_type == "canvas_video_render_done" {
+                info!("Processing canvas_video_render_done message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let _ = crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await;
+                continue;
+            }
+
+            // Page-driven render failure (extension -> daemon).
+            if msg_type == "canvas_video_render_failed" {
+                info!("Processing canvas_video_render_failed message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let _ = crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await;
+                continue;
+            }
+
             // Check for EventBus request messages from frontend
             if msg_type == "events_request" {
                 info!("Processing events_request message");

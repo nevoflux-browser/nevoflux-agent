@@ -1,8 +1,15 @@
 //! CanvasVideoService — dependency bag + method surface.
+//!
+//! The actor-rework (2026-04-20) moved `canvas.video.*` transport from the
+//! WebExtension background script onto the `NevofluxParent`/`NevofluxChild`
+//! JSActor pair. The daemon no longer pushes seek commands to the page: the
+//! render page drives the loop itself (single-threaded JS `for` over frame
+//! indices) and streams chunks back. Accordingly, `BridgeSender` and the
+//! `push_canvas_video_*` helpers have been removed.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{mpsc, Mutex};
 
 use crate::canvas_video::{
     create,
@@ -17,33 +24,33 @@ use nevoflux_protocol::canvas_video::{
     RenderStartResponse,
 };
 
-/// Trait for pushing bridge messages to the extension side.
-#[async_trait::async_trait]
-pub trait BridgeSender: Send + Sync {
-    async fn push(&self, message_type: &str, payload: serde_json::Value) -> Result<()>;
+/// Single-stream signal the render loop consumes for a given job.
+#[derive(Debug)]
+pub enum FrameSignal {
+    /// A complete PNG frame arrived from the page.
+    Frame { frame_idx: u32, png: Vec<u8> },
+    /// Page reports it has emitted the final frame; finalize the encode.
+    Done { frames_emitted: u32 },
+    /// Page reports an unrecoverable error; abort the job.
+    Failed(String),
 }
 
 pub struct CanvasVideoService {
     jobs: JobRegistry,
-    /// Maps artifact_id -> (html, width, height, duration_sec, fps).
+    /// Maps artifact_id -> composition spec + HTML.
     /// Phase B replaces with real artifact repo.
     test_compositions: Mutex<HashMap<String, TestComposition>>,
-    /// If true, render_start returns immediately without bridge calls.
+    /// If true, render_start returns immediately without page-bridge interaction.
     bridge_stub: bool,
 
     // --- bridge-side async coordination ---
 
-    /// job_id -> sender for the "render page is ready" signal.
-    ready_channels: Mutex<HashMap<String, oneshot::Sender<()>>>,
-
-    /// (job_id, frame_idx) -> sender that fires when the frame PNG is assembled.
-    frame_awaiters: Mutex<HashMap<(String, u32), oneshot::Sender<Vec<u8>>>>,
-
     /// job_id -> ChunkBuffer accumulating incoming frame chunk pieces.
     chunk_buffers: Mutex<HashMap<String, ChunkBuffer>>,
 
-    /// Outbound bridge push (None in stub / test mode).
-    bridge_sender: Option<Arc<dyn BridgeSender>>,
+    /// job_id -> unbounded sender into the render loop. One channel per active
+    /// job, fed by `on_frame_chunk` / `on_render_done` / `on_render_failed`.
+    signal_senders: Mutex<HashMap<String, mpsc::UnboundedSender<FrameSignal>>>,
 
     /// EventBus handle for jobs.render.{id} progress + terminal events.
     /// None in stub / test mode; emits become no-ops.
@@ -65,10 +72,8 @@ impl CanvasVideoService {
             jobs: JobRegistry::new(),
             test_compositions: Mutex::new(Default::default()),
             bridge_stub: false,
-            ready_channels: Mutex::new(Default::default()),
-            frame_awaiters: Mutex::new(Default::default()),
             chunk_buffers: Mutex::new(Default::default()),
-            bridge_sender: None,
+            signal_senders: Mutex::new(Default::default()),
             event_bus: None,
         }
     }
@@ -78,10 +83,8 @@ impl CanvasVideoService {
             jobs: JobRegistry::new(),
             test_compositions: Mutex::new(Default::default()),
             bridge_stub: true,
-            ready_channels: Mutex::new(Default::default()),
-            frame_awaiters: Mutex::new(Default::default()),
             chunk_buffers: Mutex::new(Default::default()),
-            bridge_sender: None,
+            signal_senders: Mutex::new(Default::default()),
             event_bus: None,
         }
     }
@@ -108,8 +111,6 @@ impl CanvasVideoService {
         req: CreateCompositionRequest,
     ) -> Result<CreateCompositionResponse> {
         let resp = create::create(self, req.clone()).await?;
-        // Stash metadata so a subsequent render_start can look it up.
-        // Phase B replaces this with real artifact persistence.
         let html = req
             .html
             .clone()
@@ -162,43 +163,37 @@ impl CanvasVideoService {
 
     // --- Bridge coordination helpers ---
 
-    /// Register a oneshot sender that fires when canvas_video_ready arrives
-    /// for this job.
-    pub async fn register_job_ready_channel(&self, job_id: &str, tx: oneshot::Sender<()>) {
-        self.ready_channels
+    /// Register the render loop's signal channel for this job. Returns the
+    /// receiver for the loop to consume. Overwrites any previous sender for
+    /// the same job_id (callers must not double-register).
+    pub async fn register_job_signal_channel(
+        &self,
+        job_id: &str,
+    ) -> mpsc::UnboundedReceiver<FrameSignal> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.signal_senders
             .lock()
             .await
             .insert(job_id.to_string(), tx);
-    }
-
-    /// Register a oneshot sender for frame PNG bytes once the frame is assembled.
-    pub async fn register_frame_awaiter(
-        &self,
-        job_id: &str,
-        frame_idx: u32,
-        tx: oneshot::Sender<Vec<u8>>,
-    ) {
-        self.frame_awaiters
+        // Pre-create the chunk buffer too so chunks arriving before the
+        // render loop finishes setup don't race.
+        self.chunk_buffers
             .lock()
             .await
-            .insert((job_id.to_string(), frame_idx), tx);
+            .entry(job_id.to_string())
+            .or_insert_with(ChunkBuffer::new);
+        rx
     }
 
-    /// Ensure a ChunkBuffer exists for this job_id.
-    pub async fn register_job_chunk_buffer(&self, job_id: &str) {
-        let mut bufs = self.chunk_buffers.lock().await;
-        bufs.entry(job_id.to_string()).or_insert_with(ChunkBuffer::new);
-    }
-
-    /// Called when canvas_video_ready arrives from extension.
-    pub async fn on_render_ready(&self, job_id: &str) {
-        if let Some(tx) = self.ready_channels.lock().await.remove(job_id) {
-            let _ = tx.send(());
-        }
+    /// Called when the render loop exits, to free per-job state.
+    pub async fn cleanup_job_channels(&self, job_id: &str) {
+        self.signal_senders.lock().await.remove(job_id);
+        self.chunk_buffers.lock().await.remove(job_id);
     }
 
     /// Called when canvas_video_frame_chunk arrives from extension.
-    /// Accumulates chunks; fires the awaiter when a frame is complete.
+    /// Accumulates chunks; pushes a `FrameSignal::Frame` into the job's signal
+    /// channel once a frame is fully assembled.
     pub async fn on_frame_chunk(&self, chunk: RenderFrameChunk) -> Result<()> {
         let complete = {
             let mut bufs = self.chunk_buffers.lock().await;
@@ -213,16 +208,41 @@ impl CanvasVideoService {
                 chunk.bytes,
             )
         };
-        if let Some(png_bytes) = complete {
-            let key = (chunk.job_id.clone(), chunk.frame_idx);
-            if let Some(tx) = self.frame_awaiters.lock().await.remove(&key) {
-                let _ = tx.send(png_bytes);
-            }
+        if let Some(png) = complete {
+            self.send_signal(
+                &chunk.job_id,
+                FrameSignal::Frame {
+                    frame_idx: chunk.frame_idx,
+                    png,
+                },
+            )
+            .await;
         }
         Ok(())
     }
 
-    /// Return composition_id for a job (used for bridge payloads).
+    /// Called when canvas_video_render_done arrives from extension (page-driven
+    /// completion signal).
+    pub async fn on_render_done(&self, job_id: &str, frames_emitted: u32) {
+        self.send_signal(job_id, FrameSignal::Done { frames_emitted })
+            .await;
+    }
+
+    /// Called when canvas_video_render_failed arrives from extension.
+    pub async fn on_render_failed(&self, job_id: &str, error: &str) {
+        self.send_signal(job_id, FrameSignal::Failed(error.to_string()))
+            .await;
+    }
+
+    async fn send_signal(&self, job_id: &str, sig: FrameSignal) {
+        if let Some(tx) = self.signal_senders.lock().await.get(job_id) {
+            // Channel closed means the render loop already exited; dropping
+            // the signal is the correct behavior.
+            let _ = tx.send(sig);
+        }
+    }
+
+    /// Return composition_id for a job (used by callers that want metadata).
     pub async fn composition_id_for(&self, job_id: &str) -> String {
         self.jobs
             .snapshot(job_id)
@@ -231,84 +251,8 @@ impl CanvasVideoService {
             .unwrap_or_default()
     }
 
-    // --- Bridge push helpers (fail gracefully when no sender is configured) ---
+    // --- EventBus emitters ---
 
-    fn require_sender(&self) -> Result<&Arc<dyn BridgeSender>> {
-        self.bridge_sender
-            .as_ref()
-            .ok_or_else(|| DaemonError::InternalError("no bridge sender configured".into()))
-    }
-
-    pub async fn push_canvas_video_open(
-        &self,
-        job_id: &str,
-        composition_id: &str,
-    ) -> Result<()> {
-        self.require_sender()?
-            .push(
-                "canvas_video_open",
-                serde_json::json!({
-                    "job_id": job_id,
-                    "composition_id": composition_id,
-                }),
-            )
-            .await
-    }
-
-    pub async fn push_canvas_video_load(
-        &self,
-        job_id: &str,
-        html: &str,
-        width: u32,
-        height: u32,
-    ) -> Result<()> {
-        self.require_sender()?
-            .push(
-                "canvas_video_load",
-                serde_json::json!({
-                    "job_id": job_id,
-                    "html": html,
-                    "width": width,
-                    "height": height,
-                }),
-            )
-            .await
-    }
-
-    pub async fn push_canvas_video_seek(
-        &self,
-        job_id: &str,
-        t: f64,
-        frame_idx: u32,
-        width: u32,
-        height: u32,
-    ) -> Result<()> {
-        self.require_sender()?
-            .push(
-                "canvas_video_seek",
-                serde_json::json!({
-                    "job_id": job_id,
-                    "t": t,
-                    "frame_idx": frame_idx,
-                    "width": width,
-                    "height": height,
-                }),
-            )
-            .await
-    }
-
-    pub async fn push_canvas_video_close(&self, job_id: &str) -> Result<()> {
-        self.require_sender()?
-            .push(
-                "canvas_video_close",
-                serde_json::json!({
-                    "job_id": job_id,
-                }),
-            )
-            .await
-    }
-
-    /// Publish an event on `jobs.render.{job_id}` if an EventBus is attached.
     async fn emit(&self, job_id: &str, payload: serde_json::Value) {
         if let Some(bus) = &self.event_bus {
             let topic = format!("jobs.render.{}", job_id);
@@ -317,7 +261,6 @@ impl CanvasVideoService {
         }
     }
 
-    /// Emit render progress on `jobs.render.{job_id}`.
     pub async fn emit_progress(&self, job_id: &str, current: u32, total: u32) {
         self.emit(
             job_id,
@@ -331,7 +274,6 @@ impl CanvasVideoService {
         .await;
     }
 
-    /// Emit render success terminal event.
     pub async fn emit_succeeded(&self, job_id: &str, path: &str, size_bytes: u64) {
         self.emit(
             job_id,
@@ -345,7 +287,6 @@ impl CanvasVideoService {
         .await;
     }
 
-    /// Emit render failure terminal event.
     pub async fn emit_failed(&self, job_id: &str, error: &str) {
         self.emit(
             job_id,

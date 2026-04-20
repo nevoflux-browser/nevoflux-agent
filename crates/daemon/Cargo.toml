@@ -131,3 +131,4 @@ rusqlite = { workspace = true }
 proptest = { workspace = true }
 wat = "1"
 tempfile = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -3502,6 +3502,7 @@ dependencies = [
  "grep-searcher",
  "hex",
  "ignore",
+ "image",
  "monty",
  "nevoflux-builtin-wasm",
  "nevoflux-computer",
