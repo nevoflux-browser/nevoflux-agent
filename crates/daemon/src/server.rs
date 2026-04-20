@@ -1075,6 +1075,9 @@ pub async fn start_server(
         ))
     };
 
+    // Canvas Video Service (video render pipeline)
+    let canvas_video_service = Arc::new(crate::canvas_video::CanvasVideoService::new());
+
     let mut services = HostServices::new(Arc::new(db))
         .with_browser_sender(browser_tx)
         .with_mcp_manager(mcp_manager)
@@ -1368,6 +1371,7 @@ pub async fn start_server(
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("canvas-tools");
     let process_canvas_share_service = canvas_share_service.clone();
     let process_canvas_persist_service = canvas_persist_service.clone();
+    let process_canvas_video_service = canvas_video_service.clone();
     tokio::spawn(async move {
         while let Some((identity, envelope)) = msg_rx.recv().await {
             let proxy_id = envelope.proxy_id.clone();
@@ -2465,6 +2469,141 @@ pub async fn start_server(
                 let response =
                     DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
                 let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_video_create_composition request.
+            if msg_type == "canvas_video_create_composition" {
+                info!("Processing canvas_video_create_composition message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await
+                {
+                    Ok(resp_json) => serde_json::json!({
+                        "type": "canvas_video_create_composition_response",
+                        "payload": resp_json
+                    }),
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_VIDEO_ERROR",
+                            "message": e.to_string()
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_video_render_start request.
+            if msg_type == "canvas_video_render_start" {
+                info!("Processing canvas_video_render_start message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await
+                {
+                    Ok(resp_json) => serde_json::json!({
+                        "type": "canvas_video_render_start_response",
+                        "payload": resp_json
+                    }),
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_VIDEO_ERROR",
+                            "message": e.to_string()
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_video_render_cancel request.
+            if msg_type == "canvas_video_render_cancel" {
+                info!("Processing canvas_video_render_cancel message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await
+                {
+                    Ok(resp_json) => serde_json::json!({
+                        "type": "canvas_video_render_cancel_response",
+                        "payload": resp_json
+                    }),
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_VIDEO_ERROR",
+                            "message": e.to_string()
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_video_ready notification (extension -> daemon).
+            if msg_type == "canvas_video_ready" {
+                info!("Processing canvas_video_ready message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let _ = crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await;
+                // No response needed — fire-and-forget.
+                continue;
+            }
+
+            // Handle canvas_video_frame_chunk notification (extension -> daemon).
+            if msg_type == "canvas_video_frame_chunk" {
+                info!("Processing canvas_video_frame_chunk message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let _ = crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await;
+                // No response needed — fire-and-forget.
                 continue;
             }
 
