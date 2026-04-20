@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use nevoflux_protocol::canvas_video::{
-    CreateCompositionRequest, RenderCancelRequest, RenderDone, RenderFailed, RenderFrameChunk,
-    RenderReady, RenderStartRequest,
+    CreateCompositionRequest, GetCompositionRequest, GetCompositionResponse, RenderCancelRequest,
+    RenderDone, RenderFailed, RenderFrameChunk, RenderReady, RenderStartRequest,
 };
 use serde_json::Value;
 
@@ -62,6 +62,21 @@ pub async fn handle(
                 .map_err(|e| DaemonError::InvalidRequest(format!("parse: {}", e)))?;
             svc.on_render_failed(&m.job_id, &m.error).await;
             Ok(Value::Null)
+        }
+        "canvas_video_get_composition" => {
+            let req: GetCompositionRequest = serde_json::from_value(payload)
+                .map_err(|e| DaemonError::InvalidRequest(format!("parse: {}", e)))?;
+            let (html, width, height, duration_sec, fps) =
+                svc.get_composition_for_job(&req.job_id).await?;
+            let resp = GetCompositionResponse {
+                html,
+                width,
+                height,
+                duration_sec,
+                fps,
+            };
+            serde_json::to_value(resp)
+                .map_err(|e| DaemonError::InternalError(format!("{}", e)))
         }
         other => Err(DaemonError::InvalidRequest(format!(
             "unknown canvas.video.* message: {}",

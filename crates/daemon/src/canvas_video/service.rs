@@ -251,6 +251,24 @@ impl CanvasVideoService {
             .unwrap_or_default()
     }
 
+    /// Fetch the composition HTML + spec that the render page needs to
+    /// draw the given job. Returns InvalidRequest if the job or its
+    /// composition is unknown.
+    pub async fn get_composition_for_job(
+        &self,
+        job_id: &str,
+    ) -> Result<(String, u32, u32, f32, u32)> {
+        let snap = self
+            .jobs
+            .snapshot(job_id)
+            .await
+            .ok_or_else(|| DaemonError::InvalidRequest(format!("job not found: {}", job_id)))?;
+        let html = self.read_composition_html(&snap.composition_id).await?;
+        let (width, height, duration_sec, fps) =
+            self.composition_spec(&snap.composition_id).await?;
+        Ok((html, width, height, duration_sec, fps))
+    }
+
     // --- EventBus emitters ---
 
     async fn emit(&self, job_id: &str, payload: serde_json::Value) {

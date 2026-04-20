@@ -2641,6 +2641,39 @@ pub async fn start_server(
                 continue;
             }
 
+            // Page fetches composition HTML + spec for its job (extension -> daemon).
+            if msg_type == "canvas_video_get_composition" {
+                info!("Processing canvas_video_get_composition message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await
+                {
+                    Ok(val) => serde_json::json!({
+                        "type": "canvas_video_get_composition_response",
+                        "payload": val,
+                    }),
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_VIDEO_ERROR",
+                            "message": e.to_string()
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
             // Check for EventBus request messages from frontend
             if msg_type == "events_request" {
                 info!("Processing events_request message");

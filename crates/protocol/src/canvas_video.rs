@@ -75,6 +75,22 @@ pub struct RenderDone {
     pub frames_emitted: u32,
 }
 
+/// Page -> daemon: "give me the composition HTML + spec for this job."
+/// Served synchronously via `bridge:request`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetCompositionRequest {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetCompositionResponse {
+    pub html: String,
+    pub width: u32,
+    pub height: u32,
+    pub duration_sec: f32,
+    pub fps: u32,
+}
+
 /// Progress event (pushed on EventBus).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderProgress {
