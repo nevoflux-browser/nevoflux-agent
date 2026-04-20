@@ -1,7 +1,14 @@
 //! Phase A PoC test suite.
 //!
 //! Task 1: binary resolution (this file — current coverage).
-//! Later tasks (8, 16) add drawSnapshot + encode round-trip tests.
+//! Task 8: PoC gate orchestrator scaffold (panics until Task 13 lands).
+//! Task 16: PoC gate test body — requires running browser.
+//!   Run: cargo test -p nevoflux-daemon --test canvas_video_poc \
+//!            poc_gate -- --ignored --nocapture
+
+use sha2::{Digest, Sha256};
+#[allow(unused_imports)]
+use std::time::Instant;
 
 #[test]
 fn test_resolve_ffmpeg_succeeds() {
@@ -57,4 +64,43 @@ fn test_frame_chunks_rejects_mismatched_total() {
     // Second chunk declares total=2 which contradicts first chunk's total=3.
     let r = buf.add_chunk(7, 1, 2, false, vec![0x02]);
     assert!(r.is_none(), "mismatched total silently rejected (or could panic; at minimum must not corrupt)");
+}
+
+/// Runs the PoC composition twice through the full pipeline and
+/// verifies:
+///   1. MP4 output SHA256 bytes are equal across the two runs.
+///   2. Per-frame drawSnapshot timing median ≤ 150 ms.
+///   3. Total render time for 150 frames (5s @ 30fps) ≤ 20 s.
+///
+/// This test requires a running NevoFlux browser with the render
+/// extension loaded. It drives two renders and compares outputs.
+#[tokio::test]
+#[ignore]
+async fn poc_gate_determinism_and_perf() {
+    // Placeholder: actual orchestration lives in Phase B's render pipeline
+    // test harness. For PoC we drive the same path the production service
+    // will use, but in a stripped-down test harness.
+    //
+    // The harness must:
+    //   - Spawn a test ZMQ bridge (or use running daemon's).
+    //   - Connect to the live extension.
+    //   - Issue canvas.video.render.start twice with identical input.
+    //   - Collect MP4 outputs.
+    //   - Assert SHA256 equality + perf thresholds.
+    //
+    // Implementation of this harness is covered in Task 13 (render
+    // service). Before then the operator should do a manual PoC using
+    // the following procedure:
+
+    panic!(
+        "PoC orchestrator requires Phase B render service (Task 13). \
+         Run Task 13 first, then return to complete this test."
+    );
+}
+
+/// Standalone SHA256 helper used by the orchestrator and any manual PoC runs.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(bytes);
+    hex::encode(h.finalize())
 }
