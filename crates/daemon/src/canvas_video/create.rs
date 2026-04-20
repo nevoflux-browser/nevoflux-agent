@@ -50,6 +50,12 @@ fn validate(req: &CreateCompositionRequest) -> Result<()> {
     Ok(())
 }
 
+/// Public wrapper over `default_scaffold` so `service.rs` can regenerate
+/// the same HTML when stashing test-composition metadata.
+pub fn default_scaffold_for(req: &CreateCompositionRequest) -> String {
+    default_scaffold(req)
+}
+
 fn default_scaffold(req: &CreateCompositionRequest) -> String {
     let bg = req.bg.clone().unwrap_or_else(|| "#000".into());
     format!(

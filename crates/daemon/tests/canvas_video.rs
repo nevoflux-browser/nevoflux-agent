@@ -113,3 +113,65 @@ async fn test_job_cancel_transitions_to_cancelled() {
     assert!(cancelled);
     assert_eq!(reg.snapshot(&job_id).await.unwrap().state, JobState::Cancelled);
 }
+
+#[tokio::test]
+async fn test_render_start_creates_job_and_returns_id() {
+    use nevoflux_daemon::canvas_video::job::JobState;
+    use nevoflux_protocol::canvas_video::RenderStartRequest;
+
+    let svc = fresh_service();
+    let create_resp = svc
+        .create_composition(CreateCompositionRequest {
+            title: "demo".into(),
+            width: 640,
+            height: 360,
+            duration_sec: 1.0,
+            fps: 30,
+            bg: None,
+            html: Some(
+                r#"<!doctype html><div id="stage" data-width="640" data-height="360" data-duration="1" data-fps="30"></div>"#
+                    .into(),
+            ),
+        })
+        .await
+        .unwrap();
+
+    let start_resp = svc
+        .render_start(RenderStartRequest {
+            composition_id: create_resp.artifact_id.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert!(start_resp.job_id.starts_with("job-"));
+
+    // Job is now tracked; state is Queued, Running, or Succeeded (stub
+    // bridge short-circuits to Succeeded but the spawned task may run
+    // before or after this observation).
+    let snap = svc.job_snapshot(&start_resp.job_id).await.unwrap();
+    assert!(matches!(
+        snap.state,
+        JobState::Queued | JobState::Running | JobState::Succeeded
+    ));
+    assert_eq!(snap.composition_id, create_resp.artifact_id);
+    assert_eq!(snap.total_frames, 30);
+}
+
+#[tokio::test]
+async fn test_render_start_rejects_unknown_composition() {
+    use nevoflux_protocol::canvas_video::RenderStartRequest;
+
+    let svc = fresh_service();
+    let err = svc
+        .render_start(RenderStartRequest {
+            composition_id: "comp-does-not-exist".into(),
+        })
+        .await
+        .unwrap_err();
+    let msg = format!("{}", err);
+    assert!(
+        msg.contains("not found") || msg.contains("unknown"),
+        "unexpected err: {}",
+        msg
+    );
+}
