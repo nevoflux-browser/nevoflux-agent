@@ -11,6 +11,7 @@ use crate::canvas_video::{
     render,
 };
 use crate::error::{DaemonError, Result};
+use crate::event_bus::{BusEvent, EventBus, PublisherIdentity};
 use nevoflux_protocol::canvas_video::{
     CreateCompositionRequest, CreateCompositionResponse, RenderFrameChunk, RenderStartRequest,
     RenderStartResponse,
@@ -43,6 +44,10 @@ pub struct CanvasVideoService {
 
     /// Outbound bridge push (None in stub / test mode).
     bridge_sender: Option<Arc<dyn BridgeSender>>,
+
+    /// EventBus handle for jobs.render.{id} progress + terminal events.
+    /// None in stub / test mode; emits become no-ops.
+    event_bus: Option<Arc<EventBus>>,
 }
 
 #[derive(Clone)]
@@ -64,6 +69,7 @@ impl CanvasVideoService {
             frame_awaiters: Mutex::new(Default::default()),
             chunk_buffers: Mutex::new(Default::default()),
             bridge_sender: None,
+            event_bus: None,
         }
     }
 
@@ -76,7 +82,15 @@ impl CanvasVideoService {
             frame_awaiters: Mutex::new(Default::default()),
             chunk_buffers: Mutex::new(Default::default()),
             bridge_sender: None,
+            event_bus: None,
         }
+    }
+
+    /// Builder: attach an EventBus so emit_* methods publish progress and
+    /// terminal events on `jobs.render.{job_id}`.
+    pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
+        self.event_bus = Some(bus);
+        self
     }
 
     pub fn bridge_is_stub(&self) -> bool {
@@ -294,14 +308,55 @@ impl CanvasVideoService {
             .await
     }
 
-    /// Emit render progress. No-op at P1 (Task 14 wires EventBus).
-    pub async fn emit_progress(&self, _job_id: &str, _current: u32, _total: u32) {}
+    /// Publish an event on `jobs.render.{job_id}` if an EventBus is attached.
+    async fn emit(&self, job_id: &str, payload: serde_json::Value) {
+        if let Some(bus) = &self.event_bus {
+            let topic = format!("jobs.render.{}", job_id);
+            let event = BusEvent::ephemeral(topic, payload, PublisherIdentity::Internal);
+            let _ = bus.publish(event).await;
+        }
+    }
 
-    /// Emit render success terminal event. No-op at P1.
-    pub async fn emit_succeeded(&self, _job_id: &str, _path: &str, _size: u64) {}
+    /// Emit render progress on `jobs.render.{job_id}`.
+    pub async fn emit_progress(&self, job_id: &str, current: u32, total: u32) {
+        self.emit(
+            job_id,
+            serde_json::json!({
+                "event": "progress",
+                "job_id": job_id,
+                "current": current,
+                "total": total,
+            }),
+        )
+        .await;
+    }
 
-    /// Emit render failure terminal event. No-op at P1.
-    pub async fn emit_failed(&self, _job_id: &str, _error: &str) {}
+    /// Emit render success terminal event.
+    pub async fn emit_succeeded(&self, job_id: &str, path: &str, size_bytes: u64) {
+        self.emit(
+            job_id,
+            serde_json::json!({
+                "event": "succeeded",
+                "job_id": job_id,
+                "output_path": path,
+                "size_bytes": size_bytes,
+            }),
+        )
+        .await;
+    }
+
+    /// Emit render failure terminal event.
+    pub async fn emit_failed(&self, job_id: &str, error: &str) {
+        self.emit(
+            job_id,
+            serde_json::json!({
+                "event": "failed",
+                "job_id": job_id,
+                "error": error,
+            }),
+        )
+        .await;
+    }
 }
 
 impl Default for CanvasVideoService {

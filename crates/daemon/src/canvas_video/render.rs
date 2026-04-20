@@ -58,10 +58,9 @@ pub async fn render_start(
         )
         .await
         {
-            svc_clone
-                .jobs()
-                .set_error(&job_id_clone, format!("{}", e))
-                .await;
+            let err_msg = format!("{}", e);
+            svc_clone.jobs().set_error(&job_id_clone, err_msg.clone()).await;
+            svc_clone.emit_failed(&job_id_clone, &err_msg).await;
         }
     });
 
