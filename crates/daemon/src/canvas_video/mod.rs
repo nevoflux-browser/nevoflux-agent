@@ -5,6 +5,7 @@
 pub mod create;
 pub mod ffmpeg;
 pub mod frame_chunks;
+pub mod job;
 pub mod service;
 
 pub use service::CanvasVideoService;
