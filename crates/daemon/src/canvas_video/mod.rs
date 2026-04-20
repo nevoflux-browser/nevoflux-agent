@@ -2,5 +2,9 @@
 //!
 //! See `docs/superpowers/specs/2026-04-19-video-skill-design.md`.
 
+pub mod create;
 pub mod ffmpeg;
 pub mod frame_chunks;
+pub mod service;
+
+pub use service::CanvasVideoService;
