@@ -1066,6 +1066,25 @@ async fn execute_canvas_video_tool(
                 .render_start(req)
                 .await
                 .map_err(|e| e.to_string())?;
+
+            // Broadcast canvas_video_open_render_tab to all connected
+            // proxies so the extension A4 handler opens
+            // nevoflux://render/{job_id}. The TCP-proxy code path in
+            // server.rs has its own broadcast for
+            // canvas_video_render_start — this one covers the MCP/ACP
+            // LLM tool-call path which never flows through that handler.
+            if let Some(tx) = services.broadcast_tx.as_ref() {
+                let payload = serde_json::json!({
+                    "type": "canvas_video_open_render_tab",
+                    "payload": { "job_id": resp.job_id }
+                });
+                let env = nevoflux_protocol::DaemonEnvelope::broadcast(
+                    nevoflux_protocol::Channel::Chat,
+                    payload,
+                );
+                let _ = tx.send((b"*".to_vec(), env)).await;
+            }
+
             serde_json::to_string(&resp)
                 .map_err(|e| format!("serialize canvas_render_video response: {}", e))
         }

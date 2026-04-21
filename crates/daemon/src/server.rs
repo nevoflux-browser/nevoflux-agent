@@ -1143,6 +1143,13 @@ pub async fn start_server(
     let (msg_tx, mut msg_rx) = mpsc::channel::<(Vec<u8>, ProxyEnvelope)>(100);
     let (response_tx, mut response_rx) = mpsc::channel::<(Vec<u8>, DaemonEnvelope)>(100);
 
+    // Wire the response channel into HostServices so
+    // `mcp_tool_executor::execute_canvas_video_tool` can emit the
+    // canvas_video_open_render_tab broadcast on the MCP/ACP path. The
+    // in-scope TCP-proxy canvas_video_render_start handler already has its
+    // own direct broadcast; this one covers the LLM-driven tool call path.
+    services = services.with_broadcast_tx(response_tx.clone());
+
     // Writer registry: maps proxy_id → writer half for routing responses
     type WriterMap = Arc<Mutex<HashMap<String, BufWriter<tokio::net::tcp::OwnedWriteHalf>>>>;
     let writers: WriterMap = Arc::new(Mutex::new(HashMap::new()));
