@@ -188,6 +188,20 @@ pub struct HostServices {
     pub vector_index: Arc<std::sync::RwLock<SimpleVectorIndex>>,
     /// Session-level memory extractor for marking manual creates.
     pub session_extractor: Option<Arc<crate::learning::session_extractor::SessionMemoryExtractor>>,
+    /// Canvas video render pipeline (P2).
+    ///
+    /// When set, the MCP tool executor dispatches `canvas_create_composition` /
+    /// `canvas_render_video` calls through this service. Required for ACP-style
+    /// providers (claude-code, gemini-cli, kimi, openclaw) whose tool calls
+    /// arrive via `mcp_tool_executor::execute_mcp_tool`; direct-API providers
+    /// reach the same service through `DaemonHostFunctions::canvas_video_*`.
+    pub canvas_video_service: Option<Arc<crate::canvas_video::CanvasVideoService>>,
+    /// Channel into the daemon's writer task. Send (identity, DaemonEnvelope)
+    /// tuples; identity=b"*" fan-outs to every connected proxy. Used by
+    /// canvas_video render_start dispatch to trigger the render-tab-open
+    /// broadcast (A3/A4 of /video P1) on the MCP/ACP path — the existing
+    /// broadcast in server.rs only fires for the TCP proxy path.
+    pub broadcast_tx: Option<mpsc::Sender<(Vec<u8>, nevoflux_protocol::DaemonEnvelope)>>,
 }
 
 impl HostServices {
@@ -240,6 +254,8 @@ impl HostServices {
             embedding: Arc::new(std::sync::RwLock::new(None)),
             vector_index: Arc::new(std::sync::RwLock::new(SimpleVectorIndex::new())),
             session_extractor: None,
+            canvas_video_service: None,
+            broadcast_tx: None,
         }
     }
 
@@ -271,6 +287,8 @@ impl HostServices {
             embedding: Arc::new(std::sync::RwLock::new(None)),
             vector_index: Arc::new(std::sync::RwLock::new(SimpleVectorIndex::new())),
             session_extractor: None,
+            canvas_video_service: None,
+            broadcast_tx: None,
         }
     }
 
@@ -496,6 +514,56 @@ impl HostServices {
         self
     }
 
+    /// Wire the shared canvas video service.
+    ///
+    /// This enables `mcp_tool_executor::execute_mcp_tool` to dispatch
+    /// `canvas_create_composition` / `canvas_render_video` — the tool path
+    /// used by ACP-style providers (claude-code, gemini-cli, kimi, openclaw).
+    /// Without this, those providers' tool calls fall through to
+    /// `Err("unknown tool: ...")` even though the tool schemas are bridged
+    /// into the MCP HTTP surface.
+    ///
+    /// # Arguments
+    ///
+    /// * `svc` - The canvas video service to use.
+    ///
+    /// # Returns
+    ///
+    /// Returns self for method chaining.
+    pub fn with_canvas_video_service(
+        mut self,
+        svc: Arc<crate::canvas_video::CanvasVideoService>,
+    ) -> Self {
+        self.canvas_video_service = Some(svc);
+        self
+    }
+
+    /// Wire the daemon's response broadcast channel.
+    ///
+    /// `broadcast_tx` is the `mpsc::Sender` feeding the daemon writer task;
+    /// sending `(b"*".to_vec(), envelope)` fan-outs `envelope` to every
+    /// connected proxy. This is used by
+    /// `mcp_tool_executor::execute_canvas_video_tool` to trigger the
+    /// `canvas_video_open_render_tab` broadcast on the MCP/ACP path; without
+    /// it, only the TCP-proxy `canvas_video_render_start` branch in
+    /// `server.rs` emits that frame, and the render tab never opens for
+    /// LLM-driven render starts.
+    ///
+    /// # Arguments
+    ///
+    /// * `tx` - The daemon response channel sender.
+    ///
+    /// # Returns
+    ///
+    /// Returns self for method chaining.
+    pub fn with_broadcast_tx(
+        mut self,
+        tx: mpsc::Sender<(Vec<u8>, nevoflux_protocol::DaemonEnvelope)>,
+    ) -> Self {
+        self.broadcast_tx = Some(tx);
+        self
+    }
+
     /// Check if subagent execution is available.
     pub fn has_subagent_executor(&self) -> bool {
         self.subagent_executor.is_some()
@@ -575,6 +643,14 @@ impl std::fmt::Debug for HostServices {
             .field(
                 "session_extractor",
                 &self.session_extractor.as_ref().map(|_| "Some(...)"),
+            )
+            .field(
+                "canvas_video_service",
+                &self.canvas_video_service.as_ref().map(|_| "Some(...)"),
+            )
+            .field(
+                "broadcast_tx",
+                &self.broadcast_tx.as_ref().map(|_| "Some(...)"),
             )
             .finish()
     }

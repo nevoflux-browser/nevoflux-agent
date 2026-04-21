@@ -124,6 +124,7 @@ async fn run_render_loop(
         if let Some(snap) = svc.jobs().snapshot(&job_id).await {
             if snap.state == JobState::Cancelled {
                 let _ = ffmpeg_child.kill();
+                svc.emit_cancelled(&job_id, frames_written, total_frames).await;
                 return Ok(());
             }
         }

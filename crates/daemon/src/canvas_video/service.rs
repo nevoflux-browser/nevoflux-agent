@@ -66,6 +66,18 @@ struct TestComposition {
     fps: u32,
 }
 
+/// Pure throttle decision for progress deliveries. Emits when `current`
+/// lands on a multiple of `throttle = max(1, total/20)`, OR when
+/// `current == total` (so the final frame always lands on the bus).
+///
+/// P2 design §4.3: reduces 1080p × 30 s (900 frames) from 900 events to
+/// ~21. At small totals (< 20) throttle is 1 so every frame emits —
+/// acceptable since the total cost is bounded.
+pub(crate) fn should_emit_progress(current: u32, total: u32) -> bool {
+    let throttle = (total / 20).max(1);
+    current % throttle == 0 || current == total
+}
+
 impl CanvasVideoService {
     pub fn new() -> Self {
         Self {
@@ -274,12 +286,37 @@ impl CanvasVideoService {
     async fn emit(&self, job_id: &str, payload: serde_json::Value) {
         if let Some(bus) = &self.event_bus {
             let topic = format!("jobs:render:{}", job_id);
-            let event = BusEvent::ephemeral(topic, payload, PublisherIdentity::Internal);
-            let _ = bus.publish(event).await;
+            let event_kind = payload
+                .get("event")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            let event = BusEvent::ephemeral(topic.clone(), payload, PublisherIdentity::Internal);
+            match bus.publish(event).await {
+                Ok(_) => tracing::info!(
+                    topic = %topic,
+                    event = %event_kind,
+                    "canvas_video emit publish ok"
+                ),
+                Err(e) => tracing::warn!(
+                    topic = %topic,
+                    event = %event_kind,
+                    error = %e,
+                    "canvas_video emit publish FAILED"
+                ),
+            }
+        } else {
+            tracing::warn!(
+                job_id = %job_id,
+                "canvas_video emit called but event_bus is None — service not wired"
+            );
         }
     }
 
     pub async fn emit_progress(&self, job_id: &str, current: u32, total: u32) {
+        if !should_emit_progress(current, total) {
+            return;
+        }
         self.emit(
             job_id,
             serde_json::json!({
@@ -316,10 +353,102 @@ impl CanvasVideoService {
         )
         .await;
     }
+
+    pub async fn emit_cancelled(&self, job_id: &str, current: u32, total: u32) {
+        self.emit(
+            job_id,
+            serde_json::json!({
+                "event": "cancelled",
+                "job_id": job_id,
+                "current": current,
+                "total": total,
+            }),
+        )
+        .await;
+    }
 }
 
 impl Default for CanvasVideoService {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod p2_emit_tests {
+    use super::*;
+    use crate::event_bus::{BackpressurePolicy, EventBus, SubscriberIdentity};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn emit_cancelled_publishes_event_with_frame_counts() {
+        let bus = Arc::new(EventBus::new());
+        let svc = Arc::new(
+            CanvasVideoService::new_for_tests().with_event_bus(bus.clone()),
+        );
+
+        // Subscribe BEFORE emitting so we capture the delivery.
+        let pattern = crate::event_bus::types::TopicPattern::wildcard("jobs:render:*");
+        let mut sub = bus
+            .subscribe(
+                pattern,
+                SubscriberIdentity::Internal,
+                BackpressurePolicy::DropOldest,
+                64,
+            )
+            .expect("subscribe");
+
+        svc.emit_cancelled("job-abc", 42, 150).await;
+
+        let delivered = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            sub.rx.recv(),
+        )
+        .await
+        .expect("timeout")
+        .expect("delivery");
+
+        assert_eq!(delivered.topic, "jobs:render:job-abc");
+        let body = &delivered.payload;
+        assert_eq!(body["event"], "cancelled");
+        assert_eq!(body["job_id"], "job-abc");
+        assert_eq!(body["current"], 42);
+        assert_eq!(body["total"], 150);
+    }
+
+    /// Pure throttle decision: kept separate from the async emit path so
+    /// we can exhaustively test the gating math without an EventBus.
+    #[test]
+    fn should_emit_progress_throttles_to_about_20_per_render() {
+        // 900 frames → throttle = 45 → emits at 0, 45, …, 900 (inclusive).
+        let mut n = 0;
+        for current in 0..=900 {
+            if super::should_emit_progress(current, 900) {
+                n += 1;
+            }
+        }
+        assert!((18..=25).contains(&n), "900→{}", n);
+
+        // 150 frames → throttle = 7 → ~22 emits.
+        let mut n = 0;
+        for current in 0..=150 {
+            if super::should_emit_progress(current, 150) {
+                n += 1;
+            }
+        }
+        assert!((18..=25).contains(&n), "150→{}", n);
+
+        // total below divisor (10): throttle = 1 → emit every frame.
+        let mut n = 0;
+        for current in 0..=10 {
+            if super::should_emit_progress(current, 10) {
+                n += 1;
+            }
+        }
+        assert_eq!(n, 11, "10→{}", n);
+
+        // Terminal (current == total) always fires even if not on the divisor.
+        assert!(super::should_emit_progress(900, 900));
+        assert!(super::should_emit_progress(7, 150));
     }
 }

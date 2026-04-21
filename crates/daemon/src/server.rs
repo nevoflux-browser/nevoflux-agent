@@ -1090,7 +1090,8 @@ pub async fn start_server(
         .with_shared_tool_search(tool_search_index)
         .with_vector_index(vector_index)
         .with_role_registry(role_registry)
-        .with_embedding(Arc::clone(&shared_embedding));
+        .with_embedding(Arc::clone(&shared_embedding))
+        .with_canvas_video_service(canvas_video_service.clone());
     if let Some(retriever) = knowledge_retriever {
         services = services.with_knowledge_retriever(retriever);
     }
@@ -1141,6 +1142,13 @@ pub async fn start_server(
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let (msg_tx, mut msg_rx) = mpsc::channel::<(Vec<u8>, ProxyEnvelope)>(100);
     let (response_tx, mut response_rx) = mpsc::channel::<(Vec<u8>, DaemonEnvelope)>(100);
+
+    // Wire the response channel into HostServices so
+    // `mcp_tool_executor::execute_canvas_video_tool` can emit the
+    // canvas_video_open_render_tab broadcast on the MCP/ACP path. The
+    // in-scope TCP-proxy canvas_video_render_start handler already has its
+    // own direct broadcast; this one covers the LLM-driven tool call path.
+    services = services.with_broadcast_tx(response_tx.clone());
 
     // Writer registry: maps proxy_id → writer half for routing responses
     type WriterMap = Arc<Mutex<HashMap<String, BufWriter<tokio::net::tcp::OwnedWriteHalf>>>>;
@@ -2838,6 +2846,7 @@ pub async fn start_server(
                     let plan_registry = process_plan_registry.clone();
                     let trace_enabled = process_trace_enabled;
                     let extraction_registry = process_extraction_registry.clone();
+                    let canvas_video_service = process_canvas_video_service.clone();
                     tokio::spawn(async move {
                         handle_chat_message_streaming(
                             &payload,
@@ -2856,6 +2865,7 @@ pub async fn start_server(
                             plan_registry,
                             trace_enabled,
                             extraction_registry,
+                            canvas_video_service,
                         )
                         .await;
                     });
@@ -2975,98 +2985,139 @@ async fn handle_event_bus_request(
 
     match request {
         EventBusRequest::Subscribe(opts) => {
-            let pattern_str = opts.patterns.first().cloned().unwrap_or_default();
-            let pattern = if pattern_str.contains('*') {
-                TopicPattern::wildcard(&pattern_str)
-            } else {
-                TopicPattern::exact(&pattern_str)
-            };
-            let subscriber = SubscriberIdentity::Extension {
-                proxy_id: proxy_id.to_string(),
-            };
+            if opts.patterns.is_empty() {
+                return EventBusResponse::Error {
+                    code: "SUBSCRIBE_FAILED".into(),
+                    message: "no patterns supplied".into(),
+                };
+            }
 
-            match event_bus.subscribe_with_options(
-                pattern,
-                subscriber,
-                BackpressurePolicy::DropOldest,
-                opts.buffer_size,
-                opts.replay_sticky,
-            ) {
-                Ok(mut sub_handle) => {
-                    let sub_id = sub_handle.id.clone();
-                    let cancel_token = tokio_util::sync::CancellationToken::new();
-                    let token_clone = cancel_token.clone();
-                    let fwd_proxy_id = proxy_id.to_string();
-                    let fwd_identity = identity.to_vec();
-                    let fwd_response_tx = response_tx.clone();
-                    let fwd_sub_id = sub_id.clone();
+            let mut sub_ids: Vec<String> = Vec::with_capacity(opts.patterns.len());
+            let mut first_error: Option<(String, String)> = None; // (pattern, err)
 
-                    // Spawn delivery forwarder that relays BusEvents to the proxy
-                    tokio::spawn(async move {
-                        loop {
-                            tokio::select! {
-                                _ = token_clone.cancelled() => break,
-                                event = sub_handle.rx.recv() => {
-                                    match event {
-                                        Some(bus_event) => {
-                                            let delivery = EventBusDelivery {
-                                                subscription_id: fwd_sub_id.clone(),
-                                                event: BusEventPayload {
-                                                    event_id: bus_event.id.clone(),
-                                                    topic: bus_event.topic.clone(),
-                                                    payload: bus_event.payload.clone(),
-                                                    delivery: match bus_event.delivery {
-                                                        Delivery::Ephemeral => DeliveryMode::Ephemeral,
-                                                        Delivery::Sticky => DeliveryMode::Sticky,
-                                                        Delivery::Persistent => DeliveryMode::Persistent {
-                                                            ttl_secs: bus_event.ttl.map(|d| d.as_secs()),
+            for pattern_str in &opts.patterns {
+                let pattern = if pattern_str.contains('*') {
+                    TopicPattern::wildcard(pattern_str)
+                } else {
+                    TopicPattern::exact(pattern_str)
+                };
+                let pattern_dbg = format!("{:?}", pattern);
+                let subscriber = SubscriberIdentity::Extension {
+                    proxy_id: proxy_id.to_string(),
+                };
+
+                match event_bus.subscribe_with_options(
+                    pattern,
+                    subscriber,
+                    BackpressurePolicy::DropOldest,
+                    opts.buffer_size,
+                    opts.replay_sticky,
+                ) {
+                    Ok(mut sub_handle) => {
+                        tracing::info!(
+                            pattern = %pattern_dbg,
+                            proxy = %proxy_id,
+                            sub = %sub_handle.id,
+                            "EventBus subscribe OK",
+                        );
+                        let sub_id = sub_handle.id.clone();
+                        let cancel_token = tokio_util::sync::CancellationToken::new();
+                        let token_clone = cancel_token.clone();
+                        let fwd_proxy_id = proxy_id.to_string();
+                        let fwd_identity = identity.to_vec();
+                        let fwd_response_tx = response_tx.clone();
+                        let fwd_sub_id = sub_id.clone();
+
+                        // Forwarder per subscription (verbatim lift from the old single-pattern path)
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::select! {
+                                    _ = token_clone.cancelled() => break,
+                                    event = sub_handle.rx.recv() => {
+                                        match event {
+                                            Some(bus_event) => {
+                                                let delivery = EventBusDelivery {
+                                                    subscription_id: fwd_sub_id.clone(),
+                                                    event: BusEventPayload {
+                                                        event_id: bus_event.id.clone(),
+                                                        topic: bus_event.topic.clone(),
+                                                        payload: bus_event.payload.clone(),
+                                                        delivery: match bus_event.delivery {
+                                                            Delivery::Ephemeral => DeliveryMode::Ephemeral,
+                                                            Delivery::Sticky => DeliveryMode::Sticky,
+                                                            Delivery::Persistent => DeliveryMode::Persistent {
+                                                                ttl_secs: bus_event.ttl.map(|d| d.as_secs()),
+                                                            },
                                                         },
+                                                        publisher: format!("{:?}", bus_event.publisher),
+                                                        timestamp_ms: bus_event.created_at.timestamp_millis() as u64,
                                                     },
-                                                    publisher: format!("{:?}", bus_event.publisher),
-                                                    timestamp_ms: bus_event.created_at.timestamp_millis() as u64,
-                                                },
-                                            };
-                                            let msg = nevoflux_protocol::AgentMessage::EventsDelivery(delivery);
-                                            let payload = serde_json::to_value(&msg).unwrap_or_default();
-                                            let env = DaemonEnvelope::new(
-                                                &fwd_proxy_id,
-                                                Channel::Chat,
-                                                payload,
-                                            );
-                                            if fwd_response_tx
-                                                .send((fwd_identity.clone(), env))
-                                                .await
-                                                .is_err()
-                                            {
-                                                break;
+                                                };
+                                                let msg = nevoflux_protocol::AgentMessage::EventsDelivery(delivery);
+                                                let payload = serde_json::to_value(&msg).unwrap_or_default();
+                                                let env = DaemonEnvelope::new(
+                                                    &fwd_proxy_id,
+                                                    Channel::Chat,
+                                                    payload,
+                                                );
+                                                if fwd_response_tx
+                                                    .send((fwd_identity.clone(), env))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    break;
+                                                }
                                             }
+                                            None => break,
                                         }
-                                        None => break,
                                     }
                                 }
                             }
+                        });
+
+                        subscription_router.lock().await.insert(
+                            sub_id.clone(),
+                            SubscriptionEntry {
+                                proxy_id: proxy_id.to_string(),
+                                identity: identity.to_vec(),
+                                cancel_token,
+                            },
+                        );
+                        sub_ids.push(sub_id);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            pattern = %pattern_dbg,
+                            proxy = %proxy_id,
+                            error = %e,
+                            "EventBus subscribe DENIED/FAILED",
+                        );
+                        if first_error.is_none() {
+                            first_error = Some((pattern_str.clone(), e.to_string()));
                         }
-                    });
-
-                    // Register in subscription router for cleanup on disconnect
-                    subscription_router.lock().await.insert(
-                        sub_id.clone(),
-                        SubscriptionEntry {
-                            proxy_id: proxy_id.to_string(),
-                            identity: identity.to_vec(),
-                            cancel_token,
-                        },
-                    );
-
-                    EventBusResponse::Subscribed {
-                        subscription_id: sub_id,
-                        patterns: opts.patterns,
                     }
                 }
-                Err(e) => EventBusResponse::Error {
+            }
+
+            // If at least one pattern subscribed successfully, return the first
+            // sub_id as the caller-visible "group anchor". Remaining sub_ids
+            // stay registered in subscription_router under their own ids; they
+            // get cleaned up independently on proxy disconnect. For explicit
+            // Unsubscribe, caller only removes the group anchor — this is a
+            // known shortcoming (tracked as a future cleanup), but acceptable
+            // because per-proxy cleanup catches everything on disconnect.
+            if let Some(anchor) = sub_ids.first().cloned() {
+                EventBusResponse::Subscribed {
+                    subscription_id: anchor,
+                    patterns: opts.patterns,
+                }
+            } else {
+                let (pat, msg) = first_error
+                    .unwrap_or_else(|| ("?".to_string(), "unknown".to_string()));
+                EventBusResponse::Error {
                     code: "SUBSCRIBE_FAILED".into(),
-                    message: e.to_string(),
-                },
+                    message: format!("all patterns failed; first: {} — {}", pat, msg),
+                }
             }
         }
 
@@ -3363,6 +3414,7 @@ async fn handle_chat_message_streaming(
     plan_registry: PlanRequestRegistry,
     trace_enabled: bool,
     extraction_registry: ExtractionRegistry,
+    canvas_video_service: Arc<crate::canvas_video::CanvasVideoService>,
 ) {
     let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -3388,6 +3440,7 @@ async fn handle_chat_message_streaming(
             runtime,
             proxy_id.clone(),
             identity.clone(),
+            canvas_video_service.clone(),
         )
         .await;
         // Add done: true to signal this is a complete response (not streaming)
@@ -3766,7 +3819,8 @@ async fn handle_chat_message_streaming(
         .with_sidebar_stream(stream_tx)
         .with_session_id(session_id.clone())
         .with_trace_collector(trace_collector.clone())
-        .with_session_extractor(session_extractor.clone());
+        .with_session_extractor(session_extractor.clone())
+        .with_canvas_video_service(canvas_video_service.clone());
 
     // Pass skill base path to host for relative path resolution
     if let Some(ref ctx) = skill_context {
@@ -4145,7 +4199,8 @@ async fn handle_chat_message_streaming(
                             .with_sidebar_stream(rerun_stream_tx)
                             .with_session_id(session_id.clone())
                             .with_trace_collector(trace_collector.clone())
-                            .with_session_extractor(session_extractor.clone());
+                            .with_session_extractor(session_extractor.clone())
+                            .with_canvas_video_service(canvas_video_service.clone());
 
                         let rerun_agent = Agent::new(rerun_host);
 
@@ -4902,6 +4957,7 @@ async fn handle_chat_message(
     runtime: tokio::runtime::Handle,
     _proxy_id: String,
     _client_identity: Vec<u8>,
+    canvas_video_service: Arc<crate::canvas_video::CanvasVideoService>,
 ) -> serde_json::Value {
     let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -5213,7 +5269,8 @@ async fn handle_chat_message(
             // Create host functions with config and runtime
             let mut host = DaemonHostFunctions::new(config.clone(), runtime)
                 .with_services(services.clone())
-                .with_session_id(session_id.clone());
+                .with_session_id(session_id.clone())
+                .with_canvas_video_service(canvas_video_service.clone());
 
             // Pass skill base path to host for relative path resolution
             if let Some(ref ctx) = skill_context {

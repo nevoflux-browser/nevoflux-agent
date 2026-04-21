@@ -31,6 +31,10 @@ pub async fn run_tool_executor(
         let start = std::time::Instant::now();
         let result = execute_mcp_tool(&req.name, &req.arguments, &services, &tool_bridge).await;
         let duration_ms = start.elapsed().as_millis() as u64;
+        match &result {
+            Ok(_) => tracing::info!(tool = %req.name, ms = duration_ms, "MCP tool dispatch ok"),
+            Err(e) => tracing::warn!(tool = %req.name, ms = duration_ms, error = %e, "MCP tool dispatch failed"),
+        }
 
         // Log tool call for sidebar display
         let call_id = format!("mcp-{}-{}", req.name, start.elapsed().as_nanos());
@@ -300,6 +304,20 @@ pub async fn execute_mcp_tool(
         }
         "create_artifact" => {
             return execute_create_artifact(arguments, tool_bridge).await;
+        }
+        _ => {}
+    }
+
+    // 3'. Canvas video tools (P2)
+    //
+    // ACP-style providers (claude-code, gemini-cli, kimi, openclaw) see
+    // canvas_create_composition / canvas_render_video via the MCP HTTP
+    // bridge and dispatch them through this executor. The corresponding
+    // direct-API-provider path lives in `DaemonHostFunctions::canvas_video_*`
+    // plus the builtin-wasm Agent::execute_tool arm.
+    match name {
+        "canvas_create_composition" | "canvas_render_video" => {
+            return execute_canvas_video_tool(name, arguments, services).await;
         }
         _ => {}
     }
@@ -1001,6 +1019,80 @@ async fn execute_create_artifact(
         "status": "created"
     })
     .to_string())
+}
+
+// ============================================================================
+// 3'. Canvas video tools (P2)
+// ============================================================================
+
+/// Execute `canvas_create_composition` / `canvas_render_video` via the shared
+/// CanvasVideoService on `HostServices`.
+///
+/// Non-blocking: `canvas_render_video` returns a `job_id` immediately; the
+/// render loop emits progress and terminal events on the EventBus channel
+/// `jobs.render.{job_id}`, which the sidebar consumes (see P2 design §3.1).
+///
+/// Mirrors the contract of `DaemonHostFunctions::canvas_video_create_composition`
+/// / `canvas_video_render_start` (agent_host.rs) so both dispatch paths
+/// (builtin-wasm's Agent loop and the ACP MCP bridge) share the same service
+/// and response shape.
+async fn execute_canvas_video_tool(
+    name: &str,
+    arguments: &serde_json::Value,
+    services: &HostServices,
+) -> Result<String, String> {
+    let svc = services
+        .canvas_video_service
+        .as_ref()
+        .ok_or_else(|| "canvas_video service not wired into HostServices".to_string())?;
+
+    match name {
+        "canvas_create_composition" => {
+            let req: nevoflux_protocol::canvas_video::CreateCompositionRequest =
+                serde_json::from_value(arguments.clone())
+                    .map_err(|e| format!("invalid canvas_create_composition args: {}", e))?;
+            let resp = svc
+                .create_composition(req)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_string(&resp)
+                .map_err(|e| format!("serialize canvas_create_composition response: {}", e))
+        }
+        "canvas_render_video" => {
+            let req: nevoflux_protocol::canvas_video::RenderStartRequest =
+                serde_json::from_value(arguments.clone())
+                    .map_err(|e| format!("invalid canvas_render_video args: {}", e))?;
+            let resp = svc
+                .render_start(req)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            // Broadcast canvas_video_open_render_tab to all connected
+            // proxies so the extension A4 handler opens
+            // nevoflux://render/{job_id}. The TCP-proxy code path in
+            // server.rs has its own broadcast for
+            // canvas_video_render_start — this one covers the MCP/ACP
+            // LLM tool-call path which never flows through that handler.
+            if let Some(tx) = services.broadcast_tx.as_ref() {
+                let payload = serde_json::json!({
+                    "type": "canvas_video_open_render_tab",
+                    "payload": { "job_id": resp.job_id }
+                });
+                let env = nevoflux_protocol::DaemonEnvelope::broadcast(
+                    nevoflux_protocol::Channel::Chat,
+                    payload,
+                );
+                let _ = tx.send((b"*".to_vec(), env)).await;
+            }
+
+            serde_json::to_string(&resp)
+                .map_err(|e| format!("serialize canvas_render_video response: {}", e))
+        }
+        other => Err(format!(
+            "execute_canvas_video_tool called with unexpected name: {}",
+            other
+        )),
+    }
 }
 
 // ============================================================================
