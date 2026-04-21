@@ -2248,6 +2248,20 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     Err(e) => format!("orchestrate error: {}", e.message),
                 }
             }
+            "canvas_create_composition" => {
+                let resp = self
+                    .host
+                    .canvas_video_create_composition(&tool_call.arguments)?;
+                serde_json::to_string(&resp)
+                    .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
+            }
+            "canvas_render_video" => {
+                let resp = self
+                    .host
+                    .canvas_video_render_start(&tool_call.arguments)?;
+                serde_json::to_string(&resp)
+                    .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
+            }
             _ => {
                 format!("Unknown tool: {}", tool_call.name)
             }
@@ -2308,6 +2322,8 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 | "subagent_kill"
                 | "subagent_list"
                 | "list_agents"
+                | "canvas_create_composition"
+                | "canvas_render_video"
         ) || name.starts_with("computer_")
             || name.starts_with("browser_")
     }
