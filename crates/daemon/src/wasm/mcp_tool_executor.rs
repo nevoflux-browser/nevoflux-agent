@@ -31,6 +31,10 @@ pub async fn run_tool_executor(
         let start = std::time::Instant::now();
         let result = execute_mcp_tool(&req.name, &req.arguments, &services, &tool_bridge).await;
         let duration_ms = start.elapsed().as_millis() as u64;
+        match &result {
+            Ok(_) => tracing::info!(tool = %req.name, ms = duration_ms, "MCP tool dispatch ok"),
+            Err(e) => tracing::warn!(tool = %req.name, ms = duration_ms, error = %e, "MCP tool dispatch failed"),
+        }
 
         // Log tool call for sidebar display
         let call_id = format!("mcp-{}-{}", req.name, start.elapsed().as_nanos());

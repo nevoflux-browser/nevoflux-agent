@@ -141,6 +141,8 @@ async fn handle_mcp_request(
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
 
+            tracing::info!(tool = %name, "MCP tools/call received from LLM");
+
             let tx = match state.tool_bridge.clone_executor() {
                 Some(tx) => tx,
                 None => {
