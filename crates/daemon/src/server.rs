@@ -2985,112 +2985,138 @@ async fn handle_event_bus_request(
 
     match request {
         EventBusRequest::Subscribe(opts) => {
-            let pattern_str = opts.patterns.first().cloned().unwrap_or_default();
-            let pattern = if pattern_str.contains('*') {
-                TopicPattern::wildcard(&pattern_str)
-            } else {
-                TopicPattern::exact(&pattern_str)
-            };
-            let subscriber = SubscriberIdentity::Extension {
-                proxy_id: proxy_id.to_string(),
-            };
+            if opts.patterns.is_empty() {
+                return EventBusResponse::Error {
+                    code: "SUBSCRIBE_FAILED".into(),
+                    message: "no patterns supplied".into(),
+                };
+            }
 
-            let pattern_dbg = format!("{:?}", pattern);
-            match event_bus.subscribe_with_options(
-                pattern,
-                subscriber,
-                BackpressurePolicy::DropOldest,
-                opts.buffer_size,
-                opts.replay_sticky,
-            ) {
-                Ok(mut sub_handle) => {
-                    tracing::info!(
-                        pattern = %pattern_dbg,
-                        proxy = %proxy_id,
-                        sub = %sub_handle.id,
-                        "EventBus subscribe OK",
-                    );
-                    let sub_id = sub_handle.id.clone();
-                    let cancel_token = tokio_util::sync::CancellationToken::new();
-                    let token_clone = cancel_token.clone();
-                    let fwd_proxy_id = proxy_id.to_string();
-                    let fwd_identity = identity.to_vec();
-                    let fwd_response_tx = response_tx.clone();
-                    let fwd_sub_id = sub_id.clone();
+            let mut sub_ids: Vec<String> = Vec::with_capacity(opts.patterns.len());
+            let mut first_error: Option<(String, String)> = None; // (pattern, err)
 
-                    // Spawn delivery forwarder that relays BusEvents to the proxy
-                    tokio::spawn(async move {
-                        loop {
-                            tokio::select! {
-                                _ = token_clone.cancelled() => break,
-                                event = sub_handle.rx.recv() => {
-                                    match event {
-                                        Some(bus_event) => {
-                                            let delivery = EventBusDelivery {
-                                                subscription_id: fwd_sub_id.clone(),
-                                                event: BusEventPayload {
-                                                    event_id: bus_event.id.clone(),
-                                                    topic: bus_event.topic.clone(),
-                                                    payload: bus_event.payload.clone(),
-                                                    delivery: match bus_event.delivery {
-                                                        Delivery::Ephemeral => DeliveryMode::Ephemeral,
-                                                        Delivery::Sticky => DeliveryMode::Sticky,
-                                                        Delivery::Persistent => DeliveryMode::Persistent {
-                                                            ttl_secs: bus_event.ttl.map(|d| d.as_secs()),
+            for pattern_str in &opts.patterns {
+                let pattern = if pattern_str.contains('*') {
+                    TopicPattern::wildcard(pattern_str)
+                } else {
+                    TopicPattern::exact(pattern_str)
+                };
+                let pattern_dbg = format!("{:?}", pattern);
+                let subscriber = SubscriberIdentity::Extension {
+                    proxy_id: proxy_id.to_string(),
+                };
+
+                match event_bus.subscribe_with_options(
+                    pattern,
+                    subscriber,
+                    BackpressurePolicy::DropOldest,
+                    opts.buffer_size,
+                    opts.replay_sticky,
+                ) {
+                    Ok(mut sub_handle) => {
+                        tracing::info!(
+                            pattern = %pattern_dbg,
+                            proxy = %proxy_id,
+                            sub = %sub_handle.id,
+                            "EventBus subscribe OK",
+                        );
+                        let sub_id = sub_handle.id.clone();
+                        let cancel_token = tokio_util::sync::CancellationToken::new();
+                        let token_clone = cancel_token.clone();
+                        let fwd_proxy_id = proxy_id.to_string();
+                        let fwd_identity = identity.to_vec();
+                        let fwd_response_tx = response_tx.clone();
+                        let fwd_sub_id = sub_id.clone();
+
+                        // Forwarder per subscription (verbatim lift from the old single-pattern path)
+                        tokio::spawn(async move {
+                            loop {
+                                tokio::select! {
+                                    _ = token_clone.cancelled() => break,
+                                    event = sub_handle.rx.recv() => {
+                                        match event {
+                                            Some(bus_event) => {
+                                                let delivery = EventBusDelivery {
+                                                    subscription_id: fwd_sub_id.clone(),
+                                                    event: BusEventPayload {
+                                                        event_id: bus_event.id.clone(),
+                                                        topic: bus_event.topic.clone(),
+                                                        payload: bus_event.payload.clone(),
+                                                        delivery: match bus_event.delivery {
+                                                            Delivery::Ephemeral => DeliveryMode::Ephemeral,
+                                                            Delivery::Sticky => DeliveryMode::Sticky,
+                                                            Delivery::Persistent => DeliveryMode::Persistent {
+                                                                ttl_secs: bus_event.ttl.map(|d| d.as_secs()),
+                                                            },
                                                         },
+                                                        publisher: format!("{:?}", bus_event.publisher),
+                                                        timestamp_ms: bus_event.created_at.timestamp_millis() as u64,
                                                     },
-                                                    publisher: format!("{:?}", bus_event.publisher),
-                                                    timestamp_ms: bus_event.created_at.timestamp_millis() as u64,
-                                                },
-                                            };
-                                            let msg = nevoflux_protocol::AgentMessage::EventsDelivery(delivery);
-                                            let payload = serde_json::to_value(&msg).unwrap_or_default();
-                                            let env = DaemonEnvelope::new(
-                                                &fwd_proxy_id,
-                                                Channel::Chat,
-                                                payload,
-                                            );
-                                            if fwd_response_tx
-                                                .send((fwd_identity.clone(), env))
-                                                .await
-                                                .is_err()
-                                            {
-                                                break;
+                                                };
+                                                let msg = nevoflux_protocol::AgentMessage::EventsDelivery(delivery);
+                                                let payload = serde_json::to_value(&msg).unwrap_or_default();
+                                                let env = DaemonEnvelope::new(
+                                                    &fwd_proxy_id,
+                                                    Channel::Chat,
+                                                    payload,
+                                                );
+                                                if fwd_response_tx
+                                                    .send((fwd_identity.clone(), env))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    break;
+                                                }
                                             }
+                                            None => break,
                                         }
-                                        None => break,
                                     }
                                 }
                             }
+                        });
+
+                        subscription_router.lock().await.insert(
+                            sub_id.clone(),
+                            SubscriptionEntry {
+                                proxy_id: proxy_id.to_string(),
+                                identity: identity.to_vec(),
+                                cancel_token,
+                            },
+                        );
+                        sub_ids.push(sub_id);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            pattern = %pattern_dbg,
+                            proxy = %proxy_id,
+                            error = %e,
+                            "EventBus subscribe DENIED/FAILED",
+                        );
+                        if first_error.is_none() {
+                            first_error = Some((pattern_str.clone(), e.to_string()));
                         }
-                    });
-
-                    // Register in subscription router for cleanup on disconnect
-                    subscription_router.lock().await.insert(
-                        sub_id.clone(),
-                        SubscriptionEntry {
-                            proxy_id: proxy_id.to_string(),
-                            identity: identity.to_vec(),
-                            cancel_token,
-                        },
-                    );
-
-                    EventBusResponse::Subscribed {
-                        subscription_id: sub_id,
-                        patterns: opts.patterns,
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        pattern = %pattern_dbg,
-                        proxy = %proxy_id,
-                        error = %e,
-                        "EventBus subscribe DENIED/FAILED",
-                    );
-                    EventBusResponse::Error {
-                        code: "SUBSCRIBE_FAILED".into(),
-                        message: e.to_string(),
-                    }
+            }
+
+            // If at least one pattern subscribed successfully, return the first
+            // sub_id as the caller-visible "group anchor". Remaining sub_ids
+            // stay registered in subscription_router under their own ids; they
+            // get cleaned up independently on proxy disconnect. For explicit
+            // Unsubscribe, caller only removes the group anchor — this is a
+            // known shortcoming (tracked as a future cleanup), but acceptable
+            // because per-proxy cleanup catches everything on disconnect.
+            if let Some(anchor) = sub_ids.first().cloned() {
+                EventBusResponse::Subscribed {
+                    subscription_id: anchor,
+                    patterns: opts.patterns,
+                }
+            } else {
+                let (pat, msg) = first_error
+                    .unwrap_or_else(|| ("?".to_string(), "unknown".to_string()));
+                EventBusResponse::Error {
+                    code: "SUBSCRIBE_FAILED".into(),
+                    message: format!("all patterns failed; first: {} — {}", pat, msg),
                 }
             }
         }
