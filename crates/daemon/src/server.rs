@@ -1075,6 +1075,15 @@ pub async fn start_server(
         ))
     };
 
+    // Canvas Video Service (video render pipeline).
+    // Wire in the EventBus so emit_progress / emit_succeeded / emit_failed
+    // actually publish on jobs.render.{job_id}. Without this, subscribers
+    // (sidebar, PoC gate test) never see terminal events even though the
+    // render loop finishes and writes the MP4.
+    let canvas_video_service = Arc::new(
+        crate::canvas_video::CanvasVideoService::new().with_event_bus(event_bus.clone()),
+    );
+
     let mut services = HostServices::new(Arc::new(db))
         .with_browser_sender(browser_tx)
         .with_mcp_manager(mcp_manager)
@@ -1149,36 +1158,68 @@ pub async fn start_server(
                 .unwrap_or("unknown")
                 .to_string();
 
-            if let Ok(data) = serde_json::to_vec(&response) {
-                let len = data.len() as u32;
-                let mut map = writer_map.lock().await;
-                if let Some(writer) = map.get_mut(&proxy_id) {
-                    let result = async {
-                        writer.write_all(&len.to_le_bytes()).await?;
-                        writer.write_all(&data).await?;
-                        writer.flush().await?;
-                        Ok::<(), std::io::Error>(())
-                    }
-                    .await;
-
-                    match result {
-                        Ok(()) => {
-                            info!("Sent to proxy {}: type={}", proxy_id, msg_type);
-                        }
-                        Err(e) => {
-                            error!("Failed to send to proxy {}: {}", proxy_id, e);
-                            // Remove disconnected writer
-                            map.remove(&proxy_id);
-                        }
-                    }
-                } else {
-                    warn!("No writer for proxy {}, dropping message", proxy_id);
-                }
-            } else {
+            let Ok(data) = serde_json::to_vec(&response) else {
                 error!(
                     "serde_json::to_vec failed for response to proxy {}: type={}",
                     proxy_id, msg_type
                 );
+                continue;
+            };
+            let len = data.len() as u32;
+
+            // Broadcast: identity "*" fans the frame out to every currently
+            // connected proxy. Used for daemon-initiated pushes that are
+            // not tied to a specific requester (e.g. canvas_video_open_render_tab).
+            if proxy_id == "*" {
+                let mut map = writer_map.lock().await;
+                let ids: Vec<String> = map.keys().cloned().collect();
+                let mut dead: Vec<String> = Vec::new();
+                for id in &ids {
+                    if let Some(writer) = map.get_mut(id) {
+                        let result = async {
+                            writer.write_all(&len.to_le_bytes()).await?;
+                            writer.write_all(&data).await?;
+                            writer.flush().await?;
+                            Ok::<(), std::io::Error>(())
+                        }
+                        .await;
+                        match result {
+                            Ok(()) => info!("Broadcast to proxy {}: type={}", id, msg_type),
+                            Err(e) => {
+                                error!("Broadcast to proxy {} failed: {}", id, e);
+                                dead.push(id.clone());
+                            }
+                        }
+                    }
+                }
+                for id in dead {
+                    map.remove(&id);
+                }
+                continue;
+            }
+
+            let mut map = writer_map.lock().await;
+            if let Some(writer) = map.get_mut(&proxy_id) {
+                let result = async {
+                    writer.write_all(&len.to_le_bytes()).await?;
+                    writer.write_all(&data).await?;
+                    writer.flush().await?;
+                    Ok::<(), std::io::Error>(())
+                }
+                .await;
+
+                match result {
+                    Ok(()) => {
+                        info!("Sent to proxy {}: type={}", proxy_id, msg_type);
+                    }
+                    Err(e) => {
+                        error!("Failed to send to proxy {}: {}", proxy_id, e);
+                        // Remove disconnected writer
+                        map.remove(&proxy_id);
+                    }
+                }
+            } else {
+                warn!("No writer for proxy {}, dropping message", proxy_id);
             }
         }
     });
@@ -1368,6 +1409,7 @@ pub async fn start_server(
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("canvas-tools");
     let process_canvas_share_service = canvas_share_service.clone();
     let process_canvas_persist_service = canvas_persist_service.clone();
+    let process_canvas_video_service = canvas_video_service.clone();
     tokio::spawn(async move {
         while let Some((identity, envelope)) = msg_rx.recv().await {
             let proxy_id = envelope.proxy_id.clone();
@@ -2458,6 +2500,234 @@ pub async fn start_server(
                         "type": "error",
                         "payload": {
                             "code": "CANVAS_PERSIST_ERROR",
+                            "message": e.to_string()
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_video_create_composition request.
+            if msg_type == "canvas_video_create_composition" {
+                info!("Processing canvas_video_create_composition message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await
+                {
+                    Ok(resp_json) => serde_json::json!({
+                        "type": "canvas_video_create_composition_response",
+                        "payload": resp_json
+                    }),
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_VIDEO_ERROR",
+                            "message": e.to_string()
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_video_render_start request.
+            if msg_type == "canvas_video_render_start" {
+                info!("Processing canvas_video_render_start message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await
+                {
+                    Ok(resp_json) => serde_json::json!({
+                        "type": "canvas_video_render_start_response",
+                        "payload": resp_json
+                    }),
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_VIDEO_ERROR",
+                            "message": e.to_string()
+                        }
+                    }),
+                };
+                // If the render job was successfully created, broadcast a
+                // canvas_video_open_render_tab frame to all connected proxies.
+                // The extension listens for this and opens the
+                // nevoflux://render/{job_id} tab; other proxies ignore it.
+                // Without this, a render_start initiated by anyone other
+                // than the extension (e.g. the PoC gate test proxy) would
+                // have no way to cause the render page to load.
+                if let Some(job_id) = resp_msg
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .filter(|t| *t == "canvas_video_render_start_response")
+                    .and_then(|_| resp_msg.get("payload"))
+                    .and_then(|p| p.get("job_id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+                {
+                    let broadcast_payload = serde_json::json!({
+                        "type": "canvas_video_open_render_tab",
+                        "payload": { "job_id": job_id }
+                    });
+                    let broadcast_env =
+                        DaemonEnvelope::broadcast(channel, broadcast_payload);
+                    let _ = process_response_tx
+                        .send((b"*".to_vec(), broadcast_env))
+                        .await;
+                }
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_video_render_cancel request.
+            if msg_type == "canvas_video_render_cancel" {
+                info!("Processing canvas_video_render_cancel message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await
+                {
+                    Ok(resp_json) => serde_json::json!({
+                        "type": "canvas_video_render_cancel_response",
+                        "payload": resp_json
+                    }),
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_VIDEO_ERROR",
+                            "message": e.to_string()
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_video_ready notification (extension -> daemon).
+            if msg_type == "canvas_video_ready" {
+                info!("Processing canvas_video_ready message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let _ = crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await;
+                // No response needed — fire-and-forget.
+                continue;
+            }
+
+            // Handle canvas_video_frame_chunk notification (extension -> daemon).
+            if msg_type == "canvas_video_frame_chunk" {
+                info!("Processing canvas_video_frame_chunk message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let _ = crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await;
+                // No response needed — fire-and-forget.
+                continue;
+            }
+
+            // Page-driven render complete (extension -> daemon).
+            if msg_type == "canvas_video_render_done" {
+                info!("Processing canvas_video_render_done message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let _ = crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await;
+                continue;
+            }
+
+            // Page-driven render failure (extension -> daemon).
+            if msg_type == "canvas_video_render_failed" {
+                info!("Processing canvas_video_render_failed message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let _ = crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await;
+                continue;
+            }
+
+            // Page fetches composition HTML + spec for its job (extension -> daemon).
+            if msg_type == "canvas_video_get_composition" {
+                info!("Processing canvas_video_get_composition message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await
+                {
+                    Ok(val) => serde_json::json!({
+                        "type": "canvas_video_get_composition_response",
+                        "payload": val,
+                    }),
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_VIDEO_ERROR",
                             "message": e.to_string()
                         }
                     }),

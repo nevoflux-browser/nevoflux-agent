@@ -114,6 +114,7 @@ impl PermissionChecker {
     /// | `agent`    | Agent + Internal                 |
     /// | `ui`       | Extension + Internal             |
     /// | `system`   | All                              |
+    /// | `jobs`     | All                              |
     /// | `mcp`      | Agent + Internal                 |
     /// | `wasm`     | Agent + Internal                 |
     /// | (unknown)  | Internal only                    |
@@ -148,7 +149,7 @@ impl PermissionChecker {
                 "{} may not subscribe to cross-prefix wildcard patterns",
                 subscriber_label(subscriber),
             )),
-            "system" => PermissionResult::Allowed,
+            "system" | "jobs" => PermissionResult::Allowed,
             "task" | "agent" | "mcp" | "wasm" => match subscriber {
                 SubscriberIdentity::Agent { .. } => PermissionResult::Allowed,
                 _ => PermissionResult::Denied(format!(

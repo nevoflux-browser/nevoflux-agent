@@ -26,6 +26,7 @@
 pub mod canvas_persist;
 pub mod canvas_share;
 pub mod canvas_tools;
+pub mod canvas_video;
 pub mod channel;
 pub mod chat;
 pub mod common;
