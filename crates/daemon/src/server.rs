@@ -2995,6 +2995,7 @@ async fn handle_event_bus_request(
                 proxy_id: proxy_id.to_string(),
             };
 
+            let pattern_dbg = format!("{:?}", pattern);
             match event_bus.subscribe_with_options(
                 pattern,
                 subscriber,
@@ -3003,6 +3004,12 @@ async fn handle_event_bus_request(
                 opts.replay_sticky,
             ) {
                 Ok(mut sub_handle) => {
+                    tracing::info!(
+                        pattern = %pattern_dbg,
+                        proxy = %proxy_id,
+                        sub = %sub_handle.id,
+                        "EventBus subscribe OK",
+                    );
                     let sub_id = sub_handle.id.clone();
                     let cancel_token = tokio_util::sync::CancellationToken::new();
                     let token_clone = cancel_token.clone();
@@ -3073,10 +3080,18 @@ async fn handle_event_bus_request(
                         patterns: opts.patterns,
                     }
                 }
-                Err(e) => EventBusResponse::Error {
-                    code: "SUBSCRIBE_FAILED".into(),
-                    message: e.to_string(),
-                },
+                Err(e) => {
+                    tracing::warn!(
+                        pattern = %pattern_dbg,
+                        proxy = %proxy_id,
+                        error = %e,
+                        "EventBus subscribe DENIED/FAILED",
+                    );
+                    EventBusResponse::Error {
+                        code: "SUBSCRIBE_FAILED".into(),
+                        message: e.to_string(),
+                    }
+                }
             }
         }
 

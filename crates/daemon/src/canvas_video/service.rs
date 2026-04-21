@@ -286,8 +286,26 @@ impl CanvasVideoService {
     async fn emit(&self, job_id: &str, payload: serde_json::Value) {
         if let Some(bus) = &self.event_bus {
             let topic = format!("jobs:render:{}", job_id);
-            let event = BusEvent::ephemeral(topic, payload, PublisherIdentity::Internal);
-            let _ = bus.publish(event).await;
+            let event_kind = payload.get("event").and_then(|v| v.as_str()).unwrap_or("?");
+            let event = BusEvent::ephemeral(topic.clone(), payload, PublisherIdentity::Internal);
+            match bus.publish(event).await {
+                Ok(_) => tracing::info!(
+                    topic = %topic,
+                    event = %event_kind,
+                    "canvas_video emit publish ok"
+                ),
+                Err(e) => tracing::warn!(
+                    topic = %topic,
+                    event = %event_kind,
+                    error = %e,
+                    "canvas_video emit publish FAILED"
+                ),
+            }
+        } else {
+            tracing::warn!(
+                job_id = %job_id,
+                "canvas_video emit called but event_bus is None — service not wired"
+            );
         }
     }
 
