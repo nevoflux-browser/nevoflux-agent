@@ -304,6 +304,20 @@ pub async fn execute_mcp_tool(
         _ => {}
     }
 
+    // 3'. Canvas video tools (P2)
+    //
+    // ACP-style providers (claude-code, gemini-cli, kimi, openclaw) see
+    // canvas_create_composition / canvas_render_video via the MCP HTTP
+    // bridge and dispatch them through this executor. The corresponding
+    // direct-API-provider path lives in `DaemonHostFunctions::canvas_video_*`
+    // plus the builtin-wasm Agent::execute_tool arm.
+    match name {
+        "canvas_create_composition" | "canvas_render_video" => {
+            return execute_canvas_video_tool(name, arguments, services).await;
+        }
+        _ => {}
+    }
+
     // 4. Memory tools
     match name {
         "memory_search" => return execute_memory_search(arguments, services),
@@ -1001,6 +1015,61 @@ async fn execute_create_artifact(
         "status": "created"
     })
     .to_string())
+}
+
+// ============================================================================
+// 3'. Canvas video tools (P2)
+// ============================================================================
+
+/// Execute `canvas_create_composition` / `canvas_render_video` via the shared
+/// CanvasVideoService on `HostServices`.
+///
+/// Non-blocking: `canvas_render_video` returns a `job_id` immediately; the
+/// render loop emits progress and terminal events on the EventBus channel
+/// `jobs.render.{job_id}`, which the sidebar consumes (see P2 design §3.1).
+///
+/// Mirrors the contract of `DaemonHostFunctions::canvas_video_create_composition`
+/// / `canvas_video_render_start` (agent_host.rs) so both dispatch paths
+/// (builtin-wasm's Agent loop and the ACP MCP bridge) share the same service
+/// and response shape.
+async fn execute_canvas_video_tool(
+    name: &str,
+    arguments: &serde_json::Value,
+    services: &HostServices,
+) -> Result<String, String> {
+    let svc = services
+        .canvas_video_service
+        .as_ref()
+        .ok_or_else(|| "canvas_video service not wired into HostServices".to_string())?;
+
+    match name {
+        "canvas_create_composition" => {
+            let req: nevoflux_protocol::canvas_video::CreateCompositionRequest =
+                serde_json::from_value(arguments.clone())
+                    .map_err(|e| format!("invalid canvas_create_composition args: {}", e))?;
+            let resp = svc
+                .create_composition(req)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_string(&resp)
+                .map_err(|e| format!("serialize canvas_create_composition response: {}", e))
+        }
+        "canvas_render_video" => {
+            let req: nevoflux_protocol::canvas_video::RenderStartRequest =
+                serde_json::from_value(arguments.clone())
+                    .map_err(|e| format!("invalid canvas_render_video args: {}", e))?;
+            let resp = svc
+                .render_start(req)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_string(&resp)
+                .map_err(|e| format!("serialize canvas_render_video response: {}", e))
+        }
+        other => Err(format!(
+            "execute_canvas_video_tool called with unexpected name: {}",
+            other
+        )),
+    }
 }
 
 // ============================================================================

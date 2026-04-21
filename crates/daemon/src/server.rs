@@ -1090,7 +1090,8 @@ pub async fn start_server(
         .with_shared_tool_search(tool_search_index)
         .with_vector_index(vector_index)
         .with_role_registry(role_registry)
-        .with_embedding(Arc::clone(&shared_embedding));
+        .with_embedding(Arc::clone(&shared_embedding))
+        .with_canvas_video_service(canvas_video_service.clone());
     if let Some(retriever) = knowledge_retriever {
         services = services.with_knowledge_retriever(retriever);
     }

@@ -188,6 +188,14 @@ pub struct HostServices {
     pub vector_index: Arc<std::sync::RwLock<SimpleVectorIndex>>,
     /// Session-level memory extractor for marking manual creates.
     pub session_extractor: Option<Arc<crate::learning::session_extractor::SessionMemoryExtractor>>,
+    /// Canvas video render pipeline (P2).
+    ///
+    /// When set, the MCP tool executor dispatches `canvas_create_composition` /
+    /// `canvas_render_video` calls through this service. Required for ACP-style
+    /// providers (claude-code, gemini-cli, kimi, openclaw) whose tool calls
+    /// arrive via `mcp_tool_executor::execute_mcp_tool`; direct-API providers
+    /// reach the same service through `DaemonHostFunctions::canvas_video_*`.
+    pub canvas_video_service: Option<Arc<crate::canvas_video::CanvasVideoService>>,
 }
 
 impl HostServices {
@@ -240,6 +248,7 @@ impl HostServices {
             embedding: Arc::new(std::sync::RwLock::new(None)),
             vector_index: Arc::new(std::sync::RwLock::new(SimpleVectorIndex::new())),
             session_extractor: None,
+            canvas_video_service: None,
         }
     }
 
@@ -271,6 +280,7 @@ impl HostServices {
             embedding: Arc::new(std::sync::RwLock::new(None)),
             vector_index: Arc::new(std::sync::RwLock::new(SimpleVectorIndex::new())),
             session_extractor: None,
+            canvas_video_service: None,
         }
     }
 
@@ -496,6 +506,30 @@ impl HostServices {
         self
     }
 
+    /// Wire the shared canvas video service.
+    ///
+    /// This enables `mcp_tool_executor::execute_mcp_tool` to dispatch
+    /// `canvas_create_composition` / `canvas_render_video` — the tool path
+    /// used by ACP-style providers (claude-code, gemini-cli, kimi, openclaw).
+    /// Without this, those providers' tool calls fall through to
+    /// `Err("unknown tool: ...")` even though the tool schemas are bridged
+    /// into the MCP HTTP surface.
+    ///
+    /// # Arguments
+    ///
+    /// * `svc` - The canvas video service to use.
+    ///
+    /// # Returns
+    ///
+    /// Returns self for method chaining.
+    pub fn with_canvas_video_service(
+        mut self,
+        svc: Arc<crate::canvas_video::CanvasVideoService>,
+    ) -> Self {
+        self.canvas_video_service = Some(svc);
+        self
+    }
+
     /// Check if subagent execution is available.
     pub fn has_subagent_executor(&self) -> bool {
         self.subagent_executor.is_some()
@@ -575,6 +609,10 @@ impl std::fmt::Debug for HostServices {
             .field(
                 "session_extractor",
                 &self.session_extractor.as_ref().map(|_| "Some(...)"),
+            )
+            .field(
+                "canvas_video_service",
+                &self.canvas_video_service.as_ref().map(|_| "Some(...)"),
             )
             .finish()
     }
