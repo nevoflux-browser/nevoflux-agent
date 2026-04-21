@@ -273,7 +273,7 @@ impl CanvasVideoService {
 
     async fn emit(&self, job_id: &str, payload: serde_json::Value) {
         if let Some(bus) = &self.event_bus {
-            let topic = format!("jobs.render.{}", job_id);
+            let topic = format!("jobs:render:{}", job_id);
             let event = BusEvent::ephemeral(topic, payload, PublisherIdentity::Internal);
             let _ = bus.publish(event).await;
         }
