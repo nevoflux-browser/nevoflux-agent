@@ -5341,6 +5341,24 @@ mod tests {
     }
 
     #[test]
+    fn agent_mode_exposes_canvas_video_tools() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        let tools = agent.get_tools_for_mode(AgentMode::Agent);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"canvas_create_composition"),
+            "agent mode missing canvas_create_composition; got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"canvas_render_video"),
+            "agent mode missing canvas_render_video; got {:?}",
+            names
+        );
+    }
+
+    #[test]
     fn test_agent_tools_include_dynamic_tools() {
         let mock = MockHostFunctions::new();
         let agent = Agent::new(mock);
