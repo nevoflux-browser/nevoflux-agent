@@ -2987,6 +2987,34 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     "required": ["id", "old_str", "new_str"]
                 }),
             },
+            ToolDefinition {
+                name: "canvas_create_composition".into(),
+                description: "Create a composition artifact for video rendering. Returns {artifact_id} immediately. Arguments: title (str), width (int 1-1920), height (int 1-1920), duration_sec (number 0.5-60), fps (24|25|30), bg (optional CSS color string), html (optional full composition HTML including any iframe-safe inline scripts and asset references). If html is omitted a minimal scaffold is generated.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "title":        { "type": "string" },
+                        "width":        { "type": "integer", "minimum": 1, "maximum": 1920 },
+                        "height":       { "type": "integer", "minimum": 1, "maximum": 1920 },
+                        "duration_sec": { "type": "number",  "minimum": 0.5, "maximum": 60 },
+                        "fps":          { "type": "integer", "enum": [24, 25, 30] },
+                        "bg":           { "type": ["string", "null"] },
+                        "html":         { "type": ["string", "null"] }
+                    },
+                    "required": ["title", "width", "height", "duration_sec", "fps"]
+                }),
+            },
+            ToolDefinition {
+                name: "canvas_render_video".into(),
+                description: "Kick off a non-blocking video render for the given composition. Returns {job_id} IMMEDIATELY — the render continues in the background for up to 2 minutes at 1080p. Progress and completion are displayed live in the sidebar (the user will see a progress card under this tool call with an in-flight progress bar and a cancel button; on completion the card shows the MP4 path). Do NOT wait for completion — after calling this tool, inform the user that rendering started and where to watch.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "composition_id": { "type": "string" }
+                    },
+                    "required": ["composition_id"]
+                }),
+            },
         ]
     }
 
@@ -5281,6 +5309,35 @@ mod tests {
         let result = agent.execute_tool(&tool_call).unwrap();
         assert!(result.success);
         assert!(result.content.contains("read_file"));
+    }
+
+    #[test]
+    fn chat_mode_exposes_canvas_video_tools() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        let tools = agent.get_chat_tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"canvas_create_composition"),
+            "missing canvas_create_composition; got {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"canvas_render_video"),
+            "missing canvas_render_video; got {:?}",
+            names
+        );
+
+        let render = tools
+            .iter()
+            .find(|t| t.name == "canvas_render_video")
+            .unwrap();
+        assert!(
+            render.description.to_lowercase().contains("sidebar"),
+            "description must mention 'sidebar'; got: {}",
+            render.description
+        );
     }
 
     #[test]
