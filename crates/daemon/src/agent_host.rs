@@ -184,6 +184,11 @@ pub struct DaemonHostFunctions {
         std::sync::Arc<crate::learning::session_extractor::SessionMemoryExtractor>,
     /// Timestamp of the last successful LLM response (for time-gap detection).
     last_response_at: Mutex<Option<std::time::Instant>>,
+    /// Shared canvas video service for non-blocking render pipeline.
+    /// None when this host instance is constructed outside of the server
+    /// (e.g., unit tests). Callers that invoke the canvas_video_* methods
+    /// without wiring the service will receive a host error.
+    canvas_video_service: Option<Arc<crate::canvas_video::CanvasVideoService>>,
     // Note: always_allowed_tools is on HostServices (shared across requests),
     // not here (per-request DaemonHostFunctions).
 }
@@ -223,6 +228,7 @@ impl DaemonHostFunctions {
             current_browser_url: Mutex::new(None),
             session_extractor,
             last_response_at: Mutex::new(None),
+            canvas_video_service: None,
         }
     }
 
@@ -277,6 +283,15 @@ impl DaemonHostFunctions {
         extractor: std::sync::Arc<crate::learning::session_extractor::SessionMemoryExtractor>,
     ) -> Self {
         self.session_extractor = extractor;
+        self
+    }
+
+    /// Wire the shared canvas video service (non-blocking render pipeline).
+    pub fn with_canvas_video_service(
+        mut self,
+        svc: Arc<crate::canvas_video::CanvasVideoService>,
+    ) -> Self {
+        self.canvas_video_service = Some(svc);
         self
     }
 
@@ -4364,6 +4379,68 @@ impl HostFunctions for DaemonHostFunctions {
         *self.model_override_model.lock().unwrap() = Some(model.to_string());
         Ok(())
     }
+
+    fn canvas_video_create_composition(
+        &self,
+        request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        let svc = self
+            .canvas_video_service
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "canvas_video service not wired".into(),
+            })?
+            .clone();
+        let req: nevoflux_protocol::canvas_video::CreateCompositionRequest =
+            serde_json::from_value(request.clone()).map_err(|e| HostError {
+                code: 4,
+                message: format!("invalid canvas_create_composition args: {}", e),
+            })?;
+        let resp = tokio::task::block_in_place(|| {
+            self.runtime
+                .block_on(async move { svc.create_composition(req).await })
+        })
+        .map_err(|e| HostError {
+            code: 3,
+            message: format!("canvas_create_composition failed: {}", e),
+        })?;
+        serde_json::to_value(&resp).map_err(|e| HostError {
+            code: 4,
+            message: format!("serialize canvas_create_composition response: {}", e),
+        })
+    }
+
+    fn canvas_video_render_start(
+        &self,
+        request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        let svc = self
+            .canvas_video_service
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "canvas_video service not wired".into(),
+            })?
+            .clone();
+        let req: nevoflux_protocol::canvas_video::RenderStartRequest =
+            serde_json::from_value(request.clone()).map_err(|e| HostError {
+                code: 4,
+                message: format!("invalid canvas_render_video args: {}", e),
+            })?;
+        let resp = tokio::task::block_in_place(|| {
+            self.runtime
+                .block_on(async move { svc.render_start(req).await })
+        })
+        .map_err(|e| HostError {
+            code: 3,
+            message: format!("canvas_render_video failed: {}", e),
+        })?;
+        serde_json::to_value(&resp).map_err(|e| HostError {
+            code: 4,
+            message: format!("serialize canvas_render_video response: {}", e),
+        })
+    }
 }
 
 impl DaemonHostFunctions {
@@ -4470,6 +4547,7 @@ impl DaemonHostFunctions {
             current_browser_url: Mutex::new(self.current_browser_url.lock().unwrap().clone()),
             session_extractor: self.session_extractor.clone(),
             last_response_at: Mutex::new(self.last_response_at.lock().unwrap().clone()),
+            canvas_video_service: self.canvas_video_service.clone(),
         }
     }
 

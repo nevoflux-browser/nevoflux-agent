@@ -2838,6 +2838,7 @@ pub async fn start_server(
                     let plan_registry = process_plan_registry.clone();
                     let trace_enabled = process_trace_enabled;
                     let extraction_registry = process_extraction_registry.clone();
+                    let canvas_video_service = process_canvas_video_service.clone();
                     tokio::spawn(async move {
                         handle_chat_message_streaming(
                             &payload,
@@ -2856,6 +2857,7 @@ pub async fn start_server(
                             plan_registry,
                             trace_enabled,
                             extraction_registry,
+                            canvas_video_service,
                         )
                         .await;
                     });
@@ -3363,6 +3365,7 @@ async fn handle_chat_message_streaming(
     plan_registry: PlanRequestRegistry,
     trace_enabled: bool,
     extraction_registry: ExtractionRegistry,
+    canvas_video_service: Arc<crate::canvas_video::CanvasVideoService>,
 ) {
     let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -3388,6 +3391,7 @@ async fn handle_chat_message_streaming(
             runtime,
             proxy_id.clone(),
             identity.clone(),
+            canvas_video_service.clone(),
         )
         .await;
         // Add done: true to signal this is a complete response (not streaming)
@@ -3766,7 +3770,8 @@ async fn handle_chat_message_streaming(
         .with_sidebar_stream(stream_tx)
         .with_session_id(session_id.clone())
         .with_trace_collector(trace_collector.clone())
-        .with_session_extractor(session_extractor.clone());
+        .with_session_extractor(session_extractor.clone())
+        .with_canvas_video_service(canvas_video_service.clone());
 
     // Pass skill base path to host for relative path resolution
     if let Some(ref ctx) = skill_context {
@@ -4145,7 +4150,8 @@ async fn handle_chat_message_streaming(
                             .with_sidebar_stream(rerun_stream_tx)
                             .with_session_id(session_id.clone())
                             .with_trace_collector(trace_collector.clone())
-                            .with_session_extractor(session_extractor.clone());
+                            .with_session_extractor(session_extractor.clone())
+                            .with_canvas_video_service(canvas_video_service.clone());
 
                         let rerun_agent = Agent::new(rerun_host);
 
@@ -4902,6 +4908,7 @@ async fn handle_chat_message(
     runtime: tokio::runtime::Handle,
     _proxy_id: String,
     _client_identity: Vec<u8>,
+    canvas_video_service: Arc<crate::canvas_video::CanvasVideoService>,
 ) -> serde_json::Value {
     let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -5213,7 +5220,8 @@ async fn handle_chat_message(
             // Create host functions with config and runtime
             let mut host = DaemonHostFunctions::new(config.clone(), runtime)
                 .with_services(services.clone())
-                .with_session_id(session_id.clone());
+                .with_session_id(session_id.clone())
+                .with_canvas_video_service(canvas_video_service.clone());
 
             // Pass skill base path to host for relative path resolution
             if let Some(ref ctx) = skill_context {

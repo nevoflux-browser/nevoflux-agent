@@ -520,6 +520,31 @@ pub trait HostFunctions {
 
     /// Override the active LLM provider and model for subsequent calls.
     fn set_model_override(&self, provider: &str, model: &str) -> HostResult<()>;
+
+    // =========================================================================
+    // Canvas Video (non-blocking render pipeline)
+    // =========================================================================
+
+    /// Create a composition artifact for video rendering. Returns the
+    /// new artifact_id immediately; the composition HTML is stored
+    /// daemon-side so the render page can later fetch it.
+    ///
+    /// Args/returns are `serde_json::Value` to keep `builtin-wasm`
+    /// independent of `nevoflux-protocol::canvas_video`. The daemon-side
+    /// impl deserializes into the typed request/response structs.
+    fn canvas_video_create_composition(
+        &self,
+        request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value>;
+
+    /// Non-blocking render start. Returns the new `job_id` immediately;
+    /// progress and terminal state are observed by the sidebar via
+    /// EventBus on `jobs:render:{job_id}`. The caller does NOT wait for
+    /// render completion.
+    fn canvas_video_render_start(
+        &self,
+        request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value>;
 }
 
 /// Mock host functions for testing.
@@ -1212,6 +1237,26 @@ impl HostFunctions for MockHostFunctions {
 
     fn set_model_override(&self, _provider: &str, _model: &str) -> HostResult<()> {
         Ok(())
+    }
+
+    fn canvas_video_create_composition(
+        &self,
+        _request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        Err(HostError {
+            code: 501,
+            message: "canvas_video_create_composition not implemented in MockHostFunctions".into(),
+        })
+    }
+
+    fn canvas_video_render_start(
+        &self,
+        _request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        Err(HostError {
+            code: 501,
+            message: "canvas_video_render_start not implemented in MockHostFunctions".into(),
+        })
     }
 }
 
