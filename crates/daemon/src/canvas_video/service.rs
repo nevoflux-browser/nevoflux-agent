@@ -316,10 +316,66 @@ impl CanvasVideoService {
         )
         .await;
     }
+
+    pub async fn emit_cancelled(&self, job_id: &str, current: u32, total: u32) {
+        self.emit(
+            job_id,
+            serde_json::json!({
+                "event": "cancelled",
+                "job_id": job_id,
+                "current": current,
+                "total": total,
+            }),
+        )
+        .await;
+    }
 }
 
 impl Default for CanvasVideoService {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod p2_emit_tests {
+    use super::*;
+    use crate::event_bus::{BackpressurePolicy, EventBus, SubscriberIdentity};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn emit_cancelled_publishes_event_with_frame_counts() {
+        let bus = Arc::new(EventBus::new());
+        let svc = Arc::new(
+            CanvasVideoService::new_for_tests().with_event_bus(bus.clone()),
+        );
+
+        // Subscribe BEFORE emitting so we capture the delivery.
+        let pattern = crate::event_bus::types::TopicPattern::wildcard("jobs:render:*");
+        let mut sub = bus
+            .subscribe(
+                pattern,
+                SubscriberIdentity::Internal,
+                BackpressurePolicy::DropOldest,
+                64,
+            )
+            .expect("subscribe");
+
+        svc.emit_cancelled("job-abc", 42, 150).await;
+
+        let delivered = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            sub.rx.recv(),
+        )
+        .await
+        .expect("timeout")
+        .expect("delivery");
+
+        assert_eq!(delivered.topic, "jobs:render:job-abc");
+        let body = &delivered.payload;
+        assert_eq!(body["event"], "cancelled");
+        assert_eq!(body["job_id"], "job-abc");
+        assert_eq!(body["current"], 42);
+        assert_eq!(body["total"], 150);
     }
 }
