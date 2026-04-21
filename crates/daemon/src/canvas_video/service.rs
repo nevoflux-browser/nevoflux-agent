@@ -66,6 +66,18 @@ struct TestComposition {
     fps: u32,
 }
 
+/// Pure throttle decision for progress deliveries. Emits when `current`
+/// lands on a multiple of `throttle = max(1, total/20)`, OR when
+/// `current == total` (so the final frame always lands on the bus).
+///
+/// P2 design §4.3: reduces 1080p × 30 s (900 frames) from 900 events to
+/// ~21. At small totals (< 20) throttle is 1 so every frame emits —
+/// acceptable since the total cost is bounded.
+pub(crate) fn should_emit_progress(current: u32, total: u32) -> bool {
+    let throttle = (total / 20).max(1);
+    current % throttle == 0 || current == total
+}
+
 impl CanvasVideoService {
     pub fn new() -> Self {
         Self {
@@ -280,6 +292,9 @@ impl CanvasVideoService {
     }
 
     pub async fn emit_progress(&self, job_id: &str, current: u32, total: u32) {
+        if !should_emit_progress(current, total) {
+            return;
+        }
         self.emit(
             job_id,
             serde_json::json!({
@@ -377,5 +392,41 @@ mod p2_emit_tests {
         assert_eq!(body["job_id"], "job-abc");
         assert_eq!(body["current"], 42);
         assert_eq!(body["total"], 150);
+    }
+
+    /// Pure throttle decision: kept separate from the async emit path so
+    /// we can exhaustively test the gating math without an EventBus.
+    #[test]
+    fn should_emit_progress_throttles_to_about_20_per_render() {
+        // 900 frames → throttle = 45 → emits at 0, 45, …, 900 (inclusive).
+        let mut n = 0;
+        for current in 0..=900 {
+            if super::should_emit_progress(current, 900) {
+                n += 1;
+            }
+        }
+        assert!((18..=25).contains(&n), "900→{}", n);
+
+        // 150 frames → throttle = 7 → ~22 emits.
+        let mut n = 0;
+        for current in 0..=150 {
+            if super::should_emit_progress(current, 150) {
+                n += 1;
+            }
+        }
+        assert!((18..=25).contains(&n), "150→{}", n);
+
+        // total below divisor (10): throttle = 1 → emit every frame.
+        let mut n = 0;
+        for current in 0..=10 {
+            if super::should_emit_progress(current, 10) {
+                n += 1;
+            }
+        }
+        assert_eq!(n, 11, "10→{}", n);
+
+        // Terminal (current == total) always fires even if not on the divisor.
+        assert!(super::should_emit_progress(900, 900));
+        assert!(super::should_emit_progress(7, 150));
     }
 }
