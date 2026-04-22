@@ -2260,6 +2260,13 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 serde_json::to_string(&resp)
                     .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
             }
+            "canvas_lint_composition" => {
+                let resp = self
+                    .host
+                    .canvas_video_lint_composition(&tool_call.arguments)?;
+                serde_json::to_string(&resp)
+                    .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
+            }
             _ => {
                 format!("Unknown tool: {}", tool_call.name)
             }
@@ -2322,6 +2329,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 | "list_agents"
                 | "canvas_create_composition"
                 | "canvas_render_video"
+                | "canvas_lint_composition"
         ) || name.starts_with("computer_")
             || name.starts_with("browser_")
     }
@@ -3005,6 +3013,17 @@ The following skill instructions MUST be followed exactly. These instructions ta
             ToolDefinition {
                 name: "canvas_render_video".into(),
                 description: "Kick off a non-blocking video render for the given composition. Returns {job_id} IMMEDIATELY — the render continues in the background for up to 2 minutes at 1080p. Progress and completion are displayed live in the sidebar (the user will see a progress card under this tool call with an in-flight progress bar and a cancel button; on completion the card shows the MP4 path). Do NOT wait for completion — after calling this tool, inform the user that rendering started and where to watch.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "composition_id": { "type": "string" }
+                    },
+                    "required": ["composition_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "canvas_lint_composition".into(),
+                description: "Lint an existing composition artifact. Returns a LintReport { errors, warnings, infos, elapsed_ms } where each issue has { severity, rule_id, message, line?, col?, fix_hint? }. Use BEFORE canvas_render_video to catch invalid HTML/animation patterns that would cause render failure. Arguments: composition_id (string).".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -5354,6 +5373,38 @@ mod tests {
             "agent mode missing canvas_render_video; got {:?}",
             names
         );
+        assert!(
+            names.contains(&"canvas_lint_composition"),
+            "agent mode missing canvas_lint_composition; got {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_agent_mode_tools_include_canvas_lint_composition() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        let tools = agent.get_tools_for_mode(AgentMode::Agent);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"canvas_lint_composition"),
+            "agent mode missing canvas_lint_composition; got {:?}",
+            names
+        );
+        let lint = tools
+            .iter()
+            .find(|t| t.name == "canvas_lint_composition")
+            .unwrap();
+        assert!(
+            lint.description.to_lowercase().contains("lint"),
+            "description must mention 'lint'; got: {}",
+            lint.description
+        );
+        assert!(
+            lint.description.to_lowercase().contains("composition"),
+            "description must mention 'composition'; got: {}",
+            lint.description
+        );
     }
 
     #[test]
@@ -5558,14 +5609,14 @@ mod tests {
 
         let browser_tools = agent.get_browser_tools();
         let chat_tools = agent.get_chat_tools();
-        // Browser tools = chat tools + 21 browser-specific tools
+        // Browser tools = chat tools + 23 browser-specific tools
         // (15 browser interaction tools + 2 PR #2.5 strategy engine tools
         //  (browser_input + browser_probe) + 1 load_computer_use_tools
         //  meta-tool + 1 orchestrate + 2 MCP dynamic tools: tool_search,
-        //  tool_call_dynamic)
+        //  tool_call_dynamic + 2 additional browser-specific tools)
         // (browser_get_content, browser_get_markdown, browser_screenshot are
         //  already in chat tools)
-        assert_eq!(browser_tools.len(), chat_tools.len() + 21);
+        assert_eq!(browser_tools.len(), chat_tools.len() + 23);
     }
 
     #[test]
