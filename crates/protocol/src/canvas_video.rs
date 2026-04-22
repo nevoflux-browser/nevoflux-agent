@@ -174,7 +174,9 @@ impl CompositionMeta {
             return Err(CompositionMetaError::InvalidFps(self.spec.fps));
         }
         if !(0.5..=60.0).contains(&self.spec.duration_sec) {
-            return Err(CompositionMetaError::InvalidDuration(self.spec.duration_sec));
+            return Err(CompositionMetaError::InvalidDuration(
+                self.spec.duration_sec,
+            ));
         }
         if self.spec.width == 0
             || self.spec.width > 1920
@@ -248,8 +250,10 @@ mod meta_tests {
             kind: CompositionKind::Composition,
             version: 1,
             spec: CompositionSpec {
-                width: 1920, height: 1080,
-                duration_sec: 30.0, fps: 30,
+                width: 1920,
+                height: 1080,
+                duration_sec: 30.0,
+                fps: 30,
                 bg: Some("#000000".into()),
             },
             origin: CompositionOrigin {
@@ -281,16 +285,29 @@ mod meta_tests {
     #[test]
     fn test_composition_meta_validate_hard_limits() {
         let mut m = CompositionMeta {
-            kind: CompositionKind::Composition, version: 1,
-            spec: CompositionSpec { width: 1920, height: 1080, duration_sec: 30.0, fps: 30, bg: None },
-            origin: CompositionOrigin { template: None, created_with: "t".into(), created_at: 0 },
+            kind: CompositionKind::Composition,
+            version: 1,
+            spec: CompositionSpec {
+                width: 1920,
+                height: 1080,
+                duration_sec: 30.0,
+                fps: 30,
+                bg: None,
+            },
+            origin: CompositionOrigin {
+                template: None,
+                created_with: "t".into(),
+                created_at: 0,
+            },
         };
         assert!(m.validate_hard_limits().is_ok());
         m.spec.fps = 60;
         assert!(m.validate_hard_limits().is_err());
-        m.spec.fps = 30; m.spec.duration_sec = 90.0;
+        m.spec.fps = 30;
+        m.spec.duration_sec = 90.0;
         assert!(m.validate_hard_limits().is_err());
-        m.spec.duration_sec = 30.0; m.spec.width = 3000;
+        m.spec.duration_sec = 30.0;
+        m.spec.width = 3000;
         assert!(m.validate_hard_limits().is_err());
     }
 
@@ -300,7 +317,8 @@ mod meta_tests {
             severity: LintSeverity::Warning,
             rule_id: "nf/cdn-whitelist".into(),
             message: "bad cdn".into(),
-            line: Some(14), col: Some(3),
+            line: Some(14),
+            col: Some(3),
             fix_hint: Some("use esm.sh".into()),
         };
         let s = serde_json::to_string(&i).unwrap();
