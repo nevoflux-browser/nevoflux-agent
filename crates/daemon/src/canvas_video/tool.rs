@@ -199,12 +199,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_register_adds_both_tools() {
+    async fn test_register_adds_all_three_tools() {
         let svc = Arc::new(CanvasVideoService::new_for_tests());
         let mut registry = ToolRegistry::empty();
         register(&mut registry, svc);
         assert!(registry.has_tool("canvas_create_composition"));
         assert!(registry.has_tool("canvas_render_video"));
+        assert!(registry.has_tool("canvas_lint_composition"));
     }
 
     #[test]
@@ -216,17 +217,6 @@ mod tests {
         assert_eq!(props["duration_sec"]["maximum"], 60);
         let fps_enum = props["fps"]["enum"].as_array().unwrap();
         assert_eq!(fps_enum.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn test_canvas_lint_composition_tool_registered() {
-        let svc = Arc::new(CanvasVideoService::new_for_tests());
-        let mut registry = ToolRegistry::empty();
-        register(&mut registry, svc);
-        assert!(
-            registry.has_tool("canvas_lint_composition"),
-            "canvas_lint_composition must be in the registry after register()"
-        );
     }
 
     #[tokio::test]
