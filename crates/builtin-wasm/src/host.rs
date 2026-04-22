@@ -1271,7 +1271,7 @@ impl HostFunctions for MockHostFunctions {
         _request: &serde_json::Value,
     ) -> HostResult<serde_json::Value> {
         Err(HostError {
-            code: 3,
+            code: 501,
             message: "canvas_video_lint_composition not implemented in MockHostFunctions".into(),
         })
     }
