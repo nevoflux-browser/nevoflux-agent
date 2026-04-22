@@ -39,9 +39,6 @@ pub enum FrameSignal {
 
 pub struct CanvasVideoService {
     jobs: JobRegistry,
-    /// Maps artifact_id -> composition spec + HTML.
-    /// Phase B replaces with real artifact repo.
-    test_compositions: Mutex<HashMap<String, TestComposition>>,
     /// If true, render_start returns immediately without page-bridge interaction.
     bridge_stub: bool,
 
@@ -66,15 +63,6 @@ pub struct CanvasVideoService {
     skills: Option<Arc<RwLock<SkillRegistry>>>,
 }
 
-#[derive(Clone)]
-struct TestComposition {
-    html: String,
-    width: u32,
-    height: u32,
-    duration_sec: f32,
-    fps: u32,
-}
-
 /// Pure throttle decision for progress deliveries. Emits when `current`
 /// lands on a multiple of `throttle = max(1, total/20)`, OR when
 /// `current == total` (so the final frame always lands on the bus).
@@ -91,7 +79,6 @@ impl CanvasVideoService {
     pub fn new() -> Self {
         Self {
             jobs: JobRegistry::new(),
-            test_compositions: Mutex::new(Default::default()),
             bridge_stub: false,
             chunk_buffers: Mutex::new(Default::default()),
             signal_senders: Mutex::new(Default::default()),
@@ -105,7 +92,6 @@ impl CanvasVideoService {
         let storage = Storage::open_in_memory().expect("new_for_tests: in-memory Storage");
         Self {
             jobs: JobRegistry::new(),
-            test_compositions: Mutex::new(Default::default()),
             bridge_stub: true,
             chunk_buffers: Mutex::new(Default::default()),
             signal_senders: Mutex::new(Default::default()),
@@ -185,7 +171,7 @@ impl CanvasVideoService {
             .files
             .as_ref()
             .ok_or_else(|| DaemonError::InvalidComposition {
-                reason: "no files map".into(),
+                reason: "no files map (not a composition artifact)".into(),
             })?;
 
         let meta_raw =
