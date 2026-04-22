@@ -16,6 +16,10 @@ pub struct CreateCompositionRequest {
     /// P2 adds template-driven authoring.
     #[serde(default)]
     pub html: Option<String>,
+    #[serde(default)]
+    pub template: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,5 +329,31 @@ mod meta_tests {
         let back: LintIssue = serde_json::from_str(&s).unwrap();
         assert_eq!(back.severity, LintSeverity::Warning);
         assert_eq!(back.rule_id, "nf/cdn-whitelist");
+    }
+
+    #[test]
+    fn test_create_request_accepts_template_and_session_id() {
+        let v = serde_json::json!({
+            "title": "t",
+            "width": 640, "height": 360,
+            "duration_sec": 5.0, "fps": 30,
+            "template": "product-intro-16x9",
+            "session_id": "sess-abc"
+        });
+        let r: CreateCompositionRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(r.template.as_deref(), Some("product-intro-16x9"));
+        assert_eq!(r.session_id.as_deref(), Some("sess-abc"));
+    }
+
+    #[test]
+    fn test_create_request_backward_compat_without_new_fields() {
+        let v = serde_json::json!({
+            "title": "t",
+            "width": 640, "height": 360,
+            "duration_sec": 5.0, "fps": 30
+        });
+        let r: CreateCompositionRequest = serde_json::from_value(v).unwrap();
+        assert!(r.template.is_none());
+        assert!(r.session_id.is_none());
     }
 }
