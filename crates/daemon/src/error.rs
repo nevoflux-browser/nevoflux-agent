@@ -76,6 +76,25 @@ pub enum DaemonError {
     /// Invalid request (permanent).
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
+
+    /// Skill asset not found.
+    #[error("skill asset not found: skill={skill}, path={path}")]
+    SkillAssetNotFound { skill: String, path: String },
+
+    /// Invalid composition.
+    #[error("invalid composition: {reason}")]
+    InvalidComposition { reason: String },
+
+    /// Lint timeout for composition.
+    #[error("lint timeout for composition {composition_id}")]
+    LintTimeout { composition_id: String },
+
+    /// Template substitution failed.
+    #[error("template substitution failed for '{template}': missing placeholders {missing:?}")]
+    TemplateSubstitutionFailed {
+        template: String,
+        missing: Vec<String>,
+    },
 }
 
 impl Retryable for DaemonError {
