@@ -1075,16 +1075,30 @@ pub async fn start_server(
         ))
     };
 
+    // Shared skill registry — created once here and handed to both
+    // CanvasVideoService (so T6/T7 can read templates) and HostServices
+    // (which previously built its own internal copy).
+    let shared_skills = {
+        let mut registry = nevoflux_skills::SkillRegistry::new();
+        if let Err(e) = registry.load() {
+            tracing::warn!("canvas_video: failed to load skills: {}", e);
+        }
+        Arc::new(tokio::sync::RwLock::new(registry))
+    };
+
     // Canvas Video Service (video render pipeline).
     // Wire in the EventBus so emit_progress / emit_succeeded / emit_failed
     // actually publish on jobs.render.{job_id}. Without this, subscribers
     // (sidebar, PoC gate test) never see terminal events even though the
     // render loop finishes and writes the MP4.
     let canvas_video_service = Arc::new(
-        crate::canvas_video::CanvasVideoService::new().with_event_bus(event_bus.clone()),
+        crate::canvas_video::CanvasVideoService::new()
+            .with_event_bus(event_bus.clone())
+            .with_storage(session_manager.shared_storage())
+            .with_skills(shared_skills.clone()),
     );
 
-    let mut services = HostServices::new(Arc::new(db))
+    let mut services = HostServices::with_skills(Arc::new(db), shared_skills)
         .with_browser_sender(browser_tx)
         .with_mcp_manager(mcp_manager)
         .with_shared_tool_search(tool_search_index)
@@ -2598,8 +2612,7 @@ pub async fn start_server(
                         "type": "canvas_video_open_render_tab",
                         "payload": { "job_id": job_id }
                     });
-                    let broadcast_env =
-                        DaemonEnvelope::broadcast(channel, broadcast_payload);
+                    let broadcast_env = DaemonEnvelope::broadcast(channel, broadcast_payload);
                     let _ = process_response_tx
                         .send((b"*".to_vec(), broadcast_env))
                         .await;
@@ -3112,8 +3125,8 @@ async fn handle_event_bus_request(
                     patterns: opts.patterns,
                 }
             } else {
-                let (pat, msg) = first_error
-                    .unwrap_or_else(|| ("?".to_string(), "unknown".to_string()));
+                let (pat, msg) =
+                    first_error.unwrap_or_else(|| ("?".to_string(), "unknown".to_string()));
                 EventBusResponse::Error {
                     code: "SUBSCRIBE_FAILED".into(),
                     message: format!("all patterns failed; first: {} — {}", pat, msg),

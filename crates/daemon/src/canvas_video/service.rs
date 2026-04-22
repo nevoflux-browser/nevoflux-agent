@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::canvas_video::{
     create,
@@ -23,6 +23,8 @@ use nevoflux_protocol::canvas_video::{
     CreateCompositionRequest, CreateCompositionResponse, RenderFrameChunk, RenderStartRequest,
     RenderStartResponse,
 };
+use nevoflux_skills::SkillRegistry;
+use nevoflux_storage::Storage;
 
 /// Single-stream signal the render loop consumes for a given job.
 #[derive(Debug)]
@@ -44,7 +46,6 @@ pub struct CanvasVideoService {
     bridge_stub: bool,
 
     // --- bridge-side async coordination ---
-
     /// job_id -> ChunkBuffer accumulating incoming frame chunk pieces.
     chunk_buffers: Mutex<HashMap<String, ChunkBuffer>>,
 
@@ -55,6 +56,14 @@ pub struct CanvasVideoService {
     /// EventBus handle for jobs.render.{id} progress + terminal events.
     /// None in stub / test mode; emits become no-ops.
     event_bus: Option<Arc<EventBus>>,
+
+    /// Persistent artifact storage. Set by server.rs via `with_storage`; used
+    /// by T6 to persist compositions to the artifact repo.
+    storage: Option<Arc<Storage>>,
+
+    /// Skill registry for reading auxiliary files (templates, DESIGN-template).
+    /// Shared with HostServices so both see the same loaded registry.
+    skills: Option<Arc<RwLock<SkillRegistry>>>,
 }
 
 #[derive(Clone)]
@@ -87,10 +96,13 @@ impl CanvasVideoService {
             chunk_buffers: Mutex::new(Default::default()),
             signal_senders: Mutex::new(Default::default()),
             event_bus: None,
+            storage: None,
+            skills: None,
         }
     }
 
     pub fn new_for_tests() -> Self {
+        let storage = Storage::open_in_memory().expect("new_for_tests: in-memory Storage");
         Self {
             jobs: JobRegistry::new(),
             test_compositions: Mutex::new(Default::default()),
@@ -98,6 +110,8 @@ impl CanvasVideoService {
             chunk_buffers: Mutex::new(Default::default()),
             signal_senders: Mutex::new(Default::default()),
             event_bus: None,
+            storage: Some(Arc::new(storage)),
+            skills: Some(Arc::new(RwLock::new(SkillRegistry::new()))),
         }
     }
 
@@ -106,6 +120,28 @@ impl CanvasVideoService {
     pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
         self.event_bus = Some(bus);
         self
+    }
+
+    /// Builder: attach the shared artifact storage (used by T6 to persist compositions).
+    pub fn with_storage(mut self, storage: Arc<Storage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// Builder: attach the shared skill registry (used by T7 to read templates/DESIGN-template).
+    pub fn with_skills(mut self, skills: Arc<RwLock<SkillRegistry>>) -> Self {
+        self.skills = Some(skills);
+        self
+    }
+
+    /// Return a reference to the artifact storage, if configured.
+    pub fn storage(&self) -> Option<&Arc<Storage>> {
+        self.storage.as_ref()
+    }
+
+    /// Return a reference to the skill registry, if configured.
+    pub fn skills(&self) -> Option<&Arc<RwLock<SkillRegistry>>> {
+        self.skills.as_ref()
     }
 
     pub fn bridge_is_stub(&self) -> bool {
@@ -146,9 +182,7 @@ impl CanvasVideoService {
             .await
             .get(id)
             .map(|c| c.html.clone())
-            .ok_or_else(|| {
-                DaemonError::InvalidRequest(format!("composition not found: {}", id))
-            })
+            .ok_or_else(|| DaemonError::InvalidRequest(format!("composition not found: {}", id)))
     }
 
     pub async fn composition_spec(&self, id: &str) -> Result<(u32, u32, f32, u32)> {
@@ -157,9 +191,7 @@ impl CanvasVideoService {
             .await
             .get(id)
             .map(|c| (c.width, c.height, c.duration_sec, c.fps))
-            .ok_or_else(|| {
-                DaemonError::InvalidRequest(format!("composition not found: {}", id))
-            })
+            .ok_or_else(|| DaemonError::InvalidRequest(format!("composition not found: {}", id)))
     }
 
     pub async fn render_start(
@@ -375,6 +407,36 @@ impl Default for CanvasVideoService {
 }
 
 #[cfg(test)]
+mod p3_deps_tests {
+    use super::*;
+    use nevoflux_skills::SkillRegistry;
+    use nevoflux_storage::Storage;
+    use std::sync::Arc;
+    use tokio::sync::RwLock as TokioRwLock;
+
+    #[tokio::test]
+    async fn new_for_tests_has_storage_and_skills() {
+        let svc = CanvasVideoService::new_for_tests();
+        assert!(svc.storage().is_some(), "test service must carry Storage");
+        assert!(
+            svc.skills().is_some(),
+            "test service must carry SkillRegistry"
+        );
+    }
+
+    #[tokio::test]
+    async fn builders_install_storage_and_skills() {
+        let storage = Arc::new(Storage::open_in_memory().expect("new Storage"));
+        let skills = Arc::new(TokioRwLock::new(SkillRegistry::new()));
+        let svc = CanvasVideoService::new()
+            .with_storage(storage.clone())
+            .with_skills(skills.clone());
+        assert!(Arc::ptr_eq(svc.storage().unwrap(), &storage));
+        assert!(Arc::ptr_eq(svc.skills().unwrap(), &skills));
+    }
+}
+
+#[cfg(test)]
 mod p2_emit_tests {
     use super::*;
     use crate::event_bus::{BackpressurePolicy, EventBus, SubscriberIdentity};
@@ -383,9 +445,7 @@ mod p2_emit_tests {
     #[tokio::test]
     async fn emit_cancelled_publishes_event_with_frame_counts() {
         let bus = Arc::new(EventBus::new());
-        let svc = Arc::new(
-            CanvasVideoService::new_for_tests().with_event_bus(bus.clone()),
-        );
+        let svc = Arc::new(CanvasVideoService::new_for_tests().with_event_bus(bus.clone()));
 
         // Subscribe BEFORE emitting so we capture the delivery.
         let pattern = crate::event_bus::types::TopicPattern::wildcard("jobs:render:*");
@@ -400,13 +460,10 @@ mod p2_emit_tests {
 
         svc.emit_cancelled("job-abc", 42, 150).await;
 
-        let delivered = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            sub.rx.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("delivery");
+        let delivered = tokio::time::timeout(std::time::Duration::from_millis(200), sub.rx.recv())
+            .await
+            .expect("timeout")
+            .expect("delivery");
 
         assert_eq!(delivered.topic, "jobs:render:job-abc");
         let body = &delivered.payload;
