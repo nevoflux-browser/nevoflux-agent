@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 use crate::canvas_video::{
     create,
@@ -20,8 +20,8 @@ use crate::canvas_video::{
 use crate::error::{DaemonError, Result};
 use crate::event_bus::{BusEvent, EventBus, PublisherIdentity};
 use nevoflux_protocol::canvas_video::{
-    CreateCompositionRequest, CreateCompositionResponse, RenderFrameChunk, RenderStartRequest,
-    RenderStartResponse,
+    CreateCompositionRequest, CreateCompositionResponse, LintReport, RenderFrameChunk,
+    RenderStartRequest, RenderStartResponse,
 };
 use nevoflux_skills::SkillRegistry;
 use nevoflux_storage::Storage;
@@ -61,6 +61,10 @@ pub struct CanvasVideoService {
     /// Skill registry for reading auxiliary files (templates, DESIGN-template).
     /// Shared with HostServices so both see the same loaded registry.
     skills: Option<Arc<RwLock<SkillRegistry>>>,
+
+    /// Pending lint correlators: correlator -> oneshot sender for the lint result.
+    /// Inserted by `lint_composition`, removed by `on_lint_result` or on timeout.
+    lint_correlators: Mutex<HashMap<String, oneshot::Sender<LintReport>>>,
 }
 
 /// Pure throttle decision for progress deliveries. Emits when `current`
@@ -85,6 +89,7 @@ impl CanvasVideoService {
             event_bus: None,
             storage: None,
             skills: None,
+            lint_correlators: Mutex::new(Default::default()),
         }
     }
 
@@ -98,6 +103,7 @@ impl CanvasVideoService {
             event_bus: None,
             storage: Some(Arc::new(storage)),
             skills: Some(Arc::new(RwLock::new(SkillRegistry::new()))),
+            lint_correlators: Mutex::new(Default::default()),
         }
     }
 
@@ -319,6 +325,79 @@ impl CanvasVideoService {
             .await
             .ok_or_else(|| DaemonError::InvalidRequest(format!("job not found: {job_id}")))?;
         self.load_composition(&snap.composition_id).await
+    }
+
+    // --- Lint correlator plumbing ---
+
+    /// Request a lint pass for the given composition.
+    ///
+    /// Publishes a lint request event on the EventBus (if wired) and awaits
+    /// a `LintReport` from the extension via `on_lint_result`. Times out
+    /// after 5 seconds if no resolver calls `on_lint_result`.
+    pub async fn lint_composition(self: &Arc<Self>, composition_id: &str) -> Result<LintReport> {
+        let (html, _w, _h, _d, _fps) = self.load_composition(composition_id).await?;
+        let correlator = uuid::Uuid::new_v4().simple().to_string();
+        let (tx, rx) = oneshot::channel();
+        self.lint_correlators
+            .lock()
+            .await
+            .insert(correlator.clone(), tx);
+
+        // Publish the lint request on the EventBus so Task 12 (TCP server glue)
+        // can pick it up and forward to the extension. Skip in test mode where
+        // event_bus is None; tests resolve correlators directly via on_lint_result.
+        if let Some(bus) = &self.event_bus {
+            let topic = format!("jobs:lint:request:{correlator}");
+            let payload = serde_json::json!({
+                "event": "lint_request",
+                "job_correlator": correlator,
+                "composition_id": composition_id,
+                "composition_html": html,
+            });
+            let event = BusEvent::ephemeral(topic, payload, PublisherIdentity::Internal);
+            let _ = bus.publish(event).await;
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+            Ok(Ok(report)) => Ok(report),
+            Ok(Err(_)) => {
+                // Sender was dropped before we received a result.
+                self.lint_correlators.lock().await.remove(&correlator);
+                Err(DaemonError::InternalError(
+                    "lint oneshot dropped before resolve".into(),
+                ))
+            }
+            Err(_) => {
+                // Timeout: remove the dangling correlator entry.
+                self.lint_correlators.lock().await.remove(&correlator);
+                Err(DaemonError::LintTimeout {
+                    composition_id: composition_id.to_string(),
+                })
+            }
+        }
+    }
+
+    /// Called when the extension delivers a lint result for a pending correlator.
+    ///
+    /// Resolves the oneshot receiver held by `lint_composition`. If the
+    /// correlator is unknown (e.g. the caller already timed out), logs a
+    /// warning and does nothing.
+    pub async fn on_lint_result(&self, correlator: &str, report: LintReport) {
+        if let Some(tx) = self.lint_correlators.lock().await.remove(correlator) {
+            let _ = tx.send(report);
+        } else {
+            tracing::warn!(
+                correlator,
+                "lint result for unknown correlator — already timed out or duplicate"
+            );
+        }
+    }
+
+    /// Returns the first pending lint correlator key, for use in tests that
+    /// need to simulate an extension response without a real EventBus.
+    #[cfg(test)]
+    pub async fn peek_pending_lint_correlator(&self) -> Option<String> {
+        self.lint_correlators.lock().await.keys().next().cloned()
     }
 
     // --- EventBus emitters ---
