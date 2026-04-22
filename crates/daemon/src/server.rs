@@ -1406,6 +1406,42 @@ pub async fn start_server(
         }
     });
 
+    // --- P3: forward canvas_video lint requests to proxies ---------------
+    // The CanvasVideoService publishes jobs:lint:request:{correlator} on the
+    // EventBus when lint_composition runs.  We subscribe here and forward each
+    // event as a canvas_video_lint_request TCP broadcast so the extension's
+    // background handler (Task 22) can run the linter and reply with
+    // canvas_video_lint_result.
+    {
+        let lint_bus = event_bus.clone();
+        let lint_tx = response_tx.clone();
+        tokio::spawn(async move {
+            use crate::event_bus::types::TopicPattern;
+            use crate::event_bus::{BackpressurePolicy, SubscriberIdentity};
+            let pattern = TopicPattern::wildcard("jobs:lint:request:*");
+            let mut sub = match lint_bus.subscribe(
+                pattern,
+                SubscriberIdentity::Internal,
+                BackpressurePolicy::DropOldest,
+                64,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "canvas_video lint bus subscribe failed");
+                    return;
+                }
+            };
+            while let Some(delivery) = sub.rx.recv().await {
+                let broadcast = serde_json::json!({
+                    "type": "canvas_video_lint_request",
+                    "payload": delivery.payload,
+                });
+                let env = DaemonEnvelope::broadcast(Channel::Chat, broadcast);
+                let _ = lint_tx.send((b"*".to_vec(), env)).await;
+            }
+        });
+    }
+
     // Spawn message processing loop
     let process_router = router.clone();
     let process_response_tx = response_tx.clone();
@@ -2653,6 +2689,64 @@ pub async fn start_server(
                 let response =
                     DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
                 let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_video_lint_composition request.
+            if msg_type == "canvas_video_lint_composition" {
+                info!("Processing canvas_video_lint_composition message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await
+                {
+                    Ok(resp_json) => serde_json::json!({
+                        "type": "canvas_video_lint_composition_response",
+                        "payload": resp_json
+                    }),
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_VIDEO_ERROR",
+                            "message": e.to_string()
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_video_lint_result — the extension's reply to a
+            // broadcast lint request. Resolves the correlator's oneshot.
+            if msg_type == "canvas_video_lint_result" {
+                info!("Processing canvas_video_lint_result message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let correlator = payload
+                    .get("job_correlator")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let report: nevoflux_protocol::canvas_video::LintReport = payload
+                    .get("report")
+                    .and_then(|r| serde_json::from_value(r.clone()).ok())
+                    .unwrap_or_default();
+                process_canvas_video_service
+                    .on_lint_result(&correlator, report)
+                    .await;
+                // No response — fire-and-forget.
                 continue;
             }
 
