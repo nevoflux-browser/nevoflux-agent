@@ -161,17 +161,61 @@ impl CanvasVideoService {
         create::create(self, req).await
     }
 
-    // TEMP stub — replaced in Task 7 by load_composition-backed lookup.
-    pub async fn read_composition_html(&self, id: &str) -> Result<String> {
-        Err(DaemonError::InternalError(format!(
-            "composition lookup not yet wired through ArtifactRepository for id {id}"
-        )))
-    }
+    /// Load a composition from the artifact repository and return (html, w, h, d, fps).
+    pub async fn load_composition(
+        &self,
+        composition_id: &str,
+    ) -> Result<(String, u32, u32, f32, u32)> {
+        use nevoflux_protocol::canvas_video::CompositionMeta;
+        use nevoflux_storage::repositories::ArtifactRepository;
 
-    // TEMP stub — replaced in Task 7 by load_composition-backed lookup.
-    pub async fn composition_spec(&self, _id: &str) -> Result<(u32, u32, f32, u32)> {
-        Err(DaemonError::InternalError(
-            "composition_spec not yet wired through ArtifactRepository".into(),
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| DaemonError::InternalError("canvas_video: storage not wired".into()))?;
+        let repo = ArtifactRepository::new(storage.database());
+        let rec = repo
+            .get(composition_id)
+            .map_err(|e| DaemonError::InternalError(format!("{e}")))?
+            .ok_or_else(|| {
+                DaemonError::InvalidRequest(format!("composition not found: {composition_id}"))
+            })?;
+
+        let files = rec
+            .files
+            .as_ref()
+            .ok_or_else(|| DaemonError::InvalidComposition {
+                reason: "no files map".into(),
+            })?;
+
+        let meta_raw =
+            files
+                .get("composition.meta.json")
+                .ok_or_else(|| DaemonError::InvalidComposition {
+                    reason: "missing composition.meta.json".into(),
+                })?;
+        let meta: CompositionMeta =
+            serde_json::from_str(meta_raw).map_err(|e| DaemonError::InvalidComposition {
+                reason: format!("malformed meta: {e}"),
+            })?;
+        meta.validate_hard_limits()
+            .map_err(|e| DaemonError::InvalidComposition {
+                reason: format!("{e}"),
+            })?;
+
+        let entry = rec.entry.as_deref().unwrap_or("index.html");
+        let html = files
+            .get(entry)
+            .cloned()
+            .ok_or_else(|| DaemonError::InvalidComposition {
+                reason: format!("entry file missing: {entry}"),
+            })?;
+        Ok((
+            html,
+            meta.spec.width,
+            meta.spec.height,
+            meta.spec.duration_sec,
+            meta.spec.fps,
         ))
     }
 
@@ -279,15 +323,16 @@ impl CanvasVideoService {
     /// Fetch the composition HTML + spec that the render page needs to
     /// draw the given job. Returns InvalidRequest if the job or its
     /// composition is unknown.
-    ///
-    /// TEMP stub — replaced in Task 7 by load_composition-backed lookup.
     pub async fn get_composition_for_job(
         &self,
         job_id: &str,
     ) -> Result<(String, u32, u32, f32, u32)> {
-        Err(DaemonError::InternalError(format!(
-            "composition lookup not yet wired through ArtifactRepository for job {job_id}"
-        )))
+        let snap = self
+            .jobs
+            .snapshot(job_id)
+            .await
+            .ok_or_else(|| DaemonError::InvalidRequest(format!("job not found: {job_id}")))?;
+        self.load_composition(&snap.composition_id).await
     }
 
     // --- EventBus emitters ---
@@ -380,6 +425,142 @@ impl CanvasVideoService {
 impl Default for CanvasVideoService {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod p3_load_tests {
+    use super::*;
+    use nevoflux_protocol::canvas_video::CreateCompositionRequest;
+    use nevoflux_storage::{repositories::ArtifactRepository, CreateArtifactParams};
+
+    fn req() -> CreateCompositionRequest {
+        CreateCompositionRequest {
+            title: "t".into(),
+            width: 640,
+            height: 360,
+            duration_sec: 5.0,
+            fps: 30,
+            bg: None,
+            html: None,
+            template: None,
+            session_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn load_reads_composition_written_by_create() {
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let resp = svc.create_composition(req()).await.unwrap();
+        let (html, w, h, d, fps) = svc.load_composition(&resp.artifact_id).await.unwrap();
+        assert!(html.contains("stage"));
+        assert_eq!((w, h, fps), (640, 360, 30));
+        assert!((d - 5.0).abs() < 1e-3);
+    }
+
+    #[tokio::test]
+    async fn load_rejects_non_composition_artifact() {
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let storage = svc.storage().unwrap().clone();
+        let repo = ArtifactRepository::new(storage.database());
+        repo.create(CreateArtifactParams {
+            id: "art-plain".into(),
+            session_id: None,
+            title: "plain".into(),
+            description: None,
+            content_type: "text/html".into(),
+            content: "<p>hi</p>".into(),
+            files: None,
+            entry: None,
+        })
+        .unwrap();
+        let err = svc.load_composition("art-plain").await.unwrap_err();
+        assert!(
+            format!("{err}").contains("invalid composition"),
+            "got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_rejects_malformed_meta() {
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let storage = svc.storage().unwrap().clone();
+        let repo = ArtifactRepository::new(storage.database());
+        let mut files = std::collections::HashMap::new();
+        files.insert("index.html".into(), "<body>ok</body>".into());
+        files.insert("composition.meta.json".into(), "not-json".into());
+        repo.create(CreateArtifactParams {
+            id: "comp-bad".into(),
+            session_id: None,
+            title: "bad".into(),
+            description: None,
+            content_type: "text/html".into(),
+            content: "<body>ok</body>".into(),
+            files: Some(files),
+            entry: Some("index.html".into()),
+        })
+        .unwrap();
+        let err = svc.load_composition("comp-bad").await.unwrap_err();
+        assert!(format!("{err}").contains("malformed"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn load_rejects_spec_out_of_bounds() {
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let storage = svc.storage().unwrap().clone();
+        let repo = ArtifactRepository::new(storage.database());
+        let bad_meta = serde_json::json!({
+            "kind": "composition", "version": 1,
+            "spec": {"width": 640, "height": 360, "duration_sec": 5.0, "fps": 60},
+            "origin": {"created_with": "t", "created_at": 0}
+        });
+        let mut files = std::collections::HashMap::new();
+        files.insert("index.html".into(), "<body>ok</body>".into());
+        files.insert("composition.meta.json".into(), bad_meta.to_string());
+        repo.create(CreateArtifactParams {
+            id: "comp-bad-fps".into(),
+            session_id: None,
+            title: "bad".into(),
+            description: None,
+            content_type: "text/html".into(),
+            content: "<body>ok</body>".into(),
+            files: Some(files),
+            entry: Some("index.html".into()),
+        })
+        .unwrap();
+        let err = svc.load_composition("comp-bad-fps").await.unwrap_err();
+        assert!(
+            format!("{err}").contains("60") || format!("{err}").contains("fps"),
+            "got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_rejects_missing_entry_file() {
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let storage = svc.storage().unwrap().clone();
+        let repo = ArtifactRepository::new(storage.database());
+        let good_meta = serde_json::json!({
+            "kind": "composition", "version": 1,
+            "spec": {"width": 640, "height": 360, "duration_sec": 5.0, "fps": 30},
+            "origin": {"created_with": "t", "created_at": 0}
+        });
+        let mut files = std::collections::HashMap::new();
+        files.insert("composition.meta.json".into(), good_meta.to_string());
+        // index.html intentionally missing
+        repo.create(CreateArtifactParams {
+            id: "comp-no-entry".into(),
+            session_id: None,
+            title: "bad".into(),
+            description: None,
+            content_type: "text/html".into(),
+            content: "".into(),
+            files: Some(files),
+            entry: Some("index.html".into()),
+        })
+        .unwrap();
+        let err = svc.load_composition("comp-no-entry").await.unwrap_err();
+        assert!(format!("{err}").contains("entry"), "got {err}");
     }
 }
 

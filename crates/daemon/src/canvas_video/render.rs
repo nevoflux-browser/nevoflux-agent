@@ -39,8 +39,8 @@ pub async fn render_start(
 ) -> Result<RenderStartResponse> {
     // Look up composition HTML + spec up front so a bad composition_id fails
     // the caller synchronously.
-    let _html = svc.read_composition_html(&req.composition_id).await?;
-    let (width, height, duration_sec, fps) = svc.composition_spec(&req.composition_id).await?;
+    let (_html, width, height, duration_sec, fps) =
+        svc.load_composition(&req.composition_id).await?;
 
     let job_id = svc
         .jobs()
@@ -64,11 +64,7 @@ pub async fn render_start(
     Ok(RenderStartResponse { job_id })
 }
 
-async fn run_render_loop(
-    svc: Arc<CanvasVideoService>,
-    job_id: String,
-    fps: u32,
-) -> Result<()> {
+async fn run_render_loop(svc: Arc<CanvasVideoService>, job_id: String, fps: u32) -> Result<()> {
     svc.jobs().set_state(&job_id, JobState::Running).await;
     svc.jobs()
         .set_progress(&job_id, 0, "awaiting frames from render page".into())
@@ -91,9 +87,8 @@ async fn run_render_loop(
             .map(|h| PathBuf::from(h).join(".cache"))
             .unwrap_or_else(|_| PathBuf::from("/tmp"));
         let dir = cache_base.join("nevoflux").join("render");
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            DaemonError::InternalError(format!("create render cache dir: {}", e))
-        })?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| DaemonError::InternalError(format!("create render cache dir: {}", e)))?;
         dir.join(format!("{}.mp4", job_id))
     };
 
@@ -124,7 +119,8 @@ async fn run_render_loop(
         if let Some(snap) = svc.jobs().snapshot(&job_id).await {
             if snap.state == JobState::Cancelled {
                 let _ = ffmpeg_child.kill();
-                svc.emit_cancelled(&job_id, frames_written, total_frames).await;
+                svc.emit_cancelled(&job_id, frames_written, total_frames)
+                    .await;
                 return Ok(());
             }
         }
@@ -160,7 +156,8 @@ async fn run_render_loop(
                         format!("frame {}/{}", frames_written, total_frames),
                     )
                     .await;
-                svc.emit_progress(&job_id, frames_written, total_frames).await;
+                svc.emit_progress(&job_id, frames_written, total_frames)
+                    .await;
             }
             FrameSignal::Done { frames_emitted: _ } => {
                 break;
