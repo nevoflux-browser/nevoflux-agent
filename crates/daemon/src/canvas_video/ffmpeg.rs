@@ -73,8 +73,18 @@ fn resolved_path() -> Result<PathBuf> {
 pub fn image2pipe_cmd(output_path: &std::path::Path, fps: u32) -> FfmpegCommand {
     let mut cmd = FfmpegCommand::new();
     cmd.hide_banner()
-        .args(["-y", "-f", "image2pipe", "-framerate", &fps.to_string(), "-i", "-"])
-        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "23", "-preset", "medium"])
+        .args([
+            "-y",
+            "-f",
+            "image2pipe",
+            "-framerate",
+            &fps.to_string(),
+            "-i",
+            "-",
+        ])
+        .args([
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "23", "-preset", "medium",
+        ])
         .args(["-movflags", "+faststart"])
         .output(output_path.to_string_lossy().as_ref());
     cmd

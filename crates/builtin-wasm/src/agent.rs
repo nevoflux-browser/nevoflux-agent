@@ -2256,9 +2256,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
             }
             "canvas_render_video" => {
-                let resp = self
-                    .host
-                    .canvas_video_render_start(&tool_call.arguments)?;
+                let resp = self.host.canvas_video_render_start(&tool_call.arguments)?;
                 serde_json::to_string(&resp)
                     .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
             }

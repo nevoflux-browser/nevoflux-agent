@@ -47,8 +47,7 @@ impl PocClient {
     /// and return the generated `request_id`.
     pub async fn send_chat(&self, payload: serde_json::Value) -> io::Result<String> {
         let request_id = format!("poc-{}", uuid::Uuid::new_v4().simple());
-        let env =
-            ProxyEnvelope::new(&self.proxy_id, &request_id, Channel::Chat, payload);
+        let env = ProxyEnvelope::new(&self.proxy_id, &request_id, Channel::Chat, payload);
         let v = serde_json::to_value(&env)?;
         write_frame(&self.writer, &v).await?;
         Ok(request_id)
@@ -88,8 +87,8 @@ async fn write_frame(
     writer: &Arc<Mutex<BufWriter<OwnedWriteHalf>>>,
     value: &serde_json::Value,
 ) -> io::Result<()> {
-    let data = serde_json::to_vec(value)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let data =
+        serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let len = u32::try_from(data.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame too large"))?;
     let mut w = writer.lock().await;

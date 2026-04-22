@@ -24,8 +24,8 @@
 pub mod agent;
 pub mod agent_host;
 pub mod canvas_persist;
-pub mod canvas_video;
 pub mod canvas_tools;
+pub mod canvas_video;
 pub mod config;
 pub mod config_watcher;
 pub mod context;

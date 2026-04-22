@@ -33,7 +33,9 @@ pub async fn run_tool_executor(
         let duration_ms = start.elapsed().as_millis() as u64;
         match &result {
             Ok(_) => tracing::info!(tool = %req.name, ms = duration_ms, "MCP tool dispatch ok"),
-            Err(e) => tracing::warn!(tool = %req.name, ms = duration_ms, error = %e, "MCP tool dispatch failed"),
+            Err(e) => {
+                tracing::warn!(tool = %req.name, ms = duration_ms, error = %e, "MCP tool dispatch failed")
+            }
         }
 
         // Log tool call for sidebar display
@@ -1062,10 +1064,7 @@ async fn execute_canvas_video_tool(
             let req: nevoflux_protocol::canvas_video::RenderStartRequest =
                 serde_json::from_value(arguments.clone())
                     .map_err(|e| format!("invalid canvas_render_video args: {}", e))?;
-            let resp = svc
-                .render_start(req)
-                .await
-                .map_err(|e| e.to_string())?;
+            let resp = svc.render_start(req).await.map_err(|e| e.to_string())?;
 
             // Broadcast canvas_video_open_render_tab to all connected
             // proxies so the extension A4 handler opens

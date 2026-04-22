@@ -32,8 +32,10 @@ impl CanvasCreateCompositionTool {
 #[async_trait]
 impl ToolExecutor for CanvasCreateCompositionTool {
     async fn execute(&self, _name: &str, arguments: &Value) -> Result<String> {
-        let req: CreateCompositionRequest = serde_json::from_value(arguments.clone())
-            .map_err(|e| DaemonError::InvalidRequest(format!("canvas_create_composition: {}", e)))?;
+        let req: CreateCompositionRequest =
+            serde_json::from_value(arguments.clone()).map_err(|e| {
+                DaemonError::InvalidRequest(format!("canvas_create_composition: {}", e))
+            })?;
         let resp = self.svc.create_composition(req).await?;
         serde_json::to_string(&resp)
             .map_err(|e| DaemonError::InternalError(format!("serialize response: {}", e)))
@@ -96,10 +98,7 @@ pub fn render_video_schema() -> Value {
 ///
 /// Call sites inject the shared `CanvasVideoService` so both tools and
 /// bridge handlers see the same job registry / composition store.
-pub fn register(
-    registry: &mut crate::agent::tools::ToolRegistry,
-    svc: Arc<CanvasVideoService>,
-) {
+pub fn register(registry: &mut crate::agent::tools::ToolRegistry, svc: Arc<CanvasVideoService>) {
     registry.register(
         "canvas_create_composition",
         Box::new(CanvasCreateCompositionTool::new(svc.clone())),
@@ -126,7 +125,10 @@ mod tests {
             "duration_sec": 1.0,
             "fps": 30
         });
-        let out = tool.execute("canvas_create_composition", &args).await.unwrap();
+        let out = tool
+            .execute("canvas_create_composition", &args)
+            .await
+            .unwrap();
         assert!(out.contains("artifact_id"));
         assert!(out.contains("comp-"));
     }
@@ -142,9 +144,16 @@ mod tests {
             "duration_sec": 1.0,
             "fps": 60
         });
-        let err = tool.execute("canvas_create_composition", &args).await.unwrap_err();
+        let err = tool
+            .execute("canvas_create_composition", &args)
+            .await
+            .unwrap_err();
         let msg = format!("{}", err);
-        assert!(msg.contains("fps") || msg.contains("60"), "unexpected: {}", msg);
+        assert!(
+            msg.contains("fps") || msg.contains("60"),
+            "unexpected: {}",
+            msg
+        );
     }
 
     #[tokio::test]
