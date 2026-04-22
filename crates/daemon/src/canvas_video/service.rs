@@ -158,40 +158,21 @@ impl CanvasVideoService {
         self: &Arc<Self>,
         req: CreateCompositionRequest,
     ) -> Result<CreateCompositionResponse> {
-        let resp = create::create(self, req.clone()).await?;
-        let html = req
-            .html
-            .clone()
-            .unwrap_or_else(|| create::default_scaffold_for(&req));
-        self.test_compositions.lock().await.insert(
-            resp.artifact_id.clone(),
-            TestComposition {
-                html,
-                width: req.width,
-                height: req.height,
-                duration_sec: req.duration_sec,
-                fps: req.fps,
-            },
-        );
-        Ok(resp)
+        create::create(self, req).await
     }
 
+    // TEMP stub — replaced in Task 7 by load_composition-backed lookup.
     pub async fn read_composition_html(&self, id: &str) -> Result<String> {
-        self.test_compositions
-            .lock()
-            .await
-            .get(id)
-            .map(|c| c.html.clone())
-            .ok_or_else(|| DaemonError::InvalidRequest(format!("composition not found: {}", id)))
+        Err(DaemonError::InternalError(format!(
+            "composition lookup not yet wired through ArtifactRepository for id {id}"
+        )))
     }
 
-    pub async fn composition_spec(&self, id: &str) -> Result<(u32, u32, f32, u32)> {
-        self.test_compositions
-            .lock()
-            .await
-            .get(id)
-            .map(|c| (c.width, c.height, c.duration_sec, c.fps))
-            .ok_or_else(|| DaemonError::InvalidRequest(format!("composition not found: {}", id)))
+    // TEMP stub — replaced in Task 7 by load_composition-backed lookup.
+    pub async fn composition_spec(&self, _id: &str) -> Result<(u32, u32, f32, u32)> {
+        Err(DaemonError::InternalError(
+            "composition_spec not yet wired through ArtifactRepository".into(),
+        ))
     }
 
     pub async fn render_start(
@@ -298,19 +279,15 @@ impl CanvasVideoService {
     /// Fetch the composition HTML + spec that the render page needs to
     /// draw the given job. Returns InvalidRequest if the job or its
     /// composition is unknown.
+    ///
+    /// TEMP stub — replaced in Task 7 by load_composition-backed lookup.
     pub async fn get_composition_for_job(
         &self,
         job_id: &str,
     ) -> Result<(String, u32, u32, f32, u32)> {
-        let snap = self
-            .jobs
-            .snapshot(job_id)
-            .await
-            .ok_or_else(|| DaemonError::InvalidRequest(format!("job not found: {}", job_id)))?;
-        let html = self.read_composition_html(&snap.composition_id).await?;
-        let (width, height, duration_sec, fps) =
-            self.composition_spec(&snap.composition_id).await?;
-        Ok((html, width, height, duration_sec, fps))
+        Err(DaemonError::InternalError(format!(
+            "composition lookup not yet wired through ArtifactRepository for job {job_id}"
+        )))
     }
 
     // --- EventBus emitters ---

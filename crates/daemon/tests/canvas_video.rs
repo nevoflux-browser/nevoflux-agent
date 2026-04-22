@@ -21,6 +21,8 @@ async fn test_create_composition_returns_artifact_id() {
         fps: 30,
         bg: None,
         html: None,
+        template: None,
+        session_id: None,
     };
     let resp: CreateCompositionResponse = svc.create_composition(req).await.unwrap();
     assert!(!resp.artifact_id.is_empty());
@@ -38,6 +40,8 @@ async fn test_create_composition_rejects_invalid_fps() {
         fps: 60, // invalid
         bg: None,
         html: None,
+        template: None,
+        session_id: None,
     };
     let err = svc.create_composition(req).await.unwrap_err();
     let msg = format!("{}", err);
@@ -59,6 +63,8 @@ async fn test_create_composition_rejects_duration_over_60s() {
         fps: 30,
         bg: None,
         html: None,
+        template: None,
+        session_id: None,
     };
     let err = svc.create_composition(req).await.unwrap_err();
     let msg = format!("{}", err);
@@ -91,15 +97,22 @@ async fn test_job_state_transitions() {
     let job_id = reg.create("comp-a".into(), 640, 360, 1.0, 30).await;
 
     reg.set_state(&job_id, JobState::Running).await;
-    assert_eq!(reg.snapshot(&job_id).await.unwrap().state, JobState::Running);
+    assert_eq!(
+        reg.snapshot(&job_id).await.unwrap().state,
+        JobState::Running
+    );
 
-    reg.set_progress(&job_id, 15, "encoding frame 15/30".into()).await;
+    reg.set_progress(&job_id, 15, "encoding frame 15/30".into())
+        .await;
     let s = reg.snapshot(&job_id).await.unwrap();
     assert_eq!(s.current_frame, 15);
     assert_eq!(s.step, "encoding frame 15/30");
 
     reg.set_state(&job_id, JobState::Succeeded).await;
-    assert_eq!(reg.snapshot(&job_id).await.unwrap().state, JobState::Succeeded);
+    assert_eq!(
+        reg.snapshot(&job_id).await.unwrap().state,
+        JobState::Succeeded
+    );
 }
 
 #[tokio::test]
@@ -111,7 +124,10 @@ async fn test_job_cancel_transitions_to_cancelled() {
     reg.set_state(&job_id, JobState::Running).await;
     let cancelled = reg.cancel(&job_id).await;
     assert!(cancelled);
-    assert_eq!(reg.snapshot(&job_id).await.unwrap().state, JobState::Cancelled);
+    assert_eq!(
+        reg.snapshot(&job_id).await.unwrap().state,
+        JobState::Cancelled
+    );
 }
 
 #[tokio::test]
@@ -132,6 +148,8 @@ async fn test_render_start_creates_job_and_returns_id() {
                 r#"<!doctype html><div id="stage" data-width="640" data-height="360" data-duration="1" data-fps="30"></div>"#
                     .into(),
             ),
+            template: None,
+            session_id: None,
         })
         .await
         .unwrap();
@@ -213,6 +231,8 @@ async fn test_render_loop_reassembles_and_encodes() {
             fps,
             bg: None,
             html: Some("<!doctype html><body></body>".into()),
+            template: None,
+            session_id: None,
         })
         .await
         .unwrap();
@@ -233,11 +253,8 @@ async fn test_render_loop_reassembles_and_encodes() {
             *px = Rgba([r, 128, 255 - r, 255]);
         }
         let mut buf: Vec<u8> = Vec::new();
-        img.write_to(
-            &mut std::io::Cursor::new(&mut buf),
-            image::ImageFormat::Png,
-        )
-        .unwrap();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
         buf
     };
 
