@@ -56,6 +56,26 @@ pub async fn create(
     repo.create(params)
         .map_err(|e| DaemonError::InternalError(format!("{e}")))?;
 
+    // Auto-persist the composition so it appears in the My Canvas list by
+    // default. Compositions are designed to be reused / re-rendered / shared;
+    // landing as a non-persistent artifact hides them behind a UI the user
+    // has to discover. Flips `is_persistent = 1` with the current timestamp,
+    // mirroring what `canvas_persist::service::save` does for manual pins.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    storage
+        .database()
+        .with_connection(|conn| {
+            conn.execute(
+                "UPDATE artifacts SET is_persistent = 1, persisted_at = ?1 WHERE id = ?2",
+                rusqlite::params![now, artifact_id],
+            )?;
+            Ok::<(), nevoflux_storage::StorageError>(())
+        })
+        .map_err(|e| DaemonError::InternalError(format!("auto-persist composition: {e}")))?;
+
     Ok(CreateCompositionResponse { artifact_id })
 }
 
