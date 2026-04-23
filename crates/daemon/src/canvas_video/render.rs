@@ -81,16 +81,13 @@ async fn run_render_loop(svc: Arc<CanvasVideoService>, job_id: String, fps: u32)
         return Ok(());
     }
 
-    // Output path: ~/.cache/nevoflux/render/<job_id>.mp4
-    let output_path: PathBuf = {
-        let cache_base = std::env::var("HOME")
-            .map(|h| PathBuf::from(h).join(".cache"))
-            .unwrap_or_else(|_| PathBuf::from("/tmp"));
-        let dir = cache_base.join("nevoflux").join("render");
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| DaemonError::InternalError(format!("create render cache dir: {}", e)))?;
-        dir.join(format!("{}.mp4", job_id))
-    };
+    // Output path: ~/Videos/NevoFlux/<title>-<date>.mp4, with fallback chain.
+    let composition_id = svc.composition_id_for(&job_id).await;
+    let title = svc
+        .load_composition_title(&composition_id)
+        .await
+        .unwrap_or_else(|_| "composition".into());
+    let output_path: PathBuf = build_output_path(&title, &job_id)?;
 
     // Resolve ffmpeg binary (auto-downloads a static build if absent).
     let _ffmpeg_path = resolve_ffmpeg()?;
@@ -191,4 +188,168 @@ async fn run_render_loop(svc: Arc<CanvasVideoService>, job_id: String, fps: u32)
     svc.emit_succeeded(&job_id, &path_str, size_bytes).await;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Output path construction helpers
+// ---------------------------------------------------------------------------
+
+fn build_output_path(title: &str, job_id: &str) -> Result<PathBuf> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // 1. Resolve the target directory with a fallback chain.
+    let dirs = directories::UserDirs::new();
+    let base_dir: PathBuf = dirs
+        .as_ref()
+        .and_then(|d| d.video_dir().map(|p| p.to_path_buf()))
+        .or_else(|| {
+            dirs.as_ref()
+                .and_then(|d| d.download_dir().map(|p| p.to_path_buf()))
+        })
+        .map(|p| p.join("NevoFlux"))
+        .unwrap_or_else(|| {
+            let cache_base = std::env::var("HOME")
+                .map(|h| PathBuf::from(h).join(".cache"))
+                .unwrap_or_else(|_| PathBuf::from("/tmp"));
+            cache_base.join("nevoflux").join("render")
+        });
+    std::fs::create_dir_all(&base_dir).map_err(|e| {
+        DaemonError::InternalError(format!(
+            "create render output dir {}: {}",
+            base_dir.display(),
+            e
+        ))
+    })?;
+
+    // 2. Build a human-friendly filename.
+    let sanitized = sanitize_filename(title);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let timestamp = format_timestamp(ts);
+    let mut candidate = base_dir.join(format!("{sanitized}-{timestamp}.mp4"));
+
+    // 3. Collision handling — append -1, -2, ... up to 100.
+    if candidate.exists() {
+        for i in 1..100 {
+            let alt = base_dir.join(format!("{sanitized}-{timestamp}-{i}.mp4"));
+            if !alt.exists() {
+                candidate = alt;
+                break;
+            }
+        }
+        // If still colliding after 99 attempts, fall back to the job_id for uniqueness.
+        if candidate.exists() {
+            candidate = base_dir.join(format!("{sanitized}-{job_id}.mp4"));
+        }
+    }
+    Ok(candidate)
+}
+
+fn sanitize_filename(title: &str) -> String {
+    // Keep alphanumerics, dash, underscore, ASCII letters. Replace anything
+    // else with '-'. Collapse consecutive dashes. Trim. Cap to 80 chars.
+    let mut buf = String::with_capacity(title.len().min(80));
+    let mut last_dash = false;
+    for ch in title.chars() {
+        let keep = ch.is_ascii_alphanumeric() || ch == '-' || ch == '_';
+        if keep {
+            buf.push(ch);
+            last_dash = false;
+        } else if !last_dash && !buf.is_empty() {
+            buf.push('-');
+            last_dash = true;
+        }
+    }
+    // Trim trailing dash.
+    while buf.ends_with('-') {
+        buf.pop();
+    }
+    if buf.is_empty() {
+        return "composition".to_string();
+    }
+    if buf.len() > 80 {
+        buf.truncate(80);
+    }
+    buf
+}
+
+fn format_timestamp(unix_secs: u64) -> String {
+    // YYYYMMDD-HHMMSS in UTC. Avoids chrono dep for this small calculation.
+    let secs_per_day = 86_400u64;
+    let days = (unix_secs / secs_per_day) as i64;
+    let secs_of_day = unix_secs % secs_per_day;
+    let hour = (secs_of_day / 3600) as u32;
+    let minute = ((secs_of_day % 3600) / 60) as u32;
+    let second = (secs_of_day % 60) as u32;
+    // Days since 1970-01-01 (Unix epoch) → YYYYMMDD.
+    let (year, month, day) = days_to_ymd(days);
+    format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")
+}
+
+fn days_to_ymd(mut days: i64) -> (i32, u32, u32) {
+    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
+    days += 719_468;
+    let era = if days >= 0 {
+        days / 146_097
+    } else {
+        (days - 146_096) / 146_097
+    };
+    let doe = (days - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (year as i32, m as u32, d as u32)
+}
+
+#[cfg(test)]
+mod filename_tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_keeps_alphanumerics() {
+        assert_eq!(sanitize_filename("smoke1"), "smoke1");
+        assert_eq!(sanitize_filename("My-Cool_Video"), "My-Cool_Video");
+    }
+
+    #[test]
+    fn test_sanitize_replaces_special_chars() {
+        assert_eq!(sanitize_filename("Hello World!"), "Hello-World");
+        assert_eq!(sanitize_filename("foo/bar\\baz"), "foo-bar-baz");
+        assert_eq!(sanitize_filename("中文标题"), "composition");
+    }
+
+    #[test]
+    fn test_sanitize_collapses_dashes_and_trims() {
+        assert_eq!(sanitize_filename("a   b   c"), "a-b-c");
+        assert_eq!(sanitize_filename("???abc???"), "abc");
+    }
+
+    #[test]
+    fn test_sanitize_truncates_to_80() {
+        let long = "a".repeat(120);
+        assert_eq!(sanitize_filename(&long).len(), 80);
+    }
+
+    #[test]
+    fn test_sanitize_empty_fallback() {
+        assert_eq!(sanitize_filename(""), "composition");
+        assert_eq!(sanitize_filename("!!!"), "composition");
+    }
+
+    #[test]
+    fn test_timestamp_format_1700000000() {
+        // 2023-11-14 22:13:20 UTC
+        assert_eq!(format_timestamp(1_700_000_000), "20231114-221320");
+    }
+
+    #[test]
+    fn test_days_to_ymd_epoch() {
+        assert_eq!(days_to_ymd(0), (1970, 1, 1));
+    }
 }

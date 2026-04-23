@@ -211,6 +211,31 @@ impl CanvasVideoService {
         ))
     }
 
+    /// Fetch just the title of a composition artifact (without loading the HTML).
+    /// Returns "composition" as a generic fallback if the row is missing or the
+    /// title is empty — the caller uses this for filename construction and
+    /// should never fail hard on a missing title.
+    pub async fn load_composition_title(&self, composition_id: &str) -> Result<String> {
+        use nevoflux_storage::repositories::ArtifactRepository;
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| DaemonError::InternalError("canvas_video: storage not wired".into()))?;
+        let repo = ArtifactRepository::new(storage.database());
+        let rec = repo
+            .get(composition_id)
+            .map_err(|e| DaemonError::InternalError(format!("{e}")))?
+            .ok_or_else(|| {
+                DaemonError::InvalidRequest(format!("composition not found: {composition_id}"))
+            })?;
+        let t = rec.title.trim();
+        Ok(if t.is_empty() {
+            "composition".to_string()
+        } else {
+            t.to_string()
+        })
+    }
+
     pub async fn render_start(
         self: &Arc<Self>,
         req: RenderStartRequest,
