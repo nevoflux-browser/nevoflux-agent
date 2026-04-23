@@ -33,7 +33,9 @@ pub async fn run_tool_executor(
         let duration_ms = start.elapsed().as_millis() as u64;
         match &result {
             Ok(_) => tracing::info!(tool = %req.name, ms = duration_ms, "MCP tool dispatch ok"),
-            Err(e) => tracing::warn!(tool = %req.name, ms = duration_ms, error = %e, "MCP tool dispatch failed"),
+            Err(e) => {
+                tracing::warn!(tool = %req.name, ms = duration_ms, error = %e, "MCP tool dispatch failed")
+            }
         }
 
         // Log tool call for sidebar display
@@ -316,7 +318,7 @@ pub async fn execute_mcp_tool(
     // direct-API-provider path lives in `DaemonHostFunctions::canvas_video_*`
     // plus the builtin-wasm Agent::execute_tool arm.
     match name {
-        "canvas_create_composition" | "canvas_render_video" => {
+        "canvas_create_composition" | "canvas_render_video" | "canvas_lint_composition" => {
             return execute_canvas_video_tool(name, arguments, services).await;
         }
         _ => {}
@@ -1062,10 +1064,7 @@ async fn execute_canvas_video_tool(
             let req: nevoflux_protocol::canvas_video::RenderStartRequest =
                 serde_json::from_value(arguments.clone())
                     .map_err(|e| format!("invalid canvas_render_video args: {}", e))?;
-            let resp = svc
-                .render_start(req)
-                .await
-                .map_err(|e| e.to_string())?;
+            let resp = svc.render_start(req).await.map_err(|e| e.to_string())?;
 
             // Broadcast canvas_video_open_render_tab to all connected
             // proxies so the extension A4 handler opens
@@ -1087,6 +1086,17 @@ async fn execute_canvas_video_tool(
 
             serde_json::to_string(&resp)
                 .map_err(|e| format!("serialize canvas_render_video response: {}", e))
+        }
+        "canvas_lint_composition" => {
+            let req: nevoflux_protocol::canvas_video::LintCompositionRequest =
+                serde_json::from_value(arguments.clone())
+                    .map_err(|e| format!("invalid canvas_lint_composition args: {}", e))?;
+            let report = svc
+                .lint_composition(&req.composition_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            serde_json::to_string(&report)
+                .map_err(|e| format!("serialize canvas_lint_composition response: {}", e))
         }
         other => Err(format!(
             "execute_canvas_video_tool called with unexpected name: {}",

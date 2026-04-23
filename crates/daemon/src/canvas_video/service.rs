@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 
 use crate::canvas_video::{
     create,
@@ -20,9 +20,11 @@ use crate::canvas_video::{
 use crate::error::{DaemonError, Result};
 use crate::event_bus::{BusEvent, EventBus, PublisherIdentity};
 use nevoflux_protocol::canvas_video::{
-    CreateCompositionRequest, CreateCompositionResponse, RenderFrameChunk, RenderStartRequest,
-    RenderStartResponse,
+    CreateCompositionRequest, CreateCompositionResponse, LintReport, RenderFrameChunk,
+    RenderStartRequest, RenderStartResponse,
 };
+use nevoflux_skills::SkillRegistry;
+use nevoflux_storage::Storage;
 
 /// Single-stream signal the render loop consumes for a given job.
 #[derive(Debug)]
@@ -37,14 +39,10 @@ pub enum FrameSignal {
 
 pub struct CanvasVideoService {
     jobs: JobRegistry,
-    /// Maps artifact_id -> composition spec + HTML.
-    /// Phase B replaces with real artifact repo.
-    test_compositions: Mutex<HashMap<String, TestComposition>>,
     /// If true, render_start returns immediately without page-bridge interaction.
     bridge_stub: bool,
 
     // --- bridge-side async coordination ---
-
     /// job_id -> ChunkBuffer accumulating incoming frame chunk pieces.
     chunk_buffers: Mutex<HashMap<String, ChunkBuffer>>,
 
@@ -55,15 +53,18 @@ pub struct CanvasVideoService {
     /// EventBus handle for jobs.render.{id} progress + terminal events.
     /// None in stub / test mode; emits become no-ops.
     event_bus: Option<Arc<EventBus>>,
-}
 
-#[derive(Clone)]
-struct TestComposition {
-    html: String,
-    width: u32,
-    height: u32,
-    duration_sec: f32,
-    fps: u32,
+    /// Persistent artifact storage. Set by server.rs via `with_storage`; used
+    /// by T6 to persist compositions to the artifact repo.
+    storage: Option<Arc<Storage>>,
+
+    /// Skill registry for reading auxiliary files (templates, DESIGN-template).
+    /// Shared with HostServices so both see the same loaded registry.
+    skills: Option<Arc<RwLock<SkillRegistry>>>,
+
+    /// Pending lint correlators: correlator -> oneshot sender for the lint result.
+    /// Inserted by `lint_composition`, removed by `on_lint_result` or on timeout.
+    lint_correlators: Mutex<HashMap<String, oneshot::Sender<LintReport>>>,
 }
 
 /// Pure throttle decision for progress deliveries. Emits when `current`
@@ -82,22 +83,27 @@ impl CanvasVideoService {
     pub fn new() -> Self {
         Self {
             jobs: JobRegistry::new(),
-            test_compositions: Mutex::new(Default::default()),
             bridge_stub: false,
             chunk_buffers: Mutex::new(Default::default()),
             signal_senders: Mutex::new(Default::default()),
             event_bus: None,
+            storage: None,
+            skills: None,
+            lint_correlators: Mutex::new(Default::default()),
         }
     }
 
     pub fn new_for_tests() -> Self {
+        let storage = Storage::open_in_memory().expect("new_for_tests: in-memory Storage");
         Self {
             jobs: JobRegistry::new(),
-            test_compositions: Mutex::new(Default::default()),
             bridge_stub: true,
             chunk_buffers: Mutex::new(Default::default()),
             signal_senders: Mutex::new(Default::default()),
             event_bus: None,
+            storage: Some(Arc::new(storage)),
+            skills: Some(Arc::new(RwLock::new(SkillRegistry::new()))),
+            lint_correlators: Mutex::new(Default::default()),
         }
     }
 
@@ -106,6 +112,28 @@ impl CanvasVideoService {
     pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
         self.event_bus = Some(bus);
         self
+    }
+
+    /// Builder: attach the shared artifact storage (used by T6 to persist compositions).
+    pub fn with_storage(mut self, storage: Arc<Storage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// Builder: attach the shared skill registry (used by T7 to read templates/DESIGN-template).
+    pub fn with_skills(mut self, skills: Arc<RwLock<SkillRegistry>>) -> Self {
+        self.skills = Some(skills);
+        self
+    }
+
+    /// Return a reference to the artifact storage, if configured.
+    pub fn storage(&self) -> Option<&Arc<Storage>> {
+        self.storage.as_ref()
+    }
+
+    /// Return a reference to the skill registry, if configured.
+    pub fn skills(&self) -> Option<&Arc<RwLock<SkillRegistry>>> {
+        self.skills.as_ref()
     }
 
     pub fn bridge_is_stub(&self) -> bool {
@@ -122,44 +150,90 @@ impl CanvasVideoService {
         self: &Arc<Self>,
         req: CreateCompositionRequest,
     ) -> Result<CreateCompositionResponse> {
-        let resp = create::create(self, req.clone()).await?;
-        let html = req
-            .html
-            .clone()
-            .unwrap_or_else(|| create::default_scaffold_for(&req));
-        self.test_compositions.lock().await.insert(
-            resp.artifact_id.clone(),
-            TestComposition {
-                html,
-                width: req.width,
-                height: req.height,
-                duration_sec: req.duration_sec,
-                fps: req.fps,
-            },
-        );
-        Ok(resp)
+        create::create(self, req).await
     }
 
-    pub async fn read_composition_html(&self, id: &str) -> Result<String> {
-        self.test_compositions
-            .lock()
-            .await
-            .get(id)
-            .map(|c| c.html.clone())
+    /// Load a composition from the artifact repository and return (html, w, h, d, fps).
+    pub async fn load_composition(
+        &self,
+        composition_id: &str,
+    ) -> Result<(String, u32, u32, f32, u32)> {
+        use nevoflux_protocol::canvas_video::CompositionMeta;
+        use nevoflux_storage::repositories::ArtifactRepository;
+
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| DaemonError::InternalError("canvas_video: storage not wired".into()))?;
+        let repo = ArtifactRepository::new(storage.database());
+        let rec = repo
+            .get(composition_id)
+            .map_err(|e| DaemonError::InternalError(format!("{e}")))?
             .ok_or_else(|| {
-                DaemonError::InvalidRequest(format!("composition not found: {}", id))
-            })
+                DaemonError::InvalidRequest(format!("composition not found: {composition_id}"))
+            })?;
+
+        let files = rec
+            .files
+            .as_ref()
+            .ok_or_else(|| DaemonError::InvalidComposition {
+                reason: "no files map (not a composition artifact)".into(),
+            })?;
+
+        let meta_raw =
+            files
+                .get("composition.meta.json")
+                .ok_or_else(|| DaemonError::InvalidComposition {
+                    reason: "missing composition.meta.json".into(),
+                })?;
+        let meta: CompositionMeta =
+            serde_json::from_str(meta_raw).map_err(|e| DaemonError::InvalidComposition {
+                reason: format!("malformed meta: {e}"),
+            })?;
+        meta.validate_hard_limits()
+            .map_err(|e| DaemonError::InvalidComposition {
+                reason: format!("{e}"),
+            })?;
+
+        let entry = rec.entry.as_deref().unwrap_or("index.html");
+        let html = files
+            .get(entry)
+            .cloned()
+            .ok_or_else(|| DaemonError::InvalidComposition {
+                reason: format!("entry file missing: {entry}"),
+            })?;
+        Ok((
+            html,
+            meta.spec.width,
+            meta.spec.height,
+            meta.spec.duration_sec,
+            meta.spec.fps,
+        ))
     }
 
-    pub async fn composition_spec(&self, id: &str) -> Result<(u32, u32, f32, u32)> {
-        self.test_compositions
-            .lock()
-            .await
-            .get(id)
-            .map(|c| (c.width, c.height, c.duration_sec, c.fps))
+    /// Fetch just the title of a composition artifact (without loading the HTML).
+    /// Returns "composition" as a generic fallback if the row is missing or the
+    /// title is empty — the caller uses this for filename construction and
+    /// should never fail hard on a missing title.
+    pub async fn load_composition_title(&self, composition_id: &str) -> Result<String> {
+        use nevoflux_storage::repositories::ArtifactRepository;
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| DaemonError::InternalError("canvas_video: storage not wired".into()))?;
+        let repo = ArtifactRepository::new(storage.database());
+        let rec = repo
+            .get(composition_id)
+            .map_err(|e| DaemonError::InternalError(format!("{e}")))?
             .ok_or_else(|| {
-                DaemonError::InvalidRequest(format!("composition not found: {}", id))
-            })
+                DaemonError::InvalidRequest(format!("composition not found: {composition_id}"))
+            })?;
+        let t = rec.title.trim();
+        Ok(if t.is_empty() {
+            "composition".to_string()
+        } else {
+            t.to_string()
+        })
     }
 
     pub async fn render_start(
@@ -274,11 +348,81 @@ impl CanvasVideoService {
             .jobs
             .snapshot(job_id)
             .await
-            .ok_or_else(|| DaemonError::InvalidRequest(format!("job not found: {}", job_id)))?;
-        let html = self.read_composition_html(&snap.composition_id).await?;
-        let (width, height, duration_sec, fps) =
-            self.composition_spec(&snap.composition_id).await?;
-        Ok((html, width, height, duration_sec, fps))
+            .ok_or_else(|| DaemonError::InvalidRequest(format!("job not found: {job_id}")))?;
+        self.load_composition(&snap.composition_id).await
+    }
+
+    // --- Lint correlator plumbing ---
+
+    /// Request a lint pass for the given composition.
+    ///
+    /// Publishes a lint request event on the EventBus (if wired) and awaits
+    /// a `LintReport` from the extension via `on_lint_result`. Times out
+    /// after 5 seconds if no resolver calls `on_lint_result`.
+    pub async fn lint_composition(self: &Arc<Self>, composition_id: &str) -> Result<LintReport> {
+        let (html, _w, _h, _d, _fps) = self.load_composition(composition_id).await?;
+        let correlator = uuid::Uuid::new_v4().simple().to_string();
+        let (tx, rx) = oneshot::channel();
+        self.lint_correlators
+            .lock()
+            .await
+            .insert(correlator.clone(), tx);
+
+        // Publish the lint request on the EventBus so Task 12 (TCP server glue)
+        // can pick it up and forward to the extension. Skip in test mode where
+        // event_bus is None; tests resolve correlators directly via on_lint_result.
+        if let Some(bus) = &self.event_bus {
+            let topic = format!("jobs:lint:request:{correlator}");
+            let payload = serde_json::json!({
+                "event": "lint_request",
+                "job_correlator": correlator,
+                "composition_id": composition_id,
+                "composition_html": html,
+            });
+            let event = BusEvent::ephemeral(topic, payload, PublisherIdentity::Internal);
+            let _ = bus.publish(event).await;
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+            Ok(Ok(report)) => Ok(report),
+            Ok(Err(_)) => {
+                // Sender was dropped before we received a result.
+                self.lint_correlators.lock().await.remove(&correlator);
+                Err(DaemonError::InternalError(
+                    "lint oneshot dropped before resolve".into(),
+                ))
+            }
+            Err(_) => {
+                // Timeout: remove the dangling correlator entry.
+                self.lint_correlators.lock().await.remove(&correlator);
+                Err(DaemonError::LintTimeout {
+                    composition_id: composition_id.to_string(),
+                })
+            }
+        }
+    }
+
+    /// Called when the extension delivers a lint result for a pending correlator.
+    ///
+    /// Resolves the oneshot receiver held by `lint_composition`. If the
+    /// correlator is unknown (e.g. the caller already timed out), logs a
+    /// warning and does nothing.
+    pub async fn on_lint_result(&self, correlator: &str, report: LintReport) {
+        if let Some(tx) = self.lint_correlators.lock().await.remove(correlator) {
+            let _ = tx.send(report);
+        } else {
+            tracing::warn!(
+                correlator,
+                "lint result for unknown correlator — already timed out or duplicate"
+            );
+        }
+    }
+
+    /// Returns the first pending lint correlator key, for use in tests that
+    /// need to simulate an extension response without a real EventBus.
+    #[cfg(test)]
+    pub async fn peek_pending_lint_correlator(&self) -> Option<String> {
+        self.lint_correlators.lock().await.keys().next().cloned()
     }
 
     // --- EventBus emitters ---
@@ -375,6 +519,172 @@ impl Default for CanvasVideoService {
 }
 
 #[cfg(test)]
+mod p3_load_tests {
+    use super::*;
+    use nevoflux_protocol::canvas_video::CreateCompositionRequest;
+    use nevoflux_storage::{repositories::ArtifactRepository, CreateArtifactParams};
+
+    fn req() -> CreateCompositionRequest {
+        CreateCompositionRequest {
+            title: "t".into(),
+            width: 640,
+            height: 360,
+            duration_sec: 5.0,
+            fps: 30,
+            bg: None,
+            html: None,
+            template: None,
+            session_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn load_reads_composition_written_by_create() {
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let resp = svc.create_composition(req()).await.unwrap();
+        let (html, w, h, d, fps) = svc.load_composition(&resp.artifact_id).await.unwrap();
+        assert!(html.contains("stage"));
+        assert_eq!((w, h, fps), (640, 360, 30));
+        assert!((d - 5.0).abs() < 1e-3);
+    }
+
+    #[tokio::test]
+    async fn load_rejects_non_composition_artifact() {
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let storage = svc.storage().unwrap().clone();
+        let repo = ArtifactRepository::new(storage.database());
+        repo.create(CreateArtifactParams {
+            id: "art-plain".into(),
+            session_id: None,
+            title: "plain".into(),
+            description: None,
+            content_type: "text/html".into(),
+            content: "<p>hi</p>".into(),
+            files: None,
+            entry: None,
+        })
+        .unwrap();
+        let err = svc.load_composition("art-plain").await.unwrap_err();
+        assert!(
+            format!("{err}").contains("invalid composition"),
+            "got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_rejects_malformed_meta() {
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let storage = svc.storage().unwrap().clone();
+        let repo = ArtifactRepository::new(storage.database());
+        let mut files = std::collections::HashMap::new();
+        files.insert("index.html".into(), "<body>ok</body>".into());
+        files.insert("composition.meta.json".into(), "not-json".into());
+        repo.create(CreateArtifactParams {
+            id: "comp-bad".into(),
+            session_id: None,
+            title: "bad".into(),
+            description: None,
+            content_type: "text/html".into(),
+            content: "<body>ok</body>".into(),
+            files: Some(files),
+            entry: Some("index.html".into()),
+        })
+        .unwrap();
+        let err = svc.load_composition("comp-bad").await.unwrap_err();
+        assert!(format!("{err}").contains("malformed"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn load_rejects_spec_out_of_bounds() {
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let storage = svc.storage().unwrap().clone();
+        let repo = ArtifactRepository::new(storage.database());
+        let bad_meta = serde_json::json!({
+            "kind": "composition", "version": 1,
+            "spec": {"width": 640, "height": 360, "duration_sec": 5.0, "fps": 60},
+            "origin": {"created_with": "t", "created_at": 0}
+        });
+        let mut files = std::collections::HashMap::new();
+        files.insert("index.html".into(), "<body>ok</body>".into());
+        files.insert("composition.meta.json".into(), bad_meta.to_string());
+        repo.create(CreateArtifactParams {
+            id: "comp-bad-fps".into(),
+            session_id: None,
+            title: "bad".into(),
+            description: None,
+            content_type: "text/html".into(),
+            content: "<body>ok</body>".into(),
+            files: Some(files),
+            entry: Some("index.html".into()),
+        })
+        .unwrap();
+        let err = svc.load_composition("comp-bad-fps").await.unwrap_err();
+        assert!(
+            format!("{err}").contains("60") || format!("{err}").contains("fps"),
+            "got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_rejects_missing_entry_file() {
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let storage = svc.storage().unwrap().clone();
+        let repo = ArtifactRepository::new(storage.database());
+        let good_meta = serde_json::json!({
+            "kind": "composition", "version": 1,
+            "spec": {"width": 640, "height": 360, "duration_sec": 5.0, "fps": 30},
+            "origin": {"created_with": "t", "created_at": 0}
+        });
+        let mut files = std::collections::HashMap::new();
+        files.insert("composition.meta.json".into(), good_meta.to_string());
+        // index.html intentionally missing
+        repo.create(CreateArtifactParams {
+            id: "comp-no-entry".into(),
+            session_id: None,
+            title: "bad".into(),
+            description: None,
+            content_type: "text/html".into(),
+            content: "".into(),
+            files: Some(files),
+            entry: Some("index.html".into()),
+        })
+        .unwrap();
+        let err = svc.load_composition("comp-no-entry").await.unwrap_err();
+        assert!(format!("{err}").contains("entry"), "got {err}");
+    }
+}
+
+#[cfg(test)]
+mod p3_deps_tests {
+    use super::*;
+    use nevoflux_skills::SkillRegistry;
+    use nevoflux_storage::Storage;
+    use std::sync::Arc;
+    use tokio::sync::RwLock as TokioRwLock;
+
+    #[tokio::test]
+    async fn new_for_tests_has_storage_and_skills() {
+        let svc = CanvasVideoService::new_for_tests();
+        assert!(svc.storage().is_some(), "test service must carry Storage");
+        assert!(
+            svc.skills().is_some(),
+            "test service must carry SkillRegistry"
+        );
+    }
+
+    #[tokio::test]
+    async fn builders_install_storage_and_skills() {
+        let storage = Arc::new(Storage::open_in_memory().expect("new Storage"));
+        let skills = Arc::new(TokioRwLock::new(SkillRegistry::new()));
+        let svc = CanvasVideoService::new()
+            .with_storage(storage.clone())
+            .with_skills(skills.clone());
+        assert!(Arc::ptr_eq(svc.storage().unwrap(), &storage));
+        assert!(Arc::ptr_eq(svc.skills().unwrap(), &skills));
+    }
+}
+
+#[cfg(test)]
 mod p2_emit_tests {
     use super::*;
     use crate::event_bus::{BackpressurePolicy, EventBus, SubscriberIdentity};
@@ -383,9 +693,7 @@ mod p2_emit_tests {
     #[tokio::test]
     async fn emit_cancelled_publishes_event_with_frame_counts() {
         let bus = Arc::new(EventBus::new());
-        let svc = Arc::new(
-            CanvasVideoService::new_for_tests().with_event_bus(bus.clone()),
-        );
+        let svc = Arc::new(CanvasVideoService::new_for_tests().with_event_bus(bus.clone()));
 
         // Subscribe BEFORE emitting so we capture the delivery.
         let pattern = crate::event_bus::types::TopicPattern::wildcard("jobs:render:*");
@@ -400,13 +708,10 @@ mod p2_emit_tests {
 
         svc.emit_cancelled("job-abc", 42, 150).await;
 
-        let delivered = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            sub.rx.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("delivery");
+        let delivered = tokio::time::timeout(std::time::Duration::from_millis(200), sub.rx.recv())
+            .await
+            .expect("timeout")
+            .expect("delivery");
 
         assert_eq!(delivered.topic, "jobs:render:job-abc");
         let body = &delivered.payload;

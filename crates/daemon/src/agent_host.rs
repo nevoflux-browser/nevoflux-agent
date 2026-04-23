@@ -4441,6 +4441,37 @@ impl HostFunctions for DaemonHostFunctions {
             message: format!("serialize canvas_render_video response: {}", e),
         })
     }
+
+    fn canvas_video_lint_composition(
+        &self,
+        request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        let svc = self
+            .canvas_video_service
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "canvas_video service not wired".into(),
+            })?
+            .clone();
+        let req: nevoflux_protocol::canvas_video::LintCompositionRequest =
+            serde_json::from_value(request.clone()).map_err(|e| HostError {
+                code: 4,
+                message: format!("invalid canvas_lint_composition args: {e}"),
+            })?;
+        let report = tokio::task::block_in_place(|| {
+            self.runtime
+                .block_on(async move { svc.lint_composition(&req.composition_id).await })
+        })
+        .map_err(|e| HostError {
+            code: 3,
+            message: format!("canvas_lint_composition failed: {e}"),
+        })?;
+        serde_json::to_value(&report).map_err(|e| HostError {
+            code: 4,
+            message: format!("serialize canvas_lint_composition response: {e}"),
+        })
+    }
 }
 
 impl DaemonHostFunctions {

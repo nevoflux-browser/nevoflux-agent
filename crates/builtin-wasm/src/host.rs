@@ -545,6 +545,13 @@ pub trait HostFunctions {
         &self,
         request: &serde_json::Value,
     ) -> HostResult<serde_json::Value>;
+
+    /// Lint an existing composition. Returns a `LintReport` (serialized to
+    /// `serde_json::Value`) or a `HostError` on timeout / invalid id.
+    fn canvas_video_lint_composition(
+        &self,
+        request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value>;
 }
 
 /// Mock host functions for testing.
@@ -1256,6 +1263,16 @@ impl HostFunctions for MockHostFunctions {
         Err(HostError {
             code: 501,
             message: "canvas_video_render_start not implemented in MockHostFunctions".into(),
+        })
+    }
+
+    fn canvas_video_lint_composition(
+        &self,
+        _request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        Err(HostError {
+            code: 501,
+            message: "canvas_video_lint_composition not implemented in MockHostFunctions".into(),
         })
     }
 }

@@ -42,6 +42,8 @@ fn test_create_composition_request_roundtrip() {
         fps: 30,
         bg: None,
         html: Some("<html></html>".into()),
+        template: None,
+        session_id: None,
     };
     let s = serde_json::to_string(&req).unwrap();
     let r: CreateCompositionRequest = serde_json::from_str(&s).unwrap();

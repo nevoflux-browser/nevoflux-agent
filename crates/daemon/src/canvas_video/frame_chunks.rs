@@ -17,7 +17,9 @@ pub struct ChunkBuffer {
 
 impl ChunkBuffer {
     pub fn new() -> Self {
-        Self { frames: HashMap::new() }
+        Self {
+            frames: HashMap::new(),
+        }
     }
 
     /// Returns `Some(png_bytes)` when the frame is fully assembled,
@@ -40,7 +42,9 @@ impl ChunkBuffer {
             // contradictory — drop
             return None;
         }
-        if is_last { state.is_last_seen = true; }
+        if is_last {
+            state.is_last_seen = true;
+        }
         state.received.insert(chunk_idx, bytes);
 
         if state.received.len() as u32 == state.total && state.is_last_seen {
@@ -65,5 +69,7 @@ impl ChunkBuffer {
 }
 
 impl Default for ChunkBuffer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

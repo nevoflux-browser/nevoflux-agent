@@ -166,11 +166,11 @@ async fn cancel_mid_render_emits_cancelled_event() {
             Some("cancelled") => {
                 let current = body.get("current").and_then(|v| v.as_u64()).unwrap_or(0);
                 let total = body.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
-                eprintln!(
-                    "[p2.cancel] cancelled: current={}/{}",
-                    current, total
+                eprintln!("[p2.cancel] cancelled: current={}/{}", current, total);
+                assert!(
+                    current > 0,
+                    "expected at least one rendered frame before cancel"
                 );
-                assert!(current > 0, "expected at least one rendered frame before cancel");
                 assert_eq!(total, 150, "expected total==150");
                 saw_cancelled = true;
                 break;

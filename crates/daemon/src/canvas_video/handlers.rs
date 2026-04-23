@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use nevoflux_protocol::canvas_video::{
-    CreateCompositionRequest, GetCompositionRequest, GetCompositionResponse, RenderCancelRequest,
-    RenderDone, RenderFailed, RenderFrameChunk, RenderReady, RenderStartRequest,
+    CreateCompositionRequest, GetCompositionRequest, GetCompositionResponse,
+    LintCompositionRequest, RenderCancelRequest, RenderDone, RenderFailed, RenderFrameChunk,
+    RenderReady, RenderStartRequest,
 };
 use serde_json::Value;
 
@@ -21,15 +22,13 @@ pub async fn handle(
             let req: CreateCompositionRequest = serde_json::from_value(payload)
                 .map_err(|e| DaemonError::InvalidRequest(format!("parse: {}", e)))?;
             let resp = svc.create_composition(req).await?;
-            serde_json::to_value(resp)
-                .map_err(|e| DaemonError::InternalError(format!("{}", e)))
+            serde_json::to_value(resp).map_err(|e| DaemonError::InternalError(format!("{}", e)))
         }
         "canvas_video_render_start" => {
             let req: RenderStartRequest = serde_json::from_value(payload)
                 .map_err(|e| DaemonError::InvalidRequest(format!("parse: {}", e)))?;
             let resp = svc.render_start(req).await?;
-            serde_json::to_value(resp)
-                .map_err(|e| DaemonError::InternalError(format!("{}", e)))
+            serde_json::to_value(resp).map_err(|e| DaemonError::InternalError(format!("{}", e)))
         }
         "canvas_video_render_cancel" => {
             let req: RenderCancelRequest = serde_json::from_value(payload)
@@ -63,6 +62,13 @@ pub async fn handle(
             svc.on_render_failed(&m.job_id, &m.error).await;
             Ok(Value::Null)
         }
+        "canvas_video_lint_composition" => {
+            let req: LintCompositionRequest = serde_json::from_value(payload).map_err(|e| {
+                DaemonError::InvalidRequest(format!("canvas_video_lint_composition: {e}"))
+            })?;
+            let report = svc.lint_composition(&req.composition_id).await?;
+            serde_json::to_value(&report).map_err(|e| DaemonError::InternalError(format!("{e}")))
+        }
         "canvas_video_get_composition" => {
             let req: GetCompositionRequest = serde_json::from_value(payload)
                 .map_err(|e| DaemonError::InvalidRequest(format!("parse: {}", e)))?;
@@ -75,8 +81,7 @@ pub async fn handle(
                 duration_sec,
                 fps,
             };
-            serde_json::to_value(resp)
-                .map_err(|e| DaemonError::InternalError(format!("{}", e)))
+            serde_json::to_value(resp).map_err(|e| DaemonError::InternalError(format!("{}", e)))
         }
         other => Err(DaemonError::InvalidRequest(format!(
             "unknown canvas.video.* message: {}",

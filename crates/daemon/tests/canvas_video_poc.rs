@@ -36,16 +36,27 @@ use common::tcp_client;
 fn test_resolve_ffmpeg_succeeds() {
     let path = nevoflux_daemon::canvas_video::ffmpeg::resolve_ffmpeg()
         .expect("ffmpeg resolution must succeed");
-    assert!(path.exists(), "resolved ffmpeg binary must exist: {:?}", path);
+    assert!(
+        path.exists(),
+        "resolved ffmpeg binary must exist: {:?}",
+        path
+    );
 
     let output = std::process::Command::new(&path)
         .arg("-version")
         .output()
         .expect("ffmpeg -version should run");
-    assert!(output.status.success(), "ffmpeg -version exit = {:?}", output.status);
+    assert!(
+        output.status.success(),
+        "ffmpeg -version exit = {:?}",
+        output.status
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("ffmpeg version"), "stdout missing version line");
+    assert!(
+        stdout.contains("ffmpeg version"),
+        "stdout missing version line"
+    );
 }
 
 #[test]
@@ -85,7 +96,10 @@ fn test_frame_chunks_rejects_mismatched_total() {
     let _ = buf.add_chunk(7, 0, 3, false, vec![0x01]);
     // Second chunk declares total=2 which contradicts first chunk's total=3.
     let r = buf.add_chunk(7, 1, 2, false, vec![0x02]);
-    assert!(r.is_none(), "mismatched total silently rejected (or could panic; at minimum must not corrupt)");
+    assert!(
+        r.is_none(),
+        "mismatched total silently rejected (or could panic; at minimum must not corrupt)"
+    );
 }
 
 /// Runs the PoC composition twice through the full pipeline and verifies
@@ -148,12 +162,11 @@ async fn poc_gate_determinism_and_perf() {
             });
             let create_rid = client.send_chat(create_payload).await.expect("send create");
             let create_resp = client
-                .recv_matching(
-                    Duration::from_secs(10),
-                    |env| env.payload.get("type").and_then(|v| v.as_str())
+                .recv_matching(Duration::from_secs(10), |env| {
+                    env.payload.get("type").and_then(|v| v.as_str())
                         == Some("canvas_video_create_composition_response")
-                        && env.request_id.as_deref() == Some(&create_rid),
-                )
+                        && env.request_id.as_deref() == Some(&create_rid)
+                })
                 .await
                 .expect("create_composition response");
             let artifact_id = create_resp
@@ -194,7 +207,8 @@ async fn poc_gate_determinism_and_perf() {
                 .and_then(|v| v.as_str())
                 .unwrap_or("<missing>");
             assert_eq!(
-                result, "subscribed",
+                result,
+                "subscribed",
                 "subscribe denied: {}",
                 serde_json::to_string(&sub_resp.payload).unwrap_or_default()
             );
@@ -356,4 +370,3 @@ fn env_u32(name: &str, default: u32) -> u32 {
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
 }
-

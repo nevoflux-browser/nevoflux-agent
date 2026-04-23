@@ -1075,16 +1075,30 @@ pub async fn start_server(
         ))
     };
 
+    // Shared skill registry — created once here and handed to both
+    // CanvasVideoService (so T6/T7 can read templates) and HostServices
+    // (which previously built its own internal copy).
+    let shared_skills = {
+        let mut registry = nevoflux_skills::SkillRegistry::new();
+        if let Err(e) = registry.load() {
+            tracing::warn!("canvas_video: failed to load skills: {}", e);
+        }
+        Arc::new(tokio::sync::RwLock::new(registry))
+    };
+
     // Canvas Video Service (video render pipeline).
     // Wire in the EventBus so emit_progress / emit_succeeded / emit_failed
     // actually publish on jobs.render.{job_id}. Without this, subscribers
     // (sidebar, PoC gate test) never see terminal events even though the
     // render loop finishes and writes the MP4.
     let canvas_video_service = Arc::new(
-        crate::canvas_video::CanvasVideoService::new().with_event_bus(event_bus.clone()),
+        crate::canvas_video::CanvasVideoService::new()
+            .with_event_bus(event_bus.clone())
+            .with_storage(session_manager.shared_storage())
+            .with_skills(shared_skills.clone()),
     );
 
-    let mut services = HostServices::new(Arc::new(db))
+    let mut services = HostServices::with_skills(Arc::new(db), shared_skills)
         .with_browser_sender(browser_tx)
         .with_mcp_manager(mcp_manager)
         .with_shared_tool_search(tool_search_index)
@@ -1391,6 +1405,42 @@ pub async fn start_server(
             }
         }
     });
+
+    // --- P3: forward canvas_video lint requests to proxies ---------------
+    // The CanvasVideoService publishes jobs:lint:request:{correlator} on the
+    // EventBus when lint_composition runs.  We subscribe here and forward each
+    // event as a canvas_video_lint_request TCP broadcast so the extension's
+    // background handler (Task 22) can run the linter and reply with
+    // canvas_video_lint_result.
+    {
+        let lint_bus = event_bus.clone();
+        let lint_tx = response_tx.clone();
+        tokio::spawn(async move {
+            use crate::event_bus::types::TopicPattern;
+            use crate::event_bus::{BackpressurePolicy, SubscriberIdentity};
+            let pattern = TopicPattern::wildcard("jobs:lint:request:*");
+            let mut sub = match lint_bus.subscribe(
+                pattern,
+                SubscriberIdentity::Internal,
+                BackpressurePolicy::DropOldest,
+                64,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "canvas_video lint bus subscribe failed");
+                    return;
+                }
+            };
+            while let Some(delivery) = sub.rx.recv().await {
+                let broadcast = serde_json::json!({
+                    "type": "canvas_video_lint_request",
+                    "payload": delivery.payload,
+                });
+                let env = DaemonEnvelope::broadcast(Channel::Chat, broadcast);
+                let _ = lint_tx.send((b"*".to_vec(), env)).await;
+            }
+        });
+    }
 
     // Spawn message processing loop
     let process_router = router.clone();
@@ -2598,8 +2648,7 @@ pub async fn start_server(
                         "type": "canvas_video_open_render_tab",
                         "payload": { "job_id": job_id }
                     });
-                    let broadcast_env =
-                        DaemonEnvelope::broadcast(channel, broadcast_payload);
+                    let broadcast_env = DaemonEnvelope::broadcast(channel, broadcast_payload);
                     let _ = process_response_tx
                         .send((b"*".to_vec(), broadcast_env))
                         .await;
@@ -2634,6 +2683,103 @@ pub async fn start_server(
                         "payload": {
                             "code": "CANVAS_VIDEO_ERROR",
                             "message": e.to_string()
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_video_lint_composition request.
+            if msg_type == "canvas_video_lint_composition" {
+                info!("Processing canvas_video_lint_composition message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await
+                {
+                    Ok(resp_json) => serde_json::json!({
+                        "type": "canvas_video_lint_composition_response",
+                        "payload": resp_json
+                    }),
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_VIDEO_ERROR",
+                            "message": e.to_string()
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Handle canvas_video_lint_result — the extension's reply to a
+            // broadcast lint request. Resolves the correlator's oneshot.
+            if msg_type == "canvas_video_lint_result" {
+                info!("Processing canvas_video_lint_result message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let correlator = payload
+                    .get("job_correlator")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let report: nevoflux_protocol::canvas_video::LintReport = payload
+                    .get("report")
+                    .and_then(|r| serde_json::from_value(r.clone()).ok())
+                    .unwrap_or_default();
+                process_canvas_video_service
+                    .on_lint_result(&correlator, report)
+                    .await;
+                // No response — fire-and-forget.
+                continue;
+            }
+
+            // Handle canvas_video_reveal_path — sidebar asks daemon to play or
+            // reveal a rendered MP4 via the OS default app. Fire-and-forget
+            // from the sidebar's POV, but we return a success/error response
+            // so the card can show a toast on failure.
+            if msg_type == "canvas_video_reveal_path" {
+                info!("Processing canvas_video_reveal_path message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match serde_json::from_value::<
+                    nevoflux_protocol::canvas_video::RevealPathRequest,
+                >(payload)
+                {
+                    Ok(req) => match crate::canvas_video::reveal::reveal_path(req) {
+                        Ok(r) => serde_json::json!({
+                            "type": "canvas_video_reveal_path_response",
+                            "payload": r,
+                        }),
+                        Err(e) => serde_json::json!({
+                            "type": "error",
+                            "payload": {"code":"CANVAS_VIDEO_ERROR","message":e.to_string()}
+                        }),
+                    },
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_VIDEO_ERROR",
+                            "message": format!("invalid canvas_video_reveal_path payload: {e}")
                         }
                     }),
                 };
@@ -3112,8 +3258,8 @@ async fn handle_event_bus_request(
                     patterns: opts.patterns,
                 }
             } else {
-                let (pat, msg) = first_error
-                    .unwrap_or_else(|| ("?".to_string(), "unknown".to_string()));
+                let (pat, msg) =
+                    first_error.unwrap_or_else(|| ("?".to_string(), "unknown".to_string()));
                 EventBusResponse::Error {
                     code: "SUBSCRIBE_FAILED".into(),
                     message: format!("all patterns failed; first: {} — {}", pat, msg),
