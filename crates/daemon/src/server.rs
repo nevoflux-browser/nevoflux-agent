@@ -2750,6 +2750,45 @@ pub async fn start_server(
                 continue;
             }
 
+            // Handle canvas_video_reveal_path — sidebar asks daemon to play or
+            // reveal a rendered MP4 via the OS default app. Fire-and-forget
+            // from the sidebar's POV, but we return a success/error response
+            // so the card can show a toast on failure.
+            if msg_type == "canvas_video_reveal_path" {
+                info!("Processing canvas_video_reveal_path message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match serde_json::from_value::<
+                    nevoflux_protocol::canvas_video::RevealPathRequest,
+                >(payload)
+                {
+                    Ok(req) => match crate::canvas_video::reveal::reveal_path(req) {
+                        Ok(r) => serde_json::json!({
+                            "type": "canvas_video_reveal_path_response",
+                            "payload": r,
+                        }),
+                        Err(e) => serde_json::json!({
+                            "type": "error",
+                            "payload": {"code":"CANVAS_VIDEO_ERROR","message":e.to_string()}
+                        }),
+                    },
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_VIDEO_ERROR",
+                            "message": format!("invalid canvas_video_reveal_path payload: {e}")
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
             // Handle canvas_video_ready notification (extension -> daemon).
             if msg_type == "canvas_video_ready" {
                 info!("Processing canvas_video_ready message");

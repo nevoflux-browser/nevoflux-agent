@@ -244,6 +244,32 @@ pub struct LintCompositionResponse {
     pub report: LintReport,
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Reveal path (UX2 — "Play" / "Open folder" buttons)
+// ─────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevealPathRequest {
+    pub path: String,
+    /// "play" → open with default app; "reveal" → open containing folder.
+    pub action: RevealAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RevealAction {
+    Play,
+    Reveal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevealPathResponse {
+    pub success: bool,
+    /// Human-readable error summary on failure; empty on success.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod meta_tests {
     use super::*;
@@ -355,5 +381,29 @@ mod meta_tests {
         let r: CreateCompositionRequest = serde_json::from_value(v).unwrap();
         assert!(r.template.is_none());
         assert!(r.session_id.is_none());
+    }
+
+    #[test]
+    fn test_reveal_action_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&RevealAction::Play).unwrap(),
+            "\"play\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RevealAction::Reveal).unwrap(),
+            "\"reveal\""
+        );
+    }
+
+    #[test]
+    fn test_reveal_path_request_roundtrip() {
+        let req = RevealPathRequest {
+            path: "/tmp/x.mp4".into(),
+            action: RevealAction::Play,
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        let back: RevealPathRequest = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.path, "/tmp/x.mp4");
+        assert_eq!(back.action, RevealAction::Play);
     }
 }

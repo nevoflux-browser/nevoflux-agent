@@ -8,6 +8,7 @@ pub mod frame_chunks;
 pub mod handlers;
 pub mod job;
 pub mod render;
+pub mod reveal;
 pub mod service;
 pub mod tool;
 
