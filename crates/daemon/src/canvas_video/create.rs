@@ -179,9 +179,17 @@ fn build_meta(req: &CreateCompositionRequest) -> CompositionMeta {
 fn substitute_placeholders(
     body: &str,
     req: &CreateCompositionRequest,
-    template: &str,
+    _template: &str,
 ) -> Result<String> {
     let bg = req.bg.clone().unwrap_or_else(|| "#000".into());
+    // All placeholders are optional. Templates may hardcode their canonical
+    // dimensions in data-width / data-height attributes (the convention for
+    // the seven shipped /video templates: each template's aspect is part of
+    // its identity, e.g. tiktok-hook is intrinsically 9:16 at 1080x1920),
+    // OR they may use {{width}}/{{height}}/{{duration}}/{{fps}}/{{bg}} for
+    // parameterization. Missing placeholders are not an error -- absent
+    // means "the template doesn't take that parameter at materialization
+    // time," not "broken template."
     let replacements = [
         ("{{width}}", req.width.to_string()),
         ("{{height}}", req.height.to_string()),
@@ -190,20 +198,10 @@ fn substitute_placeholders(
         ("{{bg}}", bg),
     ];
     let mut out = body.to_string();
-    let mut missing = Vec::new();
     for (needle, value) in &replacements {
         if body.contains(needle) {
             out = out.replace(needle, value);
-        } else if matches!(*needle, "{{width}}" | "{{height}}") {
-            // width/height are required in templates; others optional.
-            missing.push((*needle).to_string());
         }
-    }
-    if !missing.is_empty() {
-        return Err(DaemonError::TemplateSubstitutionFailed {
-            template: template.to_string(),
-            missing,
-        });
     }
     Ok(out)
 }
