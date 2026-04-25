@@ -2995,7 +2995,18 @@ The following skill instructions MUST be followed exactly. These instructions ta
             },
             ToolDefinition {
                 name: "canvas_create_composition".into(),
-                description: "Create a composition artifact for video rendering. Returns {artifact_id} immediately. Arguments: title (str), width (int 1-1920), height (int 1-1920), duration_sec (number 0.5-60), fps (24|25|30), bg (optional CSS color string), html (optional full composition HTML including any iframe-safe inline scripts and asset references). If html is omitted a minimal scaffold is generated.".into(),
+                description: "Create a composition artifact for video rendering by selecting one of \
+                              the seven shipped /video skill templates. Returns {artifact_id} \
+                              immediately. The daemon materializes the template's HTML, embeds the \
+                              composition spec metadata, and stores a multi-file artifact (index.html \
+                              + DESIGN.md + composition.meta.json). To customize text/colors/copy \
+                              afterward, use edit_artifact on the returned artifact_id.\n\n\
+                              Arguments: title (str); width (int 1-1920); height (int 1-1920); \
+                              duration_sec (number 0.5-60); fps (24|25|30); bg (optional CSS color \
+                              string); template (REQUIRED, one of the seven enum values). \
+                              Do NOT call skill_read first — the daemon reads the template directly. \
+                              The agent does NOT have access to inline an HTML body; the dispatch \
+                              layer rejects any `html` field with InvalidRequest.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -3005,9 +3016,22 @@ The following skill instructions MUST be followed exactly. These instructions ta
                         "duration_sec": { "type": "number",  "minimum": 0.5, "maximum": 60 },
                         "fps":          { "type": "integer", "enum": [24, 25, 30] },
                         "bg":           { "type": ["string", "null"] },
-                        "html":         { "type": ["string", "null"] }
+                        "template":     {
+                            "type": "string",
+                            "enum": [
+                                "website-promo-16x9",
+                                "product-intro-16x9",
+                                "product-intro-9x16",
+                                "tiktok-hook",
+                                "video-overlay",
+                                "logo-3d-reveal",
+                                "product-3d-spin"
+                            ],
+                            "description": "Skill template name. Picks the layout / scenes / GSAP \
+                                            timeline. Customize content via edit_artifact afterward."
+                        }
                     },
-                    "required": ["title", "width", "height", "duration_sec", "fps"]
+                    "required": ["title", "width", "height", "duration_sec", "fps", "template"]
                 }),
             },
             ToolDefinition {
