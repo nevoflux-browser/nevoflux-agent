@@ -69,6 +69,15 @@ impl ToolExecutor for CanvasRenderVideoTool {
 /// JSON Schema for `canvas_create_composition`. Exposed so the WASM agent
 /// `ToolDefinition` list can reuse the exact same shape — keeps the dual
 /// tool registry in sync without two sources of truth.
+///
+/// NOTE: `html` is intentionally omitted from the LLM-facing schema. The
+/// CreateCompositionRequest struct still accepts it for internal callers
+/// (tests, scripts) but agents must select one of the seven shipped
+/// templates. Earlier iterations exposed `html` and the LLM aggressively
+/// preferred it (copying skill_read'd template content into html instead
+/// of passing template:), leaving meta.origin.template = null. Removing
+/// the field from the schema makes the template path the only available
+/// option and reliably routes through daemon's substitute_placeholders.
 pub fn create_composition_schema() -> Value {
     serde_json::json!({
         "type": "object",
@@ -80,9 +89,8 @@ pub fn create_composition_schema() -> Value {
             "fps":          { "type": "integer", "enum": [24, 25, 30] },
             "bg":           { "type": ["string", "null"] },
             "template":     {
-                "type": ["string", "null"],
+                "type": "string",
                 "enum": [
-                    null,
                     "website-promo-16x9",
                     "product-intro-16x9",
                     "product-intro-9x16",
@@ -91,20 +99,13 @@ pub fn create_composition_schema() -> Value {
                     "logo-3d-reveal",
                     "product-3d-spin"
                 ],
-                "description": "Skill template name from the /video skill. REQUIRED when the user \
-                                names a template (e.g., 'using tiktok-hook template'). The daemon \
-                                materializes the named template into the composition; you do NOT \
-                                need to call skill_read first. When `template` is set, omit `html`. \
-                                One of `template` or `html` must be provided."
-            },
-            "html":         {
-                "type": ["string", "null"],
-                "description": "Raw HTML body. ONLY use when the user explicitly asks for a custom \
-                                composition AND no shipped template fits. Otherwise pass `template` \
-                                instead. One of `template` or `html` must be provided."
+                "description": "Skill template name from the /video skill. The daemon \
+                                materializes the named template into the composition; you do \
+                                NOT need to call skill_read first. To customize the rendered \
+                                HTML afterward, use edit_artifact on the resulting composition."
             }
         },
-        "required": ["title", "width", "height", "duration_sec", "fps"]
+        "required": ["title", "width", "height", "duration_sec", "fps", "template"]
     })
 }
 
@@ -244,10 +245,23 @@ mod tests {
         assert_eq!(props["duration_sec"]["maximum"], 60);
         let fps_enum = props["fps"]["enum"].as_array().unwrap();
         assert_eq!(fps_enum.len(), 3);
-        // Regression: the LLM-facing schema must expose `template` so agents
-        // can request a /video skill template instead of falling back to the
-        // `html` field every time.
-        assert!(props.get("template").is_some(), "template field missing from schema");
+
+        // template is REQUIRED and constrained to the seven shipped names.
+        assert!(props.get("template").is_some(), "template field missing");
+        let tpl_enum = props["template"]["enum"].as_array().unwrap();
+        assert_eq!(tpl_enum.len(), 7);
+        let required = s["required"].as_array().unwrap();
+        assert!(
+            required.iter().any(|v| v == "template"),
+            "template must be required, got: {required:?}"
+        );
+
+        // html must NOT be in the LLM-facing schema (LLMs persistently
+        // preferred it over template before this lockdown).
+        assert!(
+            props.get("html").is_none(),
+            "html field must be hidden from LLM schema"
+        );
     }
 
     #[tokio::test]
