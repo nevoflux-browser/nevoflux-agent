@@ -129,8 +129,17 @@ async fn resolve_index_html(
             })?;
         return substitute_placeholders(&body, req, tpl);
     }
-    // 3. Default scaffold.
-    Ok(default_scaffold(req))
+    // 3. Reject — neither template nor html supplied. Returning a 500-byte
+    //    default scaffold here silently masks LLM mistakes (it omitted both
+    //    fields), and downstream the composition has no real content. Surface
+    //    the error so the agent retries with template or html.
+    Err(DaemonError::InvalidRequest(
+        "canvas_create_composition: must provide either `template` (one of: \
+         website-promo-16x9, product-intro-16x9, product-intro-9x16, tiktok-hook, \
+         video-overlay, logo-3d-reveal, product-3d-spin) or `html` (raw composition body). \
+         Both are missing."
+            .into(),
+    ))
 }
 
 async fn resolve_design_md(svc: &CanvasVideoService) -> Result<String> {
@@ -254,7 +263,9 @@ mod persistence_tests {
             duration_sec: 5.0,
             fps: 30,
             bg: Some("#000".into()),
-            html: None,
+            // resolve_index_html now rejects creates with neither template nor
+            // html, so seed a minimal html for unit-test fixtures.
+            html: Some("<html><body></body></html>".into()),
             template: None,
             session_id: None,
         }
@@ -335,11 +346,29 @@ mod persistence_tests {
     async fn create_rejects_missing_template() {
         let svc = Arc::new(CanvasVideoService::new_for_tests());
         let mut req = mk_req("h");
+        // mk_req seeds html so the create won't fall through to the
+        // "neither field set" rejection path; null html here to force the
+        // template lookup, which is what this test exercises.
+        req.html = None;
         req.template = Some("does-not-exist".into());
         let err = svc.create_composition(req).await.unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("skill asset not found") || msg.contains("SkillAssetNotFound"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_when_both_template_and_html_missing() {
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let mut req = mk_req("h");
+        req.html = None;
+        req.template = None;
+        let err = svc.create_composition(req).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("must provide either") && msg.contains("template") && msg.contains("html"),
             "got: {msg}"
         );
     }

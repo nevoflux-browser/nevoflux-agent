@@ -81,16 +81,27 @@ pub fn create_composition_schema() -> Value {
             "bg":           { "type": ["string", "null"] },
             "template":     {
                 "type": ["string", "null"],
-                "description": "Skill template name to materialize from the /video skill. \
-                                Strongly preferred over inline `html`. Valid names (call \
-                                skill_load('video') for the canonical list): \
-                                website-promo-16x9, product-intro-16x9, product-intro-9x16, \
-                                tiktok-hook, video-overlay, logo-3d-reveal, product-3d-spin."
+                "enum": [
+                    null,
+                    "website-promo-16x9",
+                    "product-intro-16x9",
+                    "product-intro-9x16",
+                    "tiktok-hook",
+                    "video-overlay",
+                    "logo-3d-reveal",
+                    "product-3d-spin"
+                ],
+                "description": "Skill template name from the /video skill. REQUIRED when the user \
+                                names a template (e.g., 'using tiktok-hook template'). The daemon \
+                                materializes the named template into the composition; you do NOT \
+                                need to call skill_read first. When `template` is set, omit `html`. \
+                                One of `template` or `html` must be provided."
             },
             "html":         {
                 "type": ["string", "null"],
-                "description": "Raw HTML body. Only use when no template fits and a custom \
-                                composition is required. Prefer `template` whenever possible."
+                "description": "Raw HTML body. ONLY use when the user explicitly asks for a custom \
+                                composition AND no shipped template fits. Otherwise pass `template` \
+                                instead. One of `template` or `html` must be provided."
             }
         },
         "required": ["title", "width", "height", "duration_sec", "fps"]
@@ -172,12 +183,16 @@ mod tests {
     async fn test_canvas_create_composition_tool_dispatches_to_service() {
         let svc = Arc::new(CanvasVideoService::new_for_tests());
         let tool = CanvasCreateCompositionTool::new(svc);
+        // resolve_index_html now requires either template or html; supply a
+        // minimal html so this dispatch test focuses on the wire path, not
+        // template resolution (covered separately).
         let args = serde_json::json!({
             "title": "demo",
             "width": 640,
             "height": 360,
             "duration_sec": 1.0,
-            "fps": 30
+            "fps": 30,
+            "html": "<html><body></body></html>"
         });
         let out = tool
             .execute("canvas_create_composition", &args)
@@ -256,7 +271,7 @@ mod tests {
                 duration_sec: 5.0,
                 fps: 30,
                 bg: None,
-                html: None,
+                html: Some("<html><body></body></html>".into()),
                 template: None,
                 session_id: None,
             })
@@ -296,7 +311,7 @@ mod tests {
                 duration_sec: 5.0,
                 fps: 30,
                 bg: None,
-                html: None,
+                html: Some("<html><body></body></html>".into()),
                 template: None,
                 session_id: None,
             })

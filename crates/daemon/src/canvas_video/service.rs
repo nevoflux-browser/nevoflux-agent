@@ -532,7 +532,14 @@ mod p3_load_tests {
             duration_sec: 5.0,
             fps: 30,
             bg: None,
-            html: None,
+            // resolve_index_html now rejects creates with neither template nor
+            // html, so seed a minimal html that's still detectable by the
+            // load test below (contains the stage marker).
+            html: Some(
+                "<html><body><div id=\"stage\" data-width=\"640\" data-height=\"360\" \
+                 data-duration=\"5\" data-fps=\"30\"></div></body></html>"
+                    .into(),
+            ),
             template: None,
             session_id: None,
         }
