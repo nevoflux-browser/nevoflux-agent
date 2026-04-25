@@ -4392,10 +4392,13 @@ impl HostFunctions for DaemonHostFunctions {
                 message: "canvas_video service not wired".into(),
             })?
             .clone();
-        let req: nevoflux_protocol::canvas_video::CreateCompositionRequest =
-            serde_json::from_value(request.clone()).map_err(|e| HostError {
+        // Strict parser also blocks `html`-field injection from the
+        // direct-API LLM provider path (Anthropic / OpenAI / etc.) so all
+        // three dispatch surfaces share the same gate.
+        let req = crate::canvas_video::tool::parse_create_composition_args_strict(request)
+            .map_err(|e| HostError {
                 code: 4,
-                message: format!("invalid canvas_create_composition args: {}", e),
+                message: e.to_string(),
             })?;
         let resp = tokio::task::block_in_place(|| {
             self.runtime

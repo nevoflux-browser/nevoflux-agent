@@ -1050,9 +1050,13 @@ async fn execute_canvas_video_tool(
 
     match name {
         "canvas_create_composition" => {
-            let req: nevoflux_protocol::canvas_video::CreateCompositionRequest =
-                serde_json::from_value(arguments.clone())
-                    .map_err(|e| format!("invalid canvas_create_composition args: {}", e))?;
+            // Use the shared strict parser so the LLM-facing dispatch path
+            // gets the same `html`-rejection gate as the in-process tool
+            // executor (canvas_video::tool::CanvasCreateCompositionTool).
+            // Without this, the MCP/ACP path silently accepted hallucinated
+            // html submissions and meta.origin.template ended up null.
+            let req = crate::canvas_video::tool::parse_create_composition_args_strict(arguments)
+                .map_err(|e| e.to_string())?;
             let resp = svc
                 .create_composition(req)
                 .await

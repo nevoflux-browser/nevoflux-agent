@@ -31,28 +31,34 @@ impl CanvasCreateCompositionTool {
     }
 }
 
+/// Shared parser used at every LLM dispatch surface.
+///
+/// The LLM-facing JSON Schema does not advertise `html`, but the
+/// `CreateCompositionRequest` struct still accepts it for internal callers.
+/// serde sees `html` as a valid named field, so #[serde(deny_unknown_fields)]
+/// can't catch hallucinated submissions. Reject the field explicitly here so
+/// every surface (this tool, mcp_tool_executor, agent_host) routes through
+/// the same gate and the LLM gets a clear retry signal.
+pub fn parse_create_composition_args_strict(
+    arguments: &Value,
+) -> Result<CreateCompositionRequest> {
+    if arguments.get("html").is_some() {
+        return Err(DaemonError::InvalidRequest(
+            "canvas_create_composition: the `html` field is not accepted from agents; \
+             pass `template` (one of: website-promo-16x9, product-intro-16x9, \
+             product-intro-9x16, tiktok-hook, video-overlay, logo-3d-reveal, \
+             product-3d-spin) and use edit_artifact afterward to customize content."
+                .into(),
+        ));
+    }
+    serde_json::from_value(arguments.clone())
+        .map_err(|e| DaemonError::InvalidRequest(format!("canvas_create_composition: {}", e)))
+}
+
 #[async_trait]
 impl ToolExecutor for CanvasCreateCompositionTool {
     async fn execute(&self, _name: &str, arguments: &Value) -> Result<String> {
-        // The LLM-facing schema does not advertise `html`, but the
-        // CreateCompositionRequest struct still accepts it for internal callers.
-        // serde sees `html` as a valid named field, so deny_unknown_fields can't
-        // catch hallucinated submissions where the LLM remembers the field from
-        // training data or earlier conversation history. Explicitly reject the
-        // field at the dispatch boundary so the LLM gets a clear retry signal.
-        if arguments.get("html").is_some() {
-            return Err(DaemonError::InvalidRequest(
-                "canvas_create_composition: the `html` field is not accepted from agents; \
-                 pass `template` (one of: website-promo-16x9, product-intro-16x9, \
-                 product-intro-9x16, tiktok-hook, video-overlay, logo-3d-reveal, \
-                 product-3d-spin) and use edit_artifact afterward to customize content."
-                    .into(),
-            ));
-        }
-        let req: CreateCompositionRequest =
-            serde_json::from_value(arguments.clone()).map_err(|e| {
-                DaemonError::InvalidRequest(format!("canvas_create_composition: {}", e))
-            })?;
+        let req = parse_create_composition_args_strict(arguments)?;
         let resp = self.svc.create_composition(req).await?;
         serde_json::to_string(&resp)
             .map_err(|e| DaemonError::InternalError(format!("serialize response: {}", e)))
