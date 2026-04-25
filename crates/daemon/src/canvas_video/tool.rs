@@ -79,7 +79,19 @@ pub fn create_composition_schema() -> Value {
             "duration_sec": { "type": "number",  "minimum": 0.5, "maximum": 60 },
             "fps":          { "type": "integer", "enum": [24, 25, 30] },
             "bg":           { "type": ["string", "null"] },
-            "html":         { "type": ["string", "null"] }
+            "template":     {
+                "type": ["string", "null"],
+                "description": "Skill template name to materialize from the /video skill. \
+                                Strongly preferred over inline `html`. Valid names (call \
+                                skill_load('video') for the canonical list): \
+                                website-promo-16x9, product-intro-16x9, product-intro-9x16, \
+                                tiktok-hook, video-overlay, logo-3d-reveal, product-3d-spin."
+            },
+            "html":         {
+                "type": ["string", "null"],
+                "description": "Raw HTML body. Only use when no template fits and a custom \
+                                composition is required. Prefer `template` whenever possible."
+            }
         },
         "required": ["title", "width", "height", "duration_sec", "fps"]
     })
@@ -217,6 +229,10 @@ mod tests {
         assert_eq!(props["duration_sec"]["maximum"], 60);
         let fps_enum = props["fps"]["enum"].as_array().unwrap();
         assert_eq!(fps_enum.len(), 3);
+        // Regression: the LLM-facing schema must expose `template` so agents
+        // can request a /video skill template instead of falling back to the
+        // `html` field every time.
+        assert!(props.get("template").is_some(), "template field missing from schema");
     }
 
     #[tokio::test]
