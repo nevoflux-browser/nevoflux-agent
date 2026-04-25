@@ -34,6 +34,21 @@ impl CanvasCreateCompositionTool {
 #[async_trait]
 impl ToolExecutor for CanvasCreateCompositionTool {
     async fn execute(&self, _name: &str, arguments: &Value) -> Result<String> {
+        // The LLM-facing schema does not advertise `html`, but the
+        // CreateCompositionRequest struct still accepts it for internal callers.
+        // serde sees `html` as a valid named field, so deny_unknown_fields can't
+        // catch hallucinated submissions where the LLM remembers the field from
+        // training data or earlier conversation history. Explicitly reject the
+        // field at the dispatch boundary so the LLM gets a clear retry signal.
+        if arguments.get("html").is_some() {
+            return Err(DaemonError::InvalidRequest(
+                "canvas_create_composition: the `html` field is not accepted from agents; \
+                 pass `template` (one of: website-promo-16x9, product-intro-16x9, \
+                 product-intro-9x16, tiktok-hook, video-overlay, logo-3d-reveal, \
+                 product-3d-spin) and use edit_artifact afterward to customize content."
+                    .into(),
+            ));
+        }
         let req: CreateCompositionRequest =
             serde_json::from_value(arguments.clone()).map_err(|e| {
                 DaemonError::InvalidRequest(format!("canvas_create_composition: {}", e))
@@ -184,23 +199,53 @@ mod tests {
     async fn test_canvas_create_composition_tool_dispatches_to_service() {
         let svc = Arc::new(CanvasVideoService::new_for_tests());
         let tool = CanvasCreateCompositionTool::new(svc);
-        // resolve_index_html now requires either template or html; supply a
-        // minimal html so this dispatch test focuses on the wire path, not
-        // template resolution (covered separately).
+        // The dispatch boundary now rejects `html`, and the test SkillRegistry
+        // is empty (no template files loaded), so a template payload reaches
+        // the service layer and surfaces SkillAssetNotFound. That proves the
+        // dispatch path: deserialize -> service::create_composition ->
+        // resolve_index_html template branch.
         let args = serde_json::json!({
             "title": "demo",
             "width": 640,
             "height": 360,
             "duration_sec": 1.0,
             "fps": 30,
-            "html": "<html><body></body></html>"
+            "template": "tiktok-hook"
         });
-        let out = tool
+        let err = tool
             .execute("canvas_create_composition", &args)
             .await
-            .unwrap();
-        assert!(out.contains("artifact_id"));
-        assert!(out.contains("comp-"));
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("skill asset not found") || msg.contains("SkillAssetNotFound"),
+            "expected service-layer SkillAssetNotFound, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_canvas_create_composition_tool_rejects_html_field() {
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let tool = CanvasCreateCompositionTool::new(svc);
+        // LLM-style payload: schema-valid required fields PLUS a sneaky html
+        // (which the struct accepts, but the dispatch layer must reject).
+        let args = serde_json::json!({
+            "title": "demo",
+            "width": 640,
+            "height": 360,
+            "duration_sec": 1.0,
+            "fps": 30,
+            "html": "<html><body>sneaky</body></html>"
+        });
+        let err = tool
+            .execute("canvas_create_composition", &args)
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("`html` field is not accepted") && msg.contains("template"),
+            "expected html-rejection error, got: {msg}"
+        );
     }
 
     #[tokio::test]
