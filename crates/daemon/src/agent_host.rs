@@ -4395,18 +4395,34 @@ impl HostFunctions for DaemonHostFunctions {
         // Strict parser also blocks `html`-field injection from the
         // direct-API LLM provider path (Anthropic / OpenAI / etc.) so all
         // three dispatch surfaces share the same gate.
+        tracing::info!(
+            "canvas_video_create_composition: incoming args = {}",
+            serde_json::to_string(request).unwrap_or_default()
+        );
         let req = crate::canvas_video::tool::parse_create_composition_args_strict(request)
-            .map_err(|e| HostError {
-                code: 4,
-                message: e.to_string(),
+            .map_err(|e| {
+                tracing::warn!(
+                    "canvas_video_create_composition: strict-parse rejected: {}",
+                    e
+                );
+                HostError {
+                    code: 4,
+                    message: e.to_string(),
+                }
             })?;
         let resp = tokio::task::block_in_place(|| {
             self.runtime
                 .block_on(async move { svc.create_composition(req).await })
         })
-        .map_err(|e| HostError {
-            code: 3,
-            message: format!("canvas_create_composition failed: {}", e),
+        .map_err(|e| {
+            tracing::warn!(
+                "canvas_video_create_composition: service error: {}",
+                e
+            );
+            HostError {
+                code: 3,
+                message: format!("canvas_create_composition failed: {}", e),
+            }
         })?;
         serde_json::to_value(&resp).map_err(|e| HostError {
             code: 4,
