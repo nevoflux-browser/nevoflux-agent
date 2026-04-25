@@ -3,7 +3,15 @@
 use serde::{Deserialize, Serialize};
 
 /// `canvas.video.create_composition` request.
+///
+/// `deny_unknown_fields` is critical for the LLM-facing path: without it,
+/// serde silently accepts hallucinated fields (e.g., the LLM remembering
+/// `html` from earlier conversation history even after it was removed
+/// from the JSON Schema). Strict deserialization causes such payloads to
+/// fail loudly with InvalidRequest, forcing the agent to retry with a
+/// schema-compliant call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateCompositionRequest {
     pub title: String,
     pub width: u32,
@@ -12,8 +20,9 @@ pub struct CreateCompositionRequest {
     pub fps: u32,
     #[serde(default)]
     pub bg: Option<String>,
-    /// Raw HTML override. Phase B uses this for end-to-end tests;
-    /// P2 adds template-driven authoring.
+    /// Raw HTML override. Internal callers (tests, scripts) only — the
+    /// LLM-facing JSON Schema does not advertise this field. See
+    /// canvas_video::tool::create_composition_schema for rationale.
     #[serde(default)]
     pub html: Option<String>,
     #[serde(default)]
