@@ -153,6 +153,109 @@ impl CanvasVideoService {
         create::create(self, req).await
     }
 
+    /// Mode-3 entry: derive a DESIGN.md from a `VisualIdentity` blob (the
+    /// output of `canvas_extract_visual_identity`) and create the
+    /// composition with that design baseline. Composes
+    /// `vi_to_design::vi_to_design_md` + `create_composition` so the LLM
+    /// gets a deterministic VI → DESIGN.md path instead of having to
+    /// hand-translate. Caller can still `browser_edit_artifact` afterward
+    /// to apply user-specific tweaks; the deterministic baseline is the
+    /// fast path.
+    pub async fn create_from_visual_identity(
+        self: &Arc<Self>,
+        req: nevoflux_protocol::canvas_video::CreateFromVisualIdentityRequest,
+    ) -> Result<CreateCompositionResponse> {
+        use nevoflux_protocol::extract::VisualIdentity;
+
+        // Deserialize the embedded VI blob. We expose it as serde_json::Value
+        // in the protocol so this module doesn't have to leak `extract`
+        // types into every CRUD call site, but parse strictly here.
+        let vi: VisualIdentity =
+            serde_json::from_value(req.visual_identity.clone()).map_err(|e| {
+                crate::error::DaemonError::InvalidRequest(format!(
+                    "create_from_visual_identity: visual_identity is not a valid VisualIdentity: {e}"
+                ))
+            })?;
+
+        let design_md = crate::canvas_video::vi_to_design::vi_to_design_md(&vi);
+
+        let create_req = CreateCompositionRequest {
+            title: req.title,
+            width: req.width,
+            height: req.height,
+            duration_sec: req.duration_sec,
+            fps: req.fps,
+            bg: req.bg,
+            html: None,
+            template: Some(req.template),
+            design_md: Some(design_md),
+            session_id: req.session_id,
+        };
+        create::create(self, create_req).await
+    }
+
+    /// Re-inject the composition's stored DESIGN.md tokens into its
+    /// `index.html`, replacing only the `<style data-nf-design-tokens>`
+    /// marked block. Use when the user has edited DESIGN.md (in the Canvas
+    /// Editor or via a separate tool) and wants the brand layer refreshed
+    /// without losing content/copy edits to the composition body.
+    ///
+    /// Idempotent: running it twice with no DESIGN.md change leaves the
+    /// artifact byte-identical. Returns `Ok(())` on success;
+    /// `InvalidRequest` if the composition is missing or has no
+    /// `DESIGN.md` / `index.html` entries in its multi-file artifact.
+    pub async fn apply_design_md(&self, composition_id: &str) -> Result<()> {
+        use nevoflux_storage::repositories::ArtifactRepository;
+
+        let storage = self.storage.as_ref().ok_or_else(|| {
+            DaemonError::InternalError("canvas_video: storage not wired".into())
+        })?;
+        let repo = ArtifactRepository::new(storage.database());
+        let record = repo
+            .get(composition_id)
+            .map_err(|e| DaemonError::InternalError(format!("{e}")))?
+            .ok_or_else(|| {
+                DaemonError::InvalidRequest(format!(
+                    "composition not found: {composition_id}"
+                ))
+            })?;
+        let mut files = record.files.ok_or_else(|| {
+            DaemonError::InvalidRequest(format!(
+                "composition has no multi-file payload: {composition_id}"
+            ))
+        })?;
+        let design_md = files.get("DESIGN.md").cloned().ok_or_else(|| {
+            DaemonError::InvalidRequest(format!(
+                "composition has no DESIGN.md: {composition_id}"
+            ))
+        })?;
+        let index_html = files.get("index.html").cloned().ok_or_else(|| {
+            DaemonError::InvalidRequest(format!(
+                "composition has no index.html: {composition_id}"
+            ))
+        })?;
+        // Diagnostic: log what apply_design_md actually read from SQLite so
+        // we can tell whether ContentStore mirror writes are visible here.
+        let in_idx_has_brand = index_html.contains("全新 GPT 体验");
+        let in_design_has_orange = design_md.contains("#ff6600");
+        tracing::info!(
+            "apply_design_md READ: id={}, index_html_len={}, design_md_len={}, idx_has_new_brand={}, design_has_ff6600={}",
+            composition_id, index_html.len(), design_md.len(), in_idx_has_brand, in_design_has_orange,
+        );
+        let updated_html =
+            crate::canvas_video::design::inject_design_tokens(&index_html, &design_md)?;
+        let out_idx_has_brand = updated_html.contains("全新 GPT 体验");
+        let out_has_orange_token = updated_html.contains("--color-primary: #ff6600");
+        tracing::info!(
+            "apply_design_md WROTE: id={}, updated_html_len={}, idx_has_new_brand={}, has_orange_token={}",
+            composition_id, updated_html.len(), out_idx_has_brand, out_has_orange_token,
+        );
+        files.insert("index.html".to_string(), updated_html.clone());
+        repo.update_files(composition_id, &files, &updated_html)
+            .map_err(|e| DaemonError::InternalError(format!("{e}")))?;
+        Ok(())
+    }
+
     /// Load a composition from the artifact repository and return (html, w, h, d, fps).
     pub async fn load_composition(
         &self,
@@ -541,6 +644,7 @@ mod p3_load_tests {
                     .into(),
             ),
             template: None,
+            design_md: None,
             session_id: None,
         }
     }
@@ -632,33 +736,14 @@ mod p3_load_tests {
         );
     }
 
-    #[tokio::test]
-    async fn load_rejects_missing_entry_file() {
-        let svc = Arc::new(CanvasVideoService::new_for_tests());
-        let storage = svc.storage().unwrap().clone();
-        let repo = ArtifactRepository::new(storage.database());
-        let good_meta = serde_json::json!({
-            "kind": "composition", "version": 1,
-            "spec": {"width": 640, "height": 360, "duration_sec": 5.0, "fps": 30},
-            "origin": {"created_with": "t", "created_at": 0}
-        });
-        let mut files = std::collections::HashMap::new();
-        files.insert("composition.meta.json".into(), good_meta.to_string());
-        // index.html intentionally missing
-        repo.create(CreateArtifactParams {
-            id: "comp-no-entry".into(),
-            session_id: None,
-            title: "bad".into(),
-            description: None,
-            content_type: "text/html".into(),
-            content: "".into(),
-            files: Some(files),
-            entry: Some("index.html".into()),
-        })
-        .unwrap();
-        let err = svc.load_composition("comp-no-entry").await.unwrap_err();
-        assert!(format!("{err}").contains("entry"), "got {err}");
-    }
+    // Post-migration 015: the storage layer guarantees `files[entry]`
+    // exists at create time — when the caller passes a `files` map missing
+    // the entry key, `ArtifactRepository::create` synthesizes the entry
+    // from `params.content` (often empty for tests). The "missing entry"
+    // failure path tested previously is no longer reachable through the
+    // storage API; the corresponding load_rejects_missing_entry_file test
+    // was removed when this invariant landed. If you reintroduce the
+    // failure mode (e.g. via raw SQL bypass), reinstate the test.
 }
 
 #[cfg(test)]

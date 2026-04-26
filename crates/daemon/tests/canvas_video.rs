@@ -10,6 +10,25 @@ fn fresh_service() -> Arc<CanvasVideoService> {
     Arc::new(CanvasVideoService::new_for_tests())
 }
 
+const SAMPLE_DESIGN_MD: &str = r##"---
+name: "test-orange"
+colors:
+  primary: "#ff6600"
+  secondary: "#cc4400"
+  background: "#000000"
+  foreground: "#ffffff"
+typography:
+  hero:
+    family: "Inter, sans-serif"
+    weight: 800
+spacing:
+  lg: "24px"
+---
+
+## Overview
+test brand
+"##;
+
 #[tokio::test]
 async fn test_create_composition_returns_artifact_id() {
     let svc = fresh_service();
@@ -22,6 +41,7 @@ async fn test_create_composition_returns_artifact_id() {
         bg: None,
         html: None,
         template: None,
+        design_md: None,
         session_id: None,
     };
     let resp: CreateCompositionResponse = svc.create_composition(req).await.unwrap();
@@ -41,6 +61,7 @@ async fn test_create_composition_rejects_invalid_fps() {
         bg: None,
         html: None,
         template: None,
+        design_md: None,
         session_id: None,
     };
     let err = svc.create_composition(req).await.unwrap_err();
@@ -64,6 +85,7 @@ async fn test_create_composition_rejects_duration_over_60s() {
         bg: None,
         html: None,
         template: None,
+        design_md: None,
         session_id: None,
     };
     let err = svc.create_composition(req).await.unwrap_err();
@@ -149,6 +171,7 @@ async fn test_render_start_creates_job_and_returns_id() {
                     .into(),
             ),
             template: None,
+            design_md: None,
             session_id: None,
         })
         .await
@@ -173,6 +196,155 @@ async fn test_render_start_creates_job_and_returns_id() {
     ));
     assert_eq!(snap.composition_id, create_resp.artifact_id);
     assert_eq!(snap.total_frames, 30);
+}
+
+/// Caller-supplied DESIGN.md → daemon parses frontmatter and injects a
+/// `<style data-nf-design-tokens>` block at the top of the generated
+/// `index.html`. The composition is created via the `html` path (no skill
+/// registry needed) so the test runs in isolation.
+#[tokio::test]
+async fn test_create_with_caller_design_md_injects_tokens() {
+    let svc = fresh_service();
+    let req = CreateCompositionRequest {
+        title: "design-md-test".into(),
+        width: 640,
+        height: 360,
+        duration_sec: 1.0,
+        fps: 30,
+        bg: None,
+        html: Some("<!doctype html><html><head><title>T</title></head><body><div id='stage'>X</div></body></html>".into()),
+        template: None,
+        design_md: Some(SAMPLE_DESIGN_MD.to_string()),
+        session_id: None,
+    };
+    let resp = svc.create_composition(req).await.unwrap();
+
+    use nevoflux_storage::repositories::ArtifactRepository;
+    let storage = svc.storage().unwrap().clone();
+    let repo = ArtifactRepository::new(storage.database());
+    let rec = repo.get(&resp.artifact_id).unwrap().unwrap();
+    let files = rec.files.expect("multi-file artifact");
+
+    // index.html got the marked block with the caller's primary color.
+    let index = files.get("index.html").expect("index.html present");
+    assert!(
+        index.contains("data-nf-design-tokens"),
+        "marked block missing in index.html"
+    );
+    assert!(
+        index.contains("--color-primary: #ff6600;"),
+        "expected --color-primary from caller's DESIGN.md, got: {index:?}"
+    );
+    // Original body content survived the injection.
+    assert!(index.contains("<div id='stage'>X</div>"));
+
+    // DESIGN.md stored verbatim (the injection source-of-truth, used by apply).
+    let stored_md = files.get("DESIGN.md").expect("DESIGN.md present");
+    assert!(stored_md.contains("primary: \"#ff6600\""));
+
+    // content field synced with the injected index.html.
+    assert_eq!(rec.content, *index);
+}
+
+/// `canvas_apply_design_md` re-runs token injection from the artifact's
+/// stored DESIGN.md. After the user edits DESIGN.md and calls apply, only
+/// the `<style data-nf-design-tokens>` block changes — copy/text/CSS edits
+/// elsewhere in `index.html` survive byte-identical.
+#[tokio::test]
+async fn test_apply_design_md_replaces_only_marked_block() {
+    let svc = fresh_service();
+    let req = CreateCompositionRequest {
+        title: "apply-test".into(),
+        width: 640,
+        height: 360,
+        duration_sec: 1.0,
+        fps: 30,
+        bg: None,
+        html: Some("<!doctype html><html><head><title>T</title></head><body><h1 id='headline'>Original headline</h1><div id='stage'>BODY</div></body></html>".into()),
+        template: None,
+        design_md: Some(SAMPLE_DESIGN_MD.to_string()),
+        session_id: None,
+    };
+    let resp = svc.create_composition(req).await.unwrap();
+
+    use nevoflux_storage::repositories::ArtifactRepository;
+    let storage = svc.storage().unwrap().clone();
+    let repo = ArtifactRepository::new(storage.database());
+
+    // Capture index.html after creation.
+    let before = repo.get(&resp.artifact_id).unwrap().unwrap();
+    let before_files = before.files.unwrap();
+    let before_index = before_files.get("index.html").unwrap().clone();
+
+    // User edits DESIGN.md (simulating a Canvas Editor save): primary becomes green.
+    let altered_md = SAMPLE_DESIGN_MD.replace("#ff6600", "#00ff00");
+    let mut altered_files = before_files.clone();
+    altered_files.insert("DESIGN.md".to_string(), altered_md);
+    repo.update_files(&resp.artifact_id, &altered_files, &before_index)
+        .unwrap();
+
+    // Apply re-injection.
+    svc.apply_design_md(&resp.artifact_id).await.unwrap();
+
+    // Assert: only the marked block changed; everything else byte-identical.
+    let after = repo.get(&resp.artifact_id).unwrap().unwrap();
+    let after_files = after.files.unwrap();
+    let after_index = after_files.get("index.html").unwrap().clone();
+
+    assert!(
+        after_index.contains("--color-primary: #00ff00;"),
+        "expected new green primary, got: {after_index}"
+    );
+    assert!(
+        !after_index.contains("--color-primary: #ff6600;"),
+        "old primary should be gone, got: {after_index}"
+    );
+    // Content outside the marked block survives.
+    assert!(after_index.contains("<h1 id='headline'>Original headline</h1>"));
+    assert!(after_index.contains("<div id='stage'>BODY</div>"));
+    assert!(after_index.contains("<title>T</title>"));
+
+    // Idempotent: applying again produces the same result.
+    svc.apply_design_md(&resp.artifact_id).await.unwrap();
+    let after2 = repo.get(&resp.artifact_id).unwrap().unwrap();
+    let after2_files = after2.files.unwrap();
+    let after2_index = after2_files.get("index.html").unwrap();
+    assert_eq!(after2_index, &after_index, "apply is not idempotent");
+}
+
+/// Without caller-supplied design_md AND with no skills loaded (the test
+/// fixture's empty SkillRegistry), composition creation MUST still
+/// succeed — the skill-aux read failures degrade silently to an empty
+/// DESIGN.md, the inject step becomes a no-op, and the raw template HTML
+/// is stored.
+#[tokio::test]
+async fn test_create_without_design_md_falls_back_silently() {
+    let svc = fresh_service();
+    let req = CreateCompositionRequest {
+        title: "fallback".into(),
+        width: 640,
+        height: 360,
+        duration_sec: 1.0,
+        fps: 30,
+        bg: None,
+        html: Some("<!doctype html><html><head><title>T</title></head><body>Y</body></html>".into()),
+        template: None,
+        design_md: None,
+        session_id: None,
+    };
+    let resp = svc.create_composition(req).await.unwrap();
+    use nevoflux_storage::repositories::ArtifactRepository;
+    let storage = svc.storage().unwrap().clone();
+    let repo = ArtifactRepository::new(storage.database());
+    let rec = repo.get(&resp.artifact_id).unwrap().unwrap();
+    let files = rec.files.unwrap();
+
+    // index.html present; design tokens block may or may not appear depending
+    // on whether the test fixture skill registry exposes a video skill.
+    let index = files.get("index.html").unwrap();
+    assert!(index.contains("<title>T</title>"));
+    // DESIGN.md slot exists (might be empty string if no skill registry).
+    assert!(files.contains_key("DESIGN.md"));
 }
 
 #[tokio::test]
@@ -232,6 +404,7 @@ async fn test_render_loop_reassembles_and_encodes() {
             bg: None,
             html: Some("<!doctype html><body></body>".into()),
             template: None,
+            design_md: None,
             session_id: None,
         })
         .await

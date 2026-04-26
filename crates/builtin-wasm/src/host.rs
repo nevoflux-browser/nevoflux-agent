@@ -386,6 +386,21 @@ pub trait HostFunctions {
         tab_id: Option<i64>,
     ) -> HostResult<BrowserToolResult>;
 
+    /// Extract a brand's visual identity (colors / fonts / logo / hero
+    /// screenshot / name / tagline) from a URL or existing tab. Backs the
+    /// `canvas_extract_visual_identity` tool — used by Mode 3 (website-to-
+    /// video) to auto-fill DESIGN.md from a live site. See
+    /// `nevoflux_protocol::extract::ExtractVisualIdentityRequest`.
+    ///
+    /// `tab_id` is supplied by the LLM dispatch arm when `target.tab_id` is
+    /// present in the arguments; otherwise None and the extension opens a
+    /// background tab from `target.url`.
+    fn browser_extract_visual_identity(
+        &self,
+        params: &serde_json::Value,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
+
     /// Wait for page to stabilize after an action.
     fn browser_wait_for_stable(
         &self,
@@ -552,6 +567,80 @@ pub trait HostFunctions {
         &self,
         request: &serde_json::Value,
     ) -> HostResult<serde_json::Value>;
+
+    /// Re-inject DESIGN.md tokens into the composition's `index.html`.
+    /// Idempotent and non-destructive — only the marked
+    /// `<style data-nf-design-tokens>` block changes; LLM-edited content
+    /// (text placeholders, copy, custom CSS outside the block) survives
+    /// unmodified. Default implementation returns `Unsupported` so hosts
+    /// that haven't wired the apply path don't need stub code.
+    fn canvas_video_apply_design_md(
+        &self,
+        _request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        Err(HostError {
+            code: 5,
+            message: "canvas_video_apply_design_md not supported by this host".into(),
+        })
+    }
+
+    /// Mode-3 entry: create a composition with DESIGN.md auto-derived from
+    /// a `VisualIdentity` blob. Backs the `canvas_create_from_visual_identity`
+    /// tool. Daemon runs `vi_to_design::vi_to_design_md(vi)` then delegates
+    /// to the standard `create_composition` path. Default impl returns
+    /// `Unsupported`.
+    fn canvas_video_create_from_visual_identity(
+        &self,
+        _request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        Err(HostError {
+            code: 5,
+            message: "canvas_video_create_from_visual_identity not supported by this host".into(),
+        })
+    }
+
+    /// Synthesize speech via the ElevenLabs HTTP API. Backs the
+    /// `tts_synthesize_api` tool. Daemon-side reads
+    /// `~/.config/nevoflux/config.toml [tts.elevenlabs]` for the API key;
+    /// hosts without TTS configured return ConfigMissing. Default impl
+    /// returns Unsupported so non-daemon hosts (e.g. test harnesses) don't
+    /// need stub code.
+    fn tts_synthesize_api(
+        &self,
+        _request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        Err(HostError {
+            code: 5,
+            message: "tts_synthesize_api not supported by this host".into(),
+        })
+    }
+
+    /// Synthesize speech via local Kokoro ONNX inference (P5b-2).
+    /// Daemon-side reads `[tts.kokoro] model_path / voices_path` and
+    /// returns ConfigMissing until the model files exist. Hosts without
+    /// TTS support inherit the default Unsupported.
+    fn tts_synthesize_local(
+        &self,
+        _request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        Err(HostError {
+            code: 5,
+            message: "tts_synthesize_local not supported by this host".into(),
+        })
+    }
+
+    /// Transcribe audio via local Whisper ONNX (P5b-3). Backs auto-
+    /// caption generation in P5c. Daemon reads `[tts.whisper] model_path`;
+    /// returns ConfigMissing until configured.
+    fn tts_transcribe(
+        &self,
+        _request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        Err(HostError {
+            code: 5,
+            message: "tts_transcribe not supported by this host".into(),
+        })
+    }
 }
 
 /// Mock host functions for testing.
@@ -1097,6 +1186,27 @@ impl HostFunctions for MockHostFunctions {
     ) -> HostResult<BrowserToolResult> {
         Ok(BrowserToolResult::success(serde_json::json!({
             "lines": 1
+        })))
+    }
+
+    fn browser_extract_visual_identity(
+        &self,
+        _params: &serde_json::Value,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        // Mock: return a minimal VisualIdentity-shaped response so unit tests
+        // can verify the dispatch wiring without actually opening a tab.
+        Ok(BrowserToolResult::success(serde_json::json!({
+            "name": "Mock Brand",
+            "tagline": "Mock tagline",
+            "url": "https://example.com",
+            "hero_screenshot_b64": null,
+            "logo": null,
+            "colors": [],
+            "fonts": [],
+            "key_assets": [],
+            "extracted_at": 1777200000_i64,
+            "warnings": ["mock_extraction"]
         })))
     }
 

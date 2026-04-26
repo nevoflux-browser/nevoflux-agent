@@ -348,6 +348,20 @@ impl SessionManager {
         Ok(self.storage.artifacts().get(id)?)
     }
 
+    /// Update only the multi-file payload + content mirror of an existing
+    /// artifact. Used by the ContentStore mirror path so persistent artifacts
+    /// (where the FK has been SET NULL) can still receive multi-file edits
+    /// without requiring a session context — `update_files` is a pure files +
+    /// content + updated_at UPDATE that leaves session_id alone.
+    pub fn update_artifact_files(
+        &self,
+        id: &str,
+        files: &std::collections::HashMap<String, String>,
+        content: &str,
+    ) -> Result<bool> {
+        Ok(self.storage.artifacts().update_files(id, files, content)?)
+    }
+
     /// List artifacts for a session (summaries only).
     pub fn list_artifacts(&self, session_id: &str) -> Result<Vec<ArtifactRecord>> {
         Ok(self.storage.artifacts().list_by_session(session_id)?)

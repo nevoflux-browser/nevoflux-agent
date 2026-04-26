@@ -126,6 +126,13 @@ impl ToolRegistry {
             // Artifact tools
             ("browser_read_artifact", BrowserToolAction::ReadArtifact),
             ("browser_edit_artifact", BrowserToolAction::EditArtifact),
+            // Visual-identity extraction (Mode 3 entry; canvas_* prefix
+            // because output feeds canvas_video DESIGN.md, even though
+            // dispatch goes through the browser-tool bridge).
+            (
+                "canvas_extract_visual_identity",
+                BrowserToolAction::ExtractVisualIdentity,
+            ),
             // Web tools
             ("web_search", BrowserToolAction::WebSearch),
             ("fetch_page", BrowserToolAction::WebFetch),
@@ -1022,6 +1029,11 @@ impl BrowserTool {
             BrowserToolAction::ReadArtifact => {
                 let id = arguments.get("id").and_then(|v| v.as_str()).unwrap_or("");
                 let mut p = serde_json::json!({ "id": id });
+                // Multi-file artifact path selector — defaults to entry file
+                // in the extension handler when absent.
+                if let Some(path) = arguments.get("path") {
+                    p["path"] = path.clone();
+                }
                 if let Some(offset) = arguments.get("offset") {
                     p["offset"] = offset.clone();
                 }
@@ -1046,7 +1058,30 @@ impl BrowserTool {
                     .get("new_str")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                serde_json::json!({ "id": id, "old_str": old_str, "new_str": new_str })
+                let mut p = serde_json::json!({ "id": id, "old_str": old_str, "new_str": new_str });
+                if let Some(path) = arguments.get("path") {
+                    p["path"] = path.clone();
+                }
+                p
+            }
+            BrowserToolAction::ExtractVisualIdentity => {
+                // Forward the full ExtractVisualIdentityRequest shape (target,
+                // timeout_sec, viewport) through to the extension. The
+                // extension handler reads `target.url` / `target.tab_id`
+                // itself; the daemon doesn't need to interpret them here.
+                let mut p = serde_json::json!({
+                    "target": arguments
+                        .get("target")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                });
+                if let Some(t) = arguments.get("timeout_sec") {
+                    p["timeout_sec"] = t.clone();
+                }
+                if let Some(v) = arguments.get("viewport") {
+                    p["viewport"] = v.clone();
+                }
+                p
             }
             BrowserToolAction::AskUser => {
                 let question = arguments

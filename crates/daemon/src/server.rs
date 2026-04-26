@@ -73,6 +73,33 @@ fn mirror_canvas_to_artifacts_table(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    // Diagnostic: log a fingerprint of the incoming write so we can tell
+    // whether ContentStore is sending fresh edits or stale state.
+    {
+        let files_obj = obj.get("files").and_then(|v| v.as_object());
+        let files_summary = files_obj
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| format!("{}={}", k, v.as_str().map(|s| s.len()).unwrap_or(0)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_else(|| "<none>".into());
+        let probe_brand = files_obj
+            .and_then(|m| m.get("index.html"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.contains("全新 GPT 体验"))
+            .unwrap_or(false);
+        let probe_orange = files_obj
+            .and_then(|m| m.get("DESIGN.md"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.contains("#ff6600"))
+            .unwrap_or(false);
+        info!(
+            "mirror_canvas: id={}, content_len={}, files=[{}], idx_has_new_brand={}, design_has_ff6600={}",
+            id, content.len(), files_summary, probe_brand, probe_orange
+        );
+    }
     let description = obj
         .get("description")
         .and_then(|v| v.as_str())
@@ -87,9 +114,47 @@ fn mirror_canvas_to_artifacts_table(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // Resolve session_id, preserving the existing row's FK when the caller
-    // didn't send one. If there is no existing row and no session_id in the
-    // value, skip the mirror — creating an orphan row would violate the FK.
+    // Resolve the row state: existing rows take the UPDATE path (preserves
+    // session_id, works even when it's NULL), missing rows take the INSERT
+    // path which requires a session_id from the value or we skip.
+    let existing_row = match session_manager.get_artifact(&id) {
+        Ok(opt) => opt,
+        Err(e) => {
+            warn!("get_artifact({}) failed during mirror: {:#}", id, e);
+            return;
+        }
+    };
+
+    if existing_row.is_some() {
+        // Existing row: prefer update_files which only touches files+content
+        // +updated_at. This is essential for persistent artifacts whose
+        // session_id has been SET NULL (canvas_create_composition via the
+        // MCP path also creates with NULL session_id because the LLM tool
+        // args don't include one). Going through save_artifact's
+        // INSERT-ON-CONFLICT path would require a session_id and silently
+        // skip those rows, orphaning every Canvas Editor / browser_edit
+        // edit in the config table.
+        let files_for_update = files.unwrap_or_default();
+        match session_manager.update_artifact_files(&id, &files_for_update, &content) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(
+                    "update_artifact_files mirror for canvas {} returned 0 rows (vanished?)",
+                    id
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "update_artifact_files mirror for canvas {} failed: {:#}",
+                    id, e
+                );
+            }
+        }
+        return;
+    }
+
+    // No existing row: need to INSERT. INSERT requires a session_id from the
+    // value; otherwise we'd create an orphan that violates the FK.
     let session_id_from_value = obj
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -97,31 +162,13 @@ fn mirror_canvas_to_artifacts_table(
         .map(|s| s.to_string());
     let session_id = match session_id_from_value {
         Some(s) => s,
-        None => match session_manager.get_artifact(&id) {
-            Ok(Some(existing)) => match existing.session_id {
-                Some(sid) => sid,
-                // Persistent artifact with no session (FK SET NULL after migration 014);
-                // cannot mirror without a session context — skip.
-                None => {
-                    debug!(
-                        "ContentStore canvas {} has no session_id (persistent orphan); skipping artifacts mirror",
-                        id
-                    );
-                    return;
-                }
-            },
-            Ok(None) => {
-                debug!(
-                    "ContentStore canvas {} has no session_id and no existing row; skipping artifacts mirror",
-                    id
-                );
-                return;
-            }
-            Err(e) => {
-                warn!("get_artifact({}) failed during mirror: {:#}", id, e);
-                return;
-            }
-        },
+        None => {
+            debug!(
+                "ContentStore canvas {} has no session_id and no existing row; skipping artifacts mirror",
+                id
+            );
+            return;
+        }
     };
 
     let mut params =
@@ -1105,7 +1152,8 @@ pub async fn start_server(
         .with_vector_index(vector_index)
         .with_role_registry(role_registry)
         .with_embedding(Arc::clone(&shared_embedding))
-        .with_canvas_video_service(canvas_video_service.clone());
+        .with_canvas_video_service(canvas_video_service.clone())
+        .with_tts_config(agent_config.read().unwrap().tts.clone());
     if let Some(retriever) = knowledge_retriever {
         services = services.with_knowledge_retriever(retriever);
     }

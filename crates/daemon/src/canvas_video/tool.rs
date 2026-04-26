@@ -33,24 +33,16 @@ impl CanvasCreateCompositionTool {
 
 /// Shared parser used at every LLM dispatch surface.
 ///
-/// The LLM-facing JSON Schema does not advertise `html`, but the
-/// `CreateCompositionRequest` struct still accepts it for internal callers.
-/// serde sees `html` as a valid named field, so #[serde(deny_unknown_fields)]
-/// can't catch hallucinated submissions. Reject the field explicitly here so
-/// every surface (this tool, mcp_tool_executor, agent_host) routes through
-/// the same gate and the LLM gets a clear retry signal.
+/// `CreateCompositionRequest` accepts both `template` and `html`; the
+/// either-or contract (at least one must be present) is enforced downstream
+/// in `canvas_video::create::resolve_index_html`. `#[serde(deny_unknown_fields)]`
+/// on the request struct catches typo'd fields. The wrapper exists as a
+/// single funnel point that all three dispatch surfaces (this tool,
+/// mcp_tool_executor, agent_host) route through, so future cross-cutting
+/// validation has one place to live.
 pub fn parse_create_composition_args_strict(
     arguments: &Value,
 ) -> Result<CreateCompositionRequest> {
-    if arguments.get("html").is_some() {
-        return Err(DaemonError::InvalidRequest(
-            "canvas_create_composition: the `html` field is not accepted from agents; \
-             pass `template` (one of: website-promo-16x9, product-intro-16x9, \
-             product-intro-9x16, tiktok-hook, video-overlay, logo-3d-reveal, \
-             product-3d-spin) and use edit_artifact afterward to customize content."
-                .into(),
-        ));
-    }
     serde_json::from_value(arguments.clone())
         .map_err(|e| DaemonError::InvalidRequest(format!("canvas_create_composition: {}", e)))
 }
@@ -91,14 +83,20 @@ impl ToolExecutor for CanvasRenderVideoTool {
 /// `ToolDefinition` list can reuse the exact same shape — keeps the dual
 /// tool registry in sync without two sources of truth.
 ///
-/// NOTE: `html` is intentionally omitted from the LLM-facing schema. The
-/// CreateCompositionRequest struct still accepts it for internal callers
-/// (tests, scripts) but agents must select one of the seven shipped
-/// templates. Earlier iterations exposed `html` and the LLM aggressively
-/// preferred it (copying skill_read'd template content into html instead
-/// of passing template:), leaving meta.origin.template = null. Removing
-/// the field from the schema makes the template path the only available
-/// option and reliably routes through daemon's substitute_placeholders.
+/// Either `template` (one of seven shipped /video skill templates) or `html`
+/// (raw composition body) must be supplied. The downstream service prefers
+/// `html` when both are given. JSON Schema can't reliably express "exactly
+/// one of these two" across all LLM providers (anyOf/oneOf support is
+/// uneven), so the constraint is enforced in
+/// `canvas_video::create::resolve_index_html` and surfaced via the tool
+/// description.
+///
+/// The optional `design_md` argument supplies the brand-identity layer
+/// (Google design.md + NevoFlux video extension YAML frontmatter); the
+/// daemon parses it and injects a `<style data-nf-design-tokens>` block
+/// into the composition's `<head>`. When absent, the daemon falls back to
+/// the template-specific `templates/<name>.design.md` default, then to the
+/// generic `reference/DESIGN-template.md`.
 pub fn create_composition_schema() -> Value {
     serde_json::json!({
         "type": "object",
@@ -122,11 +120,24 @@ pub fn create_composition_schema() -> Value {
                 ],
                 "description": "Skill template name from the /video skill. The daemon \
                                 materializes the named template into the composition; you do \
-                                NOT need to call skill_read first. To customize the rendered \
-                                HTML afterward, use edit_artifact on the resulting composition."
+                                NOT need to call skill_read first. Default path — prefer this \
+                                whenever a shipped template fits the request."
+            },
+            "html": {
+                "type": "string",
+                "description": "Raw composition HTML body. Use ONLY when the user explicitly \
+                                wants a custom layout no template covers (or supplies their own \
+                                HTML). When provided alongside `template`, `html` wins."
+            },
+            "design_md": {
+                "type": "string",
+                "description": "Brand identity (Google design.md + NevoFlux video extension \
+                                YAML frontmatter). Drives colors / typography / spacing / \
+                                motion via daemon-injected CSS variables. Omit to use the \
+                                template's own default brand identity."
             }
         },
-        "required": ["title", "width", "height", "duration_sec", "fps", "template"]
+        "required": ["title", "width", "height", "duration_sec", "fps"]
     })
 }
 
@@ -229,28 +240,106 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_canvas_create_composition_tool_rejects_html_field() {
-        let svc = Arc::new(CanvasVideoService::new_for_tests());
-        let tool = CanvasCreateCompositionTool::new(svc);
-        // LLM-style payload: schema-valid required fields PLUS a sneaky html
-        // (which the struct accepts, but the dispatch layer must reject).
+    #[test]
+    fn test_parser_accepts_html_only_payload() {
+        // html alone (no template) must parse cleanly — agents that provide a
+        // raw composition body should not be rejected at the dispatch boundary.
         let args = serde_json::json!({
             "title": "demo",
             "width": 640,
             "height": 360,
             "duration_sec": 1.0,
             "fps": 30,
-            "html": "<html><body>sneaky</body></html>"
+            "html": "<html><body>custom</body></html>"
         });
-        let err = tool
-            .execute("canvas_create_composition", &args)
-            .await
-            .unwrap_err();
+        let req = parse_create_composition_args_strict(&args).expect("html-only payload");
+        assert_eq!(req.html.as_deref(), Some("<html><body>custom</body></html>"));
+        assert!(req.template.is_none());
+    }
+
+    #[test]
+    fn test_parser_accepts_template_only_payload() {
+        let args = serde_json::json!({
+            "title": "demo",
+            "width": 640,
+            "height": 360,
+            "duration_sec": 1.0,
+            "fps": 30,
+            "template": "tiktok-hook"
+        });
+        let req = parse_create_composition_args_strict(&args).expect("template-only payload");
+        assert_eq!(req.template.as_deref(), Some("tiktok-hook"));
+        assert!(req.html.is_none());
+    }
+
+    #[test]
+    fn test_parser_accepts_both_template_and_html() {
+        // Service-level precedence (html wins) is tested elsewhere; the
+        // parser's job is just not to reject the combo.
+        let args = serde_json::json!({
+            "title": "demo",
+            "width": 640,
+            "height": 360,
+            "duration_sec": 1.0,
+            "fps": 30,
+            "template": "tiktok-hook",
+            "html": "<html><body>override</body></html>"
+        });
+        let req = parse_create_composition_args_strict(&args).expect("both-fields payload");
+        assert_eq!(req.template.as_deref(), Some("tiktok-hook"));
+        assert_eq!(req.html.as_deref(), Some("<html><body>override</body></html>"));
+    }
+
+    #[test]
+    fn test_parser_accepts_design_md_with_template() {
+        let args = serde_json::json!({
+            "title": "demo",
+            "width": 640,
+            "height": 360,
+            "duration_sec": 1.0,
+            "fps": 30,
+            "template": "tiktok-hook",
+            "design_md": "---\nname: \"my-brand\"\ncolors:\n  primary: \"#ff6600\"\n---\n",
+        });
+        let req = parse_create_composition_args_strict(&args).expect("template+design_md");
+        assert_eq!(req.template.as_deref(), Some("tiktok-hook"));
+        assert!(req.design_md.is_some());
+        assert!(req.design_md.unwrap().contains("#ff6600"));
+    }
+
+    #[test]
+    fn test_parser_accepts_design_md_with_html() {
+        let args = serde_json::json!({
+            "title": "demo",
+            "width": 640,
+            "height": 360,
+            "duration_sec": 1.0,
+            "fps": 30,
+            "html": "<html><body>x</body></html>",
+            "design_md": "---\nname: \"my-brand\"\n---\n",
+        });
+        let req = parse_create_composition_args_strict(&args).expect("html+design_md");
+        assert!(req.html.is_some());
+        assert!(req.design_md.is_some());
+    }
+
+    #[test]
+    fn test_parser_rejects_unknown_field() {
+        // deny_unknown_fields on the request struct must still catch typos.
+        let args = serde_json::json!({
+            "title": "demo",
+            "width": 640,
+            "height": 360,
+            "duration_sec": 1.0,
+            "fps": 30,
+            "template": "tiktok-hook",
+            "templat": "tiktok-hook"  // typo
+        });
+        let err = parse_create_composition_args_strict(&args).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("`html` field is not accepted") && msg.contains("template"),
-            "expected html-rejection error, got: {msg}"
+            msg.contains("unknown field") || msg.contains("templat"),
+            "expected unknown-field error, got: {msg}"
         );
     }
 
@@ -297,21 +386,38 @@ mod tests {
         let fps_enum = props["fps"]["enum"].as_array().unwrap();
         assert_eq!(fps_enum.len(), 3);
 
-        // template is REQUIRED and constrained to the seven shipped names.
+        // template is constrained to the seven shipped names but is no longer
+        // strictly required — html is the alternate.
         assert!(props.get("template").is_some(), "template field missing");
         let tpl_enum = props["template"]["enum"].as_array().unwrap();
         assert_eq!(tpl_enum.len(), 7);
-        let required = s["required"].as_array().unwrap();
+
+        // html is exposed again so agents can supply a raw composition body.
         assert!(
-            required.iter().any(|v| v == "template"),
-            "template must be required, got: {required:?}"
+            props.get("html").is_some(),
+            "html field must be exposed to LLM (either-or with template)"
         );
 
-        // html must NOT be in the LLM-facing schema (LLMs persistently
-        // preferred it over template before this lockdown).
+        // design_md exposes the brand-identity input channel.
         assert!(
-            props.get("html").is_none(),
-            "html field must be hidden from LLM schema"
+            props.get("design_md").is_some(),
+            "design_md field must be exposed to LLM"
+        );
+
+        // Either-or contract is enforced at the service layer, so neither
+        // template, html, nor design_md should appear in `required`.
+        let required = s["required"].as_array().unwrap();
+        assert!(
+            !required.iter().any(|v| v == "template"),
+            "template must NOT be required (either-or with html), got: {required:?}"
+        );
+        assert!(
+            !required.iter().any(|v| v == "html"),
+            "html must NOT be required (either-or with template), got: {required:?}"
+        );
+        assert!(
+            !required.iter().any(|v| v == "design_md"),
+            "design_md must NOT be required (optional brand layer), got: {required:?}"
         );
     }
 
@@ -338,6 +444,7 @@ mod tests {
                 bg: None,
                 html: Some("<html><body></body></html>".into()),
                 template: None,
+                design_md: None,
                 session_id: None,
             })
             .await
@@ -378,6 +485,7 @@ mod tests {
                 bg: None,
                 html: Some("<html><body></body></html>".into()),
                 template: None,
+                design_md: None,
                 session_id: None,
             })
             .await

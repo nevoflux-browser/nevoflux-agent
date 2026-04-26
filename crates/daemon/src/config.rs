@@ -61,6 +61,95 @@ pub struct AgentConfig {
     /// Embedding provider configuration.
     #[serde(default)]
     pub embedding: EmbeddingConfig,
+
+    /// TTS subsystem configuration (umbrella spec §7).
+    #[serde(default)]
+    pub tts: TtsConfig,
+}
+
+/// TTS subsystem config — backends keyed by provider name.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TtsConfig {
+    /// ElevenLabs API path config (P5b-1).
+    #[serde(default)]
+    pub elevenlabs: ElevenLabsConfig,
+    /// Kokoro local ONNX path config (P5b-2). Inference is gated on
+    /// the `model_path` and `voices_path` files existing on disk; until
+    /// then `tts_synthesize_local` returns ConfigMissing.
+    #[serde(default)]
+    pub kokoro: KokoroConfig,
+    /// Whisper local ONNX path config (P5b-3). Same gating contract as
+    /// Kokoro — `tts_transcribe` returns ConfigMissing until
+    /// `model_path` resolves.
+    #[serde(default)]
+    pub whisper: WhisperConfig,
+}
+
+/// Kokoro local TTS config.
+///
+/// `[tts.kokoro]` in `~/.config/nevoflux/config.toml`:
+/// ```toml
+/// [tts.kokoro]
+/// model_path  = "~/.cache/nevoflux/models/kokoro-v1.0.int8.onnx"
+/// voices_path = "~/.cache/nevoflux/models/kokoro-voices-v1.0.bin"
+/// default_voice = "af"  # American female
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct KokoroConfig {
+    /// Filesystem path to the Kokoro ONNX model. None → tool returns
+    /// ConfigMissing with download instructions.
+    #[serde(default)]
+    pub model_path: Option<String>,
+    /// Filesystem path to the Kokoro voice bank.
+    #[serde(default)]
+    pub voices_path: Option<String>,
+    /// Default voice tag (`af` / `am` / `bf` / `bm` / `zf` / `zm`).
+    #[serde(default)]
+    pub default_voice: Option<String>,
+}
+
+/// Whisper transcription config.
+///
+/// `[tts.whisper]` in `~/.config/nevoflux/config.toml`:
+/// ```toml
+/// [tts.whisper]
+/// model_path = "~/.cache/nevoflux/models/whisper-base.onnx"
+/// default_size = "base"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WhisperConfig {
+    /// Filesystem path to the Whisper ONNX model. None → tool returns
+    /// ConfigMissing.
+    #[serde(default)]
+    pub model_path: Option<String>,
+    /// Default model size (`tiny` / `base` / `small` / `medium`).
+    #[serde(default)]
+    pub default_size: Option<String>,
+}
+
+/// ElevenLabs HTTP API config.
+///
+/// Source `[tts.elevenlabs]` section in `~/.config/nevoflux/config.toml`:
+/// ```toml
+/// [tts.elevenlabs]
+/// api_key = "sk_..."
+/// default_voice_id = "21m00Tcm4TlvDq8ikWAM"  # Rachel
+/// default_model_id = "eleven_multilingual_v2"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ElevenLabsConfig {
+    /// API key (`xi-api-key` header). When `None`, the
+    /// `tts_synthesize_api` tool returns ConfigError so the agent can
+    /// surface a clear "set ELEVENLABS_API_KEY" message.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Default voice ID used when the tool args don't specify one.
+    /// ElevenLabs default: `21m00Tcm4TlvDq8ikWAM` (Rachel, female, en).
+    #[serde(default)]
+    pub default_voice_id: Option<String>,
+    /// Default model ID. ElevenLabs default: `eleven_multilingual_v2`.
+    #[serde(default)]
+    pub default_model_id: Option<String>,
 }
 
 impl AgentConfig {

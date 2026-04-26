@@ -21,8 +21,24 @@ pub async fn create(
 ) -> Result<CreateCompositionResponse> {
     validate(&req)?;
 
-    let index_html = resolve_index_html(svc, &req).await?;
-    let design_md = resolve_design_md(svc).await?;
+    let index_html_raw = resolve_index_html(svc, &req).await?;
+    let design_md = resolve_design_md(svc, &req).await?;
+    // Inject DESIGN.md tokens into a marked <style> block at the top of <head>.
+    // Failure is non-fatal: invalid DESIGN.md falls back to the un-injected
+    // HTML so a broken brand layer doesn't block composition creation; the
+    // template's own var(--x, fallback) values still produce a usable canvas.
+    let index_html = match crate::canvas_video::design::inject_design_tokens(
+        &index_html_raw,
+        &design_md,
+    ) {
+        Ok(html) => html,
+        Err(e) => {
+            tracing::warn!(
+                "canvas_video::create: design token injection failed ({e}); using raw template HTML"
+            );
+            index_html_raw
+        }
+    };
     let meta = build_meta(&req);
     let meta_json = serde_json::to_string_pretty(&meta)
         .map_err(|e| DaemonError::InternalError(format!("meta serialize: {e}")))?;
@@ -36,6 +52,9 @@ pub async fn create(
 
     let mut files = HashMap::new();
     files.insert("index.html".to_string(), index_html.clone());
+    // Store the original DESIGN.md (pre-render-time source-of-truth). The
+    // injected tokens live inside index.html; canvas_apply_design_md re-runs
+    // injection from this stored DESIGN.md after the user edits it.
     files.insert("DESIGN.md".to_string(), design_md);
     files.insert("composition.meta.json".to_string(), meta_json);
 
@@ -142,11 +161,39 @@ async fn resolve_index_html(
     ))
 }
 
-async fn resolve_design_md(svc: &CanvasVideoService) -> Result<String> {
+/// Resolve the DESIGN.md content for a new composition.
+///
+/// Resolution priority:
+/// 1. Caller-supplied `req.design_md` wins outright (treats whitespace-only
+///    as "not supplied" so accidental empty strings don't blank the brand).
+/// 2. Otherwise, when `req.template` is set, look up the template-specific
+///    `templates/<name>.design.md` — each shipped template has its own brand
+///    default matching its CSS `:root` fallback values.
+/// 3. Final fallback to the generic `reference/DESIGN-template.md` (used by
+///    `html`-mode compositions and as a last-resort default).
+///
+/// All read failures degrade silently to `String::new()` so a missing
+/// auxiliary file never blocks composition creation; the daemon's
+/// `inject_design_tokens` step then becomes a no-op.
+async fn resolve_design_md(
+    svc: &CanvasVideoService,
+    req: &CreateCompositionRequest,
+) -> Result<String> {
+    if let Some(md) = &req.design_md {
+        if !md.trim().is_empty() {
+            return Ok(md.clone());
+        }
+    }
     let reg = svc.skills().ok_or_else(|| {
         DaemonError::InternalError("canvas_video: skill registry not wired".into())
     })?;
     let guard = reg.read().await;
+    if let Some(tpl) = &req.template {
+        let path = format!("templates/{tpl}.design.md");
+        if let Ok(s) = guard.read_auxiliary_file("video", &path) {
+            return Ok(s);
+        }
+    }
     match guard.read_auxiliary_file("video", "reference/DESIGN-template.md") {
         Ok(s) => Ok(s),
         Err(_) => Ok(String::new()), // empty fallback per spec §10.1
@@ -265,6 +312,7 @@ mod persistence_tests {
             // html, so seed a minimal html for unit-test fixtures.
             html: Some("<html><body></body></html>".into()),
             template: None,
+            design_md: None,
             session_id: None,
         }
     }

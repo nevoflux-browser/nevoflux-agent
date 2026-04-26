@@ -33,9 +33,11 @@ pub mod common;
 pub mod envelope;
 mod error;
 pub mod events;
+pub mod extract;
 pub mod json_repair;
 pub mod mcp;
 pub mod subagent;
+pub mod tts;
 
 // Re-export canvas share types
 pub use canvas_share::{

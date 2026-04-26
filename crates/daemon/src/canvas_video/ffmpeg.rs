@@ -70,22 +70,46 @@ fn resolved_path() -> Result<PathBuf> {
 /// Construct an ffmpeg image2pipe command for encoding a PNG stream into MP4.
 ///
 /// Reads raw PNG frames from stdin and writes an H.264/MP4 file to `output_path`.
-pub fn image2pipe_cmd(output_path: &std::path::Path, fps: u32) -> FfmpegCommand {
+/// When `audio_input` is provided, that audio file (mp3/wav) is muxed in as a
+/// second input and encoded as AAC. The video stream length sets the output
+/// duration: longer audio is truncated; shorter audio leaves trailing silence.
+pub fn image2pipe_cmd(
+    output_path: &std::path::Path,
+    fps: u32,
+    audio_input: Option<&std::path::Path>,
+) -> FfmpegCommand {
     let mut cmd = FfmpegCommand::new();
-    cmd.hide_banner()
-        .args([
-            "-y",
-            "-f",
-            "image2pipe",
-            "-framerate",
-            &fps.to_string(),
-            "-i",
-            "-",
-        ])
-        .args([
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "23", "-preset", "medium",
-        ])
-        .args(["-movflags", "+faststart"])
+    cmd.hide_banner().args([
+        "-y",
+        "-f",
+        "image2pipe",
+        "-framerate",
+        &fps.to_string(),
+        "-i",
+        "-",
+    ]);
+    if let Some(audio) = audio_input {
+        // Second input — ffmpeg auto-detects mp3/wav from extension/contents.
+        cmd.args(["-i", audio.to_string_lossy().as_ref()]);
+    }
+    cmd.args([
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "23", "-preset", "medium",
+    ]);
+    if audio_input.is_some() {
+        cmd.args([
+            // AAC at 192k for narration — overkill for speech but keeps
+            // files compatible with all major players.
+            "-c:a", "aac", "-b:a", "192k",
+            // Map streams explicitly: video from input 0, audio from input 1.
+            "-map", "0:v", "-map", "1:a",
+            // Match output duration to the video stream so a longer audio
+            // doesn't extend the file. (`-shortest` would TRUNCATE to the
+            // shorter; we want the full video with audio playing to its
+            // natural end and silence afterward — that's the default
+            // without `-shortest`.)
+        ]);
+    }
+    cmd.args(["-movflags", "+faststart"])
         .output(output_path.to_string_lossy().as_ref());
     cmd
 }
