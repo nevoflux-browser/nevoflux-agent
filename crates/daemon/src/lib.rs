@@ -46,6 +46,7 @@ pub mod session;
 pub mod share;
 pub mod skills;
 pub mod trace;
+pub mod tts;
 pub mod validation;
 pub mod wasm;
 

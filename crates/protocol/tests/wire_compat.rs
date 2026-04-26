@@ -43,6 +43,7 @@ fn test_create_composition_request_roundtrip() {
         bg: None,
         html: Some("<html></html>".into()),
         template: None,
+        design_md: None,
         session_id: None,
     };
     let s = serde_json::to_string(&req).unwrap();

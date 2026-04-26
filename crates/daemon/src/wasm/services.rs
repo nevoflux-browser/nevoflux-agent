@@ -202,6 +202,13 @@ pub struct HostServices {
     /// broadcast (A3/A4 of /video P1) on the MCP/ACP path — the existing
     /// broadcast in server.rs only fires for the TCP proxy path.
     pub broadcast_tx: Option<mpsc::Sender<(Vec<u8>, nevoflux_protocol::DaemonEnvelope)>>,
+
+    /// TTS subsystem config (P5b). Threaded through so the MCP/ACP
+    /// dispatch path (`mcp_tool_executor::execute_tts_synthesize_api`)
+    /// can read `[tts.elevenlabs]` without depending on the whole
+    /// AgentConfig surface. None means TTS isn't configured; tools
+    /// surface a clear ConfigMissing error in that case.
+    pub tts_config: Option<crate::config::TtsConfig>,
 }
 
 impl HostServices {
@@ -256,6 +263,7 @@ impl HostServices {
             session_extractor: None,
             canvas_video_service: None,
             broadcast_tx: None,
+            tts_config: None,
         }
     }
 
@@ -289,6 +297,7 @@ impl HostServices {
             session_extractor: None,
             canvas_video_service: None,
             broadcast_tx: None,
+            tts_config: None,
         }
     }
 
@@ -535,6 +544,15 @@ impl HostServices {
         svc: Arc<crate::canvas_video::CanvasVideoService>,
     ) -> Self {
         self.canvas_video_service = Some(svc);
+        self
+    }
+
+    /// Wire the TTS subsystem config (P5b). Plumbed in from the bootstrap
+    /// `AgentConfig` so MCP/ACP-path dispatchers (`execute_tts_synthesize_api`)
+    /// can read the API key without re-loading config.toml. Pass a clone
+    /// of `agent_config.tts` from server boot.
+    pub fn with_tts_config(mut self, cfg: crate::config::TtsConfig) -> Self {
+        self.tts_config = Some(cfg);
         self
     }
 

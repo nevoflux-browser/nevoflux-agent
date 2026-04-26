@@ -268,6 +268,24 @@ pub enum BrowserToolAction {
     /// Activate (switch to) a specific tab by ID.
     #[serde(rename = "activateTab")]
     ActivateTab,
+    /// Extract visual identity (brand colors / fonts / logo / hero screenshot)
+    /// from a URL or existing tab, returning a `VisualIdentity` struct that
+    /// can auto-fill a composition's DESIGN.md.
+    ///
+    /// Used by `/video` Mode 3 (website-to-video) per umbrella spec §6.
+    ///
+    /// Params:
+    /// - `target.url`: URL string (mutually exclusive with `target.tab_id`)
+    /// - `target.tab_id`: existing tab ID
+    /// - `timeout_sec`: optional, default 20
+    /// - `viewport`: optional `[w, h]`, default `[1920, 1080]`
+    ///
+    /// Returns: `VisualIdentity` JSON (see `nevoflux_protocol::extract`).
+    ///
+    /// Tab handling: URL mode opens a background tab and closes it after
+    /// extraction; TabId mode reuses the existing tab without closing.
+    #[serde(rename = "extractVisualIdentity")]
+    ExtractVisualIdentity,
 }
 
 /// File attachment
@@ -1042,3 +1060,4 @@ mod tool_result_tests {
         assert!(matches!(status, BashStatus::Timeout));
     }
 }
+

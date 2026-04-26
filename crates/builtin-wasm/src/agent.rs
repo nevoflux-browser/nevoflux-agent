@@ -2267,6 +2267,52 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 serde_json::to_string(&resp)
                     .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
             }
+            "canvas_apply_design_md" => {
+                let resp = self
+                    .host
+                    .canvas_video_apply_design_md(&tool_call.arguments)?;
+                serde_json::to_string(&resp)
+                    .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
+            }
+            "canvas_create_from_visual_identity" => {
+                let resp = self
+                    .host
+                    .canvas_video_create_from_visual_identity(&tool_call.arguments)?;
+                serde_json::to_string(&resp)
+                    .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
+            }
+            "tts_synthesize_api" => {
+                let resp = self.host.tts_synthesize_api(&tool_call.arguments)?;
+                serde_json::to_string(&resp)
+                    .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
+            }
+            "tts_synthesize_local" => {
+                let resp = self.host.tts_synthesize_local(&tool_call.arguments)?;
+                serde_json::to_string(&resp)
+                    .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
+            }
+            "tts_transcribe" => {
+                let resp = self.host.tts_transcribe(&tool_call.arguments)?;
+                serde_json::to_string(&resp)
+                    .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
+            }
+            "canvas_extract_visual_identity" => {
+                // Mode-3 entry point: route through the standard browser-tool
+                // dispatch (BrowserToolAction::ExtractVisualIdentity → daemon
+                // BrowserRequest → extension extraction handler → BrowserToolResult).
+                // Intentionally goes through `host.browser_extract_visual_identity`
+                // so the direct-API path matches mcp_tool_executor's MCP/ACP path —
+                // both ultimately produce a BrowserRequest with action=ExtractVisualIdentity.
+                let tab_id = tool_call
+                    .arguments
+                    .get("target")
+                    .and_then(|t| t.get("tab_id"))
+                    .and_then(|v| v.as_i64());
+                let result = self
+                    .host
+                    .browser_extract_visual_identity(&tool_call.arguments, tab_id)?;
+                serde_json::to_string(&result).unwrap_or_default()
+            }
             _ => {
                 format!("Unknown tool: {}", tool_call.name)
             }
@@ -2330,6 +2376,12 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 | "canvas_create_composition"
                 | "canvas_render_video"
                 | "canvas_lint_composition"
+                | "canvas_apply_design_md"
+                | "canvas_extract_visual_identity"
+                | "canvas_create_from_visual_identity"
+                | "tts_synthesize_api"
+                | "tts_synthesize_local"
+                | "tts_transcribe"
         ) || name.starts_with("computer_")
             || name.starts_with("browser_")
     }
@@ -2943,13 +2995,17 @@ The following skill instructions MUST be followed exactly. These instructions ta
             // Artifact editing tools (available in all modes)
             ToolDefinition {
                 name: "browser_read_artifact".into(),
-                description: "Read the source code of a canvas artifact. Returns full content by default (with line numbers). Use offset/limit for large artifacts, or grep to search for specific code sections. Only use when [Active Canvas] hint is present.".into(),
+                description: "Read the source code of a canvas artifact. Returns full content by default (with line numbers). Use offset/limit for large artifacts, or grep to search for specific code sections. For multi-file artifacts (e.g. canvas_video compositions: index.html + DESIGN.md + composition.meta.json), pass `path` to read a non-entry file; omit `path` to read the entry file (typically index.html). Only use when [Active Canvas] hint is present.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "id": {
                             "type": "string",
                             "description": "Artifact ID (from the [Active Canvas] context hint)"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "(Multi-file artifacts only) File path within the artifact, e.g. 'DESIGN.md' or 'composition.meta.json'. Defaults to the entry file (typically 'index.html') when omitted."
                         },
                         "offset": {
                             "type": "integer",
@@ -2973,7 +3029,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
             },
             ToolDefinition {
                 name: "browser_edit_artifact".into(),
-                description: "Edit a canvas artifact using search-and-replace. The old_str must match exactly one location in the artifact. Include surrounding lines for uniqueness. The canvas updates in real-time after each edit. Only use when [Active Canvas] hint is present.".into(),
+                description: "Edit a canvas artifact using search-and-replace. The old_str must match exactly one location in the targeted file. Include surrounding lines for uniqueness. The canvas updates in real-time after each edit. For multi-file artifacts (e.g. canvas_video compositions), pass `path` to edit a non-entry file (e.g. 'DESIGN.md'); omit `path` to edit the entry file (typically index.html). Only use when [Active Canvas] hint is present.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -2981,9 +3037,13 @@ The following skill instructions MUST be followed exactly. These instructions ta
                             "type": "string",
                             "description": "Artifact ID (from the [Active Canvas] context hint)"
                         },
+                        "path": {
+                            "type": "string",
+                            "description": "(Multi-file artifacts only) File path within the artifact to edit, e.g. 'DESIGN.md'. Defaults to the entry file (typically 'index.html') when omitted."
+                        },
                         "old_str": {
                             "type": "string",
-                            "description": "Exact string to find in the artifact code"
+                            "description": "Exact string to find in the targeted file"
                         },
                         "new_str": {
                             "type": "string",
@@ -2995,7 +3055,34 @@ The following skill instructions MUST be followed exactly. These instructions ta
             },
             ToolDefinition {
                 name: "canvas_create_composition".into(),
-                description: "Create a composition artifact for video rendering. Returns {artifact_id} immediately. Arguments: title (str), width (int 1-1920), height (int 1-1920), duration_sec (number 0.5-60), fps (24|25|30), bg (optional CSS color string), html (optional full composition HTML including any iframe-safe inline scripts and asset references). If html is omitted a minimal scaffold is generated.".into(),
+                description: "Create a composition artifact for video rendering. Returns \
+                              {artifact_id} immediately. Stores a multi-file artifact \
+                              (index.html + DESIGN.md + composition.meta.json).\n\n\
+                              THREE LAYERS — separate concerns, edit independently:\n\
+                              1. STRUCTURE (`template`): layout, scene rhythm, GSAP timeline. \
+                                 Pick at create time and don't change. Shipped templates: \
+                                 website-promo-16x9, product-intro-16x9, product-intro-9x16, \
+                                 tiktok-hook, video-overlay, logo-3d-reveal, product-3d-spin. \
+                                 Alternative: `html` for fully custom HTML body when no \
+                                 shipped template fits (when both supplied, `html` wins).\n\
+                              2. BRAND (`design_md`): colors, typography, spacing, motion \
+                                 easings. Optional YAML+markdown following Google design.md \
+                                 spec + NevoFlux video extension. Daemon parses the YAML \
+                                 frontmatter and injects a `<style data-nf-design-tokens>` \
+                                 block at the top of the composition's <head>; templates \
+                                 use `var(--color-primary, fallback)` patterns that \
+                                 auto-resolve to the injected values. Omit `design_md` to \
+                                 use the template's own default brand identity (each \
+                                 shipped template has a matching `<name>.design.md`).\n\
+                              3. CONTENT (post-create): use browser_edit_artifact on the \
+                                 returned artifact_id to replace text placeholders \
+                                 (`<<HOOK_WORD>>` etc.) and copy. After editing DESIGN.md \
+                                 separately, call canvas_apply_design_md to refresh the \
+                                 brand layer without touching content edits.\n\n\
+                              Arguments: title (str); width (int 1-1920); height (int 1-1920); \
+                              duration_sec (number 0.5-60); fps (24|25|30); bg (optional CSS \
+                              color string); plus exactly one of `template` or `html`; plus \
+                              optional `design_md` (string).".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -3005,7 +3092,37 @@ The following skill instructions MUST be followed exactly. These instructions ta
                         "duration_sec": { "type": "number",  "minimum": 0.5, "maximum": 60 },
                         "fps":          { "type": "integer", "enum": [24, 25, 30] },
                         "bg":           { "type": ["string", "null"] },
-                        "html":         { "type": ["string", "null"] }
+                        "template":     {
+                            "type": "string",
+                            "enum": [
+                                "website-promo-16x9",
+                                "product-intro-16x9",
+                                "product-intro-9x16",
+                                "tiktok-hook",
+                                "video-overlay",
+                                "logo-3d-reveal",
+                                "product-3d-spin"
+                            ],
+                            "description": "Skill template name. Default path — prefer this \
+                                            whenever a shipped template fits the request. \
+                                            Customize content via edit_artifact afterward."
+                        },
+                        "html": {
+                            "type": "string",
+                            "description": "Raw composition HTML body. Use ONLY for custom \
+                                            layouts no shipped template covers. Overrides \
+                                            `template` when both are supplied."
+                        },
+                        "design_md": {
+                            "type": "string",
+                            "description": "Brand identity (Google design.md + NevoFlux video \
+                                            extension). YAML frontmatter must include colors \
+                                            (primary/secondary/accent/background/foreground), \
+                                            typography (hero/body), spacing. The daemon parses \
+                                            and injects --color-* / --typography-* / --spacing-* \
+                                            CSS variables into the composition's <head>. Omit \
+                                            to use the template's own default brand defaults."
+                        }
                     },
                     "required": ["title", "width", "height", "duration_sec", "fps"]
                 }),
@@ -3030,6 +3147,199 @@ The following skill instructions MUST be followed exactly. These instructions ta
                         "composition_id": { "type": "string" }
                     },
                     "required": ["composition_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "canvas_apply_design_md".into(),
+                description: "Re-apply the composition's stored DESIGN.md to its rendered HTML. \
+                              Reads `artifact.files['DESIGN.md']`, parses the YAML frontmatter, \
+                              and replaces the `<style data-nf-design-tokens>:root { ... }</style>` \
+                              block at the top of `index.html`. Idempotent and non-destructive: \
+                              only the marked block changes, so any text/copy/CSS edits the \
+                              user (or you) made elsewhere in `index.html` survive untouched.\n\n\
+                              Use this AFTER the user edits DESIGN.md (in the Canvas Editor or \
+                              via any other mechanism) to refresh the brand layer without \
+                              regenerating the composition. Returns { composition_id }. \
+                              Arguments: composition_id (string).".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "composition_id": { "type": "string" }
+                    },
+                    "required": ["composition_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "tts_synthesize_api".into(),
+                description: "Synthesize speech via the ElevenLabs HTTP API and return the \
+                              audio bytes (base64 MP3). Requires `[tts.elevenlabs] api_key` \
+                              configured in `~/.config/nevoflux/config.toml`; returns a clear \
+                              ConfigMissing error otherwise.\n\n\
+                              Usage in /video Mode 3 narrated flow:\n\
+                              1. After creating a composition, call this tool with \
+                              `composition_id` set — daemon writes the MP3 directly into the \
+                              artifact's files map as `narration.mp3`.\n\
+                              2. Edit the composition's `index.html` to add an \
+                              `<audio src=\"narration.mp3\" data-start=\"0\" data-duration=\"<sec>\"/>` \
+                              element on a track-index ≥ 100.\n\
+                              3. Render — the audio is muxed into the output MP4 (P5b-final).\n\n\
+                              Limits: text ≤ 600 chars (~60s of speech). Returns audio_b64 \
+                              (always), wrote_to_files (only when composition_id supplied), \
+                              voice_id (echoes which voice was used after default-fallback), \
+                              duration_sec (estimated, ~2.5 chars/s for English).\n\n\
+                              Voice IDs: ElevenLabs catalog (e.g. `21m00Tcm4TlvDq8ikWAM` = \
+                              Rachel, `pNInz6obpgDQGcFmaJgB` = Adam). Defaults to Rachel \
+                              (en-US female) if voice_id and config default both omitted.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "text": { "type": "string", "description": "Text to speak. Max 600 chars." },
+                        "voice_id": { "type": "string", "description": "ElevenLabs voice ID (optional, falls back to config default or Rachel)." },
+                        "model_id": { "type": "string", "description": "ElevenLabs model ID (optional, e.g. 'eleven_multilingual_v2')." },
+                        "composition_id": { "type": "string", "description": "If set, the synthesized MP3 is written into this artifact's files map as 'narration.mp3'." }
+                    },
+                    "required": ["text"]
+                }),
+            },
+            ToolDefinition {
+                name: "tts_synthesize_local".into(),
+                description: "Synthesize speech via local Kokoro-82M ONNX inference (no API \
+                              key required, no network). Returns base64 WAV audio. \
+                              \n\n\
+                              STATUS: This tool is REGISTERED but the ONNX runtime \
+                              integration is the next nevoflux-tts crate milestone. Calling \
+                              it today returns a clear ConfigMissing error pointing at the \
+                              setup steps; PREFER `tts_synthesize_api` (ElevenLabs) for \
+                              narration that needs to ship now.\n\n\
+                              When wired up, voice tags follow Kokoro convention: `af` (American \
+                              female), `am` (American male), `bf` (British female), `bm` \
+                              (British male), `zf` / `zm` (Mandarin female / male). The \
+                              composition_id contract matches `tts_synthesize_api`: when \
+                              provided, the audio lands in `narration.wav` inside the \
+                              artifact's files map.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "text":           { "type": "string", "description": "Text to speak. Max 600 chars." },
+                        "voice_id":       { "type": "string", "description": "Kokoro voice tag: af / am / bf / bm / zf / zm. Defaults to config." },
+                        "composition_id": { "type": "string", "description": "If set, the synthesized WAV is written into this artifact's files map as 'narration.wav'." }
+                    },
+                    "required": ["text"]
+                }),
+            },
+            ToolDefinition {
+                name: "tts_transcribe".into(),
+                description: "Transcribe audio to text + per-segment timestamps via local \
+                              Whisper ONNX. Used by P5c auto-captions to drive caption \
+                              tracks from a composition's narration.mp3.\n\n\
+                              STATUS: REGISTERED but inference not yet wired (ships with \
+                              Kokoro in the nevoflux-tts crate). Returns ConfigMissing today.\n\n\
+                              Provide EXACTLY ONE input source:\n\
+                              - `audio_b64`: raw audio bytes (MP3/WAV/etc.), OR\n\
+                              - `composition_id` + `file_path`: read the audio from an \
+                                artifact's files map (e.g. file_path=\"narration.mp3\").\n\n\
+                              Returns { text, segments: [{start_ms, end_ms, text}, ...] } — \
+                              the segments stream straight into a caption track in the \
+                              composition's HTML.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "audio_b64":      { "type": "string", "description": "Base64-encoded audio bytes." },
+                        "composition_id": { "type": "string", "description": "Read audio from this artifact's files map (use with file_path)." },
+                        "file_path":      { "type": "string", "description": "Path inside the artifact's files map (e.g. 'narration.mp3')." },
+                        "model_size":     { "type": "string", "enum": ["tiny", "base", "small", "medium"], "description": "Whisper model size; defaults to config or 'base'." }
+                    }
+                }),
+            },
+            ToolDefinition {
+                name: "canvas_create_from_visual_identity".into(),
+                description: "Create a composition with DESIGN.md auto-derived from a \
+                              VisualIdentity blob (typically the output of \
+                              `canvas_extract_visual_identity`). Mode-3 (website-to-video) \
+                              entry point — replaces the two-step \"extract → manually render \
+                              DESIGN.md → create_composition\" flow with one deterministic \
+                              call.\n\n\
+                              The daemon serializes VI fields → DESIGN.md frontmatter \
+                              (colors picked by role_hint; fonts by source label; defaults \
+                              for spacing / motion / rounded). After this call the agent \
+                              can use `browser_edit_artifact` on the composition's \
+                              DESIGN.md if the user wants further tweaks (e.g. \"make \
+                              background black\") and then `canvas_apply_design_md` to \
+                              refresh the brand layer.\n\n\
+                              Pass the VI JSON exactly as returned by \
+                              canvas_extract_visual_identity; do NOT re-render it.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "title":         { "type": "string" },
+                        "width":         { "type": "integer", "minimum": 1, "maximum": 1920 },
+                        "height":        { "type": "integer", "minimum": 1, "maximum": 1920 },
+                        "duration_sec":  { "type": "number",  "minimum": 0.5, "maximum": 60 },
+                        "fps":           { "type": "integer", "enum": [24, 25, 30] },
+                        "bg":            { "type": ["string", "null"] },
+                        "template":      {
+                            "type": "string",
+                            "enum": [
+                                "website-promo-16x9",
+                                "product-intro-16x9",
+                                "product-intro-9x16",
+                                "tiktok-hook",
+                                "video-overlay",
+                                "logo-3d-reveal",
+                                "product-3d-spin"
+                            ]
+                        },
+                        "visual_identity": {
+                            "type": "object",
+                            "description": "VisualIdentity object as returned by canvas_extract_visual_identity. Must include `url`; other fields are optional but inform DESIGN.md output."
+                        }
+                    },
+                    "required": ["title", "width", "height", "duration_sec", "fps", "template", "visual_identity"]
+                }),
+            },
+            ToolDefinition {
+                name: "canvas_extract_visual_identity".into(),
+                description: "Extract a brand's visual identity (name, tagline, primary URL, \
+                              hero screenshot, and — once Slice B lands — colors / fonts / \
+                              logo / key value-prop items) from a URL or an existing tab. \
+                              Used by Mode 3 (website-to-video): given a URL, the agent \
+                              calls this first to populate a composition's DESIGN.md.\n\n\
+                              Tab handling:\n\
+                              - URL mode: opens a background tab, runs extraction, closes it.\n\
+                              - Tab mode: reuses the existing tab, leaves it open.\n\
+                              Provide EXACTLY ONE of `target.url` or `target.tab_id`.\n\n\
+                              Slice A returns { name, tagline, url, hero_screenshot_b64, \
+                              extracted_at, warnings }. Color / font / logo / key_assets \
+                              fields are present but empty until Slice B; consumers should \
+                              treat them as optional.\n\n\
+                              Returns the full `VisualIdentity` JSON; pass through to \
+                              `browser_edit_artifact` on a composition's DESIGN.md to wire \
+                              into the Mode 3 workflow.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "object",
+                            "properties": {
+                                "url":    { "type": "string", "description": "URL to open in a background tab" },
+                                "tab_id": { "type": "integer", "description": "WebExtension tab id to reuse" }
+                            }
+                        },
+                        "timeout_sec": {
+                            "type": "integer",
+                            "minimum": 5,
+                            "maximum": 60,
+                            "description": "Extraction wall-clock budget in seconds. Default 20."
+                        },
+                        "viewport": {
+                            "type": "array",
+                            "items": { "type": "integer" },
+                            "minItems": 2,
+                            "maxItems": 2,
+                            "description": "[width, height] for the screenshot. Default [1920, 1080]."
+                        }
+                    },
+                    "required": ["target"]
                 }),
             },
         ]

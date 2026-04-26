@@ -28,6 +28,7 @@ async fn create_then_load_reads_from_repo() {
         bg: Some("#000".into()),
         html: Some("<!doctype html><body><div id='stage' style='width:320px;height:240px;background:red'></div></body>".into()),
         template: None,
+        design_md: None,
         session_id: Some(session_id.into()),
     };
     let resp = svc.create_composition(req).await.unwrap();

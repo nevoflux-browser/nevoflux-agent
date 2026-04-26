@@ -31,10 +31,37 @@ impl<'a> ArtifactRepository<'a> {
     /// Returns the authoritative row re-read from the database so that the caller always
     /// sees the preserved field values on update.
     pub fn create(&self, params: CreateArtifactParams) -> Result<ArtifactRecord> {
-        let files_json = params
-            .files
-            .as_ref()
-            .map(|f| serde_json::to_string(f).unwrap_or_default());
+        // Storage-layer invariant for ALL artifacts (Phase C):
+        //   * `entry` is always set (defaults to "main.html" for legacy callers)
+        //   * `files` always contains at least one entry (synthesized as
+        //     `{entry: content}` for legacy single-file callers)
+        //   * `content` := `files[entry]` (mirror, not independent source)
+        //
+        // This eliminates the historical dual-write hazard between content
+        // and files[entry]. Legacy callers using `with_content("...")` only
+        // continue to work — the storage layer synthesizes the multi-file
+        // shape for them.
+        //
+        // See architecture_artifact_files_invariant.md and migration 015.
+        let entry = params
+            .entry
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "main.html".to_string());
+        let mut files_map = params.files.clone().unwrap_or_default();
+        if files_map.is_empty() {
+            files_map.insert(entry.clone(), params.content.clone());
+        } else if !files_map.contains_key(&entry) {
+            // Multi-file artifact whose entry doesn't point into the map —
+            // shouldn't happen for canvas_video, but be defensive: insert
+            // params.content under the chosen entry key.
+            files_map.insert(entry.clone(), params.content.clone());
+        }
+        let content = files_map
+            .get(&entry)
+            .cloned()
+            .unwrap_or_else(|| params.content.clone());
+        let files_json = serde_json::to_string(&files_map).unwrap_or_else(|_| "{}".to_string());
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -60,9 +87,9 @@ impl<'a> ArtifactRepository<'a> {
                     params.title,
                     params.description,
                     params.content_type,
-                    params.content,
+                    content,
                     files_json,
-                    params.entry,
+                    entry,
                     now,
                 ],
             )?;
@@ -78,6 +105,56 @@ impl<'a> ArtifactRepository<'a> {
             )?;
 
             Ok(record)
+        })
+    }
+
+    /// Update only the `files` map of an existing artifact, with `content`
+    /// auto-derived from `files[entry]` (the row's existing entry value).
+    /// Leaves title / session_id / entry / description / content_type /
+    /// persistence flags untouched.
+    ///
+    /// The `content` parameter is now ignored except as a fallback when
+    /// the row's `entry` field doesn't resolve in the new files map (which
+    /// shouldn't happen post-migration 015 since `entry` is NOT NULL and
+    /// must point into `files`). Storage layer enforces the invariant
+    /// `content := files[entry]` so no caller can produce drift.
+    ///
+    /// Returns `Ok(false)` if no row matched the id.
+    pub fn update_files(
+        &self,
+        id: &str,
+        files: &std::collections::HashMap<String, String>,
+        content: &str,
+    ) -> Result<bool> {
+        let files_json = serde_json::to_string(files)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        self.db.with_connection(|conn| {
+            // Look up the row's `entry` so we can derive content := files[entry].
+            // Falls back to caller-supplied content if entry doesn't resolve
+            // (defensive against pre-migration data).
+            let entry: Option<String> = conn
+                .query_row(
+                    "SELECT entry FROM artifacts WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .ok();
+            let derived_content = entry
+                .as_deref()
+                .and_then(|e| files.get(e).cloned())
+                .unwrap_or_else(|| content.to_string());
+
+            let rows = conn.execute(
+                "UPDATE artifacts
+                 SET files = ?1, content = ?2, updated_at = ?3
+                 WHERE id = ?4",
+                params![files_json, derived_content, now, id],
+            )?;
+            Ok(rows > 0)
         })
     }
 

@@ -46,6 +46,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "014_artifacts_persistent",
         include_str!("migrations/014_artifacts_persistent.sql"),
     ),
+    (
+        "015_artifacts_files_canonical",
+        include_str!("migrations/015_artifacts_files_canonical.sql"),
+    ),
 ];
 
 /// Run all pending migrations on the given connection.
@@ -108,7 +112,7 @@ mod tests {
         let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 13);
+        assert_eq!(count, 14);
     }
 
     #[test]

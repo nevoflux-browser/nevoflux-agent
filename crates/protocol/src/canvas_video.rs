@@ -3,7 +3,15 @@
 use serde::{Deserialize, Serialize};
 
 /// `canvas.video.create_composition` request.
+///
+/// `deny_unknown_fields` is critical for the LLM-facing path: without it,
+/// serde silently accepts hallucinated fields (e.g., the LLM remembering
+/// `html` from earlier conversation history even after it was removed
+/// from the JSON Schema). Strict deserialization causes such payloads to
+/// fail loudly with InvalidRequest, forcing the agent to retry with a
+/// schema-compliant call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateCompositionRequest {
     pub title: String,
     pub width: u32,
@@ -12,12 +20,21 @@ pub struct CreateCompositionRequest {
     pub fps: u32,
     #[serde(default)]
     pub bg: Option<String>,
-    /// Raw HTML override. Phase B uses this for end-to-end tests;
-    /// P2 adds template-driven authoring.
+    /// Raw HTML override. Either `html` or `template` must be supplied;
+    /// when both are present, `html` wins.
     #[serde(default)]
     pub html: Option<String>,
     #[serde(default)]
     pub template: Option<String>,
+    /// Caller-supplied DESIGN.md content (Google design.md + video extension
+    /// frontmatter). Drives the brand identity layer: colors, typography,
+    /// spacing, motion. Daemon parses the YAML frontmatter and injects a
+    /// `<style data-nf-design-tokens>:root { ... }</style>` block at the top
+    /// of the composition's `<head>`. When absent, the daemon falls back to
+    /// the template-specific default DESIGN.md (`templates/<name>.design.md`)
+    /// and finally to `reference/DESIGN-template.md` for `html`-only requests.
+    #[serde(default)]
+    pub design_md: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -242,6 +259,50 @@ pub struct LintCompositionRequest {
 pub struct LintCompositionResponse {
     #[serde(flatten)]
     pub report: LintReport,
+}
+
+/// `canvas.video.apply_design_md` — re-inject DESIGN.md tokens into the
+/// composition's `index.html`. Non-destructive (only the marked
+/// `<style data-nf-design-tokens>` block changes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyDesignMdRequest {
+    pub composition_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyDesignMdResponse {
+    pub composition_id: String,
+}
+
+/// `canvas.video.create_from_visual_identity` — Mode 3 entry: take a
+/// `VisualIdentity` (typically the output of `canvas_extract_visual_identity`)
+/// + a template + composition spec, and produce a composition whose
+/// DESIGN.md is auto-derived from the VI.
+///
+/// Equivalent to: caller renders DESIGN.md from VI in their head, then
+/// calls `canvas_create_composition({ template, design_md: <rendered>, ...})`.
+/// We do the rendering deterministically in the daemon so the LLM doesn't
+/// have to hand-translate VI → YAML (which it does poorly: drops fields,
+/// hallucinates names, mis-formats weights).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateFromVisualIdentityRequest {
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+    pub duration_sec: f32,
+    pub fps: u32,
+    /// Visual identity blob — `nevoflux_protocol::extract::VisualIdentity`.
+    /// Embedded as JSON so this protocol module doesn't need to depend on
+    /// the extract module's Rust types directly. The daemon deserializes
+    /// it via `serde_json::from_value::<VisualIdentity>` at the dispatch
+    /// boundary.
+    pub visual_identity: serde_json::Value,
+    pub template: String,
+    #[serde(default)]
+    pub bg: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────

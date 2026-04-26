@@ -121,6 +121,11 @@ which = "7"
 # Code Mode - Python interpreter for agent code execution
 monty = { git = "https://github.com/pydantic/monty.git", tag = "v0.0.7" }
 
+# Tempfile staging — used by canvas_video render to stage narration MP3
+# bytes for ffmpeg's `-i <audio>` input (P5b-final). Must be in [dependencies]
+# (not [dev-dependencies]) because the staging code runs in production.
+tempfile = "3"
+
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }
 

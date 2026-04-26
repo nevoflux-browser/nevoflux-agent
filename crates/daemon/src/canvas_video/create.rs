@@ -21,8 +21,24 @@ pub async fn create(
 ) -> Result<CreateCompositionResponse> {
     validate(&req)?;
 
-    let index_html = resolve_index_html(svc, &req).await?;
-    let design_md = resolve_design_md(svc).await?;
+    let index_html_raw = resolve_index_html(svc, &req).await?;
+    let design_md = resolve_design_md(svc, &req).await?;
+    // Inject DESIGN.md tokens into a marked <style> block at the top of <head>.
+    // Failure is non-fatal: invalid DESIGN.md falls back to the un-injected
+    // HTML so a broken brand layer doesn't block composition creation; the
+    // template's own var(--x, fallback) values still produce a usable canvas.
+    let index_html = match crate::canvas_video::design::inject_design_tokens(
+        &index_html_raw,
+        &design_md,
+    ) {
+        Ok(html) => html,
+        Err(e) => {
+            tracing::warn!(
+                "canvas_video::create: design token injection failed ({e}); using raw template HTML"
+            );
+            index_html_raw
+        }
+    };
     let meta = build_meta(&req);
     let meta_json = serde_json::to_string_pretty(&meta)
         .map_err(|e| DaemonError::InternalError(format!("meta serialize: {e}")))?;
@@ -36,6 +52,9 @@ pub async fn create(
 
     let mut files = HashMap::new();
     files.insert("index.html".to_string(), index_html.clone());
+    // Store the original DESIGN.md (pre-render-time source-of-truth). The
+    // injected tokens live inside index.html; canvas_apply_design_md re-runs
+    // injection from this stored DESIGN.md after the user edits it.
     files.insert("DESIGN.md".to_string(), design_md);
     files.insert("composition.meta.json".to_string(), meta_json);
 
@@ -129,15 +148,52 @@ async fn resolve_index_html(
             })?;
         return substitute_placeholders(&body, req, tpl);
     }
-    // 3. Default scaffold.
-    Ok(default_scaffold(req))
+    // 3. Reject — neither template nor html supplied. Returning a 500-byte
+    //    default scaffold here silently masks LLM mistakes (it omitted both
+    //    fields), and downstream the composition has no real content. Surface
+    //    the error so the agent retries with template or html.
+    Err(DaemonError::InvalidRequest(
+        "canvas_create_composition: must provide either `template` (one of: \
+         website-promo-16x9, product-intro-16x9, product-intro-9x16, tiktok-hook, \
+         video-overlay, logo-3d-reveal, product-3d-spin) or `html` (raw composition body). \
+         Both are missing."
+            .into(),
+    ))
 }
 
-async fn resolve_design_md(svc: &CanvasVideoService) -> Result<String> {
+/// Resolve the DESIGN.md content for a new composition.
+///
+/// Resolution priority:
+/// 1. Caller-supplied `req.design_md` wins outright (treats whitespace-only
+///    as "not supplied" so accidental empty strings don't blank the brand).
+/// 2. Otherwise, when `req.template` is set, look up the template-specific
+///    `templates/<name>.design.md` — each shipped template has its own brand
+///    default matching its CSS `:root` fallback values.
+/// 3. Final fallback to the generic `reference/DESIGN-template.md` (used by
+///    `html`-mode compositions and as a last-resort default).
+///
+/// All read failures degrade silently to `String::new()` so a missing
+/// auxiliary file never blocks composition creation; the daemon's
+/// `inject_design_tokens` step then becomes a no-op.
+async fn resolve_design_md(
+    svc: &CanvasVideoService,
+    req: &CreateCompositionRequest,
+) -> Result<String> {
+    if let Some(md) = &req.design_md {
+        if !md.trim().is_empty() {
+            return Ok(md.clone());
+        }
+    }
     let reg = svc.skills().ok_or_else(|| {
         DaemonError::InternalError("canvas_video: skill registry not wired".into())
     })?;
     let guard = reg.read().await;
+    if let Some(tpl) = &req.template {
+        let path = format!("templates/{tpl}.design.md");
+        if let Ok(s) = guard.read_auxiliary_file("video", &path) {
+            return Ok(s);
+        }
+    }
     match guard.read_auxiliary_file("video", "reference/DESIGN-template.md") {
         Ok(s) => Ok(s),
         Err(_) => Ok(String::new()), // empty fallback per spec §10.1
@@ -170,9 +226,17 @@ fn build_meta(req: &CreateCompositionRequest) -> CompositionMeta {
 fn substitute_placeholders(
     body: &str,
     req: &CreateCompositionRequest,
-    template: &str,
+    _template: &str,
 ) -> Result<String> {
     let bg = req.bg.clone().unwrap_or_else(|| "#000".into());
+    // All placeholders are optional. Templates may hardcode their canonical
+    // dimensions in data-width / data-height attributes (the convention for
+    // the seven shipped /video templates: each template's aspect is part of
+    // its identity, e.g. tiktok-hook is intrinsically 9:16 at 1080x1920),
+    // OR they may use {{width}}/{{height}}/{{duration}}/{{fps}}/{{bg}} for
+    // parameterization. Missing placeholders are not an error -- absent
+    // means "the template doesn't take that parameter at materialization
+    // time," not "broken template."
     let replacements = [
         ("{{width}}", req.width.to_string()),
         ("{{height}}", req.height.to_string()),
@@ -181,20 +245,10 @@ fn substitute_placeholders(
         ("{{bg}}", bg),
     ];
     let mut out = body.to_string();
-    let mut missing = Vec::new();
     for (needle, value) in &replacements {
         if body.contains(needle) {
             out = out.replace(needle, value);
-        } else if matches!(*needle, "{{width}}" | "{{height}}") {
-            // width/height are required in templates; others optional.
-            missing.push((*needle).to_string());
         }
-    }
-    if !missing.is_empty() {
-        return Err(DaemonError::TemplateSubstitutionFailed {
-            template: template.to_string(),
-            missing,
-        });
     }
     Ok(out)
 }
@@ -254,8 +308,11 @@ mod persistence_tests {
             duration_sec: 5.0,
             fps: 30,
             bg: Some("#000".into()),
-            html: None,
+            // resolve_index_html now rejects creates with neither template nor
+            // html, so seed a minimal html for unit-test fixtures.
+            html: Some("<html><body></body></html>".into()),
             template: None,
+            design_md: None,
             session_id: None,
         }
     }
@@ -335,11 +392,29 @@ mod persistence_tests {
     async fn create_rejects_missing_template() {
         let svc = Arc::new(CanvasVideoService::new_for_tests());
         let mut req = mk_req("h");
+        // mk_req seeds html so the create won't fall through to the
+        // "neither field set" rejection path; null html here to force the
+        // template lookup, which is what this test exercises.
+        req.html = None;
         req.template = Some("does-not-exist".into());
         let err = svc.create_composition(req).await.unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("skill asset not found") || msg.contains("SkillAssetNotFound"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_when_both_template_and_html_missing() {
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let mut req = mk_req("h");
+        req.html = None;
+        req.template = None;
+        let err = svc.create_composition(req).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("must provide either") && msg.contains("template") && msg.contains("html"),
             "got: {msg}"
         );
     }

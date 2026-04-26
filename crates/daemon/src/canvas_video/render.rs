@@ -92,7 +92,21 @@ async fn run_render_loop(svc: Arc<CanvasVideoService>, job_id: String, fps: u32)
     // Resolve ffmpeg binary (auto-downloads a static build if absent).
     let _ffmpeg_path = resolve_ffmpeg()?;
 
-    let mut ffmpeg_cmd = image2pipe_cmd(&output_path, fps);
+    // Audio mux (P5b-final): if the composition has a narration audio file
+    // in its files map (`narration.mp3` or `narration.wav`), decode the
+    // stored base64 to a temp file and pass to ffmpeg as a second input.
+    // Tempfile is held in scope until ffmpeg exits so the OS doesn't drop
+    // it while ffmpeg is reading.
+    let _audio_tempfile = stage_narration_audio(&svc, &composition_id).await;
+    let audio_path = _audio_tempfile.as_ref().map(|t| t.path());
+    if audio_path.is_some() {
+        tracing::info!(
+            "render: muxing narration audio for composition {}",
+            composition_id
+        );
+    }
+
+    let mut ffmpeg_cmd = image2pipe_cmd(&output_path, fps, audio_path);
     let mut ffmpeg_child = ffmpeg_cmd
         .spawn()
         .map_err(|e| DaemonError::InternalError(format!("spawn ffmpeg: {}", e)))?;
@@ -188,6 +202,86 @@ async fn run_render_loop(svc: Arc<CanvasVideoService>, job_id: String, fps: u32)
     svc.emit_succeeded(&job_id, &path_str, size_bytes).await;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Narration audio staging (P5b-final)
+// ---------------------------------------------------------------------------
+
+/// Decode the composition's stored narration audio (base64 in artifact's
+/// `files["narration.mp3"]` or `files["narration.wav"]`) to a temp file
+/// usable as a second input to ffmpeg. Returns `None` when no narration
+/// is present, when the artifact lookup fails, or when the base64 decode
+/// fails — caller silently proceeds without audio in those cases.
+///
+/// The returned `NamedTempFile` MUST be held in scope until ffmpeg exits;
+/// dropping it before then deletes the file from disk and ffmpeg sees an
+/// I/O error. Caller stores it in a `let _audio_tempfile = ...` binding.
+async fn stage_narration_audio(
+    svc: &std::sync::Arc<crate::canvas_video::CanvasVideoService>,
+    composition_id: &str,
+) -> Option<tempfile::NamedTempFile> {
+    use base64::Engine;
+    use nevoflux_storage::repositories::ArtifactRepository;
+    use std::io::Write;
+
+    let storage = svc.storage()?;
+    let repo = ArtifactRepository::new(storage.database());
+    let record = match repo.get(composition_id) {
+        Ok(Some(r)) => r,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(
+                "stage_narration_audio: get artifact {} failed: {}",
+                composition_id,
+                e
+            );
+            return None;
+        }
+    };
+    let files = record.files?;
+    // Look up by canonical name in priority order. Future P5b-2 (Kokoro)
+    // emits .wav; ElevenLabs emits .mp3.
+    let (key, ext) = if let Some(b64) = files.get("narration.mp3") {
+        (b64, "mp3")
+    } else if let Some(b64) = files.get("narration.wav") {
+        (b64, "wav")
+    } else {
+        return None;
+    };
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(key) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                "stage_narration_audio: base64 decode for {}: {}",
+                composition_id,
+                e
+            );
+            return None;
+        }
+    };
+
+    let suffix = format!(".{ext}");
+    let mut tmp = match tempfile::Builder::new()
+        .prefix("nf-narration-")
+        .suffix(&suffix)
+        .tempfile()
+    {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("stage_narration_audio: tempfile create failed: {}", e);
+            return None;
+        }
+    };
+    if let Err(e) = tmp.write_all(&bytes) {
+        tracing::warn!("stage_narration_audio: tempfile write failed: {}", e);
+        return None;
+    }
+    if let Err(e) = tmp.flush() {
+        tracing::warn!("stage_narration_audio: tempfile flush failed: {}", e);
+        return None;
+    }
+    Some(tmp)
 }
 
 // ---------------------------------------------------------------------------

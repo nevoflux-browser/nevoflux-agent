@@ -318,7 +318,11 @@ pub async fn execute_mcp_tool(
     // direct-API-provider path lives in `DaemonHostFunctions::canvas_video_*`
     // plus the builtin-wasm Agent::execute_tool arm.
     match name {
-        "canvas_create_composition" | "canvas_render_video" | "canvas_lint_composition" => {
+        "canvas_create_composition"
+        | "canvas_render_video"
+        | "canvas_lint_composition"
+        | "canvas_apply_design_md"
+        | "canvas_create_from_visual_identity" => {
             return execute_canvas_video_tool(name, arguments, services).await;
         }
         _ => {}
@@ -333,6 +337,21 @@ pub async fn execute_mcp_tool(
         "memory_view" => return execute_memory_view(arguments, services),
         "knowledge_teach" => return execute_knowledge_teach(arguments, services),
         _ => {}
+    }
+
+    // 4'. TTS subsystem tools (P5b).
+    //
+    // ACP-style providers see `tts_synthesize_api` via the MCP HTTP bridge
+    // and dispatch through this executor. The direct-API-provider path
+    // lives in `DaemonHostFunctions::tts_synthesize_api`.
+    if name == "tts_synthesize_api" {
+        return execute_tts_synthesize_api(arguments, services).await;
+    }
+    if name == "tts_synthesize_local" {
+        return execute_tts_synthesize_local(arguments, services).await;
+    }
+    if name == "tts_transcribe" {
+        return execute_tts_transcribe(arguments, services).await;
     }
 
     // 5. Skill/tool search
@@ -367,7 +386,15 @@ pub async fn execute_mcp_tool(
 
 /// Map tool name to BrowserToolAction.
 fn tool_name_to_browser_action(name: &str) -> Option<BrowserToolAction> {
-    let key = name.strip_prefix("browser_").unwrap_or(name);
+    // Strip either `browser_` or `canvas_` prefix. Most tools use the
+    // `browser_` namespace; `canvas_extract_visual_identity` lives in the
+    // `canvas_` family for product-grouping reasons (Mode 3 is a canvas
+    // workflow) but its dispatch goes through the same browser-tool
+    // bridge — so we also accept the `canvas_` prefix here.
+    let key = name
+        .strip_prefix("browser_")
+        .or_else(|| name.strip_prefix("canvas_"))
+        .unwrap_or(name);
     match key {
         "navigate" => Some(BrowserToolAction::Navigate),
         "activate_tab" => Some(BrowserToolAction::ActivateTab),
@@ -395,6 +422,11 @@ fn tool_name_to_browser_action(name: &str) -> Option<BrowserToolAction> {
         "key_press" => Some(BrowserToolAction::KeyPress),
         "read_artifact" => Some(BrowserToolAction::ReadArtifact),
         "edit_artifact" => Some(BrowserToolAction::EditArtifact),
+        // canvas_extract_visual_identity is dispatched as a browser tool
+        // (the action runs in the extension: open tab, run extractor, close).
+        // Caller may pass `canvas_extract_visual_identity` (preferred,
+        // matches the agent-facing tool name) or the bare suffix.
+        "extract_visual_identity" => Some(BrowserToolAction::ExtractVisualIdentity),
         "ask_user" => Some(BrowserToolAction::AskUser),
         "web_search" => Some(BrowserToolAction::WebSearch),
         "fetch_page" => Some(BrowserToolAction::WebFetch),
@@ -428,7 +460,22 @@ async fn execute_browser_tool(
         return execute_browser_upload_orchestrated(arguments, browser_ctx).await;
     }
 
-    let tab_id = arguments.get("tab_id").and_then(|v| v.as_i64());
+    // Routing tab_id: top-level for most tools; for ExtractVisualIdentity
+    // it lives at `target.tab_id` (nested) per the spec's two-mode shape
+    // (URL mode → no tab_id; TabId mode → target.tab_id present).
+    let tab_id = arguments
+        .get("tab_id")
+        .and_then(|v| v.as_i64())
+        .or_else(|| {
+            if matches!(action, BrowserToolAction::ExtractVisualIdentity) {
+                arguments
+                    .get("target")
+                    .and_then(|t| t.get("tab_id"))
+                    .and_then(|v| v.as_i64())
+            } else {
+                None
+            }
+        });
 
     // Remove tab_id from params — it's a routing field on BrowserRequest,
     // not a tool parameter. Firefox WebExtension schema rejects unknown properties.
@@ -1050,13 +1097,50 @@ async fn execute_canvas_video_tool(
 
     match name {
         "canvas_create_composition" => {
-            let req: nevoflux_protocol::canvas_video::CreateCompositionRequest =
-                serde_json::from_value(arguments.clone())
-                    .map_err(|e| format!("invalid canvas_create_composition args: {}", e))?;
+            // Use the shared strict parser so the LLM-facing dispatch path
+            // gets the same `html`-rejection gate as the in-process tool
+            // executor (canvas_video::tool::CanvasCreateCompositionTool).
+            // Without this, the MCP/ACP path silently accepted hallucinated
+            // html submissions and meta.origin.template ended up null.
+            let mut req = crate::canvas_video::tool::parse_create_composition_args_strict(arguments)
+                .map_err(|e| e.to_string())?;
+            // Inject the current session_id from HostServices when the LLM
+            // didn't supply one (the LLM tool schema doesn't expose
+            // session_id, so req.session_id is always None here). Without
+            // this, the artifact row gets created with session_id=NULL and
+            // ContentStore mirror writes have to fall back to update_files;
+            // we'd rather have a proper FK link from the start so listing /
+            // session-scoped queries see the artifact.
+            if req.session_id.is_none() && !services.session_id.is_empty() {
+                req.session_id = Some(services.session_id.clone());
+            }
             let resp = svc
                 .create_composition(req)
                 .await
                 .map_err(|e| e.to_string())?;
+            // Auto-open the canvas tab so the user immediately sees the
+            // composition they just asked the agent to create. Without
+            // this broadcast, canvas_create_composition is a silent SQL
+            // insert from the user's perspective — the artifact exists
+            // but no UI surface shows it until lint/render runs and the
+            // sidebar's artifact card appears (or the user manually opens
+            // it from the canvas list). Mirrors the pattern used by
+            // canvas_render_video → canvas_video_open_render_tab.
+            //
+            // The canvas page self-hydrates from the daemon (content_store.
+            // load → artifact.get fallback) so the extension only needs to
+            // open the tab; no upfront ContentStore population needed.
+            if let Some(tx) = services.broadcast_tx.as_ref() {
+                let payload = serde_json::json!({
+                    "type": "canvas_video_open_canvas_tab",
+                    "payload": { "artifact_id": resp.artifact_id }
+                });
+                let env = nevoflux_protocol::DaemonEnvelope::broadcast(
+                    nevoflux_protocol::Channel::Chat,
+                    payload,
+                );
+                let _ = tx.send((b"*".to_vec(), env)).await;
+            }
             serde_json::to_string(&resp)
                 .map_err(|e| format!("serialize canvas_create_composition response: {}", e))
         }
@@ -1097,6 +1181,54 @@ async fn execute_canvas_video_tool(
                 .map_err(|e| e.to_string())?;
             serde_json::to_string(&report)
                 .map_err(|e| format!("serialize canvas_lint_composition response: {}", e))
+        }
+        "canvas_apply_design_md" => {
+            let req: nevoflux_protocol::canvas_video::ApplyDesignMdRequest =
+                serde_json::from_value(arguments.clone())
+                    .map_err(|e| format!("invalid canvas_apply_design_md args: {}", e))?;
+            svc.apply_design_md(&req.composition_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            let resp = nevoflux_protocol::canvas_video::ApplyDesignMdResponse {
+                composition_id: req.composition_id,
+            };
+            serde_json::to_string(&resp)
+                .map_err(|e| format!("serialize canvas_apply_design_md response: {}", e))
+        }
+        "canvas_create_from_visual_identity" => {
+            let mut req: nevoflux_protocol::canvas_video::CreateFromVisualIdentityRequest =
+                serde_json::from_value(arguments.clone()).map_err(|e| {
+                    format!("invalid canvas_create_from_visual_identity args: {}", e)
+                })?;
+            // Inject session_id from HostServices when LLM didn't supply one
+            // — same rationale as canvas_create_composition (artifact's
+            // session_id FK must be populated for ContentStore mirror to
+            // hit the artifacts table).
+            if req.session_id.is_none() && !services.session_id.is_empty() {
+                req.session_id = Some(services.session_id.clone());
+            }
+            let resp = svc
+                .create_from_visual_identity(req)
+                .await
+                .map_err(|e| e.to_string())?;
+            // Auto-open canvas tab — mirror canvas_create_composition.
+            if let Some(tx) = services.broadcast_tx.as_ref() {
+                let payload = serde_json::json!({
+                    "type": "canvas_video_open_canvas_tab",
+                    "payload": { "artifact_id": resp.artifact_id }
+                });
+                let env = nevoflux_protocol::DaemonEnvelope::broadcast(
+                    nevoflux_protocol::Channel::Chat,
+                    payload,
+                );
+                let _ = tx.send((b"*".to_vec(), env)).await;
+            }
+            serde_json::to_string(&resp).map_err(|e| {
+                format!(
+                    "serialize canvas_create_from_visual_identity response: {}",
+                    e
+                )
+            })
         }
         other => Err(format!(
             "execute_canvas_video_tool called with unexpected name: {}",
@@ -1371,6 +1503,113 @@ fn execute_knowledge_teach(
     );
 
     Ok(serde_json::json!({"id": entry.id, "status": "taught"}).to_string())
+}
+
+// ============================================================================
+// 4'. TTS subsystem (P5b)
+// ============================================================================
+
+/// MCP/ACP dispatch arm for `tts_synthesize_api`. Reads `[tts.elevenlabs]`
+/// from the `tts_config` plumbed onto `HostServices` at server boot. When
+/// `composition_id` is provided in the request, the synthesized MP3 is
+/// written into the artifact's files map as `narration.mp3`.
+async fn execute_tts_synthesize_api(
+    arguments: &serde_json::Value,
+    services: &HostServices,
+) -> Result<String, String> {
+    let req: nevoflux_protocol::tts::SynthesizeRequest =
+        serde_json::from_value(arguments.clone())
+            .map_err(|e| format!("invalid tts_synthesize_api args: {e}"))?;
+    let cfg = services
+        .tts_config
+        .as_ref()
+        .map(|c| c.elevenlabs.clone())
+        .unwrap_or_default();
+
+    let mut resp = crate::tts::synthesize_api(&cfg, &req)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Optional composition file write (mirrors agent_host's direct-API path).
+    if let Some(comp_id) = req.composition_id.as_deref() {
+        use nevoflux_storage::repositories::ArtifactRepository;
+        let repo = ArtifactRepository::new(&services.database);
+        match repo.get(comp_id) {
+            Ok(Some(record)) => {
+                let mut files = record.files.unwrap_or_default();
+                files.insert("narration.mp3".to_string(), resp.audio_b64.clone());
+                let entry = record.entry.unwrap_or_else(|| "index.html".to_string());
+                let content = files
+                    .get(&entry)
+                    .cloned()
+                    .unwrap_or_else(|| record.content.clone());
+                if let Err(e) = repo.update_files(comp_id, &files, &content) {
+                    tracing::warn!(
+                        "tts_synthesize_api: failed to write narration.mp3 into {}: {}",
+                        comp_id,
+                        e
+                    );
+                } else {
+                    resp.wrote_to_files = Some("narration.mp3".into());
+                }
+            }
+            Ok(None) => tracing::warn!(
+                "tts_synthesize_api: composition_id {} not found; returning audio only",
+                comp_id
+            ),
+            Err(e) => tracing::warn!(
+                "tts_synthesize_api: artifact get for {}: {}",
+                comp_id,
+                e
+            ),
+        }
+    }
+
+    serde_json::to_string(&resp)
+        .map_err(|e| format!("serialize tts_synthesize_api response: {e}"))
+}
+
+/// MCP/ACP dispatch arm for `tts_synthesize_local` (P5b-2). Reads
+/// `[tts.kokoro]` config; until ONNX inference lands the call returns
+/// a clear ConfigMissing pointing at setup steps.
+async fn execute_tts_synthesize_local(
+    arguments: &serde_json::Value,
+    services: &HostServices,
+) -> Result<String, String> {
+    let req: nevoflux_protocol::tts::SynthesizeRequest =
+        serde_json::from_value(arguments.clone())
+            .map_err(|e| format!("invalid tts_synthesize_local args: {e}"))?;
+    let cfg = services
+        .tts_config
+        .as_ref()
+        .map(|c| c.kokoro.clone())
+        .unwrap_or_default();
+    let resp = crate::tts::synthesize_local(&cfg, &req)
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::to_string(&resp)
+        .map_err(|e| format!("serialize tts_synthesize_local response: {e}"))
+}
+
+/// MCP/ACP dispatch arm for `tts_transcribe` (P5b-3). Reads
+/// `[tts.whisper]` config; ConfigMissing until Whisper ONNX wires up.
+async fn execute_tts_transcribe(
+    arguments: &serde_json::Value,
+    services: &HostServices,
+) -> Result<String, String> {
+    let req: nevoflux_protocol::tts::TranscribeRequest =
+        serde_json::from_value(arguments.clone())
+            .map_err(|e| format!("invalid tts_transcribe args: {e}"))?;
+    let cfg = services
+        .tts_config
+        .as_ref()
+        .map(|c| c.whisper.clone())
+        .unwrap_or_default();
+    let resp = crate::tts::transcribe(&cfg, &req)
+        .await
+        .map_err(|e| e.to_string())?;
+    serde_json::to_string(&resp)
+        .map_err(|e| format!("serialize tts_transcribe response: {e}"))
 }
 
 // ============================================================================

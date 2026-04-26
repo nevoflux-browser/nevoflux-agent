@@ -3903,6 +3903,23 @@ impl HostFunctions for DaemonHostFunctions {
         self.execute_browser_action(BrowserToolAction::EditArtifact, params.clone(), tab_id)
     }
 
+    fn browser_extract_visual_identity(
+        &self,
+        params: &serde_json::Value,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        debug!("browser_extract_visual_identity: extracting visual identity");
+        // Default tab_id is bumped from `target.tab_id` field (already
+        // resolved by the caller in agent.rs::execute_tool); the params
+        // forward the full ExtractVisualIdentityRequest shape so the
+        // extension handler can read `target.url` itself.
+        self.execute_browser_action(
+            BrowserToolAction::ExtractVisualIdentity,
+            params.clone(),
+            tab_id,
+        )
+    }
+
     fn browser_wait_for_stable(
         &self,
         strategy: &str,
@@ -4392,18 +4409,71 @@ impl HostFunctions for DaemonHostFunctions {
                 message: "canvas_video service not wired".into(),
             })?
             .clone();
-        let req: nevoflux_protocol::canvas_video::CreateCompositionRequest =
-            serde_json::from_value(request.clone()).map_err(|e| HostError {
-                code: 4,
-                message: format!("invalid canvas_create_composition args: {}", e),
+        // Strict parser also blocks `html`-field injection from the
+        // direct-API LLM provider path (Anthropic / OpenAI / etc.) so all
+        // three dispatch surfaces share the same gate.
+        tracing::info!(
+            "canvas_video_create_composition: incoming args = {}",
+            serde_json::to_string(request).unwrap_or_default()
+        );
+        let mut req = crate::canvas_video::tool::parse_create_composition_args_strict(request)
+            .map_err(|e| {
+                tracing::warn!(
+                    "canvas_video_create_composition: strict-parse rejected: {}",
+                    e
+                );
+                HostError {
+                    code: 4,
+                    message: e.to_string(),
+                }
             })?;
+        // Inject current session_id when the LLM didn't supply one — its
+        // tool schema doesn't expose session_id. Required so the artifact
+        // row's session_id FK is populated; otherwise ContentStore mirror
+        // would have to fall back to update_files (still works, but having
+        // a proper FK is cleaner for session-scoped listing/queries).
+        if req.session_id.is_none() {
+            if let Some(sid) = self.session_id.clone() {
+                if !sid.is_empty() {
+                    req.session_id = Some(sid);
+                }
+            }
+        }
+        // Auto-open the canvas tab after create — see the matching block in
+        // mcp_tool_executor::execute_canvas_video_tool for rationale. The
+        // direct-API dispatch surface (Anthropic / OpenAI / etc. via
+        // builtin-wasm Agent::execute_tool) doesn't flow through
+        // mcp_tool_executor, so we broadcast from here too.
+        let broadcast_tx = self
+            .services
+            .as_ref()
+            .and_then(|s| s.broadcast_tx.clone());
         let resp = tokio::task::block_in_place(|| {
-            self.runtime
-                .block_on(async move { svc.create_composition(req).await })
+            self.runtime.block_on(async move {
+                let resp = svc.create_composition(req).await?;
+                if let Some(tx) = broadcast_tx {
+                    let payload = serde_json::json!({
+                        "type": "canvas_video_open_canvas_tab",
+                        "payload": { "artifact_id": resp.artifact_id }
+                    });
+                    let env = nevoflux_protocol::DaemonEnvelope::broadcast(
+                        nevoflux_protocol::Channel::Chat,
+                        payload,
+                    );
+                    let _ = tx.send((b"*".to_vec(), env)).await;
+                }
+                Ok::<_, crate::error::DaemonError>(resp)
+            })
         })
-        .map_err(|e| HostError {
-            code: 3,
-            message: format!("canvas_create_composition failed: {}", e),
+        .map_err(|e| {
+            tracing::warn!(
+                "canvas_video_create_composition: service error: {}",
+                e
+            );
+            HostError {
+                code: 3,
+                message: format!("canvas_create_composition failed: {}", e),
+            }
         })?;
         serde_json::to_value(&resp).map_err(|e| HostError {
             code: 4,
@@ -4428,9 +4498,33 @@ impl HostFunctions for DaemonHostFunctions {
                 code: 4,
                 message: format!("invalid canvas_render_video args: {}", e),
             })?;
+        // Direct-API dispatch surface (OpenAI, Anthropic, etc. routed through
+        // builtin-wasm Agent::execute_tool) does not flow through the
+        // canvas_video_render_start envelope handler in server.rs nor through
+        // mcp_tool_executor. Without this broadcast the extension never
+        // receives canvas_video_open_render_tab, the render iframe never
+        // loads, and run_render_loop times out at PAGE_IDLE_TIMEOUT (60s)
+        // with frames_written=0.
+        let broadcast_tx = self
+            .services
+            .as_ref()
+            .and_then(|s| s.broadcast_tx.clone());
         let resp = tokio::task::block_in_place(|| {
-            self.runtime
-                .block_on(async move { svc.render_start(req).await })
+            self.runtime.block_on(async move {
+                let resp = svc.render_start(req).await?;
+                if let Some(tx) = broadcast_tx {
+                    let payload = serde_json::json!({
+                        "type": "canvas_video_open_render_tab",
+                        "payload": { "job_id": resp.job_id }
+                    });
+                    let env = nevoflux_protocol::DaemonEnvelope::broadcast(
+                        nevoflux_protocol::Channel::Chat,
+                        payload,
+                    );
+                    let _ = tx.send((b"*".to_vec(), env)).await;
+                }
+                Ok::<_, crate::error::DaemonError>(resp)
+            })
         })
         .map_err(|e| HostError {
             code: 3,
@@ -4470,6 +4564,200 @@ impl HostFunctions for DaemonHostFunctions {
         serde_json::to_value(&report).map_err(|e| HostError {
             code: 4,
             message: format!("serialize canvas_lint_composition response: {e}"),
+        })
+    }
+
+    fn canvas_video_apply_design_md(
+        &self,
+        request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        let svc = self
+            .canvas_video_service
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "canvas_video service not wired".into(),
+            })?
+            .clone();
+        let req: nevoflux_protocol::canvas_video::ApplyDesignMdRequest =
+            serde_json::from_value(request.clone()).map_err(|e| HostError {
+                code: 4,
+                message: format!("invalid canvas_apply_design_md args: {e}"),
+            })?;
+        tokio::task::block_in_place(|| {
+            self.runtime
+                .block_on(async move { svc.apply_design_md(&req.composition_id).await })
+        })
+        .map_err(|e| HostError {
+            code: 3,
+            message: format!("canvas_apply_design_md failed: {e}"),
+        })?;
+        // Echo composition_id so callers can correlate.
+        let resp = nevoflux_protocol::canvas_video::ApplyDesignMdResponse {
+            composition_id: serde_json::from_value::<
+                nevoflux_protocol::canvas_video::ApplyDesignMdRequest,
+            >(request.clone())
+            .map(|r| r.composition_id)
+            .unwrap_or_default(),
+        };
+        serde_json::to_value(&resp).map_err(|e| HostError {
+            code: 4,
+            message: format!("serialize canvas_apply_design_md response: {e}"),
+        })
+    }
+
+    fn tts_synthesize_api(
+        &self,
+        request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        let req: nevoflux_protocol::tts::SynthesizeRequest =
+            serde_json::from_value(request.clone()).map_err(|e| HostError {
+                code: 4,
+                message: format!("invalid tts_synthesize_api args: {e}"),
+            })?;
+        let cfg = self.config.tts.elevenlabs.clone();
+        let database = self.services.as_ref().map(|s| s.database.clone());
+
+        let resp = tokio::task::block_in_place(|| {
+            self.runtime.block_on(async move {
+                let mut resp = crate::tts::synthesize_api(&cfg, &req).await.map_err(|e| {
+                    HostError {
+                        code: e.code() as i32,
+                        message: e.to_string(),
+                    }
+                })?;
+                // Optionally write into composition's files map.
+                if let (Some(comp_id), Some(db)) = (req.composition_id.as_deref(), database) {
+                    if let Err(e) = write_audio_to_composition(&db, comp_id, &resp.audio_b64).await {
+                        // Don't fail the whole call if write fails — still
+                        // return audio_b64 to the LLM, just record the
+                        // problem so the user knows.
+                        tracing::warn!(
+                            "tts_synthesize_api: failed to write audio into {}: {}",
+                            comp_id,
+                            e
+                        );
+                    } else {
+                        resp.wrote_to_files = Some("narration.mp3".into());
+                    }
+                }
+                Ok::<_, HostError>(resp)
+            })
+        })?;
+        serde_json::to_value(&resp).map_err(|e| HostError {
+            code: 4,
+            message: format!("serialize tts_synthesize_api response: {e}"),
+        })
+    }
+
+    fn tts_synthesize_local(
+        &self,
+        request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        let req: nevoflux_protocol::tts::SynthesizeRequest =
+            serde_json::from_value(request.clone()).map_err(|e| HostError {
+                code: 4,
+                message: format!("invalid tts_synthesize_local args: {e}"),
+            })?;
+        let cfg = self.config.tts.kokoro.clone();
+        let resp = tokio::task::block_in_place(|| {
+            self.runtime.block_on(async move {
+                crate::tts::synthesize_local(&cfg, &req).await.map_err(|e| HostError {
+                    code: e.code() as i32,
+                    message: e.to_string(),
+                })
+            })
+        })?;
+        serde_json::to_value(&resp).map_err(|e| HostError {
+            code: 4,
+            message: format!("serialize tts_synthesize_local response: {e}"),
+        })
+    }
+
+    fn tts_transcribe(
+        &self,
+        request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        let req: nevoflux_protocol::tts::TranscribeRequest =
+            serde_json::from_value(request.clone()).map_err(|e| HostError {
+                code: 4,
+                message: format!("invalid tts_transcribe args: {e}"),
+            })?;
+        let cfg = self.config.tts.whisper.clone();
+        let resp = tokio::task::block_in_place(|| {
+            self.runtime.block_on(async move {
+                crate::tts::transcribe(&cfg, &req).await.map_err(|e| HostError {
+                    code: e.code() as i32,
+                    message: e.to_string(),
+                })
+            })
+        })?;
+        serde_json::to_value(&resp).map_err(|e| HostError {
+            code: 4,
+            message: format!("serialize tts_transcribe response: {e}"),
+        })
+    }
+
+    fn canvas_video_create_from_visual_identity(
+        &self,
+        request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        let svc = self
+            .canvas_video_service
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "canvas_video service not wired".into(),
+            })?
+            .clone();
+        let mut req: nevoflux_protocol::canvas_video::CreateFromVisualIdentityRequest =
+            serde_json::from_value(request.clone()).map_err(|e| HostError {
+                code: 4,
+                message: format!("invalid canvas_create_from_visual_identity args: {e}"),
+            })?;
+        // Inject session_id from host context when LLM didn't supply one
+        // (matches the pattern in canvas_video_create_composition); we want
+        // the artifact's session_id FK populated so ContentStore mirrors
+        // and session-scoped queries work.
+        if req.session_id.is_none() {
+            if let Some(sid) = self.session_id.clone() {
+                if !sid.is_empty() {
+                    req.session_id = Some(sid);
+                }
+            }
+        }
+        // Auto-open canvas tab via broadcast (same pattern as
+        // canvas_video_create_composition) so the user immediately sees the
+        // composition. Without this, Mode-3 runs silently from the user's
+        // POV until lint/render produces a sidebar artifact card.
+        let broadcast_tx = self
+            .services
+            .as_ref()
+            .and_then(|s| s.broadcast_tx.clone());
+        let resp = tokio::task::block_in_place(|| {
+            self.runtime.block_on(async move {
+                let resp = svc.create_from_visual_identity(req).await?;
+                if let Some(tx) = broadcast_tx {
+                    let payload = serde_json::json!({
+                        "type": "canvas_video_open_canvas_tab",
+                        "payload": { "artifact_id": resp.artifact_id }
+                    });
+                    let env = nevoflux_protocol::DaemonEnvelope::broadcast(
+                        nevoflux_protocol::Channel::Chat,
+                        payload,
+                    );
+                    let _ = tx.send((b"*".to_vec(), env)).await;
+                }
+                Ok::<_, crate::error::DaemonError>(resp)
+            })
+        })
+        .map_err(|e| HostError {
+            code: 3,
+            message: format!("canvas_create_from_visual_identity failed: {e}"),
+        })?;
+        serde_json::to_value(&resp).map_err(|e| HostError {
+            code: 4,
+            message: format!("serialize canvas_create_from_visual_identity response: {e}"),
         })
     }
 }
@@ -5363,6 +5651,40 @@ fn extract_domain_from_url(url: &str) -> Option<String> {
     } else {
         Some(host.to_lowercase())
     }
+}
+
+/// Decode the base64 audio payload from a TTS response and write it into
+/// the named composition's files map as `narration.mp3` (preserving any
+/// existing files; only adds/overwrites the narration entry). Used by
+/// `tts_synthesize_api` and future `tts_synthesize_local` when the caller
+/// supplied `composition_id`.
+async fn write_audio_to_composition(
+    database: &nevoflux_storage::Database,
+    composition_id: &str,
+    audio_b64: &str,
+) -> Result<(), String> {
+    use nevoflux_storage::repositories::ArtifactRepository;
+    let repo = ArtifactRepository::new(database);
+    let record = repo
+        .get(composition_id)
+        .map_err(|e| format!("artifact get: {e}"))?
+        .ok_or_else(|| format!("composition not found: {composition_id}"))?;
+    let mut files = record.files.unwrap_or_default();
+    // Decode b64 → bytes → store as a UTF-8 string of those bytes? Files
+    // map is `HashMap<String, String>` and stores text content. For MP3
+    // we keep the base64 representation in the JSON column rather than
+    // raw bytes (SQLite TEXT is UTF-8, raw MP3 isn't valid UTF-8). The
+    // render pipeline / browser code that consumes the audio will base64-
+    // decode at use time.
+    files.insert("narration.mp3".to_string(), audio_b64.to_string());
+    let entry = record.entry.unwrap_or_else(|| "index.html".to_string());
+    let content = files
+        .get(&entry)
+        .cloned()
+        .unwrap_or_else(|| record.content.clone());
+    repo.update_files(composition_id, &files, &content)
+        .map_err(|e| format!("update_files: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
