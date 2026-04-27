@@ -1243,6 +1243,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     tool_call_id: Some(result.tool_call_id.clone()),
                     tool_calls: vec![],
                     attachments,
+                    reasoning: None,
                 });
 
                 // Check interrupt after each tool execution
@@ -2287,7 +2288,9 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
             }
             "canvas_inspect_layout" => {
-                let resp = self.host.canvas_video_inspect_layout(&tool_call.arguments)?;
+                let resp = self
+                    .host
+                    .canvas_video_inspect_layout(&tool_call.arguments)?;
                 serde_json::to_string(&resp)
                     .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
             }

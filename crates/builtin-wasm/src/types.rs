@@ -69,6 +69,11 @@ pub struct Message {
     /// Attachments for multimodal messages (images, files).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
+    /// Reasoning / thinking content from the model that produced this turn
+    /// (assistant role only). Some providers (DeepSeek with tool calls)
+    /// require it to be echoed back on subsequent turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl Message {
@@ -80,6 +85,7 @@ impl Message {
             tool_call_id: None,
             tool_calls: Vec::new(),
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -91,6 +97,7 @@ impl Message {
             tool_call_id: None,
             tool_calls: Vec::new(),
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -102,6 +109,7 @@ impl Message {
             tool_call_id: None,
             tool_calls: Vec::new(),
             attachments,
+            reasoning: None,
         }
     }
 
@@ -113,6 +121,7 @@ impl Message {
             tool_call_id: None,
             tool_calls: Vec::new(),
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -127,6 +136,27 @@ impl Message {
             tool_call_id: None,
             tool_calls,
             attachments: Vec::new(),
+            reasoning: None,
+        }
+    }
+
+    /// Create an assistant message with tool calls and reasoning content.
+    ///
+    /// Used when the model returns reasoning_content alongside tool_calls
+    /// (e.g. DeepSeek thinking-mode). The reasoning string must be echoed
+    /// back to the provider on the next turn.
+    pub fn assistant_with_tool_calls_and_reasoning(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+        reasoning: Option<String>,
+    ) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls,
+            attachments: Vec::new(),
+            reasoning,
         }
     }
 
@@ -138,6 +168,7 @@ impl Message {
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: Vec::new(),
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 }
@@ -1079,6 +1110,39 @@ mod tests {
         };
         let json = serde_json::to_string(&chunk).unwrap();
         let parsed: LlmChunk = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.reasoning.as_deref(), Some("step 1: pick the right tool"));
+        assert_eq!(
+            parsed.reasoning.as_deref(),
+            Some("step 1: pick the right tool")
+        );
+    }
+
+    #[test]
+    fn message_assistant_with_tool_calls_and_reasoning_roundtrips() {
+        let tc = ToolCall {
+            id: "call_1".into(),
+            call_id: None,
+            name: "browser_get_markdown".into(),
+            arguments: serde_json::json!({"tab_id": 4}),
+            signature: None,
+        };
+        let msg = Message::assistant_with_tool_calls_and_reasoning(
+            "",
+            vec![tc.clone()],
+            Some("I should fetch the page first.".into()),
+        );
+
+        assert!(matches!(msg.role, MessageRole::Assistant));
+        assert_eq!(msg.tool_calls.len(), 1);
+        assert_eq!(
+            msg.reasoning.as_deref(),
+            Some("I should fetch the page first.")
+        );
+
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.reasoning.as_deref(),
+            Some("I should fetch the page first.")
+        );
     }
 }
