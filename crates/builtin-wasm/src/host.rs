@@ -720,6 +720,7 @@ impl HostFunctions for MockHostFunctions {
             Ok(LlmResponse {
                 text: "Mock response".into(),
                 tool_calls: vec![],
+                reasoning: None,
             })
         } else {
             Ok(responses.remove(0))
@@ -1438,6 +1439,7 @@ mod tests {
         mock.add_llm_response(LlmResponse {
             text: "Custom response".into(),
             tool_calls: vec![],
+            reasoning: None,
         });
 
         let request = LlmRequest {

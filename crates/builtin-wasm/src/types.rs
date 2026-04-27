@@ -260,7 +260,7 @@ pub struct LlmChunk {
     pub images: Vec<GeneratedImage>,
 }
 
-/// LLM response (non-streaming).
+/// LLM response (non-streaming or aggregated from a stream).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmResponse {
     /// Full response text.
@@ -268,6 +268,10 @@ pub struct LlmResponse {
     /// Tool calls from the response.
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
+    /// Aggregated reasoning / thinking content for the turn (DeepSeek
+    /// thinking-mode and similar). None when the model produced none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// Agent input from host.
@@ -766,8 +770,21 @@ mod tests {
         let resp = LlmResponse {
             text: "Hello there".into(),
             tool_calls: vec![],
+            reasoning: None,
         };
         assert!(resp.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn llm_response_carries_reasoning_across_serde() {
+        let r = LlmResponse {
+            text: "hi".into(),
+            tool_calls: vec![],
+            reasoning: Some("thinking...".into()),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let parsed: LlmResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.reasoning.as_deref(), Some("thinking..."));
     }
 
     #[test]

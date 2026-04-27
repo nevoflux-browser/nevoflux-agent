@@ -1292,6 +1292,7 @@ impl HostFunctions for DaemonHostFunctions {
                 Ok(LlmResponse {
                     text: response.content,
                     tool_calls,
+                    reasoning: None,
                 })
             }
             Err(e) => {
