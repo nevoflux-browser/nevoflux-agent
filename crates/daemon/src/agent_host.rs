@@ -1666,6 +1666,7 @@ impl HostFunctions for DaemonHostFunctions {
                         })
                         .collect(),
                     done: chunk.done,
+                    reasoning: chunk.reasoning,
                     images: chunk
                         .images
                         .into_iter()

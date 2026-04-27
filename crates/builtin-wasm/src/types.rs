@@ -219,6 +219,11 @@ pub struct LlmChunk {
     /// Whether this is the final chunk.
     #[serde(default)]
     pub done: bool,
+    /// Reasoning / thinking content delta from the model (e.g. DeepSeek
+    /// `reasoning_content` for thinking-mode models). Must be round-tripped
+    /// back to providers that require it (DeepSeek with tool calls).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     /// Generated images.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<GeneratedImage>,
@@ -740,6 +745,7 @@ mod tests {
             text: Some("Hello".into()),
             tool_calls: vec![],
             done: false,
+            reasoning: None,
             images: vec![],
         };
         assert!(!chunk.done);
@@ -1060,5 +1066,19 @@ mod tests {
         };
         let json2 = serde_json::to_string(&input_no_tabs).unwrap();
         assert!(!json2.contains("tab_ids"));
+    }
+
+    #[test]
+    fn llm_chunk_carries_reasoning_across_serde() {
+        let chunk = LlmChunk {
+            text: None,
+            tool_calls: vec![],
+            done: false,
+            reasoning: Some("step 1: pick the right tool".into()),
+            images: vec![],
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        let parsed: LlmChunk = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.reasoning.as_deref(), Some("step 1: pick the right tool"));
     }
 }
