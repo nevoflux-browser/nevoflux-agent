@@ -2286,6 +2286,11 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 serde_json::to_string(&resp)
                     .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
             }
+            "canvas_inspect_layout" => {
+                let resp = self.host.canvas_video_inspect_layout(&tool_call.arguments)?;
+                serde_json::to_string(&resp)
+                    .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
+            }
             "tts_synthesize_api" => {
                 let resp = self.host.tts_synthesize_api(&tool_call.arguments)?;
                 serde_json::to_string(&resp)
@@ -2385,6 +2390,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 | "canvas_extract_visual_identity"
                 | "canvas_create_from_visual_identity"
                 | "canvas_attach_asset"
+                | "canvas_inspect_layout"
                 | "tts_synthesize_api"
                 | "tts_synthesize_local"
                 | "tts_transcribe"
@@ -3171,6 +3177,40 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     "type": "object",
                     "properties": {
                         "composition_id": { "type": "string" }
+                    },
+                    "required": ["composition_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "canvas_inspect_layout".into(),
+                description: "Run a visual layout + WCAG contrast audit on a composition. \
+                              The daemon broadcasts the request to the extension, which loads \
+                              the composition into a sandbox iframe, seeks the timeline at N \
+                              evenly-spaced timestamps (plus any hero frames you specify in \
+                              `at`), collects bounding boxes for every `[data-track-index]` / \
+                              `.clip` element, and runs a WCAG AA contrast check on every text \
+                              element.\n\n\
+                              Returns issues of these kinds (`kind` field):\n\
+                              - `overflow_x` / `overflow_y` — element extends past stage edges\n\
+                              - `off_stage` — element entirely outside the stage rect\n\
+                              - `zero_size` — `[data-track-index]` element has 0×0 bbox during \
+                                its `data-start..+data-duration` window (visibility/opacity \
+                                misuse)\n\
+                              - `contrast` — text contrast ratio below 4.5:1 (3:1 for large \
+                                text); includes `fg`, `bg`, `ratio`, `required` fields\n\n\
+                              Run AFTER `canvas_lint_composition` succeeds — lint catches \
+                              static rules, inspect catches runtime/visual issues. Iterate: \
+                              tweak DESIGN.md / scene padding / max-width, re-inspect, until \
+                              `issues` is empty (or only known-acceptable items remain).\n\n\
+                              Default frames=8 (good for most compositions). Bump to 15 for \
+                              dense videos with rapid scene changes. Use `at` to additionally \
+                              check exact hero-frame timestamps you suspect.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "composition_id": { "type": "string" },
+                        "frames":         { "type": "integer", "minimum": 1, "maximum": 30, "description": "Evenly-spaced sample count; defaults to 8." },
+                        "at":             { "type": "array", "items": { "type": "number" }, "description": "Optional explicit timestamps to additionally check." }
                     },
                     "required": ["composition_id"]
                 }),

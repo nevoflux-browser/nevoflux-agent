@@ -647,6 +647,18 @@ pub trait HostFunctions {
             message: "tts_transcribe not supported by this host".into(),
         })
     }
+
+    /// Run a layout / WCAG contrast audit on a composition. Backs the
+    /// `canvas_inspect_layout` tool. Default impl returns Unsupported.
+    fn canvas_video_inspect_layout(
+        &self,
+        _request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        Err(HostError {
+            code: 5,
+            message: "canvas_video_inspect_layout not supported by this host".into(),
+        })
+    }
 }
 
 /// Mock host functions for testing.

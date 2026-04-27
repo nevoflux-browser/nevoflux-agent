@@ -261,6 +261,107 @@ pub struct LintCompositionResponse {
     pub report: LintReport,
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Inspect protocol (visual layout + WCAG audit)
+// ─────────────────────────────────────────────────────────────────────────
+
+/// `canvas.video.inspect_layout` — runs the composition in an offscreen
+/// iframe, samples N timestamps across the timeline, and reports visual
+/// issues that the static linter cannot catch: text overflow,
+/// off-stage elements, zero-size visible elements, and WCAG contrast
+/// violations.
+///
+/// The bridge model mirrors `lint_composition`: daemon publishes a
+/// request event with a correlator, extension responds with the result
+/// via `canvas_video_inspect_result`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InspectLayoutRequest {
+    pub composition_id: String,
+    /// How many evenly-spaced timestamps to sample across the
+    /// composition. Defaults to 8. Bump to 15 for dense videos.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<u32>,
+    /// Optional explicit timestamps to additionally check (hero
+    /// frames the agent suspects). Merged with the evenly-spaced set.
+    #[serde(default)]
+    pub at: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectIssueKind {
+    /// Element extends past the stage's left/right edge.
+    OverflowX,
+    /// Element extends past the stage's top/bottom edge.
+    OverflowY,
+    /// Element entirely outside the stage rect at this timestamp.
+    OffStage,
+    /// `[data-track-index]` element has zero bbox during its
+    /// declared `data-start..+data-duration` window.
+    ZeroSize,
+    /// WCAG AA contrast ratio below 4.5:1 (or 3:1 for large text).
+    Contrast,
+    /// Internal — couldn't measure (selector resolution failed,
+    /// computed style read errored, etc.). Carries the message in
+    /// `fix_hint`.
+    Internal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InspectBbox {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InspectIssue {
+    /// Timestamp (seconds) at which the issue was observed.
+    pub t: f32,
+    pub kind: InspectIssueKind,
+    pub selector: String,
+    /// Element bounding box at the sampled timestamp; absent for
+    /// `Contrast` issues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<InspectBbox>,
+    /// Stage size echoed back so the agent can compute relative
+    /// percentages without a second tool call.
+    pub stage_w: u32,
+    pub stage_h: u32,
+    /// For `Contrast` issues only: foreground / background hex,
+    /// computed ratio, required ratio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ratio: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<f32>,
+    /// Suggested fix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InspectReport {
+    pub frames_checked: u32,
+    pub stage_w: u32,
+    pub stage_h: u32,
+    #[serde(default)]
+    pub issues: Vec<InspectIssue>,
+    #[serde(default)]
+    pub elapsed_ms: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InspectLayoutResponse {
+    #[serde(flatten)]
+    pub report: InspectReport,
+}
+
 /// `canvas.video.apply_design_md` — re-inject DESIGN.md tokens into the
 /// composition's `index.html`. Non-destructive (only the marked
 /// `<style data-nf-design-tokens>` block changes).

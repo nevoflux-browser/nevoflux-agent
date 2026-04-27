@@ -4649,6 +4649,41 @@ impl HostFunctions for DaemonHostFunctions {
         })
     }
 
+    fn canvas_video_inspect_layout(
+        &self,
+        request: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        let svc = self
+            .canvas_video_service
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "canvas_video service not wired".into(),
+            })?
+            .clone();
+        let req: nevoflux_protocol::canvas_video::InspectLayoutRequest =
+            serde_json::from_value(request.clone()).map_err(|e| HostError {
+                code: 4,
+                message: format!("invalid canvas_inspect_layout args: {e}"),
+            })?;
+        let frames = req.frames.unwrap_or(8);
+        let at = req.at.clone();
+        let composition_id = req.composition_id.clone();
+        let report = tokio::task::block_in_place(|| {
+            self.runtime
+                .block_on(async move { svc.inspect_layout(&composition_id, frames, &at).await })
+        })
+        .map_err(|e| HostError {
+            code: 3,
+            message: format!("canvas_inspect_layout failed: {e}"),
+        })?;
+        let resp = nevoflux_protocol::canvas_video::InspectLayoutResponse { report };
+        serde_json::to_value(&resp).map_err(|e| HostError {
+            code: 4,
+            message: format!("serialize canvas_inspect_layout response: {e}"),
+        })
+    }
+
     fn tts_synthesize_api(&self, request: &serde_json::Value) -> HostResult<serde_json::Value> {
         let req: nevoflux_protocol::tts::SynthesizeRequest =
             serde_json::from_value(request.clone()).map_err(|e| HostError {

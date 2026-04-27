@@ -1490,6 +1490,41 @@ pub async fn start_server(
         });
     }
 
+    // --- Inspect requests forwarded to proxies (mirror of lint above). ---
+    // CanvasVideoService publishes jobs:inspect:request:{correlator}; we
+    // subscribe and broadcast as canvas_video_inspect_request so the
+    // extension's background handler renders the iframe + replies with
+    // canvas_video_inspect_result.
+    {
+        let inspect_bus = event_bus.clone();
+        let inspect_tx = response_tx.clone();
+        tokio::spawn(async move {
+            use crate::event_bus::types::TopicPattern;
+            use crate::event_bus::{BackpressurePolicy, SubscriberIdentity};
+            let pattern = TopicPattern::wildcard("jobs:inspect:request:*");
+            let mut sub = match inspect_bus.subscribe(
+                pattern,
+                SubscriberIdentity::Internal,
+                BackpressurePolicy::DropOldest,
+                64,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "canvas_video inspect bus subscribe failed");
+                    return;
+                }
+            };
+            while let Some(delivery) = sub.rx.recv().await {
+                let broadcast = serde_json::json!({
+                    "type": "canvas_video_inspect_request",
+                    "payload": delivery.payload,
+                });
+                let env = DaemonEnvelope::broadcast(Channel::Chat, broadcast);
+                let _ = inspect_tx.send((b"*".to_vec(), env)).await;
+            }
+        });
+    }
+
     // Spawn message processing loop
     let process_router = router.clone();
     let process_response_tx = response_tx.clone();
@@ -2795,6 +2830,30 @@ pub async fn start_server(
                     .on_lint_result(&correlator, report)
                     .await;
                 // No response — fire-and-forget.
+                continue;
+            }
+
+            // Handle canvas_video_inspect_result — extension's reply to a
+            // broadcast inspect request. Mirrors the lint path.
+            if msg_type == "canvas_video_inspect_result" {
+                info!("Processing canvas_video_inspect_result message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let correlator = payload
+                    .get("job_correlator")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let report: nevoflux_protocol::canvas_video::InspectReport = payload
+                    .get("report")
+                    .and_then(|r| serde_json::from_value(r.clone()).ok())
+                    .unwrap_or_default();
+                process_canvas_video_service
+                    .on_inspect_result(&correlator, report)
+                    .await;
                 continue;
             }
 

@@ -20,8 +20,8 @@ use crate::canvas_video::{
 use crate::error::{DaemonError, Result};
 use crate::event_bus::{BusEvent, EventBus, PublisherIdentity};
 use nevoflux_protocol::canvas_video::{
-    CreateCompositionRequest, CreateCompositionResponse, LintReport, RenderFrameChunk,
-    RenderStartRequest, RenderStartResponse,
+    CreateCompositionRequest, CreateCompositionResponse, InspectReport, LintReport,
+    RenderFrameChunk, RenderStartRequest, RenderStartResponse,
 };
 use nevoflux_skills::SkillRegistry;
 use nevoflux_storage::Storage;
@@ -65,6 +65,10 @@ pub struct CanvasVideoService {
     /// Pending lint correlators: correlator -> oneshot sender for the lint result.
     /// Inserted by `lint_composition`, removed by `on_lint_result` or on timeout.
     lint_correlators: Mutex<HashMap<String, oneshot::Sender<LintReport>>>,
+
+    /// Pending inspect correlators — same pattern as `lint_correlators`.
+    /// Inserted by `inspect_layout`, removed by `on_inspect_result` or on timeout.
+    inspect_correlators: Mutex<HashMap<String, oneshot::Sender<InspectReport>>>,
 }
 
 /// Pure throttle decision for progress deliveries. Emits when `current`
@@ -106,6 +110,7 @@ impl CanvasVideoService {
             storage: None,
             skills: None,
             lint_correlators: Mutex::new(Default::default()),
+            inspect_correlators: Mutex::new(Default::default()),
         }
     }
 
@@ -120,6 +125,7 @@ impl CanvasVideoService {
             storage: Some(Arc::new(storage)),
             skills: Some(Arc::new(RwLock::new(SkillRegistry::new()))),
             lint_correlators: Mutex::new(Default::default()),
+            inspect_correlators: Mutex::new(Default::default()),
         }
     }
 
@@ -590,6 +596,79 @@ impl CanvasVideoService {
     #[cfg(test)]
     pub async fn peek_pending_lint_correlator(&self) -> Option<String> {
         self.lint_correlators.lock().await.keys().next().cloned()
+    }
+
+    // --- Inspect correlator plumbing ---
+
+    /// Request a layout/contrast audit for the given composition.
+    ///
+    /// Mirrors `lint_composition` exactly: publishes a request event on
+    /// the EventBus, awaits an `InspectReport` from the extension via
+    /// `on_inspect_result`. Times out after 15 seconds (longer than lint
+    /// because the extension has to drive the timeline through every
+    /// sample frame).
+    pub async fn inspect_layout(
+        self: &Arc<Self>,
+        composition_id: &str,
+        frames: u32,
+        at: &[f32],
+    ) -> Result<InspectReport> {
+        let (html, w, h, _d, _fps) = self.load_composition(composition_id).await?;
+        let correlator = uuid::Uuid::new_v4().simple().to_string();
+        let (tx, rx) = oneshot::channel();
+        self.inspect_correlators
+            .lock()
+            .await
+            .insert(correlator.clone(), tx);
+
+        if let Some(bus) = &self.event_bus {
+            let topic = format!("jobs:inspect:request:{correlator}");
+            let payload = serde_json::json!({
+                "event": "inspect_request",
+                "job_correlator": correlator,
+                "composition_id": composition_id,
+                "composition_html": html,
+                "stage_w": w,
+                "stage_h": h,
+                "frames": frames,
+                "at": at,
+            });
+            let event = BusEvent::ephemeral(topic, payload, PublisherIdentity::Internal);
+            let _ = bus.publish(event).await;
+        }
+
+        match tokio::time::timeout(std::time::Duration::from_secs(15), rx).await {
+            Ok(Ok(report)) => Ok(report),
+            Ok(Err(_)) => {
+                self.inspect_correlators.lock().await.remove(&correlator);
+                Err(DaemonError::InternalError(
+                    "inspect oneshot dropped before resolve".into(),
+                ))
+            }
+            Err(_) => {
+                self.inspect_correlators.lock().await.remove(&correlator);
+                Err(DaemonError::InternalError(format!(
+                    "inspect timeout for composition {composition_id}"
+                )))
+            }
+        }
+    }
+
+    /// Called when the extension delivers an inspect result.
+    pub async fn on_inspect_result(&self, correlator: &str, report: InspectReport) {
+        if let Some(tx) = self.inspect_correlators.lock().await.remove(correlator) {
+            let _ = tx.send(report);
+        } else {
+            tracing::warn!(
+                correlator,
+                "inspect result for unknown correlator — already timed out or duplicate"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn peek_pending_inspect_correlator(&self) -> Option<String> {
+        self.inspect_correlators.lock().await.keys().next().cloned()
     }
 
     // --- EventBus emitters ---

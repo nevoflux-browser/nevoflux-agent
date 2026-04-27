@@ -323,7 +323,8 @@ pub async fn execute_mcp_tool(
         | "canvas_lint_composition"
         | "canvas_apply_design_md"
         | "canvas_create_from_visual_identity"
-        | "canvas_attach_asset" => {
+        | "canvas_attach_asset"
+        | "canvas_inspect_layout" => {
             return execute_canvas_video_tool(name, arguments, services).await;
         }
         _ => {}
@@ -1221,6 +1222,19 @@ async fn execute_canvas_video_tool(
             };
             serde_json::to_string(&resp)
                 .map_err(|e| format!("serialize canvas_attach_asset response: {}", e))
+        }
+        "canvas_inspect_layout" => {
+            let req: nevoflux_protocol::canvas_video::InspectLayoutRequest =
+                serde_json::from_value(arguments.clone())
+                    .map_err(|e| format!("invalid canvas_inspect_layout args: {}", e))?;
+            let frames = req.frames.unwrap_or(8);
+            let report = svc
+                .inspect_layout(&req.composition_id, frames, &req.at)
+                .await
+                .map_err(|e| e.to_string())?;
+            let resp = nevoflux_protocol::canvas_video::InspectLayoutResponse { report };
+            serde_json::to_string(&resp)
+                .map_err(|e| format!("serialize canvas_inspect_layout response: {}", e))
         }
         "canvas_create_from_visual_identity" => {
             let mut req: nevoflux_protocol::canvas_video::CreateFromVisualIdentityRequest =
