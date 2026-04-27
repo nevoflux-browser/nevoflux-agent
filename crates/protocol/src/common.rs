@@ -1060,4 +1060,3 @@ mod tool_result_tests {
         assert!(matches!(status, BashStatus::Timeout));
     }
 }
-

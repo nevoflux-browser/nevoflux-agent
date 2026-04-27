@@ -27,18 +27,16 @@ pub async fn create(
     // Failure is non-fatal: invalid DESIGN.md falls back to the un-injected
     // HTML so a broken brand layer doesn't block composition creation; the
     // template's own var(--x, fallback) values still produce a usable canvas.
-    let index_html = match crate::canvas_video::design::inject_design_tokens(
-        &index_html_raw,
-        &design_md,
-    ) {
-        Ok(html) => html,
-        Err(e) => {
-            tracing::warn!(
+    let index_html =
+        match crate::canvas_video::design::inject_design_tokens(&index_html_raw, &design_md) {
+            Ok(html) => html,
+            Err(e) => {
+                tracing::warn!(
                 "canvas_video::create: design token injection failed ({e}); using raw template HTML"
             );
-            index_html_raw
-        }
-    };
+                index_html_raw
+            }
+        };
     let meta = build_meta(&req);
     let meta_json = serde_json::to_string_pretty(&meta)
         .map_err(|e| DaemonError::InternalError(format!("meta serialize: {e}")))?;

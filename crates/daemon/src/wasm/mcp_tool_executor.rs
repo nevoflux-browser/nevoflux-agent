@@ -322,7 +322,8 @@ pub async fn execute_mcp_tool(
         | "canvas_render_video"
         | "canvas_lint_composition"
         | "canvas_apply_design_md"
-        | "canvas_create_from_visual_identity" => {
+        | "canvas_create_from_visual_identity"
+        | "canvas_attach_asset" => {
             return execute_canvas_video_tool(name, arguments, services).await;
         }
         _ => {}
@@ -1102,8 +1103,9 @@ async fn execute_canvas_video_tool(
             // executor (canvas_video::tool::CanvasCreateCompositionTool).
             // Without this, the MCP/ACP path silently accepted hallucinated
             // html submissions and meta.origin.template ended up null.
-            let mut req = crate::canvas_video::tool::parse_create_composition_args_strict(arguments)
-                .map_err(|e| e.to_string())?;
+            let mut req =
+                crate::canvas_video::tool::parse_create_composition_args_strict(arguments)
+                    .map_err(|e| e.to_string())?;
             // Inject the current session_id from HostServices when the LLM
             // didn't supply one (the LLM tool schema doesn't expose
             // session_id, so req.session_id is always None here). Without
@@ -1194,6 +1196,31 @@ async fn execute_canvas_video_tool(
             };
             serde_json::to_string(&resp)
                 .map_err(|e| format!("serialize canvas_apply_design_md response: {}", e))
+        }
+        "canvas_attach_asset" => {
+            let req: nevoflux_protocol::canvas_video::AttachAssetRequest =
+                serde_json::from_value(arguments.clone())
+                    .map_err(|e| format!("invalid canvas_attach_asset args: {}", e))?;
+            let resolved = resolve_attach_asset_payload(&req)
+                .await
+                .map_err(|e| format!("canvas_attach_asset: {e}"))?;
+            let path = svc
+                .attach_asset(
+                    &req.composition_id,
+                    &resolved.name,
+                    &resolved.mime_type,
+                    &resolved.payload_b64,
+                    resolved.size_bytes,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let resp = nevoflux_protocol::canvas_video::AttachAssetResponse {
+                path,
+                mime_type: resolved.mime_type,
+                size_bytes: resolved.size_bytes,
+            };
+            serde_json::to_string(&resp)
+                .map_err(|e| format!("serialize canvas_attach_asset response: {}", e))
         }
         "canvas_create_from_visual_identity" => {
             let mut req: nevoflux_protocol::canvas_video::CreateFromVisualIdentityRequest =
@@ -1517,9 +1544,8 @@ async fn execute_tts_synthesize_api(
     arguments: &serde_json::Value,
     services: &HostServices,
 ) -> Result<String, String> {
-    let req: nevoflux_protocol::tts::SynthesizeRequest =
-        serde_json::from_value(arguments.clone())
-            .map_err(|e| format!("invalid tts_synthesize_api args: {e}"))?;
+    let req: nevoflux_protocol::tts::SynthesizeRequest = serde_json::from_value(arguments.clone())
+        .map_err(|e| format!("invalid tts_synthesize_api args: {e}"))?;
     let cfg = services
         .tts_config
         .as_ref()
@@ -1557,16 +1583,11 @@ async fn execute_tts_synthesize_api(
                 "tts_synthesize_api: composition_id {} not found; returning audio only",
                 comp_id
             ),
-            Err(e) => tracing::warn!(
-                "tts_synthesize_api: artifact get for {}: {}",
-                comp_id,
-                e
-            ),
+            Err(e) => tracing::warn!("tts_synthesize_api: artifact get for {}: {}", comp_id, e),
         }
     }
 
-    serde_json::to_string(&resp)
-        .map_err(|e| format!("serialize tts_synthesize_api response: {e}"))
+    serde_json::to_string(&resp).map_err(|e| format!("serialize tts_synthesize_api response: {e}"))
 }
 
 /// MCP/ACP dispatch arm for `tts_synthesize_local` (P5b-2). Reads
@@ -1576,9 +1597,8 @@ async fn execute_tts_synthesize_local(
     arguments: &serde_json::Value,
     services: &HostServices,
 ) -> Result<String, String> {
-    let req: nevoflux_protocol::tts::SynthesizeRequest =
-        serde_json::from_value(arguments.clone())
-            .map_err(|e| format!("invalid tts_synthesize_local args: {e}"))?;
+    let req: nevoflux_protocol::tts::SynthesizeRequest = serde_json::from_value(arguments.clone())
+        .map_err(|e| format!("invalid tts_synthesize_local args: {e}"))?;
     let cfg = services
         .tts_config
         .as_ref()
@@ -1597,9 +1617,8 @@ async fn execute_tts_transcribe(
     arguments: &serde_json::Value,
     services: &HostServices,
 ) -> Result<String, String> {
-    let req: nevoflux_protocol::tts::TranscribeRequest =
-        serde_json::from_value(arguments.clone())
-            .map_err(|e| format!("invalid tts_transcribe args: {e}"))?;
+    let req: nevoflux_protocol::tts::TranscribeRequest = serde_json::from_value(arguments.clone())
+        .map_err(|e| format!("invalid tts_transcribe args: {e}"))?;
     let cfg = services
         .tts_config
         .as_ref()
@@ -1608,8 +1627,7 @@ async fn execute_tts_transcribe(
     let resp = crate::tts::transcribe(&cfg, &req)
         .await
         .map_err(|e| e.to_string())?;
-    serde_json::to_string(&resp)
-        .map_err(|e| format!("serialize tts_transcribe response: {e}"))
+    serde_json::to_string(&resp).map_err(|e| format!("serialize tts_transcribe response: {e}"))
 }
 
 // ============================================================================
@@ -1854,6 +1872,209 @@ async fn execute_subagent_tool(
         }
         _ => Err(format!("unknown subagent tool: {name}")),
     }
+}
+
+// ============================================================================
+// canvas_attach_asset payload resolution
+// ============================================================================
+
+/// Resolved asset payload ready for `CanvasVideoService::attach_asset`.
+pub struct ResolvedAsset {
+    pub name: String,
+    pub mime_type: String,
+    pub payload_b64: String,
+    pub size_bytes: u64,
+}
+
+/// Public alias of `resolve_attach_asset_payload` for the direct-API
+/// path in `agent_host.rs`. The MCP/ACP path calls the private name
+/// directly.
+pub async fn resolve_attach_asset_payload_pub(
+    req: &nevoflux_protocol::canvas_video::AttachAssetRequest,
+) -> Result<ResolvedAsset, String> {
+    resolve_attach_asset_payload(req).await
+}
+
+/// Convert a `canvas_attach_asset` request's source variant (one of
+/// `data_b64` / `url` / `from_tab`) into a normalized
+/// `(name, mime_type, base64-payload, size_bytes)` tuple.
+async fn resolve_attach_asset_payload(
+    req: &nevoflux_protocol::canvas_video::AttachAssetRequest,
+) -> Result<ResolvedAsset, String> {
+    let chosen: i32 = [
+        req.data_b64.is_some(),
+        req.url.is_some(),
+        req.from_tab.is_some(),
+    ]
+    .iter()
+    .filter(|x| **x)
+    .count() as i32;
+    if chosen == 0 {
+        return Err("must provide one of data_b64 / url / from_tab".into());
+    }
+    if chosen > 1 {
+        return Err("only one of data_b64 / url / from_tab may be set (mutually exclusive)".into());
+    }
+
+    if let Some(b64) = req.data_b64.as_deref() {
+        let bytes =
+            decode_base64_strict(b64).map_err(|e| format!("data_b64 not valid base64: {e}"))?;
+        let mime = req
+            .mime_type
+            .clone()
+            .or_else(|| req.name.as_deref().map(infer_mime_from_name))
+            .unwrap_or_else(|| "application/octet-stream".into());
+        let name = pick_name(req.name.as_deref(), &mime, "asset");
+        return Ok(ResolvedAsset {
+            name,
+            mime_type: mime,
+            payload_b64: b64.to_string(),
+            size_bytes: bytes.len() as u64,
+        });
+    }
+
+    if let Some(url) = req.url.as_deref() {
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err("url must be http:// or https:// (file:/data: rejected)".into());
+        }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("reqwest client init: {e}"))?;
+        let resp = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("fetch failed: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("fetch returned {}: {url}", resp.status()));
+        }
+        let mime = req
+            .mime_type
+            .clone()
+            .or_else(|| {
+                resp.headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
+            })
+            .or_else(|| Some(infer_mime_from_url(url)))
+            .unwrap_or_else(|| "application/octet-stream".into());
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("read body: {e}"))?
+            .to_vec();
+        let size = bytes.len() as u64;
+        let payload_b64 = encode_base64(&bytes);
+        let name_from_url = url_basename(url);
+        let name = pick_name(
+            req.name.as_deref().or(name_from_url.as_deref()),
+            &mime,
+            "asset",
+        );
+        return Ok(ResolvedAsset {
+            name,
+            mime_type: mime,
+            payload_b64,
+            size_bytes: size,
+        });
+    }
+
+    if req.from_tab.is_some() {
+        return Err(
+            "from_tab is not yet wired (browser-tool screenshot bridge required); use data_b64 with the screenshot bytes instead"
+                .into(),
+        );
+    }
+
+    Err("no source supplied".into())
+}
+
+fn pick_name(provided: Option<&str>, mime: &str, fallback_stem: &str) -> String {
+    if let Some(n) = provided {
+        if !n.trim().is_empty() {
+            return n.to_string();
+        }
+    }
+    let ext = match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/svg+xml" => "svg",
+        "image/avif" => "avif",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "audio/mpeg" => "mp3",
+        "audio/wav" => "wav",
+        "audio/ogg" => "ogg",
+        "font/woff2" => "woff2",
+        "font/woff" => "woff",
+        "font/ttf" => "ttf",
+        _ => "bin",
+    };
+    format!("{fallback_stem}.{ext}")
+}
+
+fn url_basename(url: &str) -> Option<String> {
+    let stripped = url
+        .split('?')
+        .next()
+        .unwrap_or(url)
+        .split('#')
+        .next()
+        .unwrap_or(url);
+    stripped
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty() && s.contains('.'))
+        .map(|s| s.to_string())
+}
+
+fn infer_mime_from_name(name: &str) -> String {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+fn infer_mime_from_url(url: &str) -> String {
+    url_basename(url)
+        .map(|n| infer_mime_from_name(&n))
+        .unwrap_or_else(|| "application/octet-stream".into())
+}
+
+/// Validate base64 input and return decoded bytes (we don't actually
+/// keep the bytes; we just need a length + format check). Standard
+/// alphabet only; rejects whitespace and url-safe variants.
+fn decode_base64_strict(s: &str) -> Result<Vec<u8>, String> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    STANDARD.decode(s.as_bytes()).map_err(|e| e.to_string())
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    STANDARD.encode(bytes)
 }
 
 // ============================================================================

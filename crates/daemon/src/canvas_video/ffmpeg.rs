@@ -101,7 +101,8 @@ pub fn image2pipe_cmd(
             // files compatible with all major players.
             "-c:a", "aac", "-b:a", "192k",
             // Map streams explicitly: video from input 0, audio from input 1.
-            "-map", "0:v", "-map", "1:a",
+            "-map", "0:v", "-map",
+            "1:a",
             // Match output duration to the video stream so a longer audio
             // doesn't extend the file. (`-shortest` would TRUNCATE to the
             // shorter; we want the full video with audio playing to its

@@ -79,6 +79,22 @@ pub(crate) fn should_emit_progress(current: u32, total: u32) -> bool {
     current % throttle == 0 || current == total
 }
 
+/// Sanitize an asset filename: strip path traversal, collapse to a single
+/// `<basename>.<ext>` form. Drops `..`, leading `/`, and disallowed chars.
+/// Empty / weird input falls back to `asset.bin`.
+fn sanitize_asset_name(name: &str) -> String {
+    // Take the basename only (no directory traversal allowed).
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(*c, '.' | '-' | '_'))
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        return "asset.bin".into();
+    }
+    cleaned
+}
+
 impl CanvasVideoService {
     pub fn new() -> Self {
         Self {
@@ -207,17 +223,16 @@ impl CanvasVideoService {
     pub async fn apply_design_md(&self, composition_id: &str) -> Result<()> {
         use nevoflux_storage::repositories::ArtifactRepository;
 
-        let storage = self.storage.as_ref().ok_or_else(|| {
-            DaemonError::InternalError("canvas_video: storage not wired".into())
-        })?;
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| DaemonError::InternalError("canvas_video: storage not wired".into()))?;
         let repo = ArtifactRepository::new(storage.database());
         let record = repo
             .get(composition_id)
             .map_err(|e| DaemonError::InternalError(format!("{e}")))?
             .ok_or_else(|| {
-                DaemonError::InvalidRequest(format!(
-                    "composition not found: {composition_id}"
-                ))
+                DaemonError::InvalidRequest(format!("composition not found: {composition_id}"))
             })?;
         let mut files = record.files.ok_or_else(|| {
             DaemonError::InvalidRequest(format!(
@@ -225,14 +240,10 @@ impl CanvasVideoService {
             ))
         })?;
         let design_md = files.get("DESIGN.md").cloned().ok_or_else(|| {
-            DaemonError::InvalidRequest(format!(
-                "composition has no DESIGN.md: {composition_id}"
-            ))
+            DaemonError::InvalidRequest(format!("composition has no DESIGN.md: {composition_id}"))
         })?;
         let index_html = files.get("index.html").cloned().ok_or_else(|| {
-            DaemonError::InvalidRequest(format!(
-                "composition has no index.html: {composition_id}"
-            ))
+            DaemonError::InvalidRequest(format!("composition has no index.html: {composition_id}"))
         })?;
         // Diagnostic: log what apply_design_md actually read from SQLite so
         // we can tell whether ContentStore mirror writes are visible here.
@@ -254,6 +265,52 @@ impl CanvasVideoService {
         repo.update_files(composition_id, &files, &updated_html)
             .map_err(|e| DaemonError::InternalError(format!("{e}")))?;
         Ok(())
+    }
+
+    /// Write an asset blob into the composition's `files["assets/<name>"]`.
+    /// Returns the path the agent should reference in HTML, plus the
+    /// resolved mime type and original byte length. Caller passes the
+    /// payload base64-encoded; we store it as-is (binary types) or
+    /// decoded-then-utf8 (text types) so the render-time inliner does
+    /// the right thing.
+    pub async fn attach_asset(
+        &self,
+        composition_id: &str,
+        name: &str,
+        mime_type: &str,
+        payload_b64: &str,
+        size_bytes: u64,
+    ) -> Result<String> {
+        use nevoflux_storage::repositories::ArtifactRepository;
+
+        let storage = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| DaemonError::InternalError("canvas_video: storage not wired".into()))?;
+        let repo = ArtifactRepository::new(storage.database());
+        let record = repo
+            .get(composition_id)
+            .map_err(|e| DaemonError::InternalError(format!("{e}")))?
+            .ok_or_else(|| {
+                DaemonError::InvalidRequest(format!("composition not found: {composition_id}"))
+            })?;
+        let mut files = record.files.unwrap_or_default();
+        let path = format!("assets/{}", sanitize_asset_name(name));
+        files.insert(path.clone(), payload_b64.to_string());
+        // Preserve content (= files[entry]) — never let the dual-write
+        // invariant drift. We only touched assets/*, so content stays the
+        // same, but update_files needs both args.
+        let entry = record.entry.as_deref().unwrap_or("index.html");
+        let content = files
+            .get(entry)
+            .cloned()
+            .unwrap_or_else(|| record.content.clone());
+        repo.update_files(composition_id, &files, &content)
+            .map_err(|e| DaemonError::InternalError(format!("{e}")))?;
+        tracing::info!(
+            "canvas_attach_asset: id={composition_id} path={path} mime={mime_type} bytes={size_bytes}"
+        );
+        Ok(path)
     }
 
     /// Load a composition from the artifact repository and return (html, w, h, d, fps).
@@ -299,12 +356,19 @@ impl CanvasVideoService {
             })?;
 
         let entry = rec.entry.as_deref().unwrap_or("index.html");
-        let html = files
-            .get(entry)
-            .cloned()
-            .ok_or_else(|| DaemonError::InvalidComposition {
-                reason: format!("entry file missing: {entry}"),
-            })?;
+        let html_raw =
+            files
+                .get(entry)
+                .cloned()
+                .ok_or_else(|| DaemonError::InvalidComposition {
+                    reason: format!("entry file missing: {entry}"),
+                })?;
+        // Inline `assets/*` references as data: URIs so the render tab
+        // (which has no HTTP origin) can actually load `<img>`, `<video>`,
+        // CSS `url(...)`, etc. Stored HTML keeps the relative paths so the
+        // Canvas Editor and `browser_edit_artifact` see the agent-friendly
+        // form; only the render-time view is rewritten.
+        let html = super::asset_inline::inline_assets(&html_raw, files);
         Ok((
             html,
             meta.spec.width,

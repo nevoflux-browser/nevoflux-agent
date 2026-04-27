@@ -20,10 +20,7 @@ pub enum TtsError {
     /// 4005 — network / IO failure.
     Network(String),
     /// 4006 — provider returned non-2xx for non-auth reasons.
-    BackendError {
-        status: u16,
-        body: String,
-    },
+    BackendError { status: u16, body: String },
     /// 4099 — unexpected daemon-side error (deserialization, etc.).
     Internal(String),
 }

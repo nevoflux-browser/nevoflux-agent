@@ -4444,10 +4444,7 @@ impl HostFunctions for DaemonHostFunctions {
         // direct-API dispatch surface (Anthropic / OpenAI / etc. via
         // builtin-wasm Agent::execute_tool) doesn't flow through
         // mcp_tool_executor, so we broadcast from here too.
-        let broadcast_tx = self
-            .services
-            .as_ref()
-            .and_then(|s| s.broadcast_tx.clone());
+        let broadcast_tx = self.services.as_ref().and_then(|s| s.broadcast_tx.clone());
         let resp = tokio::task::block_in_place(|| {
             self.runtime.block_on(async move {
                 let resp = svc.create_composition(req).await?;
@@ -4466,10 +4463,7 @@ impl HostFunctions for DaemonHostFunctions {
             })
         })
         .map_err(|e| {
-            tracing::warn!(
-                "canvas_video_create_composition: service error: {}",
-                e
-            );
+            tracing::warn!("canvas_video_create_composition: service error: {}", e);
             HostError {
                 code: 3,
                 message: format!("canvas_create_composition failed: {}", e),
@@ -4505,10 +4499,7 @@ impl HostFunctions for DaemonHostFunctions {
         // receives canvas_video_open_render_tab, the render iframe never
         // loads, and run_render_loop times out at PAGE_IDLE_TIMEOUT (60s)
         // with frames_written=0.
-        let broadcast_tx = self
-            .services
-            .as_ref()
-            .and_then(|s| s.broadcast_tx.clone());
+        let broadcast_tx = self.services.as_ref().and_then(|s| s.broadcast_tx.clone());
         let resp = tokio::task::block_in_place(|| {
             self.runtime.block_on(async move {
                 let resp = svc.render_start(req).await?;
@@ -4606,10 +4597,59 @@ impl HostFunctions for DaemonHostFunctions {
         })
     }
 
-    fn tts_synthesize_api(
+    fn canvas_video_attach_asset(
         &self,
         request: &serde_json::Value,
     ) -> HostResult<serde_json::Value> {
+        let svc = self
+            .canvas_video_service
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "canvas_video service not wired".into(),
+            })?
+            .clone();
+        let req: nevoflux_protocol::canvas_video::AttachAssetRequest =
+            serde_json::from_value(request.clone()).map_err(|e| HostError {
+                code: 4,
+                message: format!("invalid canvas_attach_asset args: {e}"),
+            })?;
+        let resp = tokio::task::block_in_place(|| {
+            self.runtime.block_on(async move {
+                let resolved =
+                    crate::wasm::mcp_tool_executor::resolve_attach_asset_payload_pub(&req)
+                        .await
+                        .map_err(|e| HostError {
+                            code: 4,
+                            message: format!("canvas_attach_asset: {e}"),
+                        })?;
+                let path = svc
+                    .attach_asset(
+                        &req.composition_id,
+                        &resolved.name,
+                        &resolved.mime_type,
+                        &resolved.payload_b64,
+                        resolved.size_bytes,
+                    )
+                    .await
+                    .map_err(|e| HostError {
+                        code: 3,
+                        message: format!("canvas_attach_asset failed: {e}"),
+                    })?;
+                Ok::<_, HostError>(nevoflux_protocol::canvas_video::AttachAssetResponse {
+                    path,
+                    mime_type: resolved.mime_type,
+                    size_bytes: resolved.size_bytes,
+                })
+            })
+        })?;
+        serde_json::to_value(&resp).map_err(|e| HostError {
+            code: 4,
+            message: format!("serialize canvas_attach_asset response: {e}"),
+        })
+    }
+
+    fn tts_synthesize_api(&self, request: &serde_json::Value) -> HostResult<serde_json::Value> {
         let req: nevoflux_protocol::tts::SynthesizeRequest =
             serde_json::from_value(request.clone()).map_err(|e| HostError {
                 code: 4,
@@ -4620,15 +4660,17 @@ impl HostFunctions for DaemonHostFunctions {
 
         let resp = tokio::task::block_in_place(|| {
             self.runtime.block_on(async move {
-                let mut resp = crate::tts::synthesize_api(&cfg, &req).await.map_err(|e| {
-                    HostError {
-                        code: e.code() as i32,
-                        message: e.to_string(),
-                    }
-                })?;
+                let mut resp =
+                    crate::tts::synthesize_api(&cfg, &req)
+                        .await
+                        .map_err(|e| HostError {
+                            code: e.code() as i32,
+                            message: e.to_string(),
+                        })?;
                 // Optionally write into composition's files map.
                 if let (Some(comp_id), Some(db)) = (req.composition_id.as_deref(), database) {
-                    if let Err(e) = write_audio_to_composition(&db, comp_id, &resp.audio_b64).await {
+                    if let Err(e) = write_audio_to_composition(&db, comp_id, &resp.audio_b64).await
+                    {
                         // Don't fail the whole call if write fails — still
                         // return audio_b64 to the LLM, just record the
                         // problem so the user knows.
@@ -4650,10 +4692,7 @@ impl HostFunctions for DaemonHostFunctions {
         })
     }
 
-    fn tts_synthesize_local(
-        &self,
-        request: &serde_json::Value,
-    ) -> HostResult<serde_json::Value> {
+    fn tts_synthesize_local(&self, request: &serde_json::Value) -> HostResult<serde_json::Value> {
         let req: nevoflux_protocol::tts::SynthesizeRequest =
             serde_json::from_value(request.clone()).map_err(|e| HostError {
                 code: 4,
@@ -4662,10 +4701,12 @@ impl HostFunctions for DaemonHostFunctions {
         let cfg = self.config.tts.kokoro.clone();
         let resp = tokio::task::block_in_place(|| {
             self.runtime.block_on(async move {
-                crate::tts::synthesize_local(&cfg, &req).await.map_err(|e| HostError {
-                    code: e.code() as i32,
-                    message: e.to_string(),
-                })
+                crate::tts::synthesize_local(&cfg, &req)
+                    .await
+                    .map_err(|e| HostError {
+                        code: e.code() as i32,
+                        message: e.to_string(),
+                    })
             })
         })?;
         serde_json::to_value(&resp).map_err(|e| HostError {
@@ -4674,10 +4715,7 @@ impl HostFunctions for DaemonHostFunctions {
         })
     }
 
-    fn tts_transcribe(
-        &self,
-        request: &serde_json::Value,
-    ) -> HostResult<serde_json::Value> {
+    fn tts_transcribe(&self, request: &serde_json::Value) -> HostResult<serde_json::Value> {
         let req: nevoflux_protocol::tts::TranscribeRequest =
             serde_json::from_value(request.clone()).map_err(|e| HostError {
                 code: 4,
@@ -4686,10 +4724,12 @@ impl HostFunctions for DaemonHostFunctions {
         let cfg = self.config.tts.whisper.clone();
         let resp = tokio::task::block_in_place(|| {
             self.runtime.block_on(async move {
-                crate::tts::transcribe(&cfg, &req).await.map_err(|e| HostError {
-                    code: e.code() as i32,
-                    message: e.to_string(),
-                })
+                crate::tts::transcribe(&cfg, &req)
+                    .await
+                    .map_err(|e| HostError {
+                        code: e.code() as i32,
+                        message: e.to_string(),
+                    })
             })
         })?;
         serde_json::to_value(&resp).map_err(|e| HostError {
@@ -4730,10 +4770,7 @@ impl HostFunctions for DaemonHostFunctions {
         // canvas_video_create_composition) so the user immediately sees the
         // composition. Without this, Mode-3 runs silently from the user's
         // POV until lint/render produces a sidebar artifact card.
-        let broadcast_tx = self
-            .services
-            .as_ref()
-            .and_then(|s| s.broadcast_tx.clone());
+        let broadcast_tx = self.services.as_ref().and_then(|s| s.broadcast_tx.clone());
         let resp = tokio::task::block_in_place(|| {
             self.runtime.block_on(async move {
                 let resp = svc.create_from_visual_identity(req).await?;

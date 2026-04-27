@@ -123,8 +123,16 @@ pub fn render_design_tokens_block(fm: &DesignFrontmatter) -> String {
 
     // typography.hero/body.{family,weight} → --typography-{group}-{prop}
     for (group, css_family, css_weight) in [
-        ("hero", "--typography-hero-family", "--typography-hero-weight"),
-        ("body", "--typography-body-family", "--typography-body-weight"),
+        (
+            "hero",
+            "--typography-hero-family",
+            "--typography-hero-weight",
+        ),
+        (
+            "body",
+            "--typography-body-family",
+            "--typography-body-weight",
+        ),
     ] {
         if let Some(typo_val) = fm.typography.get(group) {
             if let Some(map) = typo_val.as_mapping() {
@@ -176,10 +184,7 @@ pub fn render_design_tokens_block(fm: &DesignFrontmatter) -> String {
 
     // aspect.safe_zones.{top,bottom,sides} → --aspect-safe_*
     if let Some(aspect) = &fm.aspect {
-        if let Some(sz) = aspect
-            .get("safe_zones")
-            .and_then(|v| v.as_mapping())
-        {
+        if let Some(sz) = aspect.get("safe_zones").and_then(|v| v.as_mapping()) {
             for (key, css_var) in [
                 ("top", "--aspect-safe_top"),
                 ("bottom", "--aspect-safe_bottom"),
@@ -223,9 +228,8 @@ pub fn inject_design_tokens(html: &str, design_md: &str) -> Result<String> {
         return Ok(html.to_string());
     }
     // Replace existing block if present.
-    let block_re =
-        regex::Regex::new(r#"<style\s+data-nf-design-tokens[^>]*>[\s\S]*?</style>"#)
-            .expect("static regex compiles");
+    let block_re = regex::Regex::new(r#"<style\s+data-nf-design-tokens[^>]*>[\s\S]*?</style>"#)
+        .expect("static regex compiles");
     if block_re.is_match(html) {
         return Ok(block_re.replace(html, block.as_str()).into_owned());
     }
@@ -239,8 +243,7 @@ pub fn inject_design_tokens(html: &str, design_md: &str) -> Result<String> {
     // the actual `<head>` un-injected — observed when `tiktok-hook.html`
     // creates produced an MP4 with only scene-3's bg color (the only one
     // not affected by the broken cascade).
-    let head_re =
-        regex::Regex::new(r#"(?i)<head\b[^>]*>"#).expect("static regex compiles");
+    let head_re = regex::Regex::new(r#"(?i)<head\b[^>]*>"#).expect("static regex compiles");
     if let Some(m) = head_re.find(html) {
         let insert_at = m.end();
         let mut out = String::with_capacity(html.len() + block.len() + 2);
@@ -251,8 +254,7 @@ pub fn inject_design_tokens(html: &str, design_md: &str) -> Result<String> {
         return Ok(out);
     }
     // No <head>: wrap minimally if <html> exists. Same `\b` rationale.
-    let html_re =
-        regex::Regex::new(r#"(?i)<html\b[^>]*>"#).expect("static regex compiles");
+    let html_re = regex::Regex::new(r#"(?i)<html\b[^>]*>"#).expect("static regex compiles");
     if let Some(m) = html_re.find(html) {
         let insert_at = m.end();
         let mut out = String::with_capacity(html.len() + block.len() + 16);
@@ -404,7 +406,8 @@ test
 
     #[test]
     fn inject_handles_head_with_attributes() {
-        let html = "<html><head class=\"x\" data-y=\"z\"><title>T</title></head><body>B</body></html>";
+        let html =
+            "<html><head class=\"x\" data-y=\"z\"><title>T</title></head><body>B</body></html>";
         let out = inject_design_tokens(html, SAMPLE_FM).expect("inject");
         assert!(out.contains("data-nf-design-tokens"));
         // The head opening tag (with attrs) should be preserved.
@@ -433,9 +436,7 @@ test
         let out = inject_design_tokens(html, SAMPLE_FM).expect("inject");
         // Block must land AFTER the real <head>, not inside the comment.
         let block_idx = out.find("data-nf-design-tokens").expect("block present");
-        let real_head_idx = out
-            .find("<head>")
-            .expect("real head still present");
+        let real_head_idx = out.find("<head>").expect("real head still present");
         let comment_close_idx = out.find("-->").expect("comment closer present");
         assert!(
             block_idx > real_head_idx,

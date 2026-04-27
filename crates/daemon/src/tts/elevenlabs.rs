@@ -67,7 +67,9 @@ pub async fn synthesize(
     let body_text = resp.text().await.unwrap_or_default();
     Err(match status_code {
         401 => TtsError::AuthFailed(format!("ElevenLabs 401 — check api_key. Body: {body_text}")),
-        429 => TtsError::RateLimit(format!("ElevenLabs 429 — quota / concurrent limit exceeded. Body: {body_text}")),
+        429 => TtsError::RateLimit(format!(
+            "ElevenLabs 429 — quota / concurrent limit exceeded. Body: {body_text}"
+        )),
         _ => TtsError::BackendError {
             status: status_code,
             body: body_text,

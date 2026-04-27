@@ -327,7 +327,9 @@ async fn test_create_without_design_md_falls_back_silently() {
         duration_sec: 1.0,
         fps: 30,
         bg: None,
-        html: Some("<!doctype html><html><head><title>T</title></head><body>Y</body></html>".into()),
+        html: Some(
+            "<!doctype html><html><head><title>T</title></head><body>Y</body></html>".into(),
+        ),
         template: None,
         design_md: None,
         session_id: None,

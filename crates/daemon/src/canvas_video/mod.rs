@@ -2,6 +2,7 @@
 //!
 //! See `docs/superpowers/specs/2026-04-19-video-skill-design.md`.
 
+pub mod asset_inline;
 pub mod create;
 pub mod design;
 pub mod ffmpeg;

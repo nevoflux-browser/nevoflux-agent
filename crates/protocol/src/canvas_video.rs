@@ -331,6 +331,62 @@ pub struct RevealPathResponse {
     pub error: Option<String>,
 }
 
+/// `canvas_attach_asset` request — write an image / audio / video / font /
+/// arbitrary file into the composition's files map under
+/// `assets/<name>.<ext>`. The render pipeline auto-inlines those references
+/// (see `canvas_video::asset_inline`), so the agent can put `<img
+/// src="assets/hero.png">` in the composition HTML and trust it'll render.
+///
+/// Exactly one of the three source variants must be supplied:
+/// - `data_b64`  — caller provides the file bytes inline (after a fetch /
+///   user upload). Pair with `mime_type` (otherwise inferred from `name`).
+/// - `url`       — daemon fetches the URL with reqwest (10 s timeout) and
+///   stores the bytes. Honors http/https only; file:/data: rejected.
+/// - `from_tab`  — daemon takes a screenshot of the given browser tab and
+///   stores it as PNG. (Browser-tool integration; falls back to error if
+///   the daemon isn't bridged to a tab capture surface.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachAssetRequest {
+    /// Composition artifact id.
+    pub composition_id: String,
+    /// Optional explicit name with extension (e.g. `hero.png`). If omitted,
+    /// derived from URL basename or content-type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Optional explicit MIME type. Useful when `data_b64` is supplied for
+    /// a file the agent doesn't have an extension for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Inline base64 payload. Mutually exclusive with `url` / `from_tab`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_b64: Option<String>,
+    /// Public URL the daemon fetches. Mutually exclusive with the others.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Tab id to screenshot. Mutually exclusive with the others.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_tab: Option<i64>,
+    /// Optional advisory role hint. Currently informational only — no
+    /// behavioural difference; future versions may use it to route the
+    /// asset into a specific scene slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+/// `canvas_attach_asset` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachAssetResponse {
+    /// Path inside the composition's files map (e.g. `assets/hero.png`).
+    /// The agent should reference this path directly in the composition
+    /// HTML; the renderer will inline it as a `data:` URI at render time.
+    pub path: String,
+    /// MIME type that was stored alongside the asset.
+    pub mime_type: String,
+    /// Original byte length (NOT the base64-encoded length).
+    pub size_bytes: u64,
+}
+
 #[cfg(test)]
 mod meta_tests {
     use super::*;

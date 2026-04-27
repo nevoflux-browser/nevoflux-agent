@@ -605,13 +605,25 @@ pub trait HostFunctions {
     /// hosts without TTS configured return ConfigMissing. Default impl
     /// returns Unsupported so non-daemon hosts (e.g. test harnesses) don't
     /// need stub code.
-    fn tts_synthesize_api(
+    fn tts_synthesize_api(&self, _request: &serde_json::Value) -> HostResult<serde_json::Value> {
+        Err(HostError {
+            code: 5,
+            message: "tts_synthesize_api not supported by this host".into(),
+        })
+    }
+
+    /// Attach an asset (image / audio / video / font) to a composition's
+    /// `files["assets/<name>"]`. Backed by `canvas_attach_asset`. Daemon
+    /// resolves the source variant (data_b64 / url / from_tab), stores
+    /// the bytes, and returns the path the agent should reference in HTML.
+    /// Default impl returns Unsupported.
+    fn canvas_video_attach_asset(
         &self,
         _request: &serde_json::Value,
     ) -> HostResult<serde_json::Value> {
         Err(HostError {
             code: 5,
-            message: "tts_synthesize_api not supported by this host".into(),
+            message: "canvas_video_attach_asset not supported by this host".into(),
         })
     }
 
@@ -619,10 +631,7 @@ pub trait HostFunctions {
     /// Daemon-side reads `[tts.kokoro] model_path / voices_path` and
     /// returns ConfigMissing until the model files exist. Hosts without
     /// TTS support inherit the default Unsupported.
-    fn tts_synthesize_local(
-        &self,
-        _request: &serde_json::Value,
-    ) -> HostResult<serde_json::Value> {
+    fn tts_synthesize_local(&self, _request: &serde_json::Value) -> HostResult<serde_json::Value> {
         Err(HostError {
             code: 5,
             message: "tts_synthesize_local not supported by this host".into(),
@@ -632,10 +641,7 @@ pub trait HostFunctions {
     /// Transcribe audio via local Whisper ONNX (P5b-3). Backs auto-
     /// caption generation in P5c. Daemon reads `[tts.whisper] model_path`;
     /// returns ConfigMissing until configured.
-    fn tts_transcribe(
-        &self,
-        _request: &serde_json::Value,
-    ) -> HostResult<serde_json::Value> {
+    fn tts_transcribe(&self, _request: &serde_json::Value) -> HostResult<serde_json::Value> {
         Err(HostError {
             code: 5,
             message: "tts_transcribe not supported by this host".into(),

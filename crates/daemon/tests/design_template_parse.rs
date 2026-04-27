@@ -118,8 +118,8 @@ fn each_shipped_template_has_a_matching_design_md() {
             "template-specific DESIGN.md missing: {design_path}",
         );
 
-        let text = fs::read_to_string(&design_path)
-            .unwrap_or_else(|e| panic!("read {design_path}: {e}"));
+        let text =
+            fs::read_to_string(&design_path).unwrap_or_else(|e| panic!("read {design_path}: {e}"));
         let front = extract_frontmatter(&text);
         let fm: DesignFrontmatter = serde_yaml::from_str(front)
             .unwrap_or_else(|e| panic!("{tpl}: frontmatter parse error: {e}"));

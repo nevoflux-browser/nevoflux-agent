@@ -47,8 +47,7 @@ pub fn vi_to_design_md(vi: &VisualIdentity) -> String {
 
     // ── Colors ───────────────────────────────────────────────────────────
     let primary = pick_color(vi, ColorRole::Primary).unwrap_or_else(|| "#635bff".to_string());
-    let background =
-        pick_color(vi, ColorRole::Background).unwrap_or_else(|| "#0a0a0f".to_string());
+    let background = pick_color(vi, ColorRole::Background).unwrap_or_else(|| "#0a0a0f".to_string());
     // Foreground — fall back to a high-contrast pair of the chosen
     // background if VI didn't provide one. Default-default ("#f5f5f7")
     // works against dark bg but fails against light bg, so derive based
@@ -68,10 +67,7 @@ pub fn vi_to_design_md(vi: &VisualIdentity) -> String {
         .collect();
     let mut accents: Vec<String> = raw_accents
         .into_iter()
-        .filter(|hex| {
-            !rgb_too_close(hex, &background, 60)
-                && !rgb_too_close(hex, &primary, 30)
-        })
+        .filter(|hex| !rgb_too_close(hex, &background, 60) && !rgb_too_close(hex, &primary, 30))
         .collect();
     // accent: first usable accent; else derive a complementary from primary.
     let accent = accents
@@ -114,7 +110,12 @@ pub fn vi_to_design_md(vi: &VisualIdentity) -> String {
     let mut out = String::with_capacity(1024);
     out.push_str("---\n");
     out.push_str(&format!("name: {}\n", yaml_str(name)));
-    if let Some(tag) = vi.tagline.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(tag) = vi
+        .tagline
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         out.push_str(&format!("description: {}\n", yaml_str(tag)));
     }
     out.push_str(&format!("source_url: {}\n", yaml_str(&vi.url)));
@@ -131,16 +132,10 @@ pub fn vi_to_design_md(vi: &VisualIdentity) -> String {
     out.push_str("typography:\n");
     out.push_str("  hero:\n");
     out.push_str(&format!("    family: {}\n", yaml_str(&hero.family)));
-    out.push_str(&format!(
-        "    weight: {}\n",
-        hero.weight.unwrap_or(700)
-    ));
+    out.push_str(&format!("    weight: {}\n", hero.weight.unwrap_or(700)));
     out.push_str("  body:\n");
     out.push_str(&format!("    family: {}\n", yaml_str(&body.family)));
-    out.push_str(&format!(
-        "    weight: {}\n",
-        body.weight.unwrap_or(400)
-    ));
+    out.push_str(&format!("    weight: {}\n", body.weight.unwrap_or(400)));
     out.push('\n');
 
     // Spacing + motion + rounded — always defaults. Templates reference
@@ -581,7 +576,10 @@ mod tests {
         let secondary = extract("secondary");
         assert!(accent != "#ffffff", "accent must not equal background");
         assert!(accent != "#626d69", "accent must not equal primary");
-        assert!(secondary != "#ffffff", "secondary must not equal background");
+        assert!(
+            secondary != "#ffffff",
+            "secondary must not equal background"
+        );
         assert!(secondary != accent, "secondary must not equal accent");
     }
 

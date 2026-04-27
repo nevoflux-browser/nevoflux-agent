@@ -40,9 +40,7 @@ impl CanvasCreateCompositionTool {
 /// single funnel point that all three dispatch surfaces (this tool,
 /// mcp_tool_executor, agent_host) route through, so future cross-cutting
 /// validation has one place to live.
-pub fn parse_create_composition_args_strict(
-    arguments: &Value,
-) -> Result<CreateCompositionRequest> {
+pub fn parse_create_composition_args_strict(arguments: &Value) -> Result<CreateCompositionRequest> {
     serde_json::from_value(arguments.clone())
         .map_err(|e| DaemonError::InvalidRequest(format!("canvas_create_composition: {}", e)))
 }
@@ -253,7 +251,10 @@ mod tests {
             "html": "<html><body>custom</body></html>"
         });
         let req = parse_create_composition_args_strict(&args).expect("html-only payload");
-        assert_eq!(req.html.as_deref(), Some("<html><body>custom</body></html>"));
+        assert_eq!(
+            req.html.as_deref(),
+            Some("<html><body>custom</body></html>")
+        );
         assert!(req.template.is_none());
     }
 
@@ -287,7 +288,10 @@ mod tests {
         });
         let req = parse_create_composition_args_strict(&args).expect("both-fields payload");
         assert_eq!(req.template.as_deref(), Some("tiktok-hook"));
-        assert_eq!(req.html.as_deref(), Some("<html><body>override</body></html>"));
+        assert_eq!(
+            req.html.as_deref(),
+            Some("<html><body>override</body></html>")
+        );
     }
 
     #[test]

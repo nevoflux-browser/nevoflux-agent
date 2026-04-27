@@ -2281,6 +2281,11 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 serde_json::to_string(&resp)
                     .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
             }
+            "canvas_attach_asset" => {
+                let resp = self.host.canvas_video_attach_asset(&tool_call.arguments)?;
+                serde_json::to_string(&resp)
+                    .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
+            }
             "tts_synthesize_api" => {
                 let resp = self.host.tts_synthesize_api(&tool_call.arguments)?;
                 serde_json::to_string(&resp)
@@ -2379,6 +2384,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 | "canvas_apply_design_md"
                 | "canvas_extract_visual_identity"
                 | "canvas_create_from_visual_identity"
+                | "canvas_attach_asset"
                 | "tts_synthesize_api"
                 | "tts_synthesize_local"
                 | "tts_transcribe"
@@ -3165,6 +3171,39 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     "type": "object",
                     "properties": {
                         "composition_id": { "type": "string" }
+                    },
+                    "required": ["composition_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "canvas_attach_asset".into(),
+                description: "Attach an image / video / audio / font / arbitrary file to a \
+                              composition under `assets/<name>.<ext>`. The renderer auto-inlines \
+                              every `<img src=\"assets/X\">`, `<video src=\"assets/X\">`, CSS \
+                              `url(assets/X)`, etc. into a `data:` URI at render time, so the \
+                              agent can write template-style references and trust they'll show up.\n\n\
+                              **Use this whenever the user provides an image** (drag-drop, URL, \
+                              clipboard, or a tab they want a screenshot of). DO NOT paste \
+                              base64 data URIs directly into composition HTML — that bloats the \
+                              artifact, breaks lint, and can't be re-used across compositions. \
+                              Call canvas_attach_asset, then reference the returned path.\n\n\
+                              Provide EXACTLY ONE source:\n\
+                              - `data_b64`: base64-encoded bytes (after a fetch / clipboard read)\n\
+                              - `url`:      http(s) URL the daemon fetches (10s timeout)\n\
+                              - `from_tab`: not yet wired; use data_b64 with screenshot bytes\n\n\
+                              Returns `{ path, mime_type, size_bytes }`. Use `path` (e.g. \
+                              \"assets/hero.png\") in HTML — NEVER reference the URL or the \
+                              base64 again.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "composition_id": { "type": "string", "description": "Target composition artifact id." },
+                        "name":           { "type": "string", "description": "Optional filename with extension (e.g. 'hero.png'). Inferred from URL/MIME otherwise." },
+                        "mime_type":      { "type": "string", "description": "Optional explicit MIME type. Inferred from name or URL response otherwise." },
+                        "data_b64":       { "type": "string", "description": "Inline base64 payload (mutually exclusive with url / from_tab)." },
+                        "url":            { "type": "string", "description": "Public http(s) URL the daemon fetches (mutually exclusive with the others)." },
+                        "from_tab":       { "type": "integer", "description": "Tab id to screenshot. NOT YET WIRED — error today; use data_b64 instead." },
+                        "role":           { "type": "string", "description": "Optional advisory hint: 'hero' / 'logo' / 'background' / 'decorative'. Informational only today." }
                     },
                     "required": ["composition_id"]
                 }),
