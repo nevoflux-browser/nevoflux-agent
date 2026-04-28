@@ -809,6 +809,7 @@ impl DaemonHostFunctions {
                     tool_calls: None,
                     tool_call_id: None,
                     attachments: Vec::new(),
+                    reasoning: None,
                 }
             })
             .collect();
@@ -892,6 +893,7 @@ impl DaemonHostFunctions {
                     tool_calls,
                     tool_call_id: m.tool_call_id.clone(),
                     attachments,
+                    reasoning: m.reasoning.clone(),
                 }
             })
             .collect();

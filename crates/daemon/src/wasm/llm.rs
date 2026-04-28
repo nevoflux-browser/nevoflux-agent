@@ -130,6 +130,11 @@ pub struct LlmMessage {
     /// Attachments for multimodal messages (images, files).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<LlmAttachment>,
+    /// Reasoning / thinking content produced by the model on this turn
+    /// (assistant role). Required to be echoed back for DeepSeek thinking
+    /// mode when the turn includes tool calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl LlmMessage {
@@ -141,6 +146,7 @@ impl LlmMessage {
             tool_calls: None,
             tool_call_id: None,
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -155,6 +161,7 @@ impl LlmMessage {
             tool_calls: None,
             tool_call_id: None,
             attachments,
+            reasoning: None,
         }
     }
 
@@ -166,6 +173,7 @@ impl LlmMessage {
             tool_calls: None,
             tool_call_id: None,
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -177,6 +185,7 @@ impl LlmMessage {
             tool_calls: Some(tool_calls),
             tool_call_id: None,
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -188,6 +197,7 @@ impl LlmMessage {
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 }
@@ -4291,6 +4301,7 @@ mod tests {
                 mime_type: "image/png".into(),
                 data: "iVBORw0KGgo=".into(),
             }],
+            reasoning: None,
         };
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -4313,6 +4324,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some("call_123".into()),
             attachments: vec![],
+            reasoning: None,
         };
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -4350,5 +4362,21 @@ mod tests {
         let malformed = r#"{"code": "print(\"=" * 80)"}"#;
         let result = parse_tool_arguments_json(malformed);
         assert_eq!(result["code"].as_str().unwrap(), r#"print("=" * 80)"#);
+    }
+
+    #[test]
+    fn llm_message_preserves_reasoning_across_serde() {
+        let json = r#"{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1", "name": "x", "arguments": {}}],
+            "reasoning": "deciding which tool to call"
+        }"#;
+        let msg: LlmMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.role, "assistant");
+        assert_eq!(msg.reasoning.as_deref(), Some("deciding which tool to call"));
+
+        let reserialized = serde_json::to_string(&msg).unwrap();
+        assert!(reserialized.contains("\"reasoning\":\"deciding which tool to call\""));
     }
 }
