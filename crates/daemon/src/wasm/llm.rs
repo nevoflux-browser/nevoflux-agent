@@ -1304,10 +1304,7 @@ where
 /// Build a rig `Message::Assistant` from a host-side `LlmMessage`, including
 /// `AssistantContent::Reasoning` when the provider requires reasoning_content
 /// to be echoed back (DeepSeek thinking-mode).
-fn build_rig_assistant_message(
-    msg: &LlmMessage,
-    provider: ProviderType,
-) -> Message {
+fn build_rig_assistant_message(msg: &LlmMessage, provider: ProviderType) -> Message {
     let mut assistant_contents: Vec<AssistantContent> = Vec::new();
 
     // DeepSeek thinking-mode requires reasoning_content to be echoed back when
@@ -1317,9 +1314,7 @@ fn build_rig_assistant_message(
     if provider == ProviderType::DeepSeek {
         if let Some(reasoning) = msg.reasoning.as_deref() {
             if !reasoning.is_empty() {
-                assistant_contents.push(AssistantContent::Reasoning(
-                    Reasoning::new(reasoning),
-                ));
+                assistant_contents.push(AssistantContent::Reasoning(Reasoning::new(reasoning)));
             }
         }
     }
@@ -4340,7 +4335,10 @@ mod tests {
         }"#;
         let msg: LlmMessage = serde_json::from_str(json).unwrap();
         assert_eq!(msg.role, "assistant");
-        assert_eq!(msg.reasoning.as_deref(), Some("deciding which tool to call"));
+        assert_eq!(
+            msg.reasoning.as_deref(),
+            Some("deciding which tool to call")
+        );
 
         let reserialized = serde_json::to_string(&msg).unwrap();
         assert!(reserialized.contains("\"reasoning\":\"deciding which tool to call\""));
@@ -4377,7 +4375,10 @@ mod tests {
         let has_tool_call = content
             .iter()
             .any(|c| matches!(c, AssistantContent::ToolCall(_)));
-        assert!(has_reasoning, "DeepSeek path must emit AssistantContent::Reasoning");
+        assert!(
+            has_reasoning,
+            "DeepSeek path must emit AssistantContent::Reasoning"
+        );
         assert!(has_tool_call, "tool call must still be present");
     }
 
@@ -4401,6 +4402,9 @@ mod tests {
         let has_reasoning = content
             .iter()
             .any(|c| matches!(c, AssistantContent::Reasoning(_)));
-        assert!(!has_reasoning, "non-DeepSeek must not leak reasoning content");
+        assert!(
+            !has_reasoning,
+            "non-DeepSeek must not leak reasoning content"
+        );
     }
 }
