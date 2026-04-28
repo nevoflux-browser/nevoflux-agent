@@ -1165,9 +1165,10 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
             // Execute tool calls - must include tool_calls in the assistant message
             let tool_calls = response.tool_calls;
-            messages.push(Message::assistant_with_tool_calls(
+            messages.push(Message::assistant_with_tool_calls_and_reasoning(
                 &response.text,
                 tool_calls.clone(),
+                response.reasoning.clone(),
             ));
 
             // Extract keywords from LLM reasoning text once (invariant across tool calls)
