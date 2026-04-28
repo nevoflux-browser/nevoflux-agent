@@ -1291,18 +1291,6 @@ where
         builder = builder.tools(rig_tools);
     }
 
-    // DeepSeek thinking-mode models return `reasoning_content` alongside `content`,
-    // and the API requires reasoning_content to be echoed back on every subsequent
-    // tool-calling turn (400 invalid_request_error otherwise). We don't yet plumb
-    // reasoning_content through LlmMessage / convert_assistant_message, so disable
-    // thinking mode here to keep tool-calling working. Remove once the full
-    // reasoning_content round-trip lands.
-    if provider == ProviderType::DeepSeek {
-        builder = builder.additional_params(serde_json::json!({
-            "thinking": { "type": "disabled" }
-        }));
-    }
-
     // Execute the request
     let completion_response = builder
         .send()
@@ -3442,18 +3430,6 @@ where
     if let Some(tools) = request.tools {
         let rig_tools: Vec<ToolDefinition> = tools.into_iter().map(|t| t.into()).collect();
         builder = builder.tools(rig_tools);
-    }
-
-    // DeepSeek thinking-mode models return `reasoning_content` alongside `content`,
-    // and the API requires reasoning_content to be echoed back on every subsequent
-    // tool-calling turn (400 invalid_request_error otherwise). We don't yet plumb
-    // reasoning_content through LlmMessage / convert_assistant_message, so disable
-    // thinking mode here to keep tool-calling working. Remove once the full
-    // reasoning_content round-trip lands.
-    if provider == ProviderType::DeepSeek {
-        builder = builder.additional_params(serde_json::json!({
-            "thinking": { "type": "disabled" }
-        }));
     }
 
     // Execute streaming request
