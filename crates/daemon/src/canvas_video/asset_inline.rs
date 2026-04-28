@@ -79,7 +79,16 @@ pub fn inline_assets(html: &str, files: &HashMap<String, String>) -> String {
                 }
                 // Look up in the files map.
                 if let Some(payload) = files.get(&asset_key) {
-                    let mime = mime_for_path(&asset_key);
+                    // MIME priority: magic-byte sniff of the actual bytes
+                    // (most reliable; immune to agent mis-extensioning a
+                    // JPEG as `.png`) → fall back to path extension. Text
+                    // payloads (SVG, JSON, CSS) skip the sniff and use the
+                    // extension since they don't have binary magic.
+                    let mime = if is_likely_base64(payload) {
+                        magic_bytes_mime(payload).unwrap_or_else(|| mime_for_path(&asset_key))
+                    } else {
+                        mime_for_path(&asset_key)
+                    };
                     let data_uri = if is_likely_base64(payload) {
                         format!("data:{};base64,{}", mime, payload)
                     } else if is_text_mime(mime) {
@@ -198,6 +207,47 @@ fn mime_for_path(p: &str) -> &'static str {
     }
 }
 
+/// Detect the true MIME type of a base64-encoded binary payload by
+/// decoding the first 16 bytes and matching common magic numbers.
+/// Returns `None` for unknown / text payloads.
+///
+/// This protects the inliner from agent path-extension mistakes — an
+/// agent that saves a JPEG as `foo.png` would otherwise produce
+/// `data:image/png;base64,<jpeg-bytes>` and the browser would refuse it.
+fn magic_bytes_mime(payload_b64: &str) -> Option<&'static str> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let head: String = payload_b64
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .take(24)
+        .collect();
+    if head.len() < 8 {
+        return None;
+    }
+    let padded = match head.len() % 4 {
+        0 => head,
+        n => format!("{head}{}", "=".repeat(4 - n)),
+    };
+    let bytes = STANDARD.decode(padded.as_bytes()).ok()?;
+    if bytes.len() < 4 {
+        return None;
+    }
+    Some(match bytes.as_slice() {
+        [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, ..] => "image/png",
+        [0xFF, 0xD8, 0xFF, ..] => "image/jpeg",
+        [0x47, 0x49, 0x46, 0x38, ..] => "image/gif",
+        [0x52, 0x49, 0x46, 0x46, _, _, _, _, 0x57, 0x45, 0x42, 0x50, ..] => "image/webp",
+        [_, _, _, _, 0x66, 0x74, 0x79, 0x70, ..] => "video/mp4",
+        [0x52, 0x49, 0x46, 0x46, _, _, _, _, 0x57, 0x41, 0x56, 0x45, ..] => "audio/wav",
+        [0x49, 0x44, 0x33, ..] => "audio/mpeg",
+        [0xFF, 0xFB, ..] | [0xFF, 0xF3, ..] | [0xFF, 0xF2, ..] => "audio/mpeg",
+        [0x4F, 0x67, 0x67, 0x53, ..] => "audio/ogg",
+        [b'w', b'O', b'F', b'2', ..] => "font/woff2",
+        [b'w', b'O', b'F', b'F', ..] => "font/woff",
+        _ => return None,
+    })
+}
+
 fn is_likely_base64(s: &str) -> bool {
     // Heuristic: base64 strings contain only A-Z a-z 0-9 + / = and are
     // at least ~16 chars (a real binary asset). Reject anything that has
@@ -282,8 +332,18 @@ mod tests {
 
     #[test]
     fn inlines_video_and_audio() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        // mp4 ftyp box (bytes 4-7 = "ftyp")
+        let mp4_bytes = vec![0u8, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, b'i', b's', b'o', b'm'];
+        // mp3 ID3v2 header
+        let mp3_bytes = vec![0x49u8, 0x44, 0x33, 0x04, 0, 0, 0, 0, 0, 0];
+        let mp4_b64 = STANDARD.encode(&mp4_bytes);
+        let mp3_b64 = STANDARD.encode(&mp3_bytes);
         let html = r#"<video src="assets/clip.mp4"></video><audio src="assets/n.mp3"></audio>"#;
-        let f = files(&[("assets/clip.mp4", PNG_1x1), ("assets/n.mp3", PNG_1x1)]);
+        let f = files(&[
+            ("assets/clip.mp4", &mp4_b64 as &str),
+            ("assets/n.mp3", &mp3_b64 as &str),
+        ]);
         let out = inline_assets(html, &f);
         assert!(out.contains("data:video/mp4;base64,"), "got: {out}");
         assert!(out.contains("data:audio/mpeg;base64,"), "got: {out}");
@@ -347,5 +407,21 @@ mod tests {
         let f = files(&[("assets/y.png", PNG_1x1)]);
         let out = inline_assets(html, &f);
         assert!(out.contains("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn jpeg_saved_as_png_is_inlined_as_jpeg() {
+        // FF D8 FF E0 = JPEG/JFIF — caller mis-extensioned as `.png`.
+        // Without magic-byte sniffing, the inliner would emit
+        // `data:image/png;base64,<jpeg bytes>` and the browser would
+        // refuse to render. With sniffing, we emit `data:image/jpeg;...`.
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let jpeg_bytes = vec![0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01];
+        let b64 = STANDARD.encode(&jpeg_bytes);
+        let html = r#"<img src="assets/foo.png">"#;
+        let f = files(&[("assets/foo.png", &b64 as &str)]);
+        let out = inline_assets(html, &f);
+        assert!(out.contains("data:image/jpeg;base64,"), "got: {out}");
+        assert!(!out.contains("data:image/png;base64,"));
     }
 }

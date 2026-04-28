@@ -3070,27 +3070,43 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 description: "Create a composition artifact for video rendering. Returns \
                               {artifact_id} immediately. Stores a multi-file artifact \
                               (index.html + DESIGN.md + composition.meta.json).\n\n\
+                              **TEMPLATE-VS-CUSTOM DECISION (read first):**\n\
+                              The seven shipped templates are PRE-BAKED scenes for specific \
+                              creative briefs. Pick `template` ONLY when the user's request \
+                              cleanly matches one — e.g. \"3-second TikTok hook\" → \
+                              tiktok-hook; \"product feature reel\" → product-intro-*; \
+                              \"website screenshot promo\" → website-promo-16x9; \"3D logo \
+                              reveal\" → logo-3d-reveal.\n\
+                              When the user says \"make a video of <THIS IMAGE>\" / \"animate \
+                              this picture\" / \"video about X\" without naming a template \
+                              vibe, USE `html` (custom layout) — DO NOT default to a template. \
+                              Templates have their own opinionated copy slots, scene timing \
+                              and decoratives that will fight the user's actual content. \
+                              Defaulting to a template is a known failure mode; the resulting \
+                              video looks like the template, not what the user asked for.\n\n\
+                              **IMAGE INPUT — call canvas_attach_asset FIRST:**\n\
+                              If the user provided an image (uploaded / URL / clipboard) that \
+                              should appear in the video, you MUST call canvas_attach_asset \
+                              BEFORE referencing it. The asset goes into the composition's \
+                              files map at `assets/<name>` and the renderer auto-inlines it. \
+                              Putting `<img src=\"https://...\">` directly in HTML or pasting \
+                              base64 inline both fail.\n\n\
                               THREE LAYERS — separate concerns, edit independently:\n\
-                              1. STRUCTURE (`template`): layout, scene rhythm, GSAP timeline. \
-                                 Pick at create time and don't change. Shipped templates: \
+                              1. STRUCTURE (`template` OR `html`): layout, scene rhythm, GSAP \
+                                 timeline. Pick at create time. Shipped templates: \
                                  website-promo-16x9, product-intro-16x9, product-intro-9x16, \
                                  tiktok-hook, video-overlay, logo-3d-reveal, product-3d-spin. \
-                                 Alternative: `html` for fully custom HTML body when no \
-                                 shipped template fits (when both supplied, `html` wins).\n\
+                                 When both are supplied, `html` wins.\n\
                               2. BRAND (`design_md`): colors, typography, spacing, motion \
                                  easings. Optional YAML+markdown following Google design.md \
                                  spec + NevoFlux video extension. Daemon parses the YAML \
                                  frontmatter and injects a `<style data-nf-design-tokens>` \
-                                 block at the top of the composition's <head>; templates \
-                                 use `var(--color-primary, fallback)` patterns that \
-                                 auto-resolve to the injected values. Omit `design_md` to \
-                                 use the template's own default brand identity (each \
-                                 shipped template has a matching `<name>.design.md`).\n\
+                                 block at the top of the composition's <head>.\n\
                               3. CONTENT (post-create): use browser_edit_artifact on the \
-                                 returned artifact_id to replace text placeholders \
-                                 (`<<HOOK_WORD>>` etc.) and copy. After editing DESIGN.md \
-                                 separately, call canvas_apply_design_md to refresh the \
-                                 brand layer without touching content edits.\n\n\
+                                 returned artifact_id to replace text placeholders, edit \
+                                 copy, and add `<img src=\"assets/...\">` references after \
+                                 canvas_attach_asset. After editing DESIGN.md separately, \
+                                 call canvas_apply_design_md to refresh the brand layer.\n\n\
                               Arguments: title (str); width (int 1-1920); height (int 1-1920); \
                               duration_sec (number 0.5-60); fps (24|25|30); bg (optional CSS \
                               color string); plus exactly one of `template` or `html`; plus \
@@ -3115,15 +3131,22 @@ The following skill instructions MUST be followed exactly. These instructions ta
                                 "logo-3d-reveal",
                                 "product-3d-spin"
                             ],
-                            "description": "Skill template name. Default path — prefer this \
-                                            whenever a shipped template fits the request. \
-                                            Customize content via edit_artifact afterward."
+                            "description": "Skill template name. ONLY pick when the user's \
+                                            request matches a template's specific creative \
+                                            brief (e.g. they say 'TikTok hook' or 'product \
+                                            intro'). For generic / image-driven requests \
+                                            ('make a video of this picture'), use `html` \
+                                            instead — defaulting to a template makes the \
+                                            output look like the template, not the user's \
+                                            content."
                         },
                         "html": {
                             "type": "string",
-                            "description": "Raw composition HTML body. Use ONLY for custom \
-                                            layouts no shipped template covers. Overrides \
-                                            `template` when both are supplied."
+                            "description": "Raw composition HTML body. Use this when the user \
+                                            didn't request a specific template style, when \
+                                            their main content is a user-supplied image / \
+                                            text, or when no shipped template's creative brief \
+                                            fits. Overrides `template` when both are supplied."
                         },
                         "design_md": {
                             "type": "string",

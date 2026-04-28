@@ -83,6 +83,68 @@ pub(crate) fn should_emit_progress(current: u32, total: u32) -> bool {
     current % throttle == 0 || current == total
 }
 
+/// Detect a binary asset's true file extension from the first few bytes
+/// of its base64-encoded payload. Returns `None` if the payload is text /
+/// non-base64 / unrecognized.
+///
+/// We decode just the first ~16 bytes (24 base64 chars) — enough to read
+/// every magic number we care about without paying for a full decode of
+/// a multi-MB asset.
+fn magic_bytes_extension(payload_b64: &str) -> Option<&'static str> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    // Skip leading whitespace; `decode` is strict about that.
+    let head: String = payload_b64
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .take(24)
+        .collect();
+    if head.len() < 8 {
+        return None;
+    }
+    // Pad to a multiple of 4 chars so STANDARD.decode accepts it.
+    let padded = match head.len() % 4 {
+        0 => head,
+        n => format!("{head}{}", "=".repeat(4 - n)),
+    };
+    let bytes = STANDARD.decode(padded.as_bytes()).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some(match bytes.as_slice() {
+        // Image magics
+        [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, ..] => "png",
+        [0xFF, 0xD8, 0xFF, ..] => "jpg",
+        [0x47, 0x49, 0x46, 0x38, ..] => "gif",
+        [0x52, 0x49, 0x46, 0x46, _, _, _, _, 0x57, 0x45, 0x42, 0x50, ..] => "webp",
+        // SVG sometimes lacks XML decl — text-like start; skip detection.
+        // Video magics (mp4 ftyp box)
+        [_, _, _, _, 0x66, 0x74, 0x79, 0x70, ..] => "mp4",
+        // Audio
+        [0x49, 0x44, 0x33, ..] => "mp3", // ID3v2
+        [0xFF, 0xFB, ..] | [0xFF, 0xF3, ..] | [0xFF, 0xF2, ..] => "mp3", // raw MPEG audio
+        [0x52, 0x49, 0x46, 0x46, _, _, _, _, 0x57, 0x41, 0x56, 0x45, ..] => "wav",
+        [0x4F, 0x67, 0x67, 0x53, ..] => "ogg",
+        // Fonts
+        [b'w', b'O', b'F', b'2', ..] => "woff2",
+        [b'w', b'O', b'F', b'F', ..] => "woff",
+        [0x00, 0x01, 0x00, 0x00, ..] => "ttf",
+        [b'O', b'T', b'T', b'O', ..] => "otf",
+        _ => return None,
+    })
+}
+
+/// Replace the extension of `name` with `new_ext`. If `name` has no
+/// extension, append `.<new_ext>`.
+fn override_extension(name: &str, new_ext: &str) -> String {
+    if let Some(dot) = name.rfind('.') {
+        let stem = &name[..dot];
+        format!("{stem}.{new_ext}")
+    } else {
+        format!("{name}.{new_ext}")
+    }
+}
+
 /// Sanitize an asset filename: strip path traversal, collapse to a single
 /// `<basename>.<ext>` form. Drops `..`, leading `/`, and disallowed chars.
 /// Empty / weird input falls back to `asset.bin`.
@@ -301,6 +363,12 @@ impl CanvasVideoService {
                 DaemonError::InvalidRequest(format!("composition not found: {composition_id}"))
             })?;
         let mut files = record.files.unwrap_or_default();
+        // Preserve the caller-supplied path verbatim. Even when the agent
+        // mis-extensions (saves a JPEG as foo.png), we keep the path so
+        // that any `<img src="assets/foo.png">` references the agent
+        // already wrote into HTML still resolve. The asset_inline module
+        // sniffs magic bytes at render time and emits the correct
+        // `data:<true-mime>;base64,...` URI regardless of path extension.
         let path = format!("assets/{}", sanitize_asset_name(name));
         files.insert(path.clone(), payload_b64.to_string());
         // Preserve content (= files[entry]) — never let the dual-write
@@ -887,6 +955,64 @@ mod p3_load_tests {
     // storage API; the corresponding load_rejects_missing_entry_file test
     // was removed when this invariant landed. If you reintroduce the
     // failure mode (e.g. via raw SQL bypass), reinstate the test.
+}
+
+#[cfg(test)]
+mod attach_helper_tests {
+    use super::{magic_bytes_extension, override_extension, sanitize_asset_name};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    #[test]
+    fn jpg_magic_detected() {
+        // FF D8 FF E0 — JPEG/JFIF
+        let bytes = [0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+        let b64 = STANDARD.encode(bytes);
+        assert_eq!(magic_bytes_extension(&b64), Some("jpg"));
+    }
+
+    #[test]
+    fn png_magic_detected() {
+        let bytes = [0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00];
+        let b64 = STANDARD.encode(bytes);
+        assert_eq!(magic_bytes_extension(&b64), Some("png"));
+    }
+
+    #[test]
+    fn gif_magic_detected() {
+        let bytes = [0x47u8, 0x49, 0x46, 0x38, 0x39, b'a'];
+        let b64 = STANDARD.encode(bytes);
+        assert_eq!(magic_bytes_extension(&b64), Some("gif"));
+    }
+
+    #[test]
+    fn unknown_magic_returns_none() {
+        let bytes = b"hello world XYZ";
+        let b64 = STANDARD.encode(bytes);
+        assert_eq!(magic_bytes_extension(&b64), None);
+    }
+
+    #[test]
+    fn empty_returns_none() {
+        assert_eq!(magic_bytes_extension(""), None);
+        assert_eq!(magic_bytes_extension("AA"), None);
+    }
+
+    #[test]
+    fn override_extension_replaces() {
+        assert_eq!(override_extension("foo.png", "jpg"), "foo.jpg");
+        assert_eq!(override_extension("kitty.bin", "png"), "kitty.png");
+    }
+
+    #[test]
+    fn override_extension_appends_when_no_dot() {
+        assert_eq!(override_extension("foo", "jpg"), "foo.jpg");
+    }
+
+    #[test]
+    fn sanitize_drops_traversal() {
+        assert_eq!(sanitize_asset_name("../etc/passwd"), "passwd");
+        assert_eq!(sanitize_asset_name("/abs/path/foo.png"), "foo.png");
+    }
 }
 
 #[cfg(test)]
