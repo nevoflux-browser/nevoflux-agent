@@ -20,7 +20,6 @@
 pub mod bridge;
 pub mod error;
 pub mod executor;
-pub mod file_server;
 pub mod fingerprint;
 pub mod plan;
 pub mod platform_adapter;
@@ -36,7 +35,6 @@ pub use platform_adapter::{
     AdapterRegistry, ComposeConfig, MentionConfig, Recipe, SubmitConfig, UploadConfig,
 };
 pub use strategy::{decide, StrategyInput};
-pub use upload::TokenStore;
 pub use verifier::{verify, VerifyReport};
 
 use nevoflux_protocol::BrowserToolAction;

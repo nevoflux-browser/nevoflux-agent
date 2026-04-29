@@ -618,14 +618,11 @@ async fn execute_browser_upload_orchestrated(
     arguments: &serde_json::Value,
     browser_ctx: &BrowserContext,
 ) -> Result<String, String> {
-    use crate::agent::browser_input::file_server::get_or_start_file_server;
     use crate::agent::browser_input::upload::{
-        check_file_size, check_sensitive_path, detect_mime, validate_workspace_path, TokenEntry,
+        check_file_size, check_sensitive_path, detect_mime, validate_workspace_path,
         DEFAULT_MAX_SIZE, TOKEN_TTL,
     };
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::Instant;
 
     let selector = arguments
         .get("selector")
@@ -665,20 +662,12 @@ async fn execute_browser_upload_orchestrated(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string());
 
-    let (port, store) = get_or_start_file_server()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    store.sweep_expired();
-    let token = store.insert(TokenEntry {
-        path: canonical,
-        mime_type: mime_type.clone(),
-        file_name: file_name.clone(),
-        size,
-        expires_at: Instant::now() + TOKEN_TTL,
-    });
-
-    let file_url = format!("http://127.0.0.1:{}/file/{}", port, token);
+    let asset_server = browser_ctx
+        .asset_server
+        .as_ref()
+        .ok_or_else(|| "browser_upload_file: AssetServer is not running on this daemon".to_string())?;
+    let file_url =
+        asset_server.register_download(canonical, mime_type.clone(), file_name.clone(), TOKEN_TTL);
 
     // Send to Actor via BrowserContext channel.
     let params = serde_json::json!({

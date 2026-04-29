@@ -97,6 +97,12 @@ pub struct BrowserContext {
     pub proxy_id: String,
     /// Client identity bytes for routing responses.
     pub client_identity: Vec<u8>,
+    /// Asset & Stream Plane HTTP server, copied from `HostServices`.
+    /// `Some` once the daemon has bound a port; tools that need to hand
+    /// the browser actor a `http://127.0.0.1:.../file/<token>` URL look
+    /// it up here. `None` means the AssetServer didn't start — caller
+    /// must report a clear error rather than silently fall back.
+    pub asset_server: Option<crate::asset_server::AssetServer>,
 }
 
 /// Browser tool request for the browser sender channel.
@@ -209,6 +215,12 @@ pub struct HostServices {
     /// AgentConfig surface. None means TTS isn't configured; tools
     /// surface a clear ConfigMissing error in that case.
     pub tts_config: Option<crate::config::TtsConfig>,
+
+    /// Asset & Stream Plane HTTP server. Lit when `start_server()`
+    /// successfully boots the AssetServer; `None` means tools that need
+    /// it (e.g. screenshot HTTP fast-path) must fall back to native
+    /// messaging. See `crates/daemon/src/asset_server/`.
+    pub asset_server: Option<crate::asset_server::AssetServer>,
 }
 
 impl HostServices {
@@ -264,6 +276,7 @@ impl HostServices {
             canvas_video_service: None,
             broadcast_tx: None,
             tts_config: None,
+            asset_server: None,
         }
     }
 
@@ -298,6 +311,7 @@ impl HostServices {
             canvas_video_service: None,
             broadcast_tx: None,
             tts_config: None,
+            asset_server: None,
         }
     }
 
@@ -309,6 +323,7 @@ impl HostServices {
             sender,
             proxy_id: self.proxy_id.clone(),
             client_identity: self.client_identity.clone(),
+            asset_server: self.asset_server.clone(),
         })
     }
 
@@ -556,6 +571,14 @@ impl HostServices {
         self
     }
 
+    /// Wire the Asset & Stream Plane HTTP server.  Tools that produce
+    /// large byte streams (screenshots, render frames, generic uploads)
+    /// look this up; absence means fall back to NM-only.
+    pub fn with_asset_server(mut self, asset_server: crate::asset_server::AssetServer) -> Self {
+        self.asset_server = Some(asset_server);
+        self
+    }
+
     /// Wire the daemon's response broadcast channel.
     ///
     /// `broadcast_tx` is the `mpsc::Sender` feeding the daemon writer task;
@@ -669,6 +692,10 @@ impl std::fmt::Debug for HostServices {
             .field(
                 "broadcast_tx",
                 &self.broadcast_tx.as_ref().map(|_| "Some(...)"),
+            )
+            .field(
+                "asset_server",
+                &self.asset_server.as_ref().map(|_| "Some(...)"),
             )
             .finish()
     }

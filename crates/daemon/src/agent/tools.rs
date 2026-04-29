@@ -1264,13 +1264,11 @@ impl BrowserTool {
     }
 
     async fn run_browser_upload_from_args(&self, arguments: &serde_json::Value) -> Result<String> {
-        use crate::agent::browser_input::file_server::get_or_start_file_server;
         use crate::agent::browser_input::upload::{
             check_file_size, check_sensitive_path, detect_mime, validate_workspace_path,
-            TokenEntry, DEFAULT_MAX_SIZE, TOKEN_TTL,
+            DEFAULT_MAX_SIZE, TOKEN_TTL,
         };
         use std::path::PathBuf;
-        use std::time::Instant;
 
         let selector = arguments
             .get("selector")
@@ -1327,22 +1325,19 @@ impl BrowserTool {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "file".to_string());
 
-        // Start (or reuse) the localhost file server.
-        let (port, store) = get_or_start_file_server()
-            .await
-            .map_err(|e| DaemonError::InternalError(e))?;
-
-        // Issue a short-lived token.
-        store.sweep_expired();
-        let token = store.insert(TokenEntry {
-            path: canonical,
-            mime_type: mime_type.clone(),
-            file_name: file_name.clone(),
-            size,
-            expires_at: Instant::now() + TOKEN_TTL,
-        });
-
-        let file_url = format!("http://127.0.0.1:{}/file/{}", port, token);
+        // Hand the canonical path to the AssetServer, which mints a
+        // short-lived URL the browser actor can fetch.  AssetServer is
+        // daemon-lifetime; absence here means the daemon couldn't bind
+        // its loopback HTTP port at boot, in which case browser_upload
+        // is genuinely unavailable.
+        let asset_server =
+            self.ctx.asset_server.as_ref().ok_or_else(|| {
+                DaemonError::InternalError(
+                    "browser_upload_file: AssetServer is not running on this daemon".into(),
+                )
+            })?;
+        let file_url =
+            asset_server.register_download(canonical, mime_type.clone(), file_name.clone(), TOKEN_TTL);
 
         // Build and dispatch the browser request.
         let params = serde_json::json!({
@@ -1618,6 +1613,7 @@ mod tests {
             sender: tx,
             proxy_id: String::new(),
             client_identity: vec![],
+            asset_server: None,
         });
         let names = registry.tool_names();
 
@@ -1674,6 +1670,7 @@ mod tests {
             sender: tx,
             proxy_id: String::new(),
             client_identity: vec![],
+            asset_server: None,
         });
         let stubs = registry.to_python_stubs();
 
@@ -1690,6 +1687,7 @@ mod tests {
             sender: tx,
             proxy_id: String::new(),
             client_identity: vec![],
+            asset_server: None,
         });
         let summary = registry.tool_categories_summary();
 
@@ -1785,6 +1783,7 @@ mod tests {
             sender: tx,
             proxy_id: String::new(),
             client_identity: vec![],
+            asset_server: None,
         });
         let mappings = registry.param_mappings();
 
@@ -2383,5 +2382,149 @@ mod tests {
         // No value/result field, falls through to full JSON
         assert!(result.contains("APjFqb"));
         assert!(result.contains("textarea"));
+    }
+
+    // -----------------------------------------------------------------------
+    // §13.7 — browser_upload_e2e_via_asset_server
+    //
+    // Run the full validation pipeline through `run_browser_upload_from_args`,
+    // catch the URL the BrowserTool is about to dispatch to the actor, and
+    // fetch it via reqwest.  Asserts: HTTP 200, correct bytes, correct
+    // Content-Disposition filename, and single-use semantics (second GET
+    // returns 404).
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn browser_upload_e2e_via_asset_server() {
+        use crate::asset_server::{AssetServer, AssetServerConfig};
+        use nevoflux_protocol::BrowserToolAction;
+        use std::io::Write;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        // Boot the AssetServer (the new infrastructure).
+        let asset_server = AssetServer::start(AssetServerConfig::default())
+            .await
+            .expect("AssetServer should boot in tests");
+
+        // Channel for the browser actor — capture the BrowserRequest, then
+        // reply success so `run_browser_upload_from_args` returns Ok.
+        let (tx, mut rx) =
+            tokio::sync::mpsc::channel::<(BrowserRequest, oneshot::Sender<BrowserResponse>)>(1);
+
+        // Workspace + fixture file.
+        let workspace = TempDir::new().unwrap();
+        let fixture = workspace.path().join("e2e.txt");
+        let payload = b"asset_server upload e2e payload";
+        let mut f = std::fs::File::create(&fixture).unwrap();
+        f.write_all(payload).unwrap();
+        f.flush().unwrap();
+
+        // BrowserTool with the AssetServer threaded into its context.
+        let ctx = Arc::new(BrowserContext {
+            sender: tx,
+            proxy_id: "test-proxy".into(),
+            client_identity: b"test-proxy".to_vec(),
+            asset_server: Some(asset_server.clone()),
+        });
+        let tool = BrowserTool {
+            ctx,
+            action: BrowserToolAction::UploadFile,
+        };
+
+        // Drain the actor channel and reply success — the channel-side
+        // task captures the dispatched URL.
+        let captured: Arc<tokio::sync::Mutex<Option<String>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+        let captured_clone = captured.clone();
+        let actor = tokio::spawn(async move {
+            if let Some((req, reply)) = rx.recv().await {
+                if let Some(url) = req.params.get("fileUrl").and_then(|v| v.as_str()) {
+                    *captured_clone.lock().await = Some(url.to_string());
+                }
+                let _ = reply.send(BrowserResponse {
+                    request_id: req.request_id,
+                    success: true,
+                    result: Some(serde_json::json!({"ok": true})),
+                    error: None,
+                });
+            }
+        });
+
+        let args = serde_json::json!({
+            "selector": "#file-input",
+            "file_path": fixture.to_str().unwrap(),
+            "workspace_dir": workspace.path().to_str().unwrap(),
+        });
+        let out = tool
+            .run_browser_upload_from_args(&args)
+            .await
+            .expect("upload from args should succeed");
+        actor.await.unwrap();
+
+        // The tool returned a JSON success blob.
+        let val: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(val["success"], true);
+        assert_eq!(val["file_name"], "e2e.txt");
+
+        // Pull the dispatched URL and fetch it via the AssetServer.
+        let url = captured.lock().await.clone().expect("dispatched URL");
+        assert!(
+            url.starts_with(&format!(
+                "http://127.0.0.1:{}/file/",
+                asset_server.bound_port()
+            )),
+            "url should target this AssetServer: got {url}"
+        );
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let cd = resp
+            .headers()
+            .get("content-disposition")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        assert_eq!(cd.as_deref(), Some("attachment; filename=\"e2e.txt\""));
+        let body = resp.bytes().await.unwrap();
+        assert_eq!(body.as_ref(), payload);
+
+        // Single-use: the second GET must 404 (token consumed).
+        let resp2 = client.get(&url).send().await.unwrap();
+        assert_eq!(resp2.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn browser_upload_returns_error_when_asset_server_missing() {
+        use nevoflux_protocol::BrowserToolAction;
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let (tx, _rx) =
+            tokio::sync::mpsc::channel::<(BrowserRequest, oneshot::Sender<BrowserResponse>)>(1);
+        let workspace = TempDir::new().unwrap();
+        let fixture = workspace.path().join("a.txt");
+        std::fs::write(&fixture, b"x").unwrap();
+
+        let ctx = Arc::new(BrowserContext {
+            sender: tx,
+            proxy_id: "p".into(),
+            client_identity: b"p".to_vec(),
+            asset_server: None,
+        });
+        let tool = BrowserTool {
+            ctx,
+            action: BrowserToolAction::UploadFile,
+        };
+
+        let args = serde_json::json!({
+            "selector": "#x",
+            "file_path": fixture.to_str().unwrap(),
+            "workspace_dir": workspace.path().to_str().unwrap(),
+        });
+        let err = tool
+            .run_browser_upload_from_args(&args)
+            .await
+            .expect_err("must fail when AssetServer is missing");
+        assert!(err.to_string().contains("AssetServer is not running"));
     }
 }

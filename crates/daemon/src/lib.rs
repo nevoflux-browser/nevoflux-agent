@@ -23,6 +23,7 @@
 
 pub mod agent;
 pub mod agent_host;
+pub mod asset_server;
 pub mod canvas_persist;
 pub mod canvas_tools;
 pub mod canvas_video;

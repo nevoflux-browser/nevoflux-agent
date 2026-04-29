@@ -1236,6 +1236,33 @@ pub async fn start_server(
     // own direct broadcast; this one covers the LLM-driven tool call path.
     services = services.with_broadcast_tx(response_tx.clone());
 
+    // Boot the Asset & Stream Plane HTTP server. Reuses the same port
+    // range as the bridge — bridge takes its slot first, AssetServer
+    // takes the next free one (per design D4 / §5.2). On bind failure
+    // the daemon keeps running with `asset_server = None`; tools fall
+    // back to NM-only (matches old-extension behavior).
+    {
+        use crate::asset_server::{AssetServer, AssetServerConfig};
+        let asset_config = AssetServerConfig {
+            port_range: config.port_start..(config.port_end.saturating_add(1)),
+            ..Default::default()
+        };
+        match AssetServer::start(asset_config).await {
+            Ok(server) => {
+                info!(
+                    bound_port = server.bound_port(),
+                    "asset_server: Asset & Stream Plane online"
+                );
+                services = services.with_asset_server(server);
+            }
+            Err(e) => {
+                warn!(
+                    "asset_server: failed to start ({e}); tools requiring HTTP transport will fall back to NM-only"
+                );
+            }
+        }
+    }
+
     // Writer registry: maps proxy_id → writer half for routing responses
     type WriterMap = Arc<Mutex<HashMap<String, BufWriter<tokio::net::tcp::OwnedWriteHalf>>>>;
     let writers: WriterMap = Arc::new(Mutex::new(HashMap::new()));
@@ -5732,6 +5759,30 @@ async fn handle_chat_message(
                 "status" => {
                     let config = AgentConfig::load().unwrap_or_default();
                     let has_configured = has_any_configured_provider(&config.llm);
+
+                    // Asset & Stream Plane handshake (bridge:hello.asset_plane).
+                    // The extension caches `port` + `bearer_token`; on session
+                    // change it invalidates URL caches. If the AssetServer
+                    // failed to bind, advertise nothing — extension falls back
+                    // to NM-only.
+                    let asset_plane_value = match services.asset_server.as_ref() {
+                        Some(asset_server) => {
+                            // If the extension reported its origin in this
+                            // status call, lock the CORS allow-origin to it.
+                            if let Some(origin) =
+                                params.get("origin").and_then(|v| v.as_str())
+                            {
+                                if !origin.is_empty() {
+                                    asset_server
+                                        .set_allowed_origin(Some(origin.to_string()));
+                                }
+                            }
+                            serde_json::to_value(asset_server.asset_plane_info())
+                                .unwrap_or(serde_json::Value::Null)
+                        }
+                        None => serde_json::Value::Null,
+                    };
+
                     serde_json::json!({
                         "type": "system_response",
                         "payload": {
@@ -5742,7 +5793,8 @@ async fn handle_chat_message(
                                 "status": "ok",
                                 "version": env!("CARGO_PKG_VERSION"),
                                 "first_run": !has_configured,
-                                "has_configured_provider": has_configured
+                                "has_configured_provider": has_configured,
+                                "asset_plane": asset_plane_value,
                             }
                         }
                     })
