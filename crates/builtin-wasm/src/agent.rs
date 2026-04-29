@@ -3263,25 +3263,41 @@ The following skill instructions MUST be followed exactly. These instructions ta
                               `url(assets/X)`, etc. into a `data:` URI at render time, so the \
                               agent can write template-style references and trust they'll show up.\n\n\
                               **Use this whenever the user provides an image** (drag-drop, URL, \
-                              clipboard, or a tab they want a screenshot of). DO NOT paste \
-                              base64 data URIs directly into composition HTML — that bloats the \
-                              artifact, breaks lint, and can't be re-used across compositions. \
-                              Call canvas_attach_asset, then reference the returned path.\n\n\
+                              clipboard, local file). DO NOT paste base64 data URIs directly \
+                              into composition HTML — that bloats the artifact, breaks lint, \
+                              and can't be re-used across compositions. Call canvas_attach_asset, \
+                              then reference the returned `path`.\n\n\
                               Provide EXACTLY ONE source:\n\
-                              - `data_b64`: base64-encoded bytes (after a fetch / clipboard read)\n\
-                              - `url`:      http(s) URL the daemon fetches (10s timeout)\n\
-                              - `from_tab`: not yet wired; use data_b64 with screenshot bytes\n\n\
+                              - `local_path`: absolute filesystem path (e.g.\n\
+                                `/tmp/Generated_Image_xyz.png`). **Use this when the path is \
+                                visible in your local_files context** (the user uploaded a \
+                                file to chat). The daemon reads the bytes server-side, so \
+                                multi-megabyte images don't blow tool-arg size limits.\n\
+                              - `data_b64`:   base64-encoded bytes (good for ≤ 1 MB only — \
+                                tool-arg size limit). For bigger files use `local_path` or \
+                                `url` instead.\n\
+                              - `url`:        http(s) URL the daemon fetches (10s timeout).\n\
+                              - `from_tab`:   not yet wired; use data_b64 with screenshot bytes.\n\n\
+                              **Decision tree for user-attached files (most common case):**\n\
+                              1. Look for the path in your local_files context (the daemon \
+                                 surfaces it as a path string near your user message).\n\
+                              2. Call `canvas_attach_asset({ composition_id, local_path })`.\n\
+                              3. Reference the returned `path` as `<img src=\"assets/...\">`.\n\
+                              DO NOT glob /tmp/, DO NOT search the page for path keywords, \
+                              DO NOT ask the user for the path again — it's already in your \
+                              context.\n\n\
                               Returns `{ path, mime_type, size_bytes }`. Use `path` (e.g. \
-                              \"assets/hero.png\") in HTML — NEVER reference the URL or the \
-                              base64 again.".into(),
+                              \"assets/hero.png\") in HTML — NEVER reference the URL, the \
+                              base64, or the local_path again.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "composition_id": { "type": "string", "description": "Target composition artifact id." },
-                        "name":           { "type": "string", "description": "Optional filename with extension (e.g. 'hero.png'). Inferred from URL/MIME otherwise." },
-                        "mime_type":      { "type": "string", "description": "Optional explicit MIME type. Inferred from name or URL response otherwise." },
-                        "data_b64":       { "type": "string", "description": "Inline base64 payload (mutually exclusive with url / from_tab)." },
-                        "url":            { "type": "string", "description": "Public http(s) URL the daemon fetches (mutually exclusive with the others)." },
+                        "name":           { "type": "string", "description": "Optional filename with extension (e.g. 'hero.png'). Inferred from URL / local_path basename / MIME otherwise." },
+                        "mime_type":      { "type": "string", "description": "Optional explicit MIME type. Inferred from name / path / URL response otherwise." },
+                        "data_b64":       { "type": "string", "description": "Inline base64 payload (mutually exclusive). Limit: ≤ 1 MB before base64 — for larger use local_path / url." },
+                        "url":            { "type": "string", "description": "Public http(s) URL the daemon fetches (mutually exclusive)." },
+                        "local_path":     { "type": "string", "description": "Absolute filesystem path the daemon reads (mutually exclusive). USE THIS when the path appears in your local_files context — it bypasses tool-arg size limits." },
                         "from_tab":       { "type": "integer", "description": "Tab id to screenshot. NOT YET WIRED — error today; use data_b64 instead." },
                         "role":           { "type": "string", "description": "Optional advisory hint: 'hero' / 'logo' / 'background' / 'decorative'. Informational only today." }
                     },

@@ -8789,13 +8789,22 @@ async fn gather_available_tools(services: &HostServices) -> Vec<String> {
 
 /// Build attachment metadata from attachments and local files for persisting in message history.
 ///
-/// Read image-typed `local_files` from disk and turn them into real
+/// Read image-typed `local_files` from disk and ALSO add them as real
 /// `Attachment` entries so the LLM can SEE the picture (vision modality)
 /// instead of being told to use the `read` tool. The `read` tool calls
 /// `fs::read_to_string` which fails on binary PNG/JPEG with a UTF-8
 /// error, leaving the agent confused (observed bug:
 /// /tmp/nevoflux-debug.log shows round 2 producing 0 text + 0 tool
 /// calls after `read` returned an 83-byte error message).
+///
+/// IMPORTANT — `local_files` entries are KEPT after promotion. The
+/// agent needs the path string to call
+/// `canvas_attach_asset({ local_path: ... })`, which is the proper
+/// way to put bytes into a composition's files map for rendering.
+/// Without the path, the agent can't bridge the gap between
+/// "vision-only LLM input" and "binary asset for the renderer" — it
+/// resorts to globbing and AskUser (observed in
+/// /tmp/nevoflux-sidebar.log).
 ///
 /// Promotion rules:
 /// - Only image MIME types (`image/*`) are promoted. Documents / archives
@@ -8918,13 +8927,17 @@ fn promote_image_local_files_to_attachments(
             original_bytes = original_bytes,
             llm_bytes = final_bytes.len(),
             outcome = ?outcome,
-            "promoted image local_file to attachment (with resize)"
+            "promoted image local_file to attachment (with resize); local_files entry preserved so agent can call canvas_attach_asset(local_path=...)"
         );
     }
 
-    if !promoted_paths.is_empty() {
-        local_files.retain(|f| !promoted_paths.contains(&f.path));
-    }
+    // Intentionally NOT removing promoted entries from `local_files`.
+    // The agent needs the path string later to call
+    // `canvas_attach_asset({ local_path: ... })` — that's how bytes get
+    // moved from disk into the composition's files map for the
+    // renderer. The duplication (vision attachment + path entry) is
+    // not wasteful: the agent uses each for a different purpose.
+    let _ = promoted_paths;
 }
 
 /// Stores only name, mime_type, and path — no base64 data — to keep the database small.
@@ -9022,7 +9035,7 @@ mod tests {
     }
 
     #[test]
-    fn promote_image_local_files_reads_bytes_and_drops_entry() {
+    fn promote_image_local_files_reads_bytes_and_keeps_entry() {
         // Write a real PNG to a tempfile and verify the helper reads it,
         // base64-encodes it into attachments, and drops the local_files
         // entry so the agent doesn't double-process.
@@ -9054,7 +9067,12 @@ mod tests {
         use base64::{engine::general_purpose::STANDARD, Engine};
         let round_trip = STANDARD.decode(&attachments[0].data).unwrap();
         assert_eq!(round_trip, bytes);
-        assert_eq!(local_files.len(), 0, "promoted entry must be removed from local_files");
+        // local_files entry MUST be preserved so the agent can call
+        // canvas_attach_asset({ local_path: ... }) afterwards. Earlier
+        // versions dropped the entry and the agent ended up globbing
+        // /tmp blindly looking for the path it could no longer see.
+        assert_eq!(local_files.len(), 1, "promoted entry must STAY in local_files for canvas_attach_asset(local_path=...)");
+        assert_eq!(local_files[0].path, path.to_string_lossy().to_string());
 
         // Reuse: writing a tmpfile guard
         let _ = &dir;
@@ -9174,7 +9192,7 @@ mod tests {
         promote_image_local_files_to_attachments(&mut attachments, &mut local_files);
 
         assert_eq!(attachments.len(), 1, "image must be promoted (with resize)");
-        assert_eq!(local_files.len(), 0, "promoted entry removed");
+        assert_eq!(local_files.len(), 1, "promoted entry preserved for canvas_attach_asset(local_path)");
 
         // Decode the output and verify it's much smaller AND inside the
         // LLM cap. Opaque photo PNG → JPEG q=85 path.

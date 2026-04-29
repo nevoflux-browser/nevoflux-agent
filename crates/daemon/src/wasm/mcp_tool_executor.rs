@@ -1893,6 +1893,7 @@ async fn execute_subagent_tool(
 // ============================================================================
 
 /// Resolved asset payload ready for `CanvasVideoService::attach_asset`.
+#[derive(Debug)]
 pub struct ResolvedAsset {
     pub name: String,
     pub mime_type: String,
@@ -1910,7 +1911,7 @@ pub async fn resolve_attach_asset_payload_pub(
 }
 
 /// Convert a `canvas_attach_asset` request's source variant (one of
-/// `data_b64` / `url` / `from_tab`) into a normalized
+/// `data_b64` / `url` / `local_path` / `from_tab`) into a normalized
 /// `(name, mime_type, base64-payload, size_bytes)` tuple.
 async fn resolve_attach_asset_payload(
     req: &nevoflux_protocol::canvas_video::AttachAssetRequest,
@@ -1918,16 +1919,20 @@ async fn resolve_attach_asset_payload(
     let chosen: i32 = [
         req.data_b64.is_some(),
         req.url.is_some(),
+        req.local_path.is_some(),
         req.from_tab.is_some(),
     ]
     .iter()
     .filter(|x| **x)
     .count() as i32;
     if chosen == 0 {
-        return Err("must provide one of data_b64 / url / from_tab".into());
+        return Err("must provide one of data_b64 / url / local_path / from_tab".into());
     }
     if chosen > 1 {
-        return Err("only one of data_b64 / url / from_tab may be set (mutually exclusive)".into());
+        return Err(
+            "only one of data_b64 / url / local_path / from_tab may be set (mutually exclusive)"
+                .into(),
+        );
     }
 
     if let Some(b64) = req.data_b64.as_deref() {
@@ -1984,6 +1989,51 @@ async fn resolve_attach_asset_payload(
         let name_from_url = url_basename(url);
         let name = pick_name(
             req.name.as_deref().or(name_from_url.as_deref()),
+            &mime,
+            "asset",
+        );
+        return Ok(ResolvedAsset {
+            name,
+            mime_type: mime,
+            payload_b64,
+            size_bytes: size,
+        });
+    }
+
+    if let Some(path_str) = req.local_path.as_deref() {
+        if path_str.trim().is_empty() {
+            return Err("local_path is empty".into());
+        }
+        let path = std::path::Path::new(path_str);
+        // Reject path traversal / non-absolute paths to keep the agent
+        // honest about what it's attaching. The promotion path passes
+        // absolute paths from the sidebar's local file picker, so this
+        // only blocks accidental relative-path leakage.
+        if !path.is_absolute() {
+            return Err(format!(
+                "local_path must be absolute (got {path_str:?}); the agent receives absolute paths from the user's local_files context"
+            ));
+        }
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("failed to read local_path {path_str:?}: {e}"))?;
+        if bytes.is_empty() {
+            return Err(format!("local_path {path_str:?} is empty"));
+        }
+        // Same MIME inference policy as the URL path: caller-provided
+        // overrides everything; otherwise infer from path extension.
+        // Magic-byte sniffing happens later in asset_inline at render
+        // time, so a misnamed extension still renders correctly.
+        let mime = req
+            .mime_type
+            .clone()
+            .unwrap_or_else(|| infer_mime_from_name(path_str));
+        let size = bytes.len() as u64;
+        let payload_b64 = encode_base64(&bytes);
+        let name_from_path = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string());
+        let name = pick_name(
+            req.name.as_deref().or(name_from_path.as_deref()),
             &mime,
             "asset",
         );
@@ -2098,6 +2148,103 @@ fn encode_base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_path_reads_disk_bytes_into_resolved_asset() {
+        // Real PNG header bytes — 12 bytes is enough for the magic
+        // sniffer; resolver doesn't decode here, just stores.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hero.png");
+        let bytes: Vec<u8> = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+        ];
+        std::fs::write(&path, &bytes).unwrap();
+
+        let req = nevoflux_protocol::canvas_video::AttachAssetRequest {
+            composition_id: "comp-x".into(),
+            name: None,
+            mime_type: None,
+            data_b64: None,
+            url: None,
+            local_path: Some(path.to_string_lossy().to_string()),
+            from_tab: None,
+            role: None,
+        };
+
+        let resolved = resolve_attach_asset_payload(&req).await.expect("resolve ok");
+        assert_eq!(resolved.size_bytes, bytes.len() as u64);
+        assert_eq!(resolved.mime_type, "image/png");
+        assert_eq!(resolved.name, "hero.png");
+        // Round-trip the base64.
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let decoded = STANDARD.decode(&resolved.payload_b64).unwrap();
+        assert_eq!(decoded, bytes);
+        let _ = &dir;
+    }
+
+    #[tokio::test]
+    async fn local_path_rejects_relative() {
+        let req = nevoflux_protocol::canvas_video::AttachAssetRequest {
+            composition_id: "comp-x".into(),
+            name: None,
+            mime_type: None,
+            data_b64: None,
+            url: None,
+            local_path: Some("relative/path.png".into()),
+            from_tab: None,
+            role: None,
+        };
+        let err = resolve_attach_asset_payload(&req).await.unwrap_err();
+        assert!(err.contains("absolute"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn local_path_rejects_missing_file() {
+        let req = nevoflux_protocol::canvas_video::AttachAssetRequest {
+            composition_id: "comp-x".into(),
+            name: None,
+            mime_type: None,
+            data_b64: None,
+            url: None,
+            local_path: Some("/nonexistent/path/foo.png".into()),
+            from_tab: None,
+            role: None,
+        };
+        let err = resolve_attach_asset_payload(&req).await.unwrap_err();
+        assert!(err.contains("failed to read"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn rejects_multiple_sources() {
+        let req = nevoflux_protocol::canvas_video::AttachAssetRequest {
+            composition_id: "comp-x".into(),
+            name: None,
+            mime_type: None,
+            data_b64: Some("AAAA".into()),
+            url: None,
+            local_path: Some("/tmp/x.png".into()),
+            from_tab: None,
+            role: None,
+        };
+        let err = resolve_attach_asset_payload(&req).await.unwrap_err();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn rejects_no_source() {
+        let req = nevoflux_protocol::canvas_video::AttachAssetRequest {
+            composition_id: "comp-x".into(),
+            name: None,
+            mime_type: None,
+            data_b64: None,
+            url: None,
+            local_path: None,
+            from_tab: None,
+            role: None,
+        };
+        let err = resolve_attach_asset_payload(&req).await.unwrap_err();
+        assert!(err.contains("must provide one of"), "got: {err}");
+    }
 
     #[test]
     fn test_tool_name_to_browser_action() {

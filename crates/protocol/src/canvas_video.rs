@@ -438,33 +438,47 @@ pub struct RevealPathResponse {
 /// (see `canvas_video::asset_inline`), so the agent can put `<img
 /// src="assets/hero.png">` in the composition HTML and trust it'll render.
 ///
-/// Exactly one of the three source variants must be supplied:
-/// - `data_b64`  — caller provides the file bytes inline (after a fetch /
+/// Exactly one of the four source variants must be supplied:
+/// - `data_b64`   — caller provides the file bytes inline (after a fetch /
 ///   user upload). Pair with `mime_type` (otherwise inferred from `name`).
-/// - `url`       — daemon fetches the URL with reqwest (10 s timeout) and
+///   AVOID for files >~1 MB: tool args have practical size limits.
+/// - `url`        — daemon fetches the URL with reqwest (10 s timeout) and
 ///   stores the bytes. Honors http/https only; file:/data: rejected.
-/// - `from_tab`  — daemon takes a screenshot of the given browser tab and
-///   stores it as PNG. (Browser-tool integration; falls back to error if
-///   the daemon isn't bridged to a tab capture surface.)
+/// - `local_path` — daemon reads the file directly from disk. Use this
+///   when the user attached a local file to the chat (its path appears
+///   in the agent's local_files context). Bypasses the tool-args size
+///   limit, so it's the right path for multi-megabyte hero images. The
+///   daemon applies the same magic-byte MIME sniff and asset_resize
+///   pipeline as the other variants.
+/// - `from_tab`   — daemon takes a screenshot of the given browser tab
+///   and stores it as PNG. (Browser-tool integration; falls back to
+///   error if the daemon isn't bridged to a tab capture surface.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AttachAssetRequest {
     /// Composition artifact id.
     pub composition_id: String,
     /// Optional explicit name with extension (e.g. `hero.png`). If omitted,
-    /// derived from URL basename or content-type.
+    /// derived from URL basename / local_path basename / content-type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Optional explicit MIME type. Useful when `data_b64` is supplied for
     /// a file the agent doesn't have an extension for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
-    /// Inline base64 payload. Mutually exclusive with `url` / `from_tab`.
+    /// Inline base64 payload. Mutually exclusive with the others.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_b64: Option<String>,
     /// Public URL the daemon fetches. Mutually exclusive with the others.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Filesystem path the daemon reads directly. Mutually exclusive with
+    /// the others. Use this when the user attached a local file to the
+    /// chat — the path appears in the agent's local_files context, and
+    /// large images can be moved to the artifact without serialising the
+    /// bytes through tool arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_path: Option<String>,
     /// Tab id to screenshot. Mutually exclusive with the others.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_tab: Option<i64>,
