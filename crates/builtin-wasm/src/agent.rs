@@ -1165,9 +1165,10 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
             // Execute tool calls - must include tool_calls in the assistant message
             let tool_calls = response.tool_calls;
-            messages.push(Message::assistant_with_tool_calls(
+            messages.push(Message::assistant_with_tool_calls_and_reasoning(
                 &response.text,
                 tool_calls.clone(),
+                response.reasoning.clone(),
             ));
 
             // Extract keywords from LLM reasoning text once (invariant across tool calls)
@@ -1243,6 +1244,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     tool_call_id: Some(result.tool_call_id.clone()),
                     tool_calls: vec![],
                     attachments,
+                    reasoning: None,
                 });
 
                 // Check interrupt after each tool execution
@@ -1324,6 +1326,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
         let stream_id = self.host.llm_stream_start(&request)?;
 
         let mut accumulated_text = String::new();
+        let mut accumulated_reasoning = String::new();
         // Use a HashMap to deduplicate tool calls by id, preferring those with call_id set
         let mut tool_calls_map: std::collections::HashMap<String, ToolCall> =
             std::collections::HashMap::new();
@@ -1426,6 +1429,13 @@ The following skill instructions MUST be followed exactly. These instructions ta
                         }
                     }
 
+                    // Accumulate reasoning/thinking content deltas
+                    if let Some(reasoning_delta) = chunk.reasoning.as_deref() {
+                        if !reasoning_delta.is_empty() {
+                            accumulated_reasoning.push_str(reasoning_delta);
+                        }
+                    }
+
                     // Accumulate tool calls, preferring those with call_id set
                     // This handles the case where OpenAI Responses API sends both
                     // delta-accumulated tool calls (without call_id) and complete
@@ -1490,6 +1500,11 @@ The following skill instructions MUST be followed exactly. These instructions ta
         Ok(LlmResponse {
             text: accumulated_text,
             tool_calls: tool_calls_map.into_values().collect(),
+            reasoning: if accumulated_reasoning.is_empty() {
+                None
+            } else {
+                Some(accumulated_reasoning)
+            },
         })
     }
 
@@ -2287,7 +2302,9 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
             }
             "canvas_inspect_layout" => {
-                let resp = self.host.canvas_video_inspect_layout(&tool_call.arguments)?;
+                let resp = self
+                    .host
+                    .canvas_video_inspect_layout(&tool_call.arguments)?;
                 serde_json::to_string(&resp)
                     .unwrap_or_else(|e| format!(r#"{{"error":"serialize failed: {}"}}"#, e))
             }
@@ -5303,10 +5320,12 @@ mod tests {
                 arguments: serde_json::json!({"query": "rust programming"}),
                 signature: None,
             }],
+            reasoning: None,
         });
         mock.add_llm_response(LlmResponse {
             text: "Here's what I found about Rust.".into(),
             tool_calls: vec![],
+            reasoning: None,
         });
 
         // Use non-streaming config since mock doesn't support streaming responses

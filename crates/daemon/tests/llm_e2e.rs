@@ -728,6 +728,7 @@ impl ToolCallTracker {
                 tool_calls: None,
                 tool_call_id: None,
                 attachments: vec![],
+                reasoning: None,
             });
         }
         messages.push(LlmMessage::user(initial_user_message));
@@ -1019,6 +1020,7 @@ async fn test_openai_image_attachment_streaming() {
                 tool_calls: None,
                 tool_call_id: None,
                 attachments: vec![],
+                reasoning: None,
             },
             LlmMessage::user_with_attachments(
                 "描述一下这个图片", // Same as sidebar test
@@ -1143,6 +1145,7 @@ Ask for permission before destructive operations."#;
                 tool_calls: None,
                 tool_call_id: None,
                 attachments: vec![],
+                reasoning: None,
             },
             LlmMessage::user_with_attachments(
                 "描述一下这个图片",
@@ -1330,6 +1333,7 @@ async fn test_openai_large_screenshot_image() {
                 tool_calls: None,
                 tool_call_id: None,
                 attachments: vec![],
+                reasoning: None,
             },
             LlmMessage::user_with_attachments(
                 "描述一下这个图片",
@@ -1402,6 +1406,7 @@ async fn test_openai_large_screenshot_image() {
                     tool_calls: None,
                     tool_call_id: None,
                     attachments: vec![],
+                    reasoning: None,
                 },
                 LlmMessage::user_with_attachments(
                     "描述一下这个图片",

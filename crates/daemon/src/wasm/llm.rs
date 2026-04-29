@@ -18,8 +18,8 @@ use rig::client::CompletionClient;
 use rig::client::Nothing;
 use rig::completion::{CompletionModel, ToolDefinition};
 use rig::message::{
-    AssistantContent, DocumentSourceKind, Image, ImageDetail, ImageMediaType, Message, Text,
-    ToolCall as RigToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
+    AssistantContent, DocumentSourceKind, Image, ImageDetail, ImageMediaType, Message, Reasoning,
+    Text, ToolCall as RigToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
 };
 use rig::providers::{
     anthropic, cohere, deepseek, gemini, groq, mistral, ollama, openai, openrouter, perplexity,
@@ -130,6 +130,11 @@ pub struct LlmMessage {
     /// Attachments for multimodal messages (images, files).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<LlmAttachment>,
+    /// Reasoning / thinking content produced by the model on this turn
+    /// (assistant role). Required to be echoed back for DeepSeek thinking
+    /// mode when the turn includes tool calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl LlmMessage {
@@ -141,6 +146,7 @@ impl LlmMessage {
             tool_calls: None,
             tool_call_id: None,
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -155,6 +161,7 @@ impl LlmMessage {
             tool_calls: None,
             tool_call_id: None,
             attachments,
+            reasoning: None,
         }
     }
 
@@ -166,6 +173,7 @@ impl LlmMessage {
             tool_calls: None,
             tool_call_id: None,
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -177,6 +185,7 @@ impl LlmMessage {
             tool_calls: Some(tool_calls),
             tool_call_id: None,
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -188,6 +197,7 @@ impl LlmMessage {
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 }
@@ -1121,22 +1131,13 @@ where
                 }
             }
             "assistant" => {
-                // Build assistant content - may include text and/or tool calls
-                let mut assistant_contents: Vec<AssistantContent> = Vec::new();
-
                 tracing::info!(
-                    "Converting assistant message: content_len={}, tool_calls_present={}, tool_calls_count={:?}",
+                    "Converting assistant message: content_len={}, tool_calls_present={}, tool_calls_count={:?}, has_reasoning={}",
                     msg.content.len(),
                     msg.tool_calls.is_some(),
-                    msg.tool_calls.as_ref().map(|tc| tc.len())
+                    msg.tool_calls.as_ref().map(|tc| tc.len()),
+                    msg.reasoning.is_some()
                 );
-
-                // Add text content if present
-                if !msg.content.is_empty() {
-                    assistant_contents.push(AssistantContent::text(&msg.content));
-                }
-
-                // Add tool calls if present - these must be properly structured
                 if let Some(ref tool_calls) = msg.tool_calls {
                     tracing::info!(
                         "Converting assistant tool_calls: count={}, ids={:?}, call_ids={:?}",
@@ -1144,31 +1145,8 @@ where
                         tool_calls.iter().map(|tc| &tc.id).collect::<Vec<_>>(),
                         tool_calls.iter().map(|tc| &tc.call_id).collect::<Vec<_>>()
                     );
-                    for tc in tool_calls {
-                        let mut rig_tool_call = RigToolCall::new(
-                            tc.id.clone(),
-                            ToolFunction::new(tc.name.clone(), tc.arguments.clone()),
-                        );
-                        // OpenAI Responses API requires call_id to be set
-                        if let Some(ref call_id) = tc.call_id {
-                            rig_tool_call = rig_tool_call.with_call_id(call_id.clone());
-                        }
-                        assistant_contents.push(AssistantContent::ToolCall(rig_tool_call));
-                    }
                 }
-
-                // If no content at all, add a single space (Anthropic rejects empty text with cache_control)
-                if assistant_contents.is_empty() {
-                    assistant_contents.push(AssistantContent::text(" "));
-                }
-
-                let content = if assistant_contents.len() == 1 {
-                    OneOrMany::one(assistant_contents.remove(0))
-                } else {
-                    OneOrMany::many(assistant_contents)
-                        .unwrap_or_else(|_| OneOrMany::one(AssistantContent::text(" ")))
-                };
-                chat_history.push(Message::Assistant { id: None, content });
+                chat_history.push(build_rig_assistant_message(msg, provider));
             }
             _ => {
                 // Treat as user message, with optional attachments
@@ -1313,18 +1291,6 @@ where
         builder = builder.tools(rig_tools);
     }
 
-    // DeepSeek thinking-mode models return `reasoning_content` alongside `content`,
-    // and the API requires reasoning_content to be echoed back on every subsequent
-    // tool-calling turn (400 invalid_request_error otherwise). We don't yet plumb
-    // reasoning_content through LlmMessage / convert_assistant_message, so disable
-    // thinking mode here to keep tool-calling working. Remove once the full
-    // reasoning_content round-trip lands.
-    if provider == ProviderType::DeepSeek {
-        builder = builder.additional_params(serde_json::json!({
-            "thinking": { "type": "disabled" }
-        }));
-    }
-
     // Execute the request
     let completion_response = builder
         .send()
@@ -1333,6 +1299,55 @@ where
 
     // Extract the response content and handle tool calls
     process_completion_response(completion_response.choice)
+}
+
+/// Build a rig `Message::Assistant` from a host-side `LlmMessage`, including
+/// `AssistantContent::Reasoning` when the provider requires reasoning_content
+/// to be echoed back (DeepSeek thinking-mode).
+fn build_rig_assistant_message(msg: &LlmMessage, provider: ProviderType) -> Message {
+    let mut assistant_contents: Vec<AssistantContent> = Vec::new();
+
+    // DeepSeek thinking-mode requires reasoning_content to be echoed back when
+    // the assistant turn contains a tool call. Emit before content/tool_calls
+    // so rig's deepseek converter picks it up via AssistantContent::Reasoning
+    // and populates Message::Assistant.reasoning_content on the wire.
+    if provider == ProviderType::DeepSeek {
+        if let Some(reasoning) = msg.reasoning.as_deref() {
+            if !reasoning.is_empty() {
+                assistant_contents.push(AssistantContent::Reasoning(Reasoning::new(reasoning)));
+            }
+        }
+    }
+
+    if !msg.content.is_empty() {
+        assistant_contents.push(AssistantContent::text(&msg.content));
+    }
+
+    if let Some(ref tool_calls) = msg.tool_calls {
+        for tc in tool_calls {
+            let mut rig_tool_call = RigToolCall::new(
+                tc.id.clone(),
+                ToolFunction::new(tc.name.clone(), tc.arguments.clone()),
+            );
+            if let Some(ref call_id) = tc.call_id {
+                rig_tool_call = rig_tool_call.with_call_id(call_id.clone());
+            }
+            assistant_contents.push(AssistantContent::ToolCall(rig_tool_call));
+        }
+    }
+
+    if assistant_contents.is_empty() {
+        assistant_contents.push(AssistantContent::text(" "));
+    }
+
+    let content = if assistant_contents.len() == 1 {
+        OneOrMany::one(assistant_contents.remove(0))
+    } else {
+        OneOrMany::many(assistant_contents)
+            .unwrap_or_else(|_| OneOrMany::one(AssistantContent::text(" ")))
+    };
+
+    Message::Assistant { id: None, content }
 }
 
 /// Merge consecutive messages with the same role into single messages.
@@ -3188,22 +3203,13 @@ where
                 }
             }
             "assistant" => {
-                // Build assistant content - may include text and/or tool calls
-                let mut assistant_contents: Vec<AssistantContent> = Vec::new();
-
                 tracing::info!(
-                    "Converting assistant message: content_len={}, tool_calls_present={}, tool_calls_count={:?}",
+                    "Converting assistant message: content_len={}, tool_calls_present={}, tool_calls_count={:?}, has_reasoning={}",
                     msg.content.len(),
                     msg.tool_calls.is_some(),
-                    msg.tool_calls.as_ref().map(|tc| tc.len())
+                    msg.tool_calls.as_ref().map(|tc| tc.len()),
+                    msg.reasoning.is_some()
                 );
-
-                // Add text content if present
-                if !msg.content.is_empty() {
-                    assistant_contents.push(AssistantContent::text(&msg.content));
-                }
-
-                // Add tool calls if present - these must be properly structured
                 if let Some(ref tool_calls) = msg.tool_calls {
                     tracing::info!(
                         "Converting assistant tool_calls: count={}, ids={:?}, call_ids={:?}",
@@ -3211,31 +3217,8 @@ where
                         tool_calls.iter().map(|tc| &tc.id).collect::<Vec<_>>(),
                         tool_calls.iter().map(|tc| &tc.call_id).collect::<Vec<_>>()
                     );
-                    for tc in tool_calls {
-                        let mut rig_tool_call = RigToolCall::new(
-                            tc.id.clone(),
-                            ToolFunction::new(tc.name.clone(), tc.arguments.clone()),
-                        );
-                        // OpenAI Responses API requires call_id to be set
-                        if let Some(ref call_id) = tc.call_id {
-                            rig_tool_call = rig_tool_call.with_call_id(call_id.clone());
-                        }
-                        assistant_contents.push(AssistantContent::ToolCall(rig_tool_call));
-                    }
                 }
-
-                // If no content at all, add a single space (Anthropic rejects empty text with cache_control)
-                if assistant_contents.is_empty() {
-                    assistant_contents.push(AssistantContent::text(" "));
-                }
-
-                let content = if assistant_contents.len() == 1 {
-                    OneOrMany::one(assistant_contents.remove(0))
-                } else {
-                    OneOrMany::many(assistant_contents)
-                        .unwrap_or_else(|_| OneOrMany::one(AssistantContent::text(" ")))
-                };
-                chat_history.push(Message::Assistant { id: None, content });
+                chat_history.push(build_rig_assistant_message(msg, provider));
             }
             _ => {
                 let mut user_content: Vec<UserContent> = Vec::new();
@@ -3442,18 +3425,6 @@ where
     if let Some(tools) = request.tools {
         let rig_tools: Vec<ToolDefinition> = tools.into_iter().map(|t| t.into()).collect();
         builder = builder.tools(rig_tools);
-    }
-
-    // DeepSeek thinking-mode models return `reasoning_content` alongside `content`,
-    // and the API requires reasoning_content to be echoed back on every subsequent
-    // tool-calling turn (400 invalid_request_error otherwise). We don't yet plumb
-    // reasoning_content through LlmMessage / convert_assistant_message, so disable
-    // thinking mode here to keep tool-calling working. Remove once the full
-    // reasoning_content round-trip lands.
-    if provider == ProviderType::DeepSeek {
-        builder = builder.additional_params(serde_json::json!({
-            "thinking": { "type": "disabled" }
-        }));
     }
 
     // Execute streaming request
@@ -4291,6 +4262,7 @@ mod tests {
                 mime_type: "image/png".into(),
                 data: "iVBORw0KGgo=".into(),
             }],
+            reasoning: None,
         };
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -4313,6 +4285,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some("call_123".into()),
             attachments: vec![],
+            reasoning: None,
         };
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -4350,5 +4323,88 @@ mod tests {
         let malformed = r#"{"code": "print(\"=" * 80)"}"#;
         let result = parse_tool_arguments_json(malformed);
         assert_eq!(result["code"].as_str().unwrap(), r#"print("=" * 80)"#);
+    }
+
+    #[test]
+    fn llm_message_preserves_reasoning_across_serde() {
+        let json = r#"{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1", "name": "x", "arguments": {}}],
+            "reasoning": "deciding which tool to call"
+        }"#;
+        let msg: LlmMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.role, "assistant");
+        assert_eq!(
+            msg.reasoning.as_deref(),
+            Some("deciding which tool to call")
+        );
+
+        let reserialized = serde_json::to_string(&msg).unwrap();
+        assert!(reserialized.contains("\"reasoning\":\"deciding which tool to call\""));
+    }
+
+    #[test]
+    fn assistant_message_with_reasoning_emits_rig_reasoning_for_deepseek() {
+        use rig::message::AssistantContent;
+
+        let msg = LlmMessage {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: Some(vec![LlmToolCall {
+                id: "call_1".into(),
+                call_id: None,
+                name: "browser_get_markdown".into(),
+                arguments: serde_json::json!({"tab_id": 4}),
+                signature: None,
+            }]),
+            tool_call_id: None,
+            attachments: vec![],
+            reasoning: Some("step 1: get the page".into()),
+        };
+
+        let rig_msg = build_rig_assistant_message(&msg, ProviderType::DeepSeek);
+
+        let rig::message::Message::Assistant { content, .. } = rig_msg else {
+            panic!("expected Assistant message");
+        };
+
+        let has_reasoning = content
+            .iter()
+            .any(|c| matches!(c, AssistantContent::Reasoning(r) if r.reasoning.iter().any(|s| s == "step 1: get the page")));
+        let has_tool_call = content
+            .iter()
+            .any(|c| matches!(c, AssistantContent::ToolCall(_)));
+        assert!(
+            has_reasoning,
+            "DeepSeek path must emit AssistantContent::Reasoning"
+        );
+        assert!(has_tool_call, "tool call must still be present");
+    }
+
+    #[test]
+    fn assistant_message_with_reasoning_skipped_for_non_deepseek() {
+        use rig::message::AssistantContent;
+
+        let msg = LlmMessage {
+            role: "assistant".into(),
+            content: "hi".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: vec![],
+            reasoning: Some("internal thoughts".into()),
+        };
+
+        let rig_msg = build_rig_assistant_message(&msg, ProviderType::OpenAi);
+        let rig::message::Message::Assistant { content, .. } = rig_msg else {
+            panic!("expected Assistant message");
+        };
+        let has_reasoning = content
+            .iter()
+            .any(|c| matches!(c, AssistantContent::Reasoning(_)));
+        assert!(
+            !has_reasoning,
+            "non-DeepSeek must not leak reasoning content"
+        );
     }
 }

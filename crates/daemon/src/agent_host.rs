@@ -809,6 +809,7 @@ impl DaemonHostFunctions {
                     tool_calls: None,
                     tool_call_id: None,
                     attachments: Vec::new(),
+                    reasoning: None,
                 }
             })
             .collect();
@@ -892,6 +893,7 @@ impl DaemonHostFunctions {
                     tool_calls,
                     tool_call_id: m.tool_call_id.clone(),
                     attachments,
+                    reasoning: m.reasoning.clone(),
                 }
             })
             .collect();
@@ -1292,6 +1294,7 @@ impl HostFunctions for DaemonHostFunctions {
                 Ok(LlmResponse {
                     text: response.content,
                     tool_calls,
+                    reasoning: None,
                 })
             }
             Err(e) => {
@@ -1666,6 +1669,7 @@ impl HostFunctions for DaemonHostFunctions {
                         })
                         .collect(),
                     done: chunk.done,
+                    reasoning: chunk.reasoning,
                     images: chunk
                         .images
                         .into_iter()
