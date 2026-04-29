@@ -1,6 +1,7 @@
 //! Repository implementations for the storage layer.
 
 mod artifact;
+pub mod composition_asset;
 mod config;
 mod knowledge;
 mod learning_metrics;
@@ -13,6 +14,7 @@ mod tool_stat;
 pub mod traces;
 
 pub use artifact::ArtifactRepository;
+pub use composition_asset::{CompositionAsset, CompositionAssetRepository};
 pub use config::ConfigRepository;
 pub use knowledge::KnowledgeRepository;
 pub use learning_metrics::LearningMetricsRepository;

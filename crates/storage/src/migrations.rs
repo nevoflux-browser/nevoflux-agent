@@ -50,6 +50,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "015_artifacts_files_canonical",
         include_str!("migrations/015_artifacts_files_canonical.sql"),
     ),
+    (
+        "016_composition_assets",
+        include_str!("migrations/016_composition_assets.sql"),
+    ),
 ];
 
 /// Run all pending migrations on the given connection.
@@ -93,6 +97,12 @@ pub fn run_all(conn: &mut Connection) -> Result<()> {
         }
     }
 
+    // Post-SQL data migrations. Each function tracks its own applied
+    // state in `_migrations` (typically under a name like
+    // "<XXX>b_<description>"), so re-running run_all is a no-op once
+    // the data move has completed.
+    crate::repositories::composition_asset::migrate_assets_to_composition_assets_table(conn)?;
+
     Ok(())
 }
 
@@ -112,7 +122,9 @@ mod tests {
         let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 14);
+        // 14 SQL migrations (001-012, 014, 015, 016) + 1 Rust post-migration
+        // marker (016b_composition_assets_data) = 16.
+        assert_eq!(count, 16);
     }
 
     #[test]
