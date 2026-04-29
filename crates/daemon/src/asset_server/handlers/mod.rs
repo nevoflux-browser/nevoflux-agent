@@ -10,5 +10,6 @@ pub mod capabilities;
 pub mod composition;
 pub mod health;
 pub mod legacy_file;
+pub mod oauth;
 pub mod stubs;
 pub mod upload;

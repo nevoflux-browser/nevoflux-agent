@@ -34,6 +34,11 @@ pub struct AssetServerState {
     pub composition_tokens: Arc<TokenStore<CompositionEntry>>,
     pub blob_tokens: Arc<TokenStore<BlobEntry>>,
     pub upload_inbox: Arc<super::inbox::UploadInbox>,
+    /// In-flight OAuth flows keyed by `state` param. The callback
+    /// handler resolves an entry by sending `OAuthCallbackResult` back
+    /// to the originator's `oneshot::Receiver`. Bearer-LESS route — the
+    /// `state` nonce is the auth.
+    pub oauth_registry: Arc<super::oauth::OAuthRegistry>,
     /// Artifact storage backend — required by composition / asset GET
     /// handlers (Phase 2). `None` in unit-test boots that don't exercise
     /// those routes; handlers return 503 when missing so callers can fall
@@ -62,6 +67,7 @@ impl AssetServerState {
             composition_tokens: Arc::new(TokenStore::new()),
             blob_tokens: Arc::new(TokenStore::new()),
             upload_inbox: Arc::new(super::inbox::UploadInbox::new()),
+            oauth_registry: Arc::new(super::oauth::OAuthRegistry::new()),
             storage: config.storage.clone(),
             canvas_video_service: config.canvas_video_service.clone(),
             bound_port: AtomicU16::new(0),
