@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use nevoflux_protocol::canvas_video::{
     CreateCompositionRequest, GetCompositionRequest, GetCompositionResponse,
-    LintCompositionRequest, RenderCancelRequest, RenderDone, RenderFailed, RenderFrameChunk,
-    RenderReady, RenderStartRequest,
+    LintCompositionRequest, LoadCompositionHtmlRequest, RenderCancelRequest, RenderDone,
+    RenderFailed, RenderFrameChunk, RenderReady, RenderStartRequest,
 };
 use serde_json::Value;
 
@@ -85,6 +85,24 @@ pub async fn handle(
                 .map_err(|e| DaemonError::InvalidRequest(format!("parse: {}", e)))?;
             let (html, width, height, duration_sec, fps) =
                 svc.get_composition_for_job(&req.job_id).await?;
+            let resp = GetCompositionResponse {
+                html,
+                width,
+                height,
+                duration_sec,
+                fps,
+            };
+            serde_json::to_value(resp).map_err(|e| DaemonError::InternalError(format!("{}", e)))
+        }
+        "canvas_video_load_composition_html" => {
+            let req: LoadCompositionHtmlRequest = serde_json::from_value(payload)
+                .map_err(|e| DaemonError::InvalidRequest(format!("parse: {}", e)))?;
+            // Direct call to load_composition by composition_id — no
+            // render-job snapshot indirection. The asset_server, if
+            // wired, will rewrite `assets/X` to /v1/asset/... URLs;
+            // otherwise refs stay relative.
+            let (html, width, height, duration_sec, fps) =
+                svc.load_composition(&req.composition_id).await?;
             let resp = GetCompositionResponse {
                 html,
                 width,

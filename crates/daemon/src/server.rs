@@ -3070,6 +3070,41 @@ pub async fn start_server(
                 continue;
             }
 
+            // Canvas Editor / preview fetches composition HTML by id
+            // (asset-stream-plane Phase 2 URL-rewritten path; sibling of
+            // canvas_video_get_composition but no job indirection).
+            if msg_type == "canvas_video_load_composition_html" {
+                info!("Processing canvas_video_load_composition_html message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await
+                {
+                    Ok(val) => serde_json::json!({
+                        "type": "canvas_video_load_composition_html_response",
+                        "payload": val,
+                    }),
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_VIDEO_ERROR",
+                            "message": e.to_string()
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
             // Check for EventBus request messages from frontend
             if msg_type == "events_request" {
                 info!("Processing events_request message");
