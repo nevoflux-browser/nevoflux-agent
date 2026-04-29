@@ -18,13 +18,14 @@
 //! - all Phase 2-5 routes return `501 Not Implemented` with
 //!   `X-NF-Future-Phase: phase-N`
 
-mod auth;
+pub mod auth;
 pub mod handlers;
 pub mod inbox;
 mod port;
 pub mod state;
 pub mod token_store;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,7 +51,6 @@ pub const DEFAULT_MAX_BODY_SIZE: usize = 64 * 1024 * 1024;
 /// `download_tokens` TTL — single-use, browser_upload `/file/:token`.
 pub const DOWNLOAD_TOKEN_TTL: Duration = Duration::from_secs(60);
 /// `composition_tokens` TTL — multi-use, `/v1/asset/composition/...`.
-#[allow(dead_code)] // lit in Phase 2
 pub const COMPOSITION_TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
 /// `blob_tokens` TTL — single-or-multi, `/v1/blob/<id>`.
 #[allow(dead_code)] // lit in Phase 5
@@ -67,7 +67,7 @@ pub enum BindError {
 }
 
 /// Boot-time configuration for the AssetServer.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AssetServerConfig {
     /// Half-open port range `[start, end)`. Must match the bridge's range
     /// so co-existing daemons each get distinct AssetServer ports.
@@ -82,6 +82,22 @@ pub struct AssetServerConfig {
     /// CORS allow-origin (the moz-extension://... URL). May be `None` at
     /// boot — populated when the extension first connects.
     pub allowed_origin: Option<String>,
+    /// Artifact storage backend — required by Phase 2 composition / asset
+    /// GET handlers. Daemon wires this from `HostServices::database`;
+    /// unit-test boots leave it `None` and the corresponding routes
+    /// return 503.
+    pub storage: Option<Arc<nevoflux_storage::Database>>,
+}
+
+impl std::fmt::Debug for AssetServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssetServerConfig")
+            .field("port_range", &self.port_range)
+            .field("max_body_size", &self.max_body_size)
+            .field("allowed_origin", &self.allowed_origin)
+            .field("storage", &self.storage.as_ref().map(|_| "Some(Database)"))
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for AssetServerConfig {
@@ -95,6 +111,7 @@ impl Default for AssetServerConfig {
             session_id: token_store::random_token(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
             allowed_origin: None,
+            storage: None,
         }
     }
 }
@@ -133,19 +150,11 @@ impl AssetServer {
             .port();
 
         let state = Arc::new(AssetServerState::new(&config));
+        state.set_bound_port(bound_port);
 
-        token_store::spawn_eviction_loop(
-            state.download_tokens.clone(),
-            Duration::from_secs(30),
-        );
-        token_store::spawn_eviction_loop(
-            state.composition_tokens.clone(),
-            Duration::from_secs(60),
-        );
-        token_store::spawn_eviction_loop(
-            state.blob_tokens.clone(),
-            Duration::from_secs(60),
-        );
+        token_store::spawn_eviction_loop(state.download_tokens.clone(), Duration::from_secs(30));
+        token_store::spawn_eviction_loop(state.composition_tokens.clone(), Duration::from_secs(60));
+        token_store::spawn_eviction_loop(state.blob_tokens.clone(), Duration::from_secs(60));
         inbox::spawn_inbox_eviction_loop(state.upload_inbox.clone(), Duration::from_secs(30));
 
         let app = build_router(state.clone(), config.max_body_size);
@@ -244,24 +253,53 @@ impl AssetServer {
         let token = self.state.download_tokens.insert(entry);
         format!("http://127.0.0.1:{}/file/{}", self.bound_port, token)
     }
+
+    /// Phase 2 caller: register a composition for asset GET. Issues ONE
+    /// short token covering all `asset_names`, returns a map of
+    /// (asset_name → absolute URL). The token is multi-use within `ttl`;
+    /// caller is responsible for choosing a sensible TTL — typically
+    /// `COMPOSITION_TOKEN_TTL` (5 min, per design D12).
+    ///
+    /// The composition handler (`/v1/composition/:id`) calls this inline
+    /// during the GET; non-handler callers (e.g. `load_composition` once
+    /// it's wired through `HostServices::asset_server` in Step B) call it
+    /// to embed URLs into a `GetCompositionResponse`.
+    pub fn register_composition_assets(
+        &self,
+        composition_id: &str,
+        asset_names: &[String],
+        ttl: Duration,
+    ) -> HashMap<String, String> {
+        let token = self.state.issue_composition_token(composition_id, ttl);
+        asset_names
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    format!(
+                        "http://127.0.0.1:{}/v1/asset/composition/{}/{}?t={}",
+                        self.bound_port, composition_id, name, token
+                    ),
+                )
+            })
+            .collect()
+    }
 }
 
 fn build_router(state: Arc<AssetServerState>, max_body: usize) -> Router {
-    // /v1/* routes — bearer-protected
-    let v1 = Router::new()
+    // /v1/* routes that REQUIRE bearer (no per-resource short-token alternative).
+    let v1_bearer = Router::new()
         .route("/v1/health", get(handlers::health::handle))
         .route("/v1/capabilities", get(handlers::capabilities::handle))
         .route(
             "/v1/upload/screenshot/:request_id",
             post(handlers::upload::handle_screenshot),
         )
-        // Phase 2-5 reserved namespaces — 501 stubs.
-        .route("/v1/composition/:id", get(handlers::stubs::stub_phase2))
+        // Phase 3-5 reserved namespaces — 501 stubs (still bearer-protected).
         .route(
-            "/v1/asset/composition/:id/:name",
-            get(handlers::stubs::stub_phase2),
+            "/v1/upload/asset/:id/:name",
+            post(handlers::stubs::stub_phase3),
         )
-        .route("/v1/upload/asset/:id/:name", post(handlers::stubs::stub_phase3))
         .route(
             "/v1/upload/generic/:inbox",
             post(handlers::stubs::stub_phase3),
@@ -279,6 +317,18 @@ fn build_router(state: Arc<AssetServerState>, max_body: usize) -> Router {
         ))
         .with_state(state.clone());
 
+    // /v1/* routes with TWO-TIER auth (bearer header OR per-composition
+    // `?t=<short_token>` query param). Auth is enforced inside the handler
+    // via `auth::check_composition_request_auth`, so these routes sit
+    // outside the bearer middleware layer.
+    let v1_composition = Router::new()
+        .route("/v1/composition/:id", get(handlers::composition::handle))
+        .route(
+            "/v1/asset/composition/:id/:name",
+            get(handlers::asset::handle),
+        )
+        .with_state(state.clone());
+
     // Legacy /file/:token — bearer-LESS (single-use UUID is the auth).
     let legacy = Router::new()
         .route("/file/:token", get(handlers::legacy_file::handle))
@@ -286,7 +336,8 @@ fn build_router(state: Arc<AssetServerState>, max_body: usize) -> Router {
 
     Router::new()
         .merge(legacy)
-        .merge(v1)
+        .merge(v1_composition)
+        .merge(v1_bearer)
         .layer(DefaultBodyLimit::max(max_body))
         // CORS layer must be outermost so OPTIONS preflights are answered
         // before the bearer layer rejects them.
@@ -373,7 +424,9 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         let phases = body["phases"].as_array().expect("phases must be array");
-        assert!(phases.iter().any(|v| v.as_str() == Some("screenshot-upload")));
+        assert!(phases
+            .iter()
+            .any(|v| v.as_str() == Some("screenshot-upload")));
         assert_eq!(body["version"], 1);
     }
 
@@ -468,8 +521,13 @@ mod tests {
     // §13.1 — 501 stubs carry X-NF-Future-Phase
     // -----------------------------------------------------------------------
 
+    /// Phase 2 is now lit, so the previous "stub returns 501" test would
+    /// false-pass. Replace with the graceful-degradation contract: when
+    /// the AssetServer has no storage wired (test boot, or a daemon where
+    /// Phase 2 hasn't been wired through start_server yet), the route
+    /// returns 503 so callers can fall back to NM-only transport.
     #[tokio::test]
-    async fn phase2_route_returns_501_with_phase_header() {
+    async fn phase2_composition_route_returns_503_when_storage_not_wired() {
         let server = boot().await;
         let url = format!(
             "http://127.0.0.1:{}/v1/composition/abc",
@@ -481,13 +539,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 501);
-        assert_eq!(
-            resp.headers()
-                .get("x-nf-future-phase")
-                .and_then(|v| v.to_str().ok()),
-            Some("phase-2")
-        );
+        assert_eq!(resp.status(), 503);
     }
 
     #[tokio::test]
@@ -672,5 +724,320 @@ mod tests {
         // Single-use: second GET 404s.
         let r2 = test_client().get(&url).send().await.unwrap();
         assert_eq!(r2.status(), 404);
+    }
+
+    // -----------------------------------------------------------------------
+    // §7.1 — Phase 2 composition + asset GET routes
+    // -----------------------------------------------------------------------
+
+    /// 1×1 transparent PNG, base64-encoded — used as a stand-in binary asset.
+    const PNG_1X1_B64: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+    fn sample_meta() -> String {
+        serde_json::json!({
+            "kind": "composition",
+            "version": 1,
+            "spec": {"width": 640, "height": 360, "duration_sec": 5.0, "fps": 30},
+            "origin": {"created_with": "test", "created_at": 0}
+        })
+        .to_string()
+    }
+
+    /// Boot an AssetServer backed by a real in-memory artifact store with a
+    /// fixture composition: HTML referencing two assets, plus the assets
+    /// themselves.
+    async fn boot_with_fixture() -> (
+        AssetServer,
+        std::sync::Arc<nevoflux_storage::Database>,
+        String,
+    ) {
+        use nevoflux_storage::repositories::ArtifactRepository;
+        use nevoflux_storage::Database;
+
+        let db = std::sync::Arc::new(
+            Database::open_in_memory().expect("in-memory Database for asset_server tests"),
+        );
+
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "index.html".into(),
+            r#"<html><body>
+                <img src="assets/hero.png">
+                <video src="assets/clip.mp4"></video>
+            </body></html>"#
+                .to_string(),
+        );
+        files.insert("assets/hero.png".into(), PNG_1X1_B64.to_string());
+        // base64-encoded mp4 stub (`ftyp` magic at bytes 4-7) — drives the
+        // magic-bytes sniffer down the video/mp4 branch.
+        {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            let mp4_bytes = vec![
+                0u8, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, b'i', b's', b'o', b'm',
+            ];
+            files.insert("assets/clip.mp4".into(), STANDARD.encode(&mp4_bytes));
+        }
+        // raw text asset — exercises the non-base64 branch of the asset
+        // GET decoder. Length: 17 bytes (drives the Range test's
+        // Content-Range total).
+        files.insert("assets/note.txt".into(), "hello asset plane".to_string());
+        files.insert("composition.meta.json".into(), sample_meta());
+
+        let repo = ArtifactRepository::new(&db);
+        let id = "comp-fixture".to_string();
+        repo.create(nevoflux_storage::CreateArtifactParams {
+            id: id.clone(),
+            session_id: None,
+            title: "fixture".into(),
+            description: None,
+            content_type: "text/html".into(),
+            content: files["index.html"].clone(),
+            files: Some(files),
+            entry: Some("index.html".into()),
+        })
+        .expect("create fixture artifact");
+
+        let server = AssetServer::start(AssetServerConfig {
+            bearer_token: "test-bearer".into(),
+            session_id: "test-session".into(),
+            storage: Some(std::sync::Arc::clone(&db)),
+            ..Default::default()
+        })
+        .await
+        .expect("AssetServer should boot with storage");
+
+        (server, db, id)
+    }
+
+    #[tokio::test]
+    async fn composition_route_rewrites_relative_assets_to_absolute_urls() {
+        let (server, _storage, id) = boot_with_fixture().await;
+        let url = format!(
+            "http://127.0.0.1:{}/v1/composition/{}",
+            server.bound_port(),
+            id
+        );
+        let resp = test_client()
+            .get(&url)
+            .header("authorization", "Bearer test-bearer")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        assert!(
+            !body.contains("data:image"),
+            "response must NOT inline data: URIs (Phase 2 contract). got: {body}"
+        );
+        // hero.png and clip.mp4 must both be rewritten to v1/asset/composition/...
+        // URLs that include the composition id and a token query param.
+        assert!(
+            body.contains("/v1/asset/composition/comp-fixture/hero.png?t="),
+            "missing rewritten hero.png URL: {body}"
+        );
+        assert!(
+            body.contains("/v1/asset/composition/comp-fixture/clip.mp4?t="),
+            "missing rewritten clip.mp4 URL: {body}"
+        );
+        assert!(!body.contains(r#"src="assets/hero.png""#));
+    }
+
+    #[tokio::test]
+    async fn composition_route_returns_etag_and_cache_control() {
+        let (server, _storage, id) = boot_with_fixture().await;
+        let url = format!(
+            "http://127.0.0.1:{}/v1/composition/{}",
+            server.bound_port(),
+            id
+        );
+        let resp = test_client()
+            .get(&url)
+            .header("authorization", "Bearer test-bearer")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("private, max-age=300")
+        );
+        let etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .expect("etag header present")
+            .to_string();
+        assert!(etag.starts_with('"') && etag.ends_with('"'));
+
+        // If-None-Match revalidation returns 304.
+        let resp304 = test_client()
+            .get(&url)
+            .header("authorization", "Bearer test-bearer")
+            .header("if-none-match", &etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp304.status(), 304);
+    }
+
+    #[tokio::test]
+    async fn composition_route_token_query_param_bypasses_bearer() {
+        let (server, _storage, id) = boot_with_fixture().await;
+        // Pre-issue a composition token via the typed API so we have one
+        // we can present without going through the bearer-protected GET.
+        let urls = server.register_composition_assets(
+            &id,
+            &[String::from("hero.png")],
+            std::time::Duration::from_secs(60),
+        );
+        let issued_url = &urls["hero.png"];
+        let token = issued_url
+            .rsplit_once("t=")
+            .expect("issued url has token")
+            .1
+            .to_string();
+
+        // Hitting /v1/composition/<id> with ?t=<token> and NO bearer must succeed.
+        let url = format!(
+            "http://127.0.0.1:{}/v1/composition/{}?t={}",
+            server.bound_port(),
+            id,
+            token
+        );
+        let resp = test_client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // No bearer + no/wrong token → 401.
+        let bare_url = format!(
+            "http://127.0.0.1:{}/v1/composition/{}",
+            server.bound_port(),
+            id
+        );
+        let resp_no_auth = test_client().get(&bare_url).send().await.unwrap();
+        assert_eq!(resp_no_auth.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn composition_route_returns_404_for_unknown_artifact_id() {
+        let (server, _storage, _id) = boot_with_fixture().await;
+        let url = format!(
+            "http://127.0.0.1:{}/v1/composition/does-not-exist",
+            server.bound_port()
+        );
+        let resp = test_client()
+            .get(&url)
+            .header("authorization", "Bearer test-bearer")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn asset_route_streams_bytes_with_correct_mime() {
+        let (server, _storage, id) = boot_with_fixture().await;
+        // Issue a composition token; use it via ?t= (the iframe / <img>
+        // path consumers can't add headers).
+        let urls = server.register_composition_assets(
+            &id,
+            &[String::from("hero.png"), String::from("note.txt")],
+            std::time::Duration::from_secs(60),
+        );
+
+        // Binary asset: PNG, magic-bytes sniffed.
+        let resp = test_client().get(&urls["hero.png"]).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("image/png")
+        );
+        let body = resp.bytes().await.unwrap();
+        // First 8 bytes must be the PNG signature.
+        assert_eq!(
+            &body[..8],
+            &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+        );
+
+        // Text asset: stored as raw UTF-8, mime resolved by extension.
+        let resp_txt = test_client().get(&urls["note.txt"]).send().await.unwrap();
+        assert_eq!(resp_txt.status(), 200);
+        assert_eq!(
+            resp_txt
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain")
+        );
+        let txt = resp_txt.text().await.unwrap();
+        assert_eq!(txt, "hello asset plane");
+    }
+
+    #[tokio::test]
+    async fn asset_route_supports_range_requests() {
+        let (server, _storage, id) = boot_with_fixture().await;
+        let urls = server.register_composition_assets(
+            &id,
+            &[String::from("note.txt")],
+            std::time::Duration::from_secs(60),
+        );
+        let resp = test_client()
+            .get(&urls["note.txt"])
+            .header("range", "bytes=0-4")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 206);
+        assert_eq!(
+            resp.headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes 0-4/17")
+        );
+        let body = resp.text().await.unwrap();
+        assert_eq!(body, "hello");
+    }
+
+    #[tokio::test]
+    async fn asset_route_short_token_multi_use_within_ttl() {
+        let (server, _storage, id) = boot_with_fixture().await;
+        let urls = server.register_composition_assets(
+            &id,
+            &[String::from("hero.png")],
+            std::time::Duration::from_secs(60),
+        );
+        let url = &urls["hero.png"];
+
+        // Multi-use: same URL/token must serve at least twice within TTL.
+        let r1 = test_client().get(url).send().await.unwrap();
+        assert_eq!(r1.status(), 200);
+        let r2 = test_client().get(url).send().await.unwrap();
+        assert_eq!(r2.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn asset_route_rejects_token_for_different_composition() {
+        let (server, _storage, id) = boot_with_fixture().await;
+        // Token issued for the fixture composition must NOT auth a request
+        // against a different composition id (defense-in-depth: handler
+        // verifies token's stored composition_id matches the URL path).
+        let urls = server.register_composition_assets(
+            &id,
+            &[String::from("hero.png")],
+            std::time::Duration::from_secs(60),
+        );
+        let issued = &urls["hero.png"];
+        let token = issued.rsplit_once("t=").unwrap().1;
+        let cross_url = format!(
+            "http://127.0.0.1:{}/v1/asset/composition/SOME-OTHER-ID/hero.png?t={}",
+            server.bound_port(),
+            token
+        );
+        let resp = test_client().get(&cross_url).send().await.unwrap();
+        assert_eq!(resp.status(), 401);
     }
 }

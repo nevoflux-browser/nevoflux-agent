@@ -1245,6 +1245,10 @@ pub async fn start_server(
         use crate::asset_server::{AssetServer, AssetServerConfig};
         let asset_config = AssetServerConfig {
             port_range: config.port_start..(config.port_end.saturating_add(1)),
+            // Phase 2 needs storage for /v1/composition/:id and the asset
+            // GET handler. Phase 1's screenshot upload doesn't read this,
+            // so passing it unconditionally is safe.
+            storage: Some(services.database.clone()),
             ..Default::default()
         };
         match AssetServer::start(asset_config).await {

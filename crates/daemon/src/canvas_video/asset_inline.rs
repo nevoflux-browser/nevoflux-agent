@@ -124,6 +124,78 @@ pub fn inline_assets(html: &str, files: &HashMap<String, String>) -> String {
     out
 }
 
+/// Replace every `assets/<name>` reference with the absolute URL provided
+/// in `asset_urls`. Same scanner as [`inline_assets`] — only the
+/// substitution differs (URL string instead of `data:` URI). Refs missing
+/// from the map are left as-is so the linter (`nf/asset-not-in-files`)
+/// can still flag them.
+///
+/// This is the path used by `canvas.video.get_composition` (Phase 2) so
+/// the response stays small (KB-class) instead of inlining every binary
+/// asset as a data URI (MB-class, blew the NM 1 MB cap).
+///
+/// Keys in `asset_urls` are the asset NAMES — the part after `assets/`.
+/// E.g. for a `<img src="assets/hero.png">` reference the lookup key is
+/// `"hero.png"`.
+pub fn rewrite_assets_to_urls(html: &str, asset_urls: &HashMap<String, String>) -> String {
+    if asset_urls.is_empty() || !html.contains("assets/") {
+        return html.to_string();
+    }
+    let mut out = String::with_capacity(html.len());
+    let bytes = html.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(rel) = bytes[i..].iter().position(|&b| b == b'a') {
+            let p = i + rel;
+            if p + 7 <= bytes.len() && &bytes[p..p + 7] == b"assets/" {
+                let (open_pos, open_kind) = match find_opening(bytes, p) {
+                    Some(v) => v,
+                    None => {
+                        out.push_str(&html[i..p + 7]);
+                        i = p + 7;
+                        continue;
+                    }
+                };
+                let close_pos = match find_closing(bytes, p + 7, open_kind) {
+                    Some(v) => v,
+                    None => {
+                        out.push_str(&html[i..p + 7]);
+                        i = p + 7;
+                        continue;
+                    }
+                };
+                let raw_url = &html[open_pos + 1..close_pos];
+                let asset_key = raw_url.trim_start_matches("./").to_string();
+                let asset_name = match asset_key.strip_prefix("assets/") {
+                    Some(name) => name.to_string(),
+                    None => {
+                        out.push_str(&html[i..p + 7]);
+                        i = p + 7;
+                        continue;
+                    }
+                };
+                if let Some(url) = asset_urls.get(&asset_name) {
+                    out.push_str(&html[i..open_pos + 1]);
+                    out.push_str(url);
+                    i = close_pos;
+                    continue;
+                }
+                out.push_str(&html[i..close_pos]);
+                i = close_pos;
+                continue;
+            } else {
+                out.push_str(&html[i..p + 1]);
+                i = p + 1;
+                continue;
+            }
+        } else {
+            out.push_str(&html[i..]);
+            break;
+        }
+    }
+    out
+}
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Open {
     DoubleQuote, // "
@@ -180,7 +252,7 @@ fn find_closing(bytes: &[u8], from: usize, kind: Open) -> Option<usize> {
     None
 }
 
-fn mime_for_path(p: &str) -> &'static str {
+pub fn mime_for_path(p: &str) -> &'static str {
     let ext = p.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
         "png" => "image/png",
@@ -214,7 +286,7 @@ fn mime_for_path(p: &str) -> &'static str {
 /// This protects the inliner from agent path-extension mistakes — an
 /// agent that saves a JPEG as `foo.png` would otherwise produce
 /// `data:image/png;base64,<jpeg-bytes>` and the browser would refuse it.
-fn magic_bytes_mime(payload_b64: &str) -> Option<&'static str> {
+pub fn magic_bytes_mime(payload_b64: &str) -> Option<&'static str> {
     use base64::{engine::general_purpose::STANDARD, Engine};
     let head: String = payload_b64
         .chars()
@@ -248,7 +320,7 @@ fn magic_bytes_mime(payload_b64: &str) -> Option<&'static str> {
     })
 }
 
-fn is_likely_base64(s: &str) -> bool {
+pub fn is_likely_base64(s: &str) -> bool {
     // Heuristic: base64 strings contain only A-Z a-z 0-9 + / = and are
     // at least ~16 chars (a real binary asset). Reject anything that has
     // whitespace or `<`/`{` (clearly text/HTML/JSON).
@@ -334,7 +406,9 @@ mod tests {
     fn inlines_video_and_audio() {
         use base64::{engine::general_purpose::STANDARD, Engine};
         // mp4 ftyp box (bytes 4-7 = "ftyp")
-        let mp4_bytes = vec![0u8, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, b'i', b's', b'o', b'm'];
+        let mp4_bytes = vec![
+            0u8, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, b'i', b's', b'o', b'm',
+        ];
         // mp3 ID3v2 header
         let mp3_bytes = vec![0x49u8, 0x44, 0x33, 0x04, 0, 0, 0, 0, 0, 0];
         let mp4_b64 = STANDARD.encode(&mp4_bytes);
@@ -416,7 +490,9 @@ mod tests {
         // `data:image/png;base64,<jpeg bytes>` and the browser would
         // refuse to render. With sniffing, we emit `data:image/jpeg;...`.
         use base64::{engine::general_purpose::STANDARD, Engine};
-        let jpeg_bytes = vec![0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01];
+        let jpeg_bytes = vec![
+            0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01,
+        ];
         let b64 = STANDARD.encode(&jpeg_bytes);
         let html = r#"<img src="assets/foo.png">"#;
         let f = files(&[("assets/foo.png", &b64 as &str)]);
