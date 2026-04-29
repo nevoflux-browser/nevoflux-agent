@@ -1245,6 +1245,10 @@ pub async fn start_server(
         use crate::asset_server::{AssetServer, AssetServerConfig};
         let asset_config = AssetServerConfig {
             port_range: config.port_start..(config.port_end.saturating_add(1)),
+            // Phase 2 needs storage for /v1/composition/:id and the asset
+            // GET handler. Phase 1's screenshot upload doesn't read this,
+            // so passing it unconditionally is safe.
+            storage: Some(services.database.clone()),
             ..Default::default()
         };
         match AssetServer::start(asset_config).await {
@@ -1253,6 +1257,13 @@ pub async fn start_server(
                     bound_port = server.bound_port(),
                     "asset_server: Asset & Stream Plane online"
                 );
+                // Late-bind the AssetServer onto CanvasVideoService so
+                // `load_composition` rewrites `assets/X` to /v1/asset/...
+                // URLs (Phase 2) instead of inlining data URIs. The
+                // service was constructed before this point and is
+                // already Arc-wrapped, so set_asset_server uses interior
+                // mutability (OnceLock).
+                canvas_video_service.set_asset_server(server.clone());
                 services = services.with_asset_server(server);
             }
             Err(e) => {

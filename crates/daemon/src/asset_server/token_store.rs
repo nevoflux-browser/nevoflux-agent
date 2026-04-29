@@ -69,7 +69,6 @@ impl<E: EvictableEntry> TokenStore<E> {
     ///
     /// Returns `None` if unknown or expired; expired entries are NOT
     /// removed by `peek` (they are reaped by the eviction loop).
-    #[allow(dead_code)] // reserved for Phase 2 composition_tokens
     pub fn peek(&self, token: &str) -> Option<E> {
         let entry = self.inner.get(token)?.clone();
         if Instant::now() > entry.expires_at() {
@@ -138,12 +137,15 @@ impl EvictableEntry for crate::agent::browser_input::upload::TokenEntry {
     }
 }
 
-/// Phase 2 placeholder — composition asset URL token.
+/// Composition asset URL token (Phase 2).
+///
+/// One entry covers ALL of a composition's assets — `register_composition_assets`
+/// inserts a single CompositionEntry whose `composition_id` is what the
+/// asset GET handler verifies against the URL path. Multi-use within the
+/// 5-minute TTL.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // lit in Phase 2
 pub struct CompositionEntry {
     pub composition_id: String,
-    pub asset_name: String,
     pub expires_at: Instant,
 }
 
@@ -228,12 +230,10 @@ mod tests {
         let s: TokenStore<CompositionEntry> = TokenStore::new();
         s.insert(CompositionEntry {
             composition_id: "c1".into(),
-            asset_name: "a.png".into(),
             expires_at: Instant::now() - Duration::from_secs(1),
         });
         let live = s.insert(CompositionEntry {
             composition_id: "c2".into(),
-            asset_name: "b.png".into(),
             expires_at: Instant::now() + Duration::from_secs(60),
         });
         s.sweep_expired();

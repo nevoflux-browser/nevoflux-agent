@@ -28,7 +28,11 @@ pub async fn bearer_middleware(
     next: Next,
 ) -> Response {
     // Host header check — defense against DNS rebinding (Threat 5).
-    if let Some(host) = req.headers().get(header::HOST).and_then(|v| v.to_str().ok()) {
+    if let Some(host) = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+    {
         if !host.starts_with("127.0.0.1") && !host.starts_with("localhost") {
             return Response::builder()
                 .status(StatusCode::FORBIDDEN)
@@ -82,9 +86,7 @@ pub async fn cors_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let origin = state
-        .allowed_origin()
-        .unwrap_or_else(|| "*".to_string());
+    let origin = state.allowed_origin().unwrap_or_else(|| "*".to_string());
 
     // Preflight short-circuit.
     if req.method() == Method::OPTIONS {
@@ -114,6 +116,47 @@ pub async fn cors_middleware(
             .insert("Access-Control-Allow-Origin", value);
     }
     resp
+}
+
+/// Dual-auth check used by the composition + asset GET handlers (Phase 2).
+///
+/// Accepts EITHER:
+/// - a daemon-wide `Authorization: Bearer <token>` header (extension
+///   `fetch()` path), OR
+/// - a `?t=<short_token>` query param whose entry exists in
+///   `composition_tokens` AND whose `composition_id` matches `expected_id`
+///   (rendered HTML / iframe / `<img src=>` path — these consumers can't
+///   add headers).
+///
+/// Per design D5 / §5.4: short tokens are multi-use within their TTL
+/// (`peek` validates without consuming). The defense-in-depth check that
+/// the token's stored `composition_id` matches the URL path prevents a
+/// token issued for composition A from being replayed against composition B.
+pub fn check_composition_request_auth(
+    state: &AssetServerState,
+    expected_composition_id: &str,
+    headers: &axum::http::HeaderMap,
+    query_token: Option<&str>,
+) -> bool {
+    if let Some(presented) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+    {
+        if presented.len() == state.bearer_token.len()
+            && constant_time_eq(presented.as_bytes(), state.bearer_token.as_bytes())
+        {
+            return true;
+        }
+    }
+
+    if let Some(token) = query_token {
+        if let Some(entry) = state.composition_tokens.peek(token) {
+            return entry.composition_id == expected_composition_id;
+        }
+    }
+
+    false
 }
 
 // Auth + CORS unit tests live alongside the integration tests in

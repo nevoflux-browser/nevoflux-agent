@@ -9,8 +9,11 @@
 //! optional CORS allow-origin (only known once the extension has sent
 //! its `bridge:hello`).
 
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
+use nevoflux_storage::Database;
 use serde::{Deserialize, Serialize};
 
 use super::token_store::{BlobEntry, CompositionEntry, TokenStore};
@@ -31,6 +34,16 @@ pub struct AssetServerState {
     pub composition_tokens: Arc<TokenStore<CompositionEntry>>,
     pub blob_tokens: Arc<TokenStore<BlobEntry>>,
     pub upload_inbox: Arc<super::inbox::UploadInbox>,
+    /// Artifact storage backend — required by composition / asset GET
+    /// handlers (Phase 2). `None` in unit-test boots that don't exercise
+    /// those routes; handlers return 503 when missing so callers can fall
+    /// back to NM transport.
+    pub storage: Option<Arc<Database>>,
+    /// Bound port — set by `AssetServer::start` after the listener wins a
+    /// slot, read by the composition handler to construct absolute asset
+    /// URLs. Stored as `AtomicU16` so the handler can access it via the
+    /// shared `Arc<AssetServerState>` without taking a lock.
+    bound_port: AtomicU16,
 }
 
 impl AssetServerState {
@@ -44,6 +57,8 @@ impl AssetServerState {
             composition_tokens: Arc::new(TokenStore::new()),
             blob_tokens: Arc::new(TokenStore::new()),
             upload_inbox: Arc::new(super::inbox::UploadInbox::new()),
+            storage: config.storage.clone(),
+            bound_port: AtomicU16::new(0),
         }
     }
 
@@ -55,6 +70,24 @@ impl AssetServerState {
 
     pub fn allowed_origin(&self) -> Option<String> {
         self.allowed_origin.read().ok().and_then(|g| g.clone())
+    }
+
+    pub fn set_bound_port(&self, port: u16) {
+        self.bound_port.store(port, Ordering::SeqCst);
+    }
+
+    pub fn bound_port_for_url(&self) -> u16 {
+        self.bound_port.load(Ordering::SeqCst)
+    }
+
+    /// Issue a single composition token covering all assets of `composition_id`.
+    /// Multi-use within `ttl`; the token store eviction loop drops it past TTL.
+    pub fn issue_composition_token(&self, composition_id: &str, ttl: Duration) -> String {
+        let entry = CompositionEntry {
+            composition_id: composition_id.to_string(),
+            expires_at: Instant::now() + ttl,
+        };
+        self.composition_tokens.insert(entry)
     }
 }
 
