@@ -16,4 +16,4 @@ pub mod service;
 pub mod tool;
 pub mod vi_to_design;
 
-pub use service::CanvasVideoService;
+pub use service::{CanvasVideoService, RenderControlEvent};

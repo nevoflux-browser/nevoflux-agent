@@ -37,6 +37,21 @@ pub enum FrameSignal {
     Failed(String),
 }
 
+/// Daemon-to-render-tab control signal (Phase 4 SSE channel).
+///
+/// The render tab opens an SSE connection on entry and listens for
+/// these events; the daemon broadcasts them when the user pauses /
+/// cancels from the sidebar (or the tool dispatcher decides to abort).
+#[derive(Debug, Clone)]
+pub enum RenderControlEvent {
+    /// User asked to cancel — render tab should stop capturing and
+    /// allow the loop to finalize/abort cleanly.
+    Cancel,
+    /// Seek the loop to the given frame index. Reserved for future
+    /// scrubbing support; the legacy NM path doesn't carry this either.
+    SeekTo(u32),
+}
+
 pub struct CanvasVideoService {
     jobs: JobRegistry,
     /// If true, render_start returns immediately without page-bridge interaction.
@@ -69,6 +84,13 @@ pub struct CanvasVideoService {
     /// Pending inspect correlators — same pattern as `lint_correlators`.
     /// Inserted by `inspect_layout`, removed by `on_inspect_result` or on timeout.
     inspect_correlators: Mutex<HashMap<String, oneshot::Sender<InspectReport>>>,
+
+    /// Per-job daemon→render-tab control broadcast (Phase 4 SSE).
+    /// `subscribe_render_control` lazily creates the broadcast channel
+    /// on first subscription; `broadcast_render_control` looks it up
+    /// and pushes events. Capacity is small (32) — control events are
+    /// rare (cancel, seek) and slow consumers can tolerate lag.
+    render_controls: Mutex<HashMap<String, tokio::sync::broadcast::Sender<RenderControlEvent>>>,
 
     /// Asset & Stream Plane HTTP server, set by `set_asset_server` after
     /// the daemon boots the server (it lives on `HostServices` and is
@@ -195,6 +217,7 @@ impl CanvasVideoService {
             skills: None,
             lint_correlators: Mutex::new(Default::default()),
             inspect_correlators: Mutex::new(Default::default()),
+            render_controls: Mutex::new(Default::default()),
             asset_server: std::sync::OnceLock::new(),
         }
     }
@@ -211,6 +234,7 @@ impl CanvasVideoService {
             skills: Some(Arc::new(RwLock::new(SkillRegistry::new()))),
             lint_correlators: Mutex::new(Default::default()),
             inspect_correlators: Mutex::new(Default::default()),
+            render_controls: Mutex::new(Default::default()),
             asset_server: std::sync::OnceLock::new(),
         }
     }
@@ -601,6 +625,9 @@ impl CanvasVideoService {
     pub async fn cleanup_job_channels(&self, job_id: &str) {
         self.signal_senders.lock().await.remove(job_id);
         self.chunk_buffers.lock().await.remove(job_id);
+        // Drop the SSE broadcast sender too — its receivers (any open
+        // SSE streams) will then see RecvError::Closed and end cleanly.
+        self.render_controls.lock().await.remove(job_id);
     }
 
     /// Called when canvas_video_frame_chunk arrives from extension.
@@ -645,6 +672,42 @@ impl CanvasVideoService {
         self.send_signal(job_id, FrameSignal::Failed(error.to_string()))
             .await;
     }
+
+    /// Phase 4 entry point: HTTP frame POST handler delivers a captured
+    /// frame straight to the render loop without going through the
+    /// chunk-reassembly path. The render loop can't tell the transport
+    /// apart — same `FrameSignal::Frame` variant either way.
+    pub async fn deliver_render_frame(&self, job_id: &str, signal: FrameSignal) {
+        self.send_signal(job_id, signal).await;
+    }
+
+    /// Phase 4 SSE handler subscribes here on connect. The broadcast
+    /// channel is lazily created on first subscription and lives until
+    /// the job is cleaned up via `cleanup_job_channels`. Capacity 32
+    /// is generous given control events are rare (cancel + seek only).
+    pub async fn subscribe_render_control(
+        &self,
+        job_id: &str,
+    ) -> tokio::sync::broadcast::Receiver<RenderControlEvent> {
+        let mut guard = self.render_controls.lock().await;
+        let tx = guard.entry(job_id.to_string()).or_insert_with(|| {
+            tokio::sync::broadcast::channel::<RenderControlEvent>(32).0
+        });
+        tx.subscribe()
+    }
+
+    /// Broadcast a control event to whatever render-tab SSE receivers
+    /// are subscribed for `job_id`. No-op if the channel doesn't exist
+    /// yet (no SSE subscriber has connected) — the render loop's NM
+    /// fallback for cancel still works via `JobRegistry::cancel`.
+    pub async fn broadcast_render_control(&self, job_id: &str, event: RenderControlEvent) {
+        if let Some(tx) = self.render_controls.lock().await.get(job_id) {
+            // Send is best-effort — `Err` only fires when no receivers
+            // are alive, which is OK (drop the event).
+            let _ = tx.send(event);
+        }
+    }
+
 
     async fn send_signal(&self, job_id: &str, sig: FrameSignal) {
         if let Some(tx) = self.signal_senders.lock().await.get(job_id) {
