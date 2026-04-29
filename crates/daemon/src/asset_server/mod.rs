@@ -264,6 +264,31 @@ impl AssetServer {
         format!("http://127.0.0.1:{}/file/{}", self.bound_port, token)
     }
 
+    /// Phase 5 caller: register raw bytes for `/v1/blob/:id` GET.
+    /// Returns the absolute blob URL containing the freshly-issued
+    /// single-use token. Default TTL is [`BLOB_TOKEN_TTL`] (1 h) —
+    /// callers can pass a shorter `ttl` for time-sensitive flows.
+    ///
+    /// Use case: tool dispatch result > 100 KB. The daemon parks the
+    /// bytes here and returns a `BlobRef { blob_id, content_type, bytes }`
+    /// over native messaging; the consumer (LLM client / sidebar) GETs
+    /// the URL out-of-band to retrieve the bytes.
+    pub fn register_blob(
+        &self,
+        bytes: Bytes,
+        content_type: String,
+        ttl: Duration,
+    ) -> String {
+        use std::time::Instant;
+        let entry = token_store::BlobEntry {
+            bytes,
+            content_type,
+            expires_at: Instant::now() + ttl,
+        };
+        let token = self.state.blob_tokens.insert(entry);
+        format!("http://127.0.0.1:{}/v1/blob/{}", self.bound_port, token)
+    }
+
     /// Phase 2 caller: register a composition for asset GET. Issues ONE
     /// short token covering all `asset_names`, returns a map of
     /// (asset_name → absolute URL). The token is multi-use within `ttl`;
@@ -317,7 +342,8 @@ fn build_router(state: Arc<AssetServerState>, max_body: usize) -> Router {
         // Phase 4-5 reserved namespaces — 501 stubs.
         .route("/v1/render/:job/frame", post(handlers::stubs::stub_phase4))
         .route("/v1/render/:job/sse", get(handlers::stubs::stub_phase4))
-        .route("/v1/blob/:id", get(handlers::stubs::stub_phase5))
+        // Phase 5 — URL-as-handle blob registry.
+        .route("/v1/blob/:id", get(handlers::blob::handle))
         .route(
             "/v1/oauth/:provider/callback",
             get(handlers::stubs::stub_phase5),
@@ -576,24 +602,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn phase5_blob_returns_501_with_phase_header() {
-        let server = boot().await;
-        let url = format!("http://127.0.0.1:{}/v1/blob/abc", server.bound_port());
-        let resp = test_client()
-            .get(&url)
-            .header("authorization", "Bearer test-bearer")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 501);
-        assert_eq!(
-            resp.headers()
-                .get("x-nf-future-phase")
-                .and_then(|v| v.to_str().ok()),
-            Some("phase-5")
-        );
-    }
+    // Phase 5 blob route is now lit; the previous "stub returns 501"
+    // expectation was replaced by the round-trip + TTL tests below.
 
     // -----------------------------------------------------------------------
     // Legacy /file/:token wire-format spec — Step A asserted byte-for-byte
@@ -1250,5 +1260,106 @@ mod tests {
         // bytes survived the base64 round-trip and the magic-byte sniff
         // selected `image/png`.
         assert_eq!(&body[..8], &PNG_1X1[..8]);
+    }
+
+    // -----------------------------------------------------------------------
+    // §7.4 — Phase 5 URL-as-handle blob registry
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn blob_register_then_fetch_round_trips_bytes_and_content_type() {
+        let server = boot().await;
+        let url = server.register_blob(
+            bytes::Bytes::from_static(b"large blob payload"),
+            "text/plain".into(),
+            BLOB_TOKEN_TTL,
+        );
+        assert!(url.starts_with(&format!("http://127.0.0.1:{}/v1/blob/", server.bound_port())));
+        let resp = test_client()
+            .get(&url)
+            .header("authorization", "Bearer test-bearer")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain")
+        );
+        let body = resp.bytes().await.unwrap();
+        assert_eq!(body.as_ref(), b"large blob payload");
+    }
+
+    #[tokio::test]
+    async fn blob_token_is_single_use() {
+        let server = boot().await;
+        let url = server.register_blob(
+            bytes::Bytes::from_static(b"once"),
+            "application/octet-stream".into(),
+            BLOB_TOKEN_TTL,
+        );
+        let r1 = test_client()
+            .get(&url)
+            .header("authorization", "Bearer test-bearer")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), 200);
+        let r2 = test_client()
+            .get(&url)
+            .header("authorization", "Bearer test-bearer")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn blob_route_unknown_id_returns_404() {
+        let server = boot().await;
+        let url = format!(
+            "http://127.0.0.1:{}/v1/blob/never-registered",
+            server.bound_port()
+        );
+        let resp = test_client()
+            .get(&url)
+            .header("authorization", "Bearer test-bearer")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn blob_expired_returns_404() {
+        let server = boot().await;
+        let url = server.register_blob(
+            bytes::Bytes::from_static(b"expired"),
+            "text/plain".into(),
+            // negative-ish TTL: 1 ms in the future, sleep past it.
+            std::time::Duration::from_millis(1),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let resp = test_client()
+            .get(&url)
+            .header("authorization", "Bearer test-bearer")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn blob_route_requires_bearer() {
+        let server = boot().await;
+        let url = server.register_blob(
+            bytes::Bytes::from_static(b"x"),
+            "text/plain".into(),
+            BLOB_TOKEN_TTL,
+        );
+        let resp = test_client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 401);
     }
 }

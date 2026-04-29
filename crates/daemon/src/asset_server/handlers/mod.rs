@@ -5,6 +5,7 @@
 //! Per-route handlers, one file each.
 
 pub mod asset;
+pub mod blob;
 pub mod capabilities;
 pub mod composition;
 pub mod health;
