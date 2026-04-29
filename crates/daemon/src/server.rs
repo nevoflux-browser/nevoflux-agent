@@ -1249,6 +1249,10 @@ pub async fn start_server(
             // GET handler. Phase 1's screenshot upload doesn't read this,
             // so passing it unconditionally is safe.
             storage: Some(services.database.clone()),
+            // Phase 3 asset upload reuses CanvasVideoService::attach_asset
+            // for resize + MIME sniff + dual-write — pass through the
+            // already-constructed service handle.
+            canvas_video_service: Some(canvas_video_service.clone()),
             ..Default::default()
         };
         match AssetServer::start(asset_config).await {
