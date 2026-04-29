@@ -1165,6 +1165,121 @@ mod p3_load_tests {
         );
         assert!(!html.contains("data:image"), "no inlining either: {html}");
     }
+
+    /// The motivating defect for Phase 2 was that compositions with
+    /// realistic binary assets blew the NM 1 MB cap when `load_composition`
+    /// inlined them as data URIs. Plant a 2 MB asset and assert the
+    /// returned HTML is now KB-class (URL rewriting only) instead of MB-class.
+    #[tokio::test]
+    async fn load_composition_response_size_is_kb_not_mb_with_large_asset() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let id = "comp-phase2-bigasset";
+
+        // 2 MiB of pseudo-random PNG payload. The exact bytes don't matter
+        // — only that they're large and base64-shaped (the inliner would
+        // route this through the binary branch).
+        let mut blob = Vec::with_capacity(2 * 1024 * 1024);
+        // Real PNG signature so magic-byte sniff succeeds.
+        blob.extend_from_slice(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+        for i in 0..(2 * 1024 * 1024) {
+            blob.push((i as u8).wrapping_mul(31));
+        }
+        let big_b64 = STANDARD.encode(&blob);
+
+        let storage = svc.storage().unwrap().clone();
+        let repo = ArtifactRepository::new(storage.database());
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "index.html".into(),
+            r#"<html><body><img src="assets/big.png"></body></html>"#.to_string(),
+        );
+        files.insert("assets/big.png".into(), big_b64);
+        files.insert("composition.meta.json".into(), composition_meta_json());
+        repo.create(CreateArtifactParams {
+            id: id.into(),
+            session_id: None,
+            title: "big".into(),
+            description: None,
+            content_type: "text/html".into(),
+            content: files["index.html"].clone(),
+            files: Some(files),
+            entry: Some("index.html".into()),
+        })
+        .unwrap();
+
+        let db_arc = std::sync::Arc::new(svc.storage().unwrap().database().clone());
+        let server = crate::asset_server::AssetServer::start(
+            crate::asset_server::AssetServerConfig {
+                bearer_token: "phase2-bearer".into(),
+                session_id: "phase2-session".into(),
+                storage: Some(db_arc),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("AssetServer should boot");
+        svc.set_asset_server(server.clone());
+
+        let (html, _w, _h, _d, _fps) = svc.load_composition(id).await.unwrap();
+
+        // Phase 2 contract: response is URL-rewritten — its size is
+        // bounded by the entry HTML + a per-asset URL (~150 B). 2 KB is
+        // a generous ceiling for this fixture; the OLD inlining path
+        // would have produced ~2.7 MiB (4/3 base64 expansion of 2 MiB).
+        assert!(
+            html.len() < 2_000,
+            "response must stay KB-class (got {} bytes)",
+            html.len()
+        );
+        assert!(!html.contains("data:image"));
+        assert!(html.contains("/v1/asset/composition/"));
+    }
+
+    /// End-to-end: take the URL `load_composition` rewrote into the HTML,
+    /// fetch it via reqwest from the running AssetServer, and assert the
+    /// bytes round-trip back to the stored asset. Proves the GET route
+    /// resolves with a real composition_token without needing a browser
+    /// in the loop.
+    #[tokio::test]
+    async fn rewritten_asset_url_round_trips_via_real_http_fetch() {
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let id = "comp-phase2-roundtrip";
+        write_fixture(&svc, id);
+
+        let db_arc = std::sync::Arc::new(svc.storage().unwrap().database().clone());
+        let server = crate::asset_server::AssetServer::start(
+            crate::asset_server::AssetServerConfig {
+                bearer_token: "phase2-bearer".into(),
+                session_id: "phase2-session".into(),
+                storage: Some(db_arc),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("AssetServer should boot");
+        svc.set_asset_server(server.clone());
+
+        let (html, _w, _h, _d, _fps) = svc.load_composition(id).await.unwrap();
+
+        // Pull the rewritten URL out of the HTML and fetch it. The token
+        // in `?t=...` is what `register_composition_assets` issued.
+        let prefix = "http://127.0.0.1:";
+        let start = html
+            .find(prefix)
+            .expect("rewritten URL must appear in HTML");
+        let end = html[start..].find('"').expect("URL must end at the quote");
+        let url = &html[start..start + end];
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client.get(url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.bytes().await.unwrap();
+        // First 8 bytes match the PNG signature — proves the asset GET
+        // handler decoded the base64 entry into raw bytes.
+        assert_eq!(&bytes[..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+    }
 }
 
 #[cfg(test)]
