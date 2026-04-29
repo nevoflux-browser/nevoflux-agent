@@ -18,7 +18,7 @@ use rig::client::CompletionClient;
 use rig::client::Nothing;
 use rig::completion::{CompletionModel, ToolDefinition};
 use rig::message::{
-    AssistantContent, DocumentSourceKind, Image, ImageDetail, ImageMediaType, Message, Reasoning,
+    AssistantContent, DocumentSourceKind, Image, ImageDetail, ImageMediaType, Message,
     Text, ToolCall as RigToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
 };
 use rig::providers::{
@@ -1530,23 +1530,10 @@ where
     process_completion_response(completion_response.choice)
 }
 
-/// Build a rig `Message::Assistant` from a host-side `LlmMessage`, including
-/// `AssistantContent::Reasoning` when the provider requires reasoning_content
-/// to be echoed back (DeepSeek thinking-mode).
-fn build_rig_assistant_message(msg: &LlmMessage, provider: ProviderType) -> Message {
+/// Build a rig `Message::Assistant` from a host-side `LlmMessage`.
+/// Provider-agnostic: does not emit reasoning content.
+fn build_rig_assistant_message(msg: &LlmMessage, _provider: ProviderType) -> Message {
     let mut assistant_contents: Vec<AssistantContent> = Vec::new();
-
-    // DeepSeek thinking-mode requires reasoning_content to be echoed back when
-    // the assistant turn contains a tool call. Emit before content/tool_calls
-    // so rig's deepseek converter picks it up via AssistantContent::Reasoning
-    // and populates Message::Assistant.reasoning_content on the wire.
-    if provider == ProviderType::DeepSeek {
-        if let Some(reasoning) = msg.reasoning.as_deref() {
-            if !reasoning.is_empty() {
-                assistant_contents.push(AssistantContent::Reasoning(Reasoning::new(reasoning)));
-            }
-        }
-    }
 
     if !msg.content.is_empty() {
         assistant_contents.push(AssistantContent::text(&msg.content));
@@ -4770,67 +4757,31 @@ mod tests {
     }
 
     #[test]
-    fn assistant_message_with_reasoning_emits_rig_reasoning_for_deepseek() {
-        use rig::message::AssistantContent;
+    fn build_rig_assistant_message_never_emits_reasoning() {
+        use rig::completion::message::AssistantContent;
 
-        let msg = LlmMessage {
-            role: "assistant".into(),
-            content: String::new(),
-            tool_calls: Some(vec![LlmToolCall {
-                id: "call_1".into(),
-                call_id: None,
-                name: "browser_get_markdown".into(),
-                arguments: serde_json::json!({"tab_id": 4}),
-                signature: None,
-            }]),
-            tool_call_id: None,
-            attachments: vec![],
-            reasoning: Some("step 1: get the page".into()),
-        };
-
-        let rig_msg = build_rig_assistant_message(&msg, ProviderType::DeepSeek);
-
-        let rig::message::Message::Assistant { content, .. } = rig_msg else {
-            panic!("expected Assistant message");
-        };
-
-        let has_reasoning = content
-            .iter()
-            .any(|c| matches!(c, AssistantContent::Reasoning(r) if r.reasoning.iter().any(|s| s == "step 1: get the page")));
-        let has_tool_call = content
-            .iter()
-            .any(|c| matches!(c, AssistantContent::ToolCall(_)));
-        assert!(
-            has_reasoning,
-            "DeepSeek path must emit AssistantContent::Reasoning"
-        );
-        assert!(has_tool_call, "tool call must still be present");
-    }
-
-    #[test]
-    fn assistant_message_with_reasoning_skipped_for_non_deepseek() {
-        use rig::message::AssistantContent;
-
-        let msg = LlmMessage {
-            role: "assistant".into(),
-            content: "hi".into(),
-            tool_calls: None,
-            tool_call_id: None,
-            attachments: vec![],
-            reasoning: Some("internal thoughts".into()),
-        };
-
-        let rig_msg = build_rig_assistant_message(&msg, ProviderType::OpenAi);
-        let rig::message::Message::Assistant { content, .. } = rig_msg else {
-            panic!("expected Assistant message");
-        };
-        let has_reasoning = content
-            .iter()
-            .any(|c| matches!(c, AssistantContent::Reasoning(_)));
-        assert!(
-            !has_reasoning,
-            "non-DeepSeek must not leak reasoning content"
-        );
+        for provider in [ProviderType::DeepSeek, ProviderType::OpenAi, ProviderType::Anthropic] {
+            let msg = LlmMessage {
+                role: "assistant".into(),
+                content: "hi".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                attachments: vec![],
+                reasoning: Some("internal thoughts".into()),
+            };
+            let rig_msg = build_rig_assistant_message(&msg, provider);
+            let rig::completion::message::Message::Assistant { content, .. } = rig_msg else {
+                panic!("expected Assistant");
+            };
+            let has_reasoning = content
+                .iter()
+                .any(|c| matches!(c, AssistantContent::Reasoning(_)));
+            assert!(
+                !has_reasoning,
+                "build_rig_assistant_message must never emit reasoning content; provider {:?} leaked it",
+                provider
+            );
+        }
     }
 
     #[test]
