@@ -888,6 +888,87 @@ async fn execute_raw_openai_compatible_chat(
     })
 }
 
+/// Execute a non-streaming DeepSeek request via raw HTTP.
+///
+/// Sister of `stream_deepseek_raw` — see that function's doc-comment for
+/// the rig 0.29 split-message bug rationale. This path also captures
+/// `reasoning_content` from the response (currently surfaced only via
+/// the model's outgoing turn; the host doesn't yet plumb it back into
+/// `LlmChatResponse` — see follow-up tracked in plan).
+async fn execute_deepseek_chat_raw(
+    api_key: &str,
+    model: &str,
+    request: LlmChatRequest,
+    base_url: Option<&str>,
+) -> Result<LlmChatResponse> {
+    let body = build_deepseek_request_body(model, &request, false);
+    let base = base_url.unwrap_or("https://api.deepseek.com/v1");
+    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| DaemonError::InternalError(format!("DeepSeek request failed: {}", e)))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(DaemonError::InternalError(format!(
+            "DeepSeek HTTP {}: {}",
+            status,
+            &text[..text.len().min(500)]
+        )));
+    }
+
+    let raw: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| DaemonError::InternalError(format!("Failed to parse response: {}", e)))?;
+
+    let choice = raw["choices"]
+        .get(0)
+        .ok_or_else(|| DaemonError::InternalError("No choices in DeepSeek response".to_string()))?;
+
+    let message = &choice["message"];
+    let content = message["content"].as_str().unwrap_or("").to_string();
+    let finish_reason = choice["finish_reason"]
+        .as_str()
+        .unwrap_or("stop")
+        .to_string();
+
+    let tool_calls = message["tool_calls"].as_array().map(|arr| {
+        arr.iter()
+            .filter_map(|tc| {
+                let id = tc["id"].as_str()?.to_string();
+                let function = tc.get("function")?;
+                let name = function["name"].as_str()?.to_string();
+                let args_raw = function["arguments"].as_str().unwrap_or("{}");
+                let arguments: serde_json::Value = serde_json::from_str(args_raw)
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                Some(LlmToolCall {
+                    id: id.clone(),
+                    call_id: Some(id),
+                    name,
+                    arguments,
+                    signature: None,
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+
+    Ok(LlmChatResponse {
+        content,
+        finish_reason,
+        tool_calls,
+        usage: None,
+        images: vec![],
+    })
+}
+
 /// Execute a chat request using the DeepSeek provider (native rig provider).
 async fn execute_deepseek_chat(
     api_key: &str,
