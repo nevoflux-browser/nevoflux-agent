@@ -18,12 +18,11 @@ use rig::client::CompletionClient;
 use rig::client::Nothing;
 use rig::completion::{CompletionModel, ToolDefinition};
 use rig::message::{
-    AssistantContent, DocumentSourceKind, Image, ImageDetail, ImageMediaType, Message,
-    Text, ToolCall as RigToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
+    AssistantContent, DocumentSourceKind, Image, ImageDetail, ImageMediaType, Message, Text,
+    ToolCall as RigToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
 };
 use rig::providers::{
-    anthropic, cohere, gemini, groq, mistral, ollama, openai, openrouter, perplexity, together,
-    xai,
+    anthropic, cohere, gemini, groq, mistral, ollama, openai, openrouter, perplexity, together, xai,
 };
 use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 use rig::OneOrMany;
@@ -732,14 +731,16 @@ fn build_deepseek_request_body(
                 if let Some(ref tcs) = msg.tool_calls {
                     let arr: Vec<serde_json::Value> = tcs
                         .iter()
-                        .map(|tc| serde_json::json!({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": tc.arguments.to_string(),
-                            },
-                        }))
+                        .map(|tc| {
+                            serde_json::json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": tc.arguments.to_string(),
+                                },
+                            })
+                        })
                         .collect();
                     m["tool_calls"] = serde_json::Value::Array(arr);
                 }
@@ -782,14 +783,16 @@ fn build_deepseek_request_body(
         if !tools.is_empty() {
             let arr: Vec<serde_json::Value> = tools
                 .iter()
-                .map(|t| serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    },
-                }))
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        },
+                    })
+                })
                 .collect();
             body["tools"] = serde_json::Value::Array(arr);
             body["tool_choice"] = serde_json::json!("auto");
@@ -2470,14 +2473,13 @@ async fn stream_deepseek_raw(
                     if let Some(tcs) = delta["tool_calls"].as_array() {
                         for tc in tcs {
                             let index = tc["index"].as_i64().unwrap_or(0);
-                            let entry =
-                                accumulated_tool_calls.entry(index).or_insert_with(|| {
-                                    ToolCallAccum {
-                                        id: String::new(),
-                                        name: String::new(),
-                                        arguments: String::new(),
-                                    }
-                                });
+                            let entry = accumulated_tool_calls.entry(index).or_insert_with(|| {
+                                ToolCallAccum {
+                                    id: String::new(),
+                                    name: String::new(),
+                                    arguments: String::new(),
+                                }
+                            });
                             if let Some(id) = tc["id"].as_str() {
                                 entry.id = id.to_string();
                             }
@@ -3012,7 +3014,9 @@ async fn stream_acp_completion(
                 ));
             }
         } else {
-            tracing::warn!("MCP bridge mode but no host_services — MCP tool calls will return 'no active tool executor'");
+            tracing::warn!(
+                "MCP bridge mode but no host_services — MCP tool calls will return 'no active tool executor'"
+            );
         }
 
         Some(tool_bridge.executor_guard())
@@ -4085,8 +4089,11 @@ where
     }
     tracing::info!(
         "Stream complete. text_chunks={}, text_bytes={}, sent_tool_call_ids={:?}, final_tool_calls_count={}, receiver_dropped={}",
-        total_text_chunks, total_text_bytes, sent_tool_call_ids,
-        final_tool_calls.len(), receiver_dropped
+        total_text_chunks,
+        total_text_bytes,
+        sent_tool_call_ids,
+        final_tool_calls.len(),
+        receiver_dropped
     );
 
     let _ = tx
@@ -4760,7 +4767,11 @@ mod tests {
     fn build_rig_assistant_message_never_emits_reasoning() {
         use rig::completion::message::AssistantContent;
 
-        for provider in [ProviderType::DeepSeek, ProviderType::OpenAi, ProviderType::Anthropic] {
+        for provider in [
+            ProviderType::DeepSeek,
+            ProviderType::OpenAi,
+            ProviderType::Anthropic,
+        ] {
             let msg = LlmMessage {
                 role: "assistant".into(),
                 content: "hi".into(),
@@ -4831,7 +4842,9 @@ mod tests {
             assistant["reasoning_content"], "step 1: get the page",
             "reasoning_content must ride with the assistant turn that has tool_calls"
         );
-        let tool_calls = assistant["tool_calls"].as_array().expect("tool_calls present");
+        let tool_calls = assistant["tool_calls"]
+            .as_array()
+            .expect("tool_calls present");
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0]["function"]["name"], "browser_get_markdown");
 
@@ -4843,10 +4856,7 @@ mod tests {
     #[test]
     fn deepseek_request_body_omits_reasoning_when_absent() {
         let request = LlmChatRequest {
-            messages: vec![
-                LlmMessage::user("hi"),
-                LlmMessage::assistant("hello"),
-            ],
+            messages: vec![LlmMessage::user("hi"), LlmMessage::assistant("hello")],
             system: None,
             temperature: None,
             max_tokens: None,
