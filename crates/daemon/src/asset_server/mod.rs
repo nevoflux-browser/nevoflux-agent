@@ -87,6 +87,11 @@ pub struct AssetServerConfig {
     /// unit-test boots leave it `None` and the corresponding routes
     /// return 503.
     pub storage: Option<Arc<nevoflux_storage::Database>>,
+    /// Canvas video service — used by Phase 3 asset upload handler to
+    /// reuse `attach_asset` (resize + magic-byte sniff + dual-write
+    /// `files`/`content` invariant). `None` in unit-test boots that
+    /// don't exercise the asset upload route.
+    pub canvas_video_service: Option<Arc<crate::canvas_video::CanvasVideoService>>,
 }
 
 impl std::fmt::Debug for AssetServerConfig {
@@ -96,6 +101,10 @@ impl std::fmt::Debug for AssetServerConfig {
             .field("max_body_size", &self.max_body_size)
             .field("allowed_origin", &self.allowed_origin)
             .field("storage", &self.storage.as_ref().map(|_| "Some(Database)"))
+            .field(
+                "canvas_video_service",
+                &self.canvas_video_service.as_ref().map(|_| "Some(...)"),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -112,6 +121,7 @@ impl Default for AssetServerConfig {
             max_body_size: DEFAULT_MAX_BODY_SIZE,
             allowed_origin: None,
             storage: None,
+            canvas_video_service: None,
         }
     }
 }
@@ -295,15 +305,16 @@ fn build_router(state: Arc<AssetServerState>, max_body: usize) -> Router {
             "/v1/upload/screenshot/:request_id",
             post(handlers::upload::handle_screenshot),
         )
-        // Phase 3-5 reserved namespaces — 501 stubs (still bearer-protected).
+        // Phase 3 — generic byte sink + asset drop (lit). Auth: bearer.
         .route(
-            "/v1/upload/asset/:id/:name",
-            post(handlers::stubs::stub_phase3),
+            "/v1/upload/asset/:composition_id/:name",
+            post(handlers::upload::handle_asset),
         )
         .route(
-            "/v1/upload/generic/:inbox",
-            post(handlers::stubs::stub_phase3),
+            "/v1/upload/generic/:inbox_id",
+            post(handlers::upload::handle_generic),
         )
+        // Phase 4-5 reserved namespaces — 501 stubs.
         .route("/v1/render/:job/frame", post(handlers::stubs::stub_phase4))
         .route("/v1/render/:job/sse", get(handlers::stubs::stub_phase4))
         .route("/v1/blob/:id", get(handlers::stubs::stub_phase5))
@@ -1039,5 +1050,205 @@ mod tests {
         );
         let resp = test_client().get(&cross_url).send().await.unwrap();
         assert_eq!(resp.status(), 401);
+    }
+
+    // -----------------------------------------------------------------------
+    // §7.3 — Phase 3 generic upload + asset drop
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn generic_upload_returns_201_with_sha_and_metadata() {
+        let server = boot().await;
+        let url = format!(
+            "http://127.0.0.1:{}/v1/upload/generic/inbox-abc",
+            server.bound_port()
+        );
+        let body = b"hello generic plane".to_vec();
+        let resp = test_client()
+            .post(&url)
+            .header("authorization", "Bearer test-bearer")
+            .header("content-type", "application/octet-stream")
+            .header("x-nf-filename", "note.bin")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(json["id"], "inbox-abc");
+        assert_eq!(json["bytes"], body.len());
+        assert_eq!(json["filename"], "note.bin");
+        assert_eq!(json["content_type"], "application/octet-stream");
+        // SHA-256 of "hello generic plane"
+        let sha = json["sha256"].as_str().unwrap();
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&body);
+        let expected = format!("{:x}", h.finalize());
+        assert_eq!(sha, expected);
+    }
+
+    #[tokio::test]
+    async fn generic_upload_then_await_inbox_returns_bytes() {
+        // Upload-then-consume round-trip — proves the generic route shares
+        // the same `upload_inbox` plumbing as the screenshot route, so a
+        // tool dispatcher waiting on `await_inbox(inbox_id)` sees the
+        // bytes a content-script POST delivered.
+        let server = boot().await;
+        let url = format!(
+            "http://127.0.0.1:{}/v1/upload/generic/inbox-roundtrip",
+            server.bound_port()
+        );
+        let resp = test_client()
+            .post(&url)
+            .header("authorization", "Bearer test-bearer")
+            .body(b"pasted data".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+
+        // The screenshot helper uses upload_inbox under the hood — the
+        // same store backs the generic route, so reusing await_screenshot
+        // here is intentional (and verifies the contract).
+        let bytes = server
+            .await_screenshot("inbox-roundtrip", std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"pasted data");
+    }
+
+    #[tokio::test]
+    async fn generic_upload_missing_bearer_returns_401() {
+        let server = boot().await;
+        let url = format!(
+            "http://127.0.0.1:{}/v1/upload/generic/inbox-noauth",
+            server.bound_port()
+        );
+        let resp = test_client()
+            .post(&url)
+            .body(b"x".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn asset_upload_returns_503_when_canvas_video_service_not_wired() {
+        // Test boot has neither storage nor canvas_video_service. Asset
+        // upload should fail gracefully so callers fall back to NM
+        // (matches the composition GET 503 contract).
+        let server = boot().await;
+        let url = format!(
+            "http://127.0.0.1:{}/v1/upload/asset/comp-x/hero.png",
+            server.bound_port()
+        );
+        let resp = test_client()
+            .post(&url)
+            .header("authorization", "Bearer test-bearer")
+            .header("content-type", "image/png")
+            .body(vec![0u8; 8])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn asset_upload_persists_into_artifact_files_and_serves_via_get() {
+        // End-to-end: POST raw PNG bytes → daemon attach_asset writes
+        // base64 into artifacts.files['assets/hero.png'] → subsequent
+        // /v1/asset/composition/<id>/hero.png GET returns the same bytes.
+        use crate::canvas_video::CanvasVideoService;
+        use nevoflux_storage::repositories::ArtifactRepository;
+
+        // 1. Build a CanvasVideoService with a fixture composition (no
+        //    asset yet — the upload will add it).
+        let svc = std::sync::Arc::new(CanvasVideoService::new_for_tests());
+        let storage = svc.storage().unwrap().clone();
+        let repo = ArtifactRepository::new(storage.database());
+        let id = "comp-phase3-upload";
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "index.html".into(),
+            r#"<html><body><img src="assets/hero.png"></body></html>"#.to_string(),
+        );
+        files.insert(
+            "composition.meta.json".into(),
+            serde_json::json!({
+                "kind": "composition", "version": 1,
+                "spec": {"width": 640, "height": 360, "duration_sec": 5.0, "fps": 30},
+                "origin": {"created_with": "phase3-test", "created_at": 0}
+            })
+            .to_string(),
+        );
+        repo.create(nevoflux_storage::CreateArtifactParams {
+            id: id.into(),
+            session_id: None,
+            title: "phase3 fixture".into(),
+            description: None,
+            content_type: "text/html".into(),
+            content: files["index.html"].clone(),
+            files: Some(files),
+            entry: Some("index.html".into()),
+        })
+        .unwrap();
+
+        let db_arc = std::sync::Arc::new(svc.storage().unwrap().database().clone());
+        let server = AssetServer::start(AssetServerConfig {
+            bearer_token: "test-bearer".into(),
+            session_id: "test-session".into(),
+            storage: Some(db_arc),
+            canvas_video_service: Some(svc.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("AssetServer should boot for phase3 upload test");
+
+        // 2. POST raw PNG bytes (1×1 transparent PNG, 67 bytes — small
+        //    enough that resize is a no-op).
+        const PNG_1X1: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // sig
+            0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D', b'R',
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89,
+            0x00, 0x00, 0x00, 0x0D, b'I', b'D', b'A', b'T',
+            0x78, 0x9C, 0x62, 0x00, 0x01, 0x00, 0x00, 0x05,
+            0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4,
+            0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D',
+            0xAE, 0x42, 0x60, 0x82,
+        ];
+        let upload_url = format!(
+            "http://127.0.0.1:{}/v1/upload/asset/{}/hero.png",
+            server.bound_port(),
+            id
+        );
+        let resp = test_client()
+            .post(&upload_url)
+            .header("authorization", "Bearer test-bearer")
+            .header("content-type", "image/png")
+            .body(PNG_1X1.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        let json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(json["composition_id"], id);
+        assert_eq!(json["path"], "assets/hero.png");
+
+        // 3. Confirm bytes round-trip via the Phase 2 asset GET route.
+        let urls = server.register_composition_assets(
+            id,
+            &[String::from("hero.png")],
+            std::time::Duration::from_secs(60),
+        );
+        let resp = test_client().get(&urls["hero.png"]).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.bytes().await.unwrap();
+        // First 8 bytes match the PNG signature — proves the upload's
+        // bytes survived the base64 round-trip and the magic-byte sniff
+        // selected `image/png`.
+        assert_eq!(&body[..8], &PNG_1X1[..8]);
     }
 }

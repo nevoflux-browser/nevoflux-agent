@@ -39,6 +39,11 @@ pub struct AssetServerState {
     /// those routes; handlers return 503 when missing so callers can fall
     /// back to NM transport.
     pub storage: Option<Arc<Database>>,
+    /// Canvas video service — used by the Phase 3 asset upload handler so
+    /// it can call `attach_asset` (which encapsulates resize, magic-byte
+    /// MIME sniff, and the dual-write `files`/`content` invariant).
+    /// `None` in test boots that don't exercise the upload route.
+    pub canvas_video_service: Option<Arc<crate::canvas_video::CanvasVideoService>>,
     /// Bound port — set by `AssetServer::start` after the listener wins a
     /// slot, read by the composition handler to construct absolute asset
     /// URLs. Stored as `AtomicU16` so the handler can access it via the
@@ -58,6 +63,7 @@ impl AssetServerState {
             blob_tokens: Arc::new(TokenStore::new()),
             upload_inbox: Arc::new(super::inbox::UploadInbox::new()),
             storage: config.storage.clone(),
+            canvas_video_service: config.canvas_video_service.clone(),
             bound_port: AtomicU16::new(0),
         }
     }
