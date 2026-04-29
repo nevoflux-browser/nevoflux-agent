@@ -86,6 +86,15 @@ pub struct LlmToolCall {
     pub signature: Option<String>,
 }
 
+/// Fallback `max_tokens` cap for completion / streaming requests when
+/// the caller didn't supply a value. Anthropic's REST API rejects
+/// requests without `max_tokens`, so this is required to keep the
+/// streaming path from failing on synthesized / test requests.
+/// 32768 matches `default_max_tokens()` in config.rs — see the comment
+/// there for the reasoning-model rationale (thinking budget + visible
+/// output share the same cap).
+const DEFAULT_MAX_TOKENS_FALLBACK: u64 = 32_768;
+
 /// Request structure for LLM chat operations.
 ///
 /// This is the JSON structure that Wasm guests send to the `llm_chat` host function.
@@ -1290,6 +1299,14 @@ where
         let rig_tools: Vec<ToolDefinition> = tools.into_iter().map(|t| t.into()).collect();
         builder = builder.tools(rig_tools);
     }
+
+    // Anthropic mandates `max_tokens`. See the matching block in
+    // `stream_rig_completion` for the long version of why this exists.
+    let resolved_max_tokens: u64 = request
+        .max_tokens
+        .map(|n| n as u64)
+        .unwrap_or(DEFAULT_MAX_TOKENS_FALLBACK);
+    builder = builder.max_tokens(resolved_max_tokens);
 
     // Execute the request
     let completion_response = builder
@@ -3426,6 +3443,22 @@ where
         let rig_tools: Vec<ToolDefinition> = tools.into_iter().map(|t| t.into()).collect();
         builder = builder.tools(rig_tools);
     }
+
+    // Anthropic's REST API mandates `max_tokens` on every request — without
+    // it rig-core fails with `RequestError: max_tokens must be set for
+    // Anthropic` before any HTTP traffic happens. Other providers tolerate
+    // an unset value (they fall back to their own model-default cap), but
+    // we always pass through whatever the caller put on the request. When
+    // the caller didn't set anything, fall back to a generic 4096 cap that
+    // covers chat-style turns without truncating. The agent path
+    // (agent_host.rs) already populates this from config; the fallback
+    // here is for synthetic / test paths that build LlmChatRequest by
+    // hand.
+    let resolved_max_tokens: u64 = request
+        .max_tokens
+        .map(|n| n as u64)
+        .unwrap_or(DEFAULT_MAX_TOKENS_FALLBACK);
+    builder = builder.max_tokens(resolved_max_tokens);
 
     // Execute streaming request
     let mut stream_response = builder

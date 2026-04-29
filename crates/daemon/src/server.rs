@@ -2975,12 +2975,33 @@ pub async fn start_server(
 
             // Page-driven render failure (extension -> daemon).
             if msg_type == "canvas_video_render_failed" {
-                info!("Processing canvas_video_render_failed message");
                 let payload = envelope
                     .payload
                     .get("payload")
                     .cloned()
                     .unwrap_or(serde_json::Value::Object(Default::default()));
+                // Surface the page's actual error message so we don't
+                // have to chase the bridge end. Without this we get a
+                // dry "Processing canvas_video_render_failed" line and
+                // nothing else — the failure cause stays opaque.
+                let job_id = payload
+                    .get("job_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let error = payload
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(no error field in payload)");
+                let frames_emitted = payload
+                    .get("frames_emitted")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                tracing::warn!(
+                    job_id = %job_id,
+                    frames_emitted = %frames_emitted,
+                    error = %error,
+                    "canvas_video_render_failed (page-driven)",
+                );
                 let _ = crate::canvas_video::handlers::handle(
                     &process_canvas_video_service,
                     msg_type,
@@ -3774,7 +3795,7 @@ async fn handle_chat_message_streaming(
         .unwrap_or(AgentMode::Chat);
 
     // Extract attachments (multimodal: images, files)
-    let attachments: Vec<Attachment> = payload
+    let mut attachments: Vec<Attachment> = payload
         .get("payload")
         .and_then(|p| p.get("attachments"))
         .and_then(|a| a.as_array())
@@ -3795,7 +3816,7 @@ async fn handle_chat_message_streaming(
         .unwrap_or_default();
 
     // Extract local file references (from file picker)
-    let local_files: Vec<nevoflux_protocol::FileInfo> = payload
+    let mut local_files: Vec<nevoflux_protocol::FileInfo> = payload
         .get("payload")
         .and_then(|p| p.get("local_files"))
         .and_then(|f| f.as_array())
@@ -3966,6 +3987,13 @@ async fn handle_chat_message_streaming(
     } else {
         (message_content.to_string(), None)
     };
+
+    // Promote image-typed local_files into real attachments so the LLM can
+    // actually SEE the picture instead of being told "use the read tool".
+    // Without this, the agent runs read() on a binary PNG, gets a UTF-8
+    // decode error, and silently gives up — observed in
+    // /tmp/nevoflux-debug.log: round 2 produces 0 text and 0 tool calls.
+    promote_image_local_files_to_attachments(&mut attachments, &mut local_files);
 
     info!(
         "Processing streaming chat message with mode={:?}, session={}, attachments={}, local_files={}, tab_id={:?}, tab_ids={}, skill={:?}",
@@ -5400,7 +5428,7 @@ async fn handle_chat_message(
                 .unwrap_or(AgentMode::Chat);
 
             // Extract attachments (multimodal: images, files)
-            let attachments: Vec<Attachment> = payload
+            let mut attachments: Vec<Attachment> = payload
                 .get("payload")
                 .and_then(|p| p.get("attachments"))
                 .and_then(|a| a.as_array())
@@ -5421,7 +5449,7 @@ async fn handle_chat_message(
                 .unwrap_or_default();
 
             // Extract local file references (from file picker)
-            let local_files: Vec<nevoflux_protocol::FileInfo> = payload
+            let mut local_files: Vec<nevoflux_protocol::FileInfo> = payload
                 .get("payload")
                 .and_then(|p| p.get("local_files"))
                 .and_then(|f| f.as_array())
@@ -5442,6 +5470,11 @@ async fn handle_chat_message(
                         .collect()
                 })
                 .unwrap_or_default();
+
+            // Mirror of the streaming path: turn image local_files into
+            // proper attachments so the LLM sees the picture instead of
+            // being told to read it via an unsupported tool.
+            promote_image_local_files_to_attachments(&mut attachments, &mut local_files);
 
             // Extract tab_id if provided (from browser sidebar)
             let tab_id = payload
@@ -8756,6 +8789,144 @@ async fn gather_available_tools(services: &HostServices) -> Vec<String> {
 
 /// Build attachment metadata from attachments and local files for persisting in message history.
 ///
+/// Read image-typed `local_files` from disk and turn them into real
+/// `Attachment` entries so the LLM can SEE the picture (vision modality)
+/// instead of being told to use the `read` tool. The `read` tool calls
+/// `fs::read_to_string` which fails on binary PNG/JPEG with a UTF-8
+/// error, leaving the agent confused (observed bug:
+/// /tmp/nevoflux-debug.log shows round 2 producing 0 text + 0 tool
+/// calls after `read` returned an 83-byte error message).
+///
+/// Promotion rules:
+/// - Only image MIME types (`image/*`) are promoted. Documents / archives
+///   stay as `local_files` so the agent can still drive `read` on text
+///   formats it knows how to handle.
+/// - **Downscale to LLM-friendly size before encoding.** A 6.45 MB PNG
+///   becomes a 9 MB base64 string in the LLM payload, which most proxies
+///   (and even the direct Anthropic 5 MB-per-image cap) reject. Modern
+///   vision models work fine on ~1024 px images; we resize via
+///   `canvas_video::asset_resize::maybe_resize_bytes` with stage=1024×1024
+///   so opaque PNGs become small JPEG q=85 and transparent PNGs stay PNG
+///   at the smaller dimensions.
+/// - Failure-safe: if `fs::read` or resize fails, the entry stays in
+///   `local_files` so the metadata is still surfaced to the agent and
+///   other code paths (history display, etc.) keep working.
+/// - Cap: skip files > 20 MB advertised; refuse promotion if even the
+///   resized output exceeds 5 MB raw (the Anthropic-direct cap and a
+///   reasonable upper bound for any proxy).
+fn promote_image_local_files_to_attachments(
+    attachments: &mut Vec<Attachment>,
+    local_files: &mut Vec<nevoflux_protocol::FileInfo>,
+) {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use crate::canvas_video::asset_resize::{maybe_resize_bytes, ResizeOutcome};
+
+    const MAX_INPUT_BYTES: u64 = 20 * 1024 * 1024;
+    const LLM_STAGE_MAX: u32 = 1024;
+    // Hard ceiling on the post-resize payload sent to the LLM. Anthropic
+    // direct caps individual images at 5 MB; third-party proxies often
+    // smaller. After resizing to 1024 px JPEG q=85 we should be well
+    // under this — guard rejects pathological cases.
+    const MAX_LLM_BYTES: usize = 5 * 1024 * 1024;
+
+    let mut promoted_paths: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    for f in local_files.iter() {
+        if f.is_directory {
+            continue;
+        }
+        let original_mime = guess_mime_type(&f.path);
+        if !original_mime.starts_with("image/") {
+            continue;
+        }
+        if f.size.map(|s| s > MAX_INPUT_BYTES).unwrap_or(false) {
+            tracing::warn!(
+                path = %f.path,
+                size = ?f.size,
+                "image local_file too large to promote to attachment; leaving as path-only reference"
+            );
+            continue;
+        }
+
+        let raw_bytes = match std::fs::read(&f.path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    path = %f.path,
+                    error = %e,
+                    "failed to read image local_file for attachment promotion"
+                );
+                continue;
+            }
+        };
+        let original_bytes = raw_bytes.len();
+        if original_bytes as u64 > MAX_INPUT_BYTES {
+            tracing::warn!(
+                path = %f.path,
+                bytes = original_bytes,
+                "image local_file exceeded MAX_INPUT_BYTES post-read; skipping promotion"
+            );
+            continue;
+        }
+
+        // Resize to LLM-friendly dimensions. The 1024×1024 box is what
+        // Claude vision tools internally normalise to anyway; sending
+        // anything bigger spends bandwidth without improving recognition.
+        let (resized_bytes, outcome) =
+            maybe_resize_bytes(&raw_bytes, LLM_STAGE_MAX, LLM_STAGE_MAX);
+        let (final_bytes, final_mime): (Vec<u8>, String) = match &outcome {
+            ResizeOutcome::Resized { format, .. } => {
+                let new_mime = match format {
+                    image::ImageFormat::Jpeg => "image/jpeg",
+                    image::ImageFormat::Png => "image/png",
+                    image::ImageFormat::Gif => "image/gif",
+                    _ => "application/octet-stream",
+                };
+                (resized_bytes, new_mime.to_string())
+            }
+            // No resize / not-an-image / failure → fall back to original
+            // bytes with the original mime. We still promote (don't drop
+            // tiny images just because they didn't get resized).
+            _ => (raw_bytes, original_mime.to_string()),
+        };
+
+        if final_bytes.len() > MAX_LLM_BYTES {
+            tracing::warn!(
+                path = %f.path,
+                final_bytes = final_bytes.len(),
+                "post-resize image still > {} MB; skipping promotion (LLM proxy will likely reject)",
+                MAX_LLM_BYTES / (1024 * 1024)
+            );
+            continue;
+        }
+
+        let name = std::path::Path::new(&f.path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| f.path.clone());
+        let data = STANDARD.encode(&final_bytes);
+        attachments.push(Attachment {
+            name,
+            mime_type: final_mime.clone(),
+            data,
+        });
+        promoted_paths.insert(f.path.clone());
+        tracing::info!(
+            path = %f.path,
+            mime = %final_mime,
+            original_bytes = original_bytes,
+            llm_bytes = final_bytes.len(),
+            outcome = ?outcome,
+            "promoted image local_file to attachment (with resize)"
+        );
+    }
+
+    if !promoted_paths.is_empty() {
+        local_files.retain(|f| !promoted_paths.contains(&f.path));
+    }
+}
+
 /// Stores only name, mime_type, and path — no base64 data — to keep the database small.
 fn build_attachment_metadata(
     attachments: &[Attachment],
@@ -8848,6 +9019,171 @@ mod tests {
         assert_eq!(config.port_start, 19500);
         assert_eq!(config.port_end, 19600);
         assert_eq!(config.bind_address, "127.0.0.1");
+    }
+
+    #[test]
+    fn promote_image_local_files_reads_bytes_and_drops_entry() {
+        // Write a real PNG to a tempfile and verify the helper reads it,
+        // base64-encodes it into attachments, and drops the local_files
+        // entry so the agent doesn't double-process.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hero.png");
+        // Minimal valid PNG header — magic byte sniffer in the inliner
+        // recognizes it; that's all we need for this unit.
+        let bytes: Vec<u8> = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+        ];
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut attachments: Vec<Attachment> = Vec::new();
+        let mut local_files = vec![nevoflux_protocol::FileInfo {
+            path: path.to_string_lossy().to_string(),
+            is_directory: false,
+            size: Some(bytes.len() as u64),
+            modified: None,
+        }];
+
+        promote_image_local_files_to_attachments(&mut attachments, &mut local_files);
+
+        assert_eq!(attachments.len(), 1, "image should have been promoted");
+        assert_eq!(attachments[0].mime_type, "image/png");
+        assert_eq!(attachments[0].name, "hero.png");
+        assert!(!attachments[0].data.is_empty(), "data must be base64-encoded");
+        // Decode and compare round-trip.
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let round_trip = STANDARD.decode(&attachments[0].data).unwrap();
+        assert_eq!(round_trip, bytes);
+        assert_eq!(local_files.len(), 0, "promoted entry must be removed from local_files");
+
+        // Reuse: writing a tmpfile guard
+        let _ = &dir;
+    }
+
+    #[test]
+    fn promote_skips_non_image_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("README.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let mut attachments: Vec<Attachment> = Vec::new();
+        let mut local_files = vec![nevoflux_protocol::FileInfo {
+            path: path.to_string_lossy().to_string(),
+            is_directory: false,
+            size: Some(5),
+            modified: None,
+        }];
+        promote_image_local_files_to_attachments(&mut attachments, &mut local_files);
+        assert_eq!(attachments.len(), 0, "non-image must NOT be promoted");
+        assert_eq!(local_files.len(), 1, "non-image stays in local_files");
+        let _ = &dir;
+    }
+
+    #[test]
+    fn promote_skips_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        // Direct path to the dir itself, marked as directory.
+        let mut attachments: Vec<Attachment> = Vec::new();
+        let mut local_files = vec![nevoflux_protocol::FileInfo {
+            path: dir.path().to_string_lossy().to_string(),
+            is_directory: true,
+            size: None,
+            modified: None,
+        }];
+        promote_image_local_files_to_attachments(&mut attachments, &mut local_files);
+        assert_eq!(attachments.len(), 0, "directories never get promoted");
+        assert_eq!(local_files.len(), 1, "directory stays in local_files");
+        let _ = &dir;
+    }
+
+    #[test]
+    fn promote_handles_missing_file_gracefully() {
+        // Path that doesn't exist — must not panic, must not add to
+        // attachments, must keep the entry in local_files (so the agent
+        // can at least see the metadata).
+        let mut attachments: Vec<Attachment> = Vec::new();
+        let mut local_files = vec![nevoflux_protocol::FileInfo {
+            path: "/this/path/does/not/exist/hero.png".to_string(),
+            is_directory: false,
+            size: Some(1024),
+            modified: None,
+        }];
+        promote_image_local_files_to_attachments(&mut attachments, &mut local_files);
+        assert_eq!(attachments.len(), 0);
+        assert_eq!(local_files.len(), 1, "missing file kept as path reference");
+    }
+
+    #[test]
+    fn promote_skips_oversized_image_by_metadata() {
+        // size > 20 MB → skip without even trying to read.
+        let mut attachments: Vec<Attachment> = Vec::new();
+        let mut local_files = vec![nevoflux_protocol::FileInfo {
+            path: "/tmp/huge.png".to_string(),
+            is_directory: false,
+            size: Some(100 * 1024 * 1024), // 100 MB advertised
+            modified: None,
+        }];
+        promote_image_local_files_to_attachments(&mut attachments, &mut local_files);
+        assert_eq!(attachments.len(), 0);
+        assert_eq!(local_files.len(), 1);
+    }
+
+    #[test]
+    fn promote_resizes_oversized_image_before_llm_payload() {
+        // Reproduces the exact failing scenario from the user's log:
+        // a 2816×1536 high-entropy PNG (logged as 6.45 MB raw, 9 MB
+        // base64). After my fix, promotion must resize it down so the
+        // LLM payload is well under the 5 MB cap.
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use image::{codecs::png::PngEncoder, ImageEncoder};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hero.png");
+
+        // High-entropy pixels — PNG predictors can't compress, simulating
+        // a real photo encoded as PNG.
+        let (w, h) = (2816u32, 1536u32);
+        let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let r = x.wrapping_mul(2654435761).wrapping_add(y.wrapping_mul(40503)) as u8;
+                let g = y.wrapping_mul(2246822519).wrapping_add(x.wrapping_mul(16807)) as u8;
+                let b = (x ^ y).wrapping_mul(1597334677) as u8;
+                rgb.extend_from_slice(&[r, g, b]);
+            }
+        }
+        let mut png_bytes = Vec::new();
+        let encoder = PngEncoder::new(&mut png_bytes);
+        encoder.write_image(&rgb, w, h, image::ColorType::Rgb8.into()).unwrap();
+        std::fs::write(&path, &png_bytes).unwrap();
+
+        let original_size = png_bytes.len();
+        // Sanity: the test fixture really exceeds the LLM-payload cap
+        // when sent raw. Otherwise the test wouldn't be exercising the
+        // resize path.
+        assert!(original_size > 5 * 1024 * 1024,
+            "fixture only {} bytes — expected > 5 MB to trigger LLM size guard", original_size);
+
+        let mut attachments: Vec<Attachment> = Vec::new();
+        let mut local_files = vec![nevoflux_protocol::FileInfo {
+            path: path.to_string_lossy().to_string(),
+            is_directory: false,
+            size: Some(original_size as u64),
+            modified: None,
+        }];
+
+        promote_image_local_files_to_attachments(&mut attachments, &mut local_files);
+
+        assert_eq!(attachments.len(), 1, "image must be promoted (with resize)");
+        assert_eq!(local_files.len(), 0, "promoted entry removed");
+
+        // Decode the output and verify it's much smaller AND inside the
+        // LLM cap. Opaque photo PNG → JPEG q=85 path.
+        let llm_bytes = STANDARD.decode(&attachments[0].data).unwrap();
+        assert!(llm_bytes.len() < 1 * 1024 * 1024,
+            "LLM payload {} bytes; should be < 1 MB after resize", llm_bytes.len());
+        assert_eq!(attachments[0].mime_type, "image/jpeg",
+            "opaque PNG should convert to JPEG");
+        let _ = &dir;
     }
 
     #[test]

@@ -778,7 +778,16 @@ impl Default for LlmConfig {
 }
 
 fn default_max_tokens() -> u32 {
-    4096
+    // 32768 covers reasoning-style models (Anthropic Sonnet 4.5 thinking,
+    // mimo-v2.5-pro, etc.) where the same `max_tokens` budget pays for
+    // BOTH internal thinking AND visible output. With 4096 the model can
+    // burn the whole budget on thinking and emit zero visible content
+    // (observed in /tmp/nevoflux-debug.log: round 3 streamed for 75s
+    // with 0 text + 0 tool calls). 32768 leaves headroom for chain-of-
+    // thought + a meaningful tool-calling response. Modern Claude
+    // models support this size; Anthropic's docs recommend setting the
+    // model's max output cap when in doubt.
+    32_768
 }
 
 fn default_temperature() -> f32 {
@@ -1418,7 +1427,7 @@ mod tests {
         assert_eq!(config.daemon.idle_timeout_secs, 1800);
 
         // Check LLM defaults
-        assert_eq!(config.llm.max_tokens, 4096);
+        assert_eq!(config.llm.max_tokens, 32_768);
         assert_eq!(config.llm.temperature, 0.7);
         assert!(config.llm.provider.is_none());
         assert!(config.llm.default_provider.is_none());
@@ -1438,7 +1447,7 @@ mod tests {
         let config = AgentConfig::load_from_path(&path).unwrap();
 
         assert_eq!(config.daemon.port_range_start, 19500);
-        assert_eq!(config.llm.max_tokens, 4096);
+        assert_eq!(config.llm.max_tokens, 32_768);
     }
 
     #[test]
@@ -1558,7 +1567,7 @@ level = "warn"
 
         // Values that weren't changed should keep their defaults
         assert_eq!(base.daemon.idle_timeout_secs, 1800);
-        assert_eq!(base.llm.max_tokens, 4096);
+        assert_eq!(base.llm.max_tokens, 32_768);
     }
 
     #[test]
@@ -1568,7 +1577,7 @@ level = "warn"
         assert!(config.provider.is_none());
         assert!(config.default_provider.is_none());
         assert!(config.default_model.is_none());
-        assert_eq!(config.max_tokens, 4096);
+        assert_eq!(config.max_tokens, 32_768);
         assert_eq!(config.temperature, 0.7);
         assert_eq!(config.timeout_secs, 120);
         assert_eq!(config.max_retries, 3);

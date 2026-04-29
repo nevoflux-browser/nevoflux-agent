@@ -145,6 +145,20 @@ fn override_extension(name: &str, new_ext: &str) -> String {
     }
 }
 
+/// Pull `(spec.width, spec.height)` out of the composition's
+/// `composition.meta.json` if available. Returns None on any parse
+/// failure — caller defaults to a generous bounding box.
+fn read_stage_dims(files: &std::collections::HashMap<String, String>) -> Option<(u32, u32)> {
+    let raw = files.get("composition.meta.json")?;
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let w = v.get("spec")?.get("width")?.as_u64()? as u32;
+    let h = v.get("spec")?.get("height")?.as_u64()? as u32;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h))
+}
+
 /// Sanitize an asset filename: strip path traversal, collapse to a single
 /// `<basename>.<ext>` form. Drops `..`, leading `/`, and disallowed chars.
 /// Empty / weird input falls back to `asset.bin`.
@@ -363,6 +377,26 @@ impl CanvasVideoService {
                 DaemonError::InvalidRequest(format!("composition not found: {composition_id}"))
             })?;
         let mut files = record.files.unwrap_or_default();
+
+        // Read stage dims from composition.meta.json so we know how big
+        // a bitmap actually has to be. Falls back to a generous 1920×1920
+        // box if the meta is missing/malformed — that's the v1 hard limit
+        // upper bound, so resize is still effective.
+        let (stage_w, stage_h) = read_stage_dims(&files).unwrap_or((1920, 1920));
+
+        // Downscale oversized images BEFORE storage. Without this, a
+        // 4000×6000 hero JPEG becomes a 600KB data: URI inlined into
+        // every rendered frame, blowing past PAGE_IDLE_TIMEOUT. The
+        // resize is best-effort: any failure (non-image payload, decode
+        // error, encode error) returns the original bytes, so attach
+        // never fails because of this path.
+        let (final_payload, resize_outcome) =
+            super::asset_resize::maybe_resize(payload_b64, stage_w, stage_h);
+        let final_size_bytes = match &resize_outcome {
+            super::asset_resize::ResizeOutcome::Resized { new_bytes, .. } => *new_bytes as u64,
+            _ => size_bytes,
+        };
+
         // Preserve the caller-supplied path verbatim. Even when the agent
         // mis-extensions (saves a JPEG as foo.png), we keep the path so
         // that any `<img src="assets/foo.png">` references the agent
@@ -370,7 +404,8 @@ impl CanvasVideoService {
         // sniffs magic bytes at render time and emits the correct
         // `data:<true-mime>;base64,...` URI regardless of path extension.
         let path = format!("assets/{}", sanitize_asset_name(name));
-        files.insert(path.clone(), payload_b64.to_string());
+        files.insert(path.clone(), final_payload);
+
         // Preserve content (= files[entry]) — never let the dual-write
         // invariant drift. We only touched assets/*, so content stays the
         // same, but update_files needs both args.
@@ -382,7 +417,9 @@ impl CanvasVideoService {
         repo.update_files(composition_id, &files, &content)
             .map_err(|e| DaemonError::InternalError(format!("{e}")))?;
         tracing::info!(
-            "canvas_attach_asset: id={composition_id} path={path} mime={mime_type} bytes={size_bytes}"
+            "canvas_attach_asset: id={composition_id} path={path} mime={mime_type} \
+             original_bytes={size_bytes} stored_bytes={final_size_bytes} \
+             stage={stage_w}x{stage_h} resize_outcome={resize_outcome:?}"
         );
         Ok(path)
     }
