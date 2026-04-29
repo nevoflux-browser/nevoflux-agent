@@ -1257,6 +1257,13 @@ pub async fn start_server(
                     bound_port = server.bound_port(),
                     "asset_server: Asset & Stream Plane online"
                 );
+                // Late-bind the AssetServer onto CanvasVideoService so
+                // `load_composition` rewrites `assets/X` to /v1/asset/...
+                // URLs (Phase 2) instead of inlining data URIs. The
+                // service was constructed before this point and is
+                // already Arc-wrapped, so set_asset_server uses interior
+                // mutability (OnceLock).
+                canvas_video_service.set_asset_server(server.clone());
                 services = services.with_asset_server(server);
             }
             Err(e) => {

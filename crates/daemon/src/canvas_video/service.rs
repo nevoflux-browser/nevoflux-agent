@@ -69,6 +69,14 @@ pub struct CanvasVideoService {
     /// Pending inspect correlators — same pattern as `lint_correlators`.
     /// Inserted by `inspect_layout`, removed by `on_inspect_result` or on timeout.
     inspect_correlators: Mutex<HashMap<String, oneshot::Sender<InspectReport>>>,
+
+    /// Asset & Stream Plane HTTP server, set by `set_asset_server` after
+    /// the daemon boots the server (it lives on `HostServices` and is
+    /// constructed AFTER this service in `start_server`). When set,
+    /// `load_composition` rewrites `assets/X` references in the entry HTML
+    /// to absolute `/v1/asset/composition/...` URLs instead of inlining
+    /// data URIs (Phase 2 of the asset-stream-plane design).
+    asset_server: std::sync::OnceLock<crate::asset_server::AssetServer>,
 }
 
 /// Pure throttle decision for progress deliveries. Emits when `current`
@@ -187,6 +195,7 @@ impl CanvasVideoService {
             skills: None,
             lint_correlators: Mutex::new(Default::default()),
             inspect_correlators: Mutex::new(Default::default()),
+            asset_server: std::sync::OnceLock::new(),
         }
     }
 
@@ -202,7 +211,21 @@ impl CanvasVideoService {
             skills: Some(Arc::new(RwLock::new(SkillRegistry::new()))),
             lint_correlators: Mutex::new(Default::default()),
             inspect_correlators: Mutex::new(Default::default()),
+            asset_server: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Late-bind the AssetServer. Called from `start_server` once the
+    /// HTTP listener wins a port slot (which happens AFTER this service
+    /// is constructed and Arc-wrapped). Subsequent calls are no-ops —
+    /// the service holds at most one AssetServer instance for its
+    /// lifetime.
+    pub fn set_asset_server(&self, server: crate::asset_server::AssetServer) {
+        let _ = self.asset_server.set(server);
+    }
+
+    pub fn asset_server(&self) -> Option<&crate::asset_server::AssetServer> {
+        self.asset_server.get()
     }
 
     /// Builder: attach an EventBus so emit_* methods publish progress and
@@ -474,12 +497,37 @@ impl CanvasVideoService {
                 .ok_or_else(|| DaemonError::InvalidComposition {
                     reason: format!("entry file missing: {entry}"),
                 })?;
-        // Inline `assets/*` references as data: URIs so the render tab
-        // (which has no HTTP origin) can actually load `<img>`, `<video>`,
-        // CSS `url(...)`, etc. Stored HTML keeps the relative paths so the
-        // Canvas Editor and `browser_edit_artifact` see the agent-friendly
-        // form; only the render-time view is rewritten.
-        let html = super::asset_inline::inline_assets(&html_raw, files);
+
+        // Phase 2: rewrite `assets/X` to absolute Asset Plane URLs when an
+        // AssetServer is wired (production path). Render tab and Canvas
+        // Editor preview both consume this HTML inside iframes that can
+        // fetch loopback HTTP, so the assets resolve via the asset GET
+        // handler instead of bloating the NM `get_composition` reply with
+        // base64 data URIs (which used to blow the 1 MB NM cap).
+        //
+        // When no AssetServer is wired (most unit tests), refs stay
+        // relative — callers of `load_composition` in those contexts
+        // (lint structural checks, fixture round-trips) don't need
+        // assets to actually resolve.
+        let html = match self.asset_server.get() {
+            Some(asset_server) => {
+                let asset_names: Vec<String> = files
+                    .keys()
+                    .filter_map(|k| k.strip_prefix("assets/").map(|s| s.to_string()))
+                    .collect();
+                if asset_names.is_empty() {
+                    html_raw
+                } else {
+                    let urls = asset_server.register_composition_assets(
+                        composition_id,
+                        &asset_names,
+                        crate::asset_server::COMPOSITION_TOKEN_TTL,
+                    );
+                    super::asset_inline::rewrite_assets_to_urls(&html_raw, &urls)
+                }
+            }
+            None => html_raw,
+        };
         Ok((
             html,
             meta.spec.width,
@@ -992,6 +1040,131 @@ mod p3_load_tests {
     // storage API; the corresponding load_rejects_missing_entry_file test
     // was removed when this invariant landed. If you reintroduce the
     // failure mode (e.g. via raw SQL bypass), reinstate the test.
+
+    // ---------------------------------------------------------------------
+    // Phase 2: load_composition emits URL-rewritten HTML (no data: URIs)
+    // when an AssetServer is wired. With no AssetServer, refs stay relative.
+    // ---------------------------------------------------------------------
+
+    /// 1×1 transparent PNG, base64-encoded — matches what the agent stores
+    /// for binary assets (canvas_attach_asset path).
+    const PNG_1X1_B64: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+    fn composition_meta_json() -> String {
+        serde_json::json!({
+            "kind": "composition", "version": 1,
+            "spec": {"width": 640, "height": 360, "duration_sec": 5.0, "fps": 30},
+            "origin": {"created_with": "phase2-test", "created_at": 0}
+        })
+        .to_string()
+    }
+
+    fn write_fixture(svc: &CanvasVideoService, id: &str) {
+        let storage = svc.storage().unwrap().clone();
+        let repo = ArtifactRepository::new(storage.database());
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "index.html".into(),
+            r#"<html><body><img src="assets/hero.png"></body></html>"#.to_string(),
+        );
+        files.insert("assets/hero.png".into(), PNG_1X1_B64.to_string());
+        files.insert("composition.meta.json".into(), composition_meta_json());
+        repo.create(CreateArtifactParams {
+            id: id.into(),
+            session_id: None,
+            title: "phase2-fixture".into(),
+            description: None,
+            content_type: "text/html".into(),
+            content: files["index.html"].clone(),
+            files: Some(files),
+            entry: Some("index.html".into()),
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_composition_returns_rewritten_urls_not_data_uris() {
+        // Boot a real AssetServer backed by the same Storage the
+        // CanvasVideoService writes to, then assert the response HTML
+        // never contains an inlined data: URI.
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let id = "comp-phase2-rewrite";
+        write_fixture(&svc, id);
+
+        // `Database` is `#[derive(Clone)]` and shares the same
+        // `Arc<Mutex<Connection>>` internally — cloning gives the
+        // AssetServer a handle to the same in-memory SQLite the
+        // CanvasVideoService writes to.
+        let db_arc = std::sync::Arc::new(svc.storage().unwrap().database().clone());
+        let server = crate::asset_server::AssetServer::start(
+            crate::asset_server::AssetServerConfig {
+                bearer_token: "phase2-bearer".into(),
+                session_id: "phase2-session".into(),
+                storage: Some(db_arc),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("AssetServer should boot for phase2 test");
+        svc.set_asset_server(server.clone());
+
+        let (html, _w, _h, _d, _fps) = svc.load_composition(id).await.unwrap();
+        assert!(
+            !html.contains("data:image"),
+            "Phase 2 contract: load_composition MUST NOT inline data: URIs.\n got: {html}"
+        );
+        assert!(
+            html.contains("/v1/asset/composition/comp-phase2-rewrite/hero.png?t="),
+            "expected rewritten Asset Plane URL.\n got: {html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_index_html_keeps_relative_refs() {
+        // C1 invariant: SQLite always holds the agent-friendly relative
+        // form, never the rewritten URL form. (The rewriting is a
+        // GET-time transform on the way out of `load_composition`.)
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let id = "comp-phase2-storage";
+        write_fixture(&svc, id);
+
+        let storage = svc.storage().unwrap().clone();
+        let repo = ArtifactRepository::new(storage.database());
+        let rec = repo.get(id).unwrap().unwrap();
+
+        let stored_html = &rec.files.unwrap()["index.html"];
+        assert!(
+            stored_html.contains(r#"src="assets/hero.png""#),
+            "stored HTML must keep `assets/X` relative refs.\n got: {stored_html}"
+        );
+        assert!(
+            !stored_html.contains("data:image"),
+            "stored HTML must NEVER contain inlined data URIs.\n got: {stored_html}"
+        );
+        assert!(
+            !stored_html.contains("/v1/asset/composition/"),
+            "stored HTML must NEVER contain rewritten asset-plane URLs.\n got: {stored_html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_composition_without_asset_server_keeps_relative_refs() {
+        // Test-mode boot has no AssetServer; load_composition returns the
+        // raw stored HTML untouched (no inlining, no rewriting). This is
+        // the unit-test path — production wires set_asset_server during
+        // start_server.
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let id = "comp-phase2-no-server";
+        write_fixture(&svc, id);
+
+        let (html, _w, _h, _d, _fps) = svc.load_composition(id).await.unwrap();
+        assert!(
+            html.contains(r#"src="assets/hero.png""#),
+            "without AssetServer, refs must stay relative.\n got: {html}"
+        );
+        assert!(!html.contains("data:image"), "no inlining either: {html}");
+    }
 }
 
 #[cfg(test)]

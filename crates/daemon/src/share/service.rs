@@ -113,6 +113,11 @@ struct ArtifactRow {
     title: String,
     content_type: String,
     content: String,
+    /// Multi-file artifact map (`assets/X` → base64 bytes / raw text). When
+    /// present, [`CanvasShareService::share`] inlines those assets into
+    /// `content` so the recipient gets a self-contained HTML even with no
+    /// daemon. Single-file artifacts leave this `None`.
+    files: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Orchestrates the Canvas Share lifecycle.
@@ -148,12 +153,26 @@ impl CanvasShareService {
         // 1. Load the artifact content from SQLite.
         let artifact = self.load_artifact(session_id, artifact_id)?;
 
-        // 2. Build the plaintext ShareBundle.
+        // 2. Inline `assets/X` references into a self-contained HTML for
+        //    multi-file artifacts (compositions). Phase 2 of the
+        //    asset-stream-plane design moved the daemon-side
+        //    `load_composition` to URL-rewriting, but share recipients
+        //    have no daemon — they need data: URIs so the downloaded
+        //    HTML opens offline. `inline_assets()` is the explicit
+        //    fallback for that path.
+        let shared_content = match artifact.files.as_ref() {
+            Some(files) if !files.is_empty() => {
+                crate::canvas_video::asset_inline::inline_assets(&artifact.content, files)
+            }
+            _ => artifact.content.clone(),
+        };
+
+        // 3. Build the plaintext ShareBundle.
         let bundle = ShareBundle {
             artifact_id: artifact_id.to_string(),
             artifact_name: artifact.title.clone(),
             artifact_type: artifact.content_type.clone(),
-            content: serde_json::Value::String(artifact.content.clone()),
+            content: serde_json::Value::String(shared_content),
             metadata: ShareMetadata {
                 created_at: Utc::now().to_rfc3339(),
                 version: "1.0".into(),
@@ -392,14 +411,20 @@ impl CanvasShareService {
             .database()
             .with_connection(|conn| {
                 conn.query_row(
-                    "SELECT id, title, content_type, content FROM artifacts WHERE id = ?1",
+                    "SELECT id, title, content_type, content, files FROM artifacts WHERE id = ?1",
                     rusqlite::params![artifact_id_db],
                     |row| {
+                        let files_json: Option<String> = row.get(4)?;
+                        let files = files_json.as_deref().and_then(|s| {
+                            serde_json::from_str::<std::collections::HashMap<String, String>>(s)
+                                .ok()
+                        });
                         Ok(ArtifactRow {
                             id: row.get(0)?,
                             title: row.get(1)?,
                             content_type: row.get(2)?,
                             content: row.get(3)?,
+                            files,
                         })
                     },
                 )
@@ -490,5 +515,69 @@ mod tests {
     async fn share_roundtrip_requires_network() {
         // Placeholder: a full share -> import roundtrip needs a running CF
         // Worker or a stub server. Kept here to document intent.
+    }
+
+    /// Phase 2 invariant: when a multi-file artifact is shared, the
+    /// `ShareBundle.content` must be self-contained — `assets/X` refs in
+    /// the entry HTML are inlined as `data:` URIs. The recipient has no
+    /// daemon, so the downloaded HTML must open offline.
+    ///
+    /// `share()` itself uploads to a Cloudflare Worker, which we don't
+    /// stand up in unit tests. Instead we exercise the inline branch
+    /// directly by reading the row, calling the same helper `share()`
+    /// uses, and asserting on the resulting `bundle.content`.
+    #[test]
+    fn canvas_share_export_inlines_assets() {
+        use nevoflux_storage::repositories::ArtifactRepository;
+        use nevoflux_storage::CreateArtifactParams;
+
+        const PNG_1X1_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+        let svc = make_service();
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "index.html".into(),
+            r#"<html><body><img src="assets/hero.png"></body></html>"#.to_string(),
+        );
+        files.insert("assets/hero.png".into(), PNG_1X1_B64.to_string());
+        let entry_html = files["index.html"].clone();
+
+        let repo = ArtifactRepository::new(svc.storage.database());
+        repo.create(CreateArtifactParams {
+            id: "share-fixture".into(),
+            session_id: None,
+            title: "fixture".into(),
+            description: None,
+            content_type: "text/html".into(),
+            content: entry_html,
+            files: Some(files),
+            entry: Some("index.html".into()),
+        })
+        .unwrap();
+
+        let row = svc
+            .load_artifact("any-session", "share-fixture")
+            .expect("load_artifact must succeed for the fixture");
+        assert!(row.files.is_some(), "load_artifact must surface files map");
+        assert!(
+            row.content.contains(r#"src="assets/hero.png""#),
+            "stored content must keep relative refs (C1)"
+        );
+
+        // Apply the same transform `share()` does before encryption.
+        let inlined = match row.files.as_ref() {
+            Some(files) if !files.is_empty() => {
+                crate::canvas_video::asset_inline::inline_assets(&row.content, files)
+            }
+            _ => row.content.clone(),
+        };
+        assert!(
+            inlined.contains("data:image/png;base64,"),
+            "shared content must inline assets as data: URIs.\n got: {inlined}"
+        );
+        assert!(
+            !inlined.contains(r#"src="assets/hero.png""#),
+            "shared content must NOT contain raw `assets/X` refs"
+        );
     }
 }
