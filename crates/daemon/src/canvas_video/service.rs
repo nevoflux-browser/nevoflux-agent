@@ -396,12 +396,14 @@ impl CanvasVideoService {
         Ok(())
     }
 
-    /// Write an asset blob into the composition's `files["assets/<name>"]`.
-    /// Returns the path the agent should reference in HTML, plus the
-    /// resolved mime type and original byte length. Caller passes the
-    /// payload base64-encoded; we store it as-is (binary types) or
-    /// decoded-then-utf8 (text types) so the render-time inliner does
-    /// the right thing.
+    /// Write an asset blob into the composition's dedicated
+    /// `composition_assets` table. Returns the canonical path the agent
+    /// should reference in HTML (`assets/<sanitized-name>`).
+    ///
+    /// Storage moved out of `artifacts.files` (migration 016): assets are
+    /// raw BLOBs in their own table now, so `files` is text-only and
+    /// ContentStore mirroring no longer needs a defensive `assets/*`
+    /// merge. See migration 016 / commit "feat(storage): composition_assets".
     pub async fn attach_asset(
         &self,
         composition_id: &str,
@@ -410,7 +412,8 @@ impl CanvasVideoService {
         payload_b64: &str,
         size_bytes: u64,
     ) -> Result<String> {
-        use nevoflux_storage::repositories::ArtifactRepository;
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use nevoflux_storage::repositories::{ArtifactRepository, CompositionAssetRepository};
 
         let storage = self
             .storage
@@ -423,7 +426,7 @@ impl CanvasVideoService {
             .ok_or_else(|| {
                 DaemonError::InvalidRequest(format!("composition not found: {composition_id}"))
             })?;
-        let mut files = record.files.unwrap_or_default();
+        let files = record.files.unwrap_or_default();
 
         // Read stage dims from composition.meta.json so we know how big
         // a bitmap actually has to be. Falls back to a generous 1920×1920
@@ -431,38 +434,45 @@ impl CanvasVideoService {
         // upper bound, so resize is still effective.
         let (stage_w, stage_h) = read_stage_dims(&files).unwrap_or((1920, 1920));
 
+        // Decode incoming base64 to raw bytes for the resize path. The
+        // bytes branch of asset_resize avoids the encode/decode round-trip
+        // we used to pay before assets moved out of artifacts.files.
+        let raw_bytes = STANDARD.decode(payload_b64.as_bytes()).map_err(|e| {
+            DaemonError::InvalidRequest(format!("canvas_attach_asset: payload not valid base64: {e}"))
+        })?;
+
         // Downscale oversized images BEFORE storage. Without this, a
-        // 4000×6000 hero JPEG becomes a 600KB data: URI inlined into
-        // every rendered frame, blowing past PAGE_IDLE_TIMEOUT. The
-        // resize is best-effort: any failure (non-image payload, decode
-        // error, encode error) returns the original bytes, so attach
-        // never fails because of this path.
-        let (final_payload, resize_outcome) =
-            super::asset_resize::maybe_resize(payload_b64, stage_w, stage_h);
+        // 4000×6000 hero JPEG would burn render-time wall clock for no
+        // visual gain. The resize is best-effort: any non-image branch
+        // returns the original bytes verbatim.
+        let (resized_bytes, resize_outcome) =
+            super::asset_resize::maybe_resize_bytes(&raw_bytes, stage_w, stage_h);
+        let final_bytes: Vec<u8> = match &resize_outcome {
+            super::asset_resize::ResizeOutcome::Resized { .. } => resized_bytes,
+            // Non-Resized outcomes return an empty bytes vec by contract;
+            // the caller's original bytes are still authoritative.
+            _ => raw_bytes,
+        };
         let final_size_bytes = match &resize_outcome {
             super::asset_resize::ResizeOutcome::Resized { new_bytes, .. } => *new_bytes as u64,
             _ => size_bytes,
         };
 
-        // Preserve the caller-supplied path verbatim. Even when the agent
-        // mis-extensions (saves a JPEG as foo.png), we keep the path so
-        // that any `<img src="assets/foo.png">` references the agent
-        // already wrote into HTML still resolve. The asset_inline module
-        // sniffs magic bytes at render time and emits the correct
-        // `data:<true-mime>;base64,...` URI regardless of path extension.
-        let path = format!("assets/{}", sanitize_asset_name(name));
-        files.insert(path.clone(), final_payload);
+        // Preserve the caller-supplied basename verbatim. Even when the
+        // agent mis-extensions (saves a JPEG as foo.png), we keep the
+        // basename so any `<img src="assets/foo.png">` references the
+        // agent already wrote into HTML still resolve. Magic-byte sniff
+        // at HTTP serve time selects the correct `Content-Type` regardless.
+        let asset_name = sanitize_asset_name(name);
+        let path = format!("assets/{asset_name}");
 
-        // Preserve content (= files[entry]) — never let the dual-write
-        // invariant drift. We only touched assets/*, so content stays the
-        // same, but update_files needs both args.
-        let entry = record.entry.as_deref().unwrap_or("index.html");
-        let content = files
-            .get(entry)
-            .cloned()
-            .unwrap_or_else(|| record.content.clone());
-        repo.update_files(composition_id, &files, &content)
+        // Persist into the dedicated table. Idempotent — repeat attaches
+        // overwrite (matches the previous `files.insert` semantic).
+        let asset_repo = CompositionAssetRepository::new(storage.database());
+        asset_repo
+            .upsert(composition_id, &asset_name, &final_bytes, Some(mime_type))
             .map_err(|e| DaemonError::InternalError(format!("{e}")))?;
+
         tracing::info!(
             "canvas_attach_asset: id={composition_id} path={path} mime={mime_type} \
              original_bytes={size_bytes} stored_bytes={final_size_bytes} \
@@ -523,11 +533,9 @@ impl CanvasVideoService {
                 })?;
 
         // Phase 2: rewrite `assets/X` to absolute Asset Plane URLs when an
-        // AssetServer is wired (production path). Render tab and Canvas
-        // Editor preview both consume this HTML inside iframes that can
-        // fetch loopback HTTP, so the assets resolve via the asset GET
-        // handler instead of bloating the NM `get_composition` reply with
-        // base64 data URIs (which used to blow the 1 MB NM cap).
+        // AssetServer is wired (production path). Asset names come from
+        // the dedicated `composition_assets` table (migration 016) — no
+        // longer interleaved with text files in the JSON map.
         //
         // When no AssetServer is wired (most unit tests), refs stay
         // relative — callers of `load_composition` in those contexts
@@ -535,10 +543,11 @@ impl CanvasVideoService {
         // assets to actually resolve.
         let html = match self.asset_server.get() {
             Some(asset_server) => {
-                let asset_names: Vec<String> = files
-                    .keys()
-                    .filter_map(|k| k.strip_prefix("assets/").map(|s| s.to_string()))
-                    .collect();
+                use nevoflux_storage::repositories::CompositionAssetRepository;
+                let asset_repo = CompositionAssetRepository::new(storage.database());
+                let asset_names = asset_repo
+                    .list_names(composition_id)
+                    .map_err(|e| DaemonError::InternalError(format!("{e}")))?;
                 if asset_names.is_empty() {
                     html_raw
                 } else {
@@ -1124,14 +1133,18 @@ mod p3_load_tests {
     }
 
     fn write_fixture(svc: &CanvasVideoService, id: &str) {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use nevoflux_storage::repositories::CompositionAssetRepository;
+
         let storage = svc.storage().unwrap().clone();
         let repo = ArtifactRepository::new(storage.database());
+        // Post-migration-016 shape: text in artifacts.files, binary in
+        // composition_assets.
         let mut files = std::collections::HashMap::new();
         files.insert(
             "index.html".into(),
             r#"<html><body><img src="assets/hero.png"></body></html>"#.to_string(),
         );
-        files.insert("assets/hero.png".into(), PNG_1X1_B64.to_string());
         files.insert("composition.meta.json".into(), composition_meta_json());
         repo.create(CreateArtifactParams {
             id: id.into(),
@@ -1144,6 +1157,11 @@ mod p3_load_tests {
             entry: Some("index.html".into()),
         })
         .unwrap();
+
+        let png_bytes = STANDARD.decode(PNG_1X1_B64.as_bytes()).unwrap();
+        CompositionAssetRepository::new(storage.database())
+            .upsert(id, "hero.png", &png_bytes, Some("image/png"))
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1235,21 +1253,18 @@ mod p3_load_tests {
     /// returned HTML is now KB-class (URL rewriting only) instead of MB-class.
     #[tokio::test]
     async fn load_composition_response_size_is_kb_not_mb_with_large_asset() {
-        use base64::{engine::general_purpose::STANDARD, Engine};
+        use nevoflux_storage::repositories::CompositionAssetRepository;
 
         let svc = Arc::new(CanvasVideoService::new_for_tests());
         let id = "comp-phase2-bigasset";
 
-        // 2 MiB of pseudo-random PNG payload. The exact bytes don't matter
-        // — only that they're large and base64-shaped (the inliner would
-        // route this through the binary branch).
+        // 2 MiB raw bytes — large enough that the OLD inlining path
+        // would have produced ~2.7 MiB HTML (4/3 base64 expansion).
         let mut blob = Vec::with_capacity(2 * 1024 * 1024);
-        // Real PNG signature so magic-byte sniff succeeds.
         blob.extend_from_slice(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
         for i in 0..(2 * 1024 * 1024) {
             blob.push((i as u8).wrapping_mul(31));
         }
-        let big_b64 = STANDARD.encode(&blob);
 
         let storage = svc.storage().unwrap().clone();
         let repo = ArtifactRepository::new(storage.database());
@@ -1258,7 +1273,6 @@ mod p3_load_tests {
             "index.html".into(),
             r#"<html><body><img src="assets/big.png"></body></html>"#.to_string(),
         );
-        files.insert("assets/big.png".into(), big_b64);
         files.insert("composition.meta.json".into(), composition_meta_json());
         repo.create(CreateArtifactParams {
             id: id.into(),
@@ -1271,6 +1285,11 @@ mod p3_load_tests {
             entry: Some("index.html".into()),
         })
         .unwrap();
+        // Asset goes in the dedicated table, raw bytes (no base64 in the
+        // store now).
+        CompositionAssetRepository::new(storage.database())
+            .upsert(id, "big.png", &blob, Some("image/png"))
+            .unwrap();
 
         let db_arc = std::sync::Arc::new(svc.storage().unwrap().database().clone());
         let server = crate::asset_server::AssetServer::start(

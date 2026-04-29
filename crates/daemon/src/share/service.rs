@@ -113,11 +113,6 @@ struct ArtifactRow {
     title: String,
     content_type: String,
     content: String,
-    /// Multi-file artifact map (`assets/X` → base64 bytes / raw text). When
-    /// present, [`CanvasShareService::share`] inlines those assets into
-    /// `content` so the recipient gets a self-contained HTML even with no
-    /// daemon. Single-file artifacts leave this `None`.
-    files: Option<std::collections::HashMap<String, String>>,
 }
 
 /// Orchestrates the Canvas Share lifecycle.
@@ -153,18 +148,32 @@ impl CanvasShareService {
         // 1. Load the artifact content from SQLite.
         let artifact = self.load_artifact(session_id, artifact_id)?;
 
-        // 2. Inline `assets/X` references into a self-contained HTML for
-        //    multi-file artifacts (compositions). Phase 2 of the
-        //    asset-stream-plane design moved the daemon-side
-        //    `load_composition` to URL-rewriting, but share recipients
-        //    have no daemon — they need data: URIs so the downloaded
-        //    HTML opens offline. `inline_assets()` is the explicit
-        //    fallback for that path.
-        let shared_content = match artifact.files.as_ref() {
-            Some(files) if !files.is_empty() => {
-                crate::canvas_video::asset_inline::inline_assets(&artifact.content, files)
+        // 2. Inline `assets/X` references into a self-contained HTML so
+        //    the recipient (no daemon) sees a working file. After
+        //    migration 016, assets live in `composition_assets` rather
+        //    than `artifacts.files` — read them from the dedicated
+        //    table, base64-encode for the inliner's expected shape,
+        //    and call inline_assets.
+        let shared_content = {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            use nevoflux_storage::repositories::CompositionAssetRepository;
+
+            let asset_repo = CompositionAssetRepository::new(self.storage.database());
+            let assets = asset_repo
+                .list_all(artifact_id)
+                .map_err(|e| DaemonError::InternalError(format!("share load_all: {e}")))?;
+
+            if assets.is_empty() {
+                artifact.content.clone()
+            } else {
+                let mut files: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                for a in &assets {
+                    let b64 = STANDARD.encode(&a.bytes);
+                    files.insert(format!("assets/{}", a.name), b64);
+                }
+                crate::canvas_video::asset_inline::inline_assets(&artifact.content, &files)
             }
-            _ => artifact.content.clone(),
         };
 
         // 3. Build the plaintext ShareBundle.
@@ -411,20 +420,14 @@ impl CanvasShareService {
             .database()
             .with_connection(|conn| {
                 conn.query_row(
-                    "SELECT id, title, content_type, content, files FROM artifacts WHERE id = ?1",
+                    "SELECT id, title, content_type, content FROM artifacts WHERE id = ?1",
                     rusqlite::params![artifact_id_db],
                     |row| {
-                        let files_json: Option<String> = row.get(4)?;
-                        let files = files_json.as_deref().and_then(|s| {
-                            serde_json::from_str::<std::collections::HashMap<String, String>>(s)
-                                .ok()
-                        });
                         Ok(ArtifactRow {
                             id: row.get(0)?,
                             title: row.get(1)?,
                             content_type: row.get(2)?,
                             content: row.get(3)?,
-                            files,
                         })
                     },
                 )
@@ -528,18 +531,20 @@ mod tests {
     /// uses, and asserting on the resulting `bundle.content`.
     #[test]
     fn canvas_share_export_inlines_assets() {
-        use nevoflux_storage::repositories::ArtifactRepository;
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use nevoflux_storage::repositories::{ArtifactRepository, CompositionAssetRepository};
         use nevoflux_storage::CreateArtifactParams;
 
         const PNG_1X1_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
         let svc = make_service();
+        // Post-migration-016 shape: text files in artifacts.files,
+        // binary assets in composition_assets table.
         let mut files = std::collections::HashMap::new();
         files.insert(
             "index.html".into(),
             r#"<html><body><img src="assets/hero.png"></body></html>"#.to_string(),
         );
-        files.insert("assets/hero.png".into(), PNG_1X1_B64.to_string());
         let entry_html = files["index.html"].clone();
 
         let repo = ArtifactRepository::new(svc.storage.database());
@@ -555,22 +560,34 @@ mod tests {
         })
         .unwrap();
 
+        // Asset goes in the dedicated table, not in files.
+        let asset_bytes = STANDARD.decode(PNG_1X1_B64.as_bytes()).unwrap();
+        CompositionAssetRepository::new(svc.storage.database())
+            .upsert("share-fixture", "hero.png", &asset_bytes, Some("image/png"))
+            .unwrap();
+
         let row = svc
             .load_artifact("any-session", "share-fixture")
             .expect("load_artifact must succeed for the fixture");
-        assert!(row.files.is_some(), "load_artifact must surface files map");
         assert!(
             row.content.contains(r#"src="assets/hero.png""#),
             "stored content must keep relative refs (C1)"
         );
 
-        // Apply the same transform `share()` does before encryption.
-        let inlined = match row.files.as_ref() {
-            Some(files) if !files.is_empty() => {
-                crate::canvas_video::asset_inline::inline_assets(&row.content, files)
-            }
-            _ => row.content.clone(),
-        };
+        // Apply the same transform `share()` does before encryption:
+        // read assets from the composition_assets table, base64-encode,
+        // call inline_assets.
+        let asset_repo = CompositionAssetRepository::new(svc.storage.database());
+        let assets = asset_repo.list_all("share-fixture").unwrap();
+        assert!(!assets.is_empty(), "fixture must have a composition asset");
+
+        let mut files: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for a in &assets {
+            files.insert(format!("assets/{}", a.name), STANDARD.encode(&a.bytes));
+        }
+        let inlined =
+            crate::canvas_video::asset_inline::inline_assets(&row.content, &files);
         assert!(
             inlined.contains("data:image/png;base64,"),
             "shared content must inline assets as data: URIs.\n got: {inlined}"
