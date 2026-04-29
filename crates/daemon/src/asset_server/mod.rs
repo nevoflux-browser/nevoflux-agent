@@ -368,9 +368,15 @@ fn build_router(state: Arc<AssetServerState>, max_body: usize) -> Router {
             "/v1/upload/generic/:inbox_id",
             post(handlers::upload::handle_generic),
         )
-        // Phase 4-5 reserved namespaces — 501 stubs.
-        .route("/v1/render/:job/frame", post(handlers::stubs::stub_phase4))
-        .route("/v1/render/:job/sse", get(handlers::stubs::stub_phase4))
+        // Phase 4 — render frame POST + SSE control channel.
+        .route(
+            "/v1/render/:job_id/frame",
+            post(handlers::render::handle_frame),
+        )
+        .route(
+            "/v1/render/:job_id/sse",
+            get(handlers::render::handle_sse),
+        )
         // Phase 5 — URL-as-handle blob registry.
         .route("/v1/blob/:id", get(handlers::blob::handle))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -617,28 +623,8 @@ mod tests {
         assert_eq!(resp.status(), 503);
     }
 
-    #[tokio::test]
-    async fn phase4_render_frame_returns_501_with_phase_header() {
-        let server = boot().await;
-        let url = format!(
-            "http://127.0.0.1:{}/v1/render/job123/frame",
-            server.bound_port()
-        );
-        let resp = test_client()
-            .post(&url)
-            .header("authorization", "Bearer test-bearer")
-            .body(Vec::<u8>::new())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 501);
-        assert_eq!(
-            resp.headers()
-                .get("x-nf-future-phase")
-                .and_then(|v| v.to_str().ok()),
-            Some("phase-4")
-        );
-    }
+    // Phase 4 render frame route is now lit; the previous "stub returns
+    // 501" test was replaced by the round-trip + SSE tests below.
 
     // Phase 5 blob route is now lit; the previous "stub returns 501"
     // expectation was replaced by the round-trip + TTL tests below.
@@ -1555,5 +1541,185 @@ mod tests {
             .unwrap();
         // 200, NOT 401.
         assert_eq!(resp.status(), 200);
+    }
+
+    // -----------------------------------------------------------------------
+    // §7.2 — Phase 4 render frame POST + SSE control channel
+    // -----------------------------------------------------------------------
+
+    /// Boot an AssetServer wired to a real CanvasVideoService so the
+    /// frame POST handler can resolve a job snapshot + push frames.
+    async fn boot_with_canvas_video() -> (AssetServer, std::sync::Arc<crate::canvas_video::CanvasVideoService>) {
+        let svc = std::sync::Arc::new(crate::canvas_video::CanvasVideoService::new_for_tests());
+        let db_arc = std::sync::Arc::new(svc.storage().unwrap().database().clone());
+        let server = AssetServer::start(AssetServerConfig {
+            bearer_token: "test-bearer".into(),
+            session_id: "test-session".into(),
+            storage: Some(db_arc),
+            canvas_video_service: Some(svc.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("AssetServer should boot for phase4 test");
+        (server, svc)
+    }
+
+    #[tokio::test]
+    async fn render_frame_post_returns_503_when_canvas_video_not_wired() {
+        let server = boot().await;
+        let url = format!(
+            "http://127.0.0.1:{}/v1/render/job-x/frame",
+            server.bound_port()
+        );
+        let resp = test_client()
+            .post(&url)
+            .header("authorization", "Bearer test-bearer")
+            .header("x-nf-frame-index", "0")
+            .body(vec![0u8; 8])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+    }
+
+    #[tokio::test]
+    async fn render_frame_post_409s_for_unknown_job() {
+        let (server, _svc) = boot_with_canvas_video().await;
+        let url = format!(
+            "http://127.0.0.1:{}/v1/render/never-registered/frame",
+            server.bound_port()
+        );
+        let resp = test_client()
+            .post(&url)
+            .header("authorization", "Bearer test-bearer")
+            .header("x-nf-frame-index", "0")
+            .body(vec![0u8; 4])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+    }
+
+    #[tokio::test]
+    async fn render_frame_post_400s_when_index_header_missing() {
+        let (server, svc) = boot_with_canvas_video().await;
+        // Make a Queued job so we get past the snapshot check before
+        // the header parse.
+        let job_id = svc.jobs().create("comp-x".into(), 320, 180, 1.0, 30).await;
+        let url = format!(
+            "http://127.0.0.1:{}/v1/render/{}/frame",
+            server.bound_port(),
+            job_id
+        );
+        let resp = test_client()
+            .post(&url)
+            .header("authorization", "Bearer test-bearer")
+            .body(vec![0u8; 4])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn render_frame_post_delivers_to_signal_channel() {
+        let (server, svc) = boot_with_canvas_video().await;
+        // Set up a job AND register the render-loop signal channel
+        // (mirrors `render_start`'s setup). The receiver is what the
+        // render loop drains in production; here we just await one frame.
+        let job_id = svc.jobs().create("comp-x".into(), 320, 180, 1.0, 30).await;
+        let mut rx = svc.register_job_signal_channel(&job_id).await;
+
+        let url = format!(
+            "http://127.0.0.1:{}/v1/render/{}/frame",
+            server.bound_port(),
+            job_id
+        );
+        let png_bytes: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xDE, 0xAD];
+        let resp = test_client()
+            .post(&url)
+            .header("authorization", "Bearer test-bearer")
+            .header("x-nf-frame-index", "42")
+            .header("content-type", "image/png")
+            .body(png_bytes.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+
+        // Render loop sees the frame on its signal channel.
+        let signal = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("frame must arrive on signal channel")
+            .expect("channel must yield Some");
+        match signal {
+            crate::canvas_video::service::FrameSignal::Frame { frame_idx, png } => {
+                assert_eq!(frame_idx, 42);
+                assert_eq!(png, png_bytes);
+            }
+            other => panic!("expected Frame variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn render_sse_emits_cancel_event_when_broadcast() {
+        // Subscribe via SSE → broadcast Cancel → reading the SSE stream
+        // sees `data: {"type":"cancel"}`. Using reqwest's chunked body
+        // reader directly so we don't need a full SSE client lib.
+        let (server, svc) = boot_with_canvas_video().await;
+        let job_id = svc.jobs().create("comp-x".into(), 320, 180, 1.0, 30).await;
+
+        let url = format!(
+            "http://127.0.0.1:{}/v1/render/{}/sse",
+            server.bound_port(),
+            job_id
+        );
+        let mut resp = test_client()
+            .get(&url)
+            .header("authorization", "Bearer test-bearer")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        // Subscriber must be registered before broadcast or it misses
+        // the event. The handler subscribes before responding, so by
+        // the time we have a 200 here we know the broadcast channel
+        // exists.
+        svc.broadcast_render_control(
+            &job_id,
+            crate::canvas_video::RenderControlEvent::Cancel,
+        )
+        .await;
+
+        // Read the next chunk that contains a `data:` line carrying our
+        // cancel event. Bound by 2 s — keep-alive comments may slip in
+        // first, so loop until we see a data line.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found = false;
+        while tokio::time::Instant::now() < deadline {
+            let chunk = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                resp.chunk(),
+            )
+            .await;
+            match chunk {
+                Ok(Ok(Some(bytes))) => {
+                    let s = String::from_utf8_lossy(&bytes).to_string();
+                    if s.contains(r#"data: {"type":"cancel"}"#) {
+                        found = true;
+                        break;
+                    }
+                }
+                _ => continue,
+            }
+        }
+        assert!(found, "expected cancel event in SSE stream");
     }
 }

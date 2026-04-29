@@ -34,6 +34,17 @@ pub async fn handle(
             let req: RenderCancelRequest = serde_json::from_value(payload)
                 .map_err(|e| DaemonError::InvalidRequest(format!("parse: {}", e)))?;
             let cancelled = svc.jobs().cancel(&req.job_id).await;
+            // Phase 4: broadcast cancel on the SSE control channel so a
+            // render tab listening via /v1/render/:job/sse can stop
+            // capturing immediately. No-op if no SSE subscriber has
+            // connected yet — the legacy NM cancellation flag still works.
+            if cancelled {
+                svc.broadcast_render_control(
+                    &req.job_id,
+                    crate::canvas_video::RenderControlEvent::Cancel,
+                )
+                .await;
+            }
             Ok(serde_json::json!({ "cancelled": cancelled }))
         }
         "canvas_video_ready" => {
