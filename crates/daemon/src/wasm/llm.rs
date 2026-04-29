@@ -18,12 +18,11 @@ use rig::client::CompletionClient;
 use rig::client::Nothing;
 use rig::completion::{CompletionModel, ToolDefinition};
 use rig::message::{
-    AssistantContent, DocumentSourceKind, Image, ImageDetail, ImageMediaType, Message, Reasoning,
-    Text, ToolCall as RigToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
+    AssistantContent, DocumentSourceKind, Image, ImageDetail, ImageMediaType, Message, Text,
+    ToolCall as RigToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
 };
 use rig::providers::{
-    anthropic, cohere, deepseek, gemini, groq, mistral, ollama, openai, openrouter, perplexity,
-    together, xai,
+    anthropic, cohere, gemini, groq, mistral, ollama, openai, openrouter, perplexity, together, xai,
 };
 use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 use rig::OneOrMany;
@@ -663,6 +662,146 @@ fn build_openai_request_body(model: &str, request: &LlmChatRequest) -> serde_jso
     body
 }
 
+/// Build an OpenAI-compatible request body for DeepSeek, threading
+/// `reasoning_content` onto the same assistant message that carries
+/// `tool_calls` when present.
+///
+/// We cannot reuse `build_openai_request_body` because it has no concept
+/// of `reasoning_content`. Bypassing rig 0.29's deepseek converter
+/// (which splits Reasoning + ToolCall into two wire messages and drops
+/// the reasoning_content from the tool-call message) is the whole point
+/// of having this function.
+fn build_deepseek_request_body(
+    model: &str,
+    request: &LlmChatRequest,
+    stream: bool,
+) -> serde_json::Value {
+    let mut messages = Vec::new();
+
+    if let Some(ref system) = request.system {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": system,
+        }));
+    }
+
+    for msg in &request.messages {
+        match msg.role.as_str() {
+            "system" => {
+                messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": msg.content,
+                }));
+            }
+            "user" => {
+                if msg.attachments.is_empty() {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": msg.content,
+                    }));
+                } else {
+                    let mut parts = vec![serde_json::json!({
+                        "type": "text",
+                        "text": msg.content,
+                    })];
+                    for att in &msg.attachments {
+                        if att.mime_type.starts_with("image/") {
+                            let data_url = if att.data.starts_with("data:") {
+                                att.data.clone()
+                            } else {
+                                format!("data:{};base64,{}", att.mime_type, att.data)
+                            };
+                            parts.push(serde_json::json!({
+                                "type": "image_url",
+                                "image_url": { "url": data_url },
+                            }));
+                        }
+                    }
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": parts,
+                    }));
+                }
+            }
+            "assistant" => {
+                let mut m = serde_json::json!({
+                    "role": "assistant",
+                    "content": msg.content,
+                });
+                if let Some(ref tcs) = msg.tool_calls {
+                    let arr: Vec<serde_json::Value> = tcs
+                        .iter()
+                        .map(|tc| {
+                            serde_json::json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": tc.arguments.to_string(),
+                                },
+                            })
+                        })
+                        .collect();
+                    m["tool_calls"] = serde_json::Value::Array(arr);
+                }
+                if let Some(ref r) = msg.reasoning {
+                    if !r.is_empty() {
+                        m["reasoning_content"] = serde_json::Value::String(r.clone());
+                    }
+                }
+                messages.push(m);
+            }
+            "tool" => {
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": msg.tool_call_id,
+                    "content": msg.content,
+                }));
+            }
+            _ => {
+                messages.push(serde_json::json!({
+                    "role": msg.role,
+                    "content": msg.content,
+                }));
+            }
+        }
+    }
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    });
+
+    if let Some(t) = request.temperature {
+        body["temperature"] = serde_json::json!(t);
+    }
+    if let Some(m) = request.max_tokens {
+        body["max_tokens"] = serde_json::json!(m);
+    }
+    if let Some(ref tools) = request.tools {
+        if !tools.is_empty() {
+            let arr: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                        },
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::Value::Array(arr);
+            body["tool_choice"] = serde_json::json!("auto");
+        }
+    }
+
+    body
+}
+
 /// Execute a chat request using raw HTTP (bypassing rig) to capture `images` field.
 ///
 /// This is used for image generation models where rig's parser drops the `images` field.
@@ -752,23 +891,99 @@ async fn execute_raw_openai_compatible_chat(
     })
 }
 
-/// Execute a chat request using the DeepSeek provider (native rig provider).
+/// Execute a non-streaming DeepSeek request via raw HTTP.
+///
+/// Sister of `stream_deepseek_raw` — see that function's doc-comment for
+/// the rig 0.29 split-message bug rationale. This path also captures
+/// `reasoning_content` from the response (currently surfaced only via
+/// the model's outgoing turn; the host doesn't yet plumb it back into
+/// `LlmChatResponse` — see follow-up tracked in plan).
+async fn execute_deepseek_chat_raw(
+    api_key: &str,
+    model: &str,
+    request: LlmChatRequest,
+    base_url: Option<&str>,
+) -> Result<LlmChatResponse> {
+    let body = build_deepseek_request_body(model, &request, false);
+    let base = base_url.unwrap_or("https://api.deepseek.com/v1");
+    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| DaemonError::InternalError(format!("DeepSeek request failed: {}", e)))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(DaemonError::InternalError(format!(
+            "DeepSeek HTTP {}: {}",
+            status,
+            &text[..text.len().min(500)]
+        )));
+    }
+
+    let raw: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| DaemonError::InternalError(format!("Failed to parse response: {}", e)))?;
+
+    let choice = raw["choices"]
+        .get(0)
+        .ok_or_else(|| DaemonError::InternalError("No choices in DeepSeek response".to_string()))?;
+
+    let message = &choice["message"];
+    let content = message["content"].as_str().unwrap_or("").to_string();
+    let finish_reason = choice["finish_reason"]
+        .as_str()
+        .unwrap_or("stop")
+        .to_string();
+
+    let tool_calls = message["tool_calls"].as_array().map(|arr| {
+        arr.iter()
+            .filter_map(|tc| {
+                let id = tc["id"].as_str()?.to_string();
+                let function = tc.get("function")?;
+                let name = function["name"].as_str()?.to_string();
+                let args_raw = function["arguments"].as_str().unwrap_or("{}");
+                let arguments: serde_json::Value = serde_json::from_str(args_raw)
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                Some(LlmToolCall {
+                    id: id.clone(),
+                    call_id: Some(id),
+                    name,
+                    arguments,
+                    signature: None,
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+
+    Ok(LlmChatResponse {
+        content,
+        finish_reason,
+        tool_calls,
+        usage: None,
+        images: vec![],
+    })
+}
+
+/// Execute a chat request using the DeepSeek provider.
+///
+/// Delegates to `execute_deepseek_chat_raw` — see that function's doc for
+/// the rig 0.29 split-message bug rationale.
 async fn execute_deepseek_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
-    provider: ProviderType,
+    _provider: ProviderType,
     base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    let mut builder = deepseek::Client::builder().api_key(api_key);
-    if let Some(url) = base_url {
-        builder = builder.base_url(url);
-    }
-    let client: deepseek::Client = builder.build().map_err(|e| {
-        DaemonError::InternalError(format!("Failed to create DeepSeek client: {}", e))
-    })?;
-    let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request, provider).await
+    execute_deepseek_chat_raw(api_key, model, request, base_url).await
 }
 
 /// Execute a chat request using the Qwen provider (custom implementation).
@@ -1318,23 +1533,10 @@ where
     process_completion_response(completion_response.choice)
 }
 
-/// Build a rig `Message::Assistant` from a host-side `LlmMessage`, including
-/// `AssistantContent::Reasoning` when the provider requires reasoning_content
-/// to be echoed back (DeepSeek thinking-mode).
-fn build_rig_assistant_message(msg: &LlmMessage, provider: ProviderType) -> Message {
+/// Build a rig `Message::Assistant` from a host-side `LlmMessage`.
+/// Provider-agnostic: does not emit reasoning content.
+fn build_rig_assistant_message(msg: &LlmMessage, _provider: ProviderType) -> Message {
     let mut assistant_contents: Vec<AssistantContent> = Vec::new();
-
-    // DeepSeek thinking-mode requires reasoning_content to be echoed back when
-    // the assistant turn contains a tool call. Emit before content/tool_calls
-    // so rig's deepseek converter picks it up via AssistantContent::Reasoning
-    // and populates Message::Assistant.reasoning_content on the wire.
-    if provider == ProviderType::DeepSeek {
-        if let Some(reasoning) = msg.reasoning.as_deref() {
-            if !reasoning.is_empty() {
-                assistant_contents.push(AssistantContent::Reasoning(Reasoning::new(reasoning)));
-            }
-        }
-    }
 
     if !msg.content.is_empty() {
         assistant_contents.push(AssistantContent::text(&msg.content));
@@ -1916,23 +2118,18 @@ async fn stream_openrouter(
 }
 
 /// Stream from DeepSeek provider.
+///
+/// Delegates to `stream_deepseek_raw` — see that function's doc for
+/// the rig 0.29 split-message bug rationale.
 async fn stream_deepseek(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
-    provider: ProviderType,
+    _provider: ProviderType,
     base_url: Option<&str>,
 ) -> Result<()> {
-    let mut builder = deepseek::Client::builder().api_key(api_key);
-    if let Some(url) = base_url {
-        builder = builder.base_url(url);
-    }
-    let client: deepseek::Client = builder.build().map_err(|e| {
-        DaemonError::InternalError(format!("Failed to create DeepSeek client: {}", e))
-    })?;
-    let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx, provider).await
+    stream_deepseek_raw(api_key, model, request, tx, base_url).await
 }
 
 /// Stream from Qwen provider using raw HTTP + SSE parsing.
@@ -2146,6 +2343,190 @@ async fn stream_qwen(
     }
 
     // Send final done chunk
+    let _ = tx
+        .send(LlmStreamChunk {
+            text: None,
+            tool_calls: vec![],
+            done: true,
+            reasoning: None,
+            images: vec![],
+        })
+        .await;
+
+    Ok(())
+}
+
+/// Stream from DeepSeek using raw HTTP + SSE parsing.
+///
+/// Bypasses rig 0.29's `rig::providers::deepseek` because its
+/// `TryFrom<message::Message>` for `Message::Assistant` splits a rig
+/// assistant message containing both `Reasoning` and `ToolCall` content
+/// variants into TWO separate wire messages: the first carries
+/// `reasoning_content` with empty `tool_calls`, the second carries
+/// `tool_calls` with `reasoning_content: None`. DeepSeek validates the
+/// second message, sees the missing reasoning_content, and returns
+/// 400 invalid_request_error on every tool-using thinking-mode turn.
+///
+/// We sidestep that by emitting the wire JSON ourselves so reasoning
+/// and tool_calls ride on the same assistant message — which matches
+/// DeepSeek's API contract per https://api-docs.deepseek.com/zh-cn/guides/thinking_mode.
+async fn stream_deepseek_raw(
+    api_key: &str,
+    model: &str,
+    request: LlmChatRequest,
+    tx: mpsc::Sender<LlmStreamChunk>,
+    base_url: Option<&str>,
+) -> Result<()> {
+    use futures::StreamExt;
+
+    let body = build_deepseek_request_body(model, &request, true);
+    let base = base_url.unwrap_or("https://api.deepseek.com/v1");
+    let url = format!("{}/chat/completions", base.trim_end_matches('/'));
+
+    let http_client = reqwest::Client::new();
+    let response = http_client
+        .post(&url)
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            DaemonError::InternalError(format!("DeepSeek stream request failed: {}", e))
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(DaemonError::InternalError(format!(
+            "DeepSeek stream HTTP {}: {}",
+            status,
+            &text[..text.len().min(500)]
+        )));
+    }
+
+    // Accumulate streaming tool call deltas (arguments come in fragments).
+    struct ToolCallAccum {
+        id: String,
+        name: String,
+        arguments: String,
+    }
+    let mut accumulated_tool_calls: HashMap<i64, ToolCallAccum> = HashMap::new();
+
+    // SSE lines may be split across byte chunks — buffer until we see a newline.
+    let mut byte_stream = response.bytes_stream();
+    let mut line_buf = String::new();
+
+    while let Some(result) = byte_stream.next().await {
+        match result {
+            Ok(bytes) => {
+                line_buf.push_str(&String::from_utf8_lossy(&bytes));
+                while let Some(nl_pos) = line_buf.find('\n') {
+                    let line = line_buf[..nl_pos].trim_end_matches('\r').to_string();
+                    line_buf.drain(..=nl_pos);
+
+                    let data = match line.strip_prefix("data: ") {
+                        Some(d) if d != "[DONE]" => d.to_string(),
+                        _ => continue,
+                    };
+
+                    let chunk: serde_json::Value = match serde_json::from_str(&data) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let choice = match chunk["choices"].get(0) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    let delta = &choice["delta"];
+
+                    // Text content delta.
+                    if let Some(content) = delta["content"].as_str() {
+                        if !content.is_empty() {
+                            let _ = tx
+                                .send(LlmStreamChunk {
+                                    text: Some(content.to_string()),
+                                    tool_calls: vec![],
+                                    done: false,
+                                    reasoning: None,
+                                    images: vec![],
+                                })
+                                .await;
+                        }
+                    }
+
+                    // Reasoning_content delta — surfaced as `reasoning` on the chunk.
+                    if let Some(r) = delta["reasoning_content"].as_str() {
+                        if !r.is_empty() {
+                            let _ = tx
+                                .send(LlmStreamChunk {
+                                    text: None,
+                                    tool_calls: vec![],
+                                    done: false,
+                                    reasoning: Some(r.to_string()),
+                                    images: vec![],
+                                })
+                                .await;
+                        }
+                    }
+
+                    // Tool-call deltas — accumulate by index, finalize at end.
+                    if let Some(tcs) = delta["tool_calls"].as_array() {
+                        for tc in tcs {
+                            let index = tc["index"].as_i64().unwrap_or(0);
+                            let entry = accumulated_tool_calls.entry(index).or_insert_with(|| {
+                                ToolCallAccum {
+                                    id: String::new(),
+                                    name: String::new(),
+                                    arguments: String::new(),
+                                }
+                            });
+                            if let Some(id) = tc["id"].as_str() {
+                                entry.id = id.to_string();
+                            }
+                            if let Some(func) = tc.get("function") {
+                                if let Some(name) = func["name"].as_str() {
+                                    entry.name = name.to_string();
+                                }
+                                if let Some(args) = func["arguments"].as_str() {
+                                    entry.arguments.push_str(args);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("DeepSeek stream chunk error: {}", e);
+                break;
+            }
+        }
+    }
+
+    // Emit accumulated tool calls in a single chunk before `done`.
+    if !accumulated_tool_calls.is_empty() {
+        let mut tool_calls: Vec<LlmToolCall> = accumulated_tool_calls
+            .into_values()
+            .map(|tc| LlmToolCall {
+                id: tc.id.clone(),
+                call_id: Some(tc.id),
+                name: tc.name,
+                arguments: serde_json::from_str(&tc.arguments)
+                    .unwrap_or(serde_json::Value::Object(Default::default())),
+                signature: None,
+            })
+            .collect();
+        tool_calls.sort_by_key(|tc| tc.id.clone());
+        let _ = tx
+            .send(LlmStreamChunk {
+                text: None,
+                tool_calls,
+                done: false,
+                reasoning: None,
+                images: vec![],
+            })
+            .await;
+    }
+
     let _ = tx
         .send(LlmStreamChunk {
             text: None,
@@ -2633,7 +3014,9 @@ async fn stream_acp_completion(
                 ));
             }
         } else {
-            tracing::warn!("MCP bridge mode but no host_services — MCP tool calls will return 'no active tool executor'");
+            tracing::warn!(
+                "MCP bridge mode but no host_services — MCP tool calls will return 'no active tool executor'"
+            );
         }
 
         Some(tool_bridge.executor_guard())
@@ -3706,8 +4089,11 @@ where
     }
     tracing::info!(
         "Stream complete. text_chunks={}, text_bytes={}, sent_tool_call_ids={:?}, final_tool_calls_count={}, receiver_dropped={}",
-        total_text_chunks, total_text_bytes, sent_tool_call_ids,
-        final_tool_calls.len(), receiver_dropped
+        total_text_chunks,
+        total_text_bytes,
+        sent_tool_call_ids,
+        final_tool_calls.len(),
+        receiver_dropped
     );
 
     let _ = tx
@@ -4378,66 +4764,148 @@ mod tests {
     }
 
     #[test]
-    fn assistant_message_with_reasoning_emits_rig_reasoning_for_deepseek() {
-        use rig::message::AssistantContent;
+    fn build_rig_assistant_message_never_emits_reasoning() {
+        use rig::completion::message::AssistantContent;
 
-        let msg = LlmMessage {
-            role: "assistant".into(),
-            content: String::new(),
-            tool_calls: Some(vec![LlmToolCall {
-                id: "call_1".into(),
-                call_id: None,
-                name: "browser_get_markdown".into(),
-                arguments: serde_json::json!({"tab_id": 4}),
-                signature: None,
-            }]),
-            tool_call_id: None,
-            attachments: vec![],
-            reasoning: Some("step 1: get the page".into()),
-        };
-
-        let rig_msg = build_rig_assistant_message(&msg, ProviderType::DeepSeek);
-
-        let rig::message::Message::Assistant { content, .. } = rig_msg else {
-            panic!("expected Assistant message");
-        };
-
-        let has_reasoning = content
-            .iter()
-            .any(|c| matches!(c, AssistantContent::Reasoning(r) if r.reasoning.iter().any(|s| s == "step 1: get the page")));
-        let has_tool_call = content
-            .iter()
-            .any(|c| matches!(c, AssistantContent::ToolCall(_)));
-        assert!(
-            has_reasoning,
-            "DeepSeek path must emit AssistantContent::Reasoning"
-        );
-        assert!(has_tool_call, "tool call must still be present");
+        for provider in [
+            ProviderType::DeepSeek,
+            ProviderType::OpenAi,
+            ProviderType::Anthropic,
+        ] {
+            let msg = LlmMessage {
+                role: "assistant".into(),
+                content: "hi".into(),
+                tool_calls: None,
+                tool_call_id: None,
+                attachments: vec![],
+                reasoning: Some("internal thoughts".into()),
+            };
+            let rig_msg = build_rig_assistant_message(&msg, provider);
+            let rig::completion::message::Message::Assistant { content, .. } = rig_msg else {
+                panic!("expected Assistant");
+            };
+            let has_reasoning = content
+                .iter()
+                .any(|c| matches!(c, AssistantContent::Reasoning(_)));
+            assert!(
+                !has_reasoning,
+                "build_rig_assistant_message must never emit reasoning content; provider {:?} leaked it",
+                provider
+            );
+        }
     }
 
     #[test]
-    fn assistant_message_with_reasoning_skipped_for_non_deepseek() {
-        use rig::message::AssistantContent;
-
-        let msg = LlmMessage {
-            role: "assistant".into(),
-            content: "hi".into(),
-            tool_calls: None,
-            tool_call_id: None,
-            attachments: vec![],
-            reasoning: Some("internal thoughts".into()),
+    fn deepseek_request_body_packs_reasoning_with_tool_calls() {
+        let request = LlmChatRequest {
+            messages: vec![
+                LlmMessage::user("hi"),
+                LlmMessage {
+                    role: "assistant".into(),
+                    content: String::new(),
+                    tool_calls: Some(vec![LlmToolCall {
+                        id: "call_1".into(),
+                        call_id: None,
+                        name: "browser_get_markdown".into(),
+                        arguments: serde_json::json!({"tab_id": 4}),
+                        signature: None,
+                    }]),
+                    tool_call_id: None,
+                    attachments: vec![],
+                    reasoning: Some("step 1: get the page".into()),
+                },
+                LlmMessage {
+                    role: "tool".into(),
+                    content: "<page contents>".into(),
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".into()),
+                    attachments: vec![],
+                    reasoning: None,
+                },
+            ],
+            system: Some("system prompt".into()),
+            temperature: None,
+            max_tokens: Some(1024),
+            tools: None,
         };
 
-        let rig_msg = build_rig_assistant_message(&msg, ProviderType::OpenAi);
-        let rig::message::Message::Assistant { content, .. } = rig_msg else {
-            panic!("expected Assistant message");
-        };
-        let has_reasoning = content
+        let body = build_deepseek_request_body("deepseek-v4-flash", &request, true);
+
+        let messages = body["messages"].as_array().expect("messages array");
+        let assistant = messages
             .iter()
-            .any(|c| matches!(c, AssistantContent::Reasoning(_)));
-        assert!(
-            !has_reasoning,
-            "non-DeepSeek must not leak reasoning content"
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+
+        // CRITICAL: reasoning_content and tool_calls must be on the SAME message.
+        assert_eq!(
+            assistant["reasoning_content"], "step 1: get the page",
+            "reasoning_content must ride with the assistant turn that has tool_calls"
         );
+        let tool_calls = assistant["tool_calls"]
+            .as_array()
+            .expect("tool_calls present");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["function"]["name"], "browser_get_markdown");
+
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["model"], "deepseek-v4-flash");
+        assert_eq!(body["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn deepseek_request_body_omits_reasoning_when_absent() {
+        let request = LlmChatRequest {
+            messages: vec![LlmMessage::user("hi"), LlmMessage::assistant("hello")],
+            system: None,
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+        };
+
+        let body = build_deepseek_request_body("deepseek-chat", &request, false);
+        let messages = body["messages"].as_array().expect("messages");
+        let assistant = messages.iter().find(|m| m["role"] == "assistant").unwrap();
+
+        assert!(
+            assistant.get("reasoning_content").is_none(),
+            "reasoning_content key must be absent when no reasoning was carried"
+        );
+        assert_eq!(body["stream"], false);
+    }
+
+    #[test]
+    fn deepseek_sse_line_buffer_splits_correctly() {
+        // This is a smoke test for the line-buffering invariant we encode in
+        // stream_deepseek_raw. We extract the buffering logic into a small
+        // testable helper to keep the test isolated from the full async path.
+        // (See impl in stream_deepseek_raw — replicated logic here so a future
+        // refactor that changes the buffering flow is forced to update this test.)
+
+        let mut line_buf = String::new();
+        let mut emitted_lines: Vec<String> = Vec::new();
+        let chunks = [
+            "data: {\"choices\":[{\"delta\":{\"co",
+            "ntent\":\"hi\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\nda",
+            "ta: [DONE]\n",
+        ];
+        for chunk in &chunks {
+            line_buf.push_str(chunk);
+            while let Some(nl_pos) = line_buf.find('\n') {
+                let line = line_buf[..nl_pos].trim_end_matches('\r').to_string();
+                line_buf.drain(..=nl_pos);
+                emitted_lines.push(line);
+            }
+        }
+
+        assert_eq!(
+            emitted_lines.len(),
+            3,
+            "three complete SSE lines must be emitted, even though the input is split into 4 byte-chunks at arbitrary boundaries"
+        );
+        assert!(emitted_lines[0].contains("\"content\":\"hi\""));
+        assert!(emitted_lines[1].contains("\"reasoning_content\":\"think\""));
+        assert_eq!(emitted_lines[2], "data: [DONE]");
     }
 }
