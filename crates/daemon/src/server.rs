@@ -125,7 +125,7 @@ fn mirror_canvas_to_artifacts_table(
         }
     };
 
-    if let Some(ref existing) = existing_row {
+    if existing_row.is_some() {
         // Existing row: prefer update_files which only touches files+content
         // +updated_at. This is essential for persistent artifacts whose
         // session_id has been SET NULL (canvas_create_composition via the
@@ -135,30 +135,14 @@ fn mirror_canvas_to_artifacts_table(
         // skip those rows, orphaning every Canvas Editor / browser_edit
         // edit in the config table.
         //
-        // ASSET PRESERVATION: the canvas tab / browser_edit_artifact write
-        // path round-trips only the editable text files (DESIGN.md,
-        // index.html, composition.meta.json). It doesn't see binary assets
-        // attached via canvas_attach_asset (e.g. assets/hero.png). If we
-        // wrote `files_for_update` verbatim, every Canvas Editor save would
-        // clobber any asset the LLM had attached, leaving `<img
-        // src="assets/...">` references with nothing to inline at render.
-        //
-        // Defensive merge: any `assets/*` entry that exists on the row but
-        // is missing from the incoming write gets carried forward. Other
-        // file keys (DESIGN.md, index.html, etc.) are still authoritatively
-        // replaced by the incoming write — the canvas tab IS the source of
-        // truth for the editable surface.
-        let mut files_for_update = files.unwrap_or_default();
-        if let Some(existing_files) = &existing.files {
-            for (k, v) in existing_files.iter() {
-                if !k.starts_with("assets/") {
-                    continue;
-                }
-                if !files_for_update.contains_key(k) {
-                    files_for_update.insert(k.clone(), v.clone());
-                }
-            }
-        }
+        // Migration 016 moved binary assets into the dedicated
+        // `composition_assets` table, so `artifacts.files` is now
+        // text-only (DESIGN.md, index.html, composition.meta.json). The
+        // historical defensive merge for `assets/*` entries is no longer
+        // needed — the editable surface and the asset surface are now
+        // separate sources of truth, written by separate paths, and
+        // never overlap.
+        let files_for_update = files.unwrap_or_default();
         match session_manager.update_artifact_files(&id, &files_for_update, &content) {
             Ok(true) => {}
             Ok(false) => {
@@ -3070,6 +3054,41 @@ pub async fn start_server(
                 {
                     Ok(val) => serde_json::json!({
                         "type": "canvas_video_get_composition_response",
+                        "payload": val,
+                    }),
+                    Err(e) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": "CANVAS_VIDEO_ERROR",
+                            "message": e.to_string()
+                        }
+                    }),
+                };
+                let response =
+                    DaemonEnvelope::new(&proxy_id, channel, resp_msg).with_request_id(&request_id);
+                let _ = process_response_tx.send((identity, response)).await;
+                continue;
+            }
+
+            // Canvas Editor / preview fetches composition HTML by id
+            // (asset-stream-plane Phase 2 URL-rewritten path; sibling of
+            // canvas_video_get_composition but no job indirection).
+            if msg_type == "canvas_video_load_composition_html" {
+                info!("Processing canvas_video_load_composition_html message");
+                let payload = envelope
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let resp_msg = match crate::canvas_video::handlers::handle(
+                    &process_canvas_video_service,
+                    msg_type,
+                    payload,
+                )
+                .await
+                {
+                    Ok(val) => serde_json::json!({
+                        "type": "canvas_video_load_composition_html_response",
                         "payload": val,
                     }),
                     Err(e) => serde_json::json!({

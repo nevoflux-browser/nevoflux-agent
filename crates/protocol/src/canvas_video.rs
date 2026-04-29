@@ -112,6 +112,21 @@ pub struct GetCompositionResponse {
     pub fps: u32,
 }
 
+/// Canvas Editor / preview consumer -> daemon: "give me the URL-rewritten
+/// composition HTML by id, no render job needed".
+///
+/// Phase 2 of the asset-stream-plane design routes binary asset bytes
+/// over HTTP via `/v1/asset/composition/<id>/<name>?t=<token>`. The
+/// daemon-side `load_composition` handles the rewrite when an
+/// `AssetServer` is wired; this request is the bridge entry point so a
+/// chrome:// page (Canvas Editor) can ask for the same HTML as the
+/// render tab without needing to know the bearer token / asset plane
+/// port itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadCompositionHtmlRequest {
+    pub composition_id: String,
+}
+
 /// Progress event (pushed on EventBus).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderProgress {

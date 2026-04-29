@@ -53,73 +53,58 @@ pub async fn handle(
         }
     };
 
-    use nevoflux_storage::repositories::ArtifactRepository;
-    let repo = ArtifactRepository::new(&storage);
-    let rec = match repo.get(&id) {
-        Ok(Some(rec)) => rec,
+    use nevoflux_storage::repositories::CompositionAssetRepository;
+    let asset_repo = CompositionAssetRepository::new(&storage);
+    let asset = match asset_repo.get(&id, &name) {
+        Ok(Some(a)) => a,
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                format!("composition not found: {id}"),
+                format!("asset not found: {id}/{name}"),
             )
                 .into_response();
         }
         Err(e) => {
-            tracing::error!(composition_id = %id, error = %e, "asset handler: storage error");
+            tracing::error!(composition_id = %id, name = %name, error = %e, "asset handler: storage error");
             return (StatusCode::INTERNAL_SERVER_ERROR, "storage error").into_response();
         }
     };
 
-    let files = match rec.files.as_ref() {
-        Some(f) => f,
-        None => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "artifact has no files map (not a composition)",
-            )
-                .into_response();
-        }
-    };
+    // MIME priority: magic-byte sniff of the raw bytes (most reliable;
+    // immune to mis-extensioned filenames) → stored mime hint → path
+    // extension. The migration recorded a path-based hint; magic-bytes
+    // wins so that a JPEG-saved-as-foo.png still serves `image/jpeg`.
+    let mime = sniff_mime(&asset.bytes, &name).unwrap_or_else(|| {
+        asset.mime_type.clone().unwrap_or_else(|| {
+            asset_inline::mime_for_path(&name).to_string()
+        })
+    });
 
-    let asset_key = format!("assets/{name}");
-    let payload = match files.get(&asset_key) {
-        Some(s) => s,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                format!("asset not found: {asset_key}"),
-            )
-                .into_response();
-        }
-    };
-
-    // Decode bytes + sniff MIME. Magic bytes win over filename so an agent
-    // that saved a JPEG as `.png` still gets a `image/jpeg` response.
-    let (bytes, mime) = decode_payload(payload, &name);
-
-    serve_with_range(&headers, mime, bytes)
+    serve_with_range(&headers, mime, asset.bytes)
 }
 
-/// Decode a files-map entry into raw bytes + sniffed MIME.
-///
-/// Binary assets are stored base64-encoded; text assets (SVG, CSS, JSON)
-/// are stored as raw UTF-8. We discriminate via `is_likely_base64` and
-/// magic-byte sniffing, falling back to the filename extension only for
-/// text content (which has no usable magic).
-fn decode_payload(payload: &str, name: &str) -> (Vec<u8>, String) {
-    if asset_inline::is_likely_base64(payload) {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        let mime = asset_inline::magic_bytes_mime(payload)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| asset_inline::mime_for_path(name).to_string());
-        let bytes = STANDARD
-            .decode(payload.as_bytes())
-            .unwrap_or_else(|_| payload.as_bytes().to_vec());
-        (bytes, mime)
-    } else {
-        let mime = asset_inline::mime_for_path(name).to_string();
-        (payload.as_bytes().to_vec(), mime)
+/// Magic-byte MIME sniff over raw bytes. Mirrors the encoded-payload
+/// version in `canvas_video::asset_inline::magic_bytes_mime` but reads
+/// raw bytes directly instead of a base64-encoded prefix.
+fn sniff_mime(bytes: &[u8], _name: &str) -> Option<String> {
+    if bytes.len() < 4 {
+        return None;
     }
+    let m = match bytes {
+        [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, ..] => "image/png",
+        [0xFF, 0xD8, 0xFF, ..] => "image/jpeg",
+        [0x47, 0x49, 0x46, 0x38, ..] => "image/gif",
+        [0x52, 0x49, 0x46, 0x46, _, _, _, _, 0x57, 0x45, 0x42, 0x50, ..] => "image/webp",
+        [_, _, _, _, 0x66, 0x74, 0x79, 0x70, ..] => "video/mp4",
+        [0x52, 0x49, 0x46, 0x46, _, _, _, _, 0x57, 0x41, 0x56, 0x45, ..] => "audio/wav",
+        [0x49, 0x44, 0x33, ..] => "audio/mpeg",
+        [0xFF, 0xFB, ..] | [0xFF, 0xF3, ..] | [0xFF, 0xF2, ..] => "audio/mpeg",
+        [0x4F, 0x67, 0x67, 0x53, ..] => "audio/ogg",
+        [b'w', b'O', b'F', b'2', ..] => "font/woff2",
+        [b'w', b'O', b'F', b'F', ..] => "font/woff",
+        _ => return None,
+    };
+    Some(m.to_string())
 }
 
 fn serve_with_range(headers: &HeaderMap, mime: String, bytes: Vec<u8>) -> Response {

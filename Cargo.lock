@@ -3612,6 +3612,7 @@ dependencies = [
 name = "nevoflux-storage"
 version = "0.1.11"
 dependencies = [
+ "base64 0.22.1",
  "nevoflux-protocol",
  "proptest",
  "rusqlite",
@@ -3619,6 +3620,7 @@ dependencies = [
  "serde_json",
  "test-case",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

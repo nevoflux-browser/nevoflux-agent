@@ -95,33 +95,41 @@ pub async fn handle(
         }
     };
 
-    // Collect asset names (`assets/<name>` → `<name>`) for URL rewriting.
-    // The bound port + composition_id appear in every URL; the short token
-    // is shared across all assets of this composition (D12: composition
-    // tokens are multi-use, 5-min TTL).
-    let asset_names: Vec<String> = files
-        .keys()
-        .filter_map(|k| k.strip_prefix("assets/").map(|s| s.to_string()))
-        .collect();
+    // Asset names come from the dedicated `composition_assets` table
+    // (migration 016) — no longer interleaved with text files in the
+    // JSON map. The token is shared across all assets of this
+    // composition (D12: composition tokens are multi-use, 5-min TTL).
+    use nevoflux_storage::repositories::CompositionAssetRepository;
+    let asset_repo = CompositionAssetRepository::new(&storage);
+    let asset_records = match asset_repo.list_all(&id) {
+        Ok(rs) => rs,
+        Err(e) => {
+            tracing::error!(composition_id = %id, error = %e, "composition handler: list_all failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "asset list error").into_response();
+        }
+    };
 
     let bound_port = state.bound_port_for_url();
     let token = state.issue_composition_token(&id, COMPOSITION_TOKEN_TTL);
-    let asset_urls: HashMap<String, String> = asset_names
+    let asset_urls: HashMap<String, String> = asset_records
         .iter()
-        .map(|name| {
+        .map(|a| {
             (
-                name.clone(),
-                format!("http://127.0.0.1:{bound_port}/v1/asset/composition/{id}/{name}?t={token}"),
+                a.name.clone(),
+                format!(
+                    "http://127.0.0.1:{bound_port}/v1/asset/composition/{}/{}?t={token}",
+                    id, a.name
+                ),
             )
         })
         .collect();
 
     let html = asset_inline::rewrite_assets_to_urls(&html_raw, &asset_urls);
 
-    // ETag = sha256 over (entry html + sorted asset (name, len)). Stable
-    // across daemon restarts as long as the artifact bytes haven't changed,
-    // which is what the spec calls out as "hash(files map)".
-    let etag = compute_etag(entry, &html_raw, files);
+    // ETag = sha256 over (entry html + sorted asset (name, len)) read
+    // from the dedicated table. Stable across daemon restarts as long
+    // as the artifact bytes haven't changed.
+    let etag = compute_etag(entry, &html_raw, &asset_records);
 
     if let Some(if_none_match) = headers
         .get(header::IF_NONE_MATCH)
@@ -145,21 +153,21 @@ pub async fn handle(
         .unwrap()
 }
 
-fn compute_etag(entry: &str, entry_html: &str, files: &HashMap<String, String>) -> String {
+fn compute_etag(
+    entry: &str,
+    entry_html: &str,
+    assets: &[nevoflux_storage::repositories::CompositionAsset],
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(entry.as_bytes());
     hasher.update(b"\0");
     hasher.update(entry_html.as_bytes());
     hasher.update(b"\0");
-    let mut keys: Vec<&String> = files.keys().collect();
-    keys.sort();
-    for k in keys {
-        if !k.starts_with("assets/") {
-            continue;
-        }
-        hasher.update(k.as_bytes());
+    // Records come pre-sorted by name from list_all (ORDER BY name).
+    for a in assets {
+        hasher.update(a.name.as_bytes());
         hasher.update(b":");
-        hasher.update(files[k].len().to_string().as_bytes());
+        hasher.update(a.bytes.len().to_string().as_bytes());
         hasher.update(b"\0");
     }
     let digest = hasher.finalize();

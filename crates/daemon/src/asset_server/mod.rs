@@ -797,13 +797,16 @@ mod tests {
         std::sync::Arc<nevoflux_storage::Database>,
         String,
     ) {
-        use nevoflux_storage::repositories::ArtifactRepository;
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use nevoflux_storage::repositories::{ArtifactRepository, CompositionAssetRepository};
         use nevoflux_storage::Database;
 
         let db = std::sync::Arc::new(
             Database::open_in_memory().expect("in-memory Database for asset_server tests"),
         );
 
+        // Post-migration-016 shape: text files in artifacts.files,
+        // binary assets in the composition_assets table.
         let mut files = std::collections::HashMap::new();
         files.insert(
             "index.html".into(),
@@ -813,20 +816,6 @@ mod tests {
             </body></html>"#
                 .to_string(),
         );
-        files.insert("assets/hero.png".into(), PNG_1X1_B64.to_string());
-        // base64-encoded mp4 stub (`ftyp` magic at bytes 4-7) — drives the
-        // magic-bytes sniffer down the video/mp4 branch.
-        {
-            use base64::{engine::general_purpose::STANDARD, Engine};
-            let mp4_bytes = vec![
-                0u8, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, b'i', b's', b'o', b'm',
-            ];
-            files.insert("assets/clip.mp4".into(), STANDARD.encode(&mp4_bytes));
-        }
-        // raw text asset — exercises the non-base64 branch of the asset
-        // GET decoder. Length: 17 bytes (drives the Range test's
-        // Content-Range total).
-        files.insert("assets/note.txt".into(), "hello asset plane".to_string());
         files.insert("composition.meta.json".into(), sample_meta());
 
         let repo = ArtifactRepository::new(&db);
@@ -842,6 +831,26 @@ mod tests {
             entry: Some("index.html".into()),
         })
         .expect("create fixture artifact");
+
+        // Fixture assets — go into the dedicated table.
+        let asset_repo = CompositionAssetRepository::new(&db);
+        let png_bytes = STANDARD.decode(PNG_1X1_B64.as_bytes()).unwrap();
+        asset_repo
+            .upsert(&id, "hero.png", &png_bytes, Some("image/png"))
+            .unwrap();
+        // mp4 stub — `ftyp` magic at bytes 4-7 drives video/mp4 sniff.
+        let mp4_bytes = vec![
+            0u8, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, b'i', b's', b'o', b'm',
+        ];
+        asset_repo
+            .upsert(&id, "clip.mp4", &mp4_bytes, Some("video/mp4"))
+            .unwrap();
+        // Text asset — drives the no-magic-match branch in the asset
+        // GET handler (length 17 → drives the Range test's
+        // Content-Range total).
+        asset_repo
+            .upsert(&id, "note.txt", b"hello asset plane", Some("text/plain"))
+            .unwrap();
 
         let server = AssetServer::start(AssetServerConfig {
             bearer_token: "test-bearer".into(),
