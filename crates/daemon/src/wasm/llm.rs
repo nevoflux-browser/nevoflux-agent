@@ -22,8 +22,8 @@ use rig::message::{
     Text, ToolCall as RigToolCall, ToolFunction, ToolResult, ToolResultContent, UserContent,
 };
 use rig::providers::{
-    anthropic, cohere, deepseek, gemini, groq, mistral, ollama, openai, openrouter, perplexity,
-    together, xai,
+    anthropic, cohere, gemini, groq, mistral, ollama, openai, openrouter, perplexity, together,
+    xai,
 };
 use rig::streaming::{StreamedAssistantContent, ToolCallDeltaContent};
 use rig::OneOrMany;
@@ -969,23 +969,18 @@ async fn execute_deepseek_chat_raw(
     })
 }
 
-/// Execute a chat request using the DeepSeek provider (native rig provider).
+/// Execute a chat request using the DeepSeek provider.
+///
+/// Delegates to `execute_deepseek_chat_raw` — see that function's doc for
+/// the rig 0.29 split-message bug rationale.
 async fn execute_deepseek_chat(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
-    provider: ProviderType,
+    _provider: ProviderType,
     base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
-    let mut builder = deepseek::Client::builder().api_key(api_key);
-    if let Some(url) = base_url {
-        builder = builder.base_url(url);
-    }
-    let client: deepseek::Client = builder.build().map_err(|e| {
-        DaemonError::InternalError(format!("Failed to create DeepSeek client: {}", e))
-    })?;
-    let completion_model = client.completion_model(model);
-    execute_rig_completion(completion_model, request, provider).await
+    execute_deepseek_chat_raw(api_key, model, request, base_url).await
 }
 
 /// Execute a chat request using the Qwen provider (custom implementation).
@@ -2133,23 +2128,18 @@ async fn stream_openrouter(
 }
 
 /// Stream from DeepSeek provider.
+///
+/// Delegates to `stream_deepseek_raw` — see that function's doc for
+/// the rig 0.29 split-message bug rationale.
 async fn stream_deepseek(
     api_key: &str,
     model: &str,
     request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
-    provider: ProviderType,
+    _provider: ProviderType,
     base_url: Option<&str>,
 ) -> Result<()> {
-    let mut builder = deepseek::Client::builder().api_key(api_key);
-    if let Some(url) = base_url {
-        builder = builder.base_url(url);
-    }
-    let client: deepseek::Client = builder.build().map_err(|e| {
-        DaemonError::InternalError(format!("Failed to create DeepSeek client: {}", e))
-    })?;
-    let completion_model = client.completion_model(model);
-    stream_rig_completion(completion_model, request, tx, provider).await
+    stream_deepseek_raw(api_key, model, request, tx, base_url).await
 }
 
 /// Stream from Qwen provider using raw HTTP + SSE parsing.
