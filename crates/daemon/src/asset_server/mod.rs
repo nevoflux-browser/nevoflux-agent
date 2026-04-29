@@ -113,6 +113,14 @@ pub struct AssetServer {
     _shutdown_tx: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
 }
 
+impl std::fmt::Debug for AssetServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AssetServer")
+            .field("bound_port", &self.bound_port)
+            .finish()
+    }
+}
+
 impl AssetServer {
     /// Start the server. Returns once the listener is bound and the
     /// background serve task is spawned. Eviction loops for all three
@@ -525,74 +533,49 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // §13.2 — legacy /file/:token byte-for-byte parity
+    // Legacy /file/:token wire-format spec — Step A asserted byte-for-byte
+    // parity against the old file_server.rs; in Step B file_server.rs has
+    // been deleted, so we now pin the wire shape directly.
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn legacy_file_route_serves_byte_identical_response() {
+    async fn legacy_file_route_wire_format_is_stable() {
         use std::io::Write;
         use tempfile::NamedTempFile;
 
         let server = boot().await;
 
-        // Fixture: a small known payload.
         let mut tf = NamedTempFile::new().unwrap();
         tf.write_all(b"hello legacy file route").unwrap();
         tf.flush().unwrap();
         let entry = TokenEntry {
             path: tf.path().to_path_buf(),
             mime_type: "text/plain".into(),
-            file_name: tf
-                .path()
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
+            file_name: "name with \"quotes\".txt".into(),
             size: 23,
             expires_at: Instant::now() + TOKEN_TTL,
         };
-        // Register via the AssetServer's download_tokens (Step A: directly;
-        // Step B will route through register_download).
-        let token = server.state().download_tokens.insert(entry.clone());
+        let token = server.state().download_tokens.insert(entry);
+        let url = format!("http://127.0.0.1:{}/file/{}", server.bound_port(), token);
 
-        // GET via AssetServer.
-        let new_url = format!("http://127.0.0.1:{}/file/{}", server.bound_port(), token);
-        let new_resp = test_client().get(&new_url).send().await.unwrap();
-
-        assert_eq!(new_resp.status(), 200);
-        let new_ct = new_resp
-            .headers()
-            .get("content-type")
-            .map(|v| v.to_str().unwrap().to_string());
-        let new_cd = new_resp
-            .headers()
-            .get("content-disposition")
-            .map(|v| v.to_str().unwrap().to_string());
-        let new_body = new_resp.bytes().await.unwrap();
-
-        // Compare against the still-running file_server.rs.
-        let store =
-            std::sync::Arc::new(crate::agent::browser_input::upload::TokenStore::new());
-        let port = crate::agent::browser_input::file_server::start_file_server(store.clone())
-            .await
-            .unwrap();
-        let old_token = store.insert(entry);
-        let old_url = format!("http://127.0.0.1:{port}/file/{old_token}");
-        let old_resp = test_client().get(&old_url).send().await.unwrap();
-        assert_eq!(old_resp.status(), 200);
-        let old_ct = old_resp
-            .headers()
-            .get("content-type")
-            .map(|v| v.to_str().unwrap().to_string());
-        let old_cd = old_resp
-            .headers()
-            .get("content-disposition")
-            .map(|v| v.to_str().unwrap().to_string());
-        let old_body = old_resp.bytes().await.unwrap();
-
-        assert_eq!(new_ct, old_ct, "Content-Type differs");
-        assert_eq!(new_cd, old_cd, "Content-Disposition differs");
-        assert_eq!(new_body, old_body, "body bytes differ");
+        let resp = test_client().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/plain")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("content-disposition")
+                .and_then(|v| v.to_str().ok()),
+            // Quote inside the filename must be escaped — same shape as
+            // the original file_server.rs::handle_file_download.
+            Some("attachment; filename=\"name with \\\"quotes\\\".txt\"")
+        );
+        let body = resp.bytes().await.unwrap();
+        assert_eq!(body.as_ref(), b"hello legacy file route");
     }
 
     #[tokio::test]

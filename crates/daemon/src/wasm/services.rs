@@ -97,6 +97,12 @@ pub struct BrowserContext {
     pub proxy_id: String,
     /// Client identity bytes for routing responses.
     pub client_identity: Vec<u8>,
+    /// Asset & Stream Plane HTTP server, copied from `HostServices`.
+    /// `Some` once the daemon has bound a port; tools that need to hand
+    /// the browser actor a `http://127.0.0.1:.../file/<token>` URL look
+    /// it up here. `None` means the AssetServer didn't start — caller
+    /// must report a clear error rather than silently fall back.
+    pub asset_server: Option<crate::asset_server::AssetServer>,
 }
 
 /// Browser tool request for the browser sender channel.
@@ -317,6 +323,7 @@ impl HostServices {
             sender,
             proxy_id: self.proxy_id.clone(),
             client_identity: self.client_identity.clone(),
+            asset_server: self.asset_server.clone(),
         })
     }
 

@@ -2,26 +2,28 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! File upload support: token management, workspace path validation, and
-//! MIME type detection via magic bytes.
+//! Browser upload validation: workspace-path containment, sensitive-file
+//! blocklist, file-size cap, and MIME detection via magic bytes.
+//!
+//! Token storage and the localhost HTTP server live on the AssetServer
+//! (`crate::asset_server`); this module retains only the validation
+//! business rules that are upload-specific.
 //!
 //! # Token lifecycle
 //!
 //! 1. Caller validates a file path with `validate_workspace_path` and
 //!    checks its size with `check_file_size`.
-//! 2. Caller constructs a `TokenEntry` and registers it via
-//!    `TokenStore::insert`, receiving a short-lived UUID token string.
-//! 3. The bridge hands the token to the Actor. The Actor calls back
-//!    with the token to retrieve the path via `TokenStore::take`.
-//! 4. Expired tokens are silently dropped on `take`; `sweep_expired`
-//!    removes all stale entries.
+//! 2. Caller hands the canonical path to
+//!    `AssetServer::register_download`, which mints a short-lived UUID
+//!    token in `download_tokens` and returns the URL the actor should
+//!    fetch.
+//! 3. The actor GETs the URL once; the AssetServer's eviction loop
+//!    sweeps any unused tokens after their TTL.
 
-use dashmap::DashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use thiserror::Error;
-use uuid::Uuid;
 
 /// Maximum file size allowed for upload (500 MiB).
 pub const DEFAULT_MAX_SIZE: u64 = 500 * 1024 * 1024;
@@ -71,10 +73,11 @@ impl UploadError {
 }
 
 // ---------------------------------------------------------------------------
-// Token store
+// Token entry shape
 // ---------------------------------------------------------------------------
 
-/// Metadata stored alongside each upload token.
+/// Metadata stored alongside each upload token.  The actual store lives
+/// on `AssetServer::state::download_tokens` (a generic `TokenStore<TokenEntry>`).
 #[derive(Debug, Clone)]
 pub struct TokenEntry {
     /// Canonical, validated file path.
@@ -87,62 +90,6 @@ pub struct TokenEntry {
     pub size: u64,
     /// Absolute instant at which the token expires.
     pub expires_at: Instant,
-}
-
-/// Thread-safe, lock-free store for short-lived upload tokens.
-///
-/// Tokens are UUID v4 strings. Each token is valid for [`TOKEN_TTL`]
-/// from the time of insertion. `take` performs an atomic remove: the
-/// entry is gone from the map whether it was expired or not, preventing
-/// double-use.
-#[derive(Debug, Default)]
-pub struct TokenStore {
-    inner: DashMap<String, TokenEntry>,
-}
-
-impl TokenStore {
-    /// Create an empty store.
-    pub fn new() -> Self {
-        Self {
-            inner: DashMap::new(),
-        }
-    }
-
-    /// Insert an entry and return the generated token string.
-    pub fn insert(&self, entry: TokenEntry) -> String {
-        let token = Uuid::new_v4().to_string();
-        self.inner.insert(token.clone(), entry);
-        token
-    }
-
-    /// Atomically remove and return an entry.
-    ///
-    /// Returns `None` if the token is unknown **or** if it has expired.
-    /// Either way the entry is removed from the map (no second chance).
-    pub fn take(&self, token: &str) -> Option<TokenEntry> {
-        let (_, entry) = self.inner.remove(token)?;
-        if Instant::now() > entry.expires_at {
-            return None;
-        }
-        Some(entry)
-    }
-
-    /// Remove all entries whose `expires_at` is in the past.
-    pub fn sweep_expired(&self) {
-        let now = Instant::now();
-        self.inner.retain(|_, entry| entry.expires_at > now);
-    }
-
-    /// Number of entries currently in the store (including expired ones
-    /// not yet swept).
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    /// Returns `true` if the store has no entries.
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -437,86 +384,13 @@ mod tests {
         f
     }
 
-    fn make_entry(path: &Path) -> TokenEntry {
-        TokenEntry {
-            path: path.to_path_buf(),
-            mime_type: "image/jpeg".to_string(),
-            file_name: "test.jpg".to_string(),
-            size: 1024,
-            expires_at: Instant::now() + TOKEN_TTL,
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // TokenStore
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn token_insert_and_take() {
-        let store = TokenStore::new();
-        let f = make_file_with_bytes(b"hello");
-        let entry = make_entry(f.path());
-        let expected_path = entry.path.clone();
-
-        let token = store.insert(entry);
-        assert!(!token.is_empty());
-
-        let retrieved = store.take(&token).expect("should retrieve inserted token");
-        assert_eq!(retrieved.path, expected_path);
-        // Map should now be empty
-        assert!(store.is_empty());
-    }
-
-    #[test]
-    fn take_unknown_token_returns_none() {
-        let store = TokenStore::new();
-        assert!(store.take("00000000-0000-0000-0000-000000000000").is_none());
-    }
-
-    #[test]
-    fn take_expired_token_returns_none() {
-        let store = TokenStore::new();
-        let f = make_file_with_bytes(b"data");
-
-        // Insert an entry that is already expired.
-        let entry = TokenEntry {
-            path: f.path().to_path_buf(),
-            mime_type: "application/octet-stream".to_string(),
-            file_name: "data.bin".to_string(),
-            size: 4,
-            expires_at: Instant::now() - Duration::from_secs(1),
-        };
-        let token = store.insert(entry);
-        assert!(store.take(&token).is_none());
-    }
-
-    #[test]
-    fn sweep_removes_expired_entries() {
-        let store = TokenStore::new();
-        let f = make_file_with_bytes(b"x");
-
-        // Insert one expired and one live entry.
-        let expired_entry = TokenEntry {
-            path: f.path().to_path_buf(),
-            mime_type: "application/octet-stream".to_string(),
-            file_name: "x".to_string(),
-            size: 1,
-            expires_at: Instant::now() - Duration::from_secs(1),
-        };
-        let live_entry = TokenEntry {
-            expires_at: Instant::now() + TOKEN_TTL,
-            ..expired_entry.clone()
-        };
-
-        store.insert(expired_entry);
-        let live_token = store.insert(live_entry);
-
-        assert_eq!(store.len(), 2);
-        store.sweep_expired();
-        assert_eq!(store.len(), 1);
-        // The live token should still be retrievable.
-        assert!(store.take(&live_token).is_some());
-    }
+    // (TokenStore lives at `crate::asset_server::token_store`; its tests
+    // live there. Upload-side tests focus on the validation business
+    // rules below.)
+    //
+    // `TOKEN_TTL` and the `TokenEntry` struct stay in this module
+    // because they are the wire shape `AssetServer::register_download`
+    // accepts.
 
     // -----------------------------------------------------------------------
     // validate_workspace_path
