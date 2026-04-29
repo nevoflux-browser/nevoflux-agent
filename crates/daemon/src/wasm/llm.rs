@@ -663,6 +663,142 @@ fn build_openai_request_body(model: &str, request: &LlmChatRequest) -> serde_jso
     body
 }
 
+/// Build an OpenAI-compatible request body for DeepSeek, threading
+/// `reasoning_content` onto the same assistant message that carries
+/// `tool_calls` when present.
+///
+/// We cannot reuse `build_openai_request_body` because it has no concept
+/// of `reasoning_content`. Bypassing rig 0.29's deepseek converter
+/// (which splits Reasoning + ToolCall into two wire messages and drops
+/// the reasoning_content from the tool-call message) is the whole point
+/// of having this function.
+fn build_deepseek_request_body(
+    model: &str,
+    request: &LlmChatRequest,
+    stream: bool,
+) -> serde_json::Value {
+    let mut messages = Vec::new();
+
+    if let Some(ref system) = request.system {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": system,
+        }));
+    }
+
+    for msg in &request.messages {
+        match msg.role.as_str() {
+            "system" => {
+                messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": msg.content,
+                }));
+            }
+            "user" => {
+                if msg.attachments.is_empty() {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": msg.content,
+                    }));
+                } else {
+                    let mut parts = vec![serde_json::json!({
+                        "type": "text",
+                        "text": msg.content,
+                    })];
+                    for att in &msg.attachments {
+                        if att.mime_type.starts_with("image/") {
+                            let data_url = if att.data.starts_with("data:") {
+                                att.data.clone()
+                            } else {
+                                format!("data:{};base64,{}", att.mime_type, att.data)
+                            };
+                            parts.push(serde_json::json!({
+                                "type": "image_url",
+                                "image_url": { "url": data_url },
+                            }));
+                        }
+                    }
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": parts,
+                    }));
+                }
+            }
+            "assistant" => {
+                let mut m = serde_json::json!({
+                    "role": "assistant",
+                    "content": msg.content,
+                });
+                if let Some(ref tcs) = msg.tool_calls {
+                    let arr: Vec<serde_json::Value> = tcs
+                        .iter()
+                        .map(|tc| serde_json::json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": tc.arguments.to_string(),
+                            },
+                        }))
+                        .collect();
+                    m["tool_calls"] = serde_json::Value::Array(arr);
+                }
+                if let Some(ref r) = msg.reasoning {
+                    if !r.is_empty() {
+                        m["reasoning_content"] = serde_json::Value::String(r.clone());
+                    }
+                }
+                messages.push(m);
+            }
+            "tool" => {
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": msg.tool_call_id,
+                    "content": msg.content,
+                }));
+            }
+            _ => {
+                messages.push(serde_json::json!({
+                    "role": msg.role,
+                    "content": msg.content,
+                }));
+            }
+        }
+    }
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    });
+
+    if let Some(t) = request.temperature {
+        body["temperature"] = serde_json::json!(t);
+    }
+    if let Some(m) = request.max_tokens {
+        body["max_tokens"] = serde_json::json!(m);
+    }
+    if let Some(ref tools) = request.tools {
+        if !tools.is_empty() {
+            let arr: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters,
+                    },
+                }))
+                .collect();
+            body["tools"] = serde_json::Value::Array(arr);
+            body["tool_choice"] = serde_json::json!("auto");
+        }
+    }
+
+    body
+}
+
 /// Execute a chat request using raw HTTP (bypassing rig) to capture `images` field.
 ///
 /// This is used for image generation models where rig's parser drops the `images` field.
@@ -4439,5 +4575,85 @@ mod tests {
             !has_reasoning,
             "non-DeepSeek must not leak reasoning content"
         );
+    }
+
+    #[test]
+    fn deepseek_request_body_packs_reasoning_with_tool_calls() {
+        let request = LlmChatRequest {
+            messages: vec![
+                LlmMessage::user("hi"),
+                LlmMessage {
+                    role: "assistant".into(),
+                    content: String::new(),
+                    tool_calls: Some(vec![LlmToolCall {
+                        id: "call_1".into(),
+                        call_id: None,
+                        name: "browser_get_markdown".into(),
+                        arguments: serde_json::json!({"tab_id": 4}),
+                        signature: None,
+                    }]),
+                    tool_call_id: None,
+                    attachments: vec![],
+                    reasoning: Some("step 1: get the page".into()),
+                },
+                LlmMessage {
+                    role: "tool".into(),
+                    content: "<page contents>".into(),
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".into()),
+                    attachments: vec![],
+                    reasoning: None,
+                },
+            ],
+            system: Some("system prompt".into()),
+            temperature: None,
+            max_tokens: Some(1024),
+            tools: None,
+        };
+
+        let body = build_deepseek_request_body("deepseek-v4-flash", &request, true);
+
+        let messages = body["messages"].as_array().expect("messages array");
+        let assistant = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant message present");
+
+        // CRITICAL: reasoning_content and tool_calls must be on the SAME message.
+        assert_eq!(
+            assistant["reasoning_content"], "step 1: get the page",
+            "reasoning_content must ride with the assistant turn that has tool_calls"
+        );
+        let tool_calls = assistant["tool_calls"].as_array().expect("tool_calls present");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["function"]["name"], "browser_get_markdown");
+
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["model"], "deepseek-v4-flash");
+        assert_eq!(body["max_tokens"], 1024);
+    }
+
+    #[test]
+    fn deepseek_request_body_omits_reasoning_when_absent() {
+        let request = LlmChatRequest {
+            messages: vec![
+                LlmMessage::user("hi"),
+                LlmMessage::assistant("hello"),
+            ],
+            system: None,
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+        };
+
+        let body = build_deepseek_request_body("deepseek-chat", &request, false);
+        let messages = body["messages"].as_array().expect("messages");
+        let assistant = messages.iter().find(|m| m["role"] == "assistant").unwrap();
+
+        assert!(
+            assistant.get("reasoning_content").is_none(),
+            "reasoning_content key must be absent when no reasoning was carried"
+        );
+        assert_eq!(body["stream"], false);
     }
 }
