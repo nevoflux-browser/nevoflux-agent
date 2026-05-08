@@ -34,7 +34,7 @@ impl ToolClass {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_class_str(s: &str) -> Option<Self> {
         Some(match s {
             "read" => Self::Read,
             "scratchpad-write" => Self::ScratchpadWrite,
@@ -97,7 +97,7 @@ pub fn is_forbidden_in_iteration(tool_name: &str) -> bool {
 pub fn parse_class_list(input: &[String]) -> Result<HashSet<ToolClass>, String> {
     input
         .iter()
-        .map(|s| ToolClass::from_str(s).ok_or_else(|| format!("unknown class: {s}")))
+        .map(|s| ToolClass::from_class_str(s).ok_or_else(|| format!("unknown class: {s}")))
         .collect()
 }
 
@@ -162,7 +162,7 @@ mod tests {
             ToolClass::Write,
             ToolClass::NetPost,
         ] {
-            assert_eq!(ToolClass::from_str(c.as_str()), Some(c));
+            assert_eq!(ToolClass::from_class_str(c.as_str()), Some(c));
         }
     }
 }
