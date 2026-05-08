@@ -2340,6 +2340,23 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     .browser_extract_visual_identity(&tool_call.arguments, tab_id)?;
                 serde_json::to_string(&result).unwrap_or_default()
             }
+            // /loop skill tools — direct-API dispatch (Anthropic / OpenAI direct
+            // providers). The MCP/ACP path goes through
+            // `mcp_tool_executor::execute_mcp_tool::loop.*`.
+            "loop.create" => self
+                .host
+                .tool_loop_create(&serde_json::to_string(&tool_call.arguments).unwrap_or_default())?,
+            "loop.list" => self.host.tool_loop_list()?,
+            "loop.cancel" => {
+                let loop_id = tool_call.arguments["loop_id"].as_str().unwrap_or("");
+                self.host.tool_loop_cancel(loop_id)?
+            }
+            "loop.scratchpad.get" => self.host.tool_loop_scratchpad_get(
+                &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
+            )?,
+            "loop.scratchpad.set" => self.host.tool_loop_scratchpad_set(
+                &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
+            )?,
             _ => {
                 format!("Unknown tool: {}", tool_call.name)
             }
@@ -2411,6 +2428,11 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 | "tts_synthesize_api"
                 | "tts_synthesize_local"
                 | "tts_transcribe"
+                | "loop.create"
+                | "loop.list"
+                | "loop.cancel"
+                | "loop.scratchpad.get"
+                | "loop.scratchpad.set"
         ) || name.starts_with("computer_")
             || name.starts_with("browser_")
     }

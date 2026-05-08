@@ -659,6 +659,55 @@ pub trait HostFunctions {
             message: "canvas_video_inspect_layout not supported by this host".into(),
         })
     }
+
+    // =========================================================================
+    // /loop skill tool functions (spec §10)
+    // =========================================================================
+
+    /// Create a /loop. JSON args: {trigger_expr, prompt_text?, wrapped_skill?, allowed_tool_classes?}.
+    /// Returns JSON {"loop_id":"…"} on success.
+    /// Default impl returns Unsupported so non-daemon hosts (mocks, tests)
+    /// don't need stub code.
+    fn tool_loop_create(&self, _args_json: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_loop_create not supported by this host".into(),
+        })
+    }
+
+    /// List loops in the current session. Returns JSON array.
+    fn tool_loop_list(&self) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_loop_list not supported by this host".into(),
+        })
+    }
+
+    /// Cancel a loop by id. Returns JSON {"cancelled":true}.
+    fn tool_loop_cancel(&self, _loop_id: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_loop_cancel not supported by this host".into(),
+        })
+    }
+
+    /// Get a loop's scratchpad. JSON args: {loop_id?: string}.
+    /// Returns JSON {"content":"…","bytes":N}.
+    fn tool_loop_scratchpad_get(&self, _args_json: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_loop_scratchpad_get not supported by this host".into(),
+        })
+    }
+
+    /// Set a loop's scratchpad (iteration-only).
+    /// JSON args: {content:string, loop_id?:string}. Returns JSON {"bytes_written":N}.
+    fn tool_loop_scratchpad_set(&self, _args_json: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_loop_scratchpad_set not supported by this host".into(),
+        })
+    }
 }
 
 /// Mock host functions for testing.

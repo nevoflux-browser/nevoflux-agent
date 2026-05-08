@@ -4836,6 +4836,222 @@ impl HostFunctions for DaemonHostFunctions {
             message: format!("serialize canvas_create_from_visual_identity response: {e}"),
         })
     }
+
+    // =========================================================================
+    // /loop skill tool functions (spec §10) — direct-API dispatch.
+    //
+    // Anthropic / OpenAI / DeepSeek (direct providers) reach the `loop.*`
+    // family through `Agent::execute_tool` in builtin-wasm, which calls these
+    // host functions. ACP-bridge providers (claude-code, gemini-cli, kimi,
+    // openclaw) take a parallel path through
+    // `mcp_tool_executor::execute_mcp_tool` and call
+    // `crate::loops::execute_loop_tool` directly. Both paths share the same
+    // dispatcher; only the surface differs.
+    //
+    // All five methods are sync (HostFunctions is sync) but
+    // `execute_loop_tool` is async, so we use the same
+    // `tokio::task::block_in_place(|| runtime.block_on(...))` pattern as
+    // `llm_chat` to avoid panicking when called from inside a Tokio runtime.
+    //
+    // The `is_iteration: false` ToolCallContext means main-session calls;
+    // direct-API HostFunctions never runs inside a /loop iteration (those go
+    // through AgentRunner with a dedicated iteration-scoped HostFunctions in
+    // a separate context). `loop.scratchpad.set` is gated to iteration-only
+    // by `execute_loop_tool` and will surface a clear error to direct-API
+    // callers — that's intentional per spec §10.2.
+    // =========================================================================
+
+    fn tool_loop_create(&self, args_json: &str) -> HostResult<String> {
+        let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| HostError {
+            code: 4,
+            message: format!("invalid args JSON: {e}"),
+        })?;
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services.loop_manager.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "LoopManager not configured".into(),
+        })?;
+        let session_id = self.session_id.clone().unwrap_or_default();
+        let ctx = crate::loops::ToolCallContext {
+            session_id,
+            is_iteration: false,
+            own_loop_id: None,
+        };
+        let mgr = mgr.clone();
+        let db = services.database.clone();
+        let runtime = self.runtime.clone();
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::loops::execute_loop_tool("loop.create", &args, &ctx, &mgr, db.as_ref()).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_loop_list(&self) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services.loop_manager.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "LoopManager not configured".into(),
+        })?;
+        let session_id = self.session_id.clone().unwrap_or_default();
+        let ctx = crate::loops::ToolCallContext {
+            session_id,
+            is_iteration: false,
+            own_loop_id: None,
+        };
+        let mgr = mgr.clone();
+        let db = services.database.clone();
+        let runtime = self.runtime.clone();
+        let args = serde_json::json!({});
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::loops::execute_loop_tool("loop.list", &args, &ctx, &mgr, db.as_ref()).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_loop_cancel(&self, loop_id: &str) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services.loop_manager.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "LoopManager not configured".into(),
+        })?;
+        let session_id = self.session_id.clone().unwrap_or_default();
+        let ctx = crate::loops::ToolCallContext {
+            session_id,
+            is_iteration: false,
+            own_loop_id: None,
+        };
+        let mgr = mgr.clone();
+        let db = services.database.clone();
+        let runtime = self.runtime.clone();
+        let args = serde_json::json!({ "loop_id": loop_id });
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::loops::execute_loop_tool("loop.cancel", &args, &ctx, &mgr, db.as_ref()).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_loop_scratchpad_get(&self, args_json: &str) -> HostResult<String> {
+        let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| HostError {
+            code: 4,
+            message: format!("invalid args JSON: {e}"),
+        })?;
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services.loop_manager.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "LoopManager not configured".into(),
+        })?;
+        let session_id = self.session_id.clone().unwrap_or_default();
+        let ctx = crate::loops::ToolCallContext {
+            session_id,
+            is_iteration: false,
+            own_loop_id: None,
+        };
+        let mgr = mgr.clone();
+        let db = services.database.clone();
+        let runtime = self.runtime.clone();
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::loops::execute_loop_tool(
+                    "loop.scratchpad.get",
+                    &args,
+                    &ctx,
+                    &mgr,
+                    db.as_ref(),
+                )
+                .await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_loop_scratchpad_set(&self, args_json: &str) -> HostResult<String> {
+        let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| HostError {
+            code: 4,
+            message: format!("invalid args JSON: {e}"),
+        })?;
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services.loop_manager.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "LoopManager not configured".into(),
+        })?;
+        let session_id = self.session_id.clone().unwrap_or_default();
+        // NOTE: scratchpad_set is iteration-only per execute_loop_tool's gating.
+        // Direct-API callers from the main session will get an error — that's
+        // intended (spec §10.2 context gating). Future: support an iteration
+        // context propagating through HostFunctions if needed.
+        let ctx = crate::loops::ToolCallContext {
+            session_id,
+            is_iteration: false,
+            own_loop_id: None,
+        };
+        let mgr = mgr.clone();
+        let db = services.database.clone();
+        let runtime = self.runtime.clone();
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::loops::execute_loop_tool(
+                    "loop.scratchpad.set",
+                    &args,
+                    &ctx,
+                    &mgr,
+                    db.as_ref(),
+                )
+                .await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
 }
 
 impl DaemonHostFunctions {
