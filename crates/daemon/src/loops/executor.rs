@@ -5,6 +5,15 @@
 //! Phase 9 will replace the stub body with a real
 //! `AgentRunner::run_for_loop_iteration` call that respects the loop's
 //! tool-class allow-list and forbidden-set.
+//!
+//! **NOTE (2026-05-08):** Phase 9 ships with the stub still in place because
+//! AgentRunner has no tool-filter mechanism today (`crates/daemon/src/agent/runner.rs`
+//! constructs an immutable `tools: ToolRegistry` once). Adding per-iteration
+//! filtering is a separate refactor. Until that lands, iterations *record*
+//! correctly but do not actually execute the LLM prompt. The triple-registry
+//! tool surfaces are wired (Phases 9.1-9.3) so the LLM can see and call
+//! loop.* tools from the main session; iteration-side execution is inert
+//! and deferred to a future phase.
 
 use crate::loops::types::LoopId;
 use nevoflux_storage::models::{IterationStatus, LoopRecord};
