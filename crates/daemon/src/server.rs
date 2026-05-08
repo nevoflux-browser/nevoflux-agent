@@ -1759,6 +1759,39 @@ pub async fn start_server(
                 continue;
             }
 
+            // Handle loop_cancel_command from sidebar (/loop skill spec §8.3).
+            // force=true is the second-click hard-cancel; false is the soft cancel
+            // that lets the current iteration finish.
+            if msg_type == "loop_cancel_command" {
+                info!("Processing loop_cancel_command message");
+                if let Some(payload) = envelope.payload.get("payload") {
+                    let loop_id = payload
+                        .get("loop_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let force = payload
+                        .get("force")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if let Some(loop_id) = loop_id {
+                        if let Some(mgr) = process_services.loop_manager.as_ref() {
+                            let id = crate::loops::LoopId(loop_id.clone());
+                            if let Err(e) = mgr.cancel_loop(&id, force).await {
+                                warn!("loop cancel from sidebar failed for {}: {}", loop_id, e);
+                            }
+                        } else {
+                            warn!(
+                                "loop_cancel_command received for {} but no LoopManager configured",
+                                loop_id
+                            );
+                        }
+                    } else {
+                        warn!("loop_cancel_command missing loop_id");
+                    }
+                }
+                continue;
+            }
+
             // Handle canvas_tool_list requests
             if msg_type == "canvas_tool_list" {
                 info!("Processing canvas_tool_list message");
