@@ -319,6 +319,29 @@ impl LoopManager {
         Ok(())
     }
 
+    /// Tear down all triggers + iterations on clean shutdown. Marks any
+    /// `running` loops as `idle` so the next startup sweep doesn't paint
+    /// them as crashed.
+    pub async fn shutdown(&self) {
+        let ids = self.registry.ids();
+        for id in &ids {
+            let _ = self
+                .cancel_loop_inner(id, true, "daemon-shutdown")
+                .await;
+        }
+        // Any rows still `running` (shouldn't be after the per-id force
+        // cancels, but defensive) get demoted to idle.
+        let now = current_timestamp();
+        let _ = self.db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE loops SET state = 'idle', updated_at = ?1 WHERE state = 'running'",
+                rusqlite::params![now],
+            )
+            .map(|_| ())
+            .map_err(nevoflux_storage::error::StorageError::from)
+        });
+    }
+
     pub async fn list_by_session(&self, session_id: &str) -> Result<Vec<LoopRecord>, String> {
         LoopRepository::new(&self.db)
             .list_by_session(session_id)
