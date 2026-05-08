@@ -126,6 +126,33 @@ impl LoopManager {
         Ok(id)
     }
 
+    pub async fn cancel_loop(&self, id: &LoopId, force: bool) -> Result<(), String> {
+        let subs: Vec<String> = self
+            .registry
+            .with_mut(id, |rt| {
+                let s = std::mem::take(&mut rt.subscription_ids);
+                if force {
+                    rt.cancel_token.cancel();
+                }
+                s
+            })
+            .unwrap_or_default();
+        for sub in &subs {
+            self.scheduler.unsubscribe(sub);
+        }
+        LoopRepository::new(&self.db)
+            .update_state(id.as_ref(), LoopState::Cancelled, current_timestamp())
+            .map_err(|e| e.to_string())?;
+        self.registry.remove(id);
+        Ok(())
+    }
+
+    pub async fn list_by_session(&self, session_id: &str) -> Result<Vec<LoopRecord>, String> {
+        LoopRepository::new(&self.db)
+            .list_by_session(session_id)
+            .map_err(|e| e.to_string())
+    }
+
     /// Wire a trigger expression's subscriptions. Phase 7 handles only `time:<duration>`;
     /// other variants are left as warn-stubs for later phases.
     fn wire_trigger(&self, id: &LoopId, expr: &TriggerExpr) {
@@ -276,5 +303,68 @@ mod tests {
             "iteration_count was {}",
             rec.iteration_count
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_loop_unsubscribes_triggers() {
+        let storage = fresh();
+        let mgr = LoopManager::start(storage.database().clone());
+
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "time:1m".into(),
+                prompt_text: Some("p".into()),
+                wrapped_skill: None,
+                allowed_tool_classes: None,
+            })
+            .await
+            .unwrap();
+
+        mgr.cancel_loop(&id, false).await.unwrap();
+
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(120)).await;
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
+        assert_eq!(rec.state, LoopState::Cancelled);
+        assert_eq!(
+            rec.iteration_count, 0,
+            "no iterations should have fired after cancel"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn list_by_session_returns_session_loops() {
+        let storage = fresh();
+        let mgr = LoopManager::start(storage.database().clone());
+
+        let _ = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "time:5m".into(),
+                prompt_text: Some("p".into()),
+                wrapped_skill: None,
+                allowed_tool_classes: None,
+            })
+            .await
+            .unwrap();
+        let _ = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "time:10m".into(),
+                prompt_text: Some("q".into()),
+                wrapped_skill: None,
+                allowed_tool_classes: None,
+            })
+            .await
+            .unwrap();
+
+        let list = mgr.list_by_session("s1").await.unwrap();
+        assert_eq!(list.len(), 2);
     }
 }
