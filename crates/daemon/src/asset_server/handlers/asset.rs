@@ -38,7 +38,18 @@ pub async fn handle(
     Query(query): Query<AuthQuery>,
     headers: HeaderMap,
 ) -> Response {
+    tracing::info!(
+        composition_id = %id,
+        asset_name = %name,
+        has_token = query.t.is_some(),
+        "asset_server: GET /v1/asset/composition/:id/:name"
+    );
     if !check_composition_request_auth(&state, &id, &headers, query.t.as_deref()) {
+        tracing::warn!(
+            composition_id = %id,
+            asset_name = %name,
+            "asset_server: 401 unauthorized"
+        );
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
 

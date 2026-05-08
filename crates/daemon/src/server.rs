@@ -3143,22 +3143,38 @@ pub async fn start_server(
                 continue;
             }
 
-            // Handle internal proxy disconnect notification for EventBus cleanup
+            // Handle internal proxy disconnect notification for EventBus cleanup.
+            //
+            // PREVIOUS BEHAVIOR (removed): synchronously cleaned subs by
+            // proxy_id. The bug: native-messaging often early-EOFs at
+            // boot — the underlying TCP bridge cycles while the
+            // WebExtension keeps using the same proxy_id. The OLD
+            // connection's EOF arrives at the daemon AFTER the NEW
+            // connection has already registered (and possibly already
+            // re-subscribed via `replaySubscriptions`). Cleanup-by-
+            // proxy_id then nukes the just-added subs, and downstream
+            // subscribers (sidebar render-progress, etc.) silently stop
+            // receiving events.
+            //
+            // We can't reliably distinguish "old conn's stale disconnect"
+            // from "true disconnect of currently-only conn" without
+            // per-connection identity tracking (the writers map is also
+            // keyed by proxy_id and gets clobbered the same way). For the
+            // single-browser-session use case, zombie subscriptions left
+            // behind by a truly-gone proxy are harmless — they take a
+            // negligible amount of memory and clear when the daemon
+            // exits. The LLM client / sidebar / canvas page all live for
+            // the duration of the daemon process anyway.
+            //
+            // Bigger architectural fix (per-connection identity → cleanup
+            // by identity instead of proxy_id) is tracked separately. For
+            // now, just NEVER auto-clean subs on disconnect.
             if msg_type == "_proxy_disconnected" {
-                let disconnected_id = envelope
+                let _disconnected_id = envelope
                     .payload
                     .get("proxy_id")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if !disconnected_id.is_empty() {
-                    cleanup_proxy_subscriptions(
-                        &disconnected_id,
-                        &process_subscription_router,
-                        &process_event_bus,
-                    )
-                    .await;
-                }
+                    .unwrap_or("");
                 continue;
             }
 

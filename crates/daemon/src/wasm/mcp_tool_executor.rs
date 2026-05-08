@@ -1194,6 +1194,7 @@ async fn execute_canvas_video_tool(
             let resolved = resolve_attach_asset_payload(&req)
                 .await
                 .map_err(|e| format!("canvas_attach_asset: {e}"))?;
+            let composition_id = req.composition_id.clone();
             let path = svc
                 .attach_asset(
                     &req.composition_id,
@@ -1204,6 +1205,26 @@ async fn execute_canvas_video_tool(
                 )
                 .await
                 .map_err(|e| e.to_string())?;
+            // Notify the extension that the composition's binary side
+            // changed (assets are NOT in artifacts.files / ContentStore
+            // anymore — moved to composition_assets in migration 016).
+            // Without this, an open Canvas Editor tab keeps rendering
+            // the pre-attach HTML and the image only shows up after a
+            // manual reload. Background.js handles the broadcast by
+            // re-fetching the artifact via system_command artifact.get,
+            // whose response hydrates ContentStore → fires the canvas
+            // page subscriber → re-render → fresh URL-rewritten HTML.
+            if let Some(tx) = services.broadcast_tx.as_ref() {
+                let payload = serde_json::json!({
+                    "type": "canvas_video_artifact_changed",
+                    "payload": { "artifact_id": composition_id }
+                });
+                let env = nevoflux_protocol::DaemonEnvelope::broadcast(
+                    nevoflux_protocol::Channel::Chat,
+                    payload,
+                );
+                let _ = tx.send((b"*".to_vec(), env)).await;
+            }
             let resp = nevoflux_protocol::canvas_video::AttachAssetResponse {
                 path,
                 mime_type: resolved.mime_type,
