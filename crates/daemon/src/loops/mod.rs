@@ -2,6 +2,7 @@
 //!
 //! Spec: docs/superpowers/specs/2026-04-22-loop-skill-design.md
 
+pub mod events;
 pub mod executor;
 pub mod expression;
 pub mod manager;
