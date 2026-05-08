@@ -3,7 +3,9 @@
 //! Spec: docs/superpowers/specs/2026-04-22-loop-skill-design.md
 
 pub mod expression;
+pub mod registry;
 pub mod tool_classes;
 pub mod types;
 pub use expression::{ParseError, TabRef, TriggerExpr};
+pub use registry::LoopRegistry;
 pub use types::{LoopId, LoopRuntime};
