@@ -103,6 +103,18 @@ pub struct GetCompositionRequest {
     pub job_id: String,
 }
 
+/// Asset plane endpoint advertisement carried inside
+/// `GetCompositionResponse` so the render page can POST captured PNG
+/// frames straight to `/v1/render/:job_id/frame` without going through
+/// native messaging. `None` when the daemon has no `AssetServer` wired
+/// (test mode, partial bring-up); render page MUST then fall back to
+/// the legacy `canvas_video_frame_chunk` NM path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetPlaneEndpoint {
+    pub port: u16,
+    pub bearer_token: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetCompositionResponse {
     pub html: String,
@@ -110,6 +122,8 @@ pub struct GetCompositionResponse {
     pub height: u32,
     pub duration_sec: f32,
     pub fps: u32,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub asset_plane: Option<AssetPlaneEndpoint>,
 }
 
 /// Canvas Editor / preview consumer -> daemon: "give me the URL-rewritten

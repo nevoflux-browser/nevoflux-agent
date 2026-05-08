@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use nevoflux_protocol::canvas_video::{
-    CreateCompositionRequest, GetCompositionRequest, GetCompositionResponse,
+    AssetPlaneEndpoint, CreateCompositionRequest, GetCompositionRequest, GetCompositionResponse,
     LintCompositionRequest, LoadCompositionHtmlRequest, RenderCancelRequest, RenderDone,
     RenderFailed, RenderFrameChunk, RenderReady, RenderStartRequest,
 };
@@ -85,12 +85,23 @@ pub async fn handle(
                 .map_err(|e| DaemonError::InvalidRequest(format!("parse: {}", e)))?;
             let (html, width, height, duration_sec, fps) =
                 svc.get_composition_for_job(&req.job_id).await?;
+            // Phase 4 wiring: hand the render page port + bearer so it can
+            // POST captured PNG frames to /v1/render/:job_id/frame instead
+            // of paging them through native messaging (which silently drops
+            // anything > NM 1 MB once background.js's chunkMessage envelope
+            // wraps it). `None` only when AssetServer isn't wired (test mode);
+            // render page falls back to the legacy NM frame_chunk path then.
+            let asset_plane = svc.asset_server().map(|s| AssetPlaneEndpoint {
+                port: s.bound_port(),
+                bearer_token: s.bearer_token().to_string(),
+            });
             let resp = GetCompositionResponse {
                 html,
                 width,
                 height,
                 duration_sec,
                 fps,
+                asset_plane,
             };
             serde_json::to_value(resp).map_err(|e| DaemonError::InternalError(format!("{}", e)))
         }
@@ -103,12 +114,20 @@ pub async fn handle(
             // otherwise refs stay relative.
             let (html, width, height, duration_sec, fps) =
                 svc.load_composition(&req.composition_id).await?;
+            // Canvas Editor / preview path doesn't need asset_plane (it
+            // doesn't capture frames), but populating keeps the wire shape
+            // stable for downstream consumers.
+            let asset_plane = svc.asset_server().map(|s| AssetPlaneEndpoint {
+                port: s.bound_port(),
+                bearer_token: s.bearer_token().to_string(),
+            });
             let resp = GetCompositionResponse {
                 html,
                 width,
                 height,
                 duration_sec,
                 fps,
+                asset_plane,
             };
             serde_json::to_value(resp).map_err(|e| DaemonError::InternalError(format!("{}", e)))
         }
