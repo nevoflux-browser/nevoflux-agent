@@ -10,6 +10,7 @@ pub mod expression;
 pub mod manager;
 pub mod registry;
 pub mod scheduler;
+pub mod sweep;
 pub mod tool_classes;
 pub mod tools;
 pub mod types;
