@@ -100,3 +100,69 @@ pub fn parse_class_list(input: &[String]) -> Result<HashSet<ToolClass>, String> 
         .map(|s| ToolClass::from_str(s).ok_or_else(|| format!("unknown class: {s}")))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn known_tool_routes_to_class() {
+        assert_eq!(class_for("read"), ToolClass::Read);
+        assert_eq!(class_for("browser_click"), ToolClass::DomClick);
+        assert_eq!(class_for("loop.scratchpad.set"), ToolClass::ScratchpadWrite);
+    }
+
+    #[test]
+    fn unknown_tool_defaults_to_write() {
+        assert_eq!(class_for("brand_new_unmapped_tool"), ToolClass::Write);
+    }
+
+    #[test]
+    fn parse_class_list_rejects_unknown() {
+        let err = parse_class_list(&["read".into(), "bogus".into()]).unwrap_err();
+        assert!(err.contains("bogus"));
+    }
+
+    #[test]
+    fn parse_class_list_accepts_all_known() {
+        let set = parse_class_list(&["read".into(), "scratchpad-write".into()]).unwrap();
+        assert!(set.contains(&ToolClass::Read));
+        assert!(set.contains(&ToolClass::ScratchpadWrite));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn defaults_are_safe() {
+        let d = default_classes();
+        assert!(d.contains(&ToolClass::Read));
+        assert!(d.contains(&ToolClass::ScratchpadWrite));
+        assert!(d.contains(&ToolClass::EventSubscribe));
+        assert!(!d.contains(&ToolClass::Write));
+        assert!(!d.contains(&ToolClass::DomClick));
+        assert!(!d.contains(&ToolClass::Nav));
+        assert!(!d.contains(&ToolClass::NetPost));
+    }
+
+    #[test]
+    fn forbidden_set() {
+        assert!(is_forbidden_in_iteration("loop.create"));
+        assert!(is_forbidden_in_iteration("ask_user"));
+        assert!(!is_forbidden_in_iteration("read"));
+        assert!(!is_forbidden_in_iteration("loop.scratchpad.set"));
+    }
+
+    #[test]
+    fn round_trip_class_strings() {
+        for c in [
+            ToolClass::Read,
+            ToolClass::ScratchpadWrite,
+            ToolClass::EventSubscribe,
+            ToolClass::DomClick,
+            ToolClass::Nav,
+            ToolClass::Write,
+            ToolClass::NetPost,
+        ] {
+            assert_eq!(ToolClass::from_str(c.as_str()), Some(c));
+        }
+    }
+}
