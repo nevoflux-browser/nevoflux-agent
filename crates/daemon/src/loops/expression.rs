@@ -261,4 +261,21 @@ mod tests {
         // "2µ" — last char is multi-byte; must NOT panic, must return BadDuration.
         assert!(matches!(parse("time:2µ"), Err(ParseError::BadDuration(_))));
     }
+
+    #[test]
+    fn combinator_empty_body_rejected() {
+        assert_eq!(parse("AND()"), Err(ParseError::CombinatorTooFew(1)));
+    }
+
+    #[test]
+    fn combinator_single_child_rejected() {
+        assert_eq!(parse("AND(time:5m)"), Err(ParseError::CombinatorTooFew(1)));
+    }
+
+    #[test]
+    fn combinator_trailing_comma_recurses_to_empty() {
+        // Documents the current behavior: trailing comma yields an empty child,
+        // which fails as ParseError::Empty during recursion.
+        assert_eq!(parse("AND(time:5m,)"), Err(ParseError::Empty));
+    }
 }
