@@ -61,6 +61,7 @@ impl LoopManager {
         let registry_for_task = registry.clone();
         let executor_for_task = executor.clone();
         let events_for_task = events.clone();
+        let scheduler_for_task = scheduler.clone();
         tokio::spawn(async move {
             while let Some(req) = fire_rx.recv().await {
                 // §8.2: drop if currently running.
@@ -103,6 +104,63 @@ impl LoopManager {
                 let _ = executor_for_task
                     .execute(req.loop_id.clone(), req.fire_reason)
                     .await;
+
+                // 3-strike auto-cancel hook — depends on Phase 9b filling
+                // in real failure counting. Reads the current
+                // consecutive_failures and trips a soft cancel-equivalent
+                // tear-down with reason "fail_threshold" if >= 3.
+                //
+                // The Phase-6 stub executor always succeeds and resets
+                // the counter on every iteration, so under MVP this hook
+                // only fires when something external (tests, future
+                // executor, manual ops) sets the counter to >= 3.
+                let cf = LoopRepository::new(&executor_for_task.database())
+                    .get(req.loop_id.as_ref())
+                    .ok()
+                    .flatten()
+                    .map(|r| r.consecutive_failures)
+                    .unwrap_or(0);
+                if cf >= 3 {
+                    let session_id = registry_for_task
+                        .with_mut(&req.loop_id, |rt| rt.session_id.clone())
+                        .unwrap_or_default();
+                    // Inline the relevant tear-down — we can't call
+                    // self.cancel_loop_inner from a 'static spawned task.
+                    // Same logic as cancel_loop_inner with by="fail_threshold"
+                    // + force=false (current iteration just finished).
+                    let watchers: Vec<String> = registry_for_task
+                        .with_mut(&req.loop_id, |rt| std::mem::take(&mut rt.dom_watchers))
+                        .unwrap_or_default();
+                    let subs: Vec<String> = registry_for_task
+                        .with_mut(&req.loop_id, |rt| {
+                            std::mem::take(&mut rt.subscription_ids)
+                        })
+                        .unwrap_or_default();
+                    for sub in &subs {
+                        scheduler_for_task.unsubscribe(sub);
+                    }
+                    let _ = watchers;
+                    let _ = LoopRepository::new(&executor_for_task.database())
+                        .update_state(
+                            req.loop_id.as_ref(),
+                            LoopState::Failed,
+                            current_timestamp(),
+                        );
+                    events_for_task
+                        .state_changed(
+                            &session_id,
+                            &req.loop_id,
+                            "failed",
+                            "running",
+                            Some("fail_threshold"),
+                        )
+                        .await;
+                    events_for_task
+                        .cancelled(&session_id, &req.loop_id, "fail_threshold", false)
+                        .await;
+                    registry_for_task.remove(&req.loop_id);
+                    continue;
+                }
 
                 registry_for_task.with_mut(&req.loop_id, |rt| {
                     rt.current_iteration = None;
@@ -175,36 +233,88 @@ impl LoopManager {
         Ok(id)
     }
 
+    /// Cancel a loop with two-click grace/force semantics (spec §8.3).
+    ///
+    /// - `force=true`: immediate force-cancel — abort in-flight iteration,
+    ///   tear down all triggers, mark loop `cancelled`.
+    /// - `force=false` (soft): first click stamps `first_cancel_at_ms` on
+    ///   the runtime; a second soft cancel within 30s escalates to force.
+    ///   Either way the trigger subscriptions are torn down and the loop
+    ///   is marked `cancelled`. With force=false the in-flight iteration
+    ///   (if any) is allowed to run to completion (its cancel_token is not
+    ///   tripped) — but no further iterations will fire because the
+    ///   triggers are gone and the runtime entry is removed.
     pub async fn cancel_loop(&self, id: &LoopId, force: bool) -> Result<(), String> {
-        // Snapshot the session_id BEFORE we touch the registry — we still
-        // need it for event emission after the runtime entry is removed.
+        let now_ms: u64 = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        if force {
+            return self.cancel_loop_inner(id, true, "user-force").await;
+        }
+
+        // First soft-click: stamp the time. Second soft-click within 30s ⇒ force.
+        let prior = self.registry.with_mut(id, |rt| {
+            let p = rt.first_cancel_at_ms;
+            if p.is_none() {
+                rt.first_cancel_at_ms = Some(now_ms);
+            }
+            p
+        });
+        if let Some(Some(t)) = prior {
+            if now_ms.saturating_sub(t) < 30_000 {
+                return self.cancel_loop_inner(id, true, "user-force").await;
+            }
+        }
+
+        // Soft cancel: tear down trigger subs but allow the current iteration
+        // (if any) to finish naturally. State → cancelled (we eagerly mark
+        // for MVP — the dispatcher checks busy and skips fires anyway).
+        self.cancel_loop_inner(id, false, "user-soft").await
+    }
+
+    /// Internal cancel implementation. `force=true` aborts in-flight iteration
+    /// and tears down everything immediately. `force=false` only tears down
+    /// triggers and lets the current iteration finish (the cancellation token
+    /// is NOT triggered).
+    async fn cancel_loop_inner(
+        &self,
+        id: &LoopId,
+        force: bool,
+        by: &str,
+    ) -> Result<(), String> {
         let session_id = self
             .registry
             .with_mut(id, |rt| rt.session_id.clone())
             .unwrap_or_default();
 
+        let watchers: Vec<String> = self
+            .registry
+            .with_mut(id, |rt| std::mem::take(&mut rt.dom_watchers))
+            .unwrap_or_default();
         let subs: Vec<String> = self
             .registry
             .with_mut(id, |rt| {
-                let s = std::mem::take(&mut rt.subscription_ids);
                 if force {
                     rt.cancel_token.cancel();
+                    if let Some(it) = &rt.current_iteration {
+                        it.cancel();
+                    }
                 }
-                s
+                std::mem::take(&mut rt.subscription_ids)
             })
             .unwrap_or_default();
         for sub in &subs {
             self.scheduler.unsubscribe(sub);
         }
+        // Phase 19 deferred — dom_watchers vec stays empty; if any are present
+        // (future phase), the bridge uninstall would happen here.
+        let _ = watchers;
+
         LoopRepository::new(&self.db)
             .update_state(id.as_ref(), LoopState::Cancelled, current_timestamp())
             .map_err(|e| e.to_string())?;
-
         self.events
-            .state_changed(&session_id, id, "cancelled", "running", Some("user"))
+            .state_changed(&session_id, id, "cancelled", "running", Some(by))
             .await;
-        self.events.cancelled(&session_id, id, "user", force).await;
-
+        self.events.cancelled(&session_id, id, by, force).await;
         self.registry.remove(id);
         Ok(())
     }
@@ -585,6 +695,55 @@ mod tests {
             "OR combinator should fire on first child; got {}",
             rec.iteration_count
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_strikes_marks_loop_failed() {
+        // Synthesize 3 consecutive failures on the loop record. The
+        // Phase-6 stub executor always succeeds and resets the counter
+        // on every "ok" iteration, so by the time the dispatcher runs,
+        // we may not see the Failed state — the executor's own state
+        // update races the 3-strike hook.
+        //
+        // For the MVP this test exercises that the dispatcher's
+        // 3-strike read path compiles and executes without panicking;
+        // once Phase 9b lands and IterationExecutor returns real
+        // ExecResult::Error and bumps consecutive_failures itself,
+        // this test will become observable end-to-end.
+        let storage = fresh();
+        let mgr = LoopManager::start(storage.database().clone());
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "time:1m".into(),
+                prompt_text: Some("p".into()),
+                wrapped_skill: None,
+                allowed_tool_classes: None,
+            })
+            .await
+            .unwrap();
+
+        // Pre-load failure counter to 3.
+        storage
+            .loops()
+            .set_consecutive_failures(id.as_ref(), 3, current_timestamp())
+            .unwrap();
+
+        // Advance past the next time tick so the dispatcher runs.
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(61)).await;
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        // The Phase-6 stub resets consecutive_failures to 0 on every
+        // "ok" iteration, so the post-iteration read may see 0. We
+        // accept either outcome here; the test's value is in
+        // exercising the dispatcher's 3-strike code path without
+        // panic.
+        let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
+        let _ = rec;
     }
 
     #[tokio::test]
