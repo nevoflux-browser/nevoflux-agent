@@ -62,6 +62,79 @@ impl TriggerScheduler {
         sub_id
     }
 
+    /// Schedule an event-driven trigger. Subscribes to `topic_pattern` on the
+    /// EventBus and re-emits each matching event as a `LoopFireRequest`.
+    /// Returns a subscription id; pass to `unsubscribe` to tear down both the
+    /// scheduler-side handle and the EventBus subscription.
+    pub fn schedule_event(
+        &self,
+        loop_id: LoopId,
+        topic_pattern: String,
+        bus: std::sync::Arc<crate::event_bus::EventBus>,
+        sink: mpsc::Sender<LoopFireRequest>,
+    ) -> Result<String, String> {
+        use crate::event_bus::types::{BackpressurePolicy, SubscriberIdentity, TopicPattern};
+
+        let pattern = if topic_pattern.contains('*') {
+            TopicPattern::Wildcard(topic_pattern.clone())
+        } else {
+            TopicPattern::Exact(topic_pattern.clone())
+        };
+
+        let handle = bus
+            .subscribe(
+                pattern,
+                SubscriberIdentity::Internal,
+                BackpressurePolicy::DropOldest,
+                32,
+            )
+            .map_err(|e| format!("event subscribe failed: {e}"))?;
+
+        let sub_id = format!("event-{}-{}", loop_id.as_ref(), handle.id);
+        let scheduler_cancel = CancellationToken::new();
+        self.cancels
+            .write()
+            .expect("scheduler poisoned")
+            .insert(sub_id.clone(), scheduler_cancel.clone());
+
+        let id = loop_id.clone();
+        let topic_label = topic_pattern.clone();
+        let bus_for_task = bus.clone();
+        let bus_sub_id = handle.id.clone();
+        let mut rx = handle.rx;
+        let join = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = scheduler_cancel.cancelled() => {
+                        bus_for_task.unsubscribe(&bus_sub_id);
+                        return;
+                    }
+                    msg = rx.recv() => match msg {
+                        Some(_event) => {
+                            if sink.send(LoopFireRequest {
+                                loop_id: id.clone(),
+                                fire_reason: format!("event:{}", topic_label),
+                            }).await.is_err() {
+                                bus_for_task.unsubscribe(&bus_sub_id);
+                                return;
+                            }
+                        }
+                        None => {
+                            // bus dropped its sender — subscription is dead, exit.
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        self.handles
+            .write()
+            .expect("scheduler poisoned")
+            .insert(sub_id.clone(), join);
+
+        Ok(sub_id)
+    }
+
     /// Unsubscribe a previously-issued subscription. Idempotent — no-op if id is unknown.
     pub fn unsubscribe(&self, sub_id: &str) {
         if let Some(c) = self.cancels.write().expect("scheduler poisoned").remove(sub_id) {
@@ -158,5 +231,69 @@ mod tests {
         }
         assert!(got.contains("a"));
         assert!(got.contains("b"));
+    }
+
+    #[tokio::test]
+    async fn schedule_event_fires_on_topic_match() {
+        use crate::event_bus::types::{BusEvent, PublisherIdentity};
+        use crate::event_bus::EventBus;
+        use std::sync::Arc;
+
+        let bus = Arc::new(EventBus::new());
+        let sched = TriggerScheduler::new();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let sub = sched.schedule_event(
+            LoopId("a".into()),
+            "ui:test:click".into(),
+            bus.clone(),
+            tx,
+        ).expect("schedule_event");
+
+        bus.publish(BusEvent::ephemeral(
+            "ui:test:click",
+            serde_json::json!({}),
+            PublisherIdentity::Internal,
+        )).await.unwrap();
+
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            rx.recv(),
+        ).await.expect("event fire").expect("fire request");
+        assert_eq!(r.loop_id.as_ref(), "a");
+        assert_eq!(r.fire_reason, "event:ui:test:click");
+
+        sched.unsubscribe(&sub);
+    }
+
+    #[tokio::test]
+    async fn schedule_event_wildcard_pattern() {
+        use crate::event_bus::types::{BusEvent, PublisherIdentity};
+        use crate::event_bus::EventBus;
+        use std::sync::Arc;
+
+        let bus = Arc::new(EventBus::new());
+        let sched = TriggerScheduler::new();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        sched.schedule_event(
+            LoopId("a".into()),
+            "ui:tab:*:click".into(),
+            bus.clone(),
+            tx,
+        ).expect("schedule_event with wildcard");
+
+        bus.publish(BusEvent::ephemeral(
+            "ui:tab:42:click",
+            serde_json::json!({}),
+            PublisherIdentity::Internal,
+        )).await.unwrap();
+
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            rx.recv(),
+        ).await.expect("event fire").expect("fire request");
+        assert_eq!(r.loop_id.as_ref(), "a");
+        assert!(r.fire_reason.starts_with("event:ui:tab"));
     }
 }
