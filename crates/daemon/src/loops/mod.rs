@@ -4,4 +4,6 @@
 
 pub mod expression;
 pub mod tool_classes;
+pub mod types;
 pub use expression::{ParseError, TabRef, TriggerExpr};
+pub use types::{LoopId, LoopRuntime};
