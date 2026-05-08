@@ -32,6 +32,12 @@ pub enum ParseError {
     TooDeep,
     #[error("unknown atom: {0}")]
     UnknownAtom(String),
+    #[error("combinator needs at least 2 children, got {0}")]
+    CombinatorTooFew(usize),
+    #[error("empty event topic")]
+    EmptyEventTopic,
+    #[error("malformed state atom: {0}")]
+    MalformedState(String),
 }
 
 impl TriggerExpr {
@@ -64,7 +70,7 @@ impl TriggerExpr {
 fn parse_combinator(body: &str, depth: u8) -> Result<Vec<TriggerExpr>, ParseError> {
     let parts = split_top_level_commas(body)?;
     if parts.len() < 2 {
-        return Err(ParseError::Unexpected(0, "combinator needs ≥2 children".into()));
+        return Err(ParseError::CombinatorTooFew(parts.len()));
     }
     parts.into_iter().map(|p| TriggerExpr::parse_with_depth(p.trim(), depth)).collect()
 }
@@ -118,22 +124,22 @@ fn parse_duration(s: &str) -> Result<Duration, ParseError> {
 
 fn parse_event_atom(rest: &str) -> Result<TriggerExpr, ParseError> {
     if rest.is_empty() {
-        return Err(ParseError::Unexpected(0, "empty event topic".into()));
+        return Err(ParseError::EmptyEventTopic);
     }
     Ok(TriggerExpr::Event(rest.to_string()))
 }
 
 fn parse_state_atom(rest: &str) -> Result<TriggerExpr, ParseError> {
     let after_tab = rest.strip_prefix("tab=")
-        .ok_or_else(|| ParseError::Unexpected(0, "expected 'tab='".into()))?;
+        .ok_or_else(|| ParseError::MalformedState("expected 'tab='".into()))?;
     let (tab_str, rest) = after_tab.split_once(':')
-        .ok_or_else(|| ParseError::Unexpected(0, "expected ':' after tab=…".into()))?;
+        .ok_or_else(|| ParseError::MalformedState("expected ':' after tab=…".into()))?;
     let tab = if tab_str == "current" { TabRef::Current }
-              else { TabRef::Id(tab_str.parse().map_err(|_| ParseError::Unexpected(0, format!("bad tab id: {tab_str}")))?) };
+              else { TabRef::Id(tab_str.parse().map_err(|_| ParseError::MalformedState(format!("bad tab id: {tab_str}")))?) };
     let selector = rest.strip_suffix(":change")
-        .ok_or_else(|| ParseError::Unexpected(0, "state atom must end with ':change'".into()))?;
+        .ok_or_else(|| ParseError::MalformedState("state atom must end with ':change'".into()))?;
     if selector.is_empty() {
-        return Err(ParseError::Unexpected(0, "empty selector".into()));
+        return Err(ParseError::MalformedState("empty selector".into()));
     }
     Ok(TriggerExpr::State { tab, selector: selector.to_string() })
 }
@@ -187,7 +193,7 @@ mod tests {
 
     #[test]
     fn event_empty_topic_rejected() {
-        assert!(matches!(parse("event:"), Err(ParseError::Unexpected(_, _))));
+        assert_eq!(parse("event:"), Err(ParseError::EmptyEventTopic));
     }
 
     #[test]
