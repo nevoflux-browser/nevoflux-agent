@@ -95,15 +95,22 @@ fn parse_time_atom(rest: &str) -> Result<TriggerExpr, ParseError> {
 }
 
 fn parse_duration(s: &str) -> Result<Duration, ParseError> {
-    if s.len() < 2 { return Err(ParseError::BadDuration(s.into())); }
-    let (num, unit) = s.split_at(s.len() - 1);
+    let mut iter = s.char_indices();
+    // Last char_indices entry gives the byte offset of the final char.
+    let (last_idx, unit_ch) = iter.next_back()
+        .ok_or_else(|| ParseError::BadDuration(s.into()))?;
+    if last_idx == 0 {
+        // Single-char input like "5" — no number prefix.
+        return Err(ParseError::BadDuration(s.into()));
+    }
+    let num = &s[..last_idx];
     let n: u64 = num.parse().map_err(|_| ParseError::BadDuration(s.into()))?;
     if n == 0 { return Err(ParseError::BadDuration(s.into())); }
-    let secs = match unit {
-        "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
-        "d" => n * 86400,
+    let secs = match unit_ch {
+        's' => n,
+        'm' => n * 60,
+        'h' => n * 3600,
+        'd' => n * 86400,
         _ => return Err(ParseError::BadDuration(s.into())),
     };
     Ok(Duration::from_secs(secs))
@@ -241,5 +248,11 @@ mod tests {
     #[test]
     fn unbalanced_parens_rejected() {
         assert!(parse("AND(time:5m,event:foo").is_err());
+    }
+
+    #[test]
+    fn time_multibyte_unit_does_not_panic() {
+        // "2µ" — last char is multi-byte; must NOT panic, must return BadDuration.
+        assert!(matches!(parse("time:2µ"), Err(ParseError::BadDuration(_))));
     }
 }
