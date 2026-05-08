@@ -3477,6 +3477,64 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     "required": ["target"]
                 }),
             },
+            // /loop skill tools (spec §10).
+            //
+            // NOTE: These ToolDefinition entries make the tools VISIBLE to the LLM,
+            // but the actual dispatch lives in `mcp_tool_executor::execute_mcp_tool`
+            // (Phase 9.3). The builtin-wasm `Agent::execute_tool` match arm has no
+            // direct access to `LoopManager` or `Database` (the `HostFunctions`
+            // trait does not surface them), so a direct-API provider that reaches
+            // builtin-wasm without going through mcp_tool_executor will fall through
+            // to the generic "unknown tool" path. Wiring the builtin-wasm execution
+            // arm requires extending `HostFunctions` and is deferred.
+            ToolDefinition {
+                name: "loop.create".into(),
+                description: "Create a recurring task that re-runs a prompt or wrapped skill on a trigger. Trigger grammar: time:<5m|1h|...>, time:dynamic, event:<topic>, state:tab=current|<id>:<css>:change, with AND/OR up to depth 3. Default tool classes are read+scratchpad-write+event-subscribe; opt in to dom-click/nav/write/net-post explicitly.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "trigger_expr": { "type": "string", "description": "trigger expression, e.g. 'time:5m' or 'event:ui:tab:click'" },
+                        "prompt_text": { "type": "string", "description": "raw prompt re-issued each fire — XOR with wrapped_skill" },
+                        "wrapped_skill": { "type": "object", "description": "{name, args} — XOR with prompt_text" },
+                        "allowed_tool_classes": {
+                            "type": "array",
+                            "items": { "type": "string", "enum": ["read","scratchpad-write","event-subscribe","dom-click","nav","write","net-post"] }
+                        }
+                    },
+                    "required": ["trigger_expr"]
+                }),
+            },
+            ToolDefinition {
+                name: "loop.list".into(),
+                description: "List loops in the current session.".into(),
+                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            },
+            ToolDefinition {
+                name: "loop.cancel".into(),
+                description: "Cancel a loop. From inside an iteration you may only cancel your own loop_id.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "loop_id": { "type": "string" } },
+                    "required": ["loop_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "loop.scratchpad.get".into(),
+                description: "Read the loop's ≤4KB scratchpad. Defaults to current iteration's loop.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "loop_id": { "type": "string" } }
+                }),
+            },
+            ToolDefinition {
+                name: "loop.scratchpad.set".into(),
+                description: "Replace the loop's scratchpad (≤4096 bytes). Iteration-only.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "content": { "type": "string" } },
+                    "required": ["content"]
+                }),
+            },
         ]
     }
 
