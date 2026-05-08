@@ -372,6 +372,50 @@ pub async fn execute_mcp_tool(
         _ => {}
     }
 
+    // 6'. /loop skill tools (spec §10).
+    //
+    // Dispatched via `crate::loops::execute_loop_tool`. ACP-bridge providers
+    // (claude-code, gemini-cli, kimi, openclaw) reach this branch through
+    // the MCP HTTP bridge; direct-API providers reach the same dispatcher
+    // here too because builtin-wasm's `Agent::execute_tool` arm has no
+    // direct access to `LoopManager` (see Phase 9 scope correction).
+    //
+    // Requires `services.loop_manager` to be set at daemon startup
+    // (Phase 23 wires this; until then tool calls surface a clear error).
+    if matches!(
+        name,
+        "loop.create" | "loop.list" | "loop.cancel" | "loop.scratchpad.get" | "loop.scratchpad.set"
+    ) {
+        let mgr = match services.loop_manager.as_ref() {
+            Some(m) => m,
+            None => {
+                return Err(
+                    "/loop tools are not available — daemon was started without a LoopManager"
+                        .to_string(),
+                );
+            }
+        };
+        let ctx = crate::loops::ToolCallContext {
+            session_id: services.session_id.clone(),
+            // mcp_tool_executor is the main-session tool path; loop iterations
+            // dispatch through a different (Phase 9b) AgentRunner code path.
+            is_iteration: false,
+            own_loop_id: None,
+        };
+        let result = crate::loops::execute_loop_tool(
+            name,
+            arguments,
+            &ctx,
+            mgr.as_ref(),
+            services.database.as_ref(),
+        )
+        .await;
+        return match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(e),
+        };
+    }
+
     // 7. External MCP tools (via McpManager)
     if let Some(ref mcp_manager) = services.mcp_manager {
         if let Ok(result) = execute_mcp_manager_tool(name, arguments, mcp_manager).await {
