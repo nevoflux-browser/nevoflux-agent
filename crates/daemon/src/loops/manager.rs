@@ -91,6 +91,15 @@ impl LoopManager {
                     rt.current_iteration = Some(token.clone());
                 });
 
+                // TODO(Phase 9b + 12): once AgentRunner is wired and IterationExecutor
+                // returns the LLM's final assistant text, parse the `loop-meta` block
+                // here for `time:dynamic` triggers and reschedule via:
+                //   if rec.trigger_expr == "time:dynamic" {
+                //       let next = crate::loops::dynamic::extract_next_delay(&final_text);
+                //       // tear down old time-* subs, schedule_time(next), push new sub_id.
+                //   }
+                // The parser is already implemented in `crate::loops::dynamic`; the
+                // missing piece is the executor returning the assistant text.
                 let _ = executor_for_task
                     .execute(req.loop_id.clone(), req.fire_reason)
                     .await;
