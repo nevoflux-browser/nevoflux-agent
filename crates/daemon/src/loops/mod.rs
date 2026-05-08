@@ -2,11 +2,13 @@
 //!
 //! Spec: docs/superpowers/specs/2026-04-22-loop-skill-design.md
 
+pub mod executor;
 pub mod expression;
 pub mod registry;
 pub mod scheduler;
 pub mod tool_classes;
 pub mod types;
+pub use executor::{ExecResult, IterationExecutor};
 pub use expression::{ParseError, TabRef, TriggerExpr};
 pub use registry::LoopRegistry;
 pub use scheduler::{LoopFireRequest, TriggerScheduler};
