@@ -41,11 +41,47 @@ impl TriggerExpr {
         if depth > 3 { return Err(ParseError::TooDeep); }
         if s.is_empty() { return Err(ParseError::Empty); }
 
+        // Catch unbalanced "AND(..." / "OR(..." early so the test for unbalanced parens passes.
+        if (s.starts_with("AND(") || s.starts_with("OR(")) && !s.ends_with(')') {
+            return Err(ParseError::Unexpected(0, "unbalanced parentheses".into()));
+        }
+
+        if let Some(body) = s.strip_prefix("AND(").and_then(|t| t.strip_suffix(')')) {
+            return parse_combinator(body, depth + 1).map(TriggerExpr::And);
+        }
+        if let Some(body) = s.strip_prefix("OR(").and_then(|t| t.strip_suffix(')')) {
+            return parse_combinator(body, depth + 1).map(TriggerExpr::Or);
+        }
         if let Some(rest) = s.strip_prefix("time:") { return parse_time_atom(rest); }
         if let Some(rest) = s.strip_prefix("event:") { return parse_event_atom(rest); }
         if let Some(rest) = s.strip_prefix("state:") { return parse_state_atom(rest); }
         Err(ParseError::UnknownAtom(s.to_string()))
     }
+}
+
+fn parse_combinator(body: &str, depth: u8) -> Result<Vec<TriggerExpr>, ParseError> {
+    let parts = split_top_level_commas(body)?;
+    if parts.len() < 2 {
+        return Err(ParseError::Unexpected(0, "combinator needs ≥2 children".into()));
+    }
+    parts.into_iter().map(|p| TriggerExpr::parse_with_depth(p.trim(), depth)).collect()
+}
+
+fn split_top_level_commas(s: &str) -> Result<Vec<&str>, ParseError> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => { depth -= 1; if depth < 0 { return Err(ParseError::Unexpected(i, "unbalanced ')'".into())); } }
+            ',' if depth == 0 => { out.push(&s[start..i]); start = i + 1; }
+            _ => {}
+        }
+    }
+    if depth != 0 { return Err(ParseError::Unexpected(s.len(), "unbalanced '('".into())); }
+    out.push(&s[start..]);
+    Ok(out)
 }
 
 fn parse_time_atom(rest: &str) -> Result<TriggerExpr, ParseError> {
@@ -164,5 +200,44 @@ mod tests {
     #[test]
     fn state_missing_change_suffix_rejected() {
         assert!(parse("state:tab=current:.x").is_err());
+    }
+
+    #[test]
+    fn and_two_atoms() {
+        assert_eq!(
+            parse("AND(time:5m,event:foo)").unwrap(),
+            TriggerExpr::And(vec![
+                TriggerExpr::Time(Duration::from_secs(300)),
+                TriggerExpr::Event("foo".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn or_three_atoms() {
+        assert_eq!(
+            parse("OR(time:5m,event:a,event:b)").unwrap(),
+            TriggerExpr::Or(vec![
+                TriggerExpr::Time(Duration::from_secs(300)),
+                TriggerExpr::Event("a".into()),
+                TriggerExpr::Event("b".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn nested_combinator_depth_2() {
+        assert!(parse("AND(time:5m,OR(event:a,event:b))").is_ok());
+    }
+
+    #[test]
+    fn depth_4_rejected() {
+        let s = "AND(OR(AND(OR(time:1m,time:2m),time:3m),time:4m),time:5m)";
+        assert_eq!(parse(s), Err(ParseError::TooDeep));
+    }
+
+    #[test]
+    fn unbalanced_parens_rejected() {
+        assert!(parse("AND(time:5m,event:foo").is_err());
     }
 }
