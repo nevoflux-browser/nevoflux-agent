@@ -159,3 +159,228 @@ fn scratchpad_set(args: &Value, ctx: &ToolCallContext, db: &Database) -> Result<
         .map_err(|e| e.to_string())?;
     Ok(json!({ "bytes_written": content.len() }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::loops::manager::LoopManager;
+    use nevoflux_storage::models::CreateSessionParams;
+    use nevoflux_storage::Storage;
+
+    fn setup() -> (Storage, LoopManager) {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .sessions()
+            .create(CreateSessionParams::new().with_id("s1").with_title("t"))
+            .unwrap();
+        let mgr = LoopManager::start(storage.database().clone());
+        (storage, mgr)
+    }
+
+    fn ctx(is_iter: bool, own: Option<&str>) -> ToolCallContext {
+        ToolCallContext {
+            session_id: "s1".into(),
+            is_iteration: is_iter,
+            own_loop_id: own.map(|s| LoopId(s.into())),
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_create_then_list_includes_it() {
+        let (storage, mgr) = setup();
+        let res = execute_loop_tool(
+            "loop.create",
+            &json!({ "trigger_expr": "time:5m", "prompt_text": "x" }),
+            &ctx(false, None),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap();
+        let id = res.get("loop_id").unwrap().as_str().unwrap().to_string();
+
+        let list = execute_loop_tool(
+            "loop.list",
+            &json!({}),
+            &ctx(false, None),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap();
+        let arr = list.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].get("loop_id").unwrap().as_str().unwrap(), id);
+        assert_eq!(arr[0].get("state").unwrap().as_str().unwrap(), "pending");
+        assert_eq!(
+            arr[0].get("trigger_expr").unwrap().as_str().unwrap(),
+            "time:5m"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_create_blocked_in_iteration() {
+        let (storage, mgr) = setup();
+        let err = execute_loop_tool(
+            "loop.create",
+            &json!({ "trigger_expr": "time:5m", "prompt_text": "x" }),
+            &ctx(true, Some("aaa")),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("forbidden") || err.contains("inside an iteration"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scratchpad_set_rejects_oversize() {
+        let (storage, mgr) = setup();
+        let id = execute_loop_tool(
+            "loop.create",
+            &json!({ "trigger_expr": "time:5m", "prompt_text": "x" }),
+            &ctx(false, None),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap()
+        .get("loop_id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+
+        let big = "x".repeat(4097);
+        let err = execute_loop_tool(
+            "loop.scratchpad.set",
+            &json!({ "content": big }),
+            &ctx(true, Some(&id)),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("4096"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn scratchpad_set_persists_under_limit() {
+        let (storage, mgr) = setup();
+        let id = execute_loop_tool(
+            "loop.create",
+            &json!({ "trigger_expr": "time:5m", "prompt_text": "x" }),
+            &ctx(false, None),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap()
+        .get("loop_id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+
+        execute_loop_tool(
+            "loop.scratchpad.set",
+            &json!({ "content": "k=v" }),
+            &ctx(true, Some(&id)),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap();
+
+        let got = execute_loop_tool(
+            "loop.scratchpad.get",
+            &json!({ "loop_id": id }),
+            &ctx(false, None),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.get("content").unwrap().as_str().unwrap(), "k=v");
+        assert_eq!(got.get("bytes").unwrap().as_i64().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn cancel_other_loop_from_iteration_rejected() {
+        let (storage, mgr) = setup();
+        let id = execute_loop_tool(
+            "loop.create",
+            &json!({ "trigger_expr": "time:5m", "prompt_text": "x" }),
+            &ctx(false, None),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap()
+        .get("loop_id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+
+        let err = execute_loop_tool(
+            "loop.cancel",
+            &json!({ "loop_id": &id }),
+            &ctx(true, Some("self")),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("only cancel its own"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn scratchpad_set_outside_iteration_rejected() {
+        let (storage, mgr) = setup();
+        let id = execute_loop_tool(
+            "loop.create",
+            &json!({ "trigger_expr": "time:5m", "prompt_text": "x" }),
+            &ctx(false, None),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap()
+        .get("loop_id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+
+        let err = execute_loop_tool(
+            "loop.scratchpad.set",
+            &json!({ "content": "k=v" }),
+            &ctx(false, None),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("iteration"), "got: {err}");
+        let _ = id;
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_name_errors() {
+        let (storage, mgr) = setup();
+        let err = execute_loop_tool(
+            "loop.invented",
+            &json!({}),
+            &ctx(false, None),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("unknown loop tool"));
+    }
+}
