@@ -22,7 +22,13 @@ impl LoopState {
             Self::Cancelled => "cancelled",
         }
     }
-    pub fn from_str(s: &str) -> Option<Self> {
+
+    /// Parse from the on-disk string representation.
+    ///
+    /// Named `from_db_str` (rather than `from_str`) so the `Option<Self>`
+    /// signature does not collide with the conventional `FromStr` trait,
+    /// which is what clippy's `should_implement_trait` lint flags.
+    pub fn from_db_str(s: &str) -> Option<Self> {
         Some(match s {
             "pending" => Self::Pending,
             "running" => Self::Running,

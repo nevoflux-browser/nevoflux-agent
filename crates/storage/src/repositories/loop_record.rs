@@ -226,7 +226,7 @@ fn row_to_loop(row: &Row<'_>) -> rusqlite::Result<Result<LoopRecord>> {
 
     Ok((|| -> Result<LoopRecord> {
         let allowed_tool_classes: Vec<String> = serde_json::from_str(&classes_json)?;
-        let state = LoopState::from_str(&state_str).ok_or_else(|| {
+        let state = LoopState::from_db_str(&state_str).ok_or_else(|| {
             StorageError::Migration(format!("unknown loop state in row: {state_str}"))
         })?;
         Ok(LoopRecord {
