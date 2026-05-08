@@ -158,6 +158,7 @@ mod tests {
     use super::*;
     use nevoflux_storage::models::CreateSessionParams;
     use nevoflux_storage::Storage;
+    use std::time::Duration;
 
     fn fresh() -> Storage {
         let s = Storage::open_in_memory().unwrap();
@@ -240,5 +241,40 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("prompt_text or wrapped_skill"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn create_loop_then_one_iteration_fires() {
+        let storage = fresh();
+        let mgr = LoopManager::start(storage.database().clone());
+
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "time:1m".into(),
+                prompt_text: Some("check".into()),
+                wrapped_skill: None,
+                allowed_tool_classes: None,
+            })
+            .await
+            .unwrap();
+
+        // Advance past the first 60s tick, then drive the runtime so the
+        // scheduler task -> dispatcher channel -> executor chain drains.
+        // With virtual time paused, we alternate `advance` + yield to
+        // ensure every spawned task gets polled.
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(61)).await;
+            for _ in 0..200 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
+        assert!(
+            rec.iteration_count >= 1,
+            "iteration_count was {}",
+            rec.iteration_count
+        );
     }
 }
