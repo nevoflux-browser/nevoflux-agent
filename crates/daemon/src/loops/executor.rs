@@ -1,55 +1,60 @@
 //! Per-iteration execution (spec §7).
 //!
-//! ## Phase 9b status (2026-05-08)
+//! ## Phase 9c status (2026-05-08)
 //!
-//! Phase 9b lands the **tool-class filter plumbing** end-to-end:
+//! Phase 9c lights up **real LLM-driven iteration execution** by reusing
+//! the production agent host the chat-send path uses. Iteration flow:
 //!
-//! - `AgentRunner::with_tools_allowlist(Vec<String>)` (new) — gates the
-//!   runner's tool dispatch through `ToolRegistry::execute_with_guard`.
-//! - `tool_classes::filter_tool_names_by_classes` (new) — translates a
-//!   `HashSet<ToolClass>` from the loop record's `allowed_tool_classes`
-//!   into the concrete tool-name allowlist the runner needs.
-//! - `IterationExecutor::execute` — validates `allowed_tool_classes`,
-//!   computes the allowlist, tracks `consecutive_failures` with proper
-//!   reset-on-success semantics, and returns the iteration's final
-//!   assistant text via the new `ExecResult::OkWithText` variant so
-//!   Phase 12.2's `time:dynamic` reschedule has a hook.
+//! 1. Read the loop record, increment `iteration_count`, insert a
+//!    `loop_iterations` row with `status=running`, emit
+//!    `system:loop:iteration_start`.
+//! 2. Validate `allowed_tool_classes`; on parse failure record an
+//!    iteration error and bump `consecutive_failures`.
+//! 3. Build the §7.2 LOOP-CONTEXT block + per-class tool-name allowlist.
+//! 4. **Production path** (when [`HostServices`] are wired via
+//!    [`IterationExecutor::with_services`]): spawn a
+//!    [`crate::agent_host::DaemonHostFunctions`] via the daemon's
+//!    [`HostServices::agent_config`] + [`HostServices::runtime_handle`]
+//!    snapshots, then call
+//!    `nevoflux_builtin_wasm::Agent::new(host).run(&AgentInput { tools_config: Allow(...), ..})`.
+//!    The host's pre-LLM tool filter (`Agent::filter_tools`) honors the
+//!    allowlist, so no extra runtime guard is needed.
+//! 5. **Stub path** (no services — unit tests only): record a no-op
+//!    success without invoking an LLM. This preserves Phase-6 test
+//!    semantics while production traffic gets real execution.
+//! 6. On success → reset `consecutive_failures` to 0; on error → bump.
+//!    The dispatcher in `manager.rs` auto-cancels at >= 3 strikes
+//!    (spec §8.4).
+//! 7. Emit `system:loop:iteration_end` with the final status + a small
+//!    `tool_calls_summary` array.
 //!
-//! What is **NOT** wired here yet:
+//! ## What is intentionally **NOT** wired here
 //!
-//! Production agent execution in this codebase runs through
-//! `nevoflux_builtin_wasm::Agent::new(host).run(input)` (see
-//! `server.rs::handle_chat_send`), not the daemon-side `AgentRunner` in
-//! `crates/daemon/src/agent/runner.rs` (which is currently
-//! test-infrastructure with a simulated `call_agent` body). Wiring real
-//! LLM-driven iteration execution here requires either:
+//! - **Sidebar streaming**. Iterations don't push their delta-chunks to
+//!   the chat sidebar; the §7-mandated visibility surface is the sticky
+//!   loop card + `system:loop:iteration_end` event, not the streaming
+//!   `stream_chunk` channel. So we skip `with_sidebar_stream`.
+//! - **Session memory extraction**. Loop iterations would otherwise
+//!   pollute `session_memories` with one extraction per tick; we skip
+//!   `with_session_extractor` to keep memory pristine.
+//! - **Trace collection**. Iterations write their own
+//!   `tool_calls_summary` to `loop_iterations.summary_json`; the
+//!   per-chat trace collector is intentionally bypassed.
+//! - **Canvas video service**. Loops can't render video (the
+//!   `canvas_*` tools are in the `Write` class, which isn't in the
+//!   default tool-class set); we don't bother wiring
+//!   `with_canvas_video_service`. If a loop opts into the `Write`
+//!   class, the call will fail with a clear "tool not configured"
+//!   error — acceptable for MVP.
 //!
-//! 1. Snapshotting the full `HostServices` + an `LlmHostFunctions` adapter
-//!    at the iteration site (the daemon currently builds these per
-//!    chat session in `server.rs`, drawing on `proxy_id`, `client_identity`,
-//!    `session_extractor`, and the active sidebar stream — none of which
-//!    have natural values for an out-of-band loop tick).
-//! 2. OR materializing `agent_wasm` bytes into `HostServices` and using
-//!    the daemon-side `AgentRunner` (which still needs a real WASM
-//!    `agent_process` export — today the runner only simulates the call).
-//!
-//! Both threads are out of scope for Phase 9b. The path of least
-//! resistance is the daemon-AgentRunner + real `agent_process` route,
-//! and the allowlist plumbing landed here is exactly what that route
-//! will need.
-//!
-//! Until that ships, iterations record correctly (status=ok,
-//! sequence advances, events emit) but do not actually invoke an LLM
-//! and `OkWithText` always carries `None`.
-//!
-//! Phase 10 emits `system:loop:iteration_start` / `iteration_end`
-//! around the work — already wired via [`LoopEvents`].
+//! Phase 12.2 (`time:dynamic` reschedule) reads
+//! [`ExecResult::final_text`] in `manager.rs` and parses the
+//! `loop-meta` block out of the assistant text.
 
 use crate::loops::events::LoopEvents;
-use crate::loops::tool_classes::{
-    filter_tool_names_by_classes, parse_class_list,
-};
+use crate::loops::tool_classes::{filter_tool_names_by_classes, parse_class_list};
 use crate::loops::types::LoopId;
+use crate::wasm::services::HostServices;
 use nevoflux_storage::models::{current_timestamp, IterationStatus, LoopRecord};
 use nevoflux_storage::repositories::LoopRepository;
 use nevoflux_storage::Database;
@@ -62,7 +67,7 @@ pub enum ExecResult {
     /// Iteration completed successfully and carried final assistant text.
     /// Phase 12.2's `time:dynamic` reschedule reads `loop-meta` from this
     /// text. `None` means the iteration ran but produced no text (e.g.
-    /// when AgentRunner invocation is still stubbed — see module docs).
+    /// when `HostServices` is not wired — unit tests only).
     OkWithText(Option<String>),
     /// Iteration failed; the string is a short human-readable reason.
     Error(String),
@@ -86,6 +91,11 @@ impl ExecResult {
 pub struct IterationExecutor {
     db: Database,
     events: Arc<LoopEvents>,
+    /// `HostServices` snapshot for spawning a production
+    /// [`crate::agent_host::DaemonHostFunctions`]. `None` in unit tests
+    /// → stub success path. Set during server boot via
+    /// [`Self::with_services`] (see `manager.rs::start_with_bus`).
+    services: Option<HostServices>,
 }
 
 impl IterationExecutor {
@@ -94,7 +104,20 @@ impl IterationExecutor {
     }
 
     pub fn new_with_events(db: Database, events: Arc<LoopEvents>) -> Self {
-        Self { db, events }
+        Self {
+            db,
+            events,
+            services: None,
+        }
+    }
+
+    /// Wire the `HostServices` snapshot the executor uses to invoke a
+    /// real production agent. When unset, [`Self::execute`] short-circuits
+    /// to the Phase-6 stub path that records the iteration as `ok`
+    /// without invoking an LLM. Phase 9c.
+    pub fn with_services(mut self, services: HostServices) -> Self {
+        self.services = Some(services);
+        self
     }
 
     /// Cheap clone of the underlying Database handle.
@@ -104,24 +127,8 @@ impl IterationExecutor {
         self.db.clone()
     }
 
-    /// Run a single iteration.
-    ///
-    /// Phase 9b semantics (see module-level docs):
-    /// 1. Read the loop record.
-    /// 2. Increment `iteration_count`, insert a `loop_iterations` row,
-    ///    emit `system:loop:iteration_start`.
-    /// 3. Validate `allowed_tool_classes`; on parse failure record an
-    ///    iteration error and bump `consecutive_failures`.
-    /// 4. Build the §7.2 LOOP-CONTEXT block + tool-name allowlist.
-    /// 5. **STUB:** invoke AgentRunner with the allowlist. Today this
-    ///    short-circuits to a no-op success because the production agent
-    ///    path is in `builtin-wasm` and not yet bridged in. The plumbing
-    ///    needed to bridge it (allowlist on AgentRunner) is in place.
-    /// 6. On success → reset `consecutive_failures` to 0 and finish the
-    ///    row with `status=ok`. On error → bump `consecutive_failures`,
-    ///    finish with `status=error`. The dispatcher in `manager.rs`
-    ///    auto-cancels at >= 3 strikes (spec §8.4).
-    /// 7. Emit `system:loop:iteration_end`.
+    /// Run a single iteration. See module-level docs for the
+    /// production-vs-stub split and intentionally-skipped wiring.
     pub async fn execute(&self, loop_id: LoopId, fire_reason: String) -> ExecResult {
         let repo = LoopRepository::new(&self.db);
         let now = current_timestamp();
@@ -151,79 +158,298 @@ impl IterationExecutor {
             .iteration_start(&session_id, &loop_id, seq, now, &fire_reason)
             .await;
 
-        // Build §7.2 LOOP-CONTEXT user-message. (The actual AgentInput
-        // construction is deferred — see module docs.)
-        let _user_message = build_user_message(&rec, seq, &fire_reason);
+        // Validate allowed_tool_classes + compute the tool-name allowlist
+        // for `AgentInput.tools_config = Allow(...)`. Pre-LLM filter inside
+        // `nevoflux_builtin_wasm::Agent::filter_tools` honors this list.
+        let allowed_classes = match parse_class_list(&rec.allowed_tool_classes) {
+            Ok(s) => s,
+            Err(e) => {
+                return self
+                    .finalize_iteration_error(
+                        iter_id,
+                        format!("bad allowed_tool_classes: {e}"),
+                        &session_id,
+                        &loop_id,
+                        seq,
+                        &rec,
+                    )
+                    .await;
+            }
+        };
 
-        // Validate allowed_tool_classes and compute the tool-name
-        // allowlist that a future AgentRunner invocation will use.
-        let outcome: Result<Option<String>, String> =
-            match parse_class_list(&rec.allowed_tool_classes) {
-                Ok(allowed_classes) => {
-                    // Build the would-be allowlist from the *daemon's*
-                    // ToolRegistry (the one AgentRunner consults).
-                    // We materialize it eagerly so the path is exercised
-                    // even though the runner invocation itself is stubbed
-                    // — this catches drift in `class_for` / forbidden-set
-                    // before Phase 9b's follow-up wires the real call.
-                    let registry = crate::agent::tools::ToolRegistry::new();
-                    let all_names: Vec<String> = registry
-                        .tool_names()
-                        .into_iter()
-                        .map(|s| s.to_string())
-                        .collect();
-                    let _allowlist =
-                        filter_tool_names_by_classes(&all_names, &allowed_classes);
+        let user_message = build_user_message(&rec, seq, &fire_reason);
+        let allowlist =
+            filter_tool_names_by_classes(&known_chat_tool_catalog(), &allowed_classes);
 
-                    // STUB: invoke the runner here once the production
-                    // agent path is bridged. Until then, claim success
-                    // without text.
-                    Ok(None)
-                }
-                Err(e) => Err(format!("bad allowed_tool_classes: {e}")),
-            };
+        // Stub path: no services → record ok without invoking LLM.
+        // Preserves Phase-6 test semantics. Production callers always
+        // wire services via `LoopManager::start_with_bus`.
+        let services = match self.services.as_ref() {
+            Some(s) => s.clone(),
+            None => {
+                tracing::debug!(
+                    loop_id = %loop_id,
+                    seq = seq,
+                    "IterationExecutor: no HostServices wired — skipping LLM (stub path)"
+                );
+                return self
+                    .finalize_iteration_ok(
+                        iter_id,
+                        None,
+                        serde_json::json!([]),
+                        &session_id,
+                        &loop_id,
+                        seq,
+                        &rec,
+                    )
+                    .await;
+            }
+        };
 
+        // Production path: spawn a real agent host and run one turn.
+        // Skip sidebar streaming (sticky card + iteration_end events
+        // suffice), session extraction (would pollute memories), and
+        // trace collection (we have our own tool_calls_summary).
+        let agent_config = match services.agent_config.as_ref() {
+            Some(c) => c.clone(),
+            None => {
+                return self
+                    .finalize_iteration_error(
+                        iter_id,
+                        "HostServices has no agent_config — bug at server boot".into(),
+                        &session_id,
+                        &loop_id,
+                        seq,
+                        &rec,
+                    )
+                    .await;
+            }
+        };
+        let runtime_handle = match services.runtime_handle.as_ref() {
+            Some(h) => h.clone(),
+            None => {
+                return self
+                    .finalize_iteration_error(
+                        iter_id,
+                        "HostServices has no runtime_handle — bug at server boot".into(),
+                        &session_id,
+                        &loop_id,
+                        seq,
+                        &rec,
+                    )
+                    .await;
+            }
+        };
+
+        let mut services_for_iter = services.clone();
+        services_for_iter.session_id = session_id.clone();
+        // Reset interrupt flag so a stray prior cancel doesn't poison
+        // this iteration. Note: the loop's own cancel_token is checked
+        // by `manager.rs::cancel_loop_inner`, not here.
+        services_for_iter.reset_interrupt();
+
+        let host = crate::agent_host::DaemonHostFunctions::new(agent_config, runtime_handle)
+            .with_services(services_for_iter)
+            .with_session_id(session_id.clone());
+
+        let agent = nevoflux_builtin_wasm::Agent::new(host);
+        let input = nevoflux_builtin_wasm::AgentInput {
+            session_id: session_id.clone(),
+            mode: nevoflux_builtin_wasm::AgentMode::Chat,
+            user_message,
+            history: vec![],
+            attachments: vec![],
+            local_files: vec![],
+            custom_system_prompt: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
+            available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
+            tools_config: Some(nevoflux_protocol::subagent::ToolsConfig::Allow(allowlist)),
+            os_platform: Some(std::env::consts::OS.to_string()),
+        };
+
+        // `Agent::run` is synchronous; the host functions block on the
+        // runtime handle stashed at construction time for any async LLM
+        // calls. Wrapping in `spawn_blocking` keeps us from hogging the
+        // dispatcher's executor thread.
+        let outcome: Result<nevoflux_builtin_wasm::AgentOutput, nevoflux_builtin_wasm::HostError> =
+            tokio::task::spawn_blocking(move || agent.run(&input))
+                .await
+                .unwrap_or_else(|e| {
+                    Err(nevoflux_builtin_wasm::HostError {
+                        code: 500,
+                        message: format!("agent task panicked: {e}"),
+                    })
+                });
+
+        match outcome {
+            Ok(out) => {
+                let trace = serde_json::Value::Array(
+                    out.tool_calls
+                        .iter()
+                        .map(|tc| {
+                            serde_json::json!({
+                                "name": tc.name,
+                                "ok": true,
+                            })
+                        })
+                        .collect(),
+                );
+                self.finalize_iteration_ok(
+                    iter_id,
+                    Some(out.text),
+                    trace,
+                    &session_id,
+                    &loop_id,
+                    seq,
+                    &rec,
+                )
+                .await
+            }
+            Err(e) => {
+                self.finalize_iteration_error(
+                    iter_id,
+                    e.message,
+                    &session_id,
+                    &loop_id,
+                    seq,
+                    &rec,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Finish row + emit event for a successful iteration. Resets
+    /// `consecutive_failures` to 0.
+    async fn finalize_iteration_ok(
+        &self,
+        iter_id: i64,
+        final_text: Option<String>,
+        trace_summary: serde_json::Value,
+        session_id: &str,
+        loop_id: &LoopId,
+        seq: i64,
+        _rec: &LoopRecord,
+    ) -> ExecResult {
         let end_now = current_timestamp();
-        let (status, error_msg, final_text) = match &outcome {
-            Ok(text) => (IterationStatus::Ok, None, text.clone()),
-            Err(e) => (IterationStatus::Error, Some(e.clone()), None),
-        };
+        let repo = LoopRepository::new(&self.db);
+        let _ = repo.set_consecutive_failures(loop_id.as_ref(), 0, end_now);
+        let _ = repo.finish_iteration(
+            iter_id,
+            end_now,
+            IterationStatus::Ok,
+            None,
+            Some(&serde_json::to_string(&trace_summary).unwrap_or_default()),
+        );
+        self.events
+            .iteration_end(session_id, loop_id, seq, end_now, "ok", trace_summary)
+            .await;
+        ExecResult::OkWithText(final_text)
+    }
 
-        // Update consecutive_failures: reset on success, bump on error.
-        // The dispatcher's 3-strike auto-cancel hook reads this field.
-        let new_failures = if matches!(status, IterationStatus::Ok) {
-            0
-        } else {
-            rec.consecutive_failures + 1
-        };
+    /// Finish row + emit event for a failed iteration. Bumps
+    /// `consecutive_failures`.
+    async fn finalize_iteration_error(
+        &self,
+        iter_id: i64,
+        err: String,
+        session_id: &str,
+        loop_id: &LoopId,
+        seq: i64,
+        rec: &LoopRecord,
+    ) -> ExecResult {
+        let end_now = current_timestamp();
+        let repo = LoopRepository::new(&self.db);
+        let new_failures = rec.consecutive_failures + 1;
         let _ = repo.set_consecutive_failures(loop_id.as_ref(), new_failures, end_now);
-
-        let _ = repo.finish_iteration(iter_id, end_now, status, error_msg.as_deref(), None);
-
-        let status_str = match status {
-            IterationStatus::Ok => "ok",
-            _ => "error",
-        };
+        let _ = repo.finish_iteration(iter_id, end_now, IterationStatus::Error, Some(&err), None);
         self.events
             .iteration_end(
-                &session_id,
-                &loop_id,
+                session_id,
+                loop_id,
                 seq,
                 end_now,
-                status_str,
+                "error",
                 serde_json::json!([]),
             )
             .await;
-
-        match outcome {
-            Ok(text) => ExecResult::OkWithText(text),
-            Err(e) => ExecResult::Error(e),
-        }
+        ExecResult::Error(err)
     }
 }
 
+/// Static catalog of tool names known to be in the chat-mode tool set.
+/// Used to translate the loop's `allowed_tool_classes` into an explicit
+/// `AgentInput.tools_config = Allow(...)` allowlist.
+///
+/// Keep in sync with:
+/// - `nevoflux_builtin_wasm::Agent::get_chat_tools()` (the actual
+///   tool definitions the LLM sees), and
+/// - `crate::loops::tool_classes::class_for()` (the class assignment).
+///
+/// Anything that ends up classified as `Write` but isn't in this list
+/// will silently never be exposed to a loop iteration. That's the
+/// fail-closed behavior we want.
+fn known_chat_tool_catalog() -> Vec<String> {
+    [
+        // read class
+        "read",
+        "list_files",
+        "fetch_page",
+        "dom_query",
+        "screenshot",
+        "loop.scratchpad.get",
+        "memory_search",
+        "web_fetch",
+        "web_search",
+        "browser_query",
+        "browser_inspect",
+        // scratchpad-write
+        "loop.scratchpad.set",
+        // event-subscribe
+        "events.subscribe",
+        // dom-click
+        "browser_click",
+        "browser_click_by_id",
+        "browser_type",
+        "browser_type_by_id",
+        "browser_fill",
+        "browser_fill_by_id",
+        "browser_key_press",
+        // nav
+        "browser_navigate",
+        "browser_go_back",
+        "browser_go_forward",
+        "browser_open_tab",
+        "browser_close_tab",
+        // write
+        "write",
+        "edit",
+        "bash",
+        "create_artifact",
+        "browser_edit_artifact",
+        "memory_create",
+        "canvas_create_composition",
+        "canvas_apply_design_md",
+        "canvas_create_from_visual_identity",
+        "canvas_attach_asset",
+        "canvas_render_video",
+        // baseline tools always exposed by Agent::get_chat_tools()
+        "think",
+        "plan",
+        "switch_model",
+        "ask_user",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 /// Build the §7.2 LOOP-CONTEXT-prefixed user message for an iteration.
-/// Public-in-crate for unit testing and for Phase 9's AgentInput construction.
+/// Public-in-crate for unit testing and for Phase 9c's AgentInput construction.
 pub(crate) fn build_user_message(rec: &LoopRecord, sequence: i64, fire_reason: &str) -> String {
     let scratchpad = if rec.scratchpad.is_empty() {
         "(empty)"
@@ -323,7 +549,7 @@ mod tests {
         let result = executor.execute(LoopId("abc".into()), "time".into()).await;
 
         assert!(result.is_ok(), "expected ok-variant, got {:?}", result);
-        // No final text yet — production agent path not bridged.
+        // Stub path (no services wired) — claims success without text.
         assert!(matches!(result, ExecResult::OkWithText(None)));
 
         let rec = storage.loops().get("abc").unwrap().unwrap();

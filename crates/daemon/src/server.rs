@@ -1153,15 +1153,18 @@ pub async fn start_server(
             .with_skills(shared_skills.clone()),
     );
 
-    // Construct the /loop skill's LoopManager and inject into HostServices
-    // so the loop.* tool dispatcher (mcp_tool_executor + future direct-API
-    // path) can resolve `services.loop_manager`. Spec §4 architecture.
-    let loop_manager = std::sync::Arc::new(crate::loops::LoopManager::start_with_bus(
-        db.clone(),
-        Some(event_bus.clone()),
-    ));
-
-    let mut services = HostServices::with_skills(Arc::new(db), shared_skills)
+    // Build HostServices first (without loop_manager), spin up LoopManager
+    // with a `services` clone so its IterationExecutor can spawn a real
+    // production agent (Phase 9c), then snap loop_manager back onto the
+    // canonical services. The two have a chicken-and-egg dependency:
+    // services needs loop_manager for the loop.* MCP dispatch path, and
+    // loop_manager needs services for `Agent::run`. HostServices is `Clone`
+    // and Arc-backed, so the round-trip is cheap.
+    //
+    // We also stash `agent_config` + the runtime Handle on services so
+    // `IterationExecutor` can build a `DaemonHostFunctions` without
+    // depending on the chat-session boot path (server.rs::handle_chat_send).
+    let mut services = HostServices::with_skills(Arc::new(db.clone()), shared_skills)
         .with_browser_sender(browser_tx)
         .with_mcp_manager(mcp_manager)
         .with_shared_tool_search(tool_search_index)
@@ -1170,7 +1173,20 @@ pub async fn start_server(
         .with_embedding(Arc::clone(&shared_embedding))
         .with_canvas_video_service(canvas_video_service.clone())
         .with_tts_config(agent_config.read().unwrap().tts.clone())
-        .with_loop_manager(loop_manager.clone());
+        .with_agent_config(agent_config.read().unwrap().clone())
+        .with_runtime_handle(tokio::runtime::Handle::current());
+
+    // Construct the /loop skill's LoopManager and inject into HostServices
+    // so the loop.* tool dispatcher (mcp_tool_executor + future direct-API
+    // path) can resolve `services.loop_manager`. Spec §4 architecture.
+    // Pass the (loop_manager-less) services clone so the IterationExecutor
+    // gets a real `Agent::run` invocation path.
+    let loop_manager = std::sync::Arc::new(crate::loops::LoopManager::start_with_bus(
+        db.clone(),
+        Some(event_bus.clone()),
+        Some(services.clone()),
+    ));
+    services = services.with_loop_manager(loop_manager.clone());
     if let Some(retriever) = knowledge_retriever {
         services = services.with_knowledge_retriever(retriever);
     }

@@ -227,6 +227,21 @@ pub struct HostServices {
     /// this manager. `None` means /loop is not configured for this daemon
     /// instance — tool calls return a clear ConfigMissing error.
     pub loop_manager: Option<Arc<crate::loops::LoopManager>>,
+
+    /// AgentConfig snapshot for spawning a `DaemonHostFunctions` from
+    /// out-of-band callers (e.g. /loop iterations) that don't sit on the
+    /// chat-session hot path. Set during server boot via
+    /// [`HostServices::with_agent_config`]; `None` in tests / standalone
+    /// daemon-less constructors. The /loop `IterationExecutor` requires
+    /// this to invoke `nevoflux_builtin_wasm::Agent::run`.
+    pub agent_config: Option<Arc<crate::config::AgentConfig>>,
+
+    /// Tokio runtime handle for `DaemonHostFunctions::new(...)`. Out-of-band
+    /// callers (notably the /loop dispatcher) run on the same multi-thread
+    /// runtime as the daemon, but they don't hold a `Handle` directly; we
+    /// stash it here so they can build a host without having to reach into
+    /// `Handle::current()` from a `'static`-spawned task.
+    pub runtime_handle: Option<tokio::runtime::Handle>,
 }
 
 impl HostServices {
@@ -284,6 +299,8 @@ impl HostServices {
             tts_config: None,
             asset_server: None,
             loop_manager: None,
+            agent_config: None,
+            runtime_handle: None,
         }
     }
 
@@ -320,6 +337,8 @@ impl HostServices {
             tts_config: None,
             asset_server: None,
             loop_manager: None,
+            agent_config: None,
+            runtime_handle: None,
         }
     }
 
@@ -411,6 +430,24 @@ impl HostServices {
     /// clear ConfigMissing error instead of being silently dropped.
     pub fn with_loop_manager(mut self, manager: Arc<crate::loops::LoopManager>) -> Self {
         self.loop_manager = Some(manager);
+        self
+    }
+
+    /// Stash the live `AgentConfig` so out-of-band callers (the /loop
+    /// `IterationExecutor`) can spawn a `DaemonHostFunctions` without
+    /// needing access to the chat-session boot path. Phase 9c.
+    pub fn with_agent_config(mut self, config: Arc<crate::config::AgentConfig>) -> Self {
+        self.agent_config = Some(config);
+        self
+    }
+
+    /// Stash the multi-thread Tokio runtime handle for the same reason as
+    /// [`Self::with_agent_config`]. The host functions invoke
+    /// `runtime.block_on(...)` on synchronous LLM calls, so they need a
+    /// handle into the daemon's main runtime — not a fresh per-iteration
+    /// runtime that would deadlock against the dispatcher.
+    pub fn with_runtime_handle(mut self, h: tokio::runtime::Handle) -> Self {
+        self.runtime_handle = Some(h);
         self
     }
 
@@ -715,6 +752,14 @@ impl std::fmt::Debug for HostServices {
             .field(
                 "asset_server",
                 &self.asset_server.as_ref().map(|_| "Some(...)"),
+            )
+            .field(
+                "agent_config",
+                &self.agent_config.as_ref().map(|_| "Some(...)"),
+            )
+            .field(
+                "runtime_handle",
+                &self.runtime_handle.as_ref().map(|_| "Some(...)"),
             )
             .finish()
     }

@@ -42,21 +42,35 @@ impl LoopManager {
     /// and routes them to `IterationExecutor::execute`, applying the
     /// drop-on-busy concurrency policy from spec §8.2.
     pub fn start(db: Database) -> Self {
-        Self::start_with_bus(db, None)
+        Self::start_with_bus(db, None, None)
     }
 
     /// Same as [`start`], but with an EventBus handle so the manager and its
     /// dispatcher emit `system:loop:*` events. If `bus` is `None`, all
     /// emissions are silent no-ops (used by unit tests that don't care).
-    pub fn start_with_bus(db: Database, bus: Option<Arc<EventBus>>) -> Self {
+    ///
+    /// `services` carries the live `HostServices` snapshot the iteration
+    /// executor uses to spawn a production `DaemonHostFunctions`. When
+    /// `None` (unit tests), the executor falls back to the Phase-6 stub
+    /// path that records iterations as `ok` without invoking an LLM.
+    /// When `Some`, the executor invokes
+    /// `nevoflux_builtin_wasm::Agent::run` on every iteration with the
+    /// loop's tool-class allowlist (Phase 9c).
+    pub fn start_with_bus(
+        db: Database,
+        bus: Option<Arc<EventBus>>,
+        services: Option<crate::wasm::services::HostServices>,
+    ) -> Self {
         let (fire_tx, mut fire_rx) = mpsc::channel::<LoopFireRequest>(64);
         let registry = LoopRegistry::new();
         let scheduler = TriggerScheduler::new();
         let events = Arc::new(LoopEvents::new(bus.clone()));
-        let executor = Arc::new(IterationExecutor::new_with_events(
-            db.clone(),
-            events.clone(),
-        ));
+        let executor_inner =
+            IterationExecutor::new_with_events(db.clone(), events.clone());
+        let executor = Arc::new(match services {
+            Some(s) => executor_inner.with_services(s),
+            None => executor_inner,
+        });
 
         let registry_for_task = registry.clone();
         let executor_for_task = executor.clone();
@@ -657,7 +671,7 @@ mod tests {
 
         let storage = fresh();
         let bus = Arc::new(EventBus::new());
-        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus.clone()));
+        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus.clone()), None);
 
         let id = mgr.create_loop(CreateLoopArgs {
             session_id: "s1".into(),
@@ -689,7 +703,7 @@ mod tests {
 
         let storage = fresh();
         let bus = Arc::new(EventBus::new());
-        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus.clone()));
+        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus.clone()), None);
 
         let id = mgr
             .create_loop(CreateLoopArgs {
@@ -778,7 +792,7 @@ mod tests {
 
         let storage = fresh();
         let bus = Arc::new(EventBus::new());
-        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus.clone()));
+        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus.clone()), None);
 
         let id = mgr
             .create_loop(CreateLoopArgs {
