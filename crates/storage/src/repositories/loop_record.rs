@@ -4,7 +4,7 @@ use rusqlite::{params, OptionalExtension, Row};
 
 use crate::connection::Database;
 use crate::error::{Result, StorageError};
-use crate::models::{LoopRecord, LoopState};
+use crate::models::{IterationStatus, LoopRecord, LoopState};
 
 pub struct LoopRepository<'a> {
     db: &'a Database,
@@ -114,6 +114,67 @@ impl<'a> LoopRepository<'a> {
             conn.execute(
                 "UPDATE loops SET consecutive_failures = ?1, updated_at = ?2 WHERE id = ?3",
                 params![n, now, id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Insert a new iteration and trim history to the most-recent 50 rows
+    /// for this loop. Returns the new iteration row id.
+    ///
+    /// The insert + trim run in a single transaction so retention can never
+    /// race with another reader observing >50 rows.
+    pub fn insert_iteration(
+        &self,
+        loop_id: &str,
+        sequence_number: i64,
+        started_at: i64,
+        status: IterationStatus,
+    ) -> Result<i64> {
+        self.db.with_connection_mut(|conn| {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO loop_iterations (loop_id, sequence_number, started_at, status)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![loop_id, sequence_number, started_at, status.as_str()],
+            )?;
+            let id: i64 = tx.last_insert_rowid();
+            tx.execute(
+                "DELETE FROM loop_iterations
+                 WHERE loop_id = ?1
+                   AND id NOT IN (
+                      SELECT id FROM loop_iterations
+                      WHERE loop_id = ?1
+                      ORDER BY sequence_number DESC
+                      LIMIT 50
+                   )",
+                params![loop_id],
+            )?;
+            tx.commit()?;
+            Ok(id)
+        })
+    }
+
+    pub fn finish_iteration(
+        &self,
+        iteration_id: i64,
+        ended_at: i64,
+        status: IterationStatus,
+        error: Option<&str>,
+        tool_calls_json: Option<&str>,
+    ) -> Result<()> {
+        self.db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE loop_iterations
+                 SET ended_at = ?1, status = ?2, error_message = ?3, tool_calls_json = ?4
+                 WHERE id = ?5",
+                params![
+                    ended_at,
+                    status.as_str(),
+                    error,
+                    tool_calls_json,
+                    iteration_id
+                ],
             )?;
             Ok(())
         })
@@ -265,5 +326,84 @@ mod tests {
         repo.create(&sample_loop("abc")).unwrap();
         repo.set_consecutive_failures("abc", 3, 200).unwrap();
         assert_eq!(repo.get("abc").unwrap().unwrap().consecutive_failures, 3);
+    }
+
+    #[test]
+    fn insert_iteration_returns_id() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        let id = repo
+            .insert_iteration("abc", 1, 100, IterationStatus::Running)
+            .unwrap();
+        assert!(id > 0);
+    }
+
+    #[test]
+    fn insert_iteration_trims_to_50() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        for n in 1..=55 {
+            repo.insert_iteration("abc", n, 100 + n, IterationStatus::Ok)
+                .unwrap();
+        }
+        let kept = s
+            .database()
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM loop_iterations WHERE loop_id = ?1",
+                    params!["abc"],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(crate::error::StorageError::from)
+            })
+            .unwrap();
+        assert_eq!(kept, 50);
+        let oldest = s
+            .database()
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT MIN(sequence_number) FROM loop_iterations WHERE loop_id = ?1",
+                    params!["abc"],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(crate::error::StorageError::from)
+            })
+            .unwrap();
+        assert_eq!(oldest, 6);
+    }
+
+    #[test]
+    fn finish_iteration_writes_status_and_trace() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        let id = repo
+            .insert_iteration("abc", 1, 100, IterationStatus::Running)
+            .unwrap();
+        repo.finish_iteration(id, 110, IterationStatus::Ok, None, Some("[]"))
+            .unwrap();
+        // Spot check via raw SQL since we don't have list_iterations yet:
+        let row: (i64, String, Option<String>) = s
+            .database()
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT ended_at, status, tool_calls_json FROM loop_iterations WHERE id = ?1",
+                    params![id],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .map_err(crate::error::StorageError::from)
+            })
+            .unwrap();
+        assert_eq!(row.0, 110);
+        assert_eq!(row.1, "ok");
+        assert_eq!(row.2.as_deref(), Some("[]"));
     }
 }
