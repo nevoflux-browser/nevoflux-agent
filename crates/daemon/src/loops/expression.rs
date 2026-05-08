@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+/// Public parse entry. Tab-existence validation happens later (Phase 4) once
+/// the registry has a TabRegistry handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TriggerExpr {
     Time(Duration),
