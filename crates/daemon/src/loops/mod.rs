@@ -4,12 +4,14 @@
 
 pub mod executor;
 pub mod expression;
+pub mod manager;
 pub mod registry;
 pub mod scheduler;
 pub mod tool_classes;
 pub mod types;
 pub use executor::{ExecResult, IterationExecutor};
 pub use expression::{ParseError, TabRef, TriggerExpr};
+pub use manager::{CreateLoopArgs, LoopManager};
 pub use registry::LoopRegistry;
 pub use scheduler::{LoopFireRequest, TriggerScheduler};
 pub use types::{LoopId, LoopRuntime};
