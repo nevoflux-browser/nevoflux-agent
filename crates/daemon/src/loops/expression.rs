@@ -41,9 +41,9 @@ impl TriggerExpr {
         if depth > 3 { return Err(ParseError::TooDeep); }
         if s.is_empty() { return Err(ParseError::Empty); }
 
-        if let Some(rest) = s.strip_prefix("time:") {
-            return parse_time_atom(rest);
-        }
+        if let Some(rest) = s.strip_prefix("time:") { return parse_time_atom(rest); }
+        if let Some(rest) = s.strip_prefix("event:") { return parse_event_atom(rest); }
+        if let Some(rest) = s.strip_prefix("state:") { return parse_state_atom(rest); }
         Err(ParseError::UnknownAtom(s.to_string()))
     }
 }
@@ -69,6 +69,28 @@ fn parse_duration(s: &str) -> Result<Duration, ParseError> {
         _ => return Err(ParseError::BadDuration(s.into())),
     };
     Ok(Duration::from_secs(secs))
+}
+
+fn parse_event_atom(rest: &str) -> Result<TriggerExpr, ParseError> {
+    if rest.is_empty() {
+        return Err(ParseError::Unexpected(0, "empty event topic".into()));
+    }
+    Ok(TriggerExpr::Event(rest.to_string()))
+}
+
+fn parse_state_atom(rest: &str) -> Result<TriggerExpr, ParseError> {
+    let after_tab = rest.strip_prefix("tab=")
+        .ok_or_else(|| ParseError::Unexpected(0, "expected 'tab='".into()))?;
+    let (tab_str, rest) = after_tab.split_once(':')
+        .ok_or_else(|| ParseError::Unexpected(0, "expected ':' after tab=…".into()))?;
+    let tab = if tab_str == "current" { TabRef::Current }
+              else { TabRef::Id(tab_str.parse().map_err(|_| ParseError::Unexpected(0, format!("bad tab id: {tab_str}")))?) };
+    let selector = rest.strip_suffix(":change")
+        .ok_or_else(|| ParseError::Unexpected(0, "state atom must end with ':change'".into()))?;
+    if selector.is_empty() {
+        return Err(ParseError::Unexpected(0, "empty selector".into()));
+    }
+    Ok(TriggerExpr::State { tab, selector: selector.to_string() })
 }
 
 #[cfg(test)]
@@ -103,5 +125,44 @@ mod tests {
     #[test]
     fn time_missing_suffix_is_rejected() {
         assert!(matches!(parse("time:5"), Err(ParseError::BadDuration(_))));
+    }
+
+    #[test]
+    fn time_dynamic() {
+        assert_eq!(parse("time:dynamic").unwrap(), TriggerExpr::TimeDynamic);
+    }
+
+    #[test]
+    fn event_atom() {
+        assert_eq!(
+            parse("event:ui:tab:*:click").unwrap(),
+            TriggerExpr::Event("ui:tab:*:click".into())
+        );
+    }
+
+    #[test]
+    fn event_empty_topic_rejected() {
+        assert!(matches!(parse("event:"), Err(ParseError::Unexpected(_, _))));
+    }
+
+    #[test]
+    fn state_current_tab() {
+        assert_eq!(
+            parse("state:tab=current:.chat-list:change").unwrap(),
+            TriggerExpr::State { tab: TabRef::Current, selector: ".chat-list".into() }
+        );
+    }
+
+    #[test]
+    fn state_numeric_tab() {
+        assert_eq!(
+            parse("state:tab=42:#root .item:change").unwrap(),
+            TriggerExpr::State { tab: TabRef::Id(42), selector: "#root .item".into() }
+        );
+    }
+
+    #[test]
+    fn state_missing_change_suffix_rejected() {
+        assert!(parse("state:tab=current:.x").is_err());
     }
 }
