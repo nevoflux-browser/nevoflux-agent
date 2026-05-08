@@ -76,6 +76,7 @@ impl LoopManager {
         let executor_for_task = executor.clone();
         let events_for_task = events.clone();
         let scheduler_for_task = scheduler.clone();
+        let fire_tx_for_task = fire_tx.clone();
         tokio::spawn(async move {
             while let Some(req) = fire_rx.recv().await {
                 // §8.2: drop if currently running.
@@ -106,16 +107,7 @@ impl LoopManager {
                     rt.current_iteration = Some(token.clone());
                 });
 
-                // TODO(Phase 9b + 12): once AgentRunner is wired and IterationExecutor
-                // returns the LLM's final assistant text, parse the `loop-meta` block
-                // here for `time:dynamic` triggers and reschedule via:
-                //   if rec.trigger_expr == "time:dynamic" {
-                //       let next = crate::loops::dynamic::extract_next_delay(&final_text);
-                //       // tear down old time-* subs, schedule_time(next), push new sub_id.
-                //   }
-                // The parser is already implemented in `crate::loops::dynamic`; the
-                // missing piece is the executor returning the assistant text.
-                let _ = executor_for_task
+                let exec_result = executor_for_task
                     .execute(req.loop_id.clone(), req.fire_reason)
                     .await;
 
@@ -179,6 +171,46 @@ impl LoopManager {
                 registry_for_task.with_mut(&req.loop_id, |rt| {
                     rt.current_iteration = None;
                 });
+
+                // time:dynamic protocol (spec §5.2): if the loop's trigger is
+                // time:dynamic and this iteration succeeded with text, parse the
+                // `loop-meta` block for `next_delay_seconds` and reschedule.
+                if let crate::loops::executor::ExecResult::OkWithText(Some(text)) = &exec_result {
+                    let rec = LoopRepository::new(&executor_for_task.database())
+                        .get(req.loop_id.as_ref())
+                        .ok()
+                        .flatten();
+                    if let Some(rec) = rec {
+                        if rec.trigger_expr == "time:dynamic" {
+                            let next = crate::loops::dynamic::extract_next_delay(text);
+                            // Tear down old time-* subscriptions, schedule a new one.
+                            let old_time_subs: Vec<String> = registry_for_task
+                                .with_mut(&req.loop_id, |rt| {
+                                    let removed: Vec<String> = rt
+                                        .subscription_ids
+                                        .iter()
+                                        .filter(|s| s.starts_with("time-"))
+                                        .cloned()
+                                        .collect();
+                                    rt.subscription_ids
+                                        .retain(|s| !s.starts_with("time-"));
+                                    removed
+                                })
+                                .unwrap_or_default();
+                            for s in &old_time_subs {
+                                scheduler_for_task.unsubscribe(s);
+                            }
+                            let new_sub = scheduler_for_task.schedule_time(
+                                req.loop_id.clone(),
+                                next,
+                                fire_tx_for_task.clone(),
+                            );
+                            registry_for_task.with_mut(&req.loop_id, |rt| {
+                                rt.subscription_ids.push(new_sub);
+                            });
+                        }
+                    }
+                }
             }
         });
 

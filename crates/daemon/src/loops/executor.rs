@@ -177,7 +177,8 @@ impl IterationExecutor {
             }
         };
 
-        let user_message = build_user_message(&rec, seq, &fire_reason);
+        let user_message =
+            build_user_message(&rec, seq, &fire_reason, self.services.as_ref()).await;
         let allowlist =
             filter_tool_names_by_classes(&known_chat_tool_catalog(), &allowed_classes);
 
@@ -450,16 +451,31 @@ fn known_chat_tool_catalog() -> Vec<String> {
 
 /// Build the §7.2 LOOP-CONTEXT-prefixed user message for an iteration.
 /// Public-in-crate for unit testing and for Phase 9c's AgentInput construction.
-pub(crate) fn build_user_message(rec: &LoopRecord, sequence: i64, fire_reason: &str) -> String {
+///
+/// When `rec.prompt_text` is `None` and `rec.wrapped_skill` is `Some(json)`,
+/// resolves the wrapped-skill body from the [`HostServices`] skill registry
+/// (Phase 21). The JSON shape is `{ "name": "<skill>", "args": <string-or-object> }`,
+/// matching the slash-command sender on the extension side.
+pub(crate) async fn build_user_message(
+    rec: &LoopRecord,
+    sequence: i64,
+    fire_reason: &str,
+    services: Option<&HostServices>,
+) -> String {
     let scratchpad = if rec.scratchpad.is_empty() {
         "(empty)"
     } else {
         rec.scratchpad.as_str()
     };
-    let body = rec
-        .prompt_text
-        .as_deref()
-        .unwrap_or("(wrapped skill — Phase 21)");
+
+    let body: String = if let Some(prompt) = &rec.prompt_text {
+        prompt.clone()
+    } else if let Some(skill_json) = &rec.wrapped_skill {
+        materialize_wrapped_skill(skill_json, services).await
+    } else {
+        "(no prompt or wrapped_skill)".into()
+    };
+
     format!(
         "<LOOP-CONTEXT>\n\
          loop_id={}\n\
@@ -479,6 +495,60 @@ pub(crate) fn build_user_message(rec: &LoopRecord, sequence: i64, fire_reason: &
         scratchpad,
         body,
     )
+}
+
+/// Resolve the wrapped-skill JSON blob (`{name, args}`) into the raw skill
+/// body the iteration should run. Args, when present, are appended verbatim
+/// after a blank line — the skill itself decides how to interpret them.
+///
+/// Returns a self-explanatory diagnostic string if anything goes wrong (no
+/// skill registry, missing skill, parse failure). Loops should not fail
+/// outright on a bad wrapped_skill — they should surface the problem in the
+/// iteration log so the operator can fix the loop record.
+async fn materialize_wrapped_skill(
+    skill_json: &str,
+    services: Option<&HostServices>,
+) -> String {
+    // Parse the {name, args} JSON shape stashed at loop creation.
+    let parsed: serde_json::Value = match serde_json::from_str(skill_json) {
+        Ok(v) => v,
+        Err(e) => return format!("(wrapped_skill parse error: {e})"),
+    };
+    let name = parsed
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let args = parsed
+        .get("args")
+        .and_then(|v| {
+            // Sender wraps args either as a string or an object — handle both.
+            v.as_str()
+                .map(|s| s.to_string())
+                .or_else(|| Some(v.to_string()))
+        })
+        .unwrap_or_default();
+
+    if name.is_empty() {
+        return "(wrapped_skill missing 'name')".into();
+    }
+
+    let services = match services {
+        Some(s) => s,
+        None => return format!("(wrapped_skill {name}: no skill registry available)"),
+    };
+
+    let registry = services.skills.read().await;
+    let content = match registry.get(name) {
+        Some(s) => s.content.clone(),
+        None => return format!("(wrapped_skill not found: {name})"),
+    };
+    drop(registry);
+
+    if args.is_empty() || args == "\"\"" || args == "{}" {
+        content
+    } else {
+        format!("{}\n\n{}", content, args)
+    }
 }
 
 #[cfg(test)]
@@ -505,10 +575,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn loop_context_block_includes_required_fields() {
+    #[tokio::test]
+    async fn loop_context_block_includes_required_fields() {
         let rec = sample_loop("abcd1234");
-        let s = build_user_message(&rec, 1, "time");
+        let s = build_user_message(&rec, 1, "time", None).await;
         assert!(s.contains("loop_id=abcd1234"));
         assert!(s.contains("iteration=1"));
         assert!(s.contains("trigger=time:5m"));
@@ -518,22 +588,24 @@ mod tests {
         assert!(s.contains("check PR"));
     }
 
-    #[test]
-    fn loop_context_block_marks_empty_scratchpad() {
+    #[tokio::test]
+    async fn loop_context_block_marks_empty_scratchpad() {
         let mut rec = sample_loop("a");
         rec.scratchpad.clear();
-        let s = build_user_message(&rec, 1, "time");
+        let s = build_user_message(&rec, 1, "time", None).await;
         assert!(s.contains("scratchpad_bytes=0"));
         assert!(s.contains("(empty)"));
     }
 
-    #[test]
-    fn loop_context_block_falls_back_for_wrapped_skill() {
+    #[tokio::test]
+    async fn loop_context_block_falls_back_for_wrapped_skill() {
         let mut rec = sample_loop("a");
         rec.prompt_text = None;
         rec.wrapped_skill = Some(r#"{"name":"video","args":{}}"#.into());
-        let s = build_user_message(&rec, 1, "time");
-        assert!(s.contains("wrapped skill — Phase 21"));
+        let s = build_user_message(&rec, 1, "time", None).await;
+        // services=None → "(wrapped_skill <name>: no skill registry available)"
+        assert!(s.contains("video"));
+        assert!(s.contains("no skill registry available"));
     }
 
     #[tokio::test]
