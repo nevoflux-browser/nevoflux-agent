@@ -2,8 +2,7 @@
 
 use std::time::Duration;
 
-/// Public parse entry. Tab-existence validation happens later (Phase 4) once
-/// the registry has a TabRegistry handle.
+/// AST node for parsed trigger expressions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TriggerExpr {
     Time(Duration),
@@ -41,6 +40,8 @@ pub enum ParseError {
 }
 
 impl TriggerExpr {
+    /// Parse a trigger expression. Tab-existence validation is deferred to
+    /// Phase 4, when the LoopRegistry can consult a TabRegistry.
     pub fn parse(input: &str) -> Result<Self, ParseError> {
         Self::parse_with_depth(input.trim(), 0)
     }
