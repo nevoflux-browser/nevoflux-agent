@@ -1153,6 +1153,14 @@ pub async fn start_server(
             .with_skills(shared_skills.clone()),
     );
 
+    // Construct the /loop skill's LoopManager and inject into HostServices
+    // so the loop.* tool dispatcher (mcp_tool_executor + future direct-API
+    // path) can resolve `services.loop_manager`. Spec §4 architecture.
+    let loop_manager = std::sync::Arc::new(crate::loops::LoopManager::start_with_bus(
+        db.clone(),
+        Some(event_bus.clone()),
+    ));
+
     let mut services = HostServices::with_skills(Arc::new(db), shared_skills)
         .with_browser_sender(browser_tx)
         .with_mcp_manager(mcp_manager)
@@ -1161,7 +1169,8 @@ pub async fn start_server(
         .with_role_registry(role_registry)
         .with_embedding(Arc::clone(&shared_embedding))
         .with_canvas_video_service(canvas_video_service.clone())
-        .with_tts_config(agent_config.read().unwrap().tts.clone());
+        .with_tts_config(agent_config.read().unwrap().tts.clone())
+        .with_loop_manager(loop_manager.clone());
     if let Some(retriever) = knowledge_retriever {
         services = services.with_knowledge_retriever(retriever);
     }
@@ -1349,6 +1358,7 @@ pub async fn start_server(
     let config_managed = config.managed;
     let config_idle_timeout = config.idle_timeout;
     let accept_shutdown_tx = shutdown_tx.clone();
+    let shutdown_loop_manager = loop_manager.clone();
     tokio::spawn(async move {
         let last_message_time = Arc::new(Mutex::new(std::time::Instant::now()));
 
@@ -1397,6 +1407,8 @@ pub async fn start_server(
                 }
                 _ = shutdown_rx.recv() => {
                     info!("Server shutdown signal received");
+                    info!("Tearing down /loop skill subscriptions and pending iterations…");
+                    shutdown_loop_manager.shutdown().await;
                     break;
                 }
             }
@@ -1790,6 +1802,81 @@ pub async fn start_server(
                     }
                 }
                 continue;
+            }
+
+            // Handle skill_command messages from sidebar — currently used
+            // by the /loop slash command (Phase 17). Routes skill_name=="loop"
+            // to LoopManager::create_loop. Other skill_names fall through and
+            // get the slash-skill treatment via the chat path further down.
+            if msg_type == "skill_command" {
+                let payload = envelope.payload.get("payload");
+                let skill_name = payload
+                    .and_then(|p| p.get("skill_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if skill_name == "loop" {
+                    info!("Processing skill_command: loop");
+                    let session_id = payload
+                        .and_then(|p| p.get("session_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let args = payload
+                        .and_then(|p| p.get("args"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+
+                    let trigger_expr = args
+                        .get("trigger_expr")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if trigger_expr.is_empty() {
+                        warn!("skill_command 'loop' missing trigger_expr");
+                        continue;
+                    }
+                    let prompt_text = args
+                        .get("prompt_text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let wrapped_skill = args
+                        .get("wrapped_skill")
+                        .filter(|v| !v.is_null())
+                        .map(|v| v.to_string());
+                    let allowed_tool_classes = args
+                        .get("allowed_tool_classes")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect::<Vec<String>>()
+                        });
+
+                    if let Some(mgr) = process_services.loop_manager.as_ref() {
+                        match mgr
+                            .create_loop(crate::loops::manager::CreateLoopArgs {
+                                session_id,
+                                trigger_expr_text: trigger_expr,
+                                prompt_text,
+                                wrapped_skill,
+                                allowed_tool_classes,
+                            })
+                            .await
+                        {
+                            Ok(id) => {
+                                info!("Created loop {} from /loop slash command", id);
+                            }
+                            Err(e) => {
+                                warn!("loop.create from /loop failed: {}", e);
+                            }
+                        }
+                    } else {
+                        warn!("skill_command 'loop' received but no LoopManager configured");
+                    }
+                    continue;
+                }
+                // Other skill_command names not handled here — fall through
+                // (no `continue`) to the chat-message slash-skill path.
             }
 
             // Handle canvas_tool_list requests
