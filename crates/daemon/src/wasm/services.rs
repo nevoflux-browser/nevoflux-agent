@@ -221,6 +221,12 @@ pub struct HostServices {
     /// it (e.g. screenshot HTTP fast-path) must fall back to native
     /// messaging. See `crates/daemon/src/asset_server/`.
     pub asset_server: Option<crate::asset_server::AssetServer>,
+
+    /// /loop skill manager. When set, the MCP tool executor dispatches the
+    /// `loop.*` family (create/list/cancel/scratchpad.{get,set}) through
+    /// this manager. `None` means /loop is not configured for this daemon
+    /// instance — tool calls return a clear ConfigMissing error.
+    pub loop_manager: Option<Arc<crate::loops::LoopManager>>,
 }
 
 impl HostServices {
@@ -277,6 +283,7 @@ impl HostServices {
             broadcast_tx: None,
             tts_config: None,
             asset_server: None,
+            loop_manager: None,
         }
     }
 
@@ -312,6 +319,7 @@ impl HostServices {
             broadcast_tx: None,
             tts_config: None,
             asset_server: None,
+            loop_manager: None,
         }
     }
 
@@ -392,6 +400,17 @@ impl HostServices {
     /// Returns self for method chaining.
     pub fn with_mcp_manager(mut self, manager: Arc<McpManager>) -> Self {
         self.mcp_manager = Some(manager);
+        self
+    }
+
+    /// Add the /loop manager to the services.
+    ///
+    /// Once set, `mcp_tool_executor::execute_mcp_tool` dispatches the
+    /// `loop.create / loop.list / loop.cancel / loop.scratchpad.{get,set}`
+    /// family through this manager. Without it, those tool calls return a
+    /// clear ConfigMissing error instead of being silently dropped.
+    pub fn with_loop_manager(mut self, manager: Arc<crate::loops::LoopManager>) -> Self {
+        self.loop_manager = Some(manager);
         self
     }
 
