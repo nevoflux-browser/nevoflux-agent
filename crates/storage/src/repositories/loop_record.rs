@@ -60,6 +60,64 @@ impl<'a> LoopRepository<'a> {
             .and_then(|opt| opt.transpose())
         })
     }
+
+    pub fn update_state(&self, id: &str, state: LoopState, now: i64) -> Result<()> {
+        self.db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE loops SET state = ?1, updated_at = ?2 WHERE id = ?3",
+                params![state.as_str(), now, id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn update_scratchpad(&self, id: &str, content: &str, now: i64) -> Result<()> {
+        // Note: 4096-byte cap is enforced by the SQL CHECK; we let it raise.
+        self.db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE loops SET scratchpad = ?1, updated_at = ?2 WHERE id = ?3",
+                params![content, now, id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn increment_skipped(&self, id: &str, now: i64) -> Result<()> {
+        self.db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE loops SET skipped_triggers = skipped_triggers + 1, updated_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn increment_iteration_count(&self, id: &str, now: i64) -> Result<i64> {
+        // rusqlite's `RETURNING` support depends on the build; do it as
+        // UPDATE-then-SELECT inside one connection borrow.
+        self.db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE loops SET iteration_count = iteration_count + 1, updated_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+            let n: i64 = conn.query_row(
+                "SELECT iteration_count FROM loops WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )?;
+            Ok(n)
+        })
+    }
+
+    pub fn set_consecutive_failures(&self, id: &str, n: i64, now: i64) -> Result<()> {
+        self.db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE loops SET consecutive_failures = ?1, updated_at = ?2 WHERE id = ?3",
+                params![n, now, id],
+            )?;
+            Ok(())
+        })
+    }
 }
 
 fn row_to_loop(row: &Row<'_>) -> rusqlite::Result<Result<LoopRecord>> {
@@ -150,5 +208,62 @@ mod tests {
         let s = fresh();
         let repo = LoopRepository::new(s.database());
         assert!(repo.get("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn update_state_persists() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        repo.update_state("abc", LoopState::Running, 200).unwrap();
+        assert_eq!(repo.get("abc").unwrap().unwrap().state, LoopState::Running);
+    }
+
+    #[test]
+    fn update_scratchpad_under_4kb_succeeds() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        repo.update_scratchpad("abc", "k=v", 200).unwrap();
+        assert_eq!(repo.get("abc").unwrap().unwrap().scratchpad, "k=v");
+    }
+
+    #[test]
+    fn update_scratchpad_over_4kb_rejected_by_check() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        let big = "x".repeat(4097);
+        assert!(repo.update_scratchpad("abc", &big, 200).is_err());
+    }
+
+    #[test]
+    fn increment_skipped_triggers() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        repo.increment_skipped("abc", 200).unwrap();
+        repo.increment_skipped("abc", 201).unwrap();
+        assert_eq!(repo.get("abc").unwrap().unwrap().skipped_triggers, 2);
+    }
+
+    #[test]
+    fn increment_iteration_count_returns_new_value() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        let n = repo.increment_iteration_count("abc", 200).unwrap();
+        assert_eq!(n, 1);
+        let n = repo.increment_iteration_count("abc", 201).unwrap();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn set_consecutive_failures_persists() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        repo.set_consecutive_failures("abc", 3, 200).unwrap();
+        assert_eq!(repo.get("abc").unwrap().unwrap().consecutive_failures, 3);
     }
 }
