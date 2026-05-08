@@ -107,6 +107,12 @@ pub struct AgentRunner {
     services: Option<HostServices>,
     trace_collector: Option<Arc<TraceCollector>>,
     pattern_engine: Option<Mutex<PatternEngine>>,
+    /// When `Some`, every tool call is checked against this allowlist via
+    /// `ToolRegistry::execute_with_guard`. Calls to tools NOT in the list
+    /// return an error to the LLM. Used by /loop iterations to enforce
+    /// the loop's `allowed_tool_classes` (spec §6.2). `None` (the default)
+    /// preserves the unfiltered behaviour for non-loop callers.
+    tools_allowlist: Option<Vec<String>>,
 }
 
 impl AgentRunner {
@@ -120,6 +126,7 @@ impl AgentRunner {
             services: None,
             trace_collector: None,
             pattern_engine: None,
+            tools_allowlist: None,
         })
     }
 
@@ -133,6 +140,7 @@ impl AgentRunner {
             services: None,
             trace_collector: None,
             pattern_engine: None,
+            tools_allowlist: None,
         })
     }
 
@@ -140,6 +148,26 @@ impl AgentRunner {
     pub fn with_services(mut self, services: HostServices) -> Self {
         self.services = Some(services);
         self
+    }
+
+    /// Restrict the runner to only call tools whose names appear in `tools`.
+    /// Calls to other tools surface an error to the LLM via
+    /// `ToolRegistry::execute_with_guard`. Used by `/loop` iterations to enforce
+    /// the loop's `allowed_tool_classes`.
+    pub fn with_tools_allowlist(mut self, tools: Vec<String>) -> Self {
+        self.tools_allowlist = Some(tools);
+        self
+    }
+
+    /// Snapshot of registered tool names — useful for callers (notably
+    /// `/loop`'s `IterationExecutor`) that want to compute a tool-class
+    /// allowlist before invoking [`Self::run`].
+    pub fn tool_names_for_filter(&self) -> Vec<String> {
+        self.tools
+            .tool_names()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// Enable trace collection and pattern detection.
@@ -423,8 +451,15 @@ impl AgentRunner {
     /// Execute a tool call using the tool registry.
     ///
     /// This method dispatches the tool call to the appropriate executor
-    /// in the tool registry and returns the result.
+    /// in the tool registry and returns the result. When
+    /// [`Self::with_tools_allowlist`] has been set, the call is routed
+    /// through `ToolRegistry::execute_with_guard` so that tools outside
+    /// the allowlist surface an error to the LLM rather than executing.
     async fn execute_tool(&self, tool_call: &PendingToolCall) -> ToolResult {
+        if let Some(allowed) = self.tools_allowlist.as_ref() {
+            let cfg = nevoflux_protocol::subagent::ToolsConfig::Allow(allowed.clone());
+            return self.tools.execute_with_guard(tool_call, &Some(cfg)).await;
+        }
         self.tools.execute(tool_call).await
     }
 

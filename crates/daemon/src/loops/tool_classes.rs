@@ -101,6 +101,25 @@ pub fn parse_class_list(input: &[String]) -> Result<HashSet<ToolClass>, String> 
         .collect()
 }
 
+/// Given a set of allowed classes and a list of all known tool names,
+/// return the subset whose class is in the allowed set. Tools in
+/// [`is_forbidden_in_iteration`] are always excluded regardless of class.
+pub fn filter_tool_names_by_classes(
+    all_tools: &[String],
+    allowed: &HashSet<ToolClass>,
+) -> Vec<String> {
+    all_tools
+        .iter()
+        .filter(|name| {
+            if is_forbidden_in_iteration(name) {
+                return false;
+            }
+            allowed.contains(&class_for(name))
+        })
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
