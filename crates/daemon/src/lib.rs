@@ -35,6 +35,7 @@ pub mod event_bus;
 pub mod file_picker;
 pub mod health;
 pub mod learning;
+pub mod loops;
 pub mod mcp_config;
 pub mod openclaw_setup;
 pub mod permission;
