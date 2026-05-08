@@ -3,6 +3,8 @@
 //! Phase 7 wires only the `time:<duration>` trigger; other trigger variants
 //! land in later phases (event in 11, dynamic in 12, state in 19, AND/OR in 20).
 
+use crate::event_bus::EventBus;
+use crate::loops::events::LoopEvents;
 use crate::loops::executor::IterationExecutor;
 use crate::loops::expression::TriggerExpr;
 use crate::loops::registry::LoopRegistry;
@@ -30,6 +32,7 @@ pub struct LoopManager {
     registry: LoopRegistry,
     scheduler: TriggerScheduler,
     fire_tx: mpsc::Sender<LoopFireRequest>,
+    events: Arc<LoopEvents>,
 }
 
 impl LoopManager {
@@ -38,13 +41,25 @@ impl LoopManager {
     /// and routes them to `IterationExecutor::execute`, applying the
     /// drop-on-busy concurrency policy from spec §8.2.
     pub fn start(db: Database) -> Self {
+        Self::start_with_bus(db, None)
+    }
+
+    /// Same as [`start`], but with an EventBus handle so the manager and its
+    /// dispatcher emit `system:loop:*` events. If `bus` is `None`, all
+    /// emissions are silent no-ops (used by unit tests that don't care).
+    pub fn start_with_bus(db: Database, bus: Option<Arc<EventBus>>) -> Self {
         let (fire_tx, mut fire_rx) = mpsc::channel::<LoopFireRequest>(64);
         let registry = LoopRegistry::new();
         let scheduler = TriggerScheduler::new();
-        let executor = Arc::new(IterationExecutor::new(db.clone()));
+        let events = Arc::new(LoopEvents::new(bus));
+        let executor = Arc::new(IterationExecutor::new_with_events(
+            db.clone(),
+            events.clone(),
+        ));
 
         let registry_for_task = registry.clone();
         let executor_for_task = executor.clone();
+        let events_for_task = events.clone();
         tokio::spawn(async move {
             while let Some(req) = fire_rx.recv().await {
                 // §8.2: drop if currently running.
@@ -55,6 +70,18 @@ impl LoopManager {
                     let now = current_timestamp();
                     let _ = LoopRepository::new(&executor_for_task.database())
                         .increment_skipped(req.loop_id.as_ref(), now);
+                    let session_id = registry_for_task
+                        .with_mut(&req.loop_id, |rt| rt.session_id.clone())
+                        .unwrap_or_default();
+                    let count = LoopRepository::new(&executor_for_task.database())
+                        .get(req.loop_id.as_ref())
+                        .ok()
+                        .flatten()
+                        .map(|r| r.skipped_triggers)
+                        .unwrap_or(0);
+                    events_for_task
+                        .trigger_dropped(&session_id, &req.loop_id, count)
+                        .await;
                     continue;
                 }
 
@@ -78,6 +105,7 @@ impl LoopManager {
             registry,
             scheduler,
             fire_tx,
+            events,
         }
     }
 
@@ -123,10 +151,27 @@ impl LoopManager {
             .insert(LoopRuntime::new(id.clone(), args.session_id.clone()));
         self.wire_trigger(&id, &expr);
 
+        self.events
+            .created(
+                &args.session_id,
+                &id,
+                &rec.trigger_expr,
+                rec.prompt_text.as_deref(),
+                rec.wrapped_skill.as_deref(),
+            )
+            .await;
+
         Ok(id)
     }
 
     pub async fn cancel_loop(&self, id: &LoopId, force: bool) -> Result<(), String> {
+        // Snapshot the session_id BEFORE we touch the registry — we still
+        // need it for event emission after the runtime entry is removed.
+        let session_id = self
+            .registry
+            .with_mut(id, |rt| rt.session_id.clone())
+            .unwrap_or_default();
+
         let subs: Vec<String> = self
             .registry
             .with_mut(id, |rt| {
@@ -143,6 +188,12 @@ impl LoopManager {
         LoopRepository::new(&self.db)
             .update_state(id.as_ref(), LoopState::Cancelled, current_timestamp())
             .map_err(|e| e.to_string())?;
+
+        self.events
+            .state_changed(&session_id, id, "cancelled", "running", Some("user"))
+            .await;
+        self.events.cancelled(&session_id, id, "user", force).await;
+
         self.registry.remove(id);
         Ok(())
     }

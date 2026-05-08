@@ -15,10 +15,12 @@
 //! loop.* tools from the main session; iteration-side execution is inert
 //! and deferred to a future phase.
 
+use crate::loops::events::LoopEvents;
 use crate::loops::types::LoopId;
 use nevoflux_storage::models::{IterationStatus, LoopRecord};
 use nevoflux_storage::repositories::LoopRepository;
 use nevoflux_storage::Database;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub enum ExecResult {
@@ -28,11 +30,16 @@ pub enum ExecResult {
 
 pub struct IterationExecutor {
     db: Database,
+    events: Arc<LoopEvents>,
 }
 
 impl IterationExecutor {
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self::new_with_events(db, Arc::new(LoopEvents::new(None)))
+    }
+
+    pub fn new_with_events(db: Database, events: Arc<LoopEvents>) -> Self {
+        Self { db, events }
     }
 
     /// Cheap clone of the underlying Database handle.
@@ -46,8 +53,9 @@ impl IterationExecutor {
     ///
     /// Phase 6 stub: reads the loop record, advances `iteration_count`,
     /// inserts a `loop_iterations` row, and marks it `ok`. No AgentRunner
-    /// invocation, no tool dispatch, no event emission yet — those wire
-    /// in at Phases 9 and 10.
+    /// invocation, no tool dispatch yet — that lands in a future phase.
+    /// Phase 10: emits `system:loop:iteration_start` and `iteration_end`
+    /// EventBus events around the work.
     pub async fn execute(&self, loop_id: LoopId, fire_reason: String) -> ExecResult {
         let repo = LoopRepository::new(&self.db);
         let now = chrono::Utc::now().timestamp();
@@ -73,13 +81,29 @@ impl IterationExecutor {
             Err(e) => return ExecResult::Error(e.to_string()),
         };
 
+        let session_id = rec.session_id.clone();
+        self.events
+            .iteration_start(&session_id, &loop_id, seq, now, &fire_reason)
+            .await;
+
         // Build the §7.2 LOOP-CONTEXT block. Returned as a plain string for
-        // now; Phase 9 turns this into the user_message of an AgentInput.
+        // now; a future phase turns this into the user_message of an AgentInput.
         let _input = build_user_message(&rec, seq, &fire_reason);
 
         // STUB: pretend the iteration succeeded.
         let end_now = chrono::Utc::now().timestamp();
         let _ = repo.finish_iteration(iter_id, end_now, IterationStatus::Ok, None, None);
+
+        self.events
+            .iteration_end(
+                &session_id,
+                &loop_id,
+                seq,
+                end_now,
+                "ok",
+                serde_json::json!([]),
+            )
+            .await;
 
         ExecResult::Ok
     }
