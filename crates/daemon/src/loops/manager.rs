@@ -33,6 +33,7 @@ pub struct LoopManager {
     scheduler: TriggerScheduler,
     fire_tx: mpsc::Sender<LoopFireRequest>,
     events: Arc<LoopEvents>,
+    event_bus: Option<Arc<EventBus>>,
 }
 
 impl LoopManager {
@@ -51,7 +52,7 @@ impl LoopManager {
         let (fire_tx, mut fire_rx) = mpsc::channel::<LoopFireRequest>(64);
         let registry = LoopRegistry::new();
         let scheduler = TriggerScheduler::new();
-        let events = Arc::new(LoopEvents::new(bus));
+        let events = Arc::new(LoopEvents::new(bus.clone()));
         let executor = Arc::new(IterationExecutor::new_with_events(
             db.clone(),
             events.clone(),
@@ -106,6 +107,7 @@ impl LoopManager {
             scheduler,
             fire_tx,
             events,
+            event_bus: bus.clone(),
         }
     }
 
@@ -218,8 +220,19 @@ impl LoopManager {
             TriggerExpr::TimeDynamic => {
                 tracing::warn!("time:dynamic not yet wired (Phase 12)");
             }
-            TriggerExpr::Event(_) => {
-                tracing::warn!("event:* not yet wired (Phase 11)");
+            TriggerExpr::Event(topic) => {
+                let Some(bus) = self.event_bus.clone() else {
+                    tracing::warn!("event:{} ignored — LoopManager has no EventBus handle", topic);
+                    return;
+                };
+                match self.scheduler.schedule_event(id.clone(), topic.clone(), bus, self.fire_tx.clone()) {
+                    Ok(sub) => {
+                        self.registry.with_mut(id, |rt| rt.subscription_ids.push(sub));
+                    }
+                    Err(e) => {
+                        tracing::warn!("event:{} subscription failed: {e}", topic);
+                    }
+                }
             }
             TriggerExpr::State { .. } => {
                 tracing::warn!("state:* not yet wired (Phase 19)");
@@ -417,5 +430,36 @@ mod tests {
 
         let list = mgr.list_by_session("s1").await.unwrap();
         assert_eq!(list.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn event_trigger_fires_iteration_on_publish() {
+        use crate::event_bus::types::{BusEvent, PublisherIdentity};
+        use crate::event_bus::EventBus;
+        use std::sync::Arc;
+
+        let storage = fresh();
+        let bus = Arc::new(EventBus::new());
+        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus.clone()));
+
+        let id = mgr.create_loop(CreateLoopArgs {
+            session_id: "s1".into(),
+            trigger_expr_text: "event:ui:test:click".into(),
+            prompt_text: Some("p".into()),
+            wrapped_skill: None,
+            allowed_tool_classes: None,
+        }).await.unwrap();
+
+        bus.publish(BusEvent::ephemeral(
+            "ui:test:click",
+            serde_json::json!({}),
+            PublisherIdentity::Internal,
+        )).await.unwrap();
+
+        // Real-time wait for the dispatcher + executor to run.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
+        assert!(rec.iteration_count >= 1, "iteration_count was {}", rec.iteration_count);
     }
 }
