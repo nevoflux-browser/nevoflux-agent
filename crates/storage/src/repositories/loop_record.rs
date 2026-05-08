@@ -179,6 +179,34 @@ impl<'a> LoopRepository<'a> {
             Ok(())
         })
     }
+
+    pub fn list_by_session(&self, session_id: &str) -> Result<Vec<LoopRecord>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, trigger_expr, prompt_text, wrapped_skill,
+                        allowed_tool_classes, scratchpad, state,
+                        consecutive_failures, skipped_triggers, iteration_count,
+                        created_at, updated_at
+                 FROM loops WHERE session_id = ?1 ORDER BY created_at",
+            )?;
+            let rows = stmt.query_map(params![session_id], row_to_loop)?;
+            rows.map(|r| r?).collect()
+        })
+    }
+
+    pub fn list_running_or_pending(&self) -> Result<Vec<LoopRecord>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, session_id, trigger_expr, prompt_text, wrapped_skill,
+                        allowed_tool_classes, scratchpad, state,
+                        consecutive_failures, skipped_triggers, iteration_count,
+                        created_at, updated_at
+                 FROM loops WHERE state IN ('pending', 'running') ORDER BY created_at",
+            )?;
+            let rows = stmt.query_map([], row_to_loop)?;
+            rows.map(|r| r?).collect()
+        })
+    }
 }
 
 fn row_to_loop(row: &Row<'_>) -> rusqlite::Result<Result<LoopRecord>> {
@@ -405,5 +433,47 @@ mod tests {
         assert_eq!(row.0, 110);
         assert_eq!(row.1, "ok");
         assert_eq!(row.2.as_deref(), Some("[]"));
+    }
+
+    #[test]
+    fn list_by_session_filters_correctly() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("a")).unwrap();
+
+        s.sessions()
+            .create(
+                CreateSessionParams::new()
+                    .with_id("other")
+                    .with_title("x"),
+            )
+            .unwrap();
+        let mut other = sample_loop("b");
+        other.session_id = "other".into();
+        repo.create(&other).unwrap();
+
+        let in_s1 = repo.list_by_session("s1").unwrap();
+        assert_eq!(in_s1.len(), 1);
+        assert_eq!(in_s1[0].id, "a");
+    }
+
+    #[test]
+    fn list_running_or_pending_returns_both_states() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        let mut a = sample_loop("a");
+        a.state = LoopState::Pending;
+        repo.create(&a).unwrap();
+        let mut b = sample_loop("b");
+        b.state = LoopState::Running;
+        repo.create(&b).unwrap();
+        let mut c = sample_loop("c");
+        c.state = LoopState::Idle;
+        repo.create(&c).unwrap();
+
+        let active = repo.list_running_or_pending().unwrap();
+        let mut ids: Vec<&str> = active.iter().map(|r| r.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b"]);
     }
 }
