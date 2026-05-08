@@ -215,14 +215,24 @@ impl LoopManager {
             .map_err(|e| e.to_string())
     }
 
-    /// Wire a trigger expression's subscriptions. Phase 7 handles only `time:<duration>`;
-    /// other variants are left as warn-stubs for later phases.
+    /// Wire a trigger expression's subscriptions into the loop's main fire channel.
     fn wire_trigger(&self, id: &LoopId, expr: &TriggerExpr) {
+        self.wire_trigger_into(id, expr, self.fire_tx.clone());
+    }
+
+    /// Recursive wiring helper: routes a trigger's fires into `sink` rather
+    /// than the main fire channel. Combinators use this to splice their
+    /// children's pulses through the [`combinator::CombinatorRuntime`] before
+    /// the parent fire is forwarded to `self.fire_tx`.
+    fn wire_trigger_into(
+        &self,
+        id: &LoopId,
+        expr: &TriggerExpr,
+        sink: mpsc::Sender<LoopFireRequest>,
+    ) {
         match expr {
             TriggerExpr::Time(dur) => {
-                let sub = self
-                    .scheduler
-                    .schedule_time(id.clone(), *dur, self.fire_tx.clone());
+                let sub = self.scheduler.schedule_time(id.clone(), *dur, sink);
                 self.registry
                     .with_mut(id, |rt| rt.subscription_ids.push(sub));
             }
@@ -234,7 +244,10 @@ impl LoopManager {
                     tracing::warn!("event:{} ignored — LoopManager has no EventBus handle", topic);
                     return;
                 };
-                match self.scheduler.schedule_event(id.clone(), topic.clone(), bus, self.fire_tx.clone()) {
+                match self
+                    .scheduler
+                    .schedule_event(id.clone(), topic.clone(), bus, sink)
+                {
                     Ok(sub) => {
                         self.registry.with_mut(id, |rt| rt.subscription_ids.push(sub));
                     }
@@ -246,9 +259,71 @@ impl LoopManager {
             TriggerExpr::State { .. } => {
                 tracing::warn!("state:* not yet wired (Phase 19)");
             }
-            TriggerExpr::And(_) | TriggerExpr::Or(_) => {
-                tracing::warn!("AND/OR combinators not yet wired (Phase 20)");
+            TriggerExpr::And(children) | TriggerExpr::Or(children) => {
+                self.wire_combinator(id, expr, children, sink);
             }
+        }
+    }
+
+    /// Wire a combinator (AND/OR) by spawning a forwarding task that re-emits
+    /// the runtime's parent fires into `parent_sink`, plus per-child adapter
+    /// tasks that translate child `LoopFireRequest`s into
+    /// [`combinator::CombinatorRuntime::on_child_fire`] calls.
+    fn wire_combinator(
+        &self,
+        id: &LoopId,
+        expr: &TriggerExpr,
+        children: &[TriggerExpr],
+        parent_sink: mpsc::Sender<LoopFireRequest>,
+    ) {
+        // Per-combinator output channel: when the combinator fires, we
+        // re-emit a single LoopFireRequest into the parent sink.
+        let (out_tx, mut out_rx) = mpsc::channel::<()>(8);
+        let runtime = std::sync::Arc::new(tokio::sync::Mutex::new(match expr {
+            TriggerExpr::And(_) => {
+                crate::loops::combinator::CombinatorRuntime::new_and(children.len(), out_tx)
+            }
+            TriggerExpr::Or(_) => crate::loops::combinator::CombinatorRuntime::new_or(out_tx),
+            _ => unreachable!("wire_combinator called with non-combinator"),
+        }));
+
+        let label = match expr {
+            TriggerExpr::And(_) => "AND",
+            TriggerExpr::Or(_) => "OR",
+            _ => "?",
+        };
+
+        // Forward combinator output -> parent fire sink.
+        let id_for_forward = id.clone();
+        let sink_for_forward = parent_sink.clone();
+        let label_owned = label.to_string();
+        tokio::spawn(async move {
+            while out_rx.recv().await.is_some() {
+                if sink_for_forward
+                    .send(LoopFireRequest {
+                        loop_id: id_for_forward.clone(),
+                        fire_reason: format!("combinator:{}", label_owned),
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        // Per-child mpsc adapter: receives LoopFireRequest from a child's
+        // schedule_* call, calls combinator.on_child_fire(idx) for each.
+        for (idx, child) in children.iter().enumerate() {
+            let (child_tx, mut child_rx) = mpsc::channel::<LoopFireRequest>(8);
+            self.wire_trigger_into(id, child, child_tx);
+
+            let runtime_clone = runtime.clone();
+            tokio::spawn(async move {
+                while child_rx.recv().await.is_some() {
+                    runtime_clone.lock().await.on_child_fire(idx).await;
+                }
+            });
         }
     }
 }
@@ -470,5 +545,100 @@ mod tests {
 
         let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
         assert!(rec.iteration_count >= 1, "iteration_count was {}", rec.iteration_count);
+    }
+
+    #[tokio::test]
+    async fn or_combinator_fires_on_any_event() {
+        use crate::event_bus::types::{BusEvent, PublisherIdentity};
+        use crate::event_bus::EventBus;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let storage = fresh();
+        let bus = Arc::new(EventBus::new());
+        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus.clone()));
+
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "OR(event:a:test,event:b:test)".into(),
+                prompt_text: Some("p".into()),
+                wrapped_skill: None,
+                allowed_tool_classes: None,
+            })
+            .await
+            .unwrap();
+
+        bus.publish(BusEvent::ephemeral(
+            "a:test",
+            serde_json::json!({}),
+            PublisherIdentity::Internal,
+        ))
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
+        assert!(
+            rec.iteration_count >= 1,
+            "OR combinator should fire on first child; got {}",
+            rec.iteration_count
+        );
+    }
+
+    #[tokio::test]
+    async fn and_combinator_waits_for_all() {
+        use crate::event_bus::types::{BusEvent, PublisherIdentity};
+        use crate::event_bus::EventBus;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let storage = fresh();
+        let bus = Arc::new(EventBus::new());
+        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus.clone()));
+
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "AND(event:and:a,event:and:b)".into(),
+                prompt_text: Some("p".into()),
+                wrapped_skill: None,
+                allowed_tool_classes: None,
+            })
+            .await
+            .unwrap();
+
+        // Only one child fires — AND must NOT trip yet.
+        bus.publish(BusEvent::ephemeral(
+            "and:a",
+            serde_json::json!({}),
+            PublisherIdentity::Internal,
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
+        assert_eq!(
+            rec.iteration_count, 0,
+            "AND should not fire on partial: got {}",
+            rec.iteration_count
+        );
+
+        // Both children fired — AND should trip.
+        bus.publish(BusEvent::ephemeral(
+            "and:b",
+            serde_json::json!({}),
+            PublisherIdentity::Internal,
+        ))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
+        assert!(
+            rec.iteration_count >= 1,
+            "AND should fire after both children: got {}",
+            rec.iteration_count
+        );
     }
 }
