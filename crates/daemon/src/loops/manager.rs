@@ -435,8 +435,31 @@ impl LoopManager {
                     }
                 }
             }
-            TriggerExpr::State { .. } => {
-                tracing::warn!("state:* not yet wired (Phase 19)");
+            TriggerExpr::State { tab, selector } => {
+                // MVP: subscribe to a generic dom-mutation topic. The dom-watcher
+                // content script (Phase 18) publishes ui:tab:dom:mutation on every
+                // batch of mutations across all tabs. Per-selector and per-tab
+                // filtering is deferred — for now, the trigger fires on any DOM
+                // mutation, and the iteration's LLM can use browser_query to verify
+                // the selector matches before acting.
+                let _ = (tab, selector); // recorded in trigger_expr_text for future per-tab filtering
+                let Some(bus) = self.event_bus.clone() else {
+                    tracing::warn!("state:* trigger ignored — no EventBus handle");
+                    return;
+                };
+                let topic = "ui:tab:dom:mutation".to_string();
+                match self
+                    .scheduler
+                    .schedule_event(id.clone(), topic, bus, sink)
+                {
+                    Ok(sub) => {
+                        self.registry
+                            .with_mut(id, |rt| rt.subscription_ids.push(sub));
+                    }
+                    Err(e) => {
+                        tracing::warn!("state:* subscription failed: {e}");
+                    }
+                }
             }
             TriggerExpr::And(children) | TriggerExpr::Or(children) => {
                 self.wire_combinator(id, expr, children, sink);
@@ -866,6 +889,51 @@ mod tests {
         assert!(
             rec.iteration_count >= 1,
             "AND should fire after both children: got {}",
+            rec.iteration_count
+        );
+    }
+
+    #[tokio::test]
+    async fn state_trigger_fires_on_dom_mutation_event() {
+        use crate::event_bus::types::{BusEvent, PublisherIdentity};
+        use crate::event_bus::EventBus;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let storage = fresh();
+        let bus = Arc::new(EventBus::new());
+        let mgr = LoopManager::start_with_bus(
+            storage.database().clone(),
+            Some(bus.clone()),
+            None,
+        );
+
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "state:tab=current:.chat-list:change".into(),
+                prompt_text: Some("p".into()),
+                wrapped_skill: None,
+                allowed_tool_classes: None,
+            })
+            .await
+            .unwrap();
+
+        // Simulate the dom-watcher publishing a mutation event.
+        bus.publish(BusEvent::ephemeral(
+            "ui:tab:dom:mutation",
+            serde_json::json!({"url": "https://example.com", "ts_ms": 0}),
+            PublisherIdentity::Internal,
+        ))
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
+        assert!(
+            rec.iteration_count >= 1,
+            "state:* trigger should fire on dom mutation; got {}",
             rec.iteration_count
         );
     }
