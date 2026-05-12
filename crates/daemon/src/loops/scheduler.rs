@@ -90,6 +90,13 @@ impl TriggerScheduler {
             )
             .map_err(|e| format!("event subscribe failed: {e}"))?;
 
+        tracing::info!(
+            loop_id = %loop_id.as_ref(),
+            topic = %topic_pattern,
+            sub = %handle.id,
+            "loop event trigger subscribed"
+        );
+
         let sub_id = format!("event-{}-{}", loop_id.as_ref(), handle.id);
         let scheduler_cancel = CancellationToken::new();
         self.cancels
@@ -111,10 +118,20 @@ impl TriggerScheduler {
                     }
                     msg = rx.recv() => match msg {
                         Some(_event) => {
+                            tracing::debug!(
+                                loop_id = %id.as_ref(),
+                                topic = %topic_label,
+                                "loop scheduler received event, dispatching fire"
+                            );
                             if sink.send(LoopFireRequest {
                                 loop_id: id.clone(),
                                 fire_reason: format!("event:{}", topic_label),
                             }).await.is_err() {
+                                tracing::warn!(
+                                    loop_id = %id.as_ref(),
+                                    topic = %topic_label,
+                                    "loop scheduler sink closed — exiting"
+                                );
                                 bus_for_task.unsubscribe(&bus_sub_id);
                                 return;
                             }

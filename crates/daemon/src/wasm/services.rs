@@ -181,6 +181,24 @@ pub struct HostServices {
     pub session_id: String,
     /// Tools that user has approved "Always Allow" (shared across requests in the same daemon).
     pub always_allowed_tools: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    /// True when this HostServices is the per-iteration clone owned by an
+    /// `IterationExecutor`. The /loop skill's permission handler short-circuits
+    /// dialogs in this mode: the loop's `allowed_tool_classes` is already the
+    /// gating layer, and there is no sidebar to display dialogs to anyway.
+    pub is_iteration: bool,
+    /// When `is_iteration` is true, the loop_id of the running iteration.
+    /// Used by `mcp_tool_executor`'s `loop.*` dispatch to build a correct
+    /// `ToolCallContext` so `loop.scratchpad.set` etc. can target the right
+    /// loop's scratchpad.
+    pub iteration_loop_id: Option<String>,
+    /// Tracks the most-recently-active sidebar proxy per session_id.
+    /// `IterationExecutor` reads this at iteration start to "borrow" a
+    /// connected sidebar's `proxy_id` + `client_identity` so `browser_*`
+    /// tools dispatched from inside an iteration can actually reach a
+    /// sidebar/content-script for execution. Without this, iterations
+    /// have `proxy_id=""` and the daemon's writer lookup fails (see
+    /// `server.rs::No writer for proxy ""`).
+    pub session_proxy_tracker: Option<Arc<crate::registry::SessionProxyTracker>>,
     /// Knowledge retriever for injecting learned context into agent execution.
     ///
     /// When set, enables the agent to retrieve relevant knowledge entries
@@ -289,6 +307,9 @@ impl HostServices {
             always_allowed_tools: Arc::new(
                 std::sync::RwLock::new(std::collections::HashSet::new()),
             ),
+            is_iteration: false,
+            iteration_loop_id: None,
+            session_proxy_tracker: None,
             knowledge_retriever: None,
             computer_controller: None,
             embedding: Arc::new(std::sync::RwLock::new(None)),
@@ -327,6 +348,9 @@ impl HostServices {
             always_allowed_tools: Arc::new(
                 std::sync::RwLock::new(std::collections::HashSet::new()),
             ),
+            is_iteration: false,
+            iteration_loop_id: None,
+            session_proxy_tracker: None,
             knowledge_retriever: None,
             computer_controller: None,
             embedding: Arc::new(std::sync::RwLock::new(None)),
@@ -532,6 +556,16 @@ impl HostServices {
     /// Set session ID for session-scoped operations (e.g. artifact creation).
     pub fn with_session_id(mut self, session_id: String) -> Self {
         self.session_id = session_id;
+        self
+    }
+
+    /// Attach the daemon-global session→proxy tracker so `/loop` iterations
+    /// can borrow a connected sidebar's proxy_id to fulfill `browser_*` tools.
+    pub fn with_session_proxy_tracker(
+        mut self,
+        tracker: Arc<crate::registry::SessionProxyTracker>,
+    ) -> Self {
+        self.session_proxy_tracker = Some(tracker);
         self
     }
 

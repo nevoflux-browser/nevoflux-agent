@@ -287,16 +287,26 @@ impl EventBus {
         // Collect matching targets while holding the read lock, then release it
         // before any `.await` to avoid holding a std RwLockReadGuard across an
         // await point.
-        let targets: Vec<(mpsc::Sender<BusEvent>, BackpressurePolicy)> = {
+        let (targets, total_subs): (Vec<(mpsc::Sender<BusEvent>, BackpressurePolicy)>, usize) = {
             let subs = self
                 .subscriptions
                 .read()
                 .expect("subscriptions lock poisoned");
-            subs.iter()
+            let total = subs.len();
+            let t = subs
+                .iter()
                 .filter(|a| a.sub.pattern.matches(&event.topic))
                 .map(|a| (a.tx.clone(), a.sub.policy))
-                .collect()
+                .collect();
+            (t, total)
         };
+
+        tracing::debug!(
+            topic = %event.topic,
+            matched = targets.len(),
+            total_subs,
+            "EventBus deliver"
+        );
 
         for (tx, policy) in &targets {
             let sent = match policy {

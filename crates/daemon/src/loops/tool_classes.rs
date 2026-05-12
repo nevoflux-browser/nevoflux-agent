@@ -1,123 +1,22 @@
-//! Tool-class vocabulary for /loop iterations (spec §6.2).
+//! Iteration-specific tool guards.
 //!
-//! Tools called from inside a loop iteration are filtered against the
-//! loop's `allowed_tool_classes`. Default classes are read-only;
-//! anything destructive (`dom-click`, `nav`, `write`, `net-post`)
-//! requires explicit opt-in at loop creation time.
+//! Historical note: this module used to maintain a parallel "tool class"
+//! taxonomy (Read / Write / DomClick / Nav / etc.) for /loop iterations.
+//! That taxonomy used fictitious tool names that didn't match the real
+//! `builtin-wasm::Agent::get_chat_tools()` catalog, so iterations ended
+//! up with empty allowlists (no `browser_query` etc.).
 //!
-//! Tools NOT in the static map are treated as `Write` — fail-closed
-//! default for safety when new tools land before this table is updated.
+//! Migration 018 replaced the class system with the existing
+//! `AgentMode { Chat, Browser, Agent }` enum from `builtin-wasm`, and
+//! the iteration's tool catalog now comes directly from
+//! `Agent::get_tools_for_mode(mode)`. The only iteration-specific filter
+//! left is [`is_forbidden_in_iteration`].
 
-use std::collections::HashSet;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ToolClass {
-    Read,
-    ScratchpadWrite,
-    EventSubscribe,
-    DomClick,
-    Nav,
-    Write,
-    NetPost,
-}
-
-impl ToolClass {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Read => "read",
-            Self::ScratchpadWrite => "scratchpad-write",
-            Self::EventSubscribe => "event-subscribe",
-            Self::DomClick => "dom-click",
-            Self::Nav => "nav",
-            Self::Write => "write",
-            Self::NetPost => "net-post",
-        }
-    }
-
-    pub fn from_class_str(s: &str) -> Option<Self> {
-        Some(match s {
-            "read" => Self::Read,
-            "scratchpad-write" => Self::ScratchpadWrite,
-            "event-subscribe" => Self::EventSubscribe,
-            "dom-click" => Self::DomClick,
-            "nav" => Self::Nav,
-            "write" => Self::Write,
-            "net-post" => Self::NetPost,
-            _ => return None,
-        })
-    }
-}
-
-/// Map of tool name → class. Tools NOT in the map fall through to
-/// [`ToolClass::Write`] (fail-closed default).
-pub fn class_for(tool_name: &str) -> ToolClass {
-    match tool_name {
-        // read class
-        "read" | "list_files" | "fetch_page" | "dom_query" | "screenshot"
-        | "loop.scratchpad.get" | "memory_search" | "web_fetch" | "web_search"
-        | "browser_query" | "browser_inspect" => ToolClass::Read,
-
-        // scratchpad-write
-        "loop.scratchpad.set" => ToolClass::ScratchpadWrite,
-
-        // event-subscribe
-        "events.subscribe" => ToolClass::EventSubscribe,
-
-        // dom-click
-        "browser_click" | "browser_click_by_id" | "browser_type" | "browser_type_by_id"
-        | "browser_fill" | "browser_fill_by_id" | "browser_key_press" => ToolClass::DomClick,
-
-        // nav
-        "browser_navigate" | "browser_go_back" | "browser_go_forward"
-        | "browser_open_tab" | "browser_close_tab" => ToolClass::Nav,
-
-        // write
-        "write" | "edit" | "bash" | "create_artifact" | "browser_edit_artifact"
-        | "memory_create" | "canvas_create_composition" | "canvas_apply_design_md"
-        | "canvas_create_from_visual_identity" | "canvas_attach_asset"
-        | "canvas_render_video" => ToolClass::Write,
-
-        // net-post — left empty in MVP (no current tools fit); fall through.
-        _ => ToolClass::Write,
-    }
-}
-
-/// Default classes when `allowed_tool_classes` is omitted at loop creation.
-pub fn default_classes() -> Vec<ToolClass> {
-    vec![ToolClass::Read, ToolClass::ScratchpadWrite, ToolClass::EventSubscribe]
-}
-
-/// Tools that are forbidden inside loop iterations regardless of class.
+/// Tools that are forbidden inside loop iterations regardless of mode.
 /// `loop.create` would let an iteration spawn nested loops; `ask_user` blocks
 /// on a sidebar that may be closed.
 pub fn is_forbidden_in_iteration(tool_name: &str) -> bool {
     matches!(tool_name, "loop.create" | "ask_user")
-}
-
-pub fn parse_class_list(input: &[String]) -> Result<HashSet<ToolClass>, String> {
-    input
-        .iter()
-        .map(|s| ToolClass::from_class_str(s).ok_or_else(|| format!("unknown class: {s}")))
-        .collect()
-}
-
-/// Given a set of allowed classes and a list of all known tool names,
-/// return the subset whose class is in the allowed set. Tools in
-/// [`is_forbidden_in_iteration`] are always excluded regardless of class.
-pub fn filter_tool_names_by_classes(
-    all_tools: &[String],
-    allowed: &HashSet<ToolClass>,
-) -> Vec<String> {
-    all_tools
-        .iter()
-        .filter(|name| {
-            if is_forbidden_in_iteration(name) {
-                return false;
-            }
-            allowed.contains(&class_for(name))
-        })
-        .cloned()
-        .collect()
 }
 
 #[cfg(test)]
@@ -125,63 +24,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn known_tool_routes_to_class() {
-        assert_eq!(class_for("read"), ToolClass::Read);
-        assert_eq!(class_for("browser_click"), ToolClass::DomClick);
-        assert_eq!(class_for("loop.scratchpad.set"), ToolClass::ScratchpadWrite);
-    }
-
-    #[test]
-    fn unknown_tool_defaults_to_write() {
-        assert_eq!(class_for("brand_new_unmapped_tool"), ToolClass::Write);
-    }
-
-    #[test]
-    fn parse_class_list_rejects_unknown() {
-        let err = parse_class_list(&["read".into(), "bogus".into()]).unwrap_err();
-        assert!(err.contains("bogus"));
-    }
-
-    #[test]
-    fn parse_class_list_accepts_all_known() {
-        let set = parse_class_list(&["read".into(), "scratchpad-write".into()]).unwrap();
-        assert!(set.contains(&ToolClass::Read));
-        assert!(set.contains(&ToolClass::ScratchpadWrite));
-        assert_eq!(set.len(), 2);
-    }
-
-    #[test]
-    fn defaults_are_safe() {
-        let d = default_classes();
-        assert!(d.contains(&ToolClass::Read));
-        assert!(d.contains(&ToolClass::ScratchpadWrite));
-        assert!(d.contains(&ToolClass::EventSubscribe));
-        assert!(!d.contains(&ToolClass::Write));
-        assert!(!d.contains(&ToolClass::DomClick));
-        assert!(!d.contains(&ToolClass::Nav));
-        assert!(!d.contains(&ToolClass::NetPost));
-    }
-
-    #[test]
     fn forbidden_set() {
         assert!(is_forbidden_in_iteration("loop.create"));
         assert!(is_forbidden_in_iteration("ask_user"));
         assert!(!is_forbidden_in_iteration("read"));
         assert!(!is_forbidden_in_iteration("loop.scratchpad.set"));
-    }
-
-    #[test]
-    fn round_trip_class_strings() {
-        for c in [
-            ToolClass::Read,
-            ToolClass::ScratchpadWrite,
-            ToolClass::EventSubscribe,
-            ToolClass::DomClick,
-            ToolClass::Nav,
-            ToolClass::Write,
-            ToolClass::NetPost,
-        ] {
-            assert_eq!(ToolClass::from_class_str(c.as_str()), Some(c));
-        }
+        assert!(!is_forbidden_in_iteration("browser_get_content"));
     }
 }

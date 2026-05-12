@@ -119,6 +119,62 @@ impl ProxyRegistry {
     }
 }
 
+/// Tracks the most-recently-active sidebar proxy per session_id, so that
+/// `/loop` iterations can borrow a connected sidebar to fulfill `browser_*`
+/// tool calls. Iterations themselves have `proxy_id=""` (no inbound chat
+/// connection), and without this tracker their browser requests get dropped
+/// at the `No writer for proxy ""` check in `server.rs::browser request handler`.
+///
+/// Updated by `server.rs` on every Chat-channel message arrival; read by
+/// `IterationExecutor` at iteration start.
+pub struct SessionProxyTracker {
+    map: RwLock<HashMap<String, SessionProxyEntry>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionProxyEntry {
+    pub proxy_id: String,
+    pub client_identity: Vec<u8>,
+    pub last_seen: Instant,
+}
+
+impl Default for SessionProxyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SessionProxyTracker {
+    pub fn new() -> Self {
+        Self {
+            map: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Record that `session_id` was most recently seen on `proxy_id`.
+    /// Empty proxy_id is ignored (iteration-internal messages can't borrow
+    /// from themselves).
+    pub fn note(&self, session_id: &str, proxy_id: &str, client_identity: &[u8]) {
+        if session_id.is_empty() || proxy_id.is_empty() {
+            return;
+        }
+        let entry = SessionProxyEntry {
+            proxy_id: proxy_id.to_string(),
+            client_identity: client_identity.to_vec(),
+            last_seen: Instant::now(),
+        };
+        self.map
+            .write()
+            .unwrap()
+            .insert(session_id.to_string(), entry);
+    }
+
+    /// Return the latest sidebar proxy info for `session_id`, if any.
+    pub fn latest(&self, session_id: &str) -> Option<SessionProxyEntry> {
+        self.map.read().unwrap().get(session_id).cloned()
+    }
+}
+
 /// Information about an active request.
 #[derive(Debug, Clone)]
 pub struct ActiveRequest {

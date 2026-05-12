@@ -59,7 +59,7 @@ mod tests {
             trigger_expr: "time:5m".into(),
             prompt_text: Some("p".into()),
             wrapped_skill: None,
-            allowed_tool_classes: vec!["read".into()],
+            mode: "chat".into(),
             scratchpad: String::new(),
             state: LoopState::Running,
             consecutive_failures: 0,

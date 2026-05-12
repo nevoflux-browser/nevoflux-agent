@@ -8,7 +8,7 @@
 //! 1. Read the loop record, increment `iteration_count`, insert a
 //!    `loop_iterations` row with `status=running`, emit
 //!    `system:loop:iteration_start`.
-//! 2. Validate `allowed_tool_classes`; on parse failure record an
+//! 2. Resolve the loop's `mode`; build per-mode tool allowlist via
 //!    iteration error and bump `consecutive_failures`.
 //! 3. Build the §7.2 LOOP-CONTEXT block + per-class tool-name allowlist.
 //! 4. **Production path** (when [`HostServices`] are wired via
@@ -52,7 +52,8 @@
 //! `loop-meta` block out of the assistant text.
 
 use crate::loops::events::LoopEvents;
-use crate::loops::tool_classes::{filter_tool_names_by_classes, parse_class_list};
+use crate::loops::manager::db_str_to_agent_mode;
+use crate::loops::tool_classes::is_forbidden_in_iteration;
 use crate::loops::types::LoopId;
 use crate::wasm::services::HostServices;
 use nevoflux_storage::models::{current_timestamp, IterationStatus, LoopRecord};
@@ -158,29 +159,13 @@ impl IterationExecutor {
             .iteration_start(&session_id, &loop_id, seq, now, &fire_reason)
             .await;
 
-        // Validate allowed_tool_classes + compute the tool-name allowlist
-        // for `AgentInput.tools_config = Allow(...)`. Pre-LLM filter inside
-        // `nevoflux_builtin_wasm::Agent::filter_tools` honors this list.
-        let allowed_classes = match parse_class_list(&rec.allowed_tool_classes) {
-            Ok(s) => s,
-            Err(e) => {
-                return self
-                    .finalize_iteration_error(
-                        iter_id,
-                        format!("bad allowed_tool_classes: {e}"),
-                        &session_id,
-                        &loop_id,
-                        seq,
-                        &rec,
-                    )
-                    .await;
-            }
-        };
-
+        // Resolve the loop's AgentMode from its DB record. The mode picks
+        // the iteration's tool catalog via `Agent::get_tools_for_mode`. Tools
+        // forbidden in iteration context (`ask_user`, `loop.create`) are
+        // stripped from the resulting allowlist.
+        let iter_mode = db_str_to_agent_mode(&rec.mode);
         let user_message =
             build_user_message(&rec, seq, &fire_reason, self.services.as_ref()).await;
-        let allowlist =
-            filter_tool_names_by_classes(&known_chat_tool_catalog(), &allowed_classes);
 
         // Stub path: no services → record ok without invoking LLM.
         // Preserves Phase-6 test semantics. Production callers always
@@ -244,6 +229,47 @@ impl IterationExecutor {
 
         let mut services_for_iter = services.clone();
         services_for_iter.session_id = session_id.clone();
+        // Mark this clone as iteration-mode so permission handlers in
+        // `wasm::mcp_tool_executor` and `agent_host` short-circuit dialogs
+        // (the loop's `mode` is the gating layer; permission dialogs would
+        // anyway be sent to the borrowed sidebar, which the user did not
+        // explicitly authorize — auto-approve keeps the interaction silent).
+        services_for_iter.is_iteration = true;
+        services_for_iter.iteration_loop_id = Some(loop_id.0.clone());
+        // Borrow the session's most recently active sidebar so browser_*
+        // tools issued from inside this iteration can actually reach a
+        // content script for execution. Without this, the daemon's writer
+        // lookup at `server.rs::browser request handler` warns "No writer
+        // for proxy" and drops the request (the iteration has proxy_id="").
+        if let Some(tracker) = services_for_iter.session_proxy_tracker.as_ref() {
+            if let Some(entry) = tracker.latest(&session_id) {
+                tracing::info!(
+                    loop_id = %loop_id.as_ref(),
+                    session_id = %session_id,
+                    borrowed_proxy = %entry.proxy_id,
+                    "loop iteration borrowed sidebar proxy"
+                );
+                services_for_iter.proxy_id = entry.proxy_id;
+                services_for_iter.client_identity = entry.client_identity;
+            } else {
+                tracing::warn!(
+                    loop_id = %loop_id.as_ref(),
+                    session_id = %session_id,
+                    "loop iteration could not borrow a sidebar proxy — browser_* tools will fail"
+                );
+            }
+        }
+        // Back-fill loop_manager handle: the LoopManager's stored services
+        // snapshot has `loop_manager: None` (chicken-and-egg at construction
+        // time), but the iteration's LLM may call loop.scratchpad.set / .get
+        // via the MCP tool surface, which dispatches through `mcp_tool_executor`
+        // and needs `services.loop_manager`. Resolve via the process-global
+        // OnceLock set by server.rs at daemon startup.
+        if services_for_iter.loop_manager.is_none() {
+            if let Some(mgr) = crate::loops::CURRENT_LOOP_MANAGER.get() {
+                services_for_iter.loop_manager = Some(mgr.clone());
+            }
+        }
         // Reset interrupt flag so a stray prior cancel doesn't poison
         // this iteration. Note: the loop's own cancel_token is checked
         // by `manager.rs::cancel_loop_inner`, not here.
@@ -254,9 +280,20 @@ impl IterationExecutor {
             .with_session_id(session_id.clone());
 
         let agent = nevoflux_builtin_wasm::Agent::new(host);
+        // Build the iteration's tool allowlist from the mode's canonical
+        // tool catalog, then strip iteration-forbidden tools (ask_user,
+        // loop.create). Passing as `ToolsConfig::Allow(...)` ensures the
+        // filter is enforced even if `Agent::run`'s mode-default would
+        // otherwise have included them.
+        let allowlist: Vec<String> = agent
+            .get_tools_for_mode(iter_mode)
+            .into_iter()
+            .map(|t| t.name)
+            .filter(|n| !is_forbidden_in_iteration(n))
+            .collect();
         let input = nevoflux_builtin_wasm::AgentInput {
             session_id: session_id.clone(),
-            mode: nevoflux_builtin_wasm::AgentMode::Chat,
+            mode: iter_mode,
             user_message,
             history: vec![],
             attachments: vec![],
@@ -382,73 +419,6 @@ impl IterationExecutor {
     }
 }
 
-/// Static catalog of tool names known to be in the chat-mode tool set.
-/// Used to translate the loop's `allowed_tool_classes` into an explicit
-/// `AgentInput.tools_config = Allow(...)` allowlist.
-///
-/// Keep in sync with:
-/// - `nevoflux_builtin_wasm::Agent::get_chat_tools()` (the actual
-///   tool definitions the LLM sees), and
-/// - `crate::loops::tool_classes::class_for()` (the class assignment).
-///
-/// Anything that ends up classified as `Write` but isn't in this list
-/// will silently never be exposed to a loop iteration. That's the
-/// fail-closed behavior we want.
-fn known_chat_tool_catalog() -> Vec<String> {
-    [
-        // read class
-        "read",
-        "list_files",
-        "fetch_page",
-        "dom_query",
-        "screenshot",
-        "loop.scratchpad.get",
-        "memory_search",
-        "web_fetch",
-        "web_search",
-        "browser_query",
-        "browser_inspect",
-        // scratchpad-write
-        "loop.scratchpad.set",
-        // event-subscribe
-        "events.subscribe",
-        // dom-click
-        "browser_click",
-        "browser_click_by_id",
-        "browser_type",
-        "browser_type_by_id",
-        "browser_fill",
-        "browser_fill_by_id",
-        "browser_key_press",
-        // nav
-        "browser_navigate",
-        "browser_go_back",
-        "browser_go_forward",
-        "browser_open_tab",
-        "browser_close_tab",
-        // write
-        "write",
-        "edit",
-        "bash",
-        "create_artifact",
-        "browser_edit_artifact",
-        "memory_create",
-        "canvas_create_composition",
-        "canvas_apply_design_md",
-        "canvas_create_from_visual_identity",
-        "canvas_attach_asset",
-        "canvas_render_video",
-        // baseline tools always exposed by Agent::get_chat_tools()
-        "think",
-        "plan",
-        "switch_model",
-        "ask_user",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
 /// Build the §7.2 LOOP-CONTEXT-prefixed user message for an iteration.
 /// Public-in-crate for unit testing and for Phase 9c's AgentInput construction.
 ///
@@ -564,7 +534,7 @@ mod tests {
             trigger_expr: "time:5m".into(),
             prompt_text: Some("check PR".into()),
             wrapped_skill: None,
-            allowed_tool_classes: vec!["read".into()],
+            mode: "chat".into(),
             scratchpad: "k=v".into(),
             state: LoopState::Running,
             consecutive_failures: 0,
@@ -658,46 +628,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn execute_bumps_failure_counter_on_class_parse_error() {
-        let storage = Storage::open_in_memory().unwrap();
-        storage
-            .sessions()
-            .create(CreateSessionParams::new().with_id("s1").with_title("t"))
-            .unwrap();
-        let mut rec = sample_loop("bad");
-        rec.allowed_tool_classes = vec!["bogus-class".into()];
-        rec.consecutive_failures = 1;
-        storage.loops().create(&rec).unwrap();
-
-        let executor = IterationExecutor::new(storage.database().clone());
-        let result = executor.execute(LoopId("bad".into()), "time".into()).await;
-        match result {
-            ExecResult::Error(e) => assert!(e.contains("bogus-class"), "unexpected msg: {e}"),
-            other => panic!("expected Error, got {:?}", other),
-        }
-
-        let after = storage.loops().get("bad").unwrap().unwrap();
-        assert_eq!(
-            after.consecutive_failures, 2,
-            "error iteration must bump consecutive_failures"
-        );
-
-        // The iteration row was inserted with status=running, then
-        // updated to error via finish_iteration. Spot-check via direct
-        // SQL since LoopRepository doesn't expose a list-iterations API.
-        let (status, err_msg): (String, Option<String>) = storage
-            .database()
-            .with_connection(|conn| {
-                let row = conn.query_row(
-                    "SELECT status, error_message FROM loop_iterations WHERE loop_id = ?1",
-                    rusqlite::params!["bad"],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
-                )?;
-                Ok(row)
-            })
-            .unwrap();
-        assert_eq!(status, "error");
-        assert!(err_msg.unwrap_or_default().contains("bogus-class"));
-    }
 }

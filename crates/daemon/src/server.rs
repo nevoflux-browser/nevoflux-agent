@@ -1164,6 +1164,11 @@ pub async fn start_server(
     // We also stash `agent_config` + the runtime Handle on services so
     // `IterationExecutor` can build a `DaemonHostFunctions` without
     // depending on the chat-session boot path (server.rs::handle_chat_send).
+    // Shared session→proxy tracker so /loop iterations (which have no
+    // inbound proxy of their own) can borrow the session's active sidebar
+    // to fulfill browser_* tool calls.
+    let session_proxy_tracker = Arc::new(crate::registry::SessionProxyTracker::new());
+
     let mut services = HostServices::with_skills(Arc::new(db.clone()), shared_skills)
         .with_browser_sender(browser_tx)
         .with_mcp_manager(mcp_manager)
@@ -1174,7 +1179,8 @@ pub async fn start_server(
         .with_canvas_video_service(canvas_video_service.clone())
         .with_tts_config(agent_config.read().unwrap().tts.clone())
         .with_agent_config(agent_config.read().unwrap().clone())
-        .with_runtime_handle(tokio::runtime::Handle::current());
+        .with_runtime_handle(tokio::runtime::Handle::current())
+        .with_session_proxy_tracker(session_proxy_tracker.clone());
 
     // Construct the /loop skill's LoopManager and inject into HostServices
     // so the loop.* tool dispatcher (mcp_tool_executor + future direct-API
@@ -1186,6 +1192,9 @@ pub async fn start_server(
         Some(event_bus.clone()),
         Some(services.clone()),
     ));
+    // Publish process-global handle so IterationExecutor can back-fill
+    // services.loop_manager when claude-code (ACP) calls loop.* via MCP.
+    let _ = crate::loops::CURRENT_LOOP_MANAGER.set(loop_manager.clone());
     services = services.with_loop_manager(loop_manager.clone());
     if let Some(retriever) = knowledge_retriever {
         services = services.with_knowledge_retriever(retriever);
@@ -1859,14 +1868,14 @@ pub async fn start_server(
                         .get("wrapped_skill")
                         .filter(|v| !v.is_null())
                         .map(|v| v.to_string());
-                    let allowed_tool_classes = args
-                        .get("allowed_tool_classes")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|x| x.as_str().map(String::from))
-                                .collect::<Vec<String>>()
-                        });
+                    // Mode comes from the SkillCommandPayload's top-level
+                    // `mode` field, populated by the sidebar from the current
+                    // session's chat mode (chat/browser/agent).
+                    let mode = payload
+                        .and_then(|p| p.get("mode"))
+                        .and_then(|v| v.as_str())
+                        .map(parse_agent_mode)
+                        .unwrap_or(AgentMode::Chat);
 
                     if let Some(mgr) = process_services.loop_manager.as_ref() {
                         match mgr
@@ -1875,7 +1884,7 @@ pub async fn start_server(
                                 trigger_expr_text: trigger_expr,
                                 prompt_text,
                                 wrapped_skill,
-                                allowed_tool_classes,
+                                mode,
                             })
                             .await
                         {
@@ -3644,6 +3653,12 @@ async fn handle_event_bus_request(
             let publisher = PublisherIdentity::Extension {
                 proxy_id: proxy_id.to_string(),
             };
+            tracing::info!(
+                topic = %opts.topic,
+                proxy = %proxy_id,
+                delivery = ?opts.delivery,
+                "EventBus publish received"
+            );
             let event = match opts.delivery {
                 DeliveryMode::Ephemeral => {
                     BusEvent::ephemeral(opts.topic.clone(), opts.payload, publisher)
@@ -3998,6 +4013,13 @@ async fn handle_chat_message_streaming(
         .and_then(|s| s.as_str())
         .unwrap_or("default")
         .to_string();
+
+    // Record session→proxy mapping so /loop iterations spawned in this
+    // session can borrow this sidebar's proxy_id/client_identity for
+    // browser_* tool calls.
+    if let Some(tracker) = services.session_proxy_tracker.as_ref() {
+        tracker.note(&session_id, &proxy_id, &identity);
+    }
 
     // Extract mode if provided (default to Chat)
     let mode = payload

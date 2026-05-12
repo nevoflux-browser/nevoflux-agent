@@ -3007,11 +3007,35 @@ async fn stream_acp_completion(
                 nevoflux_llm::providers::acp::mcp_bridge::PermissionRequest,
             >(4);
             tool_bridge.set_permission_handler(perm_tx);
+            let is_iteration = services.is_iteration;
             if let Some(browser_ctx) = services.browser_context() {
                 tokio::spawn(crate::wasm::mcp_tool_executor::run_permission_handler(
                     perm_rx,
                     browser_ctx,
+                    is_iteration,
                 ));
+            } else if is_iteration {
+                // Iteration without browser_ctx: still spawn the handler so
+                // it can auto-approve. Without a handler, the bridge would
+                // hang on every permission request. The dummy sender is
+                // never read because is_iteration=true short-circuits before
+                // any browser_ask_user call.
+                if let Some(browser_sender) = services.browser_sender.clone() {
+                    let dummy_ctx = crate::wasm::services::BrowserContext {
+                        sender: browser_sender,
+                        client_identity: Vec::new(),
+                        proxy_id: String::new(),
+                        asset_server: services.asset_server.clone(),
+                    };
+                    tokio::spawn(crate::wasm::mcp_tool_executor::run_permission_handler(
+                        perm_rx,
+                        dummy_ctx,
+                        true,
+                    ));
+                }
+                // If browser_sender is None too, the bridge won't work in
+                // any mode — that's a daemon-startup misconfig, not our
+                // problem to handle here.
             }
         } else {
             tracing::warn!(

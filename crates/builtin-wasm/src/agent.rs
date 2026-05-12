@@ -742,8 +742,10 @@ The following skill instructions MUST be followed exactly. These instructions ta
         self.run_loop(input, &system_prompt, &tools)
     }
 
-    /// Get tools for a specific mode.
-    fn get_tools_for_mode(&self, mode: AgentMode) -> Vec<ToolDefinition> {
+    /// Get tools for a specific mode. Public so daemon-side callers (e.g.
+    /// the /loop iteration executor) can enumerate the canonical tool list
+    /// for a given mode without going through `Agent::run`.
+    pub fn get_tools_for_mode(&self, mode: AgentMode) -> Vec<ToolDefinition> {
         match mode {
             AgentMode::Chat => self.get_chat_tools(),
             AgentMode::Browser => self.get_browser_tools(),
@@ -3511,16 +3513,17 @@ The following skill instructions MUST be followed exactly. These instructions ta
             // arm requires extending `HostFunctions` and is deferred.
             ToolDefinition {
                 name: "loop.create".into(),
-                description: "Create a recurring task that re-runs a prompt or wrapped skill on a trigger. Trigger grammar: time:<5m|1h|...>, time:dynamic, event:<topic>, state:tab=current|<id>:<css>:change, with AND/OR up to depth 3. Default tool classes are read+scratchpad-write+event-subscribe; opt in to dom-click/nav/write/net-post explicitly.".into(),
+                description: "Create a recurring task that re-runs a prompt or wrapped skill on a trigger. Trigger grammar: time:<5m|1h|...>, time:dynamic, event:<topic>, state:tab=current|<id>:<css>:change, with AND/OR up to depth 3. The `mode` arg picks the iteration's tool catalog: 'chat' (default, safe — reasoning + scratchpad), 'browser' (chat + browser interaction), 'agent' (browser + write/edit/bash).".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "trigger_expr": { "type": "string", "description": "trigger expression, e.g. 'time:5m' or 'event:ui:tab:click'" },
                         "prompt_text": { "type": "string", "description": "raw prompt re-issued each fire — XOR with wrapped_skill" },
                         "wrapped_skill": { "type": "object", "description": "{name, args} — XOR with prompt_text" },
-                        "allowed_tool_classes": {
-                            "type": "array",
-                            "items": { "type": "string", "enum": ["read","scratchpad-write","event-subscribe","dom-click","nav","write","net-post"] }
+                        "mode": {
+                            "type": "string",
+                            "enum": ["chat", "browser", "agent"],
+                            "description": "Agent mode for iterations. Default 'chat'."
                         }
                     },
                     "required": ["trigger_expr"]

@@ -47,7 +47,9 @@ pub struct LoopRecord {
     pub trigger_expr: String,
     pub prompt_text: Option<String>,
     pub wrapped_skill: Option<String>,
-    pub allowed_tool_classes: Vec<String>,
+    /// Agent mode (one of "chat" | "browser" | "agent"). Drives the
+    /// iteration's tool catalog via `builtin-wasm::Agent::get_tools_for_mode`.
+    pub mode: String,
     pub scratchpad: String,
     pub state: LoopState,
     pub consecutive_failures: i64,

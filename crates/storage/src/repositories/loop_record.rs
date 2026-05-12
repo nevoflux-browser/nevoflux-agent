@@ -16,12 +16,11 @@ impl<'a> LoopRepository<'a> {
     }
 
     pub fn create(&self, rec: &LoopRecord) -> Result<String> {
-        let classes_json = serde_json::to_string(&rec.allowed_tool_classes)?;
         self.db.with_connection(|conn| {
             conn.execute(
                 "INSERT INTO loops
                     (id, session_id, trigger_expr, prompt_text, wrapped_skill,
-                     allowed_tool_classes, scratchpad, state, consecutive_failures,
+                     mode, scratchpad, state, consecutive_failures,
                      skipped_triggers, iteration_count, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
@@ -30,7 +29,7 @@ impl<'a> LoopRepository<'a> {
                     rec.trigger_expr,
                     rec.prompt_text,
                     rec.wrapped_skill,
-                    classes_json,
+                    rec.mode,
                     rec.scratchpad,
                     rec.state.as_str(),
                     rec.consecutive_failures,
@@ -48,7 +47,7 @@ impl<'a> LoopRepository<'a> {
         self.db.with_connection(|conn| {
             conn.query_row(
                 "SELECT id, session_id, trigger_expr, prompt_text, wrapped_skill,
-                        allowed_tool_classes, scratchpad, state,
+                        mode, scratchpad, state,
                         consecutive_failures, skipped_triggers, iteration_count,
                         created_at, updated_at
                  FROM loops WHERE id = ?1",
@@ -184,7 +183,7 @@ impl<'a> LoopRepository<'a> {
         self.db.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, session_id, trigger_expr, prompt_text, wrapped_skill,
-                        allowed_tool_classes, scratchpad, state,
+                        mode, scratchpad, state,
                         consecutive_failures, skipped_triggers, iteration_count,
                         created_at, updated_at
                  FROM loops WHERE session_id = ?1 ORDER BY created_at",
@@ -198,7 +197,7 @@ impl<'a> LoopRepository<'a> {
         self.db.with_connection(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, session_id, trigger_expr, prompt_text, wrapped_skill,
-                        allowed_tool_classes, scratchpad, state,
+                        mode, scratchpad, state,
                         consecutive_failures, skipped_triggers, iteration_count,
                         created_at, updated_at
                  FROM loops WHERE state IN ('pending', 'running') ORDER BY created_at",
@@ -215,7 +214,7 @@ fn row_to_loop(row: &Row<'_>) -> rusqlite::Result<Result<LoopRecord>> {
     let trigger_expr: String = row.get(2)?;
     let prompt_text: Option<String> = row.get(3)?;
     let wrapped_skill: Option<String> = row.get(4)?;
-    let classes_json: String = row.get(5)?;
+    let mode: String = row.get(5)?;
     let scratchpad: String = row.get(6)?;
     let state_str: String = row.get(7)?;
     let consecutive_failures: i64 = row.get(8)?;
@@ -225,7 +224,6 @@ fn row_to_loop(row: &Row<'_>) -> rusqlite::Result<Result<LoopRecord>> {
     let updated_at: i64 = row.get(12)?;
 
     Ok((|| -> Result<LoopRecord> {
-        let allowed_tool_classes: Vec<String> = serde_json::from_str(&classes_json)?;
         let state = LoopState::from_db_str(&state_str).ok_or_else(|| {
             StorageError::Migration(format!("unknown loop state in row: {state_str}"))
         })?;
@@ -235,7 +233,7 @@ fn row_to_loop(row: &Row<'_>) -> rusqlite::Result<Result<LoopRecord>> {
             trigger_expr,
             prompt_text,
             wrapped_skill,
-            allowed_tool_classes,
+            mode,
             scratchpad,
             state,
             consecutive_failures,
@@ -268,7 +266,7 @@ mod tests {
             trigger_expr: "time:5m".into(),
             prompt_text: Some("p".into()),
             wrapped_skill: None,
-            allowed_tool_classes: vec!["read".into()],
+            mode: "chat".into(),
             scratchpad: String::new(),
             state: LoopState::Pending,
             consecutive_failures: 0,
@@ -289,7 +287,7 @@ mod tests {
         let row = repo.get("abcd1234").unwrap().unwrap();
         assert_eq!(row.trigger_expr, "time:5m");
         assert_eq!(row.state, LoopState::Pending);
-        assert_eq!(row.allowed_tool_classes, vec!["read".to_string()]);
+        assert_eq!(row.mode, "chat");
     }
 
     #[test]

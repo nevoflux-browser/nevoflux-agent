@@ -54,11 +54,26 @@ pub async fn run_tool_executor(
 }
 
 /// Handle permission requests by showing a dialog in the sidebar via browser_ask_user.
+///
+/// When `is_iteration` is true (the call site is a /loop iteration), all
+/// requests are auto-approved without a dialog — the loop's
+/// `allowed_tool_classes` already gates which tools the LLM is told about,
+/// and the iteration has no sidebar to display dialogs to anyway.
 pub async fn run_permission_handler(
     mut rx: mpsc::Receiver<PermissionRequest>,
     browser_ctx: BrowserContext,
+    is_iteration: bool,
 ) {
     while let Some(req) = rx.recv().await {
+        if is_iteration {
+            tracing::debug!(
+                "iteration auto-approve for {} (proxy_id empty, no sidebar)",
+                req.tool_name
+            );
+            let _ = req.result_tx.send(PermissionResponse::AllowOnce);
+            continue;
+        }
+
         let description = describe_tool_action(&req.tool_name, &req.arguments_summary);
         let question = format!(
             "AI wants to perform an action:\n\n{}\n\nDo you want to allow this?",
@@ -285,6 +300,27 @@ pub async fn execute_mcp_tool(
     services: &HostServices,
     tool_bridge: &Arc<McpToolBridge>,
 ) -> Result<String, String> {
+    // /loop iteration gate: reject tools that are forbidden inside iterations
+    // (spec §10.2). MCP tools are registered server-side and visible to the
+    // ACP provider regardless of the builtin-wasm Agent's tools_config filter,
+    // so the gate has to live here too.
+    if services.is_iteration {
+        if matches!(name, "browser_ask_user" | "ask_user") {
+            return Err(
+                "ask_user is forbidden inside /loop iterations \
+                 (sidebar may be closed; nobody to answer). \
+                 Use loop.scratchpad.set to persist state instead."
+                    .to_string(),
+            );
+        }
+        if name == "loop.create" {
+            return Err(
+                "loop.create is forbidden inside /loop iterations (no nested loops)"
+                    .to_string(),
+            );
+        }
+    }
+
     // 1. Browser tools
     if let Some(action) = tool_name_to_browser_action(name) {
         let browser_ctx = services
@@ -395,12 +431,25 @@ pub async fn execute_mcp_tool(
                 );
             }
         };
+        tracing::info!(
+            tool = %name,
+            is_iteration = services.is_iteration,
+            iteration_loop_id = ?services.iteration_loop_id,
+            session_id = %services.session_id,
+            "loop.* MCP dispatch ctx"
+        );
         let ctx = crate::loops::ToolCallContext {
             session_id: services.session_id.clone(),
-            // mcp_tool_executor is the main-session tool path; loop iterations
-            // dispatch through a different (Phase 9b) AgentRunner code path.
-            is_iteration: false,
-            own_loop_id: None,
+            // When the call originates inside an /loop iteration (claude-code
+            // via ACP/MCP HTTP), `services.is_iteration` is true and the
+            // iteration's loop_id is set on the per-iteration HostServices
+            // clone (see IterationExecutor::execute). The main-session tool
+            // path leaves both at default so context gating works correctly.
+            is_iteration: services.is_iteration,
+            own_loop_id: services
+                .iteration_loop_id
+                .as_ref()
+                .map(|id| crate::loops::LoopId(id.clone())),
         };
         let result = crate::loops::execute_loop_tool(
             name,

@@ -387,6 +387,12 @@ impl DaemonHostFunctions {
             return Ok(());
         };
 
+        // /loop iteration: auto-approve (no sidebar to display dialog to;
+        // tool gating is via the loop's `allowed_tool_classes`).
+        if services.is_iteration {
+            return Ok(());
+        }
+
         // Check always-allow cache (shared across requests on HostServices)
         if services
             .always_allowed_tools

@@ -39,7 +39,7 @@ pub async fn execute_loop_tool(
         "loop.list" => loop_list(args, ctx, db),
         "loop.cancel" => loop_cancel(args, ctx, mgr).await,
         "loop.scratchpad.get" => scratchpad_get(args, ctx, db),
-        "loop.scratchpad.set" => scratchpad_set(args, ctx, db),
+        "loop.scratchpad.set" => scratchpad_set(args, ctx, mgr, db).await,
         _ => Err(format!("unknown loop tool: {name}")),
     }
 }
@@ -62,14 +62,13 @@ async fn loop_create(
         .and_then(|v| v.as_str())
         .map(String::from);
     let wrapped_skill = args.get("wrapped_skill").map(|v| v.to_string());
-    let allowed_tool_classes = args
-        .get("allowed_tool_classes")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect::<Vec<String>>()
-        });
+    // Optional `mode` arg: one of "chat" | "browser" | "agent". Defaults to
+    // Chat (matches `server.rs::parse_agent_mode` semantics).
+    let mode = args
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .map(crate::loops::manager::db_str_to_agent_mode)
+        .unwrap_or(nevoflux_builtin_wasm::AgentMode::Chat);
 
     let id = mgr
         .create_loop(CreateLoopArgs {
@@ -77,7 +76,7 @@ async fn loop_create(
             trigger_expr_text,
             prompt_text,
             wrapped_skill,
-            allowed_tool_classes,
+            mode,
         })
         .await?;
     Ok(json!({ "loop_id": id.0 }))
@@ -136,7 +135,12 @@ fn scratchpad_get(args: &Value, ctx: &ToolCallContext, db: &Database) -> Result<
     Ok(json!({ "content": rec.scratchpad, "bytes": rec.scratchpad.len() }))
 }
 
-fn scratchpad_set(args: &Value, ctx: &ToolCallContext, db: &Database) -> Result<Value, String> {
+async fn scratchpad_set(
+    args: &Value,
+    ctx: &ToolCallContext,
+    mgr: &LoopManager,
+    db: &Database,
+) -> Result<Value, String> {
     if !ctx.is_iteration {
         return Err("loop.scratchpad.set is only callable from inside an iteration".into());
     }
@@ -157,6 +161,9 @@ fn scratchpad_set(args: &Value, ctx: &ToolCallContext, db: &Database) -> Result<
     LoopRepository::new(db)
         .update_scratchpad(&own.0, content, current_timestamp())
         .map_err(|e| e.to_string())?;
+    mgr.events()
+        .scratchpad_changed(&ctx.session_id, own, content)
+        .await;
     Ok(json!({ "bytes_written": content.len() }))
 }
 

@@ -9,7 +9,7 @@ use crate::loops::executor::IterationExecutor;
 use crate::loops::expression::TriggerExpr;
 use crate::loops::registry::LoopRegistry;
 use crate::loops::scheduler::{LoopFireRequest, TriggerScheduler};
-use crate::loops::tool_classes::{default_classes, parse_class_list, ToolClass};
+use nevoflux_builtin_wasm::AgentMode;
 use crate::loops::types::{LoopId, LoopRuntime};
 use nevoflux_storage::connection::Database;
 use nevoflux_storage::models::{current_timestamp, LoopRecord, LoopState};
@@ -17,13 +17,38 @@ use nevoflux_storage::repositories::LoopRepository;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Canonical wire/DB form of an `AgentMode`. Mirrors `serde(rename_all="snake_case")`
+/// from `builtin-wasm/types.rs` but as a `&'static str` for SQL bind/CHECK.
+pub fn agent_mode_to_db_str(mode: AgentMode) -> &'static str {
+    match mode {
+        AgentMode::Chat => "chat",
+        AgentMode::Browser => "browser",
+        AgentMode::Agent => "agent",
+        #[allow(deprecated)]
+        AgentMode::Code => "agent",
+    }
+}
+
+/// Parse a DB/wire string into an `AgentMode`. Unknown strings default to `Chat`
+/// (matches `server::parse_agent_mode` behavior for forward compatibility).
+pub fn db_str_to_agent_mode(s: &str) -> AgentMode {
+    match s {
+        "browser" => AgentMode::Browser,
+        "agent" => AgentMode::Agent,
+        _ => AgentMode::Chat,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CreateLoopArgs {
     pub session_id: String,
     pub trigger_expr_text: String,
     pub prompt_text: Option<String>,
     pub wrapped_skill: Option<String>, // JSON {name, args}
-    pub allowed_tool_classes: Option<Vec<String>>,
+    /// Agent mode for iterations (chat | browser | agent). Drives the
+    /// iteration's tool catalog via `builtin-wasm::Agent::get_tools_for_mode`.
+    /// Inherited from `SkillCommandPayload.mode` at /loop creation time.
+    pub mode: nevoflux_builtin_wasm::AgentMode,
 }
 
 #[derive(Clone)]
@@ -78,7 +103,44 @@ impl LoopManager {
         let scheduler_for_task = scheduler.clone();
         let fire_tx_for_task = fire_tx.clone();
         tokio::spawn(async move {
-            while let Some(req) = fire_rx.recv().await {
+            while let Some(initial_req) = fire_rx.recv().await {
+                // SKILL.md §8.2 "drop if currently running": the dispatcher is
+                // single-tasked, so events arriving during execute().await pile
+                // up in fire_rx. Without coalescing, each queued event would
+                // spawn its own back-to-back iteration. Drain same-loop fires
+                // to last-wins; re-enqueue fires for other loops so they get
+                // their own pass.
+                let mut req = initial_req;
+                let mut dropped_for_current: u32 = 0;
+                while let Ok(queued) = fire_rx.try_recv() {
+                    if queued.loop_id == req.loop_id {
+                        dropped_for_current += 1;
+                        req = queued;
+                    } else {
+                        let _ = fire_tx_for_task.try_send(queued);
+                    }
+                }
+                if dropped_for_current > 0 {
+                    let now = current_timestamp();
+                    let db = executor_for_task.database();
+                    let repo = LoopRepository::new(&db);
+                    for _ in 0..dropped_for_current {
+                        let _ = repo.increment_skipped(req.loop_id.as_ref(), now);
+                    }
+                    let session_id = registry_for_task
+                        .with_mut(&req.loop_id, |rt| rt.session_id.clone())
+                        .unwrap_or_default();
+                    let count = repo
+                        .get(req.loop_id.as_ref())
+                        .ok()
+                        .flatten()
+                        .map(|r| r.skipped_triggers)
+                        .unwrap_or(0);
+                    events_for_task
+                        .trigger_dropped(&session_id, &req.loop_id, count)
+                        .await;
+                }
+
                 // §8.2: drop if currently running.
                 let busy = registry_for_task
                     .with_mut(&req.loop_id, |rt| rt.current_iteration.is_some())
@@ -224,6 +286,10 @@ impl LoopManager {
         }
     }
 
+    pub fn events(&self) -> &LoopEvents {
+        &self.events
+    }
+
     pub fn registry(&self) -> &LoopRegistry {
         &self.registry
     }
@@ -235,12 +301,6 @@ impl LoopManager {
         }
         let expr = TriggerExpr::parse(&args.trigger_expr_text).map_err(|e| e.to_string())?;
 
-        let classes: Vec<ToolClass> = match args.allowed_tool_classes.as_ref() {
-            Some(list) => parse_class_list(list)?.into_iter().collect(),
-            None => default_classes(),
-        };
-        let classes_str: Vec<String> = classes.iter().map(|c| c.as_str().to_string()).collect();
-
         let id = LoopId::generate();
         let now = current_timestamp();
         let rec = LoopRecord {
@@ -249,7 +309,7 @@ impl LoopManager {
             trigger_expr: args.trigger_expr_text.clone(),
             prompt_text: args.prompt_text,
             wrapped_skill: args.wrapped_skill,
-            allowed_tool_classes: classes_str,
+            mode: agent_mode_to_db_str(args.mode).to_string(),
             scratchpad: String::new(),
             state: LoopState::Pending,
             consecutive_failures: 0,
@@ -416,7 +476,17 @@ impl LoopManager {
                     .with_mut(id, |rt| rt.subscription_ids.push(sub));
             }
             TriggerExpr::TimeDynamic => {
-                tracing::warn!("time:dynamic not yet wired (Phase 12)");
+                // Initial fire at T+5m. Subsequent fires use `next_delay_seconds`
+                // emitted by the LLM in a `loop-meta` JSON block; the dispatcher
+                // re-schedules via `crate::loops::dynamic::extract_next_delay`
+                // after each iteration succeeds (see start_with_bus loop body).
+                let sub = self.scheduler.schedule_time(
+                    id.clone(),
+                    std::time::Duration::from_secs(300),
+                    sink,
+                );
+                self.registry
+                    .with_mut(id, |rt| rt.subscription_ids.push(sub));
             }
             TriggerExpr::Event(topic) => {
                 let Some(bus) = self.event_bus.clone() else {
@@ -555,7 +625,7 @@ mod tests {
                 trigger_expr_text: "time:5m".into(),
                 prompt_text: Some("check".into()),
                 wrapped_skill: None,
-                allowed_tool_classes: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
             })
             .await
             .unwrap();
@@ -563,14 +633,8 @@ mod tests {
         let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
         assert_eq!(rec.state, LoopState::Pending);
         assert_eq!(rec.trigger_expr, "time:5m");
-        // default classes applied
-        assert!(rec.allowed_tool_classes.contains(&"read".to_string()));
-        assert!(rec
-            .allowed_tool_classes
-            .contains(&"scratchpad-write".to_string()));
-        assert!(rec
-            .allowed_tool_classes
-            .contains(&"event-subscribe".to_string()));
+        // mode persisted (default chat)
+        assert_eq!(rec.mode, "chat");
     }
 
     #[tokio::test(start_paused = true)]
@@ -583,7 +647,7 @@ mod tests {
                 trigger_expr_text: "garbage".into(),
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
-                allowed_tool_classes: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
             })
             .await
             .unwrap_err();
@@ -601,7 +665,7 @@ mod tests {
                 trigger_expr_text: "time:5m".into(),
                 prompt_text: None,
                 wrapped_skill: None,
-                allowed_tool_classes: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
             })
             .await
             .unwrap_err();
@@ -613,7 +677,7 @@ mod tests {
                 trigger_expr_text: "time:5m".into(),
                 prompt_text: Some("p".into()),
                 wrapped_skill: Some("{}".into()),
-                allowed_tool_classes: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
             })
             .await
             .unwrap_err();
@@ -631,7 +695,7 @@ mod tests {
                 trigger_expr_text: "time:1m".into(),
                 prompt_text: Some("check".into()),
                 wrapped_skill: None,
-                allowed_tool_classes: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
             })
             .await
             .unwrap();
@@ -666,7 +730,7 @@ mod tests {
                 trigger_expr_text: "time:1m".into(),
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
-                allowed_tool_classes: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
             })
             .await
             .unwrap();
@@ -699,7 +763,7 @@ mod tests {
                 trigger_expr_text: "time:5m".into(),
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
-                allowed_tool_classes: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
             })
             .await
             .unwrap();
@@ -709,7 +773,7 @@ mod tests {
                 trigger_expr_text: "time:10m".into(),
                 prompt_text: Some("q".into()),
                 wrapped_skill: None,
-                allowed_tool_classes: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
             })
             .await
             .unwrap();
@@ -733,7 +797,7 @@ mod tests {
             trigger_expr_text: "event:ui:test:click".into(),
             prompt_text: Some("p".into()),
             wrapped_skill: None,
-            allowed_tool_classes: None,
+            mode: nevoflux_builtin_wasm::AgentMode::Chat,
         }).await.unwrap();
 
         bus.publish(BusEvent::ephemeral(
@@ -766,7 +830,7 @@ mod tests {
                 trigger_expr_text: "OR(event:a:test,event:b:test)".into(),
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
-                allowed_tool_classes: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
             })
             .await
             .unwrap();
@@ -810,7 +874,7 @@ mod tests {
                 trigger_expr_text: "time:1m".into(),
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
-                allowed_tool_classes: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
             })
             .await
             .unwrap();
@@ -855,7 +919,7 @@ mod tests {
                 trigger_expr_text: "AND(event:and:a,event:and:b)".into(),
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
-                allowed_tool_classes: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
             })
             .await
             .unwrap();
@@ -914,7 +978,7 @@ mod tests {
                 trigger_expr_text: "state:tab=current:.chat-list:change".into(),
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
-                allowed_tool_classes: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
             })
             .await
             .unwrap();
