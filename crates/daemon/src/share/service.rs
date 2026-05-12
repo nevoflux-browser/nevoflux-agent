@@ -280,18 +280,32 @@ impl CanvasShareService {
         let content_type_db = bundle.artifact_type.clone();
         let share_id_db = share_id.to_string();
 
+        // Migration 015 invariant: every row must have a non-empty `files`
+        // map and an `entry` pointing into it. The share bundle ships the
+        // renderable payload as a single string (assets already inlined on
+        // the export side), so synthesize a one-key map. Without this the
+        // columns default to '{}' / 'main.html', and Canvas's
+        // `_renderProject` short-circuits to "No files in project".
+        let entry_name = "main.html".to_string();
+        let mut files_map = std::collections::HashMap::new();
+        files_map.insert(entry_name.clone(), content_str.clone());
+        let files_json = serde_json::to_string(&files_map)
+            .unwrap_or_else(|_| "{}".to_string());
+
         self.storage.database().with_connection(|conn| {
             let session_id_db =
                 resolve_import_session_id(conn, &session_id_db_source, now)?;
             conn.execute(
-                "INSERT INTO artifacts (id, session_id, title, content_type, content, imported_from_url, imported_from_share_id, imported_at, is_persistent, persisted_at, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT INTO artifacts (id, session_id, title, content_type, content, files, entry, imported_from_url, imported_from_share_id, imported_at, is_persistent, persisted_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 rusqlite::params![
                     artifact_id_db,
                     session_id_db,
                     title_db,
                     content_type_db,
                     content_str,
+                    files_json,
+                    entry_name,
                     share_url,
                     share_id_db,
                     now,
