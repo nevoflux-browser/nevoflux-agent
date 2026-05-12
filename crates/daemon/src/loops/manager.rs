@@ -169,6 +169,39 @@ impl LoopManager {
                     rt.current_iteration = Some(token.clone());
                 });
 
+                // Emit pending|idle -> running so the sidebar's sticky card
+                // status badge tracks reality. Without this, the badge stays
+                // at the initial "pending" set by create_loop forever, even
+                // while iterations are firing.
+                let prev_state_for_run: String = {
+                    let db = executor_for_task.database();
+                    let repo = LoopRepository::new(&db);
+                    let prev = repo
+                        .get(req.loop_id.as_ref())
+                        .ok()
+                        .flatten()
+                        .map(|r| r.state.as_str().to_string())
+                        .unwrap_or_else(|| "pending".to_string());
+                    let _ = repo.update_state(
+                        req.loop_id.as_ref(),
+                        LoopState::Running,
+                        current_timestamp(),
+                    );
+                    prev
+                };
+                let session_id_for_state = registry_for_task
+                    .with_mut(&req.loop_id, |rt| rt.session_id.clone())
+                    .unwrap_or_default();
+                events_for_task
+                    .state_changed(
+                        &session_id_for_state,
+                        &req.loop_id,
+                        "running",
+                        &prev_state_for_run,
+                        None,
+                    )
+                    .await;
+
                 let exec_result = executor_for_task
                     .execute(req.loop_id.clone(), req.fire_reason)
                     .await;
@@ -233,6 +266,27 @@ impl LoopManager {
                 registry_for_task.with_mut(&req.loop_id, |rt| {
                     rt.current_iteration = None;
                 });
+
+                // Emit running -> idle so the sidebar's sticky card status
+                // badge falls back to "idle" between fires.
+                {
+                    let db = executor_for_task.database();
+                    let repo = LoopRepository::new(&db);
+                    let _ = repo.update_state(
+                        req.loop_id.as_ref(),
+                        LoopState::Idle,
+                        current_timestamp(),
+                    );
+                }
+                events_for_task
+                    .state_changed(
+                        &session_id_for_state,
+                        &req.loop_id,
+                        "idle",
+                        "running",
+                        None,
+                    )
+                    .await;
 
                 // time:dynamic protocol (spec §5.2): if the loop's trigger is
                 // time:dynamic and this iteration succeeded with text, parse the

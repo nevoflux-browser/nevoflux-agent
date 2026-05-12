@@ -384,7 +384,15 @@ impl IterationExecutor {
             Some(&serde_json::to_string(&trace_summary).unwrap_or_default()),
         );
         self.events
-            .iteration_end(session_id, loop_id, seq, end_now, "ok", trace_summary)
+            .iteration_end(
+                session_id,
+                loop_id,
+                seq,
+                end_now,
+                "ok",
+                trace_summary,
+                final_text.as_deref(),
+            )
             .await;
         ExecResult::OkWithText(final_text)
     }
@@ -413,6 +421,7 @@ impl IterationExecutor {
                 end_now,
                 "error",
                 serde_json::json!([]),
+                None,
             )
             .await;
         ExecResult::Error(err)

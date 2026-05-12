@@ -116,10 +116,22 @@ impl LoopEvents {
         ended_at: i64,
         status: &str,
         tool_calls_summary: serde_json::Value,
+        final_text: Option<&str>,
     ) {
         let Some(bus) = &self.bus else {
             return;
         };
+        // Cap final_text at 4KB to avoid bloating event payloads when an
+        // iteration produces a long response. Sidebar rendering is for
+        // quick inspection, not full transcripts — anything longer can
+        // be moved to scratchpad explicitly.
+        let final_text_capped: Option<String> = final_text.map(|s| {
+            if s.len() > 4096 {
+                s.chars().take(4096).collect()
+            } else {
+                s.to_string()
+            }
+        });
         let _ = bus
             .publish(BusEvent::ephemeral(
                 "system:loop:iteration_end",
@@ -130,6 +142,7 @@ impl LoopEvents {
                     "ended_at": ended_at,
                     "status": status,
                     "tool_calls_summary": tool_calls_summary,
+                    "final_text": final_text_capped,
                 }),
                 PublisherIdentity::Internal,
             ))
@@ -205,7 +218,7 @@ mod tests {
         evts.state_changed("s1", &id, "running", "pending", None)
             .await;
         evts.iteration_start("s1", &id, 1, 100, "time").await;
-        evts.iteration_end("s1", &id, 1, 110, "ok", serde_json::json!([]))
+        evts.iteration_end("s1", &id, 1, 110, "ok", serde_json::json!([]), None)
             .await;
         evts.scratchpad_changed("s1", &id, "k=v").await;
         evts.trigger_dropped("s1", &id, 1).await;
