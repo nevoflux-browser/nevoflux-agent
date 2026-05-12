@@ -181,6 +181,24 @@ pub struct HostServices {
     pub session_id: String,
     /// Tools that user has approved "Always Allow" (shared across requests in the same daemon).
     pub always_allowed_tools: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    /// True when this HostServices is the per-iteration clone owned by an
+    /// `IterationExecutor`. The /loop skill's permission handler short-circuits
+    /// dialogs in this mode: the loop's `allowed_tool_classes` is already the
+    /// gating layer, and there is no sidebar to display dialogs to anyway.
+    pub is_iteration: bool,
+    /// When `is_iteration` is true, the loop_id of the running iteration.
+    /// Used by `mcp_tool_executor`'s `loop.*` dispatch to build a correct
+    /// `ToolCallContext` so `loop.scratchpad.set` etc. can target the right
+    /// loop's scratchpad.
+    pub iteration_loop_id: Option<String>,
+    /// Tracks the most-recently-active sidebar proxy per session_id.
+    /// `IterationExecutor` reads this at iteration start to "borrow" a
+    /// connected sidebar's `proxy_id` + `client_identity` so `browser_*`
+    /// tools dispatched from inside an iteration can actually reach a
+    /// sidebar/content-script for execution. Without this, iterations
+    /// have `proxy_id=""` and the daemon's writer lookup fails (see
+    /// `server.rs::No writer for proxy ""`).
+    pub session_proxy_tracker: Option<Arc<crate::registry::SessionProxyTracker>>,
     /// Knowledge retriever for injecting learned context into agent execution.
     ///
     /// When set, enables the agent to retrieve relevant knowledge entries
@@ -221,6 +239,27 @@ pub struct HostServices {
     /// it (e.g. screenshot HTTP fast-path) must fall back to native
     /// messaging. See `crates/daemon/src/asset_server/`.
     pub asset_server: Option<crate::asset_server::AssetServer>,
+
+    /// /loop skill manager. When set, the MCP tool executor dispatches the
+    /// `loop.*` family (create/list/cancel/scratchpad.{get,set}) through
+    /// this manager. `None` means /loop is not configured for this daemon
+    /// instance — tool calls return a clear ConfigMissing error.
+    pub loop_manager: Option<Arc<crate::loops::LoopManager>>,
+
+    /// AgentConfig snapshot for spawning a `DaemonHostFunctions` from
+    /// out-of-band callers (e.g. /loop iterations) that don't sit on the
+    /// chat-session hot path. Set during server boot via
+    /// [`HostServices::with_agent_config`]; `None` in tests / standalone
+    /// daemon-less constructors. The /loop `IterationExecutor` requires
+    /// this to invoke `nevoflux_builtin_wasm::Agent::run`.
+    pub agent_config: Option<Arc<crate::config::AgentConfig>>,
+
+    /// Tokio runtime handle for `DaemonHostFunctions::new(...)`. Out-of-band
+    /// callers (notably the /loop dispatcher) run on the same multi-thread
+    /// runtime as the daemon, but they don't hold a `Handle` directly; we
+    /// stash it here so they can build a host without having to reach into
+    /// `Handle::current()` from a `'static`-spawned task.
+    pub runtime_handle: Option<tokio::runtime::Handle>,
 }
 
 impl HostServices {
@@ -268,6 +307,9 @@ impl HostServices {
             always_allowed_tools: Arc::new(
                 std::sync::RwLock::new(std::collections::HashSet::new()),
             ),
+            is_iteration: false,
+            iteration_loop_id: None,
+            session_proxy_tracker: None,
             knowledge_retriever: None,
             computer_controller: None,
             embedding: Arc::new(std::sync::RwLock::new(None)),
@@ -277,6 +319,9 @@ impl HostServices {
             broadcast_tx: None,
             tts_config: None,
             asset_server: None,
+            loop_manager: None,
+            agent_config: None,
+            runtime_handle: None,
         }
     }
 
@@ -303,6 +348,9 @@ impl HostServices {
             always_allowed_tools: Arc::new(
                 std::sync::RwLock::new(std::collections::HashSet::new()),
             ),
+            is_iteration: false,
+            iteration_loop_id: None,
+            session_proxy_tracker: None,
             knowledge_retriever: None,
             computer_controller: None,
             embedding: Arc::new(std::sync::RwLock::new(None)),
@@ -312,6 +360,9 @@ impl HostServices {
             broadcast_tx: None,
             tts_config: None,
             asset_server: None,
+            loop_manager: None,
+            agent_config: None,
+            runtime_handle: None,
         }
     }
 
@@ -392,6 +443,35 @@ impl HostServices {
     /// Returns self for method chaining.
     pub fn with_mcp_manager(mut self, manager: Arc<McpManager>) -> Self {
         self.mcp_manager = Some(manager);
+        self
+    }
+
+    /// Add the /loop manager to the services.
+    ///
+    /// Once set, `mcp_tool_executor::execute_mcp_tool` dispatches the
+    /// `loop.create / loop.list / loop.cancel / loop.scratchpad.{get,set}`
+    /// family through this manager. Without it, those tool calls return a
+    /// clear ConfigMissing error instead of being silently dropped.
+    pub fn with_loop_manager(mut self, manager: Arc<crate::loops::LoopManager>) -> Self {
+        self.loop_manager = Some(manager);
+        self
+    }
+
+    /// Stash the live `AgentConfig` so out-of-band callers (the /loop
+    /// `IterationExecutor`) can spawn a `DaemonHostFunctions` without
+    /// needing access to the chat-session boot path. Phase 9c.
+    pub fn with_agent_config(mut self, config: Arc<crate::config::AgentConfig>) -> Self {
+        self.agent_config = Some(config);
+        self
+    }
+
+    /// Stash the multi-thread Tokio runtime handle for the same reason as
+    /// [`Self::with_agent_config`]. The host functions invoke
+    /// `runtime.block_on(...)` on synchronous LLM calls, so they need a
+    /// handle into the daemon's main runtime — not a fresh per-iteration
+    /// runtime that would deadlock against the dispatcher.
+    pub fn with_runtime_handle(mut self, h: tokio::runtime::Handle) -> Self {
+        self.runtime_handle = Some(h);
         self
     }
 
@@ -476,6 +556,16 @@ impl HostServices {
     /// Set session ID for session-scoped operations (e.g. artifact creation).
     pub fn with_session_id(mut self, session_id: String) -> Self {
         self.session_id = session_id;
+        self
+    }
+
+    /// Attach the daemon-global session→proxy tracker so `/loop` iterations
+    /// can borrow a connected sidebar's proxy_id to fulfill `browser_*` tools.
+    pub fn with_session_proxy_tracker(
+        mut self,
+        tracker: Arc<crate::registry::SessionProxyTracker>,
+    ) -> Self {
+        self.session_proxy_tracker = Some(tracker);
         self
     }
 
@@ -696,6 +786,14 @@ impl std::fmt::Debug for HostServices {
             .field(
                 "asset_server",
                 &self.asset_server.as_ref().map(|_| "Some(...)"),
+            )
+            .field(
+                "agent_config",
+                &self.agent_config.as_ref().map(|_| "Some(...)"),
+            )
+            .field(
+                "runtime_handle",
+                &self.runtime_handle.as_ref().map(|_| "Some(...)"),
             )
             .finish()
     }

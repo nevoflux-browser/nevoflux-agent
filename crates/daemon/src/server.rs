@@ -1153,7 +1153,23 @@ pub async fn start_server(
             .with_skills(shared_skills.clone()),
     );
 
-    let mut services = HostServices::with_skills(Arc::new(db), shared_skills)
+    // Build HostServices first (without loop_manager), spin up LoopManager
+    // with a `services` clone so its IterationExecutor can spawn a real
+    // production agent (Phase 9c), then snap loop_manager back onto the
+    // canonical services. The two have a chicken-and-egg dependency:
+    // services needs loop_manager for the loop.* MCP dispatch path, and
+    // loop_manager needs services for `Agent::run`. HostServices is `Clone`
+    // and Arc-backed, so the round-trip is cheap.
+    //
+    // We also stash `agent_config` + the runtime Handle on services so
+    // `IterationExecutor` can build a `DaemonHostFunctions` without
+    // depending on the chat-session boot path (server.rs::handle_chat_send).
+    // Shared session→proxy tracker so /loop iterations (which have no
+    // inbound proxy of their own) can borrow the session's active sidebar
+    // to fulfill browser_* tool calls.
+    let session_proxy_tracker = Arc::new(crate::registry::SessionProxyTracker::new());
+
+    let mut services = HostServices::with_skills(Arc::new(db.clone()), shared_skills)
         .with_browser_sender(browser_tx)
         .with_mcp_manager(mcp_manager)
         .with_shared_tool_search(tool_search_index)
@@ -1161,7 +1177,25 @@ pub async fn start_server(
         .with_role_registry(role_registry)
         .with_embedding(Arc::clone(&shared_embedding))
         .with_canvas_video_service(canvas_video_service.clone())
-        .with_tts_config(agent_config.read().unwrap().tts.clone());
+        .with_tts_config(agent_config.read().unwrap().tts.clone())
+        .with_agent_config(agent_config.read().unwrap().clone())
+        .with_runtime_handle(tokio::runtime::Handle::current())
+        .with_session_proxy_tracker(session_proxy_tracker.clone());
+
+    // Construct the /loop skill's LoopManager and inject into HostServices
+    // so the loop.* tool dispatcher (mcp_tool_executor + future direct-API
+    // path) can resolve `services.loop_manager`. Spec §4 architecture.
+    // Pass the (loop_manager-less) services clone so the IterationExecutor
+    // gets a real `Agent::run` invocation path.
+    let loop_manager = std::sync::Arc::new(crate::loops::LoopManager::start_with_bus(
+        db.clone(),
+        Some(event_bus.clone()),
+        Some(services.clone()),
+    ));
+    // Publish process-global handle so IterationExecutor can back-fill
+    // services.loop_manager when claude-code (ACP) calls loop.* via MCP.
+    let _ = crate::loops::CURRENT_LOOP_MANAGER.set(loop_manager.clone());
+    services = services.with_loop_manager(loop_manager.clone());
     if let Some(retriever) = knowledge_retriever {
         services = services.with_knowledge_retriever(retriever);
     }
@@ -1349,6 +1383,7 @@ pub async fn start_server(
     let config_managed = config.managed;
     let config_idle_timeout = config.idle_timeout;
     let accept_shutdown_tx = shutdown_tx.clone();
+    let shutdown_loop_manager = loop_manager.clone();
     tokio::spawn(async move {
         let last_message_time = Arc::new(Mutex::new(std::time::Instant::now()));
 
@@ -1397,6 +1432,8 @@ pub async fn start_server(
                 }
                 _ = shutdown_rx.recv() => {
                     info!("Server shutdown signal received");
+                    info!("Tearing down /loop skill subscriptions and pending iterations…");
+                    shutdown_loop_manager.shutdown().await;
                     break;
                 }
             }
@@ -1757,6 +1794,129 @@ pub async fn start_server(
                     }
                 }
                 continue;
+            }
+
+            // Handle loop_cancel_command from sidebar (/loop skill spec §8.3).
+            // force=true is the second-click hard-cancel; false is the soft cancel
+            // that lets the current iteration finish.
+            if msg_type == "loop_cancel_command" {
+                info!("Processing loop_cancel_command message");
+                if let Some(payload) = envelope.payload.get("payload") {
+                    let loop_id = payload
+                        .get("loop_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let force = payload
+                        .get("force")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if let Some(loop_id) = loop_id {
+                        if let Some(mgr) = process_services.loop_manager.as_ref() {
+                            let id = crate::loops::LoopId(loop_id.clone());
+                            if let Err(e) = mgr.cancel_loop(&id, force).await {
+                                warn!("loop cancel from sidebar failed for {}: {}", loop_id, e);
+                            }
+                        } else {
+                            warn!(
+                                "loop_cancel_command received for {} but no LoopManager configured",
+                                loop_id
+                            );
+                        }
+                    } else {
+                        warn!("loop_cancel_command missing loop_id");
+                    }
+                }
+                continue;
+            }
+
+            // Handle skill_command messages from sidebar — currently used
+            // by the /loop slash command (Phase 17). Routes skill_name=="loop"
+            // to LoopManager::create_loop. Other skill_names fall through and
+            // get the slash-skill treatment via the chat path further down.
+            if msg_type == "skill_command" {
+                let payload = envelope.payload.get("payload");
+                let skill_name = payload
+                    .and_then(|p| p.get("skill_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                // Record session→proxy mapping from this skill_command so /loop
+                // iterations spawned in this session can borrow a sidebar for
+                // browser_* tool calls. Without this, a /loop created in a fresh
+                // session (one that never sent a normal chat_message) cannot
+                // resolve a sidebar proxy at iteration time and browser_* tools
+                // hit "No writer for proxy , dropping message".
+                if let Some(tracker) = process_services.session_proxy_tracker.as_ref() {
+                    let sid = payload
+                        .and_then(|p| p.get("session_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !sid.is_empty() {
+                        tracker.note(sid, &proxy_id, &identity);
+                    }
+                }
+                if skill_name == "loop" {
+                    info!("Processing skill_command: loop");
+                    let session_id = payload
+                        .and_then(|p| p.get("session_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let args = payload
+                        .and_then(|p| p.get("args"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+
+                    let trigger_expr = args
+                        .get("trigger_expr")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if trigger_expr.is_empty() {
+                        warn!("skill_command 'loop' missing trigger_expr");
+                        continue;
+                    }
+                    let prompt_text = args
+                        .get("prompt_text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let wrapped_skill = args
+                        .get("wrapped_skill")
+                        .filter(|v| !v.is_null())
+                        .map(|v| v.to_string());
+                    // Mode comes from the SkillCommandPayload's top-level
+                    // `mode` field, populated by the sidebar from the current
+                    // session's chat mode (chat/browser/agent).
+                    let mode = payload
+                        .and_then(|p| p.get("mode"))
+                        .and_then(|v| v.as_str())
+                        .map(parse_agent_mode)
+                        .unwrap_or(AgentMode::Chat);
+
+                    if let Some(mgr) = process_services.loop_manager.as_ref() {
+                        match mgr
+                            .create_loop(crate::loops::manager::CreateLoopArgs {
+                                session_id,
+                                trigger_expr_text: trigger_expr,
+                                prompt_text,
+                                wrapped_skill,
+                                mode,
+                            })
+                            .await
+                        {
+                            Ok(id) => {
+                                info!("Created loop {} from /loop slash command", id);
+                            }
+                            Err(e) => {
+                                warn!("loop.create from /loop failed: {}", e);
+                            }
+                        }
+                    } else {
+                        warn!("skill_command 'loop' received but no LoopManager configured");
+                    }
+                    continue;
+                }
+                // Other skill_command names not handled here — fall through
+                // (no `continue`) to the chat-message slash-skill path.
             }
 
             // Handle canvas_tool_list requests
@@ -3508,6 +3668,12 @@ async fn handle_event_bus_request(
             let publisher = PublisherIdentity::Extension {
                 proxy_id: proxy_id.to_string(),
             };
+            tracing::info!(
+                topic = %opts.topic,
+                proxy = %proxy_id,
+                delivery = ?opts.delivery,
+                "EventBus publish received"
+            );
             let event = match opts.delivery {
                 DeliveryMode::Ephemeral => {
                     BusEvent::ephemeral(opts.topic.clone(), opts.payload, publisher)
@@ -3862,6 +4028,13 @@ async fn handle_chat_message_streaming(
         .and_then(|s| s.as_str())
         .unwrap_or("default")
         .to_string();
+
+    // Record session→proxy mapping so /loop iterations spawned in this
+    // session can borrow this sidebar's proxy_id/client_identity for
+    // browser_* tool calls.
+    if let Some(tracker) = services.session_proxy_tracker.as_ref() {
+        tracker.note(&session_id, &proxy_id, &identity);
+    }
 
     // Extract mode if provided (default to Chat)
     let mode = payload

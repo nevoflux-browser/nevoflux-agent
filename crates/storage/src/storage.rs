@@ -7,8 +7,8 @@ use crate::error::Result;
 use crate::repositories::traces::TraceRepository;
 use crate::repositories::{
     ArtifactRepository, ConfigRepository, KnowledgeRepository, LearningMetricsRepository,
-    MessageRepository, PermissionRepository, SessionRepository, SiteAdaptationRepository,
-    ToolStatsRepository,
+    LoopRepository, MessageRepository, PermissionRepository, SessionRepository,
+    SiteAdaptationRepository, ToolStatsRepository,
 };
 
 /// Main storage facade providing access to all repositories.
@@ -105,6 +105,14 @@ impl Storage {
     /// Use this to create, query, and delete learning system metrics.
     pub fn learning_metrics(&self) -> LearningMetricsRepository<'_> {
         LearningMetricsRepository::new(&self.db)
+    }
+
+    /// Get a loop repository.
+    ///
+    /// Use this to create, read, and update /loop skill records and
+    /// their per-iteration history.
+    pub fn loops(&self) -> LoopRepository<'_> {
+        LoopRepository::new(&self.db)
     }
 
     /// Get the underlying database (for advanced operations).
