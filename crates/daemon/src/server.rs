@@ -1839,6 +1839,21 @@ pub async fn start_server(
                     .and_then(|p| p.get("skill_name"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                // Record session→proxy mapping from this skill_command so /loop
+                // iterations spawned in this session can borrow a sidebar for
+                // browser_* tool calls. Without this, a /loop created in a fresh
+                // session (one that never sent a normal chat_message) cannot
+                // resolve a sidebar proxy at iteration time and browser_* tools
+                // hit "No writer for proxy , dropping message".
+                if let Some(tracker) = process_services.session_proxy_tracker.as_ref() {
+                    let sid = payload
+                        .and_then(|p| p.get("session_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !sid.is_empty() {
+                        tracker.note(sid, &proxy_id, &identity);
+                    }
+                }
                 if skill_name == "loop" {
                     info!("Processing skill_command: loop");
                     let session_id = payload
