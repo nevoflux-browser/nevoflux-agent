@@ -436,7 +436,7 @@ async fn run_daemon(
     }
     let router = std::sync::Arc::new(nevoflux_daemon::Router::new());
 
-    let server = nevoflux_daemon::start_server(config, router, session_manager).await?;
+    let mut server = nevoflux_daemon::start_server(config, router, session_manager).await?;
     let port = server.port();
 
     tracing::info!("Daemon started on port {} (managed={})", port, managed);
@@ -445,6 +445,9 @@ async fn run_daemon(
     tokio::signal::ctrl_c().await?;
 
     logging::log_shutdown();
+
+    // Gracefully shut down the server (stops listeners and background tasks)
+    server.shutdown().await;
 
     // Cleanup — only remove files we actually wrote.
     // In managed+port mode no files were written, so nothing to clean up.
@@ -459,7 +462,12 @@ async fn run_daemon(
         let _ = std::fs::remove_file(data_dir.join(pid_name));
     }
 
-    Ok(())
+    // Force-exit the process. Loop iterations run Agent::run() inside
+    // spawn_blocking — those threads cannot be interrupted by tokio
+    // cancellation. Without this, the tokio runtime drop waits for the
+    // blocking thread pool to drain, which hangs indefinitely if an LLM
+    // HTTP call is still in-flight.
+    std::process::exit(0);
 }
 
 /// Get the database path for storage.
