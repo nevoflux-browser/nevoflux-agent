@@ -29,9 +29,17 @@ use crate::native_messaging::{read_message, write_message};
 use crate::port_discovery::{find_available_port, launch_daemon_with_port, wait_for_daemon_ready};
 use crate::proxy::parse_native_message;
 use nevoflux_protocol::{Channel, DaemonEnvelope, ProxyEnvelope};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, warn};
+
+/// Shared slot for the PID of a daemon spawned during proxy startup.
+///
+/// The proxy populates this as soon as the daemon process is launched, so an
+/// external caller (e.g. a `tokio::signal::ctrl_c` branch) can still recover
+/// the PID and clean it up if the proxy future is cancelled mid-run.
+pub type SpawnedPidSlot = Arc<Mutex<Option<u32>>>;
 
 /// Message from stdin (sidebar) to be processed.
 #[derive(Debug, Clone)]
@@ -66,6 +74,10 @@ pub struct AsyncProxyConfig {
     pub bridge: BridgeConfig,
     /// Channel buffer size for internal communication.
     pub channel_buffer_size: usize,
+    /// Optional slot that receives the spawned daemon's PID as soon as it is
+    /// known. Used by the caller to clean up a spawned daemon if the proxy
+    /// future is cancelled (e.g. via Ctrl+C) before returning normally.
+    pub spawned_pid_slot: Option<SpawnedPidSlot>,
 }
 
 impl Default for AsyncProxyConfig {
@@ -73,6 +85,7 @@ impl Default for AsyncProxyConfig {
         Self {
             bridge: BridgeConfig::default(),
             channel_buffer_size: 100,
+            spawned_pid_slot: None,
         }
     }
 }
@@ -92,6 +105,14 @@ impl AsyncProxyConfig {
     /// Set the channel buffer size.
     pub fn with_channel_buffer_size(mut self, size: usize) -> Self {
         self.channel_buffer_size = size;
+        self
+    }
+
+    /// Provide an externally-owned slot that the proxy will populate with the
+    /// spawned daemon's PID. The caller can then read the slot on a cancel
+    /// path (e.g. Ctrl+C) to clean up the daemon.
+    pub fn with_spawned_pid_slot(mut self, slot: SpawnedPidSlot) -> Self {
+        self.spawned_pid_slot = Some(slot);
         self
     }
 }
@@ -139,6 +160,14 @@ where
         ConnectionMode::Prod => connect_prod_mode(&mut daemon_client, &config.bridge).await?,
     };
     info!("Proxy {} connected to daemon", proxy_id);
+
+    // Publish the spawned PID to the external slot (if any) so a Ctrl+C path
+    // in the caller can still clean it up even if this future never returns.
+    if let Some(slot) = config.spawned_pid_slot.as_ref() {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = spawned_pid;
+        }
+    }
 
     // Send initial connected message
     stdout_tx

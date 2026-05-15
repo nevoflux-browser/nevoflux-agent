@@ -238,17 +238,45 @@ fn acquire_daemon_lock(managed: bool) -> std::io::Result<File> {
 /// messages (like cancel requests or browser tool responses) while streaming.
 async fn run_proxy(verbose: bool, dev_mode: bool) -> Result<(), Box<dyn std::error::Error>> {
     use nevoflux_bridge::{run_async_proxy, AsyncProxyConfig, BridgeConfig, ConnectionMode};
+    use std::io::IsTerminal;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{stdin, stdout};
 
-    // On Windows, hide the console window so proxy runs silently in the background.
-    // Other modes (daemon, mcp, status, stop) keep the console for interactive use.
+    // Layer 2: refuse to run proxy mode from an interactive terminal. The
+    // proxy speaks the Native Messaging binary framing on stdin/stdout, so a
+    // human at a tty cannot meaningfully drive it. Refusing here prevents
+    // users from accidentally invoking proxy mode when they meant to run a
+    // CLI subcommand.
+    if std::io::stdin().is_terminal() {
+        eprintln!("nevoflux: proxy mode is for browser Native Messaging, not interactive use.");
+        eprintln!();
+        eprintln!("For CLI usage, try:");
+        eprintln!("  nevoflux --daemon     start the daemon");
+        eprintln!("  nevoflux --mcp        run MCP server");
+        eprintln!("  nevoflux --status     show daemon status");
+        eprintln!("  nevoflux --stop       stop the daemon");
+        eprintln!("  nevoflux --help       full help");
+        std::process::exit(2);
+    }
+
+    // Layer 1: on Windows, only hide the console if we exclusively own it.
+    // GetConsoleProcessList returns the number of processes attached to the
+    // current console. When a browser launches us via Native Messaging the
+    // OS allocates a fresh console and we are the sole owner (count == 1),
+    // so hiding it removes a brief flash. When a user launches us from
+    // PowerShell / cmd / Windows Terminal we inherit the parent's console
+    // (count >= 2) — hiding it would hide the user's own terminal window.
     #[cfg(windows)]
     {
-        use windows_sys::Win32::System::Console::GetConsoleWindow;
+        use windows_sys::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
         use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
-        let hwnd = unsafe { GetConsoleWindow() };
-        if !hwnd.is_null() {
-            unsafe { ShowWindow(hwnd, SW_HIDE) };
+        let mut pids = [0u32; 2];
+        let count = unsafe { GetConsoleProcessList(pids.as_mut_ptr(), 2) };
+        if count == 1 {
+            let hwnd = unsafe { GetConsoleWindow() };
+            if !hwnd.is_null() {
+                unsafe { ShowWindow(hwnd, SW_HIDE) };
+            }
         }
     }
 
@@ -267,14 +295,29 @@ async fn run_proxy(verbose: bool, dev_mode: bool) -> Result<(), Box<dyn std::err
 
     tracing::debug!("Starting async proxy mode (full-duplex, {:?})", mode);
 
-    let bridge_config = BridgeConfig::new().with_mode(mode).with_data_dir(data_dir);
-    let config = AsyncProxyConfig::new().with_bridge(bridge_config);
+    // Layer 3: share the spawned-daemon PID with the Ctrl+C branch so we can
+    // still kill the daemon if the proxy future is cancelled before it
+    // returns normally.
+    let pid_slot: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
 
-    let result = run_async_proxy(stdin(), stdout(), config).await?;
+    let bridge_config = BridgeConfig::new().with_mode(mode).with_data_dir(data_dir);
+    let config = AsyncProxyConfig::new()
+        .with_bridge(bridge_config)
+        .with_spawned_pid_slot(pid_slot.clone());
+
+    let proxy_fut = run_async_proxy(stdin(), stdout(), config);
+
+    let spawned_pid = tokio::select! {
+        result = proxy_fut => result?.spawned_daemon_pid,
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Ctrl+C received in proxy mode, shutting down");
+            pid_slot.lock().ok().and_then(|g| *g)
+        }
+    };
 
     // In prod mode, clean up the spawned daemon.
     // Zero-file mode: only kill the process. No port/pid/lock files to remove.
-    if let Some(pid) = result.spawned_daemon_pid {
+    if let Some(pid) = spawned_pid {
         tracing::info!("Proxy shutting down, killing spawned daemon PID {}", pid);
         kill_process(pid);
         // No files to clean up — daemon was launched with --port (zero-file mode)
