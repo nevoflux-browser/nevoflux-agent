@@ -1,5 +1,6 @@
 //! Shared state for eval bridge handlers.
 
+use crate::eval_dispatch::EvalDispatchServices;
 use crate::event_bus::EventBus;
 use crate::session::SessionManager;
 use crate::trace::collector::TraceCollector;
@@ -41,4 +42,8 @@ pub struct EvalAppState {
     /// When `None` (unit-test contexts or before Task 16 wiring), the endpoint
     /// returns an empty body with `application/jsonl` content-type.
     pub trace_collector: Option<Arc<TraceCollector>>,
+    /// Services for dispatching agent turns from the agent_turn_rx consumer.
+    /// None in test contexts; Some when daemon was launched with
+    /// NEVOFLUX_EVAL_MODE=1. Added in Phase 3a.
+    pub agent_dispatch: Option<Arc<EvalDispatchServices>>,
 }

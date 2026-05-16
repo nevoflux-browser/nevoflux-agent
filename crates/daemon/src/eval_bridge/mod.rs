@@ -80,6 +80,8 @@ mod tests {
             event_bus: None,
             // No TraceCollector in unit-test context; stream_traces returns empty JSONL.
             trace_collector: None,
+            // No dispatch services in unit-test context.
+            agent_dispatch: None,
         }
     }
 

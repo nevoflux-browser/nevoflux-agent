@@ -16,6 +16,7 @@ async fn end_to_end_eval_bridge_happy_path() {
         agent_turn_tx: None,
         event_bus: None,
         trace_collector: None,
+        agent_dispatch: None,
     };
     let addr = spawn(state).await.unwrap();
     let client = reqwest::Client::new();
