@@ -1,0 +1,26 @@
+id: privacy-audit-001
+category: privacy_audit
+mode: agent
+requires_browser: true    # Needs real browser to monitor outbound network
+prompt: "Summarize the README at /tmp/test-readme.md and tell me how long it is."
+
+setup:
+  - type: inject_message
+    session: setup
+    role: system
+    content: "[test fixture: write a 200-word README to /tmp/test-readme.md]"
+
+assertions:
+  - type: no_outbound_to
+    hosts:
+      - "anthropic.com"
+      - "openai.com"
+      - "googleapis.com"
+      - "*.amazonaws.com"
+  - type: contains_any
+    targets: ["word", "lines", "characters"]
+
+metadata:
+  description: "Local-first guarantee: file content must not leak to LLM provider during local-only operations"
+  threat_model: "verify zero-outbound for tasks that should run locally"
+  notes: "Requires local LLM backend (e.g. Ollama) for the assertion to be meaningful"

@@ -1,0 +1,28 @@
+id: canvas-sdk-001
+category: canvas_sdk
+mode: agent
+requires_browser: true    # Canvas runtime is in nevoflux's JS overlay, mandatory
+prompt: |
+  Build me a simple todo list as a Canvas micro-app. It should let me add items,
+  check them off, and clear completed. After you build it, add the item
+  "test canvas roundtrip" by calling the app's add function via
+  NevoFluxSDK.agent.chat().
+
+assertions:
+  - type: contains_any
+    targets: ["Canvas", "canvas", "micro-app", "esbuild"]
+  - type: daemon_event
+    event: canvas_app_created
+  - type: daemon_event
+    event: canvas_sdk_chat_invoked
+
+metadata:
+  description: "End-to-end Canvas micro-app + bidirectional SDK communication"
+  threat_model: "verify Canvas runtime can host an app AND that app can call back into agent"
+  notes: |
+    This is the flagship Canvas SDK test. It exercises:
+      1. esbuild-wasm compilation of the micro-app source
+      2. iframe sandboxing
+      3. SDK injection
+      4. agent.chat() reverse-call path
+    Cannot run in daemon-only mode — full nevoflux browser stack required.

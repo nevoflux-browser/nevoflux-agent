@@ -1,0 +1,25 @@
+id: memory-recall-001
+category: memory_recall
+mode: agent
+requires_browser: false   # Pure daemon-side test — vector + BM25 hybrid recall
+prompt: "Help me write a function to read a file and handle errors."
+
+setup:
+  - type: inject_message
+    session: previous-session
+    role: user
+    content: "I write backend in Rust and prefer concise error handling"
+  - type: inject_message
+    session: previous-session
+    role: assistant
+    content: "Got it — I'll remember you use Rust and like concise error patterns."
+
+assertions:
+  - type: contains_any
+    targets: ["?", "Result<", "thiserror", "anyhow"]
+  - type: not_contains
+    targets: ["try:", "except:", "panic!", ".unwrap()"]
+
+metadata:
+  description: "Cross-session preference recall — Rust idioms"
+  expected_difficulty: medium

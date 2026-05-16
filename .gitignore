@@ -36,3 +36,9 @@ docs/testing/
 # crates/storage/src/models/.
 /models/
 
+# Eval data — secrets and local reports
+eval/.env
+eval/reports/exploratory/
+eval/reports/failures/
+.cache/nevoflux-releases/
+

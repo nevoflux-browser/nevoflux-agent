@@ -1,0 +1,12 @@
+# Exploratory reports: dev-mode or daemon-only runs.
+# Never committed — these are not safe for public reporting.
+exploratory/
+
+# Cached nevoflux release binaries (downloaded by ReleaseBrowser).
+nevoflux-releases/
+
+# Local environment file (API keys).
+.env
+
+# Per-run trace dumps (large, ephemeral).
+traces/
