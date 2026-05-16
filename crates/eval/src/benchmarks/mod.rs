@@ -1,4 +1,8 @@
-use crate::{EvalResult, Task};
+use crate::{
+    browser::BrowserLaunchMode,
+    termination::{AnswerExtractor, TerminationStrategy},
+    EvalResult, Task,
+};
 use async_trait::async_trait;
 
 pub mod browsecomp;
@@ -30,6 +34,34 @@ pub trait Benchmark: Send + Sync {
     /// Default judge name for this benchmark (e.g. "programmatic", "webjudge").
     /// Runner uses this if user does not override with `--judge`.
     fn default_judge(&self) -> &str;
+
+    /// When to stop watching the SSE stream. See spec §6.2.3.
+    /// Default `NaturalStop` covers most benchmarks.
+    fn termination_strategy(&self) -> TerminationStrategy {
+        TerminationStrategy::NaturalStop
+    }
+
+    /// How to extract `final_answer` from the event stream.
+    /// Default `LastAssistantMessage` concatenates all Token events.
+    fn answer_extractor(&self) -> AnswerExtractor {
+        AnswerExtractor::LastAssistantMessage
+    }
+
+    /// Append this string to each task's prompt before submission. The
+    /// report header will note the modification (see reporter.rs).
+    /// BrowseComp uses this to inject `<ANSWER>` tag instructions.
+    fn prompt_suffix(&self) -> Option<&str> {
+        None
+    }
+
+    /// Per-benchmark max concurrent tasks. Runner uses
+    /// `min(config.parallelism, benchmark.max_parallelism(mode))`.
+    fn max_parallelism(&self, mode: &BrowserLaunchMode) -> usize {
+        match mode {
+            BrowserLaunchMode::DaemonOnly => 8,
+            _ => 1, // real-browser benchmarks are conservative by default
+        }
+    }
 }
 
 /// Registry — maps benchmark name → instance. Add new benchmarks here.
