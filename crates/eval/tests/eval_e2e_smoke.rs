@@ -69,6 +69,19 @@ fn daemon_path() -> PathBuf {
 
 #[tokio::test]
 async fn eval_runs_against_real_daemon() {
+    // Enable mock LLM mode for this test. The forwarded env var causes the
+    // spawned daemon (built with --features eval-mock-llm) to use its local
+    // mock HTTP server. Without this, every task would time out waiting for
+    // a real API call.
+    std::env::set_var("NEVOFLUX_EVAL_LLM_MODE", "mock");
+    struct EnvVarGuard(&'static str);
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+    let _guard = EnvVarGuard("NEVOFLUX_EVAL_LLM_MODE");
+
     let daemon = daemon_path();
     if !daemon.exists() {
         eprintln!(
@@ -83,7 +96,7 @@ async fn eval_runs_against_real_daemon() {
 
     let config = RunnerConfig {
         daemon_addr: "".into(),
-        task_timeout_secs: 30,
+        task_timeout_secs: 15,
         parallelism: 1,
         task_filter: None,
         limit: None,
@@ -105,11 +118,26 @@ async fn eval_runs_against_real_daemon() {
         "DaemonOnly always produces Exploratory grade"
     );
 
-    // Phase 1's agent_turn_rx consumer is warn-only — the message is never
-    // processed, so the SSE stream eventually times out or fails. The important
-    // invariant is that the runner completed end-to-end without crashing and
-    // produced exactly one terminal outcome.
     assert_eq!(summary.per_task.len(), 1, "expected one TaskOutcome");
+
+    // With mock LLM, the agent should reach Stop (not timeout).
+    assert_eq!(
+        summary.timeouts, 0,
+        "with mock LLM, the agent should reach Stop, not timeout. Got timeouts={}",
+        summary.timeouts
+    );
+
+    // The task should complete (Status::Completed or Status::Failed — both
+    // indicate the agent ran, distinguishing from Timeout).
+    let status = summary.per_task[0].result.status;
+    assert!(
+        matches!(
+            status,
+            nevoflux_eval::TaskStatus::Completed | nevoflux_eval::TaskStatus::Failed
+        ),
+        "expected Completed or Failed (agent ran), got {:?}",
+        status
+    );
 
     // `passed`, `failed`, and `timeouts` are NOT mutually exclusive counters:
     // `timeouts` counts tasks whose status was Timeout, while `passed`/`failed`

@@ -52,14 +52,22 @@ impl DaemonOnlyBrowser {
             )));
         }
 
-        let child = Command::new(&daemon_binary)
-            .arg("--daemon")
+        let mut cmd = Command::new(&daemon_binary);
+        cmd.arg("--daemon")
             .env("NEVOFLUX_EVAL_MODE", "1")
             .env("NEVOFLUX_EVAL_RUN_ID", &run_id)
             .env("NEVOFLUX_EVAL_STATE_DIR", &state_dir)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+
+        // Forward NEVOFLUX_EVAL_LLM_MODE from parent if set, so tests/CI can opt
+        // into mock LLM mode without needing to set it on every spawn.
+        if let Ok(mode) = std::env::var("NEVOFLUX_EVAL_LLM_MODE") {
+            cmd.env("NEVOFLUX_EVAL_LLM_MODE", mode);
+        }
+
+        let child = cmd
             .spawn()
             .map_err(|e| EvalError::Other(format!("spawn daemon: {e}")))?;
 

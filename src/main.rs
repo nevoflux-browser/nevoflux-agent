@@ -606,6 +606,9 @@ async fn run_daemon(
         let (agent_turn_tx, agent_turn_rx) = tokio::sync::mpsc::unbounded_channel::<
             nevoflux_daemon::eval_bridge::state::AgentTurnRequest,
         >();
+        // Clone event_bus before moving it into EvalAppState so the step-8
+        // consumer can publish `agent:turn_done` after each dispatch completes.
+        let event_bus_for_consumer = event_bus.clone();
         let state = nevoflux_daemon::eval_bridge::EvalAppState {
             session_manager: session_manager.clone(),
             bearer_token: std::sync::Arc::from(token.as_str()),
@@ -623,14 +626,21 @@ async fn run_daemon(
 
         // Step 8: Real agent_turn_rx consumer — calls dispatch_eval_turn for
         //          each submitted prompt. Replaces the Phase-1 warn-only stub.
+        //
+        //          After each turn completes (success or error), publish an
+        //          `agent:turn_done` event to the EventBus so the SSE consumer
+        //          in `stream_events` can emit `EvalEvent::Stop` and let the
+        //          eval runner move on instead of waiting for the task timeout.
         let dispatch_for_consumer = dispatch_services.clone();
         tokio::spawn(async move {
             let mut rx = agent_turn_rx;
             while let Some(req) = rx.recv().await {
                 let services = dispatch_for_consumer.clone();
+                let bus = event_bus_for_consumer.clone();
+                let session_id = req.session_id.clone();
                 // Spawn each turn in its own task so the consumer keeps draining.
                 tokio::spawn(async move {
-                    match nevoflux_daemon::eval_dispatch::dispatch_eval_turn(
+                    let stop_reason = match nevoflux_daemon::eval_dispatch::dispatch_eval_turn(
                         &services,
                         &req.session_id,
                         &req.prompt,
@@ -642,6 +652,7 @@ async fn run_daemon(
                                 session_id = %req.session_id,
                                 "eval turn complete"
                             );
+                            "stop"
                         }
                         Err(e) => {
                             tracing::error!(
@@ -649,7 +660,25 @@ async fn run_daemon(
                                 error = %e,
                                 "eval agent dispatch failed"
                             );
+                            "error"
                         }
+                    };
+
+                    // Publish agent:turn_done so the SSE consumer can emit Stop.
+                    let evt = nevoflux_daemon::event_bus::BusEvent::ephemeral(
+                        "agent:turn_done",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "reason": stop_reason,
+                        }),
+                        nevoflux_daemon::event_bus::PublisherIdentity::Internal,
+                    );
+                    if let Err(e) = bus.publish(evt).await {
+                        tracing::warn!(
+                            %session_id,
+                            error = %e,
+                            "eval: failed to publish agent:turn_done"
+                        );
                     }
                 });
             }

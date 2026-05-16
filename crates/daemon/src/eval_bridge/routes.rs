@@ -304,6 +304,19 @@ pub async fn stream_events(
                                 if payload_sid != Some(sid.as_str()) {
                                     return None;
                                 }
+                                // `agent:turn_done` signals that dispatch_eval_turn
+                                // completed. Map it to EvalEvent::Stop so that the
+                                // NaturalStop termination strategy fires immediately
+                                // instead of waiting for the task timeout.
+                                if bus_evt.topic == "agent:turn_done" {
+                                    let reason = bus_evt
+                                        .payload
+                                        .get("reason")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("stop")
+                                        .to_string();
+                                    return Some(EvalEvent::Stop { reason });
+                                }
                                 Some(EvalEvent::DaemonEvent {
                                     name: bus_evt.topic,
                                     payload: bus_evt.payload,
