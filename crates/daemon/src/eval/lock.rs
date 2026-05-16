@@ -30,9 +30,9 @@ pub fn write_atomic(path: &Path, lock: &DaemonLock) -> Result<(), LockError> {
     let parent = path.parent().expect("lock path must have parent");
     std::fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(".daemon.lock.tmp.{}", std::process::id()));
+    let json = serde_json::to_vec_pretty(lock)?;
     {
         let mut f = std::fs::File::create(&tmp)?;
-        let json = serde_json::to_vec_pretty(lock)?;
         f.write_all(&json)?;
         f.sync_all()?;
     }
