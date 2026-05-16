@@ -59,9 +59,13 @@ pub fn write_lock(http_addr: &str, bearer_token: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn lock_path_uses_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("NEVOFLUX_DEV_INSTANCE_STATE_DIR", tmp.path());
         let path = lock_path();
@@ -72,6 +76,7 @@ mod tests {
 
     #[test]
     fn write_and_read_lock_roundtrip() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("NEVOFLUX_DEV_INSTANCE_STATE_DIR", tmp.path());
         write_lock("127.0.0.1:12345", "secret").unwrap();
