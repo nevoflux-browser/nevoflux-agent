@@ -110,13 +110,21 @@ async fn eval_runs_against_real_daemon() {
     // invariant is that the runner completed end-to-end without crashing and
     // produced exactly one terminal outcome.
     assert_eq!(summary.per_task.len(), 1, "expected one TaskOutcome");
+
+    // `passed`, `failed`, and `timeouts` are NOT mutually exclusive counters:
+    // `timeouts` counts tasks whose status was Timeout, while `passed`/`failed`
+    // are verdict-based (judge result). A timed-out task can still be judged
+    // passed if the extractor found a match. Assert the structural invariant
+    // instead: total == skipped + (passed + failed), where failed absorbs
+    // everything that is neither skipped nor judged-correct.
     assert_eq!(
-        summary.passed + summary.failed + summary.timeouts,
-        1,
-        "expected exactly one terminal outcome; \
-         got passed={} failed={} timeouts={}",
+        summary.total,
+        summary.skipped + summary.passed + summary.failed,
+        "total must equal skipped + passed + failed; \
+         got total={} skipped={} passed={} failed={}",
+        summary.total,
+        summary.skipped,
         summary.passed,
         summary.failed,
-        summary.timeouts,
     );
 }

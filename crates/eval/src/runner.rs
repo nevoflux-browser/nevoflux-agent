@@ -125,6 +125,31 @@ impl Runner {
         browser.ensure_ready().await?;
         let browser_version = browser.version_string();
 
+        // Derive an HTTP client from the browser lock when the caller did not supply one
+        // explicitly.  DaemonOnlyBrowser writes a daemon.lock that contains the HTTP address
+        // and bearer token; we read it here so that Runner::new (the default path) actually
+        // reaches the daemon instead of erroring with "runner has no http client".
+        //
+        // Runner::with_client stays for Phase 3+ (External/Release modes have their own
+        // discovery paths and pass in a pre-built client).
+        let derived_client: Option<crate::daemon_client::DaemonHttpClient> = self
+            .client
+            .clone()
+            .or_else(|| {
+                browser
+                    .lock()
+                    .map(crate::daemon_client::DaemonHttpClient::from_lock)
+            });
+
+        if derived_client.is_none() {
+            return Err(crate::EvalError::DaemonConnection(
+                "no HTTP client available — runner has no pre-built client and the \
+                 browser handle does not expose a daemon lock (non-daemon-only modes \
+                 are Phase 3/4 stubs)"
+                    .into(),
+            ));
+        }
+
         info!(
             benchmark = benchmark.name(),
             judge = judge.name(),
@@ -188,7 +213,8 @@ impl Runner {
         > = FuturesUnordered::new();
 
         let timeout_secs = self.config.task_timeout_secs;
-        let client = self.client.clone();
+        // Use the derived client (pre-built or lock-derived) for all per-task futures.
+        let client = derived_client;
 
         for task in to_run.iter().cloned() {
             let permit = semaphore
