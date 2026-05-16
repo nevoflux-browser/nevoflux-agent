@@ -1,0 +1,24 @@
+{
+  "version": "phase3b-fixture-v1",
+  "source": "hand-written for Phase 3b smoke; replaced by OSU-NLP-Group/Online-Mind2Web in Phase 3c",
+  "tasks": [
+    {
+      "id": "om2w-fixture-001",
+      "url": "https://example.com/",
+      "instruction": "Open the page and confirm the title contains the word 'Example'.",
+      "evaluation_criteria": "Agent's final answer mentions 'Example' or 'example' from the page title."
+    },
+    {
+      "id": "om2w-fixture-002",
+      "url": "https://en.wikipedia.org/wiki/Main_Page",
+      "instruction": "Open the Wikipedia main page and report one of the 'On this day' or 'Did you know' headline items.",
+      "evaluation_criteria": "Agent's final answer references a headline visible on the page (any wording)."
+    },
+    {
+      "id": "om2w-fixture-003",
+      "url": "https://github.com/OSU-NLP-Group/Online-Mind2Web",
+      "instruction": "Open the GitHub repository page for OSU-NLP-Group/Online-Mind2Web and report the description in the page header.",
+      "evaluation_criteria": "Agent's final answer summarises the repo description (one sentence)."
+    }
+  ]
+}
