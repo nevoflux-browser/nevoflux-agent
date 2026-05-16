@@ -99,11 +99,28 @@ mod tests {
         let resp = reqwest::Client::new()
             .post(&url)
             .bearer_auth("secret-test-token")
-            .json(&serde_json::json!({}))
+            .json(&serde_json::json!({ "mode": "chat" }))
             .send()
             .await
             .unwrap();
-        // Stub handler returns 501 NOT_IMPLEMENTED; that proves bearer passed through middleware.
-        assert_eq!(resp.status().as_u16(), 501);
+        // Handler is now implemented — 200 proves bearer passed through middleware.
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn create_session_returns_id() {
+        let state = test_state();
+        let addr = spawn(state).await.unwrap();
+        let url = format!("http://{}/_eval/sessions", addr);
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .bearer_auth("secret-test-token")
+            .json(&serde_json::json!({ "mode": "chat" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body.get("session_id").and_then(|v| v.as_str()).is_some());
     }
 }
