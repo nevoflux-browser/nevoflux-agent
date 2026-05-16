@@ -20,6 +20,14 @@ use nevoflux_eval::{
 };
 use std::path::PathBuf;
 
+/// RAII guard: removes an env var when dropped, so tests don't leak state.
+struct EnvVarGuard(&'static str);
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(self.0);
+    }
+}
+
 struct OneTaskBench;
 
 #[async_trait]
@@ -74,12 +82,6 @@ async fn eval_runs_against_real_daemon() {
     // mock HTTP server. Without this, every task would time out waiting for
     // a real API call.
     std::env::set_var("NEVOFLUX_EVAL_LLM_MODE", "mock");
-    struct EnvVarGuard(&'static str);
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            std::env::remove_var(self.0);
-        }
-    }
     let _guard = EnvVarGuard("NEVOFLUX_EVAL_LLM_MODE");
 
     let daemon = daemon_path();
@@ -154,5 +156,104 @@ async fn eval_runs_against_real_daemon() {
         summary.skipped,
         summary.passed,
         summary.failed,
+    );
+}
+
+/// Verifies the tools-enabled dispatch code path does not crash or hang.
+///
+/// Uses `ToolsConfig::Allow(["*"])` (wildcard allow) so the daemon's tool
+/// dispatch plumbing is exercised. The task itself is trivial — we only care
+/// that the runner finishes without a timeout.
+#[tokio::test]
+async fn tools_enabled_dispatch_does_not_crash() {
+    use nevoflux_protocol::subagent::ToolsConfig;
+
+    let daemon = daemon_path();
+    if !daemon.exists() {
+        eprintln!(
+            "skipping: daemon binary not built at {}. \
+             Run `cargo build --release --bin nevoflux-agent --features eval-mock-llm`.",
+            daemon.display()
+        );
+        return;
+    }
+
+    std::env::set_var("NEVOFLUX_EVAL_LLM_MODE", "mock");
+    let _guard = EnvVarGuard("NEVOFLUX_EVAL_LLM_MODE");
+
+    let state_dir = tempfile::tempdir().unwrap();
+
+    struct ToolsEnabledBench;
+
+    #[async_trait]
+    impl Benchmark for ToolsEnabledBench {
+        fn name(&self) -> &str {
+            "tools-enabled-smoke"
+        }
+
+        fn description(&self) -> &str {
+            "verifies tool dispatch plumbing does not crash"
+        }
+
+        fn requires_network(&self) -> bool {
+            false
+        }
+
+        fn default_judge(&self) -> &str {
+            "programmatic"
+        }
+
+        fn tools_config(&self) -> ToolsConfig {
+            // Wildcard allow — enables all tools without restriction.
+            ToolsConfig::Allow(vec!["*".to_string()])
+        }
+
+        async fn load_tasks(&self, _filter: Option<&str>) -> nevoflux_eval::EvalResult<Vec<Task>> {
+            Ok(vec![Task {
+                id: "tools-001".into(),
+                category: "smoke".into(),
+                mode: NevoFluxMode::Chat,
+                prompt: "Reply with a greeting.".into(),
+                setup: vec![],
+                reference: None,
+                // ContainsAny with empty string always matches any (including empty) answer.
+                assertions: vec![Assertion::ContainsAny {
+                    targets: vec!["".into()],
+                }],
+                requires_browser: false,
+                metadata: Default::default(),
+            }])
+        }
+    }
+
+    let config = RunnerConfig {
+        daemon_addr: "".into(),
+        task_timeout_secs: 15,
+        parallelism: 1,
+        task_filter: None,
+        limit: None,
+        browser_mode: BrowserLaunchMode::DaemonOnly {
+            daemon_binary: daemon,
+            state_dir: state_dir.path().to_path_buf(),
+        },
+    };
+    let runner = Runner::new(config);
+    let bench = ToolsEnabledBench;
+    let judge = ProgrammaticJudge::new();
+    let summary = runner.run(&bench, &judge).await.expect("runner completed");
+
+    assert_eq!(summary.total, 1, "expected 1 task total");
+    assert_eq!(summary.timeouts, 0, "tools-enabled dispatch should not hang");
+    assert_eq!(summary.per_task.len(), 1, "expected one TaskOutcome");
+
+    // Status should be Completed or Failed (agent ran), never Timeout.
+    let status = summary.per_task[0].result.status;
+    assert!(
+        matches!(
+            status,
+            nevoflux_eval::TaskStatus::Completed | nevoflux_eval::TaskStatus::Failed
+        ),
+        "expected Completed or Failed (agent ran), got {:?}",
+        status
     );
 }
