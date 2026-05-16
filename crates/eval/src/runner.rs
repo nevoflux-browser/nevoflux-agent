@@ -214,7 +214,12 @@ impl Runner {
             }
         }
 
-        // Dispatch all runnable tasks into a FuturesUnordered pool, gated by the semaphore.
+        // Dispatch tasks into a FuturesUnordered pool, interleaving dispatch and collection
+        // to avoid deadlock when parallelism < to_run.len().
+        //
+        // Pattern: pre-fill up to effective_parallelism slots, then drain-one / refill-one.
+        // This ensures pending futures are always being polled (via the drain loop) while
+        // new permits are being acquired, so tasks in flight can complete and release permits.
         let mut pending: FuturesUnordered<
             std::pin::Pin<
                 Box<dyn std::future::Future<Output = (Task, EvalResult<TaskResult>)> + Send>,
@@ -225,25 +230,30 @@ impl Runner {
         // Use the derived client (pre-built or lock-derived) for all per-task futures.
         let client = derived_client;
 
-        for task in to_run.iter().cloned() {
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|e| EvalError::Other(format!("semaphore: {e}")))?;
-            let client_for_task = client.clone();
-            let task_for_log = task.id.clone();
-            info!(id = %task_for_log, "queuing task");
-            pending.push(Box::pin(execute_task_owned(
-                task,
-                benchmark,
-                browser.as_ref(),
-                client_for_task,
-                timeout_secs,
-                permit,
-            )));
+        let mut task_iter = to_run.into_iter();
+
+        // Pre-fill up to effective_parallelism slots (or until tasks exhausted).
+        for _ in 0..effective_parallelism {
+            if let Some(task) = task_iter.next() {
+                let permit = semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| EvalError::Other(format!("semaphore: {e}")))?;
+                let client_for_task = client.clone();
+                info!(id = %task.id, "queuing task");
+                pending.push(Box::pin(execute_task_owned(
+                    task,
+                    benchmark,
+                    browser.as_ref(),
+                    client_for_task,
+                    timeout_secs,
+                    permit,
+                )));
+            }
         }
 
+        // Drain one at a time; refill from task_iter after each completion.
         // Collect results as they complete (order is non-deterministic; outcomes are appended
         // to the vec as they arrive — the RunSummary consumer sorts by task.id if needed).
         while let Some((task, exec_result)) = pending.next().await {
@@ -289,6 +299,25 @@ impl Runner {
                 result,
                 verdict,
             });
+
+            // Refill the drained slot from the remaining task iterator.
+            if let Some(next_task) = task_iter.next() {
+                let permit = semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| EvalError::Other(format!("semaphore: {e}")))?;
+                let client_for_task = client.clone();
+                info!(id = %next_task.id, "queuing task");
+                pending.push(Box::pin(execute_task_owned(
+                    next_task,
+                    benchmark,
+                    browser.as_ref(),
+                    client_for_task,
+                    timeout_secs,
+                    permit,
+                )));
+            }
         }
 
         if let Err(e) = browser.shutdown().await {

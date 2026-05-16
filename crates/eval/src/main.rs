@@ -166,28 +166,18 @@ async fn main() -> anyhow::Result<()> {
                 },
             };
 
-            let browser = nevoflux_eval::browser::launch(&mode).await?;
-            browser.ensure_ready().await?;
-
-            let client = browser
-                .lock()
-                .map(nevoflux_eval::daemon_client::DaemonHttpClient::from_lock)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "this browser mode doesn't expose a daemon lock; \
-                         non-daemon-only modes are stubbed for Phase 2 — see Task 9"
-                    )
-                })?;
-
             let cfg = RunnerConfig {
-                daemon_addr: String::new(), // unused — HTTP discovery via lock
+                daemon_addr: String::new(), // unused — HTTP discovery via daemon lock
                 task_timeout_secs: timeout,
                 parallelism: 1,
                 task_filter: filter,
                 limit,
-                browser_mode: mode.clone(),
+                browser_mode: mode,
             };
-            let runner = Runner::with_client(cfg, client);
+            // Runner::new launches the browser internally via Runner::run, derives the HTTP
+            // client from the daemon lock, and shuts the browser down on completion.
+            // Do NOT pre-launch here — that would spawn a second daemon (C2 fix).
+            let runner = Runner::new(cfg);
 
             let bench = benchmarks::find(&benchmark)
                 .ok_or_else(|| anyhow::anyhow!("benchmark not found: {benchmark}"))?;
@@ -205,8 +195,7 @@ async fn main() -> anyhow::Result<()> {
             let grade_dir = out_dir.join(summary.signal_grade.subdir());
             let report_path = reporter::write_markdown(&summary, &grade_dir).await?;
             info!(path = ?report_path, "report written");
-
-            browser.shutdown().await?;
+            // Browser is launched and shut down internally by Runner::run.
         }
     }
 
