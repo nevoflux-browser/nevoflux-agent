@@ -217,8 +217,9 @@ pub async fn submit_message(
 
     let tools_config = match body.tools_config.clone() {
         None => nevoflux_protocol::subagent::ToolsConfig::None,
-        Some(v) => serde_json::from_value(v)
-            .unwrap_or(nevoflux_protocol::subagent::ToolsConfig::None),
+        Some(v) => {
+            serde_json::from_value(v).unwrap_or(nevoflux_protocol::subagent::ToolsConfig::None)
+        }
     };
 
     // Dispatch to the daemon's agent loop — non-blocking.

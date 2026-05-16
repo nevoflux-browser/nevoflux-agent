@@ -184,8 +184,14 @@ mod tests {
             .await
             .unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("dev-instance lock file not found"), "got: {msg}");
-        assert!(msg.contains("NEVOFLUX_DEV_INSTANCE_MODE"), "should suggest env var");
+        assert!(
+            msg.contains("dev-instance lock file not found"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("NEVOFLUX_DEV_INSTANCE_MODE"),
+            "should suggest env var"
+        );
         std::env::remove_var("NEVOFLUX_DEV_INSTANCE_STATE_DIR");
     }
 

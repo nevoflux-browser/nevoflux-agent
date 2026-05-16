@@ -152,7 +152,10 @@ mod tests {
         assert_eq!(tasks[0].mode, NevoFluxMode::Browser);
         assert!(tasks[0].prompt.contains("https://example.com/"));
         assert_eq!(
-            tasks[0].metadata.get("evaluation_criteria").and_then(|v| v.as_str()),
+            tasks[0]
+                .metadata
+                .get("evaluation_criteria")
+                .and_then(|v| v.as_str()),
             Some("agent did the thing")
         );
     }

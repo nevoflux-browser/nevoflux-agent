@@ -9,7 +9,10 @@
 //! Wire shape: simple Anthropic chat completion request. The daemon's mock
 //! server supports both Anthropic and OpenAI formats; WebJudge uses Anthropic.
 
-use crate::{judge::{Judge, Verdict}, EvalResult, Task, TaskResult};
+use crate::{
+    judge::{Judge, Verdict},
+    EvalResult, Task, TaskResult,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -147,11 +150,14 @@ impl Judge for WebJudge {
             });
         }
 
-        let body: AnthropicResponse = resp.json().await.map_err(|e| crate::EvalError::JudgeFailure {
-            judge: "webjudge".into(),
-            task_id: task.id.clone(),
-            reason: format!("parse: {e}"),
-        })?;
+        let body: AnthropicResponse =
+            resp.json()
+                .await
+                .map_err(|e| crate::EvalError::JudgeFailure {
+                    judge: "webjudge".into(),
+                    task_id: task.id.clone(),
+                    reason: format!("parse: {e}"),
+                })?;
 
         let text = body
             .content
@@ -248,7 +254,10 @@ mod tests {
             "test".into(),
             "test-model".into(),
         );
-        let v = j.judge(&dummy_task(), &dummy_result("Cats are mammals.")).await.unwrap();
+        let v = j
+            .judge(&dummy_task(), &dummy_result("Cats are mammals."))
+            .await
+            .unwrap();
         assert!(v.correct);
         assert_eq!(v.score, 1.0);
     }
@@ -261,7 +270,10 @@ mod tests {
             "test".into(),
             "test-model".into(),
         );
-        let v = j.judge(&dummy_task(), &dummy_result("I like dogs.")).await.unwrap();
+        let v = j
+            .judge(&dummy_task(), &dummy_result("I like dogs."))
+            .await
+            .unwrap();
         assert!(!v.correct);
         assert_eq!(v.score, 0.0);
     }
@@ -270,12 +282,12 @@ mod tests {
     async fn judge_treats_mock_response_as_PASS() {
         // The daemon's mock server returns this exact string.
         let addr = spawn_test_server("Eval mock response.").await;
-        let j = WebJudge::new().with_llm_config(
-            format!("http://{addr}"),
-            "mock".into(),
-            "mock".into(),
-        );
-        let v = j.judge(&dummy_task(), &dummy_result("anything")).await.unwrap();
+        let j =
+            WebJudge::new().with_llm_config(format!("http://{addr}"), "mock".into(), "mock".into());
+        let v = j
+            .judge(&dummy_task(), &dummy_result("anything"))
+            .await
+            .unwrap();
         assert!(v.correct);
     }
 }

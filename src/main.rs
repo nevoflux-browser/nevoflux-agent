@@ -709,10 +709,7 @@ async fn run_daemon(
         // Written only when NEVOFLUX_DEV_INSTANCE_MODE=1 is also set. Re-uses
         // the same HTTP bridge addr + bearer token that eval mode already started.
         if nevoflux_daemon::dev_instance::is_enabled() {
-            match nevoflux_daemon::dev_instance::write_lock(
-                &lock.http_addr,
-                &lock.bearer_token,
-            ) {
+            match nevoflux_daemon::dev_instance::write_lock(&lock.http_addr, &lock.bearer_token) {
                 Ok(()) => tracing::info!(
                     path = ?nevoflux_daemon::dev_instance::lock_path(),
                     "dev-instance lock written (NEVOFLUX_DEV_INSTANCE_MODE=1)"

@@ -243,7 +243,10 @@ async fn tools_enabled_dispatch_does_not_crash() {
     let summary = runner.run(&bench, &judge).await.expect("runner completed");
 
     assert_eq!(summary.total, 1, "expected 1 task total");
-    assert_eq!(summary.timeouts, 0, "tools-enabled dispatch should not hang");
+    assert_eq!(
+        summary.timeouts, 0,
+        "tools-enabled dispatch should not hang"
+    );
     assert_eq!(summary.per_task.len(), 1, "expected one TaskOutcome");
 
     // Status should be Completed or Failed (agent ran), never Timeout.

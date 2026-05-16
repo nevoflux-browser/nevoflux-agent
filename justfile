@@ -179,12 +179,13 @@ eval-daemon BENCHMARK="nevoflux-suite":
         --browser-mode daemon-only \
         --out-dir eval/reports
 
-# External dev-instance eval (Phase 3 stub for now — errors out cleanly).
-eval-dev BENCHMARK LIMIT="10":
+# External dev-instance eval — connects to a locally-running nevoflux dev
+# instance whose daemon was launched with NEVOFLUX_DEV_INSTANCE_MODE=1.
+# See eval/README-EXTERNAL-MODE.md for setup.
+eval-dev BENCHMARK="online-mind2web" LIMIT="3":
     cargo run --release -p nevoflux-eval -- run \
         --benchmark {{BENCHMARK}} \
         --browser-mode external \
-        --browser-endpoint http://localhost:5959 \
         --limit {{LIMIT}} \
         --out-dir eval/reports
 
