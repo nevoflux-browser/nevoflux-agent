@@ -496,7 +496,10 @@ async fn execute_task_impl(
             &SubmitMessageRequest {
                 prompt,
                 timeout_secs: Some(task_timeout_secs),
-                tools_config: None,
+                tools_config: Some(
+                    serde_json::to_value(benchmark.tools_config())
+                        .unwrap_or(serde_json::Value::Null),
+                ),
             },
         )
         .await

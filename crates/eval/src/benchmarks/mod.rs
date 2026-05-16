@@ -4,6 +4,7 @@ use crate::{
     EvalResult, Task,
 };
 use async_trait::async_trait;
+use nevoflux_protocol::subagent::ToolsConfig;
 
 pub mod browsecomp;
 pub mod nevoflux_suite;
@@ -61,6 +62,14 @@ pub trait Benchmark: Send + Sync {
             BrowserLaunchMode::DaemonOnly { .. } => 8,
             _ => 1, // real-browser benchmarks are conservative by default
         }
+    }
+
+    /// Tools to expose to the agent for tasks in this benchmark.
+    /// Default `None` — most benchmarks don't need tools. Browser-based
+    /// benchmarks (Online-Mind2Web, etc.) override to enable navigation,
+    /// click, type, etc.
+    fn tools_config(&self) -> ToolsConfig {
+        ToolsConfig::None
     }
 }
 
