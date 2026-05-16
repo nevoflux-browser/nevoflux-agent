@@ -132,6 +132,11 @@ pub struct TaskResult {
     pub error: Option<String>,
     /// References to traces in the daemon's `traces` table for post-mortem.
     pub trace_ids: Vec<String>,
+    /// Names of daemon_event spans observed during this task run.
+    /// Populated by Runner from the /traces endpoint after task completion.
+    /// Phase 3a addition (defaults to empty for backwards compat).
+    #[serde(default)]
+    pub observed_events: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

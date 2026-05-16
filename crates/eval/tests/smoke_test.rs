@@ -32,6 +32,7 @@ async fn structured_judge_passes_when_all_assertions_match() {
         token_cost: None,
         error: None,
         trace_ids: vec![],
+        observed_events: vec![],
     };
 
     let judge = StructuredJudge::new();

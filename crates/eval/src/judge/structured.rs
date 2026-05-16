@@ -105,6 +105,7 @@ mod tests {
             token_cost: None,
             error: None,
             trace_ids: vec![],
+            observed_events: vec![],
         }
     }
 

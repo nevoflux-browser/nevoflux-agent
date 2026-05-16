@@ -206,6 +206,7 @@ impl Runner {
                         token_cost: None,
                         error: None,
                         trace_ids: vec![],
+                        observed_events: vec![],
                     },
                     verdict: None,
                 });
@@ -269,6 +270,7 @@ impl Runner {
                         token_cost: None,
                         error: Some(e.to_string()),
                         trace_ids: vec![],
+                        observed_events: vec![],
                     }
                 }
             };
@@ -541,6 +543,20 @@ async fn execute_task_impl(
         tracing::warn!(session_id = %sid, error = %e, "delete_session failed (continuing)");
     }
 
+    // Fetch traces and extract daemon_event names + trace ids
+    let mut observed_events: Vec<String> = Vec::new();
+    let mut trace_ids: Vec<String> = Vec::new();
+    match client.get_traces(&sid).await {
+        Ok(body) => {
+            let entries = crate::daemon_client::traces::parse_jsonl(&body);
+            trace_ids = entries.iter().map(|e| e.id.to_string()).collect();
+            observed_events = crate::daemon_client::traces::event_names(&entries);
+        }
+        Err(e) => {
+            tracing::warn!(session_id = %sid, error = %e, "get_traces failed (continuing)");
+        }
+    }
+
     // (7) Build result
     let status = if timed_out {
         TaskStatus::Timeout
@@ -559,6 +575,7 @@ async fn execute_task_impl(
         latency_ms: started.elapsed().as_millis() as u64,
         token_cost: None, // Phase 3: parse from tool_result events
         error: termination_reason,
-        trace_ids: vec![], // Phase 3: read traces endpoint and extract IDs
+        trace_ids,
+        observed_events,
     })
 }

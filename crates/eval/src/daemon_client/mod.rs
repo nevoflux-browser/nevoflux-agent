@@ -10,5 +10,8 @@ pub mod http;
 pub mod sse;
 pub use sse::{stream_events, SseError};
 
+pub mod traces;
+pub use traces::{event_names, parse_jsonl, TraceEntry, TracesParseError};
+
 pub use http::{DaemonHttpClient, HttpError};
 pub use lock::{wait_for_lock, DaemonLock, LockError};
