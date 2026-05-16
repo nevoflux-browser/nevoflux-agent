@@ -171,10 +171,7 @@ async fn cross_session_inject_routes_correctly() {
 
     let daemon = daemon_path();
     if !daemon.exists() {
-        eprintln!(
-            "skipping: daemon binary not built at {}.",
-            daemon.display()
-        );
+        eprintln!("skipping: daemon binary not built at {}.", daemon.display());
         return;
     }
 

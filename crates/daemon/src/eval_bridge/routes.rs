@@ -141,7 +141,11 @@ pub async fn setup_session(
 
     for step in body.steps {
         match step {
-            SetupStep::InjectMessage { session, role, content } => {
+            SetupStep::InjectMessage {
+                session,
+                role,
+                content,
+            } => {
                 let message_role = MessageRole::from_str(&role).map_err(|_| {
                     (
                         StatusCode::BAD_REQUEST,

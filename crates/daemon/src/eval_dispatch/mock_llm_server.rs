@@ -176,10 +176,7 @@ async fn anthropic_messages(Json(req): Json<AnthropicRequest>) -> Json<Anthropic
         id: "msg_mock_eval".into(),
         ty: "message",
         role: "assistant",
-        content: vec![AnthropicContent {
-            ty: "text",
-            text,
-        }],
+        content: vec![AnthropicContent { ty: "text", text }],
         model: req.model,
         stop_reason: "end_turn",
         stop_sequence: None,
@@ -264,7 +261,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status().as_u16(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["choices"][0]["message"]["content"], "Custom test reply.");
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "Custom test reply."
+        );
 
         // Next call falls back to canned default.
         let resp2 = reqwest::Client::new()
@@ -277,6 +277,9 @@ mod tests {
             .await
             .unwrap();
         let body2: serde_json::Value = resp2.json().await.unwrap();
-        assert_eq!(body2["choices"][0]["message"]["content"], "Eval mock response.");
+        assert_eq!(
+            body2["choices"][0]["message"]["content"],
+            "Eval mock response."
+        );
     }
 }

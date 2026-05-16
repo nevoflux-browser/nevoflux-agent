@@ -455,13 +455,19 @@ async fn execute_task_impl(
             .setup
             .iter()
             .map(|s| match s {
-                crate::SetupStep::InjectMessage { session, role, content } => {
-                    ClientSetupStep::InjectMessage {
-                        session: if session.is_empty() { None } else { Some(session.clone()) },
-                        role: role.clone(),
-                        content: content.clone(),
-                    }
-                }
+                crate::SetupStep::InjectMessage {
+                    session,
+                    role,
+                    content,
+                } => ClientSetupStep::InjectMessage {
+                    session: if session.is_empty() {
+                        None
+                    } else {
+                        Some(session.clone())
+                    },
+                    role: role.clone(),
+                    content: content.clone(),
+                },
                 crate::SetupStep::SeedMemory { content } => ClientSetupStep::SeedMemory {
                     key: "memory".into(),
                     value: content.clone(),

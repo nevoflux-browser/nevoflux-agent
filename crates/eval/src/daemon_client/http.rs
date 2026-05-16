@@ -50,8 +50,13 @@ pub enum SetupStep {
         role: String,
         content: String,
     },
-    SeedMemory { key: String, value: String },
-    GrantPermission { tool: String },
+    SeedMemory {
+        key: String,
+        value: String,
+    },
+    GrantPermission {
+        tool: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
