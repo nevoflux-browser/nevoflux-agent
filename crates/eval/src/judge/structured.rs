@@ -1,9 +1,10 @@
 //! Structured judge — verifies daemon-side state assertions by inspecting
 //! the trace export (`GET /_eval/sessions/:id/traces`).
 //!
-//! For Phase 2 this judge checks text assertions fully. `DaemonEvent` and
-//! `NoOutboundTo` are best-effort (pass without verification) until Phase 3
-//! threads observed daemon events / tcpdump results into TaskResult.
+//! For Phase 2 this judge checks text assertions fully. `NoOutboundTo` is
+//! best-effort (pass without verification) until Phase 3 threads tcpdump
+//! results into TaskResult. `DaemonEvent` is now verified in Phase 3 against
+//! `TaskResult::observed_events`.
 
 use crate::{
     judge::{Judge, Verdict},
@@ -34,11 +35,8 @@ impl Judge for StructuredJudge {
 
         for a in &task.assertions {
             let pass = match a {
-                Assertion::DaemonEvent { event: _ } => {
-                    // Phase 2: best-effort pass. Real verification lands in
-                    // Phase 3 once Runner attaches observed daemon events to
-                    // TaskResult.
-                    true
+                Assertion::DaemonEvent { event } => {
+                    result.observed_events.iter().any(|n| n == event)
                 }
                 Assertion::NoOutboundTo { .. } => {
                     // Phase 3 (tcpdump).
@@ -111,9 +109,11 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_event_phase2_best_effort_passes() {
+        // Phase 3: DaemonEvent now requires observed_events to contain the event.
+        // With no observed events the assertion must fail.
         let t = task(vec![Assertion::DaemonEvent { event: "x".into() }]);
         let v = StructuredJudge.judge(&t, &result("any")).await.unwrap();
-        assert!(v.correct);
+        assert!(!v.correct);
     }
 
     #[tokio::test]
@@ -128,6 +128,23 @@ mod tests {
             .judge(&t, &result("no match"))
             .await
             .unwrap();
+        assert!(!v.correct);
+    }
+
+    #[tokio::test]
+    async fn daemon_event_passes_when_observed() {
+        let t = task(vec![Assertion::DaemonEvent { event: "canvas_app_created".into() }]);
+        let mut r = result("");
+        r.observed_events = vec!["canvas_app_created".into()];
+        let v = StructuredJudge.judge(&t, &r).await.unwrap();
+        assert!(v.correct);
+    }
+
+    #[tokio::test]
+    async fn daemon_event_fails_when_not_observed() {
+        let t = task(vec![Assertion::DaemonEvent { event: "canvas_app_created".into() }]);
+        let r = result(""); // observed_events stays default []
+        let v = StructuredJudge.judge(&t, &r).await.unwrap();
         assert!(!v.correct);
     }
 }
