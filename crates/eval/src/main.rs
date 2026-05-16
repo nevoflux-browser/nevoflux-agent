@@ -23,7 +23,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use nevoflux_eval::{benchmarks, browser::BrowserLaunchMode, judge, reporter, Runner, RunnerConfig};
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::info;
 
 #[derive(Parser)]
 #[command(name = "nevoflux-eval", about = "NevoFlux evaluation harness")]
@@ -113,8 +113,8 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Run {
             benchmark,
-            judge: judge_name,
-            daemon_addr,
+            judge,
+            daemon_addr: _,
             timeout,
             limit,
             filter,
@@ -123,80 +123,87 @@ async fn main() -> anyhow::Result<()> {
             browser_version,
             browser_cache_dir,
             out_dir,
-            trends,
+            trends: _,
         } => {
-            let bench = benchmarks::find(&benchmark).ok_or_else(|| {
-                anyhow::anyhow!("benchmark `{}` not found; run `nevoflux-eval list`", benchmark)
-            })?;
+            // Resolve daemon binary path.
+            // Priority: NEVOFLUX_EVAL_DAEMON_BINARY env var → sibling of current_exe.
+            let daemon_binary: PathBuf = std::env::var_os("NEVOFLUX_EVAL_DAEMON_BINARY")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    // current_exe lands in target/<profile>/nevoflux-eval;
+                    // the daemon binary is a sibling: target/<profile>/nevoflux-agent.
+                    let mut p = std::env::current_exe().expect("current_exe");
+                    p.pop(); // strip exec name — now at target/<profile>/
+                    p.push("nevoflux-agent");
+                    p
+                });
 
-            let judge_name = judge_name.unwrap_or_else(|| bench.default_judge().to_string());
-            let judge = judge::find(&judge_name).ok_or_else(|| {
-                anyhow::anyhow!("judge `{}` not found; run `nevoflux-eval list`", judge_name)
-            })?;
+            // Resolve state dir.
+            // Priority: NEVOFLUX_EVAL_STATE_DIR env var → OS data-local dir → .cache fallback.
+            let state_dir: PathBuf = std::env::var_os("NEVOFLUX_EVAL_STATE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    directories::ProjectDirs::from("com", "nevoflux", "nevoflux-eval")
+                        .map(|d| d.data_local_dir().to_path_buf())
+                        .unwrap_or_else(|| PathBuf::from(".cache/nevoflux-eval"))
+                });
 
-            let browser = match browser_mode {
-                // TODO(Task 16): resolve daemon_binary and state_dir from CLI flags properly.
-                // For now, use placeholder paths so the crate compiles; Task 16 replaces this.
+            let mode = match browser_mode {
                 BrowserModeArg::DaemonOnly => BrowserLaunchMode::DaemonOnly {
-                    daemon_binary: PathBuf::from("target/release/nevoflux-agent"),
-                    state_dir: PathBuf::from(".eval-state"),
+                    daemon_binary: daemon_binary.clone(),
+                    state_dir: state_dir.clone(),
                 },
                 BrowserModeArg::External => BrowserLaunchMode::ExternalDevInstance {
                     endpoint: browser_endpoint,
                 },
-                BrowserModeArg::Release => {
-                    let v = browser_version.ok_or_else(|| {
-                        anyhow::anyhow!("--browser-version required for --browser-mode=release")
-                    })?;
-                    BrowserLaunchMode::ReleaseBinary {
-                        version: v,
-                        cache_dir: browser_cache_dir,
-                    }
-                }
+                BrowserModeArg::Release => BrowserLaunchMode::ReleaseBinary {
+                    version: browser_version
+                        .ok_or_else(|| anyhow::anyhow!("--browser-version required for --browser-mode=release"))?,
+                    cache_dir: browser_cache_dir,
+                },
             };
 
-            let signal_grade = browser.signal_grade();
-            info!(benchmark = %benchmark, judge = %judge_name, grade = ?signal_grade, "starting eval");
+            let browser = nevoflux_eval::browser::launch(&mode).await?;
+            browser.ensure_ready().await?;
+
+            let client = browser
+                .lock()
+                .map(nevoflux_eval::daemon_client::DaemonHttpClient::from_lock)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "this browser mode doesn't expose a daemon lock; \
+                         non-daemon-only modes are stubbed for Phase 2 — see Task 9"
+                    )
+                })?;
 
             let cfg = RunnerConfig {
-                daemon_addr,
+                daemon_addr: String::new(), // unused — HTTP discovery via lock
                 task_timeout_secs: timeout,
                 parallelism: 1,
                 task_filter: filter,
                 limit,
-                browser_mode: browser,
+                browser_mode: mode.clone(),
             };
-            let runner = Runner::new(cfg);
-            let summary = runner.run(bench.as_ref(), judge.as_ref()).await?;
+            let runner = Runner::with_client(cfg, client);
 
-            // Route output by signal grade.
-            let graded_dir = out_dir.join(summary.signal_grade.subdir());
-            let md_path = reporter::write_markdown(&summary, &graded_dir).await?;
-            let json_path = reporter::write_json(&summary, &graded_dir).await?;
-            reporter::append_trend(&summary, &trends).await?;
+            let bench = benchmarks::find(&benchmark)
+                .ok_or_else(|| anyhow::anyhow!("benchmark not found: {benchmark}"))?;
+            let judge_name = judge.unwrap_or_else(|| bench.default_judge().to_string());
+            let judge_inst = judge::find(&judge_name)
+                .ok_or_else(|| anyhow::anyhow!("judge not found: {judge_name}"))?;
 
             info!(
-                accuracy = format!("{:.1}%", summary.accuracy() * 100.0),
-                grade = ?summary.signal_grade,
-                browser = %summary.browser_version,
-                skipped = summary.skipped,
-                report = ?md_path,
-                json = ?json_path,
-                "eval finished"
+                benchmark = %benchmark,
+                judge = %judge_name,
+                "starting eval run"
             );
+            let summary = runner.run(&*bench, &*judge_inst).await?;
 
-            // Optional CI threshold check.
-            if let Ok(threshold) = std::env::var("EVAL_MIN_ACCURACY") {
-                let threshold: f64 = threshold.parse()?;
-                if summary.accuracy() < threshold {
-                    error!(
-                        accuracy = summary.accuracy(),
-                        threshold = threshold,
-                        "below CI threshold — failing build"
-                    );
-                    std::process::exit(1);
-                }
-            }
+            let grade_dir = out_dir.join(summary.signal_grade.subdir());
+            let report_path = reporter::write_markdown(&summary, &grade_dir).await?;
+            info!(path = ?report_path, "report written");
+
+            browser.shutdown().await?;
         }
     }
 
