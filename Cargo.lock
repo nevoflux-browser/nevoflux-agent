@@ -3545,6 +3545,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "nevoflux-eval"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "clap",
+ "directories",
+ "futures",
+ "glob",
+ "nevoflux-protocol",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "nevoflux-llm"
 version = "0.2.0"
 dependencies = [

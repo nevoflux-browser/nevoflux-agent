@@ -11,16 +11,17 @@ description = "NevoFlux Native Agent - AI-powered browser assistant"
 [workspace]
 resolver = "2"
 members = [
-    "crates/protocol",
-    "crates/storage",
-    "crates/llm",
-    "crates/testing",
-    "crates/mcp",
-    "crates/daemon",
     "crates/bridge",
-    "crates/skills",
-    "crates/computer",
     "crates/builtin-wasm",
+    "crates/computer",
+    "crates/daemon",
+    "crates/eval",
+    "crates/llm",
+    "crates/mcp",
+    "crates/protocol",
+    "crates/skills",
+    "crates/storage",
+    "crates/testing",
 ]
 
 [workspace.package]
@@ -41,6 +42,10 @@ rmp-serde = "1"
 
 # Error handling
 thiserror = "2"
+anyhow = "1"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
 
 # Storage
 rusqlite = { version = "0.32", features = ["bundled"] }
