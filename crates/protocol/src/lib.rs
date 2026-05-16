@@ -32,6 +32,7 @@ pub mod chat;
 pub mod common;
 pub mod envelope;
 mod error;
+pub mod eval_events;
 pub mod events;
 pub mod extract;
 pub mod json_repair;
@@ -75,6 +76,9 @@ pub use mcp::{
     JsonRpcError, JsonRpcId, JsonRpcRequest, JsonRpcResponse, McpMessage, McpRequest, McpResponse,
     McpSource,
 };
+
+// Re-export eval event registry
+pub use eval_events::DaemonEventName;
 
 // Re-export EventBus types
 pub use events::{
