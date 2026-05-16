@@ -32,6 +32,14 @@ pub async fn create_session(
     // Default to "chat" if mode is not specified.
     let mode_str = body.mode.as_deref().unwrap_or("chat");
 
+    if body.llm_backend.is_some() || body.mock_browser.is_some() {
+        tracing::warn!(
+            llm_backend = ?body.llm_backend,
+            mock_browser = ?body.mock_browser,
+            "eval-bridge: llm_backend/mock_browser not yet wired; fields ignored (phase-2)"
+        );
+    }
+
     let session = match mode_str {
         "agent" => state
             .session_manager
@@ -43,6 +51,14 @@ pub async fn create_session(
             .create_session(None, None)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("create_session: {e}")))?,
+        // TODO(phase-2): "browser" mode deferred — SessionManager has no Browser variant yet.
+        // Currently only "chat" and "agent" are supported.
+        "browser" => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "browser mode not yet supported (phase-2 — SessionManager needs Browser variant)".into(),
+            ));
+        }
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
