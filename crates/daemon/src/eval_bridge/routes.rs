@@ -35,7 +35,16 @@ pub struct CreateSessionResponse {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SetupStep {
     /// Insert a prior conversation message into the session history.
-    InjectMessage { role: String, content: String },
+    InjectMessage {
+        /// Optional target session — if Some, messages are injected into
+        /// that named session (created if absent). If None or matches the
+        /// path-level :id, the message is injected into the current session.
+        /// Phase 3c addition; backward-compat for callers that omit it.
+        #[serde(default)]
+        session: Option<String>,
+        role: String,
+        content: String,
+    },
     /// Pre-populate a memory entry visible to this session.
     SeedMemory { key: String, value: String },
     /// Grant a permission upfront so the agent can use a gated tool.
@@ -132,7 +141,7 @@ pub async fn setup_session(
 
     for step in body.steps {
         match step {
-            SetupStep::InjectMessage { role, content } => {
+            SetupStep::InjectMessage { session, role, content } => {
                 let message_role = MessageRole::from_str(&role).map_err(|_| {
                     (
                         StatusCode::BAD_REQUEST,
@@ -141,9 +150,42 @@ pub async fn setup_session(
                         ),
                     )
                 })?;
+                // Determine target session: body.session overrides path session_id.
+                let target_session_id: String = match session {
+                    Some(s) if s != session_id => s,
+                    _ => session_id.clone(),
+                };
+                // Ensure target session exists. get_session returns Result<Option<Session>>:
+                //   Err — DB lookup failed (bubble up)
+                //   Ok(None) — session not found, create it
+                //   Ok(Some(_)) — session already exists, no-op
+                if target_session_id != session_id {
+                    let existing = state
+                        .session_manager
+                        .get_session(&target_session_id)
+                        .await
+                        .map_err(|e| {
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("get_session({target_session_id}): {e}"),
+                            )
+                        })?;
+                    if existing.is_none() {
+                        state
+                            .session_manager
+                            .create_session(Some(target_session_id.clone()), None)
+                            .await
+                            .map_err(|e| {
+                                (
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    format!("create_named_session({target_session_id}): {e}"),
+                                )
+                            })?;
+                    }
+                }
                 state
                     .session_manager
-                    .add_message(&session_id, message_role, &content)
+                    .add_message(&target_session_id, message_role, &content)
                     .await
                     .map_err(|e| {
                         (

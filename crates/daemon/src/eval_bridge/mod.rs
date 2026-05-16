@@ -264,4 +264,48 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status().as_u16(), 204);
     }
+
+    #[tokio::test]
+    async fn setup_inject_message_routes_to_named_session() {
+        let state = test_state();
+        let sm = state.session_manager.clone();
+        let addr = spawn(state).await.unwrap();
+        let client = reqwest::Client::new();
+        let sid = create_test_session(&client, addr).await;
+
+        let resp = client
+            .post(format!("http://{}/_eval/sessions/{}/setup", addr, sid))
+            .bearer_auth("secret-test-token")
+            .json(&serde_json::json!({
+                "steps": [
+                    {
+                        "type": "inject_message",
+                        "session": "memory-prev",
+                        "role": "user",
+                        "content": "I prefer 测试 mode"
+                    }
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+
+        // Verify the message landed in the named session, not the path one.
+        let prev_msgs = sm
+            .get_recent_messages("memory-prev", 10)
+            .await
+            .expect("named session exists after cross-session inject");
+        assert_eq!(prev_msgs.len(), 1);
+        assert!(prev_msgs[0].content.contains("测试 mode"));
+
+        let path_msgs = sm
+            .get_recent_messages(&sid, 10)
+            .await
+            .expect("path session still exists");
+        assert!(
+            !path_msgs.iter().any(|m| m.content.contains("测试 mode")),
+            "cross-session inject leaked into path session"
+        );
+    }
 }
