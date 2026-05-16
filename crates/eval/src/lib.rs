@@ -17,6 +17,7 @@
 
 pub mod benchmarks;
 pub mod browser;
+pub mod daemon_client;
 pub mod error;
 pub mod judge;
 pub mod metrics;
@@ -25,6 +26,7 @@ pub mod runner;
 pub mod termination;
 
 pub use browser::{BrowserHandle, BrowserLaunchMode};
+pub use daemon_client::DaemonLock;
 pub use error::{EvalError, EvalResult};
 pub use runner::{Runner, RunnerConfig};
 pub use termination::{AnswerExtractor, DaemonEvent, TerminationDecision, TerminationStrategy};
