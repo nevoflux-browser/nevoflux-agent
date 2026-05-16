@@ -1,0 +1,31 @@
+{
+  "version": "phase3c-fixture-v1",
+  "source": "hand-written for Phase 3c smoke; replace with HuggingFace Phantom-AI/BrowseComp-ZH parquet in Phase 3d/4 (see eval/README-DATASETS.md)",
+  "tasks": [
+    {
+      "id": "bc-zh-fixture-001",
+      "question": "中国的首都是哪个城市？",
+      "answer": "北京"
+    },
+    {
+      "id": "bc-zh-fixture-002",
+      "question": "鲁迅的本名是什么？",
+      "answer": "周树人"
+    },
+    {
+      "id": "bc-zh-fixture-003",
+      "question": "中国哪一年加入世界贸易组织（WTO）？",
+      "answer": "2001"
+    },
+    {
+      "id": "bc-zh-fixture-004",
+      "question": "中国第一颗人造地球卫星的名字是什么？",
+      "answer": "东方红一号"
+    },
+    {
+      "id": "bc-zh-fixture-005",
+      "question": "中国大陆面积最大的湖泊是哪个？",
+      "answer": "青海湖"
+    }
+  ]
+}
