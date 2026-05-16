@@ -246,4 +246,19 @@ mod tests {
             "unexpected body for empty trace: {body:?}"
         );
     }
+
+    #[tokio::test]
+    async fn delete_session_returns_204() {
+        let state = test_state();
+        let addr = spawn(state).await.unwrap();
+        let client = reqwest::Client::new();
+        let sid = create_test_session(&client, addr).await;
+        let resp = client
+            .delete(format!("http://{}/_eval/sessions/{}", addr, sid))
+            .bearer_auth("secret-test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 204);
+    }
 }

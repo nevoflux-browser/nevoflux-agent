@@ -287,6 +287,19 @@ impl SessionManager {
             .await
     }
 
+    /// Close a session without deleting any data rows.
+    ///
+    /// Marks the session as archived so it no longer appears in the active
+    /// session list, but all messages, artifacts, and memory entries are
+    /// **preserved** in the database.  Trace spans are kept untouched because
+    /// they live in a separate [`TraceCollector`] storage (e.g. `traces.db`).
+    ///
+    /// This is the correct teardown path for eval runs — the runner must be
+    /// able to inspect messages and traces after the session ends.
+    pub async fn close_session_preserve_data(&self, session_id: &str) -> Result<Session> {
+        self.archive_session(session_id).await
+    }
+
     /// Set session title.
     pub async fn set_title(&self, session_id: &str, title: &str) -> Result<Session> {
         self.update_session(session_id, UpdateSessionParams::new().with_title(title))

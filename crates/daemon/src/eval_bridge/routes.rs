@@ -341,6 +341,30 @@ pub async fn stream_traces(
         .unwrap()
 }
 
-pub async fn delete_session(State(_s): State<EvalAppState>, Path(_id): Path<String>) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "delete_session — see Task 15")
+pub async fn delete_session(
+    State(state): State<EvalAppState>,
+    Path(session_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // Archive the session so it is removed from active listings, but keep all
+    // message, artifact, and trace rows intact for post-run debugging.
+    // Trace spans live in a separate TraceCollector storage (traces.db) and
+    // are never touched by this path.
+    state
+        .session_manager
+        .close_session_preserve_data(&session_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("close_session_preserve_data: {e}"),
+            )
+        })?;
+
+    tracing::info!(
+        run_id = %state.eval_run_id,
+        session_id = %session_id,
+        "eval session closed (data preserved)"
+    );
+
+    Ok(StatusCode::NO_CONTENT)
 }
