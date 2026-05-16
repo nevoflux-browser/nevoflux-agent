@@ -9,7 +9,6 @@ use axum::{
 use futures::StreamExt;
 use nevoflux_storage::MessageRole;
 use serde::{Deserialize, Serialize};
-use std::convert::Infallible;
 use std::pin::Pin;
 use std::str::FromStr;
 use super::sse::{to_sse, EvalEvent};
