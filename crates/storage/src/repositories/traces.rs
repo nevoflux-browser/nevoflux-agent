@@ -28,7 +28,7 @@ pub struct CreateTraceSpanParams {
 }
 
 /// A trace span record from the database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct TraceSpanRecord {
     /// Auto-incremented row ID.
     pub id: i64,

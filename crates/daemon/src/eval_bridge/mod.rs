@@ -78,6 +78,8 @@ mod tests {
             agent_turn_tx: None,
             // No EventBus in unit-test context; stream_events emits a phase-2 placeholder.
             event_bus: None,
+            // No TraceCollector in unit-test context; stream_traces returns empty JSONL.
+            trace_collector: None,
         }
     }
 
@@ -212,6 +214,36 @@ mod tests {
         assert!(
             ct.starts_with("text/event-stream"),
             "expected SSE content-type, got: {ct}"
+        );
+    }
+
+    #[tokio::test]
+    async fn traces_endpoint_returns_jsonl() {
+        let state = test_state();
+        let addr = spawn(state).await.unwrap();
+        let client = reqwest::Client::new();
+        let sid = create_test_session(&client, addr).await;
+        let resp = client
+            .get(format!("http://{}/_eval/sessions/{}/traces", addr, sid))
+            .bearer_auth("secret-test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("application/jsonl"),
+            "expected application/jsonl content-type, got: {ct}"
+        );
+        // Empty session: empty body or trailing newline only.
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.is_empty() || body.ends_with('\n'),
+            "unexpected body for empty trace: {body:?}"
         );
     }
 }

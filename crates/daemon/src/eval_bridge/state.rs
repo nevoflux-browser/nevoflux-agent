@@ -2,6 +2,7 @@
 
 use crate::event_bus::EventBus;
 use crate::session::SessionManager;
+use crate::trace::collector::TraceCollector;
 use std::sync::Arc;
 
 /// A request to run one agent turn, sent through the eval-bridge dispatch channel.
@@ -33,4 +34,11 @@ pub struct EvalAppState {
     /// When `None` (unit-test contexts), the stream emits a single phase-2
     /// placeholder `Error` event and then closes.
     pub event_bus: Option<Arc<EventBus>>,
+    /// Optional handle to the per-run TraceCollector.
+    ///
+    /// When `Some`, `GET /_eval/sessions/:id/traces` reads all recorded spans
+    /// for the session and streams them as JSONL.
+    /// When `None` (unit-test contexts or before Task 16 wiring), the endpoint
+    /// returns an empty body with `application/jsonl` content-type.
+    pub trace_collector: Option<Arc<TraceCollector>>,
 }

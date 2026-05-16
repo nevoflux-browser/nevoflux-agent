@@ -300,8 +300,45 @@ pub async fn stream_events(
     to_sse(eval_stream).into_response()
 }
 
-pub async fn stream_traces(State(_s): State<EvalAppState>, Path(_id): Path<String>) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "stream_traces — see Task 14")
+pub async fn stream_traces(
+    State(state): State<EvalAppState>,
+    Path(session_id): Path<String>,
+) -> axum::response::Response {
+    use axum::body::Body;
+    use axum::http::header;
+
+    let spans = match &state.trace_collector {
+        Some(tc) => match tc.traces_for_session(&session_id) {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("traces: {e}"),
+                )
+                    .into_response();
+            }
+        },
+        None => {
+            // Test-mode or trace collector not yet wired — return empty body.
+            tracing::debug!(
+                session_id = %session_id,
+                "no trace collector wired; returning empty JSONL"
+            );
+            vec![]
+        }
+    };
+
+    let mut body = String::with_capacity(spans.len() * 128);
+    for span in &spans {
+        body.push_str(&serde_json::to_string(span).unwrap_or_else(|_| "{}".into()));
+        body.push('\n');
+    }
+
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/jsonl")
+        .body(Body::from(body))
+        .unwrap()
 }
 
 pub async fn delete_session(State(_s): State<EvalAppState>, Path(_id): Path<String>) -> impl IntoResponse {

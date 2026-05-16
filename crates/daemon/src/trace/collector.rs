@@ -166,6 +166,20 @@ impl TraceCollector {
             .unwrap_or(0)
     }
 
+    /// Return all trace spans for a session, ordered by iteration then id.
+    ///
+    /// Used by `GET /_eval/sessions/:id/traces` to export a JSONL snapshot of
+    /// everything recorded during an eval run.
+    pub fn traces_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<nevoflux_storage::TraceSpanRecord>, StorageError> {
+        self.storage
+            .traces()
+            .list_by_session(session_id)
+            .map_err(|e| e)
+    }
+
     /// Cleanup traces for a completed session.
     pub fn cleanup_session(&self, session_id: &str) {
         let _ = self.storage.traces().delete_by_session(session_id);
