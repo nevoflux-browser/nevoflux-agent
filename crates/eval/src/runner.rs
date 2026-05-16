@@ -16,8 +16,11 @@ use crate::{
     judge::{Judge, Verdict},
     EvalError, EvalResult, SignalGrade, Task, TaskResult, TaskStatus,
 };
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::time::timeout;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 #[derive(Debug, Clone)]
@@ -142,11 +145,22 @@ impl Runner {
         let mut latencies = Vec::with_capacity(tasks.len());
         let mut timeouts = 0usize;
         let mut skipped = 0usize;
-        let mut total_token_cost = 0.0;
-        let mut total_judge_cost = 0.0;
+        let mut total_token_cost = 0.0f64;
+        let mut total_judge_cost = 0.0f64;
 
-        for (i, task) in tasks.iter().enumerate() {
-            // Browser availability check.
+        // Compute effective parallelism: bounded by config and benchmark's own cap.
+        let effective_parallelism = self
+            .config
+            .parallelism
+            .min(benchmark.max_parallelism(&self.config.browser_mode))
+            .max(1);
+        tracing::info!(parallelism = effective_parallelism, "effective concurrency");
+
+        let semaphore = Arc::new(Semaphore::new(effective_parallelism));
+
+        // Partition tasks into skipped (no browser) and to-run.
+        let mut to_run: Vec<Task> = Vec::with_capacity(tasks.len());
+        for task in tasks.iter() {
             if task.requires_browser && !browser.is_real_browser() {
                 info!(id = %task.id, "skipping: task requires browser, runner is DaemonOnly");
                 skipped += 1;
@@ -163,49 +177,52 @@ impl Runner {
                     },
                     verdict: None,
                 });
-                continue;
+            } else {
+                to_run.push(task.clone());
             }
+        }
 
-            info!(
-                progress = format!("{}/{}", i + 1, tasks.len()),
-                id = %task.id,
-                "running task"
-            );
+        // Dispatch all runnable tasks into a FuturesUnordered pool, gated by the semaphore.
+        let mut pending: FuturesUnordered<
+            std::pin::Pin<Box<dyn std::future::Future<Output = (Task, EvalResult<TaskResult>)> + Send>>,
+        > = FuturesUnordered::new();
 
-            let started = Instant::now();
-            let exec_result = timeout(
-                Duration::from_secs(self.config.task_timeout_secs + 30),
-                self.execute_task(task, benchmark, browser.as_ref()),
-            )
-            .await;
+        let timeout_secs = self.config.task_timeout_secs;
+        let client = self.client.clone();
 
+        for task in to_run.iter().cloned() {
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| EvalError::Other(format!("semaphore: {e}")))?;
+            let client_for_task = client.clone();
+            let task_for_log = task.id.clone();
+            info!(id = %task_for_log, "queuing task");
+            pending.push(Box::pin(execute_task_owned(
+                task,
+                benchmark,
+                browser.as_ref(),
+                client_for_task,
+                timeout_secs,
+                permit,
+            )));
+        }
+
+        // Collect results as they complete (order is non-deterministic; outcomes are appended
+        // to the vec as they arrive — the RunSummary consumer sorts by task.id if needed).
+        while let Some((task, exec_result)) = pending.next().await {
             let result = match exec_result {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
+                Ok(r) => r,
+                Err(e) => {
                     error!(id = %task.id, error = %e, "task execution failed");
                     TaskResult {
                         task_id: task.id.clone(),
                         status: TaskStatus::Failed,
                         final_answer: None,
-                        latency_ms: started.elapsed().as_millis() as u64,
+                        latency_ms: 0,
                         token_cost: None,
                         error: Some(e.to_string()),
-                        trace_ids: vec![],
-                    }
-                }
-                Err(_) => {
-                    timeouts += 1;
-                    warn!(id = %task.id, "task timed out");
-                    TaskResult {
-                        task_id: task.id.clone(),
-                        status: TaskStatus::Timeout,
-                        final_answer: None,
-                        latency_ms: (self.config.task_timeout_secs * 1000) as u64,
-                        token_cost: None,
-                        error: Some(format!(
-                            "timeout after {}s",
-                            self.config.task_timeout_secs
-                        )),
                         trace_ids: vec![],
                     }
                 }
@@ -215,15 +232,24 @@ impl Runner {
             if let Some(ref c) = result.token_cost {
                 total_token_cost += c.usd;
             }
+            if matches!(result.status, TaskStatus::Timeout) {
+                timeouts += 1;
+            }
 
-            let verdict = judge.judge(task, &result).await?;
-            total_judge_cost += verdict.judge_cost_usd;
+            // Judge runs synchronously here (in the collector loop) so it can borrow `judge`
+            // from the outer scope without needing to move it into each per-task future.
+            let verdict = match judge.judge(&task, &result).await {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    warn!(id = %task.id, error = %e, "judge failed");
+                    None
+                }
+            };
+            if let Some(ref v) = verdict {
+                total_judge_cost += v.judge_cost_usd;
+            }
 
-            outcomes.push(TaskOutcome {
-                task: task.clone(),
-                result,
-                verdict: Some(verdict),
-            });
+            outcomes.push(TaskOutcome { task, result, verdict });
         }
 
         if let Err(e) = browser.shutdown().await {
@@ -272,165 +298,194 @@ impl Runner {
 
     /// Execute a single task against the daemon via HTTP + SSE.
     ///
-    /// Flow:
-    ///   1. Create a fresh daemon session for the task's mode
-    ///   2. Apply setup steps (inject messages, seed memory, grant permissions)
-    ///   3. Open SSE event stream before submitting the prompt (avoids race)
-    ///   4. Submit the prompt (with optional benchmark-supplied suffix)
-    ///   5. Consume events, evaluating `TerminationStrategy` after each event
-    ///   6. Clean up the session (DELETE)
-    ///   7. Extract `final_answer` via `AnswerExtractor` and build `TaskResult`
-    async fn execute_task(
+    /// Thin wrapper kept for direct callers / tests that bypass `run`.
+    #[allow(dead_code)]
+    pub(crate) async fn execute_task(
         &self,
         task: &Task,
         benchmark: &dyn Benchmark,
         _browser: &dyn BrowserHandle,
     ) -> EvalResult<TaskResult> {
-        use crate::daemon_client::http::{
-            CreateSessionRequest, SetupRequest, SetupStep as ClientSetupStep,
-            SubmitMessageRequest,
-        };
-        use crate::daemon_client::sse::stream_events;
-        use crate::termination::{DaemonEvent, TerminationDecision};
-        use futures::StreamExt;
+        execute_task_impl(task, benchmark, self.client.as_ref(), self.config.task_timeout_secs).await
+    }
+}
 
-        let client = self
-            .client
-            .as_ref()
-            .ok_or_else(|| EvalError::DaemonConnection("runner has no http client".into()))?;
+// ---------------------------------------------------------------------------
+// Free functions — own all inputs so they can be stored in FuturesUnordered
+// ---------------------------------------------------------------------------
 
-        let started = std::time::Instant::now();
+/// Wrapper that takes full ownership of `task` and a semaphore permit.
+/// The permit is dropped when the future resolves, releasing the concurrency slot.
+async fn execute_task_owned<'b>(
+    task: Task,
+    benchmark: &'b dyn Benchmark,
+    _browser: &'b dyn BrowserHandle,
+    client: Option<crate::daemon_client::DaemonHttpClient>,
+    task_timeout_secs: u64,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+) -> (Task, EvalResult<TaskResult>) {
+    let result = execute_task_impl(&task, benchmark, client.as_ref(), task_timeout_secs).await;
+    (task, result)
+}
 
-        // (1) Create session
-        let mode_str = match task.mode {
-            crate::NevoFluxMode::Chat => "chat",
-            crate::NevoFluxMode::Browser => "browser",
-            crate::NevoFluxMode::Agent => "agent",
-        };
-        let create = client
-            .create_session(&CreateSessionRequest {
-                mode: mode_str.to_string(),
-                llm_backend: None,
-                mock_browser: None,
-                eval_run_id: None,
-            })
-            .await
-            .map_err(|e| EvalError::DaemonError(format!("create_session: {e}")))?;
-        let sid = create.session_id;
+/// Core execution logic — borrows `task` and `benchmark`, owns `client` reference.
+///
+/// Flow:
+///   1. Create a fresh daemon session for the task's mode
+///   2. Apply setup steps (inject messages, seed memory, grant permissions)
+///   3. Open SSE event stream before submitting the prompt (avoids race)
+///   4. Submit the prompt (with optional benchmark-supplied suffix)
+///   5. Consume events, evaluating `TerminationStrategy` after each event
+///   6. Clean up the session (DELETE)
+///   7. Extract `final_answer` via `AnswerExtractor` and build `TaskResult`
+async fn execute_task_impl(
+    task: &Task,
+    benchmark: &dyn Benchmark,
+    client: Option<&crate::daemon_client::DaemonHttpClient>,
+    task_timeout_secs: u64,
+) -> EvalResult<TaskResult> {
+    use crate::daemon_client::http::{
+        CreateSessionRequest, SetupRequest, SetupStep as ClientSetupStep,
+        SubmitMessageRequest,
+    };
+    use crate::daemon_client::sse::stream_events;
+    use crate::termination::{DaemonEvent, TerminationDecision};
+    use futures::StreamExt;
 
-        // (2) Apply setup steps
-        if !task.setup.is_empty() {
-            let steps: Vec<ClientSetupStep> = task
-                .setup
-                .iter()
-                .map(|s| match s {
-                    crate::SetupStep::InjectMessage { role, content, .. } => {
-                        ClientSetupStep::InjectMessage {
-                            role: role.clone(),
-                            content: content.clone(),
-                        }
-                    }
-                    crate::SetupStep::SeedMemory { content } => ClientSetupStep::SeedMemory {
-                        key: "memory".into(),
-                        value: content.clone(),
-                    },
-                    crate::SetupStep::GrantPermission { resource, action } => {
-                        ClientSetupStep::GrantPermission {
-                            tool: format!("{resource}:{action}"),
-                        }
-                    }
-                })
-                .collect();
-            let _ = client
-                .setup_session(&sid, &SetupRequest { steps })
-                .await
-                .map_err(|e| EvalError::DaemonError(format!("setup: {e}")))?;
-        }
+    let client = client
+        .ok_or_else(|| EvalError::DaemonConnection("runner has no http client".into()))?;
 
-        // (3) Open SSE stream FIRST so we don't race the submit
-        let resp = client
-            .open_events(&sid)
-            .await
-            .map_err(|e| EvalError::DaemonError(format!("open_events: {e}")))?;
-        let mut events = stream_events(resp);
+    let started = Instant::now();
 
-        // (4) Submit prompt (with optional suffix from benchmark)
-        let prompt = match benchmark.prompt_suffix() {
-            Some(suffix) => format!("{}{}", task.prompt, suffix),
-            None => task.prompt.clone(),
-        };
-        let _ = client
-            .submit_message(
-                &sid,
-                &SubmitMessageRequest {
-                    prompt,
-                    timeout_secs: Some(self.config.task_timeout_secs),
-                },
-            )
-            .await
-            .map_err(|e| EvalError::DaemonError(format!("submit: {e}")))?;
+    // (1) Create session
+    let mode_str = match task.mode {
+        crate::NevoFluxMode::Chat => "chat",
+        crate::NevoFluxMode::Browser => "browser",
+        crate::NevoFluxMode::Agent => "agent",
+    };
+    let create = client
+        .create_session(&CreateSessionRequest {
+            mode: mode_str.to_string(),
+            llm_backend: None,
+            mock_browser: None,
+            eval_run_id: None,
+        })
+        .await
+        .map_err(|e| EvalError::DaemonError(format!("create_session: {e}")))?;
+    let sid = create.session_id;
 
-        // (5) Consume events until termination strategy fires or task_timeout elapses
-        let strategy = benchmark.termination_strategy();
-        let extractor = benchmark.answer_extractor();
-        let task_timeout = Duration::from_secs(self.config.task_timeout_secs);
-        let mut collected: Vec<DaemonEvent> = Vec::new();
-        let mut termination_reason: Option<String> = None;
-
-        let consume = async {
-            loop {
-                match events.next().await {
-                    Some(Ok(evt)) => {
-                        collected.push(evt);
-                        match strategy.evaluate(&collected) {
-                            TerminationDecision::Continue => continue,
-                            TerminationDecision::Stop => break,
-                            TerminationDecision::StopWithError(msg) => {
-                                termination_reason = Some(msg);
-                                break;
-                            }
-                        }
-                    }
-                    Some(Err(e)) => {
-                        termination_reason = Some(format!("sse error: {e}"));
-                        break;
-                    }
-                    None => {
-                        termination_reason = Some("sse stream ended unexpectedly".into());
-                        break;
+    // (2) Apply setup steps
+    if !task.setup.is_empty() {
+        let steps: Vec<ClientSetupStep> = task
+            .setup
+            .iter()
+            .map(|s| match s {
+                crate::SetupStep::InjectMessage { role, content, .. } => {
+                    ClientSetupStep::InjectMessage {
+                        role: role.clone(),
+                        content: content.clone(),
                     }
                 }
-            }
-            Ok::<(), EvalError>(())
-        };
-
-        let timed = tokio::time::timeout(task_timeout, consume).await;
-        let timed_out = timed.is_err();
-
-        // (6) Cleanup: DELETE session (best-effort)
-        if let Err(e) = client.delete_session(&sid).await {
-            tracing::warn!(session_id = %sid, error = %e, "delete_session failed (continuing)");
-        }
-
-        // (7) Build result
-        let status = if timed_out {
-            TaskStatus::Timeout
-        } else if termination_reason.is_some() {
-            TaskStatus::Failed
-        } else {
-            TaskStatus::Completed
-        };
-
-        let final_answer = extractor.extract(&collected);
-
-        Ok(TaskResult {
-            task_id: task.id.clone(),
-            status,
-            final_answer,
-            latency_ms: started.elapsed().as_millis() as u64,
-            token_cost: None, // Phase 3: parse from tool_result events
-            error: termination_reason,
-            trace_ids: vec![], // Phase 3: read traces endpoint and extract IDs
-        })
+                crate::SetupStep::SeedMemory { content } => ClientSetupStep::SeedMemory {
+                    key: "memory".into(),
+                    value: content.clone(),
+                },
+                crate::SetupStep::GrantPermission { resource, action } => {
+                    ClientSetupStep::GrantPermission {
+                        tool: format!("{resource}:{action}"),
+                    }
+                }
+            })
+            .collect();
+        let _ = client
+            .setup_session(&sid, &SetupRequest { steps })
+            .await
+            .map_err(|e| EvalError::DaemonError(format!("setup: {e}")))?;
     }
+
+    // (3) Open SSE stream FIRST so we don't race the submit
+    let resp = client
+        .open_events(&sid)
+        .await
+        .map_err(|e| EvalError::DaemonError(format!("open_events: {e}")))?;
+    let mut events = stream_events(resp);
+
+    // (4) Submit prompt (with optional suffix from benchmark)
+    let prompt = match benchmark.prompt_suffix() {
+        Some(suffix) => format!("{}{}", task.prompt, suffix),
+        None => task.prompt.clone(),
+    };
+    let _ = client
+        .submit_message(
+            &sid,
+            &SubmitMessageRequest {
+                prompt,
+                timeout_secs: Some(task_timeout_secs),
+            },
+        )
+        .await
+        .map_err(|e| EvalError::DaemonError(format!("submit: {e}")))?;
+
+    // (5) Consume events until termination strategy fires or task_timeout elapses
+    let strategy = benchmark.termination_strategy();
+    let extractor = benchmark.answer_extractor();
+    let task_timeout = Duration::from_secs(task_timeout_secs);
+    let mut collected: Vec<DaemonEvent> = Vec::new();
+    let mut termination_reason: Option<String> = None;
+
+    let consume = async {
+        loop {
+            match events.next().await {
+                Some(Ok(evt)) => {
+                    collected.push(evt);
+                    match strategy.evaluate(&collected) {
+                        TerminationDecision::Continue => continue,
+                        TerminationDecision::Stop => break,
+                        TerminationDecision::StopWithError(msg) => {
+                            termination_reason = Some(msg);
+                            break;
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    termination_reason = Some(format!("sse error: {e}"));
+                    break;
+                }
+                None => {
+                    termination_reason = Some("sse stream ended unexpectedly".into());
+                    break;
+                }
+            }
+        }
+        Ok::<(), EvalError>(())
+    };
+
+    let timed = tokio::time::timeout(task_timeout, consume).await;
+    let timed_out = timed.is_err();
+
+    // (6) Cleanup: DELETE session (best-effort)
+    if let Err(e) = client.delete_session(&sid).await {
+        tracing::warn!(session_id = %sid, error = %e, "delete_session failed (continuing)");
+    }
+
+    // (7) Build result
+    let status = if timed_out {
+        TaskStatus::Timeout
+    } else if termination_reason.is_some() {
+        TaskStatus::Failed
+    } else {
+        TaskStatus::Completed
+    };
+
+    let final_answer = extractor.extract(&collected);
+
+    Ok(TaskResult {
+        task_id: task.id.clone(),
+        status,
+        final_answer,
+        latency_ms: started.elapsed().as_millis() as u64,
+        token_cost: None, // Phase 3: parse from tool_result events
+        error: termination_reason,
+        trace_ids: vec![], // Phase 3: read traces endpoint and extract IDs
+    })
 }
