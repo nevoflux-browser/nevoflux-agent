@@ -3515,6 +3515,7 @@ dependencies = [
  "nevoflux-testing",
  "nix 0.29.0",
  "notify",
+ "once_cell",
  "proptest",
  "pulldown-cmark",
  "rand 0.8.5",

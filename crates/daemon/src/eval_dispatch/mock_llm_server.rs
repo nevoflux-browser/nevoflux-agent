@@ -7,14 +7,42 @@
 //!
 //! For Phase 3a, the server returns a single canned assistant message
 //! ("Eval mock response.") with appropriate stop_reason for every request.
-//! Phase 3b will extend with response queues per scenario.
+//! Phase 3c extends with a response queue: callers enqueue per-call replies
+//! via `enqueue_response`; the canned message is the fallback when empty.
 
 #![cfg(feature = "eval-mock-llm")]
 
 use axum::{routing::post, Json, Router};
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::Mutex;
 use tokio::net::TcpListener;
+
+/// Response queue. Tests / setup code calls `enqueue_response` to stage a
+/// specific reply; the mock handler pops one per request. When empty, the
+/// handler falls back to the canned `"Eval mock response."` string.
+static RESPONSE_QUEUE: Lazy<Mutex<VecDeque<String>>> = Lazy::new(|| Mutex::new(VecDeque::new()));
+
+/// Enqueue a response string. The next call to the mock server will return it.
+/// Test helper; not used in production code paths.
+pub fn enqueue_response(reply: impl Into<String>) {
+    RESPONSE_QUEUE.lock().unwrap().push_back(reply.into());
+}
+
+/// Reset the queue (drains all pending). Use between tests.
+pub fn reset_queue() {
+    RESPONSE_QUEUE.lock().unwrap().clear();
+}
+
+fn pop_response_or_default() -> String {
+    RESPONSE_QUEUE
+        .lock()
+        .unwrap()
+        .pop_front()
+        .unwrap_or_else(|| "Eval mock response.".to_string())
+}
 
 /// Spawn the mock LLM server on 127.0.0.1:0 (OS-assigned port). Returns the
 /// bound address. The server runs for the lifetime of the daemon process —
@@ -68,7 +96,7 @@ struct Choice {
 #[derive(Debug, Serialize)]
 struct AssistantMessage {
     role: &'static str,
-    content: &'static str,
+    content: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,6 +107,7 @@ struct Usage {
 }
 
 async fn chat_completions(Json(req): Json<ChatRequest>) -> Json<ChatResponse> {
+    let content = pop_response_or_default();
     Json(ChatResponse {
         id: "chatcmpl-mock-eval".into(),
         object: "chat.completion",
@@ -88,7 +117,7 @@ async fn chat_completions(Json(req): Json<ChatRequest>) -> Json<ChatResponse> {
             index: 0,
             message: AssistantMessage {
                 role: "assistant",
-                content: "Eval mock response.",
+                content,
             },
             finish_reason: "stop",
         }],
@@ -119,7 +148,7 @@ struct AnthropicResponse {
 struct AnthropicContent {
     #[serde(rename = "type")]
     ty: &'static str,
-    text: &'static str,
+    text: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -142,13 +171,14 @@ struct AnthropicRequest {
 }
 
 async fn anthropic_messages(Json(req): Json<AnthropicRequest>) -> Json<AnthropicResponse> {
+    let text = pop_response_or_default();
     Json(AnthropicResponse {
         id: "msg_mock_eval".into(),
         ty: "message",
         role: "assistant",
         content: vec![AnthropicContent {
             ty: "text",
-            text: "Eval mock response.",
+            text,
         }],
         model: req.model,
         stop_reason: "end_turn",
@@ -166,6 +196,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_returns_loopback_addr() {
+        reset_queue();
         let addr = spawn().await.unwrap();
         assert!(addr.ip().is_loopback());
         assert!(addr.port() > 0);
@@ -173,6 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn openai_endpoint_returns_canned_response() {
+        reset_queue();
         let addr = spawn().await.unwrap();
         let url = format!("http://{addr}/v1/chat/completions");
         let resp = reqwest::Client::new()
@@ -195,6 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn anthropic_endpoint_returns_canned_response() {
+        reset_queue();
         let addr = spawn().await.unwrap();
         let url = format!("http://{addr}/v1/messages");
         let resp = reqwest::Client::new()
@@ -211,5 +244,39 @@ mod tests {
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["content"][0]["text"], "Eval mock response.");
         assert_eq!(body["stop_reason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn enqueued_response_overrides_default() {
+        reset_queue();
+        enqueue_response("Custom test reply.");
+
+        let addr = spawn().await.unwrap();
+        let url = format!("http://{addr}/v1/chat/completions");
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .json(&serde_json::json!({
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "Custom test reply.");
+
+        // Next call falls back to canned default.
+        let resp2 = reqwest::Client::new()
+            .post(&url)
+            .json(&serde_json::json!({
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": "again"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        let body2: serde_json::Value = resp2.json().await.unwrap();
+        assert_eq!(body2["choices"][0]["message"]["content"], "Eval mock response.");
     }
 }
