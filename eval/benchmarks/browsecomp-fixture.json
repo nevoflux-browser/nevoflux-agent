@@ -1,0 +1,31 @@
+{
+  "version": "phase3c-fixture-v1",
+  "source": "hand-written for Phase 3c smoke; replace with openai/simple-evals decrypted set in Phase 3d/4 (see eval/README-DATASETS.md)",
+  "tasks": [
+    {
+      "id": "bc-fixture-001",
+      "question": "What is the capital city of France?",
+      "answer": "Paris"
+    },
+    {
+      "id": "bc-fixture-002",
+      "question": "What year was the GNU project announced by Richard Stallman?",
+      "answer": "1983"
+    },
+    {
+      "id": "bc-fixture-003",
+      "question": "What is the chemical symbol for gold?",
+      "answer": "Au"
+    },
+    {
+      "id": "bc-fixture-004",
+      "question": "How many time zones does Russia span?",
+      "answer": "11"
+    },
+    {
+      "id": "bc-fixture-005",
+      "question": "What is the largest moon of Jupiter?",
+      "answer": "Ganymede"
+    }
+  ]
+}

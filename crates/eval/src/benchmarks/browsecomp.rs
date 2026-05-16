@@ -1,31 +1,30 @@
-//! BrowseComp adapter (OpenAI, 1,266 tasks).
+//! BrowseComp benchmark adapter (Phase 3c minimal slice).
 //!
-//! Source: git submodule at `eval/benchmarks/browsecomp/` pointing to
-//! github.com/openai/simple-evals. Tasks are JSONL with short verifiable answers.
-//!
-//! Default judge: `programmatic` (case-insensitive string equals).
+//! For Phase 3c this loads a hand-written 5-task fixture from
+//! `eval/benchmarks/browsecomp-fixture.json`. Phase 3d/4 will swap the
+//! source for the decrypted openai/simple-evals browse_comp_test_set.csv
+//! (XOR-encrypted to prevent training contamination — see
+//! `eval/README-DATASETS.md`).
 
-use super::Benchmark;
-use crate::{Assertion, EvalError, EvalResult, NevoFluxMode, Task};
+use crate::{benchmarks::Benchmark, Assertion, EvalError, EvalResult, NevoFluxMode, Task};
 use async_trait::async_trait;
+use nevoflux_protocol::subagent::ToolsConfig;
+use serde::Deserialize;
 use std::path::PathBuf;
-use tokio::fs;
-use tokio::io::AsyncBufReadExt;
-use tracing::{debug, warn};
-
-const DEFAULT_DATA_PATH: &str = "eval/benchmarks/browsecomp/data/browsecomp.jsonl";
 
 pub struct BrowseComp {
-    data_path: PathBuf,
+    fixture_path: PathBuf,
 }
 
 impl BrowseComp {
     pub fn new() -> Self {
         Self {
-            data_path: PathBuf::from(
-                std::env::var("BROWSECOMP_DATA").unwrap_or_else(|_| DEFAULT_DATA_PATH.to_string()),
-            ),
+            fixture_path: PathBuf::from("eval/benchmarks/browsecomp-fixture.json"),
         }
+    }
+
+    pub fn with_fixture(path: PathBuf) -> Self {
+        Self { fixture_path: path }
     }
 }
 
@@ -35,6 +34,22 @@ impl Default for BrowseComp {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct FixtureFile {
+    #[allow(dead_code)]
+    version: String,
+    #[allow(dead_code)]
+    source: String,
+    tasks: Vec<FixtureTask>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixtureTask {
+    id: String,
+    question: String,
+    answer: String,
+}
+
 #[async_trait]
 impl Benchmark for BrowseComp {
     fn name(&self) -> &str {
@@ -42,7 +57,7 @@ impl Benchmark for BrowseComp {
     }
 
     fn description(&self) -> &str {
-        "OpenAI BrowseComp — 1,266 hard information-retrieval tasks (English web)"
+        "BrowseComp — hard short-answer web research (Phase 3c: 5-task fixture; Phase 3d/4: full decrypted upstream)"
     }
 
     fn requires_network(&self) -> bool {
@@ -53,67 +68,91 @@ impl Benchmark for BrowseComp {
         "programmatic"
     }
 
+    fn tools_config(&self) -> ToolsConfig {
+        ToolsConfig::Allow(vec!["browser_*".to_string(), "web_search".to_string()])
+    }
+
     async fn load_tasks(&self, filter: Option<&str>) -> EvalResult<Vec<Task>> {
-        if !self.data_path.exists() {
-            return Err(EvalError::BenchmarkNotFound {
-                name: format!(
-                    "browsecomp data missing at {:?}; did you `git submodule update --init`?",
-                    self.data_path
-                ),
-            });
-        }
-
-        let file = fs::File::open(&self.data_path).await?;
-        let reader = tokio::io::BufReader::new(file);
-        let mut lines = reader.lines();
-
+        let raw = tokio::fs::read_to_string(&self.fixture_path)
+            .await
+            .map_err(EvalError::Io)?;
+        let file: FixtureFile = serde_json::from_str(&raw).map_err(|e| EvalError::TaskParse {
+            path: self.fixture_path.display().to_string(),
+            reason: e.to_string(),
+        })?;
         let mut tasks = Vec::new();
-        let mut idx = 0usize;
-        while let Some(line) = lines.next_line().await? {
-            idx += 1;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let raw: BrowseCompRaw = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(line = idx, error = %e, "skipping malformed BrowseComp row");
-                    continue;
-                }
-            };
-
-            let task_id = format!("browsecomp-{:04}", idx);
-
-            // Apply filter glob (simple substring for now; upgrade to glob crate if needed).
+        for ft in file.tasks {
             if let Some(f) = filter {
-                if !task_id.contains(f) && !raw.problem.contains(f) {
+                if !ft.id.contains(f) {
                     continue;
                 }
             }
-
             tasks.push(Task {
-                id: task_id,
+                id: ft.id,
                 category: "browsecomp".into(),
                 mode: NevoFluxMode::Agent,
-                prompt: raw.problem,
+                prompt: format!(
+                    "{question}\n\nReply with just the short answer (1-5 words).",
+                    question = ft.question
+                ),
                 setup: vec![],
-                reference: Some(raw.answer.clone()),
-                requires_browser: false,
-                assertions: vec![Assertion::EqualsAny {
-                    targets: vec![raw.answer],
+                reference: Some(ft.answer.clone()),
+                assertions: vec![Assertion::ContainsAny {
+                    targets: vec![ft.answer.clone()],
                 }],
-                metadata: serde_json::Map::new(),
+                requires_browser: false,
+                metadata: Default::default(),
             });
         }
-
-        debug!(loaded = tasks.len(), "BrowseComp tasks loaded");
         Ok(tasks)
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct BrowseCompRaw {
-    problem: String,
-    answer: String,
-    // BrowseComp also includes `topic` and `source_url` — keep simple for now.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn loads_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fixture.json");
+        let raw = r#"
+{
+  "version": "test-1",
+  "source": "test",
+  "tasks": [
+    { "id": "bc-test-001", "question": "What is 1+1?", "answer": "2" }
+  ]
+}
+"#;
+        tokio::fs::write(&path, raw).await.unwrap();
+        let bench = BrowseComp::with_fixture(path);
+        let tasks = bench.load_tasks(None).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "bc-test-001");
+        assert_eq!(tasks[0].reference, Some("2".into()));
+        assert!(tasks[0].prompt.contains("What is 1+1?"));
+        assert_eq!(tasks[0].mode, NevoFluxMode::Agent);
+    }
+
+    #[tokio::test]
+    async fn filter_narrows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fixture.json");
+        let raw = r#"
+{
+  "version": "t",
+  "source": "t",
+  "tasks": [
+    { "id": "alpha", "question": "?", "answer": "A" },
+    { "id": "beta", "question": "?", "answer": "B" }
+  ]
+}
+"#;
+        tokio::fs::write(&path, raw).await.unwrap();
+        let bench = BrowseComp::with_fixture(path);
+        let tasks = bench.load_tasks(Some("alph")).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, "alpha");
+    }
 }
