@@ -703,6 +703,31 @@ async fn run_daemon(
         nevoflux_daemon::eval::write_lock_atomic(&dirs.lock_path(), &lock)
             .expect("write daemon.lock");
         tracing::info!(addr = %addr, run_id = %cfg.run_id, "eval bridge ready");
+
+        // Step 10: Dev-instance lock — stable path for `--browser-mode external`.
+        // Written only when NEVOFLUX_DEV_INSTANCE_MODE=1 is also set. Re-uses
+        // the same HTTP bridge addr + bearer token that eval mode already started.
+        if nevoflux_daemon::dev_instance::is_enabled() {
+            match nevoflux_daemon::dev_instance::write_lock(
+                &lock.http_addr,
+                &lock.bearer_token,
+            ) {
+                Ok(()) => tracing::info!(
+                    path = ?nevoflux_daemon::dev_instance::lock_path(),
+                    "dev-instance lock written (NEVOFLUX_DEV_INSTANCE_MODE=1)"
+                ),
+                Err(e) => tracing::warn!(error = %e, "failed to write dev-instance lock"),
+            }
+        }
+    }
+
+    // Warn if NEVOFLUX_DEV_INSTANCE_MODE=1 was set without NEVOFLUX_EVAL_MODE=1.
+    if nevoflux_daemon::dev_instance::is_enabled() && eval_cfg.is_none() {
+        tracing::warn!(
+            "NEVOFLUX_DEV_INSTANCE_MODE=1 set but NEVOFLUX_EVAL_MODE not — \
+             no eval bridge to advertise; dev-instance lock NOT written. \
+             Set both env vars together."
+        );
     }
 
     // Remember whether we're in zero-file mode before `port` gets shadowed

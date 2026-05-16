@@ -30,6 +30,7 @@ pub mod canvas_video;
 pub mod config;
 pub mod config_watcher;
 pub mod context;
+pub mod dev_instance;
 pub mod error;
 pub mod eval;
 pub mod eval_bridge;
