@@ -6,8 +6,10 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use nevoflux_storage::MessageRole;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::str::FromStr;
 use super::state::EvalAppState;
 
 #[derive(Debug, Deserialize)]
@@ -23,6 +25,27 @@ pub struct CreateSessionRequest {
 #[derive(Debug, Serialize)]
 pub struct CreateSessionResponse {
     pub session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SetupStep {
+    /// Insert a prior conversation message into the session history.
+    InjectMessage { role: String, content: String },
+    /// Pre-populate a memory entry visible to this session.
+    SeedMemory { key: String, value: String },
+    /// Grant a permission upfront so the agent can use a gated tool.
+    GrantPermission { tool: String },
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetupRequest {
+    pub steps: Vec<SetupStep>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SetupResponse {
+    pub applied: usize,
 }
 
 pub async fn create_session(
@@ -80,11 +103,51 @@ pub async fn create_session(
 }
 
 pub async fn setup_session(
-    State(_s): State<EvalAppState>,
-    Path(_id): Path<String>,
-    Json(_body): Json<Value>,
-) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "setup_session — see Task 11")
+    State(state): State<EvalAppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<SetupRequest>,
+) -> Result<Json<SetupResponse>, (StatusCode, String)> {
+    let mut applied = 0usize;
+
+    for step in body.steps {
+        match step {
+            SetupStep::InjectMessage { role, content } => {
+                let message_role = MessageRole::from_str(&role).map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("inject_message: unknown role {role:?}; expected user|assistant|system"),
+                    )
+                })?;
+                state
+                    .session_manager
+                    .add_message(&session_id, message_role, &content)
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("inject_message: {e}"),
+                        )
+                    })?;
+            }
+            SetupStep::SeedMemory { key, value } => {
+                // No SessionManager API for memory seeding yet (phase-2).
+                tracing::warn!(
+                    %session_id, %key, value_len = value.len(),
+                    "eval-bridge: SeedMemory step not yet wired (phase-2)"
+                );
+            }
+            SetupStep::GrantPermission { tool } => {
+                // No SessionManager API for upfront permission grant yet (phase-2).
+                tracing::warn!(
+                    %session_id, %tool,
+                    "eval-bridge: GrantPermission step not yet wired (phase-2)"
+                );
+            }
+        }
+        applied += 1;
+    }
+
+    Ok(Json(SetupResponse { applied }))
 }
 
 pub async fn submit_message(
