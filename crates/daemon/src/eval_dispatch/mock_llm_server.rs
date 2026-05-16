@@ -189,6 +189,9 @@ async fn anthropic_messages(Json(req): Json<AnthropicRequest>) -> Json<Anthropic
 
 #[cfg(test)]
 mod tests {
+    //! Tests in this module mutate the global `RESPONSE_QUEUE` static.
+    //! They MUST run with `--test-threads=1`. Each test calls
+    //! `reset_queue()` at the start to clear residual queue state.
     use super::*;
 
     #[tokio::test]

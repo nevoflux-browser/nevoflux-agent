@@ -70,11 +70,10 @@ A Rust port + CSV downloader lands in Phase 3d. Until then, run real
 BrowseComp via the OpenAI simple-evals Python harness directly:
 
 ```bash
-pip install pandas openai
-python -c "
-from openai_simple_evals import browsecomp_eval
-# ... run their harness pointing at your daemon's HTTP eval bridge
-"
+git clone https://github.com/openai/simple-evals /tmp/simple-evals
+cd /tmp/simple-evals
+pip install -r requirements.txt  # if a requirements.txt exists; otherwise inspect imports
+python browsecomp_eval.py --help  # confirm CLI shape, then point at the daemon's HTTP bridge
 ```
 
 ## BrowseComp-ZH (289 tasks, HKUST/Phantom-AI)
