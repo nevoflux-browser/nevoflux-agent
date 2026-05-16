@@ -32,6 +32,7 @@ pub mod config_watcher;
 pub mod context;
 pub mod error;
 pub mod eval;
+pub mod eval_bridge;
 pub mod event_bus;
 pub mod file_picker;
 pub mod health;
