@@ -108,7 +108,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_event_phase2_best_effort_passes() {
+    async fn daemon_event_fails_without_observed_events() {
         // Phase 3: DaemonEvent now requires observed_events to contain the event.
         // With no observed events the assertion must fail.
         let t = task(vec![Assertion::DaemonEvent { event: "x".into() }]);
