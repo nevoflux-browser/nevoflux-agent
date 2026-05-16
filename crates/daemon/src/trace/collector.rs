@@ -177,7 +177,6 @@ impl TraceCollector {
         self.storage
             .traces()
             .list_by_session(session_id)
-            .map_err(|e| e)
     }
 
     /// Cleanup traces for a completed session.
