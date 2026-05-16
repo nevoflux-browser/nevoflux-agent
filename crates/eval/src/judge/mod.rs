@@ -3,9 +3,10 @@ use async_trait::async_trait;
 
 pub mod programmatic;
 pub mod structured;
+pub mod webjudge;
+pub use webjudge::WebJudge;
 
 // Stubs for subsequent PRs:
-// pub mod webjudge;     // o4-mini / Sonnet for Online-Mind2Web
 // pub mod privacy;      // outbound traffic auditor
 
 /// Verdict produced by a judge for a single task execution.
@@ -30,6 +31,7 @@ pub fn registry() -> Vec<Box<dyn Judge>> {
     vec![
         Box::new(programmatic::ProgrammaticJudge::new()),
         Box::new(structured::StructuredJudge::new()),
+        Box::new(webjudge::WebJudge::new()),
     ]
 }
 
