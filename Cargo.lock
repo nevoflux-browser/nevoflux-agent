@@ -3532,6 +3532,8 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "toml",
+ "tower",
+ "tower-http",
  "tracing",
  "uuid",
  "wasmtime",
@@ -6153,6 +6155,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]

@@ -64,7 +64,12 @@ test-case = "3"
 mockall = "0.13"
 
 # UUID
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# HTTP server
+axum = { version = "0.7" }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
 
 # Platform directories
 directories = "5"
