@@ -91,6 +91,7 @@ mod tests {
             setup: vec![],
             reference: Some(reference.into()),
             assertions: vec![],
+            requires_browser: false,
             metadata: serde_json::Map::new(),
         }
     }
@@ -98,7 +99,7 @@ mod tests {
     fn result_with(answer: &str) -> TaskResult {
         TaskResult {
             task_id: "test-001".into(),
-            success: true,
+            status: crate::TaskStatus::Completed,
             final_answer: Some(answer.into()),
             latency_ms: 100,
             token_cost: None,
@@ -143,7 +144,7 @@ mod tests {
         let task = task_with_ref("Paris");
         let result = TaskResult {
             task_id: "test-001".into(),
-            success: false,
+            status: crate::TaskStatus::Timeout,
             final_answer: None,
             latency_ms: 0,
             token_cost: None,

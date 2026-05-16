@@ -22,10 +22,12 @@ pub mod judge;
 pub mod metrics;
 pub mod reporter;
 pub mod runner;
+pub mod termination;
 
 pub use browser::{BrowserHandle, BrowserLaunchMode};
 pub use error::{EvalError, EvalResult};
 pub use runner::{Runner, RunnerConfig};
+pub use termination::{AnswerExtractor, DaemonEvent, TerminationDecision, TerminationStrategy};
 
 /// Signal grade — drives report routing.
 ///
