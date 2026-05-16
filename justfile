@@ -199,3 +199,14 @@ eval-release VERSION BENCHMARK="online-mind2web":
 # List registered benchmarks + judges.
 eval-list:
     cargo run --release -p nevoflux-eval -- list
+
+# Mock-LLM eval — deterministic + free, suitable for CI. Builds the daemon
+# binary with the eval-mock-llm feature flag enabled. Phase 3a.
+eval-mock BENCHMARK="nevoflux-suite":
+    cargo build --release --bin nevoflux-agent --features eval-mock-llm
+    NEVOFLUX_EVAL_LLM_MODE=mock cargo run --release -p nevoflux-eval -- run \
+        --benchmark {{BENCHMARK}} \
+        --browser-mode daemon-only \
+        --filter mode-authz \
+        --timeout 30 \
+        --out-dir eval/reports

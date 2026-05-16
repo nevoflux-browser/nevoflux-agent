@@ -133,7 +133,9 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_event_passes_when_observed() {
-        let t = task(vec![Assertion::DaemonEvent { event: "canvas_app_created".into() }]);
+        let t = task(vec![Assertion::DaemonEvent {
+            event: "canvas_app_created".into(),
+        }]);
         let mut r = result("");
         r.observed_events = vec!["canvas_app_created".into()];
         let v = StructuredJudge.judge(&t, &r).await.unwrap();
@@ -142,7 +144,9 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_event_fails_when_not_observed() {
-        let t = task(vec![Assertion::DaemonEvent { event: "canvas_app_created".into() }]);
+        let t = task(vec![Assertion::DaemonEvent {
+            event: "canvas_app_created".into(),
+        }]);
         let r = result(""); // observed_events stays default []
         let v = StructuredJudge.judge(&t, &r).await.unwrap();
         assert!(!v.correct);

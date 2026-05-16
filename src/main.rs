@@ -525,9 +525,8 @@ async fn run_daemon(
         //          database (for session history), skills (for system-prompt
         //          construction), llm_config (to actually call the LLM), and
         //          agent_config / runtime_handle (for DaemonHostFunctions).
-        let agent_config_for_eval = std::sync::Arc::new(
-            nevoflux_daemon::AgentConfig::load().unwrap_or_default(),
-        );
+        let agent_config_for_eval =
+            std::sync::Arc::new(nevoflux_daemon::AgentConfig::load().unwrap_or_default());
         let db_for_eval = session_manager.storage().database().clone();
         let eval_skills = {
             let mut registry = nevoflux_skills::SkillRegistry::new();
@@ -541,14 +540,13 @@ async fn run_daemon(
                 .with_event_bus(event_bus.clone())
                 .with_storage(session_manager.shared_storage()),
         );
-        let mut eval_services =
-            nevoflux_daemon::wasm::HostServices::with_skills(
-                std::sync::Arc::new(db_for_eval),
-                eval_skills,
-            )
-            .with_agent_config(agent_config_for_eval.clone())
-            .with_runtime_handle(tokio::runtime::Handle::current())
-            .with_canvas_video_service(eval_canvas_video_service.clone());
+        let mut eval_services = nevoflux_daemon::wasm::HostServices::with_skills(
+            std::sync::Arc::new(db_for_eval),
+            eval_skills,
+        )
+        .with_agent_config(agent_config_for_eval.clone())
+        .with_runtime_handle(tokio::runtime::Handle::current())
+        .with_canvas_video_service(eval_canvas_video_service.clone());
 
         // Wire LLM config from the user's AgentConfig (or mock URL if enabled).
         {
@@ -559,8 +557,7 @@ async fn run_daemon(
                 llm_cfg.active_model(),
             ) {
                 if let Ok(provider) = provider_str.parse::<nevoflux_llm::ProviderType>() {
-                    let mut lc =
-                        nevoflux_daemon::wasm::LlmConfig::new(provider, api_key, model);
+                    let mut lc = nevoflux_daemon::wasm::LlmConfig::new(provider, api_key, model);
                     if let Some(base_url) = llm_cfg.active_base_url() {
                         lc.base_url = Some(base_url.to_string());
                     }
@@ -591,15 +588,14 @@ async fn run_daemon(
             }
         }
 
-        let dispatch_services = std::sync::Arc::new(
-            nevoflux_daemon::eval_dispatch::EvalDispatchServices {
+        let dispatch_services =
+            std::sync::Arc::new(nevoflux_daemon::eval_dispatch::EvalDispatchServices {
                 services: eval_services,
                 config: agent_config_for_eval.clone(),
                 runtime: tokio::runtime::Handle::current(),
                 session_manager: session_manager.clone(),
                 canvas_video_service: eval_canvas_video_service,
-            },
-        );
+            });
 
         // Step 6: Bearer token + EvalAppState.
         let token = uuid::Uuid::new_v4().to_string();

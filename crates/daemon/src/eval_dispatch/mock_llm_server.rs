@@ -186,7 +186,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status().as_u16(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["choices"][0]["message"]["content"], "Eval mock response.");
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "Eval mock response."
+        );
         assert_eq!(body["choices"][0]["finish_reason"], "stop");
     }
 

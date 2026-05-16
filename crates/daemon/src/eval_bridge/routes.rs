@@ -287,12 +287,11 @@ pub async fn stream_events(
                         // Filter events that carry this session_id in their payload,
                         // then map the raw BusEvent to an EvalEvent.
                         //
-                        // TODO(phase-2): When dedicated `agent:token`, `agent:tool_call`,
-                        // `agent:tool_result`, and `agent:turn_done` topics exist, add
-                        // typed variants (Token, ToolCall, ToolResult, Stop) here.
-                        // For now we forward all matching events as DaemonEvent so that
-                        // the wire format and content-type are correct and SSE consumers
-                        // can at least inspect raw bus traffic.
+                        // Phase 3a: maps `agent:turn_done` → EvalEvent::Stop so that
+                        // NaturalStop fires immediately instead of waiting for the task
+                        // timeout. All other matching events are forwarded as DaemonEvent.
+                        // Future: add typed Token / ToolCall / ToolResult variants in
+                        // Phase 3b/c once those bus topics are wired.
                         let mapped = rx_stream.filter_map(move |bus_evt| {
                             let sid = sid.clone();
                             async move {
