@@ -99,11 +99,12 @@ pub trait BrowserHandle: Send + Sync {
 /// Construct a browser handle from a launch mode.
 pub async fn launch(mode: &BrowserLaunchMode) -> EvalResult<Box<dyn BrowserHandle>> {
     match mode {
-        BrowserLaunchMode::DaemonOnly { daemon_binary, state_dir } => {
-            Ok(Box::new(
-                DaemonOnlyBrowser::spawn(daemon_binary.clone(), state_dir.clone()).await?,
-            ))
-        }
+        BrowserLaunchMode::DaemonOnly {
+            daemon_binary,
+            state_dir,
+        } => Ok(Box::new(
+            DaemonOnlyBrowser::spawn(daemon_binary.clone(), state_dir.clone()).await?,
+        )),
         BrowserLaunchMode::ExternalDevInstance { endpoint } => Ok(Box::new(
             dev_instance::DevInstanceBrowser::connect(endpoint.clone()).await?,
         )),

@@ -98,13 +98,11 @@ async fn browser_mode_grade_routing() {
 
 #[tokio::test]
 async fn browser_mode_supports_check() {
-    assert!(
-        !BrowserLaunchMode::DaemonOnly {
-            daemon_binary: std::path::PathBuf::from("/unused-test-path"),
-            state_dir: std::path::PathBuf::from("/unused-test-path"),
-        }
-        .supports_browser_tasks()
-    );
+    assert!(!BrowserLaunchMode::DaemonOnly {
+        daemon_binary: std::path::PathBuf::from("/unused-test-path"),
+        state_dir: std::path::PathBuf::from("/unused-test-path"),
+    }
+    .supports_browser_tasks());
     assert!(BrowserLaunchMode::ExternalDevInstance {
         endpoint: "x".into()
     }

@@ -150,12 +150,9 @@ mod tests {
         let mut s = sample();
         // Pick a PID far above the max for the system so it's surely dead.
         s.pid = 4_000_000_000;
-        tokio::fs::write(
-            run_dir.join("daemon.lock"),
-            serde_json::to_vec(&s).unwrap(),
-        )
-        .await
-        .unwrap();
+        tokio::fs::write(run_dir.join("daemon.lock"), serde_json::to_vec(&s).unwrap())
+            .await
+            .unwrap();
         let result = wait_for_lock(tmp.path(), "run-test", Duration::from_secs(1)).await;
         assert!(matches!(result, Err(LockError::StaleLock { .. })));
     }

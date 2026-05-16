@@ -105,11 +105,20 @@ pub struct Runner {
 
 impl Runner {
     pub fn new(config: RunnerConfig) -> Self {
-        Self { config, client: None }
+        Self {
+            config,
+            client: None,
+        }
     }
 
-    pub fn with_client(config: RunnerConfig, client: crate::daemon_client::DaemonHttpClient) -> Self {
-        Self { config, client: Some(client) }
+    pub fn with_client(
+        config: RunnerConfig,
+        client: crate::daemon_client::DaemonHttpClient,
+    ) -> Self {
+        Self {
+            config,
+            client: Some(client),
+        }
     }
 
     pub async fn run(
@@ -132,10 +141,8 @@ impl Runner {
         //
         // Runner::with_client stays for Phase 3+ (External/Release modes have their own
         // discovery paths and pass in a pre-built client).
-        let derived_client: Option<crate::daemon_client::DaemonHttpClient> = self
-            .client
-            .clone()
-            .or_else(|| {
+        let derived_client: Option<crate::daemon_client::DaemonHttpClient> =
+            self.client.clone().or_else(|| {
                 browser
                     .lock()
                     .map(crate::daemon_client::DaemonHttpClient::from_lock)
@@ -209,7 +216,9 @@ impl Runner {
 
         // Dispatch all runnable tasks into a FuturesUnordered pool, gated by the semaphore.
         let mut pending: FuturesUnordered<
-            std::pin::Pin<Box<dyn std::future::Future<Output = (Task, EvalResult<TaskResult>)> + Send>>,
+            std::pin::Pin<
+                Box<dyn std::future::Future<Output = (Task, EvalResult<TaskResult>)> + Send>,
+            >,
         > = FuturesUnordered::new();
 
         let timeout_secs = self.config.task_timeout_secs;
@@ -275,7 +284,11 @@ impl Runner {
                 total_judge_cost += v.judge_cost_usd;
             }
 
-            outcomes.push(TaskOutcome { task, result, verdict });
+            outcomes.push(TaskOutcome {
+                task,
+                result,
+                verdict,
+            });
         }
 
         if let Err(e) = browser.shutdown().await {
@@ -332,7 +345,13 @@ impl Runner {
         benchmark: &dyn Benchmark,
         _browser: &dyn BrowserHandle,
     ) -> EvalResult<TaskResult> {
-        execute_task_impl(task, benchmark, self.client.as_ref(), self.config.task_timeout_secs).await
+        execute_task_impl(
+            task,
+            benchmark,
+            self.client.as_ref(),
+            self.config.task_timeout_secs,
+        )
+        .await
     }
 }
 
@@ -371,15 +390,14 @@ async fn execute_task_impl(
     task_timeout_secs: u64,
 ) -> EvalResult<TaskResult> {
     use crate::daemon_client::http::{
-        CreateSessionRequest, SetupRequest, SetupStep as ClientSetupStep,
-        SubmitMessageRequest,
+        CreateSessionRequest, SetupRequest, SetupStep as ClientSetupStep, SubmitMessageRequest,
     };
     use crate::daemon_client::sse::stream_events;
     use crate::termination::{DaemonEvent, TerminationDecision};
     use futures::StreamExt;
 
-    let client = client
-        .ok_or_else(|| EvalError::DaemonConnection("runner has no http client".into()))?;
+    let client =
+        client.ok_or_else(|| EvalError::DaemonConnection("runner has no http client".into()))?;
 
     let started = Instant::now();
 

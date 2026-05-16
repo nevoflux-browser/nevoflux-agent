@@ -168,3 +168,34 @@ install:
 # Uninstall local installation
 uninstall:
     cargo uninstall nevoflux-agent
+
+# --- Eval recipes (Phase 2) ---
+
+# Daemon-only eval — fastest path, no real browser, Exploratory grade.
+eval-daemon BENCHMARK="nevoflux-suite":
+    cargo build --release --bin nevoflux-agent
+    cargo run --release -p nevoflux-eval -- run \
+        --benchmark {{BENCHMARK}} \
+        --browser-mode daemon-only \
+        --out-dir eval/reports
+
+# External dev-instance eval (Phase 3 stub for now — errors out cleanly).
+eval-dev BENCHMARK LIMIT="10":
+    cargo run --release -p nevoflux-eval -- run \
+        --benchmark {{BENCHMARK}} \
+        --browser-mode external \
+        --browser-endpoint http://localhost:5959 \
+        --limit {{LIMIT}} \
+        --out-dir eval/reports
+
+# Release-mode eval (Phase 4 stub for now — errors out cleanly).
+eval-release VERSION BENCHMARK="online-mind2web":
+    cargo run --release -p nevoflux-eval -- run \
+        --benchmark {{BENCHMARK}} \
+        --browser-mode release \
+        --browser-version {{VERSION}} \
+        --out-dir eval/reports
+
+# List registered benchmarks + judges.
+eval-list:
+    cargo run --release -p nevoflux-eval -- list

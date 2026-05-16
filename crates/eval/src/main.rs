@@ -21,7 +21,9 @@
 //!   - Exploratory   → eval/reports/exploratory/<timestamp>-<benchmark>.md  (gitignored)
 
 use clap::{Parser, Subcommand, ValueEnum};
-use nevoflux_eval::{benchmarks, browser::BrowserLaunchMode, judge, reporter, Runner, RunnerConfig};
+use nevoflux_eval::{
+    benchmarks, browser::BrowserLaunchMode, judge, reporter, Runner, RunnerConfig,
+};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -157,8 +159,9 @@ async fn main() -> anyhow::Result<()> {
                     endpoint: browser_endpoint,
                 },
                 BrowserModeArg::Release => BrowserLaunchMode::ReleaseBinary {
-                    version: browser_version
-                        .ok_or_else(|| anyhow::anyhow!("--browser-version required for --browser-mode=release"))?,
+                    version: browser_version.ok_or_else(|| {
+                        anyhow::anyhow!("--browser-version required for --browser-mode=release")
+                    })?,
                     cache_dir: browser_cache_dir,
                 },
             };

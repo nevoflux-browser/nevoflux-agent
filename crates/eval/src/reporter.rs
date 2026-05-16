@@ -11,7 +11,10 @@ use crate::{metrics, runner::RunSummary, EvalResult, SignalGrade};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
-pub async fn write_markdown(summary: &RunSummary, out_dir: &Path) -> EvalResult<std::path::PathBuf> {
+pub async fn write_markdown(
+    summary: &RunSummary,
+    out_dir: &Path,
+) -> EvalResult<std::path::PathBuf> {
     tokio::fs::create_dir_all(out_dir).await?;
 
     let filename = match summary.signal_grade {
@@ -53,11 +56,11 @@ pub async fn write_markdown(summary: &RunSummary, out_dir: &Path) -> EvalResult<
     }
 
     body.push_str("## Run metadata\n\n");
+    body.push_str(&format!("- **Browser**: `{}`\n", summary.browser_version));
     body.push_str(&format!(
-        "- **Browser**: `{}`\n",
-        summary.browser_version
+        "- **Signal grade**: `{:?}`\n",
+        summary.signal_grade
     ));
-    body.push_str(&format!("- **Signal grade**: `{:?}`\n", summary.signal_grade));
     body.push_str(&format!("- **Judge**: `{}`\n", summary.judge));
     body.push_str(&format!(
         "- **Run started**: {}\n",
@@ -118,7 +121,13 @@ pub async fn write_markdown(summary: &RunSummary, out_dir: &Path) -> EvalResult<
             let explanation = o
                 .verdict
                 .as_ref()
-                .map(|v| v.explanation.replace('|', "\\|").chars().take(80).collect::<String>())
+                .map(|v| {
+                    v.explanation
+                        .replace('|', "\\|")
+                        .chars()
+                        .take(80)
+                        .collect::<String>()
+                })
                 .unwrap_or_else(|| "(no verdict)".into());
             body.push_str(&format!("| `{}` | {} |\n", o.task.id, explanation));
         }
@@ -219,8 +228,14 @@ mod tests {
             "JSON sidecar should exist"
         );
         let md = tokio::fs::read_to_string(&path).await.unwrap();
-        assert!(md.contains("EXPLORATORY"), "Grade banner should contain EXPLORATORY");
-        assert!(md.contains("accuracy"), "Metrics section should contain accuracy metric");
+        assert!(
+            md.contains("EXPLORATORY"),
+            "Grade banner should contain EXPLORATORY"
+        );
+        assert!(
+            md.contains("accuracy"),
+            "Metrics section should contain accuracy metric"
+        );
     }
 }
 
@@ -256,7 +271,10 @@ pub async fn append_trend(summary: &RunSummary, trends_path: &Path) -> EvalResul
     let metrics = metrics::standard_set();
     let mut row = serde_json::Map::new();
     row.insert("benchmark".into(), summary.benchmark.clone().into());
-    row.insert("browser_version".into(), summary.browser_version.clone().into());
+    row.insert(
+        "browser_version".into(),
+        summary.browser_version.clone().into(),
+    );
     row.insert("timestamp".into(), summary.started_at.to_rfc3339().into());
     for m in &metrics {
         row.insert(m.name().into(), m.compute(summary).into());
@@ -277,6 +295,12 @@ pub async fn append_trend(summary: &RunSummary, trends_path: &Path) -> EvalResul
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }

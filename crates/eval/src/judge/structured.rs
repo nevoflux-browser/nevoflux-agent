@@ -5,7 +5,10 @@
 //! `NoOutboundTo` are best-effort (pass without verification) until Phase 3
 //! threads observed daemon events / tcpdump results into TaskResult.
 
-use crate::{judge::{Judge, Verdict}, EvalResult, Task, TaskResult};
+use crate::{
+    judge::{Judge, Verdict},
+    EvalResult, Task, TaskResult,
+};
 use async_trait::async_trait;
 
 pub struct StructuredJudge;
@@ -53,22 +56,22 @@ impl Judge for StructuredJudge {
                     let lower = answer.to_lowercase();
                     !targets.iter().any(|t| lower.contains(&t.to_lowercase()))
                 }
-                Assertion::Regex { pattern } => {
-                    regex::Regex::new(pattern)
-                        .map(|r| r.is_match(answer))
-                        .unwrap_or(false)
-                }
+                Assertion::Regex { pattern } => regex::Regex::new(pattern)
+                    .map(|r| r.is_match(answer))
+                    .unwrap_or(false),
             };
-            if pass { hits += 1; } else { misses += 1; }
+            if pass {
+                hits += 1;
+            } else {
+                misses += 1;
+            }
         }
 
         let correct = misses == 0;
         Ok(Verdict {
             correct,
             score: hits as f64 / (hits + misses).max(1) as f64,
-            explanation: format!(
-                "{hits} assertion(s) passed, {misses} failed (structured)"
-            ),
+            explanation: format!("{hits} assertion(s) passed, {misses} failed (structured)"),
             judge_cost_usd: 0.0,
         })
     }
@@ -116,9 +119,14 @@ mod tests {
     async fn mixed_assertions_short_circuit_on_text_miss() {
         let t = task(vec![
             Assertion::DaemonEvent { event: "x".into() },
-            Assertion::ContainsAny { targets: vec!["foo".into()] },
+            Assertion::ContainsAny {
+                targets: vec!["foo".into()],
+            },
         ]);
-        let v = StructuredJudge.judge(&t, &result("no match")).await.unwrap();
+        let v = StructuredJudge
+            .judge(&t, &result("no match"))
+            .await
+            .unwrap();
         assert!(!v.correct);
     }
 }

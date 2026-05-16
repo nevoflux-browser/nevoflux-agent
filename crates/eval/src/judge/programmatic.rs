@@ -1,7 +1,10 @@
 //! Programmatic judge — equals / contains / regex matching against the
 //! task's `reference` answer. Cheap, no LLM, deterministic.
 
-use crate::{judge::{Judge, Verdict}, EvalResult, Task, TaskResult};
+use crate::{
+    judge::{Judge, Verdict},
+    EvalResult, Task, TaskResult,
+};
 use async_trait::async_trait;
 use regex::Regex;
 
@@ -27,7 +30,11 @@ impl Judge for ProgrammaticJudge {
         let mut misses = 0;
         for a in &task.assertions {
             let pass = check_assertion(a, answer, result);
-            if pass { hits += 1; } else { misses += 1; }
+            if pass {
+                hits += 1;
+            } else {
+                misses += 1;
+            }
         }
 
         // Fall back to reference if no assertions.
@@ -70,9 +77,7 @@ fn check_assertion(a: &crate::Assertion, answer: &str, _result: &TaskResult) -> 
     match a {
         Assertion::EqualsAny { targets } => {
             let lower = answer.trim().to_lowercase();
-            targets
-                .iter()
-                .any(|t| lower == t.trim().to_lowercase())
+            targets.iter().any(|t| lower == t.trim().to_lowercase())
         }
         Assertion::ContainsAny { targets } => {
             let lower = answer.to_lowercase();
@@ -82,9 +87,9 @@ fn check_assertion(a: &crate::Assertion, answer: &str, _result: &TaskResult) -> 
             let lower = answer.to_lowercase();
             !targets.iter().any(|t| lower.contains(&t.to_lowercase()))
         }
-        Assertion::Regex { pattern } => {
-            Regex::new(pattern).map(|r| r.is_match(answer)).unwrap_or(false)
-        }
+        Assertion::Regex { pattern } => Regex::new(pattern)
+            .map(|r| r.is_match(answer))
+            .unwrap_or(false),
         // Structured assertions (DaemonEvent / NoOutboundTo) are handled
         // by StructuredJudge — programmatic skips them silently.
         Assertion::DaemonEvent { .. } | Assertion::NoOutboundTo { .. } => true,
@@ -132,30 +137,45 @@ mod tests {
     #[tokio::test]
     async fn contains_any_passes() {
         let t = task(
-            vec![Assertion::ContainsAny { targets: vec!["foo".into()] }],
+            vec![Assertion::ContainsAny {
+                targets: vec!["foo".into()],
+            }],
             None,
         );
-        let v = ProgrammaticJudge.judge(&t, &result("contains FOO inside")).await.unwrap();
+        let v = ProgrammaticJudge
+            .judge(&t, &result("contains FOO inside"))
+            .await
+            .unwrap();
         assert!(v.correct);
     }
 
     #[tokio::test]
     async fn not_contains_fails_on_hit() {
         let t = task(
-            vec![Assertion::NotContains { targets: vec!["secret".into()] }],
+            vec![Assertion::NotContains {
+                targets: vec!["secret".into()],
+            }],
             None,
         );
-        let v = ProgrammaticJudge.judge(&t, &result("contains SECRET")).await.unwrap();
+        let v = ProgrammaticJudge
+            .judge(&t, &result("contains SECRET"))
+            .await
+            .unwrap();
         assert!(!v.correct);
     }
 
     #[tokio::test]
     async fn regex_match() {
         let t = task(
-            vec![Assertion::Regex { pattern: r"\d+".into() }],
+            vec![Assertion::Regex {
+                pattern: r"\d+".into(),
+            }],
             None,
         );
-        let v = ProgrammaticJudge.judge(&t, &result("answer is 42")).await.unwrap();
+        let v = ProgrammaticJudge
+            .judge(&t, &result("answer is 42"))
+            .await
+            .unwrap();
         assert!(v.correct);
     }
 }

@@ -15,12 +15,29 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonEvent {
-    Token { text: String },
-    ToolCall { name: String, args: serde_json::Value, trace_id: String },
-    ToolResult { trace_id: String, ok: bool, result: serde_json::Value },
-    DaemonEvent { name: String, payload: serde_json::Value },
-    Stop { reason: String },
-    Error { message: String },
+    Token {
+        text: String,
+    },
+    ToolCall {
+        name: String,
+        args: serde_json::Value,
+        trace_id: String,
+    },
+    ToolResult {
+        trace_id: String,
+        ok: bool,
+        result: serde_json::Value,
+    },
+    DaemonEvent {
+        name: String,
+        payload: serde_json::Value,
+    },
+    Stop {
+        reason: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// What the runner should do after observing the events so far.
@@ -72,9 +89,7 @@ impl TerminationStrategy {
         match self {
             Self::NaturalStop => evaluate_natural_stop(events),
             Self::AnswerTag => evaluate_answer_tag(events),
-            Self::StopWithRequiredEvents(required) => {
-                evaluate_required_events(events, required)
-            }
+            Self::StopWithRequiredEvents(required) => evaluate_required_events(events, required),
             Self::Custom(f) => f(events),
         }
     }
@@ -105,10 +120,7 @@ fn evaluate_answer_tag(events: &[DaemonEvent]) -> TerminationDecision {
     }
 }
 
-fn evaluate_required_events(
-    events: &[DaemonEvent],
-    required: &[String],
-) -> TerminationDecision {
+fn evaluate_required_events(events: &[DaemonEvent], required: &[String]) -> TerminationDecision {
     let stop_seen = events.iter().any(|e| matches!(e, DaemonEvent::Stop { .. }));
     if !stop_seen {
         return TerminationDecision::Continue;
@@ -171,7 +183,11 @@ fn extract_last_assistant(events: &[DaemonEvent]) -> Option<String> {
             buf.push_str(text);
         }
     }
-    if buf.is_empty() { None } else { Some(buf) }
+    if buf.is_empty() {
+        None
+    } else {
+        Some(buf)
+    }
 }
 
 fn extract_answer_tag_or_last(events: &[DaemonEvent]) -> Option<String> {
@@ -189,25 +205,46 @@ fn extract_answer_tag_or_last(events: &[DaemonEvent]) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn token(s: &str) -> DaemonEvent { DaemonEvent::Token { text: s.into() } }
-    fn stop() -> DaemonEvent { DaemonEvent::Stop { reason: "natural".into() } }
+    fn token(s: &str) -> DaemonEvent {
+        DaemonEvent::Token { text: s.into() }
+    }
+    fn stop() -> DaemonEvent {
+        DaemonEvent::Stop {
+            reason: "natural".into(),
+        }
+    }
     fn dev(name: &str) -> DaemonEvent {
-        DaemonEvent::DaemonEvent { name: name.into(), payload: serde_json::Value::Null }
+        DaemonEvent::DaemonEvent {
+            name: name.into(),
+            payload: serde_json::Value::Null,
+        }
     }
 
     #[test]
     fn natural_stop_continues_until_stop() {
         let s = TerminationStrategy::NaturalStop;
         assert_eq!(s.evaluate(&[token("hi")]), TerminationDecision::Continue);
-        assert_eq!(s.evaluate(&[token("hi"), stop()]), TerminationDecision::Stop);
+        assert_eq!(
+            s.evaluate(&[token("hi"), stop()]),
+            TerminationDecision::Stop
+        );
     }
 
     #[test]
     fn answer_tag_finds_closed_pair() {
         let s = TerminationStrategy::AnswerTag;
-        assert_eq!(s.evaluate(&[token("<ANSWER>42</ANSWER>")]), TerminationDecision::Stop);
-        assert_eq!(s.evaluate(&[token("<ANSWER>partial")]), TerminationDecision::Continue);
-        assert_eq!(s.evaluate(&[token("any"), stop()]), TerminationDecision::Stop);
+        assert_eq!(
+            s.evaluate(&[token("<ANSWER>42</ANSWER>")]),
+            TerminationDecision::Stop
+        );
+        assert_eq!(
+            s.evaluate(&[token("<ANSWER>partial")]),
+            TerminationDecision::Continue
+        );
+        assert_eq!(
+            s.evaluate(&[token("any"), stop()]),
+            TerminationDecision::Stop
+        );
     }
 
     #[test]
@@ -216,8 +253,15 @@ mod tests {
             "canvas_app_created".into(),
             "canvas_sdk_chat_invoked".into(),
         ]);
-        assert_eq!(s.evaluate(&[dev("canvas_app_created")]), TerminationDecision::Continue);
-        let all = vec![dev("canvas_app_created"), dev("canvas_sdk_chat_invoked"), stop()];
+        assert_eq!(
+            s.evaluate(&[dev("canvas_app_created")]),
+            TerminationDecision::Continue
+        );
+        let all = vec![
+            dev("canvas_app_created"),
+            dev("canvas_sdk_chat_invoked"),
+            stop(),
+        ];
         assert_eq!(s.evaluate(&all), TerminationDecision::Stop);
         let missing = vec![dev("canvas_app_created"), stop()];
         match s.evaluate(&missing) {

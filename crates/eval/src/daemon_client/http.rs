@@ -135,10 +135,7 @@ impl DaemonHttpClient {
     /// Returns the raw streaming response. Caller wraps it in an SSE parser
     /// (see `daemon_client::sse`). Uses a no-timeout client because SSE is
     /// long-lived.
-    pub async fn open_events(
-        &self,
-        session_id: &str,
-    ) -> Result<reqwest::Response, HttpError> {
+    pub async fn open_events(&self, session_id: &str) -> Result<reqwest::Response, HttpError> {
         let resp = Client::builder()
             .build()
             .expect("reqwest client (no timeout)")

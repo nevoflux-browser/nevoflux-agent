@@ -29,10 +29,7 @@ impl DaemonOnlyBrowser {
     /// `daemon_binary`: path to the daemon binary, e.g. `target/release/nevoflux-agent`.
     /// `state_dir`: where the daemon writes its state (`<state_dir>/runs/<run_id>/...`).
     pub async fn spawn(daemon_binary: PathBuf, state_dir: PathBuf) -> EvalResult<Self> {
-        let run_id = format!(
-            "run-{}",
-            chrono::Utc::now().format("%Y%m%d-%H%M%S-%f")
-        );
+        let run_id = format!("run-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S-%f"));
         Self::spawn_with_run_id(daemon_binary, state_dir, run_id).await
     }
 
@@ -66,13 +63,9 @@ impl DaemonOnlyBrowser {
             .spawn()
             .map_err(|e| EvalError::Other(format!("spawn daemon: {e}")))?;
 
-        let lock = wait_for_lock(
-            &state_dir,
-            &run_id,
-            std::time::Duration::from_secs(30),
-        )
-        .await
-        .map_err(|e| EvalError::DaemonConnection(format!("lock wait: {e}")))?;
+        let lock = wait_for_lock(&state_dir, &run_id, std::time::Duration::from_secs(30))
+            .await
+            .map_err(|e| EvalError::DaemonConnection(format!("lock wait: {e}")))?;
 
         info!(
             http_addr = %lock.http_addr,
@@ -111,12 +104,12 @@ impl BrowserHandle for DaemonOnlyBrowser {
                 Ok(Some(status)) => Err(EvalError::DaemonConnection(format!(
                     "daemon exited unexpectedly with status {status}"
                 ))),
-                Err(e) => Err(EvalError::DaemonConnection(format!(
-                    "wait failed: {e}"
-                ))),
+                Err(e) => Err(EvalError::DaemonConnection(format!("wait failed: {e}"))),
             }
         } else {
-            Err(EvalError::DaemonConnection("daemon already shut down".into()))
+            Err(EvalError::DaemonConnection(
+                "daemon already shut down".into(),
+            ))
         }
     }
 
