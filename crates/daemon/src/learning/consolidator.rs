@@ -107,6 +107,16 @@ pub async fn consolidate_category(
     category: &str,
     target_count: usize,
 ) -> Result<ConsolidationResult> {
+    if crate::learning::is_disabled() {
+        tracing::info!("learning system disabled (eval mode) — skipping");
+        return Ok(ConsolidationResult {
+            category: category.to_string(),
+            original_count: 0,
+            consolidated_count: 0,
+            archived_count: 0,
+        });
+    }
+
     let repo = KnowledgeRepository::new(&database);
 
     // 1. Get all hot entries for this category

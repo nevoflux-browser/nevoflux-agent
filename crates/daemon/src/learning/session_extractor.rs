@@ -181,6 +181,10 @@ pub async fn extract_session_memories(
     database: Arc<Database>,
     recent_messages: Vec<ContextMessage>,
 ) -> Result<usize> {
+    if crate::learning::is_disabled() {
+        tracing::info!("learning system disabled (eval mode) — skipping");
+        return Ok(0);
+    }
     if recent_messages.is_empty() {
         return Ok(0);
     }

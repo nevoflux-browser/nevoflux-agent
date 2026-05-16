@@ -240,6 +240,10 @@ impl LearningPipeline {
     /// Returns the number of **new** entries that were created (merged
     /// duplicates are not counted). Returns `Ok(0)` if the pipeline is paused.
     pub fn flush(&self) -> Result<usize> {
+        if crate::learning::is_disabled() {
+            tracing::info!("learning system disabled (eval mode) — skipping");
+            return Ok(0);
+        }
         if !self.is_enabled() {
             return Ok(0);
         }
@@ -402,6 +406,10 @@ impl LearningPipeline {
     /// Returns the number of entries that were validated. Returns `Ok(0)` if
     /// the pipeline is paused.
     pub fn validate(&self, thresholds: &ValidationThresholds) -> Result<usize> {
+        if crate::learning::is_disabled() {
+            tracing::info!("learning system disabled (eval mode) — skipping");
+            return Ok(0);
+        }
         if !self.is_enabled() {
             return Ok(0);
         }
@@ -498,6 +506,10 @@ impl LearningPipeline {
     ///
     /// Returns a `PromotionResult` with counts of promoted/skipped entries.
     pub async fn promote(&self, thresholds: &PromotionThresholds) -> Result<PromotionResult> {
+        if crate::learning::is_disabled() {
+            tracing::info!("learning system disabled (eval mode) — skipping");
+            return Ok(PromotionResult::default());
+        }
         if !self.is_enabled() {
             return Ok(PromotionResult::default());
         }
