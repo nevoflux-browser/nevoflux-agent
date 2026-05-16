@@ -8,10 +8,10 @@ use nevoflux_protocol::subagent::ToolsConfig;
 
 pub mod browsecomp;
 pub mod nevoflux_suite;
+pub mod online_mind2web;
 
 // Stubs to be implemented in subsequent PRs:
 // pub mod browsecomp_zh;
-// pub mod online_mind2web;
 // pub mod webarena;
 // pub mod webvoyager;
 
@@ -78,8 +78,8 @@ pub fn registry() -> Vec<Box<dyn Benchmark>> {
     vec![
         Box::new(browsecomp::BrowseComp::new()),
         Box::new(nevoflux_suite::NevoFluxSuite::new()),
+        Box::new(online_mind2web::OnlineMind2Web::new()),
         // Box::new(browsecomp_zh::BrowseCompZh::new()),
-        // Box::new(online_mind2web::OnlineMind2Web::new()),
     ]
 }
 
