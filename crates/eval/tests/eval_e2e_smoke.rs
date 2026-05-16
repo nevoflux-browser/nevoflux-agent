@@ -165,6 +165,106 @@ async fn eval_runs_against_real_daemon() {
 /// dispatch plumbing is exercised. The task itself is trivial — we only care
 /// that the runner finishes without a timeout.
 #[tokio::test]
+async fn cross_session_inject_routes_correctly() {
+    use nevoflux_eval::SetupStep;
+    use nevoflux_protocol::subagent::ToolsConfig;
+
+    let daemon = daemon_path();
+    if !daemon.exists() {
+        eprintln!(
+            "skipping: daemon binary not built at {}.",
+            daemon.display()
+        );
+        return;
+    }
+
+    std::env::set_var("NEVOFLUX_EVAL_LLM_MODE", "mock");
+    let _guard = EnvVarGuard("NEVOFLUX_EVAL_LLM_MODE");
+
+    let state_dir = tempfile::tempdir().unwrap();
+
+    struct CrossSessionBench;
+
+    #[async_trait]
+    impl Benchmark for CrossSessionBench {
+        fn name(&self) -> &str {
+            "cross-session-smoke"
+        }
+
+        fn description(&self) -> &str {
+            "verifies cross-session InjectMessage routes through daemon"
+        }
+
+        fn requires_network(&self) -> bool {
+            false
+        }
+
+        fn default_judge(&self) -> &str {
+            "programmatic"
+        }
+
+        fn tools_config(&self) -> ToolsConfig {
+            ToolsConfig::None
+        }
+
+        async fn load_tasks(&self, _filter: Option<&str>) -> nevoflux_eval::EvalResult<Vec<Task>> {
+            Ok(vec![Task {
+                id: "cross-001".into(),
+                category: "smoke".into(),
+                mode: NevoFluxMode::Chat,
+                prompt: "Do you remember my preference?".into(),
+                setup: vec![SetupStep::InjectMessage {
+                    session: "memory-prev".into(),
+                    role: "user".into(),
+                    content: "I prefer concise answers".into(),
+                }],
+                reference: None,
+                // ContainsAny with empty string always matches any (including empty) answer.
+                assertions: vec![Assertion::ContainsAny {
+                    targets: vec!["".into()],
+                }],
+                requires_browser: false,
+                metadata: Default::default(),
+            }])
+        }
+    }
+
+    let config = RunnerConfig {
+        daemon_addr: "".into(),
+        task_timeout_secs: 30,
+        parallelism: 1,
+        task_filter: None,
+        limit: None,
+        browser_mode: BrowserLaunchMode::DaemonOnly {
+            daemon_binary: daemon,
+            state_dir: state_dir.path().to_path_buf(),
+        },
+    };
+    let runner = Runner::new(config);
+    let bench = CrossSessionBench;
+    let judge = ProgrammaticJudge::new();
+    let summary = runner.run(&bench, &judge).await.expect("runner completed");
+
+    assert_eq!(summary.total, 1, "expected 1 task total");
+    assert_eq!(
+        summary.timeouts, 0,
+        "cross-session inject should not hang; got timeouts={}",
+        summary.timeouts
+    );
+
+    // Status should be Completed or Failed (agent ran), never Timeout.
+    let status = summary.per_task[0].result.status;
+    assert!(
+        matches!(
+            status,
+            nevoflux_eval::TaskStatus::Completed | nevoflux_eval::TaskStatus::Failed
+        ),
+        "expected Completed or Failed (agent ran), got {:?}",
+        status
+    );
+}
+
+#[tokio::test]
 async fn tools_enabled_dispatch_does_not_crash() {
     use nevoflux_protocol::subagent::ToolsConfig;
 
