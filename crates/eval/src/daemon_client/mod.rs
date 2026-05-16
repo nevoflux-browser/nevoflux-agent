@@ -5,6 +5,7 @@
 
 pub mod lock;
 
-// http and sse modules land in Tasks 6 and 7 — declarations added then.
+pub mod http;
 
+pub use http::{DaemonHttpClient, HttpError};
 pub use lock::{wait_for_lock, DaemonLock, LockError};

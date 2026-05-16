@@ -26,7 +26,7 @@ pub mod runner;
 pub mod termination;
 
 pub use browser::{BrowserHandle, BrowserLaunchMode};
-pub use daemon_client::DaemonLock;
+pub use daemon_client::{DaemonHttpClient, DaemonLock};
 pub use error::{EvalError, EvalResult};
 pub use runner::{Runner, RunnerConfig};
 pub use termination::{AnswerExtractor, DaemonEvent, TerminationDecision, TerminationStrategy};
