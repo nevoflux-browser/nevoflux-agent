@@ -96,12 +96,17 @@ pub struct TaskOutcome {
 }
 
 pub struct Runner {
-    config: RunnerConfig,
+    pub(crate) config: RunnerConfig,
+    pub(crate) client: Option<crate::daemon_client::DaemonHttpClient>,
 }
 
 impl Runner {
     pub fn new(config: RunnerConfig) -> Self {
-        Self { config }
+        Self { config, client: None }
+    }
+
+    pub fn with_client(config: RunnerConfig, client: crate::daemon_client::DaemonHttpClient) -> Self {
+        Self { config, client: Some(client) }
     }
 
     pub async fn run(
@@ -169,8 +174,8 @@ impl Runner {
 
             let started = Instant::now();
             let exec_result = timeout(
-                Duration::from_secs(self.config.task_timeout_secs),
-                self.execute_task(task, browser.as_ref()),
+                Duration::from_secs(self.config.task_timeout_secs + 30),
+                self.execute_task(task, benchmark, browser.as_ref()),
             )
             .await;
 
@@ -265,24 +270,167 @@ impl Runner {
         })
     }
 
-    /// Execute a single task — STUB.
+    /// Execute a single task against the daemon via HTTP + SSE.
     ///
-    /// Concrete implementation must:
-    ///   1. Use `nevoflux_daemon_client::DaemonClient::connect(&self.config.daemon_addr)`
-    ///   2. Apply `task.setup` steps (CreateSession, AppendMessage, GrantPermission)
-    ///   3. Open session in `task.mode` and dispatch the prompt
-    ///   4. If `task.requires_browser`, route page actions through `browser`
-    ///   5. Stream events until `Stop`; collect text into `final_answer`
-    ///   6. Read the `traces` SQLite table for trace IDs
-    ///   7. Compute token cost from LLM provider response metadata
+    /// Flow:
+    ///   1. Create a fresh daemon session for the task's mode
+    ///   2. Apply setup steps (inject messages, seed memory, grant permissions)
+    ///   3. Open SSE event stream before submitting the prompt (avoids race)
+    ///   4. Submit the prompt (with optional benchmark-supplied suffix)
+    ///   5. Consume events, evaluating `TerminationStrategy` after each event
+    ///   6. Clean up the session (DELETE)
+    ///   7. Extract `final_answer` via `AnswerExtractor` and build `TaskResult`
     async fn execute_task(
         &self,
         task: &Task,
+        benchmark: &dyn Benchmark,
         _browser: &dyn BrowserHandle,
     ) -> EvalResult<TaskResult> {
-        let _ = task;
-        Err(EvalError::DaemonConnection(
-            "Runner::execute_task not yet wired to DaemonClient — see TODO".into(),
-        ))
+        use crate::daemon_client::http::{
+            CreateSessionRequest, SetupRequest, SetupStep as ClientSetupStep,
+            SubmitMessageRequest,
+        };
+        use crate::daemon_client::sse::stream_events;
+        use crate::termination::{DaemonEvent, TerminationDecision};
+        use futures::StreamExt;
+
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| EvalError::DaemonConnection("runner has no http client".into()))?;
+
+        let started = std::time::Instant::now();
+
+        // (1) Create session
+        let mode_str = match task.mode {
+            crate::NevoFluxMode::Chat => "chat",
+            crate::NevoFluxMode::Browser => "browser",
+            crate::NevoFluxMode::Agent => "agent",
+        };
+        let create = client
+            .create_session(&CreateSessionRequest {
+                mode: mode_str.to_string(),
+                llm_backend: None,
+                mock_browser: None,
+                eval_run_id: None,
+            })
+            .await
+            .map_err(|e| EvalError::DaemonError(format!("create_session: {e}")))?;
+        let sid = create.session_id;
+
+        // (2) Apply setup steps
+        if !task.setup.is_empty() {
+            let steps: Vec<ClientSetupStep> = task
+                .setup
+                .iter()
+                .map(|s| match s {
+                    crate::SetupStep::InjectMessage { role, content, .. } => {
+                        ClientSetupStep::InjectMessage {
+                            role: role.clone(),
+                            content: content.clone(),
+                        }
+                    }
+                    crate::SetupStep::SeedMemory { content } => ClientSetupStep::SeedMemory {
+                        key: "memory".into(),
+                        value: content.clone(),
+                    },
+                    crate::SetupStep::GrantPermission { resource, action } => {
+                        ClientSetupStep::GrantPermission {
+                            tool: format!("{resource}:{action}"),
+                        }
+                    }
+                })
+                .collect();
+            let _ = client
+                .setup_session(&sid, &SetupRequest { steps })
+                .await
+                .map_err(|e| EvalError::DaemonError(format!("setup: {e}")))?;
+        }
+
+        // (3) Open SSE stream FIRST so we don't race the submit
+        let resp = client
+            .open_events(&sid)
+            .await
+            .map_err(|e| EvalError::DaemonError(format!("open_events: {e}")))?;
+        let mut events = stream_events(resp);
+
+        // (4) Submit prompt (with optional suffix from benchmark)
+        let prompt = match benchmark.prompt_suffix() {
+            Some(suffix) => format!("{}{}", task.prompt, suffix),
+            None => task.prompt.clone(),
+        };
+        let _ = client
+            .submit_message(
+                &sid,
+                &SubmitMessageRequest {
+                    prompt,
+                    timeout_secs: Some(self.config.task_timeout_secs),
+                },
+            )
+            .await
+            .map_err(|e| EvalError::DaemonError(format!("submit: {e}")))?;
+
+        // (5) Consume events until termination strategy fires or task_timeout elapses
+        let strategy = benchmark.termination_strategy();
+        let extractor = benchmark.answer_extractor();
+        let task_timeout = Duration::from_secs(self.config.task_timeout_secs);
+        let mut collected: Vec<DaemonEvent> = Vec::new();
+        let mut termination_reason: Option<String> = None;
+
+        let consume = async {
+            loop {
+                match events.next().await {
+                    Some(Ok(evt)) => {
+                        collected.push(evt);
+                        match strategy.evaluate(&collected) {
+                            TerminationDecision::Continue => continue,
+                            TerminationDecision::Stop => break,
+                            TerminationDecision::StopWithError(msg) => {
+                                termination_reason = Some(msg);
+                                break;
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        termination_reason = Some(format!("sse error: {e}"));
+                        break;
+                    }
+                    None => {
+                        termination_reason = Some("sse stream ended unexpectedly".into());
+                        break;
+                    }
+                }
+            }
+            Ok::<(), EvalError>(())
+        };
+
+        let timed = tokio::time::timeout(task_timeout, consume).await;
+        let timed_out = timed.is_err();
+
+        // (6) Cleanup: DELETE session (best-effort)
+        if let Err(e) = client.delete_session(&sid).await {
+            tracing::warn!(session_id = %sid, error = %e, "delete_session failed (continuing)");
+        }
+
+        // (7) Build result
+        let status = if timed_out {
+            TaskStatus::Timeout
+        } else if termination_reason.is_some() {
+            TaskStatus::Failed
+        } else {
+            TaskStatus::Completed
+        };
+
+        let final_answer = extractor.extract(&collected);
+
+        Ok(TaskResult {
+            task_id: task.id.clone(),
+            status,
+            final_answer,
+            latency_ms: started.elapsed().as_millis() as u64,
+            token_cost: None, // Phase 3: parse from tool_result events
+            error: termination_reason,
+            trace_ids: vec![], // Phase 3: read traces endpoint and extract IDs
+        })
     }
 }
