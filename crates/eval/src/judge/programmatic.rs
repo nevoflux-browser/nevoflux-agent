@@ -1,31 +1,15 @@
-//! Programmatic judge — case-insensitive whitespace-normalized string equals.
-//!
-//! Used by BrowseComp / BrowseComp-ZH where reference answers are short and
-//! verifiable. Zero LLM cost.
+//! Programmatic judge — equals / contains / regex matching against the
+//! task's `reference` answer. Cheap, no LLM, deterministic.
 
-use super::{Judge, Verdict};
-use crate::{EvalResult, Task, TaskResult};
+use crate::{judge::{Judge, Verdict}, EvalResult, Task, TaskResult};
 use async_trait::async_trait;
+use regex::Regex;
 
 pub struct ProgrammaticJudge;
 
 impl ProgrammaticJudge {
     pub fn new() -> Self {
         Self
-    }
-
-    fn normalize(s: &str) -> String {
-        s.trim()
-            .to_lowercase()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-}
-
-impl Default for ProgrammaticJudge {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -36,72 +20,102 @@ impl Judge for ProgrammaticJudge {
     }
 
     async fn judge(&self, task: &Task, result: &TaskResult) -> EvalResult<Verdict> {
-        let answer = match &result.final_answer {
-            Some(a) => a,
-            None => {
+        let answer = result.final_answer.as_deref().unwrap_or("");
+
+        // Try assertions first (more structured).
+        let mut hits = 0;
+        let mut misses = 0;
+        for a in &task.assertions {
+            let pass = check_assertion(a, answer, result);
+            if pass { hits += 1; } else { misses += 1; }
+        }
+
+        // Fall back to reference if no assertions.
+        if task.assertions.is_empty() {
+            if let Some(reference) = &task.reference {
+                let ans = answer.trim().to_lowercase();
+                let r = reference.trim().to_lowercase();
+                let correct = ans == r;
                 return Ok(Verdict {
-                    correct: false,
-                    score: 0.0,
-                    explanation: "no final answer produced".into(),
+                    correct,
+                    score: if correct { 1.0 } else { 0.0 },
+                    explanation: if correct {
+                        "exact match against reference".into()
+                    } else {
+                        format!("got `{ans}`, expected `{r}`")
+                    },
                     judge_cost_usd: 0.0,
-                })
+                });
             }
-        };
+            return Ok(Verdict {
+                correct: false,
+                score: 0.0,
+                explanation: "no assertions and no reference".into(),
+                judge_cost_usd: 0.0,
+            });
+        }
 
-        let reference = match &task.reference {
-            Some(r) => r,
-            None => {
-                return Ok(Verdict {
-                    correct: false,
-                    score: 0.0,
-                    explanation: "task has no reference answer".into(),
-                    judge_cost_usd: 0.0,
-                })
-            }
-        };
-
-        let answer_n = Self::normalize(answer);
-        let reference_n = Self::normalize(reference);
-
-        let correct = answer_n == reference_n;
+        let correct = misses == 0;
         Ok(Verdict {
             correct,
-            score: if correct { 1.0 } else { 0.0 },
-            explanation: if correct {
-                "exact match (normalized)".into()
-            } else {
-                format!("expected `{}`, got `{}`", reference_n, answer_n)
-            },
+            score: hits as f64 / (hits + misses).max(1) as f64,
+            explanation: format!("{hits} assertion(s) passed, {misses} failed"),
             judge_cost_usd: 0.0,
         })
+    }
+}
+
+fn check_assertion(a: &crate::Assertion, answer: &str, _result: &TaskResult) -> bool {
+    use crate::Assertion;
+    match a {
+        Assertion::EqualsAny { targets } => {
+            let lower = answer.trim().to_lowercase();
+            targets
+                .iter()
+                .any(|t| lower == t.trim().to_lowercase())
+        }
+        Assertion::ContainsAny { targets } => {
+            let lower = answer.to_lowercase();
+            targets.iter().any(|t| lower.contains(&t.to_lowercase()))
+        }
+        Assertion::NotContains { targets } => {
+            let lower = answer.to_lowercase();
+            !targets.iter().any(|t| lower.contains(&t.to_lowercase()))
+        }
+        Assertion::Regex { pattern } => {
+            Regex::new(pattern).map(|r| r.is_match(answer)).unwrap_or(false)
+        }
+        // Structured assertions (DaemonEvent / NoOutboundTo) are handled
+        // by StructuredJudge — programmatic skips them silently.
+        Assertion::DaemonEvent { .. } | Assertion::NoOutboundTo { .. } => true,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NevoFluxMode;
+    use crate::{Assertion, NevoFluxMode, TaskStatus};
 
-    fn task_with_ref(reference: &str) -> Task {
+    fn task(asserts: Vec<Assertion>, reference: Option<&str>) -> Task {
         Task {
-            id: "test-001".into(),
+            id: "t".into(),
             category: "test".into(),
-            mode: NevoFluxMode::Agent,
-            prompt: "?".into(),
+            mode: NevoFluxMode::Chat,
+            prompt: "".into(),
             setup: vec![],
-            reference: Some(reference.into()),
-            assertions: vec![],
+            reference: reference.map(String::from),
+            assertions: asserts,
             requires_browser: false,
-            metadata: serde_json::Map::new(),
+            metadata: Default::default(),
         }
     }
 
-    fn result_with(answer: &str) -> TaskResult {
+    fn result(answer: &str) -> TaskResult {
         TaskResult {
-            task_id: "test-001".into(),
-            status: crate::TaskStatus::Completed,
+            task_id: "t".into(),
+            status: TaskStatus::Completed,
             final_answer: Some(answer.into()),
-            latency_ms: 100,
+            latency_ms: 1,
             token_cost: None,
             error: None,
             trace_ids: vec![],
@@ -109,49 +123,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matches_exact() {
-        let j = ProgrammaticJudge::new();
-        let v = j
-            .judge(&task_with_ref("Paris"), &result_with("Paris"))
-            .await
-            .unwrap();
+    async fn reference_exact_match() {
+        let t = task(vec![], Some("42"));
+        let v = ProgrammaticJudge.judge(&t, &result("42")).await.unwrap();
         assert!(v.correct);
     }
 
     #[tokio::test]
-    async fn normalizes_case_and_whitespace() {
-        let j = ProgrammaticJudge::new();
-        let v = j
-            .judge(&task_with_ref("Paris"), &result_with("  paris  "))
-            .await
-            .unwrap();
+    async fn contains_any_passes() {
+        let t = task(
+            vec![Assertion::ContainsAny { targets: vec!["foo".into()] }],
+            None,
+        );
+        let v = ProgrammaticJudge.judge(&t, &result("contains FOO inside")).await.unwrap();
         assert!(v.correct);
     }
 
     #[tokio::test]
-    async fn rejects_mismatch() {
-        let j = ProgrammaticJudge::new();
-        let v = j
-            .judge(&task_with_ref("Paris"), &result_with("London"))
-            .await
-            .unwrap();
+    async fn not_contains_fails_on_hit() {
+        let t = task(
+            vec![Assertion::NotContains { targets: vec!["secret".into()] }],
+            None,
+        );
+        let v = ProgrammaticJudge.judge(&t, &result("contains SECRET")).await.unwrap();
         assert!(!v.correct);
     }
 
     #[tokio::test]
-    async fn no_answer_is_incorrect() {
-        let j = ProgrammaticJudge::new();
-        let task = task_with_ref("Paris");
-        let result = TaskResult {
-            task_id: "test-001".into(),
-            status: crate::TaskStatus::Timeout,
-            final_answer: None,
-            latency_ms: 0,
-            token_cost: None,
-            error: Some("timeout".into()),
-            trace_ids: vec![],
-        };
-        let v = j.judge(&task, &result).await.unwrap();
-        assert!(!v.correct);
+    async fn regex_match() {
+        let t = task(
+            vec![Assertion::Regex { pattern: r"\d+".into() }],
+            None,
+        );
+        let v = ProgrammaticJudge.judge(&t, &result("answer is 42")).await.unwrap();
+        assert!(v.correct);
     }
 }
