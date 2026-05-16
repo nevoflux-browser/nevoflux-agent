@@ -135,7 +135,12 @@ async fn main() -> anyhow::Result<()> {
             })?;
 
             let browser = match browser_mode {
-                BrowserModeArg::DaemonOnly => BrowserLaunchMode::DaemonOnly,
+                // TODO(Task 16): resolve daemon_binary and state_dir from CLI flags properly.
+                // For now, use placeholder paths so the crate compiles; Task 16 replaces this.
+                BrowserModeArg::DaemonOnly => BrowserLaunchMode::DaemonOnly {
+                    daemon_binary: PathBuf::from("target/release/nevoflux-agent"),
+                    state_dir: PathBuf::from(".eval-state"),
+                },
                 BrowserModeArg::External => BrowserLaunchMode::ExternalDevInstance {
                     endpoint: browser_endpoint,
                 },

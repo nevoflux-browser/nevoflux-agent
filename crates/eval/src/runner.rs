@@ -38,7 +38,10 @@ impl Default for RunnerConfig {
             parallelism: 1,
             task_filter: None,
             limit: None,
-            browser_mode: BrowserLaunchMode::DaemonOnly,
+            browser_mode: BrowserLaunchMode::DaemonOnly {
+                daemon_binary: std::path::PathBuf::from("target/release/nevoflux-agent"),
+                state_dir: std::path::PathBuf::from(".eval-state"),
+            },
         }
     }
 }

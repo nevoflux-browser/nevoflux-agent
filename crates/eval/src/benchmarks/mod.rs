@@ -58,7 +58,7 @@ pub trait Benchmark: Send + Sync {
     /// `min(config.parallelism, benchmark.max_parallelism(mode))`.
     fn max_parallelism(&self, mode: &BrowserLaunchMode) -> usize {
         match mode {
-            BrowserLaunchMode::DaemonOnly => 8,
+            BrowserLaunchMode::DaemonOnly { .. } => 8,
             _ => 1, // real-browser benchmarks are conservative by default
         }
     }
