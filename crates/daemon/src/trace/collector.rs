@@ -174,9 +174,7 @@ impl TraceCollector {
         &self,
         session_id: &str,
     ) -> Result<Vec<nevoflux_storage::TraceSpanRecord>, StorageError> {
-        self.storage
-            .traces()
-            .list_by_session(session_id)
+        self.storage.traces().list_by_session(session_id)
     }
 
     /// Cleanup traces for a completed session.
@@ -249,7 +247,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("custom-traces.db");
         let collector = TraceCollector::with_db_path(db_path.clone()).unwrap();
-        assert!(db_path.exists(), "DB file should be created at requested path");
+        assert!(
+            db_path.exists(),
+            "DB file should be created at requested path"
+        );
 
         // Verify the DB is structurally identical: write a span and read it back.
         collector.record_tool_exec(

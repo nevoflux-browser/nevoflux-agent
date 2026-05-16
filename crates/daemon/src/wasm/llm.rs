@@ -3028,9 +3028,7 @@ async fn stream_acp_completion(
                         asset_server: services.asset_server.clone(),
                     };
                     tokio::spawn(crate::wasm::mcp_tool_executor::run_permission_handler(
-                        perm_rx,
-                        dummy_ctx,
-                        true,
+                        perm_rx, dummy_ctx, true,
                     ));
                 }
                 // If browser_sender is None too, the bridge won't work in

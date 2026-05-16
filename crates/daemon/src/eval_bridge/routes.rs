@@ -1,5 +1,7 @@
 //! Eval bridge route handlers — see spec §6.2.
 
+use super::sse::{to_sse, EvalEvent};
+use super::state::EvalAppState;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -11,8 +13,6 @@ use nevoflux_storage::MessageRole;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::str::FromStr;
-use super::sse::{to_sse, EvalEvent};
-use super::state::EvalAppState;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateSessionRequest {
@@ -70,18 +70,29 @@ pub async fn create_session(
             .session_manager
             .create_agent_session(None, None)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("create_session: {e}")))?,
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("create_session: {e}"),
+                )
+            })?,
         "chat" => state
             .session_manager
             .create_session(None, None)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("create_session: {e}")))?,
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("create_session: {e}"),
+                )
+            })?,
         // TODO(phase-2): "browser" mode deferred — SessionManager has no Browser variant yet.
         // Currently only "chat" and "agent" are supported.
         "browser" => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                "browser mode not yet supported (phase-2 — SessionManager needs Browser variant)".into(),
+                "browser mode not yet supported (phase-2 — SessionManager needs Browser variant)"
+                    .into(),
             ));
         }
         other => {
@@ -117,7 +128,9 @@ pub async fn setup_session(
                 let message_role = MessageRole::from_str(&role).map_err(|_| {
                     (
                         StatusCode::BAD_REQUEST,
-                        format!("inject_message: unknown role {role:?}; expected user|assistant|system"),
+                        format!(
+                            "inject_message: unknown role {role:?}; expected user|assistant|system"
+                        ),
                     )
                 })?;
                 state
@@ -224,8 +237,8 @@ pub async fn stream_events(
     State(state): State<EvalAppState>,
     Path(session_id): Path<String>,
 ) -> axum::response::Response {
-    use crate::event_bus::{BackpressurePolicy, SubscriberIdentity};
     use crate::event_bus::types::TopicPattern;
+    use crate::event_bus::{BackpressurePolicy, SubscriberIdentity};
 
     let eval_stream: Pin<Box<dyn futures::Stream<Item = EvalEvent> + Send>> =
         match state.event_bus.as_ref() {
@@ -246,7 +259,7 @@ pub async fn stream_events(
                 // the event payload (phase-2: narrow to per-session topics when they land).
                 let sid = session_id.clone();
                 match bus.subscribe(
-                    TopicPattern::double_wildcard(""),  // all topics
+                    TopicPattern::double_wildcard(""), // all topics
                     SubscriberIdentity::Internal,
                     BackpressurePolicy::DropNewest,
                     256,
@@ -259,8 +272,7 @@ pub async fn stream_events(
                     }
                     Ok(handle) => {
                         // Convert the mpsc::Receiver<BusEvent> into a Stream.
-                        let rx_stream =
-                            tokio_stream::wrappers::ReceiverStream::new(handle.rx);
+                        let rx_stream = tokio_stream::wrappers::ReceiverStream::new(handle.rx);
 
                         // Filter events that carry this session_id in their payload,
                         // then map the raw BusEvent to an EvalEvent.
@@ -277,10 +289,8 @@ pub async fn stream_events(
                                 // Only forward events whose payload contains the
                                 // matching session_id (or that have no session_id
                                 // field, which we skip to avoid flooding the client).
-                                let payload_sid = bus_evt
-                                    .payload
-                                    .get("session_id")
-                                    .and_then(|v| v.as_str());
+                                let payload_sid =
+                                    bus_evt.payload.get("session_id").and_then(|v| v.as_str());
                                 if payload_sid != Some(sid.as_str()) {
                                     return None;
                                 }
@@ -310,11 +320,7 @@ pub async fn stream_traces(
         Some(tc) => match tc.traces_for_session(&session_id) {
             Ok(s) => s,
             Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("traces: {e}"),
-                )
-                    .into_response();
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("traces: {e}")).into_response();
             }
         },
         None => {

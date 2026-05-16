@@ -56,9 +56,8 @@ pub fn to_sse(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     use futures::StreamExt;
     let mapped = stream.map(|evt| {
-        let json = serde_json::to_string(&evt).unwrap_or_else(|e| {
-            format!(r#"{{"type":"error","message":"serialize: {e}"}}"#)
-        });
+        let json = serde_json::to_string(&evt)
+            .unwrap_or_else(|e| format!(r#"{{"type":"error","message":"serialize: {e}"}}"#));
         Ok(Event::default().data(json))
     });
     Sse::new(mapped).keep_alive(KeepAlive::default())

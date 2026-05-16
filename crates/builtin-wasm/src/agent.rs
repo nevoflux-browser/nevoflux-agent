@@ -2345,9 +2345,9 @@ The following skill instructions MUST be followed exactly. These instructions ta
             // /loop skill tools — direct-API dispatch (Anthropic / OpenAI direct
             // providers). The MCP/ACP path goes through
             // `mcp_tool_executor::execute_mcp_tool::loop.*`.
-            "loop.create" => self
-                .host
-                .tool_loop_create(&serde_json::to_string(&tool_call.arguments).unwrap_or_default())?,
+            "loop.create" => self.host.tool_loop_create(
+                &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
+            )?,
             "loop.list" => self.host.tool_loop_list()?,
             "loop.cancel" => {
                 let loop_id = tool_call.arguments["loop_id"].as_str().unwrap_or("");

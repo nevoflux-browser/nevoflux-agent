@@ -17,8 +17,8 @@ pub fn from_env() -> Result<Option<EvalConfig>, EvalConfigError> {
     if std::env::var("NEVOFLUX_EVAL_MODE").ok().as_deref() != Some("1") {
         return Ok(None);
     }
-    let run_id = std::env::var("NEVOFLUX_EVAL_RUN_ID")
-        .map_err(|_| EvalConfigError::MissingRunId)?;
+    let run_id =
+        std::env::var("NEVOFLUX_EVAL_RUN_ID").map_err(|_| EvalConfigError::MissingRunId)?;
     if run_id.trim().is_empty() {
         return Err(EvalConfigError::MissingRunId);
     }
@@ -34,7 +34,10 @@ mod tests {
 
     fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let prev: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var(*k).ok())).collect();
+        let prev: Vec<_> = vars
+            .iter()
+            .map(|(k, _)| (*k, std::env::var(*k).ok()))
+            .collect();
         for (k, v) in vars {
             match v {
                 Some(val) => std::env::set_var(k, val),
@@ -66,7 +69,10 @@ mod tests {
     #[test]
     fn eval_mode_set_without_run_id_errors() {
         with_env(
-            &[("NEVOFLUX_EVAL_MODE", Some("1")), ("NEVOFLUX_EVAL_RUN_ID", None)],
+            &[
+                ("NEVOFLUX_EVAL_MODE", Some("1")),
+                ("NEVOFLUX_EVAL_RUN_ID", None),
+            ],
             || {
                 let err = from_env().unwrap_err();
                 assert!(matches!(err, EvalConfigError::MissingRunId));
@@ -77,9 +83,15 @@ mod tests {
     #[test]
     fn eval_mode_set_with_empty_run_id_errors() {
         with_env(
-            &[("NEVOFLUX_EVAL_MODE", Some("1")), ("NEVOFLUX_EVAL_RUN_ID", Some("   "))],
+            &[
+                ("NEVOFLUX_EVAL_MODE", Some("1")),
+                ("NEVOFLUX_EVAL_RUN_ID", Some("   ")),
+            ],
             || {
-                assert!(matches!(from_env().unwrap_err(), EvalConfigError::MissingRunId));
+                assert!(matches!(
+                    from_env().unwrap_err(),
+                    EvalConfigError::MissingRunId
+                ));
             },
         );
     }

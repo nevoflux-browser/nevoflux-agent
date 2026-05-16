@@ -145,15 +145,11 @@ impl IterationExecutor {
             Ok(s) => s,
             Err(e) => return ExecResult::Error(e.to_string()),
         };
-        let iter_id = match repo.insert_iteration(
-            loop_id.as_ref(),
-            seq,
-            now,
-            IterationStatus::Running,
-        ) {
-            Ok(i) => i,
-            Err(e) => return ExecResult::Error(e.to_string()),
-        };
+        let iter_id =
+            match repo.insert_iteration(loop_id.as_ref(), seq, now, IterationStatus::Running) {
+                Ok(i) => i,
+                Err(e) => return ExecResult::Error(e.to_string()),
+            };
 
         self.events
             .iteration_start(&session_id, &loop_id, seq, now, &fire_reason)
@@ -348,15 +344,8 @@ impl IterationExecutor {
                 .await
             }
             Err(e) => {
-                self.finalize_iteration_error(
-                    iter_id,
-                    e.message,
-                    &session_id,
-                    &loop_id,
-                    seq,
-                    &rec,
-                )
-                .await
+                self.finalize_iteration_error(iter_id, e.message, &session_id, &loop_id, seq, &rec)
+                    .await
             }
         }
     }
@@ -484,19 +473,13 @@ pub(crate) async fn build_user_message(
 /// skill registry, missing skill, parse failure). Loops should not fail
 /// outright on a bad wrapped_skill — they should surface the problem in the
 /// iteration log so the operator can fix the loop record.
-async fn materialize_wrapped_skill(
-    skill_json: &str,
-    services: Option<&HostServices>,
-) -> String {
+async fn materialize_wrapped_skill(skill_json: &str, services: Option<&HostServices>) -> String {
     // Parse the {name, args} JSON shape stashed at loop creation.
     let parsed: serde_json::Value = match serde_json::from_str(skill_json) {
         Ok(v) => v,
         Err(e) => return format!("(wrapped_skill parse error: {e})"),
     };
-    let name = parsed
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = parsed
         .get("args")
         .and_then(|v| {
@@ -636,5 +619,4 @@ mod tests {
             "successful iteration must reset consecutive_failures"
         );
     }
-
 }

@@ -9,8 +9,8 @@ use crate::loops::executor::IterationExecutor;
 use crate::loops::expression::TriggerExpr;
 use crate::loops::registry::LoopRegistry;
 use crate::loops::scheduler::{LoopFireRequest, TriggerScheduler};
-use nevoflux_builtin_wasm::AgentMode;
 use crate::loops::types::{LoopId, LoopRuntime};
+use nevoflux_builtin_wasm::AgentMode;
 use nevoflux_storage::connection::Database;
 use nevoflux_storage::models::{current_timestamp, LoopRecord, LoopState};
 use nevoflux_storage::repositories::LoopRepository;
@@ -90,8 +90,7 @@ impl LoopManager {
         let registry = LoopRegistry::new();
         let scheduler = TriggerScheduler::new();
         let events = Arc::new(LoopEvents::new(bus.clone()));
-        let executor_inner =
-            IterationExecutor::new_with_events(db.clone(), events.clone());
+        let executor_inner = IterationExecutor::new_with_events(db.clone(), events.clone());
         let executor = Arc::new(match services {
             Some(s) => executor_inner.with_services(s),
             None => executor_inner,
@@ -233,20 +232,17 @@ impl LoopManager {
                         .with_mut(&req.loop_id, |rt| std::mem::take(&mut rt.dom_watchers))
                         .unwrap_or_default();
                     let subs: Vec<String> = registry_for_task
-                        .with_mut(&req.loop_id, |rt| {
-                            std::mem::take(&mut rt.subscription_ids)
-                        })
+                        .with_mut(&req.loop_id, |rt| std::mem::take(&mut rt.subscription_ids))
                         .unwrap_or_default();
                     for sub in &subs {
                         scheduler_for_task.unsubscribe(sub);
                     }
                     let _ = watchers;
-                    let _ = LoopRepository::new(&executor_for_task.database())
-                        .update_state(
-                            req.loop_id.as_ref(),
-                            LoopState::Failed,
-                            current_timestamp(),
-                        );
+                    let _ = LoopRepository::new(&executor_for_task.database()).update_state(
+                        req.loop_id.as_ref(),
+                        LoopState::Failed,
+                        current_timestamp(),
+                    );
                     events_for_task
                         .state_changed(
                             &session_id,
@@ -279,13 +275,7 @@ impl LoopManager {
                     );
                 }
                 events_for_task
-                    .state_changed(
-                        &session_id_for_state,
-                        &req.loop_id,
-                        "idle",
-                        "running",
-                        None,
-                    )
+                    .state_changed(&session_id_for_state, &req.loop_id, "idle", "running", None)
                     .await;
 
                 // time:dynamic protocol (spec §5.2): if the loop's trigger is
@@ -308,8 +298,7 @@ impl LoopManager {
                                         .filter(|s| s.starts_with("time-"))
                                         .cloned()
                                         .collect();
-                                    rt.subscription_ids
-                                        .retain(|s| !s.starts_with("time-"));
+                                    rt.subscription_ids.retain(|s| !s.starts_with("time-"));
                                     removed
                                 })
                                 .unwrap_or_default();
@@ -434,12 +423,7 @@ impl LoopManager {
     /// and tears down everything immediately. `force=false` only tears down
     /// triggers and lets the current iteration finish (the cancellation token
     /// is NOT triggered).
-    async fn cancel_loop_inner(
-        &self,
-        id: &LoopId,
-        force: bool,
-        by: &str,
-    ) -> Result<(), String> {
+    async fn cancel_loop_inner(&self, id: &LoopId, force: bool, by: &str) -> Result<(), String> {
         let session_id = self
             .registry
             .with_mut(id, |rt| rt.session_id.clone())
@@ -485,9 +469,7 @@ impl LoopManager {
     pub async fn shutdown(&self) {
         let ids = self.registry.ids();
         for id in &ids {
-            let _ = self
-                .cancel_loop_inner(id, true, "daemon-shutdown")
-                .await;
+            let _ = self.cancel_loop_inner(id, true, "daemon-shutdown").await;
         }
         // Any rows still `running` (shouldn't be after the per-id force
         // cancels, but defensive) get demoted to idle.
@@ -544,7 +526,10 @@ impl LoopManager {
             }
             TriggerExpr::Event(topic) => {
                 let Some(bus) = self.event_bus.clone() else {
-                    tracing::warn!("event:{} ignored — LoopManager has no EventBus handle", topic);
+                    tracing::warn!(
+                        "event:{} ignored — LoopManager has no EventBus handle",
+                        topic
+                    );
                     return;
                 };
                 match self
@@ -552,7 +537,8 @@ impl LoopManager {
                     .schedule_event(id.clone(), topic.clone(), bus, sink)
                 {
                     Ok(sub) => {
-                        self.registry.with_mut(id, |rt| rt.subscription_ids.push(sub));
+                        self.registry
+                            .with_mut(id, |rt| rt.subscription_ids.push(sub));
                     }
                     Err(e) => {
                         tracing::warn!("event:{} subscription failed: {e}", topic);
@@ -572,10 +558,7 @@ impl LoopManager {
                     return;
                 };
                 let topic = "ui:tab:dom:mutation".to_string();
-                match self
-                    .scheduler
-                    .schedule_event(id.clone(), topic, bus, sink)
-                {
+                match self.scheduler.schedule_event(id.clone(), topic, bus, sink) {
                     Ok(sub) => {
                         self.registry
                             .with_mut(id, |rt| rt.subscription_ids.push(sub));
@@ -846,25 +829,34 @@ mod tests {
         let bus = Arc::new(EventBus::new());
         let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus.clone()), None);
 
-        let id = mgr.create_loop(CreateLoopArgs {
-            session_id: "s1".into(),
-            trigger_expr_text: "event:ui:test:click".into(),
-            prompt_text: Some("p".into()),
-            wrapped_skill: None,
-            mode: nevoflux_builtin_wasm::AgentMode::Chat,
-        }).await.unwrap();
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "event:ui:test:click".into(),
+                prompt_text: Some("p".into()),
+                wrapped_skill: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
+            })
+            .await
+            .unwrap();
 
         bus.publish(BusEvent::ephemeral(
             "ui:test:click",
             serde_json::json!({}),
             PublisherIdentity::Internal,
-        )).await.unwrap();
+        ))
+        .await
+        .unwrap();
 
         // Real-time wait for the dispatcher + executor to run.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
-        assert!(rec.iteration_count >= 1, "iteration_count was {}", rec.iteration_count);
+        assert!(
+            rec.iteration_count >= 1,
+            "iteration_count was {}",
+            rec.iteration_count
+        );
     }
 
     #[tokio::test]
@@ -1020,11 +1012,7 @@ mod tests {
 
         let storage = fresh();
         let bus = Arc::new(EventBus::new());
-        let mgr = LoopManager::start_with_bus(
-            storage.database().clone(),
-            Some(bus.clone()),
-            None,
-        );
+        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus.clone()), None);
 
         let id = mgr
             .create_loop(CreateLoopArgs {

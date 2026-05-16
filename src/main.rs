@@ -498,7 +498,9 @@ async fn run_daemon(
     //   8. Spawn warn-only agent_turn_rx consumer (Phase-1 stub)
     //   9. Write atomic daemon.lock for eval-client discovery
     if let Some(cfg) = &eval_cfg {
-        let dirs = eval_dirs.as_ref().expect("eval_dirs always Some when eval_cfg is Some");
+        let dirs = eval_dirs
+            .as_ref()
+            .expect("eval_dirs always Some when eval_cfg is Some");
 
         // Step 3: Disable learning so eval runs don't pollute user memory.
         nevoflux_daemon::learning::disable();
@@ -506,10 +508,8 @@ async fn run_daemon(
 
         // Step 4: Isolated TraceCollector.
         let trace_collector = std::sync::Arc::new(
-            nevoflux_daemon::trace::collector::TraceCollector::with_db_path(
-                dirs.traces_db_path(),
-            )
-            .expect("eval-mode traces DB"),
+            nevoflux_daemon::trace::collector::TraceCollector::with_db_path(dirs.traces_db_path())
+                .expect("eval-mode traces DB"),
         );
 
         // Step 5: Simple EventBus (no persistence).
@@ -517,8 +517,9 @@ async fn run_daemon(
 
         // Step 6: Bearer token + EvalAppState.
         let token = uuid::Uuid::new_v4().to_string();
-        let (agent_turn_tx, agent_turn_rx) =
-            tokio::sync::mpsc::unbounded_channel::<nevoflux_daemon::eval_bridge::state::AgentTurnRequest>();
+        let (agent_turn_tx, agent_turn_rx) = tokio::sync::mpsc::unbounded_channel::<
+            nevoflux_daemon::eval_bridge::state::AgentTurnRequest,
+        >();
         let state = nevoflux_daemon::eval_bridge::EvalAppState {
             session_manager: session_manager.clone(),
             bearer_token: std::sync::Arc::from(token.as_str()),
@@ -646,7 +647,20 @@ fn epoch_to_ymd_hms(epoch_secs: u64) -> (u64, u8, u8, u8, u8, u8) {
         year += 1;
     }
     let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
-    let days_in_month = [31u64, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let days_in_month = [
+        31u64,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut month = 0u8;
     for &dim in &days_in_month {
         if days < dim {

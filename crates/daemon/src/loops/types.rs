@@ -17,7 +17,9 @@ impl LoopId {
 }
 
 impl AsRef<str> for LoopId {
-    fn as_ref(&self) -> &str { &self.0 }
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
 }
 
 impl std::fmt::Display for LoopId {

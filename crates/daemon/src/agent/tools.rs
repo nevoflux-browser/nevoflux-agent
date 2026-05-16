@@ -1330,14 +1330,17 @@ impl BrowserTool {
         // daemon-lifetime; absence here means the daemon couldn't bind
         // its loopback HTTP port at boot, in which case browser_upload
         // is genuinely unavailable.
-        let asset_server =
-            self.ctx.asset_server.as_ref().ok_or_else(|| {
-                DaemonError::InternalError(
-                    "browser_upload_file: AssetServer is not running on this daemon".into(),
-                )
-            })?;
-        let file_url =
-            asset_server.register_download(canonical, mime_type.clone(), file_name.clone(), TOKEN_TTL);
+        let asset_server = self.ctx.asset_server.as_ref().ok_or_else(|| {
+            DaemonError::InternalError(
+                "browser_upload_file: AssetServer is not running on this daemon".into(),
+            )
+        })?;
+        let file_url = asset_server.register_download(
+            canonical,
+            mime_type.clone(),
+            file_name.clone(),
+            TOKEN_TTL,
+        );
 
         // Build and dispatch the browser request.
         let params = serde_json::json!({

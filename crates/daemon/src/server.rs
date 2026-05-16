@@ -5992,12 +5992,9 @@ async fn handle_chat_message(
                         Some(asset_server) => {
                             // If the extension reported its origin in this
                             // status call, lock the CORS allow-origin to it.
-                            if let Some(origin) =
-                                params.get("origin").and_then(|v| v.as_str())
-                            {
+                            if let Some(origin) = params.get("origin").and_then(|v| v.as_str()) {
                                 if !origin.is_empty() {
-                                    asset_server
-                                        .set_allowed_origin(Some(origin.to_string()));
+                                    asset_server.set_allowed_origin(Some(origin.to_string()));
                                 }
                             }
                             serde_json::to_value(asset_server.asset_plane_info())
@@ -9102,8 +9099,8 @@ fn promote_image_local_files_to_attachments(
     attachments: &mut Vec<Attachment>,
     local_files: &mut Vec<nevoflux_protocol::FileInfo>,
 ) {
-    use base64::{engine::general_purpose::STANDARD, Engine};
     use crate::canvas_video::asset_resize::{maybe_resize_bytes, ResizeOutcome};
+    use base64::{engine::general_purpose::STANDARD, Engine};
 
     const MAX_INPUT_BYTES: u64 = 20 * 1024 * 1024;
     const LLM_STAGE_MAX: u32 = 1024;
@@ -9113,8 +9110,7 @@ fn promote_image_local_files_to_attachments(
     // under this — guard rejects pathological cases.
     const MAX_LLM_BYTES: usize = 5 * 1024 * 1024;
 
-    let mut promoted_paths: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut promoted_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for f in local_files.iter() {
         if f.is_directory {
@@ -9157,8 +9153,7 @@ fn promote_image_local_files_to_attachments(
         // Resize to LLM-friendly dimensions. The 1024×1024 box is what
         // Claude vision tools internally normalise to anyway; sending
         // anything bigger spends bandwidth without improving recognition.
-        let (resized_bytes, outcome) =
-            maybe_resize_bytes(&raw_bytes, LLM_STAGE_MAX, LLM_STAGE_MAX);
+        let (resized_bytes, outcome) = maybe_resize_bytes(&raw_bytes, LLM_STAGE_MAX, LLM_STAGE_MAX);
         let (final_bytes, final_mime): (Vec<u8>, String) = match &outcome {
             ResizeOutcome::Resized { format, .. } => {
                 let new_mime = match format {
@@ -9337,7 +9332,10 @@ mod tests {
         assert_eq!(attachments.len(), 1, "image should have been promoted");
         assert_eq!(attachments[0].mime_type, "image/png");
         assert_eq!(attachments[0].name, "hero.png");
-        assert!(!attachments[0].data.is_empty(), "data must be base64-encoded");
+        assert!(
+            !attachments[0].data.is_empty(),
+            "data must be base64-encoded"
+        );
         // Decode and compare round-trip.
         use base64::{engine::general_purpose::STANDARD, Engine};
         let round_trip = STANDARD.decode(&attachments[0].data).unwrap();
@@ -9346,7 +9344,11 @@ mod tests {
         // canvas_attach_asset({ local_path: ... }) afterwards. Earlier
         // versions dropped the entry and the agent ended up globbing
         // /tmp blindly looking for the path it could no longer see.
-        assert_eq!(local_files.len(), 1, "promoted entry must STAY in local_files for canvas_attach_asset(local_path=...)");
+        assert_eq!(
+            local_files.len(),
+            1,
+            "promoted entry must STAY in local_files for canvas_attach_asset(local_path=...)"
+        );
         assert_eq!(local_files[0].path, path.to_string_lossy().to_string());
 
         // Reuse: writing a tmpfile guard
@@ -9438,23 +9440,32 @@ mod tests {
         let mut rgb = Vec::with_capacity((w * h * 3) as usize);
         for y in 0..h {
             for x in 0..w {
-                let r = x.wrapping_mul(2654435761).wrapping_add(y.wrapping_mul(40503)) as u8;
-                let g = y.wrapping_mul(2246822519).wrapping_add(x.wrapping_mul(16807)) as u8;
+                let r = x
+                    .wrapping_mul(2654435761)
+                    .wrapping_add(y.wrapping_mul(40503)) as u8;
+                let g = y
+                    .wrapping_mul(2246822519)
+                    .wrapping_add(x.wrapping_mul(16807)) as u8;
                 let b = (x ^ y).wrapping_mul(1597334677) as u8;
                 rgb.extend_from_slice(&[r, g, b]);
             }
         }
         let mut png_bytes = Vec::new();
         let encoder = PngEncoder::new(&mut png_bytes);
-        encoder.write_image(&rgb, w, h, image::ColorType::Rgb8.into()).unwrap();
+        encoder
+            .write_image(&rgb, w, h, image::ColorType::Rgb8.into())
+            .unwrap();
         std::fs::write(&path, &png_bytes).unwrap();
 
         let original_size = png_bytes.len();
         // Sanity: the test fixture really exceeds the LLM-payload cap
         // when sent raw. Otherwise the test wouldn't be exercising the
         // resize path.
-        assert!(original_size > 5 * 1024 * 1024,
-            "fixture only {} bytes — expected > 5 MB to trigger LLM size guard", original_size);
+        assert!(
+            original_size > 5 * 1024 * 1024,
+            "fixture only {} bytes — expected > 5 MB to trigger LLM size guard",
+            original_size
+        );
 
         let mut attachments: Vec<Attachment> = Vec::new();
         let mut local_files = vec![nevoflux_protocol::FileInfo {
@@ -9467,15 +9478,24 @@ mod tests {
         promote_image_local_files_to_attachments(&mut attachments, &mut local_files);
 
         assert_eq!(attachments.len(), 1, "image must be promoted (with resize)");
-        assert_eq!(local_files.len(), 1, "promoted entry preserved for canvas_attach_asset(local_path)");
+        assert_eq!(
+            local_files.len(),
+            1,
+            "promoted entry preserved for canvas_attach_asset(local_path)"
+        );
 
         // Decode the output and verify it's much smaller AND inside the
         // LLM cap. Opaque photo PNG → JPEG q=85 path.
         let llm_bytes = STANDARD.decode(&attachments[0].data).unwrap();
-        assert!(llm_bytes.len() < 1 * 1024 * 1024,
-            "LLM payload {} bytes; should be < 1 MB after resize", llm_bytes.len());
-        assert_eq!(attachments[0].mime_type, "image/jpeg",
-            "opaque PNG should convert to JPEG");
+        assert!(
+            llm_bytes.len() < 1 * 1024 * 1024,
+            "LLM payload {} bytes; should be < 1 MB after resize",
+            llm_bytes.len()
+        );
+        assert_eq!(
+            attachments[0].mime_type, "image/jpeg",
+            "opaque PNG should convert to JPEG"
+        );
         let _ = &dir;
     }
 
