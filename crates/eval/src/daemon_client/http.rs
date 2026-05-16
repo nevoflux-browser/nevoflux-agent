@@ -44,7 +44,12 @@ pub struct CreateSessionResponse {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SetupStep {
-    InjectMessage { role: String, content: String },
+    InjectMessage {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+        role: String,
+        content: String,
+    },
     SeedMemory { key: String, value: String },
     GrantPermission { tool: String },
 }
