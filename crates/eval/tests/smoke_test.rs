@@ -71,7 +71,14 @@ assertions:
 
 #[tokio::test]
 async fn browser_mode_grade_routing() {
-    assert_eq!(BrowserLaunchMode::DaemonOnly.signal_grade(), SignalGrade::Exploratory);
+    assert_eq!(
+        BrowserLaunchMode::DaemonOnly {
+            daemon_binary: std::path::PathBuf::from("/unused-test-path"),
+            state_dir: std::path::PathBuf::from("/unused-test-path"),
+        }
+        .signal_grade(),
+        SignalGrade::Exploratory
+    );
     assert_eq!(
         BrowserLaunchMode::ExternalDevInstance {
             endpoint: "http://localhost:5959".into()
@@ -91,7 +98,13 @@ async fn browser_mode_grade_routing() {
 
 #[tokio::test]
 async fn browser_mode_supports_check() {
-    assert!(!BrowserLaunchMode::DaemonOnly.supports_browser_tasks());
+    assert!(
+        !BrowserLaunchMode::DaemonOnly {
+            daemon_binary: std::path::PathBuf::from("/unused-test-path"),
+            state_dir: std::path::PathBuf::from("/unused-test-path"),
+        }
+        .supports_browser_tasks()
+    );
     assert!(BrowserLaunchMode::ExternalDevInstance {
         endpoint: "x".into()
     }
