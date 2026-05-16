@@ -10,9 +10,9 @@
 //! `soul_context` is skipped: eval services have `knowledge_retriever = None`,
 //! so `build_soul_context` would return `None` anyway.
 
-// Re-export mock server when the feature is enabled (Task 4 lands the impl).
-// #[cfg(feature = "eval-mock-llm")]
-// pub mod mock_llm_server;
+// Re-export mock server when the feature is enabled.
+#[cfg(feature = "eval-mock-llm")]
+pub mod mock_llm_server;
 
 use crate::agent_host::{DaemonHostFunctions, SidebarStreamChunk};
 use crate::config::AgentConfig;
