@@ -20,7 +20,9 @@ pub struct CreateSessionRequest {
     pub mode: Option<String>,
     pub llm_backend: Option<String>,
     pub mock_browser: Option<bool>,
-    /// Echoed in handler logs for traceability; runner uses to scope state.
+    /// When provided, used in this handler's tracing call instead of the
+    /// daemon-level eval_run_id. Useful when the eval runner scopes multiple
+    /// logical runs within a single daemon lifetime.
     pub eval_run_id: Option<String>,
 }
 
@@ -48,6 +50,7 @@ pub struct SetupRequest {
 #[derive(Debug, Serialize)]
 pub struct SetupResponse {
     pub applied: usize,
+    pub skipped: usize,
 }
 
 pub async fn create_session(
@@ -105,8 +108,12 @@ pub async fn create_session(
 
     let session_id = session.id.clone();
 
+    // Prefer the body-supplied run id for this log line so that eval runners
+    // that scope multiple logical runs within one daemon lifetime can trace
+    // session creation back to the correct run without ambiguity.
+    let body_run_id = body.eval_run_id.as_deref().unwrap_or(&state.eval_run_id);
     tracing::info!(
-        run_id = %state.eval_run_id,
+        run_id = %body_run_id,
         session_id = %session_id,
         mode = %mode_str,
         "eval created session"
@@ -121,6 +128,7 @@ pub async fn setup_session(
     Json(body): Json<SetupRequest>,
 ) -> Result<Json<SetupResponse>, (StatusCode, String)> {
     let mut applied = 0usize;
+    let mut skipped = 0usize;
 
     for step in body.steps {
         match step {
@@ -143,6 +151,7 @@ pub async fn setup_session(
                             format!("inject_message: {e}"),
                         )
                     })?;
+                applied += 1;
             }
             SetupStep::SeedMemory { key, value } => {
                 // No SessionManager API for memory seeding yet (phase-2).
@@ -150,6 +159,7 @@ pub async fn setup_session(
                     %session_id, %key, value_len = value.len(),
                     "eval-bridge: SeedMemory step not yet wired (phase-2)"
                 );
+                skipped += 1;
             }
             SetupStep::GrantPermission { tool } => {
                 // No SessionManager API for upfront permission grant yet (phase-2).
@@ -157,12 +167,12 @@ pub async fn setup_session(
                     %session_id, %tool,
                     "eval-bridge: GrantPermission step not yet wired (phase-2)"
                 );
+                skipped += 1;
             }
         }
-        applied += 1;
     }
 
-    Ok(Json(SetupResponse { applied }))
+    Ok(Json(SetupResponse { applied, skipped }))
 }
 
 #[derive(Debug, Deserialize)]

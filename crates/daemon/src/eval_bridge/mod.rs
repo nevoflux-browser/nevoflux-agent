@@ -172,6 +172,7 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["applied"], 1);
+        assert_eq!(body["skipped"], 0);
     }
 
     #[tokio::test]
