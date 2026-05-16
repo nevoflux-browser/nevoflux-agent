@@ -12,6 +12,9 @@ description = "Core daemon for NevoFlux Agent"
 [features]
 default = ["embedding"]
 embedding = ["nevoflux-llm/embedding"]
+# Enables the eval-mode mock LLM HTTP server (see eval_dispatch::mock_llm_server).
+# Production builds leave this disabled; eval CI builds enable it.
+eval-mock-llm = []
 
 [dependencies]
 # Internal crates
