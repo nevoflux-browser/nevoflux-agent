@@ -102,6 +102,7 @@ wasmtime-wasi = "27"
 [features]
 default = ["embedding"]
 embedding = ["nevoflux-daemon/embedding"]
+eval-mock-llm = ["nevoflux-daemon/eval-mock-llm"]
 
 [[bin]]
 name = "nevoflux-agent"
@@ -110,6 +111,7 @@ path = "src/main.rs"
 [dependencies]
 nevoflux-daemon = { path = "crates/daemon", default-features = false }
 nevoflux-bridge = { path = "crates/bridge" }
+nevoflux-llm = { path = "crates/llm" }
 nevoflux-mcp = { path = "crates/mcp" }
 nevoflux-skills = { path = "crates/skills" }
 nevoflux-protocol = { path = "crates/protocol" }

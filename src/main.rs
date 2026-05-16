@@ -515,6 +515,92 @@ async fn run_daemon(
         // Step 5: Simple EventBus (no persistence).
         let event_bus = std::sync::Arc::new(nevoflux_daemon::event_bus::EventBus::new());
 
+        // Step 6: Build eval-local HostServices + CanvasVideoService so
+        //          dispatch_eval_turn has the WASM host machinery it needs.
+        //
+        //          This is intentionally minimal: no browser_sender, no MCP
+        //          manager, no loop_manager, no embedding. The eval agent runs
+        //          in AgentMode::Chat with tools_config=None so none of those
+        //          services are exercised. The only mandatory fields are:
+        //          database (for session history), skills (for system-prompt
+        //          construction), llm_config (to actually call the LLM), and
+        //          agent_config / runtime_handle (for DaemonHostFunctions).
+        let agent_config_for_eval = std::sync::Arc::new(
+            nevoflux_daemon::AgentConfig::load().unwrap_or_default(),
+        );
+        let db_for_eval = session_manager.storage().database().clone();
+        let eval_skills = {
+            let mut registry = nevoflux_skills::SkillRegistry::new();
+            if let Err(e) = registry.load() {
+                tracing::warn!("eval: failed to load skills: {}", e);
+            }
+            std::sync::Arc::new(tokio::sync::RwLock::new(registry))
+        };
+        let eval_canvas_video_service = std::sync::Arc::new(
+            nevoflux_daemon::canvas_video::CanvasVideoService::new()
+                .with_event_bus(event_bus.clone())
+                .with_storage(session_manager.shared_storage()),
+        );
+        let mut eval_services =
+            nevoflux_daemon::wasm::HostServices::with_skills(
+                std::sync::Arc::new(db_for_eval),
+                eval_skills,
+            )
+            .with_agent_config(agent_config_for_eval.clone())
+            .with_runtime_handle(tokio::runtime::Handle::current())
+            .with_canvas_video_service(eval_canvas_video_service.clone());
+
+        // Wire LLM config from the user's AgentConfig (or mock URL if enabled).
+        {
+            let llm_cfg = &agent_config_for_eval.llm;
+            if let (Some(provider_str), Some(api_key), Some(model)) = (
+                llm_cfg.active_provider(),
+                llm_cfg.active_api_key(),
+                llm_cfg.active_model(),
+            ) {
+                if let Ok(provider) = provider_str.parse::<nevoflux_llm::ProviderType>() {
+                    let mut lc =
+                        nevoflux_daemon::wasm::LlmConfig::new(provider, api_key, model);
+                    if let Some(base_url) = llm_cfg.active_base_url() {
+                        lc.base_url = Some(base_url.to_string());
+                    }
+                    eval_services = eval_services.with_llm(lc);
+                }
+            }
+        }
+
+        // Optionally override base_url with the mock LLM server.
+        #[cfg(feature = "eval-mock-llm")]
+        {
+            if nevoflux_daemon::eval_dispatch::mock_llm_server::is_enabled() {
+                let mock_addr = nevoflux_daemon::eval_dispatch::mock_llm_server::spawn()
+                    .await
+                    .expect("spawn eval mock LLM server");
+                let mock_url = format!("http://{}", mock_addr);
+                tracing::info!(%mock_url, "eval mock LLM server active; patching llm_config.base_url");
+                // Build or patch the LlmConfig with the mock base_url.
+                // We use Anthropic + a dummy key since the mock handles both
+                // /v1/messages and /v1/chat/completions.
+                let mock_lc = nevoflux_daemon::wasm::LlmConfig {
+                    provider: nevoflux_llm::ProviderType::Anthropic,
+                    api_key: "mock".into(),
+                    model: "claude-3-5-sonnet-latest".into(),
+                    base_url: Some(mock_url),
+                };
+                eval_services = eval_services.with_llm(mock_lc);
+            }
+        }
+
+        let dispatch_services = std::sync::Arc::new(
+            nevoflux_daemon::eval_dispatch::EvalDispatchServices {
+                services: eval_services,
+                config: agent_config_for_eval.clone(),
+                runtime: tokio::runtime::Handle::current(),
+                session_manager: session_manager.clone(),
+                canvas_video_service: eval_canvas_video_service,
+            },
+        );
+
         // Step 6: Bearer token + EvalAppState.
         let token = uuid::Uuid::new_v4().to_string();
         let (agent_turn_tx, agent_turn_rx) = tokio::sync::mpsc::unbounded_channel::<
@@ -527,6 +613,7 @@ async fn run_daemon(
             agent_turn_tx: Some(agent_turn_tx),
             event_bus: Some(event_bus),
             trace_collector: Some(trace_collector),
+            agent_dispatch: Some(dispatch_services.clone()),
         };
 
         // Step 7: Spawn HTTP bridge; returns OS-assigned SocketAddr.
@@ -534,16 +621,39 @@ async fn run_daemon(
             .await
             .expect("failed to spawn eval bridge");
 
-        // Step 8: Phase-1 warn-only consumer. Full agent dispatch is Phase-2.
+        // Step 8: Real agent_turn_rx consumer — calls dispatch_eval_turn for
+        //          each submitted prompt. Replaces the Phase-1 warn-only stub.
+        let dispatch_for_consumer = dispatch_services.clone();
         tokio::spawn(async move {
             let mut rx = agent_turn_rx;
             while let Some(req) = rx.recv().await {
-                tracing::warn!(
-                    session_id = %req.session_id,
-                    prompt_len = req.prompt.len(),
-                    "agent_turn dispatch not yet wired (eval phase-2)"
-                );
+                let services = dispatch_for_consumer.clone();
+                // Spawn each turn in its own task so the consumer keeps draining.
+                tokio::spawn(async move {
+                    match nevoflux_daemon::eval_dispatch::dispatch_eval_turn(
+                        &services,
+                        &req.session_id,
+                        &req.prompt,
+                    )
+                    .await
+                    {
+                        Ok(_output) => {
+                            tracing::info!(
+                                session_id = %req.session_id,
+                                "eval turn complete"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                session_id = %req.session_id,
+                                error = %e,
+                                "eval agent dispatch failed"
+                            );
+                        }
+                    }
+                });
             }
+            tracing::info!("eval agent_turn_rx closed");
         });
 
         // Step 9: Write atomic daemon.lock for eval-client discovery.
