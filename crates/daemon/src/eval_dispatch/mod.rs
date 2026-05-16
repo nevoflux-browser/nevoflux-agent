@@ -112,6 +112,7 @@ pub async fn dispatch_eval_turn(
     svc: &EvalDispatchServices,
     session_id: &str,
     prompt: &str,
+    tools_config: ToolsConfig,
 ) -> Result<nevoflux_builtin_wasm::AgentOutput, EvalDispatchError> {
     info!(%session_id, prompt_len = prompt.len(), "eval dispatch starting");
 
@@ -205,7 +206,7 @@ pub async fn dispatch_eval_turn(
         available_models: svc.config.llm.configured_providers(),
         mcp_servers,
         soul_context: None, // knowledge_retriever is None in eval
-        tools_config: Some(ToolsConfig::None),
+        tools_config: Some(tools_config),
         os_platform: Some(std::env::consts::OS.to_string()),
     };
 
