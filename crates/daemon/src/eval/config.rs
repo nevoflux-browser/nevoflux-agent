@@ -33,7 +33,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var(*k).ok())).collect();
         for (k, v) in vars {
             match v {
@@ -41,12 +41,15 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
-        f();
-        for (k, prev) in prev {
-            match prev {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        for (k, prev_val) in prev {
+            match prev_val {
                 Some(val) => std::env::set_var(k, val),
                 None => std::env::remove_var(k),
             }
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
         }
     }
 
