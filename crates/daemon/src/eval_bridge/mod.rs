@@ -74,7 +74,29 @@ mod tests {
             session_manager: Arc::new(SessionManager::in_memory().expect("in-memory SM")),
             bearer_token: Arc::from("secret-test-token"),
             eval_run_id: Arc::from("run-test"),
+            // No real agent loop in unit-test context; submit_message still returns accepted: true.
+            agent_turn_tx: None,
         }
+    }
+
+    /// Create a session and return its ID. Used by multiple tests to avoid
+    /// repeating the inline boilerplate.
+    async fn create_test_session(client: &reqwest::Client, addr: std::net::SocketAddr) -> String {
+        client
+            .post(format!("http://{}/_eval/sessions", addr))
+            .bearer_auth("secret-test-token")
+            .json(&serde_json::json!({ "mode": "chat" }))
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+            .get("session_id")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string()
     }
 
     #[tokio::test]
@@ -111,16 +133,17 @@ mod tests {
     async fn create_session_returns_id() {
         let state = test_state();
         let addr = spawn(state).await.unwrap();
-        let url = format!("http://{}/_eval/sessions", addr);
-        let resp = reqwest::Client::new()
-            .post(&url)
+        let client = reqwest::Client::new();
+        let body: serde_json::Value = client
+            .post(format!("http://{}/_eval/sessions", addr))
             .bearer_auth("secret-test-token")
             .json(&serde_json::json!({ "mode": "chat" }))
             .send()
             .await
+            .unwrap()
+            .json()
+            .await
             .unwrap();
-        assert_eq!(resp.status().as_u16(), 200);
-        let body: serde_json::Value = resp.json().await.unwrap();
         assert!(body.get("session_id").and_then(|v| v.as_str()).is_some());
     }
 
@@ -129,22 +152,7 @@ mod tests {
         let state = test_state();
         let addr = spawn(state).await.unwrap();
         let client = reqwest::Client::new();
-
-        let sid: String = client
-            .post(format!("http://{}/_eval/sessions", addr))
-            .bearer_auth("secret-test-token")
-            .json(&serde_json::json!({ "mode": "chat" }))
-            .send()
-            .await
-            .unwrap()
-            .json::<serde_json::Value>()
-            .await
-            .unwrap()
-            .get("session_id")
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string();
+        let sid = create_test_session(&client, addr).await;
 
         let resp = client
             .post(format!("http://{}/_eval/sessions/{}/setup", addr, sid))
@@ -160,5 +168,24 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["applied"], 1);
+    }
+
+    #[tokio::test]
+    async fn submit_message_returns_accepted() {
+        let state = test_state();
+        let addr = spawn(state).await.unwrap();
+        let client = reqwest::Client::new();
+        let sid = create_test_session(&client, addr).await;
+
+        let resp = client
+            .post(format!("http://{}/_eval/sessions/{}/messages", addr, sid))
+            .bearer_auth("secret-test-token")
+            .json(&serde_json::json!({ "prompt": "hello" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["accepted"], true);
     }
 }

@@ -8,7 +8,6 @@ use axum::{
 };
 use nevoflux_storage::MessageRole;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::str::FromStr;
 use super::state::EvalAppState;
 
@@ -150,12 +149,72 @@ pub async fn setup_session(
     Ok(Json(SetupResponse { applied }))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SubmitMessageRequest {
+    pub prompt: String,
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SubmitMessageResponse {
+    pub accepted: bool,
+}
+
 pub async fn submit_message(
-    State(_s): State<EvalAppState>,
-    Path(_id): Path<String>,
-    Json(_body): Json<Value>,
-) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "submit_message — see Task 12")
+    State(state): State<EvalAppState>,
+    Path(session_id): Path<String>,
+    Json(body): Json<SubmitMessageRequest>,
+) -> Result<Json<SubmitMessageResponse>, (StatusCode, String)> {
+    // Persist user message so the turn appears in session history / trace replay.
+    state
+        .session_manager
+        .add_message(&session_id, MessageRole::User, &body.prompt)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("add_message: {e}"),
+            )
+        })?;
+
+    if let Some(t) = body.timeout_secs {
+        tracing::debug!(
+            session_id = %session_id,
+            timeout_secs = t,
+            "eval submit timeout (informational; eval client owns timeout)"
+        );
+    }
+
+    // Dispatch to the daemon's agent loop — non-blocking.
+    // The receiver lives in start_server (wired in Task 16) where the full
+    // AgentConfig + HostServices machinery is available.
+    // In test contexts the sender is None; we still return accepted: true.
+    if let Some(ref tx) = state.agent_turn_tx {
+        if let Err(e) = tx.send(super::state::AgentTurnRequest {
+            session_id: session_id.clone(),
+            prompt: body.prompt.clone(),
+        }) {
+            tracing::error!(
+                session_id = %session_id,
+                error = %e,
+                "eval agent_turn_tx send failed — daemon agent loop may have shut down"
+            );
+        }
+    } else {
+        tracing::debug!(
+            session_id = %session_id,
+            "eval agent_turn_tx not wired (test mode); skipping dispatch"
+        );
+    }
+
+    tracing::info!(
+        run_id = %state.eval_run_id,
+        session_id = %session_id,
+        prompt_len = body.prompt.len(),
+        "eval submitted message"
+    );
+
+    Ok(Json(SubmitMessageResponse { accepted: true }))
 }
 
 pub async fn stream_events(State(_s): State<EvalAppState>, Path(_id): Path<String>) -> impl IntoResponse {
