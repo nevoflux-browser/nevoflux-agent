@@ -3549,7 +3549,9 @@ name = "nevoflux-eval"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
+ "bytes",
  "chrono",
  "clap",
  "directories",

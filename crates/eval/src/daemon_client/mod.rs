@@ -7,5 +7,8 @@ pub mod lock;
 
 pub mod http;
 
+pub mod sse;
+pub use sse::{stream_events, SseError};
+
 pub use http::{DaemonHttpClient, HttpError};
 pub use lock::{wait_for_lock, DaemonLock, LockError};
