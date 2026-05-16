@@ -141,10 +141,87 @@ pub async fn write_markdown(summary: &RunSummary, out_dir: &Path) -> EvalResult<
         );
     }
 
+    // JSON sidecar — written first so it exists even if the Markdown write fails.
+    let json_path = path.with_extension("json");
+    let json = serde_json::to_string_pretty(summary)?;
+    tokio::fs::write(&json_path, json).await?;
+
     let mut file = tokio::fs::File::create(&path).await?;
     file.write_all(body.as_bytes()).await?;
     file.flush().await?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        judge::Verdict,
+        runner::{RunSummary, TaskOutcome},
+        NevoFluxMode, SignalGrade, Task, TaskResult, TaskStatus,
+    };
+
+    fn make_summary() -> RunSummary {
+        RunSummary {
+            benchmark: "test".into(),
+            judge: "programmatic".into(),
+            signal_grade: SignalGrade::Exploratory,
+            browser_version: "test-0.0.0".into(),
+            total: 1,
+            passed: 1,
+            failed: 0,
+            skipped: 0,
+            timeouts: 0,
+            mean_latency_ms: 10.0,
+            p99_latency_ms: 12,
+            total_token_cost_usd: 0.0,
+            total_judge_cost_usd: 0.0,
+            started_at: chrono::Utc::now(),
+            finished_at: chrono::Utc::now(),
+            per_task: vec![TaskOutcome {
+                task: Task {
+                    id: "t".into(),
+                    category: "c".into(),
+                    mode: NevoFluxMode::Chat,
+                    prompt: "p".into(),
+                    setup: vec![],
+                    reference: None,
+                    assertions: vec![],
+                    requires_browser: false,
+                    metadata: Default::default(),
+                },
+                result: TaskResult {
+                    task_id: "t".into(),
+                    status: TaskStatus::Completed,
+                    final_answer: Some("a".into()),
+                    latency_ms: 10,
+                    token_cost: None,
+                    error: None,
+                    trace_ids: vec![],
+                },
+                verdict: Some(Verdict {
+                    correct: true,
+                    score: 1.0,
+                    explanation: "ok".into(),
+                    judge_cost_usd: 0.0,
+                }),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn writes_markdown_and_json_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_markdown(&make_summary(), tmp.path()).await.unwrap();
+        assert!(path.exists(), "Markdown file should exist");
+        assert!(
+            path.with_extension("json").exists(),
+            "JSON sidecar should exist"
+        );
+        let md = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(md.contains("EXPLORATORY"), "Grade banner should contain EXPLORATORY");
+        assert!(md.contains("accuracy"), "Metrics section should contain accuracy metric");
+    }
 }
 
 pub async fn write_json(summary: &RunSummary, out_dir: &Path) -> EvalResult<std::path::PathBuf> {
