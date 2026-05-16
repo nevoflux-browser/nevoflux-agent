@@ -6,9 +6,13 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use futures::StreamExt;
 use nevoflux_storage::MessageRole;
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
+use std::pin::Pin;
 use std::str::FromStr;
+use super::sse::{to_sse, EvalEvent};
 use super::state::EvalAppState;
 
 #[derive(Debug, Deserialize)]
@@ -217,8 +221,83 @@ pub async fn submit_message(
     Ok(Json(SubmitMessageResponse { accepted: true }))
 }
 
-pub async fn stream_events(State(_s): State<EvalAppState>, Path(_id): Path<String>) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, "stream_events — see Task 13")
+pub async fn stream_events(
+    State(state): State<EvalAppState>,
+    Path(session_id): Path<String>,
+) -> axum::response::Response {
+    use crate::event_bus::{BackpressurePolicy, SubscriberIdentity};
+    use crate::event_bus::types::TopicPattern;
+
+    let eval_stream: Pin<Box<dyn futures::Stream<Item = EvalEvent> + Send>> =
+        match state.event_bus.as_ref() {
+            None => {
+                // Unit-test / no-bus context: emit a single phase-2 placeholder and close.
+                let placeholder = futures::stream::once(async {
+                    EvalEvent::Error {
+                        message: "event_bus not wired (phase-2): connect Arc<EventBus> via \
+                                  EvalAppState::event_bus to enable real event streaming"
+                            .into(),
+                    }
+                });
+                Box::pin(placeholder)
+            }
+            Some(bus) => {
+                // Subscribe as Internal so permission checks pass for all topic prefixes.
+                // Use a broad wildcard and filter client-side by session_id embedded in
+                // the event payload (phase-2: narrow to per-session topics when they land).
+                let sid = session_id.clone();
+                match bus.subscribe(
+                    TopicPattern::double_wildcard(""),  // all topics
+                    SubscriberIdentity::Internal,
+                    BackpressurePolicy::DropNewest,
+                    256,
+                ) {
+                    Err(e) => {
+                        let msg = format!("subscribe failed: {e}");
+                        Box::pin(futures::stream::once(async move {
+                            EvalEvent::Error { message: msg }
+                        }))
+                    }
+                    Ok(handle) => {
+                        // Convert the mpsc::Receiver<BusEvent> into a Stream.
+                        let rx_stream =
+                            tokio_stream::wrappers::ReceiverStream::new(handle.rx);
+
+                        // Filter events that carry this session_id in their payload,
+                        // then map the raw BusEvent to an EvalEvent.
+                        //
+                        // TODO(phase-2): When dedicated `agent:token`, `agent:tool_call`,
+                        // `agent:tool_result`, and `agent:turn_done` topics exist, add
+                        // typed variants (Token, ToolCall, ToolResult, Stop) here.
+                        // For now we forward all matching events as DaemonEvent so that
+                        // the wire format and content-type are correct and SSE consumers
+                        // can at least inspect raw bus traffic.
+                        let mapped = rx_stream.filter_map(move |bus_evt| {
+                            let sid = sid.clone();
+                            async move {
+                                // Only forward events whose payload contains the
+                                // matching session_id (or that have no session_id
+                                // field, which we skip to avoid flooding the client).
+                                let payload_sid = bus_evt
+                                    .payload
+                                    .get("session_id")
+                                    .and_then(|v| v.as_str());
+                                if payload_sid != Some(sid.as_str()) {
+                                    return None;
+                                }
+                                Some(EvalEvent::DaemonEvent {
+                                    name: bus_evt.topic,
+                                    payload: bus_evt.payload,
+                                })
+                            }
+                        });
+                        Box::pin(mapped)
+                    }
+                }
+            }
+        };
+
+    to_sse(eval_stream).into_response()
 }
 
 pub async fn stream_traces(State(_s): State<EvalAppState>, Path(_id): Path<String>) -> impl IntoResponse {

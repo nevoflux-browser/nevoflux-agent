@@ -76,6 +76,8 @@ mod tests {
             eval_run_id: Arc::from("run-test"),
             // No real agent loop in unit-test context; submit_message still returns accepted: true.
             agent_turn_tx: None,
+            // No EventBus in unit-test context; stream_events emits a phase-2 placeholder.
+            event_bus: None,
         }
     }
 
@@ -187,5 +189,29 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 200);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["accepted"], true);
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_returns_sse_content_type() {
+        let state = test_state();
+        let addr = spawn(state).await.unwrap();
+        let client = reqwest::Client::new();
+        let sid = create_test_session(&client, addr).await;
+        let resp = client
+            .get(format!("http://{}/_eval/sessions/{}/events", addr, sid))
+            .bearer_auth("secret-test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "expected SSE content-type, got: {ct}"
+        );
     }
 }

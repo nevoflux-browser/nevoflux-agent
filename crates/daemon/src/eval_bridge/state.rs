@@ -1,5 +1,6 @@
 //! Shared state for eval bridge handlers.
 
+use crate::event_bus::EventBus;
 use crate::session::SessionManager;
 use std::sync::Arc;
 
@@ -25,4 +26,11 @@ pub struct EvalAppState {
     /// where the full daemon machinery is not available; in that case
     /// `submit_message` still returns `accepted: true` without dispatching.
     pub agent_turn_tx: Option<tokio::sync::mpsc::UnboundedSender<AgentTurnRequest>>,
+    /// Optional handle to the daemon EventBus.
+    ///
+    /// When `Some`, `GET /_eval/sessions/:id/events` subscribes to daemon
+    /// events filtered by session_id and forwards them as SSE frames.
+    /// When `None` (unit-test contexts), the stream emits a single phase-2
+    /// placeholder `Error` event and then closes.
+    pub event_bus: Option<Arc<EventBus>>,
 }
