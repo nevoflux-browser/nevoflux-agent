@@ -65,6 +65,9 @@ pub struct SubmitMessageRequest {
     pub prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+    /// Server-side default is ToolsConfig::None when omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]

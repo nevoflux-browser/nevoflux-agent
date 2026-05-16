@@ -496,6 +496,7 @@ async fn execute_task_impl(
             &SubmitMessageRequest {
                 prompt,
                 timeout_secs: Some(task_timeout_secs),
+                tools_config: None,
             },
         )
         .await

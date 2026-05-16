@@ -11,12 +11,15 @@ use std::sync::Arc;
 /// The channel receiver lives inside `start_server` (wired in Task 16) where the
 /// full `AgentConfig` + `HostServices` machinery is available. The eval HTTP handler
 /// only builds and posts this lightweight envelope; it never blocks on the turn.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AgentTurnRequest {
     /// Session to run the turn on.
     pub session_id: String,
     /// User prompt for this turn.
     pub prompt: String,
+    /// Tools available to the agent. Default `ToolsConfig::None` matches
+    /// Phase 3a's safe behaviour (no tools → no hang risk).
+    pub tools_config: nevoflux_protocol::subagent::ToolsConfig,
 }
 
 #[derive(Clone)]

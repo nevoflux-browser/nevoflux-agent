@@ -640,7 +640,7 @@ async fn run_daemon(
                         &services,
                         &req.session_id,
                         &req.prompt,
-                        nevoflux_protocol::subagent::ToolsConfig::None,
+                        req.tools_config.clone(),
                     )
                     .await
                     {

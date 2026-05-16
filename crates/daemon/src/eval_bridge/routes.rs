@@ -178,7 +178,11 @@ pub async fn setup_session(
 #[derive(Debug, Deserialize)]
 pub struct SubmitMessageRequest {
     pub prompt: String,
+    #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Optional override; default None on the wire → ToolsConfig::None.
+    #[serde(default)]
+    pub tools_config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -211,6 +215,12 @@ pub async fn submit_message(
         );
     }
 
+    let tools_config = match body.tools_config.clone() {
+        None => nevoflux_protocol::subagent::ToolsConfig::None,
+        Some(v) => serde_json::from_value(v)
+            .unwrap_or(nevoflux_protocol::subagent::ToolsConfig::None),
+    };
+
     // Dispatch to the daemon's agent loop — non-blocking.
     // The receiver lives in start_server (wired in Task 16) where the full
     // AgentConfig + HostServices machinery is available.
@@ -219,6 +229,7 @@ pub async fn submit_message(
         if let Err(e) = tx.send(super::state::AgentTurnRequest {
             session_id: session_id.clone(),
             prompt: body.prompt.clone(),
+            tools_config,
         }) {
             tracing::error!(
                 session_id = %session_id,
