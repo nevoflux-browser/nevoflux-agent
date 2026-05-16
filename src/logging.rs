@@ -117,6 +117,20 @@ pub fn init_file_only_logging(log_file: PathBuf, verbose: bool) {
     // If file creation fails, logging is silently disabled
 }
 
+/// Init logging for eval mode: file-only writer, NO stdout/stderr layer.
+/// Required because Native Messaging owns daemon stdio for protocol frames.
+/// Any tracing layer that writes to stdout/stderr will corrupt NM.
+pub fn init_eval_logging(log_path: std::path::PathBuf) -> std::io::Result<()> {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let file = std::fs::File::create(&log_path)?;
+    let file_layer = fmt::layer().with_writer(file).with_ansi(false);
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(file_layer)
+        .init();
+    Ok(())
+}
+
 /// Log a startup message with version information.
 ///
 /// # Arguments
