@@ -398,19 +398,44 @@ async fn run_daemon(
     port: Option<u16>,
     managed: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // ── Step 1: Detect eval mode FIRST ───────────────────────────────────────
+    // Must happen before init_logging() so the eval run log goes to
+    // <run_dir>/daemon.log and never touches NM stdio.
+    let eval_cfg: Option<nevoflux_daemon::eval::EvalConfig> =
+        match nevoflux_daemon::eval::from_env() {
+            Ok(opt) => opt,
+            Err(e) => {
+                eprintln!("nevoflux-agent eval-mode error: {e}");
+                std::process::exit(2);
+            }
+        };
+    let eval_dirs: Option<nevoflux_daemon::eval::EvalRunDirs> = match &eval_cfg {
+        Some(cfg) => Some(
+            nevoflux_daemon::eval::EvalRunDirs::resolve(&cfg.run_id)
+                .expect("failed to create eval run dir"),
+        ),
+        None => None,
+    };
+
     // Ensure data directory exists first — managed daemons need it for the
     // log file, and SessionManager needs it for the database. This must
     // happen before init_logging() so the log file can actually be created.
     let data_dir = ensure_data_dir()?;
 
-    // Initialize logging — managed daemons write to a log file since the
-    // bridge launches them with stderr redirected to null.
-    let log_file = if managed {
-        Some(data_dir.join("daemon.log"))
+    // ── Step 2: Branch logging on eval mode ──────────────────────────────────
+    // Eval mode: file-only to <run_dir>/daemon.log — never stdout/stderr.
+    // Normal managed mode: file at <data_dir>/daemon.log + console.
+    // Normal dev mode: console only.
+    if let Some(dirs) = &eval_dirs {
+        logging::init_eval_logging(dirs.log_path()).expect("init_eval_logging");
     } else {
-        None
-    };
-    logging::init_logging(verbose, log_file);
+        let log_file = if managed {
+            Some(data_dir.join("daemon.log"))
+        } else {
+            None
+        };
+        logging::init_logging(verbose, log_file);
+    }
 
     let trace_enabled = trace
         || std::env::var("NEVOFLUX_TRACE")
@@ -438,7 +463,9 @@ async fn run_daemon(
     }
 
     // In managed+port mode the proxy is the lifecycle manager — skip file lock.
-    let _lock = if managed && port.is_some() {
+    // In eval mode the daemon.lock has a different purpose (eval client discovery)
+    // and is written below, so we also skip the normal file lock in that case.
+    let _lock = if (managed && port.is_some()) || eval_cfg.is_some() {
         None
     } else {
         match acquire_daemon_lock(managed) {
@@ -460,6 +487,87 @@ async fn run_daemon(
         nevoflux_daemon::SessionManager::new(db_path.to_str().unwrap_or("nevoflux.db"))
             .expect("Failed to create session manager"),
     );
+
+    // ── Steps 3-7: Eval bridge boot ──────────────────────────────────────────
+    // All of this runs only when NEVOFLUX_EVAL_MODE=1 is set. Ordering:
+    //   3. Disable learning (prevents eval "facts" from mutating SOUL.md/USER.md)
+    //   4. Build isolated TraceCollector backed by <run_dir>/traces.db
+    //   5. Build a simple EventBus (no persistence — eval runs are ephemeral)
+    //   6. Generate bearer token + construct EvalAppState
+    //   7. Spawn bridge → get SocketAddr
+    //   8. Spawn warn-only agent_turn_rx consumer (Phase-1 stub)
+    //   9. Write atomic daemon.lock for eval-client discovery
+    if let Some(cfg) = &eval_cfg {
+        let dirs = eval_dirs.as_ref().expect("eval_dirs always Some when eval_cfg is Some");
+
+        // Step 3: Disable learning so eval runs don't pollute user memory.
+        nevoflux_daemon::learning::disable();
+        tracing::info!(run_id = %cfg.run_id, "eval mode: learning disabled");
+
+        // Step 4: Isolated TraceCollector.
+        let trace_collector = std::sync::Arc::new(
+            nevoflux_daemon::trace::collector::TraceCollector::with_db_path(
+                dirs.traces_db_path(),
+            )
+            .expect("eval-mode traces DB"),
+        );
+
+        // Step 5: Simple EventBus (no persistence).
+        let event_bus = std::sync::Arc::new(nevoflux_daemon::event_bus::EventBus::new());
+
+        // Step 6: Bearer token + EvalAppState.
+        let token = uuid::Uuid::new_v4().to_string();
+        let (agent_turn_tx, agent_turn_rx) =
+            tokio::sync::mpsc::unbounded_channel::<nevoflux_daemon::eval_bridge::state::AgentTurnRequest>();
+        let state = nevoflux_daemon::eval_bridge::EvalAppState {
+            session_manager: session_manager.clone(),
+            bearer_token: std::sync::Arc::from(token.as_str()),
+            eval_run_id: std::sync::Arc::from(cfg.run_id.as_str()),
+            agent_turn_tx: Some(agent_turn_tx),
+            event_bus: Some(event_bus),
+            trace_collector: Some(trace_collector),
+        };
+
+        // Step 7: Spawn HTTP bridge; returns OS-assigned SocketAddr.
+        let addr = nevoflux_daemon::eval_bridge::spawn(state)
+            .await
+            .expect("failed to spawn eval bridge");
+
+        // Step 8: Phase-1 warn-only consumer. Full agent dispatch is Phase-2.
+        tokio::spawn(async move {
+            let mut rx = agent_turn_rx;
+            while let Some(req) = rx.recv().await {
+                tracing::warn!(
+                    session_id = %req.session_id,
+                    prompt_len = req.prompt.len(),
+                    "agent_turn dispatch not yet wired (eval phase-2)"
+                );
+            }
+        });
+
+        // Step 9: Write atomic daemon.lock for eval-client discovery.
+        let started_at = {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            // Minimal RFC3339 without fractional seconds — sufficient for lock file.
+            let (y, mo, d, h, m, s) = epoch_to_ymd_hms(secs);
+            format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, m, s)
+        };
+        let lock = nevoflux_daemon::eval::DaemonLock {
+            pid: std::process::id(),
+            started_at,
+            http_addr: addr.to_string(),
+            bearer_token: token,
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            eval_run_id: cfg.run_id.clone(),
+        };
+        nevoflux_daemon::eval::write_lock_atomic(&dirs.lock_path(), &lock)
+            .expect("write daemon.lock");
+        tracing::info!(addr = %addr, run_id = %cfg.run_id, "eval bridge ready");
+    }
 
     // Remember whether we're in zero-file mode before `port` gets shadowed
     // by `server.port()`.
@@ -494,7 +602,8 @@ async fn run_daemon(
 
     // Cleanup — only remove files we actually wrote.
     // In managed+port mode no files were written, so nothing to clean up.
-    if !zero_file_mode {
+    // In eval mode normal port/pid files are not written either.
+    if !zero_file_mode && eval_cfg.is_none() {
         let data_dir = get_data_dir();
         let (port_name, pid_name) = if managed {
             ("daemon-managed.port", "daemon-managed.pid")
@@ -511,6 +620,42 @@ async fn run_daemon(
     // blocking thread pool to drain, which hangs indefinitely if an LLM
     // HTTP call is still in-flight.
     std::process::exit(0);
+}
+
+/// Convert a Unix epoch timestamp (seconds) to (year, month, day, hour, min, sec).
+///
+/// Minimal Gregorian calendar implementation used only for RFC3339 formatting
+/// in the eval daemon.lock — avoids pulling chrono into the bin crate.
+fn epoch_to_ymd_hms(epoch_secs: u64) -> (u64, u8, u8, u8, u8, u8) {
+    let s = epoch_secs % 60;
+    let total_minutes = epoch_secs / 60;
+    let m = (total_minutes % 60) as u8;
+    let total_hours = total_minutes / 60;
+    let h = (total_hours % 24) as u8;
+    let mut days = total_hours / 24;
+
+    // Gregorian calendar calculation
+    let mut year = 1970u64;
+    loop {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let days_in_year = if leap { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let days_in_month = [31u64, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 0u8;
+    for &dim in &days_in_month {
+        if days < dim {
+            break;
+        }
+        days -= dim;
+        month += 1;
+    }
+    (year, month + 1, (days + 1) as u8, h, m, s as u8)
 }
 
 /// Get the database path for storage.
