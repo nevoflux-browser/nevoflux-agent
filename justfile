@@ -211,3 +211,16 @@ eval-mock BENCHMARK="nevoflux-suite":
         --filter mode-authz \
         --timeout 30 \
         --out-dir eval/reports
+
+# Fetch the upstream benchmark datasets (BrowseComp, BrowseComp-ZH,
+# Online-Mind2Web). NOT run by default — eval CI uses fixtures.
+# See eval/README-DATASETS.md for the manual playbook.
+eval-fetch-data:
+    @echo "See eval/README-DATASETS.md for the manual fetch playbook."
+    @echo "BrowseComp: XOR-encrypted CSV at OpenAI blob (~\$20-30 LLM cost to run)"
+    @echo "BrowseComp-ZH: HuggingFace Phantom-AI/BrowseComp-ZH parquet"
+    @echo "Online-Mind2Web: 450MB GitHub clone, derive tasks from per-id result.json files"
+    @echo ""
+    @echo "Phase 3c ships 5-task fixtures for all three; this recipe is a"
+    @echo "placeholder for the full integration in Phase 3d/4."
+    @false
