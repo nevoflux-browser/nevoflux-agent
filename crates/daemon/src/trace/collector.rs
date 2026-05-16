@@ -5,7 +5,8 @@
 
 use crate::trace::file_writer::TraceFileWriter;
 use crate::trace::models::{FullTraceSpan, SpanType};
-use nevoflux_storage::{CreateTraceSpanParams, Storage, TraceSpanRecord};
+use nevoflux_storage::{CreateTraceSpanParams, Storage, StorageError, TraceSpanRecord};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Dual-track trace collector.
@@ -21,6 +22,20 @@ impl TraceCollector {
             storage,
             file_writer: None,
         }
+    }
+
+    /// Create a collector backed by an explicit SQLite DB path.
+    ///
+    /// Opens (or creates) a DB at `path` with the same schema migrations and
+    /// WAL mode that `Storage::open` applies. Intended for eval mode so each
+    /// eval run uses its own isolated `<run_dir>/traces.db` and does not
+    /// pollute the real user traces DB.
+    pub fn with_db_path(path: PathBuf) -> Result<Self, StorageError> {
+        let storage = Arc::new(Storage::open(path)?);
+        Ok(Self {
+            storage,
+            file_writer: None,
+        })
     }
 
     /// Create a collector with both SQLite and JSONL file output.
@@ -214,5 +229,32 @@ mod tests {
 
         assert_eq!(collector.span_count("sess-1"), 0);
         assert_eq!(collector.span_count("sess-2"), 1);
+    }
+
+    #[test]
+    fn with_db_path_creates_db_at_explicit_location() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("custom-traces.db");
+        let collector = TraceCollector::with_db_path(db_path.clone()).unwrap();
+        assert!(db_path.exists(), "DB file should be created at requested path");
+
+        // Verify the DB is structurally identical: write a span and read it back.
+        collector.record_tool_exec(
+            "eval-sess",
+            1,
+            "eval_tool",
+            None,
+            true,
+            None,
+            None,
+            50,
+            None,
+            None,
+        );
+        assert_eq!(
+            collector.span_count("eval-sess"),
+            1,
+            "span written to isolated DB should be readable"
+        );
     }
 }
