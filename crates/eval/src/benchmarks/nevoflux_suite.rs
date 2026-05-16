@@ -13,9 +13,10 @@ pub struct NevoFluxSuite {
 
 impl NevoFluxSuite {
     pub fn new() -> Self {
-        Self {
-            root: PathBuf::from("eval/nevoflux-suite"),
-        }
+        let root = std::env::var_os("NEVOFLUX_SUITE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("eval/nevoflux-suite"));
+        Self { root }
     }
 
     pub fn with_root(root: PathBuf) -> Self {
