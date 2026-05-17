@@ -72,6 +72,21 @@ impl Benchmark for BrowseCompZh {
     }
 
     async fn load_tasks(&self, filter: Option<&str>) -> EvalResult<Vec<Task>> {
+        // Phase 3d: NEVOFLUX_BC_ZH_DATA_PATH override routes to a JSONL
+        // pre-converted from the HuggingFace parquet (the Rust parquet
+        // reader is deferred to Phase 4).  Filter glob is still honoured.
+        if let Some(real_path) = std::env::var_os("NEVOFLUX_BC_ZH_DATA_PATH") {
+            let p = std::path::PathBuf::from(real_path);
+            let mut tasks = crate::datasets::jsonl::load(
+                &p,
+                "browsecomp-zh",
+                "请用中文简短作答（不超过 10 个字）。",
+            )?;
+            if let Some(f) = filter {
+                tasks.retain(|t| t.id.contains(f));
+            }
+            return Ok(tasks);
+        }
         let raw = tokio::fs::read_to_string(&self.fixture_path)
             .await
             .map_err(EvalError::Io)?;
