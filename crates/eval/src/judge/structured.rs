@@ -1,10 +1,10 @@
 //! Structured judge — verifies daemon-side state assertions by inspecting
 //! the trace export (`GET /_eval/sessions/:id/traces`).
 //!
-//! For Phase 2 this judge checks text assertions fully. `NoOutboundTo` is
-//! best-effort (pass without verification) until Phase 3 threads tcpdump
-//! results into TaskResult. `DaemonEvent` is now verified in Phase 3 against
-//! `TaskResult::observed_events`.
+//! Phase 3d makes `NoOutboundTo` real: the assertion fails if any
+//! forbidden host appears as a substring inside an observed host on
+//! `TaskResult::outbound_hosts`.  `DaemonEvent` is verified against
+//! `TaskResult::observed_events` (Phase 3).
 
 use crate::{
     judge::{Judge, Verdict},
@@ -38,9 +38,18 @@ impl Judge for StructuredJudge {
                 Assertion::DaemonEvent { event } => {
                     result.observed_events.iter().any(|n| n == event)
                 }
-                Assertion::NoOutboundTo { .. } => {
-                    // Phase 3 (tcpdump).
-                    true
+                Assertion::NoOutboundTo { hosts } => {
+                    // Phase 3d: consult the outbound_hosts list populated by
+                    // the privacy-audit tcpdump hook. The assertion fails
+                    // when any forbidden host is a substring of an observed
+                    // host (so "google.com" matches "www.google.com").
+                    let forbidden_hit = hosts.iter().any(|forbidden| {
+                        result
+                            .outbound_hosts
+                            .iter()
+                            .any(|seen| seen.contains(forbidden))
+                    });
+                    !forbidden_hit
                 }
                 Assertion::ContainsAny { targets } => {
                     let lower = answer.to_lowercase();
@@ -152,5 +161,40 @@ mod tests {
         let r = result(""); // observed_events stays default []
         let v = StructuredJudge.judge(&t, &r).await.unwrap();
         assert!(!v.correct);
+    }
+
+    #[tokio::test]
+    async fn no_outbound_to_passes_when_no_forbidden_host_seen() {
+        let t = task(vec![Assertion::NoOutboundTo {
+            hosts: vec!["evil.example.com".into()],
+        }]);
+        let mut r = result("");
+        r.outbound_hosts = vec!["safe.local".into()];
+        let v = StructuredJudge.judge(&t, &r).await.unwrap();
+        assert!(v.correct);
+    }
+
+    #[tokio::test]
+    async fn no_outbound_to_fails_when_forbidden_host_seen() {
+        let t = task(vec![Assertion::NoOutboundTo {
+            hosts: vec!["evil.example.com".into()],
+        }]);
+        let mut r = result("");
+        r.outbound_hosts = vec!["www.evil.example.com".into()];
+        let v = StructuredJudge.judge(&t, &r).await.unwrap();
+        assert!(!v.correct);
+    }
+
+    #[tokio::test]
+    async fn no_outbound_to_passes_when_outbound_hosts_empty() {
+        // Phase 3d Privacy-Audit fixtures may run without tcpdump (the
+        // smoke recorder isn't wired into the runner yet). An empty
+        // outbound_hosts means we observed nothing → assertion passes.
+        let t = task(vec![Assertion::NoOutboundTo {
+            hosts: vec!["openai.com".into(), "anthropic.com".into()],
+        }]);
+        let r = result("");
+        let v = StructuredJudge.judge(&t, &r).await.unwrap();
+        assert!(v.correct);
     }
 }
