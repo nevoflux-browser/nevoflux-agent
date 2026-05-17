@@ -1,0 +1,49 @@
+name: eval-pr
+
+on:
+  pull_request:
+    paths:
+      - "crates/eval/**"
+      - "crates/eval-bridge/**"
+      - "crates/protocol/**"
+      - "eval/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "justfile"
+      - ".github/workflows/eval-pr.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  eval-pr:
+    name: eval — fmt + clippy + unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-eval-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-eval-
+
+      - name: cargo fmt --check
+        run: cargo fmt -p nevoflux-eval -- --check
+
+      - name: cargo clippy
+        run: cargo clippy -p nevoflux-eval --all-targets --no-deps -- -D warnings
+
+      - name: cargo test (lib only)
+        run: cargo test -p nevoflux-eval --lib -- --test-threads=1
