@@ -110,10 +110,16 @@ fn parse_libpcap_records(bytes: &[u8]) -> Result<Vec<String>, &'static str> {
     if bytes.len() < 24 {
         return Err("truncated global header");
     }
+    // LE-decode the magic. The canonical libpcap magic is `0xa1b2c3d4`
+    // (`0xa1b23c4d` for nanosecond resolution); a writer emits it in its
+    // native byte order. So:
+    //   - LE writer → raw bytes `d4 c3 b2 a1` → LE-decoded = 0xa1b2c3d4
+    //   - BE writer → raw bytes `a1 b2 c3 d4` → LE-decoded = 0xd4c3b2a1
+    // i.e. canonical-after-LE-decode ⇒ LE writer, byte-swapped ⇒ BE writer.
     let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     let big_endian = match magic {
-        0xa1b2c3d4 | 0xa1b23c4d => true,  // BE writer
-        0xd4c3b2a1 | 0x4d3cb2a1 => false, // LE writer
+        0xa1b2c3d4 | 0xa1b23c4d => false, // LE writer (canonical magic in LE order)
+        0xd4c3b2a1 | 0x4d3cb2a1 => true,  // BE writer (byte-swapped from LE reader's view)
         _ => return Err("unknown libpcap magic"),
     };
     let read_u32 = |off: usize| -> u32 {
@@ -257,8 +263,10 @@ mod tests {
 
     fn build_libpcap_with_ipv4_packet(dest: [u8; 4]) -> Vec<u8> {
         let mut out = Vec::new();
-        // Global header — LE writer, linktype = 1 (Ethernet)
-        out.extend_from_slice(&0xd4c3b2a1u32.to_le_bytes()); // magic
+        // Global header — LE writer, linktype = 1 (Ethernet).
+        // Canonical magic 0xa1b2c3d4 written in LE byte order → raw bytes
+        // [d4, c3, b2, a1] on disk (matches real tcpdump LE output).
+        out.extend_from_slice(&0xa1b2c3d4u32.to_le_bytes()); // magic
         out.extend_from_slice(&2u16.to_le_bytes()); // version major
         out.extend_from_slice(&4u16.to_le_bytes()); // version minor
         out.extend_from_slice(&0i32.to_le_bytes()); // thiszone
@@ -312,7 +320,7 @@ mod tests {
     fn parse_pcap_hosts_ignores_unknown_linktype() {
         // Build a libpcap with linktype = 999 (unknown), one byte of "data".
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&0xd4c3b2a1u32.to_le_bytes());
+        bytes.extend_from_slice(&0xa1b2c3d4u32.to_le_bytes()); // canonical LE magic
         bytes.extend_from_slice(&2u16.to_le_bytes());
         bytes.extend_from_slice(&4u16.to_le_bytes());
         bytes.extend_from_slice(&0i32.to_le_bytes());
@@ -327,6 +335,77 @@ mod tests {
         bytes.push(0xff);
         let hosts = parse_pcap_hosts(&bytes);
         assert!(hosts.is_empty());
+    }
+
+    fn build_libpcap_with_ipv4_packet_be(dest: [u8; 4]) -> Vec<u8> {
+        // BE writer: canonical magic emitted in big-endian byte order, all
+        // multi-byte header fields likewise BE.  Packet payload bytes
+        // (Ethernet + IP) are byte-order-neutral.
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xa1b2c3d4u32.to_be_bytes()); // magic
+        out.extend_from_slice(&2u16.to_be_bytes());
+        out.extend_from_slice(&4u16.to_be_bytes());
+        out.extend_from_slice(&0i32.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&65535u32.to_be_bytes());
+        out.extend_from_slice(&1u32.to_be_bytes()); // linktype = Ethernet
+
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&[0; 6]);
+        pkt.extend_from_slice(&[0; 6]);
+        pkt.extend_from_slice(&[0x08, 0x00]);
+        let mut ip = vec![0u8; 20];
+        ip[0] = (4 << 4) | 5;
+        ip[16] = dest[0];
+        ip[17] = dest[1];
+        ip[18] = dest[2];
+        ip[19] = dest[3];
+        pkt.extend_from_slice(&ip);
+
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&(pkt.len() as u32).to_be_bytes());
+        out.extend_from_slice(&(pkt.len() as u32).to_be_bytes());
+        out.extend_from_slice(&pkt);
+        out
+    }
+
+    #[test]
+    fn parse_pcap_hosts_handles_be_writer() {
+        let pcap = build_libpcap_with_ipv4_packet_be([5, 6, 7, 8]);
+        let hosts = parse_pcap_hosts(&pcap);
+        assert_eq!(hosts, vec!["5.6.7.8".to_string()]);
+    }
+
+    #[test]
+    fn parse_pcap_hosts_extracts_ipv6_dest_from_real_format() {
+        // Mirror the Linux tcpdump on `lo` shape: Ethernet linktype, IPv6
+        // ethertype, ::1 → ::1 packet. Regression for the inverted-endian
+        // bug that returned [] from real-world captures.
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xa1b2c3d4u32.to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&4u16.to_le_bytes());
+        out.extend_from_slice(&0i32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&65535u32.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes()); // Ethernet
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&[0; 6]);
+        pkt.extend_from_slice(&[0; 6]);
+        pkt.extend_from_slice(&[0x86, 0xdd]); // IPv6 ethertype
+        let mut ip6 = vec![0u8; 40];
+        ip6[0] = 0x60; // version = 6
+        // dest IPv6 = ::1 (bytes 24..40 in L3)
+        ip6[24..40].copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        pkt.extend_from_slice(&ip6);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(pkt.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(pkt.len() as u32).to_le_bytes());
+        out.extend_from_slice(&pkt);
+        let hosts = parse_pcap_hosts(&out);
+        assert_eq!(hosts, vec!["0:0:0:0:0:0:0:1".to_string()]);
     }
 
     #[test]
