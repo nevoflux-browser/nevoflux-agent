@@ -82,6 +82,16 @@ impl Benchmark for OnlineMind2Web {
     }
 
     async fn load_tasks(&self, filter: Option<&str>) -> EvalResult<Vec<Task>> {
+        // Phase 3d: NEVOFLUX_OM2W_DATA_PATH override walks the upstream
+        // Online-Mind2Web `data/` tree (per-task `result.json` files).
+        if let Some(real_path) = std::env::var_os("NEVOFLUX_OM2W_DATA_PATH") {
+            let p = std::path::PathBuf::from(real_path);
+            let mut tasks = crate::datasets::om2w_dir::load(&p)?;
+            if let Some(f) = filter {
+                tasks.retain(|t| t.id.contains(f));
+            }
+            return Ok(tasks);
+        }
         let raw = tokio::fs::read_to_string(&self.fixture_path)
             .await
             .map_err(EvalError::Io)?;
