@@ -125,4 +125,21 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "alpha");
     }
+
+    #[tokio::test]
+    async fn shipped_fixture_parses_with_default_path() {
+        // Walks up from CARGO_MANIFEST_DIR (crates/eval) to the workspace
+        // root, then loads the checked-in fixture.
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let workspace = std::path::Path::new(manifest_dir).ancestors().nth(2).unwrap();
+        let path = workspace.join("eval/benchmarks/browsecomp-fixture.json");
+        let bench = BrowseComp::with_fixture(path);
+        let tasks = bench.load_tasks(None).await.unwrap();
+        assert_eq!(tasks.len(), 5, "fixture should ship 5 tasks");
+        assert!(
+            tasks[0].prompt.contains("Nobel Prize"),
+            "Phase 4 fixture should contain multi-hop Nobel Prize question, got: {}",
+            tasks[0].prompt
+        );
+    }
 }
