@@ -198,6 +198,7 @@ mod tests {
                     assertions: vec![],
                     requires_browser: false,
                     metadata: Default::default(),
+                    supports_platform: vec![],
                 },
                 result: TaskResult {
                     task_id: "t".into(),
@@ -208,6 +209,7 @@ mod tests {
                     error: None,
                     trace_ids: vec![],
                     observed_events: vec![],
+                    outbound_hosts: vec![],
                 },
                 verdict: Some(Verdict {
                     correct: true,

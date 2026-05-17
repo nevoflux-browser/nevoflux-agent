@@ -190,7 +190,8 @@ impl Runner {
 
         let semaphore = Arc::new(Semaphore::new(effective_parallelism));
 
-        // Partition tasks into skipped (no browser) and to-run.
+        // Partition tasks into skipped (no browser / wrong platform) and to-run.
+        let current_platform = crate::Platform::current();
         let mut to_run: Vec<Task> = Vec::with_capacity(tasks.len());
         for task in tasks.iter() {
             if task.requires_browser && !browser.is_real_browser() {
@@ -207,6 +208,35 @@ impl Runner {
                         error: None,
                         trace_ids: vec![],
                         observed_events: vec![],
+                        outbound_hosts: vec![],
+                    },
+                    verdict: None,
+                });
+            } else if !task.supports_platform.is_empty()
+                && !task.supports_platform.contains(&current_platform)
+            {
+                tracing::info!(
+                    id = %task.id,
+                    current = ?current_platform,
+                    supports = ?task.supports_platform,
+                    "skipping: task not supported on this platform"
+                );
+                skipped += 1;
+                outcomes.push(TaskOutcome {
+                    task: task.clone(),
+                    result: TaskResult {
+                        task_id: task.id.clone(),
+                        status: TaskStatus::SkippedNoBrowser, // reusing variant; Phase 4 may narrow
+                        final_answer: None,
+                        latency_ms: 0,
+                        token_cost: None,
+                        error: Some(format!(
+                            "task supports {:?}, current platform is {:?}",
+                            task.supports_platform, current_platform
+                        )),
+                        trace_ids: vec![],
+                        observed_events: vec![],
+                        outbound_hosts: vec![],
                     },
                     verdict: None,
                 });
@@ -271,6 +301,7 @@ impl Runner {
                         error: Some(e.to_string()),
                         trace_ids: vec![],
                         observed_events: vec![],
+                        outbound_hosts: vec![],
                     }
                 }
             };
@@ -588,5 +619,6 @@ async fn execute_task_impl(
         error: termination_reason,
         trace_ids,
         observed_events,
+        outbound_hosts: vec![],
     })
 }

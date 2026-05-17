@@ -22,6 +22,7 @@ async fn structured_judge_passes_when_all_assertions_match() {
         }],
         requires_browser: false,
         metadata: serde_json::Map::new(),
+        supports_platform: vec![],
     };
 
     let result = TaskResult {
@@ -33,6 +34,7 @@ async fn structured_judge_passes_when_all_assertions_match() {
         error: None,
         trace_ids: vec![],
         observed_events: vec![],
+        outbound_hosts: vec![],
     };
 
     let judge = StructuredJudge::new();

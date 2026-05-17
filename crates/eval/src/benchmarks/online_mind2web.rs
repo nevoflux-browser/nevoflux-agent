@@ -115,6 +115,7 @@ impl Benchmark for OnlineMind2Web {
                 assertions: vec![],
                 requires_browser: true,
                 metadata,
+                supports_platform: vec![],
             });
         }
         Ok(tasks)

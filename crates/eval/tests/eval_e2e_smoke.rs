@@ -62,6 +62,7 @@ impl Benchmark for OneTaskBench {
             }],
             requires_browser: false,
             metadata: Default::default(),
+            supports_platform: vec![],
         }])
     }
 }
@@ -222,6 +223,7 @@ async fn cross_session_inject_routes_correctly() {
                 }],
                 requires_browser: false,
                 metadata: Default::default(),
+                supports_platform: vec![],
             }])
         }
     }
@@ -319,6 +321,7 @@ async fn tools_enabled_dispatch_does_not_crash() {
                 }],
                 requires_browser: false,
                 metadata: Default::default(),
+                supports_platform: vec![],
             }])
         }
     }

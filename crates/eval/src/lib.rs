@@ -31,6 +31,39 @@ pub use error::{EvalError, EvalResult};
 pub use runner::{Runner, RunnerConfig};
 pub use termination::{AnswerExtractor, DaemonEvent, TerminationDecision, TerminationStrategy};
 
+/// The host platform the eval runner is executing on.
+///
+/// Used by `Task::supports_platform` to skip tasks that cannot run on the
+/// current OS (e.g. Windows-only browser automation, macOS-only keychain
+/// tests).  An empty `supports_platform` means "all platforms" for
+/// backwards compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Platform {
+    Linux,
+    Macos,
+    Windows,
+}
+
+impl Platform {
+    /// Detect the current compile-time target platform.
+    pub fn current() -> Self {
+        #[cfg(target_os = "linux")]
+        return Platform::Linux;
+        #[cfg(target_os = "macos")]
+        return Platform::Macos;
+        #[cfg(target_os = "windows")]
+        return Platform::Windows;
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        return Platform::Linux; // fallback for other unix-likes
+    }
+}
+
+#[allow(dead_code)]
+fn default_all_platforms() -> Vec<Platform> {
+    vec![Platform::Linux, Platform::Macos, Platform::Windows]
+}
+
 /// Signal grade — drives report routing.
 ///
 /// - `Authoritative` reports go to `eval/reports/authoritative/` and are
@@ -79,6 +112,12 @@ pub struct Task {
     /// Free-form metadata for benchmark-specific fields.
     #[serde(default)]
     pub metadata: serde_json::Map<String, serde_json::Value>,
+    /// Platforms this task can run on.  An empty Vec means "all platforms"
+    /// (backwards-compatible default).  The runner skips tasks whose
+    /// `supports_platform` list does not contain the host platform.
+    /// Phase 3d addition.
+    #[serde(default)]
+    pub supports_platform: Vec<Platform>,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -137,6 +176,11 @@ pub struct TaskResult {
     /// Phase 3a addition (defaults to empty for backwards compat).
     #[serde(default)]
     pub observed_events: Vec<String>,
+    /// Outbound hosts observed via tcpdump during this task.  Populated by
+    /// the privacy-audit runner hook.  Empty when not under privacy audit.
+    /// Phase 3d addition.
+    #[serde(default)]
+    pub outbound_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -167,4 +211,41 @@ pub struct TokenCost {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub usd: f64,
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    #[test]
+    fn platform_current_returns_compile_target() {
+        let p = Platform::current();
+        #[cfg(target_os = "linux")]
+        assert_eq!(p, Platform::Linux);
+        #[cfg(target_os = "macos")]
+        assert_eq!(p, Platform::Macos);
+        #[cfg(target_os = "windows")]
+        assert_eq!(p, Platform::Windows);
+    }
+
+    #[test]
+    fn task_default_supports_empty_vec() {
+        let task: Task = serde_yaml::from_str(
+            "id: t\ncategory: c\nmode: chat\nprompt: p\nrequires_browser: false\n",
+        )
+        .unwrap();
+        // serde default for Vec is empty — that is our "all platforms" sentinel.
+        assert!(task.supports_platform.is_empty());
+    }
+
+    #[test]
+    fn task_with_explicit_platforms_parses() {
+        let task: Task = serde_yaml::from_str(
+            "id: t\ncategory: c\nmode: chat\nprompt: p\nrequires_browser: false\nsupports_platform: [linux, macos]\n",
+        )
+        .unwrap();
+        assert_eq!(task.supports_platform.len(), 2);
+        assert!(task.supports_platform.contains(&Platform::Linux));
+        assert!(task.supports_platform.contains(&Platform::Macos));
+    }
 }

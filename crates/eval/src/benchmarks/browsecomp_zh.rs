@@ -101,6 +101,7 @@ impl Benchmark for BrowseCompZh {
                 }],
                 requires_browser: false,
                 metadata: Default::default(),
+                supports_platform: vec![],
             });
         }
         Ok(tasks)

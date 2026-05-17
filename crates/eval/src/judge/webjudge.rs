@@ -230,6 +230,7 @@ mod tests {
             assertions: vec![],
             requires_browser: true,
             metadata,
+            supports_platform: vec![],
         }
     }
 
@@ -243,6 +244,7 @@ mod tests {
             error: None,
             trace_ids: vec![],
             observed_events: vec![],
+            outbound_hosts: vec![],
         }
     }
 

@@ -112,6 +112,7 @@ mod tests {
             assertions: asserts,
             requires_browser: false,
             metadata: Default::default(),
+            supports_platform: vec![],
         }
     }
 
@@ -125,6 +126,7 @@ mod tests {
             error: None,
             trace_ids: vec![],
             observed_events: vec![],
+            outbound_hosts: vec![],
         }
     }
 
