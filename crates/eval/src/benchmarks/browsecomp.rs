@@ -73,6 +73,17 @@ impl Benchmark for BrowseComp {
     }
 
     async fn load_tasks(&self, filter: Option<&str>) -> EvalResult<Vec<Task>> {
+        // Phase 3d: NEVOFLUX_BC_DATA_PATH override switches to the real
+        // upstream XOR-encrypted CSV (see eval/README-DATASETS.md and
+        // `just eval-fetch-bc`).  Fixture path used when unset.
+        if let Some(real_path) = std::env::var_os("NEVOFLUX_BC_DATA_PATH") {
+            let p = std::path::PathBuf::from(real_path);
+            let mut tasks = crate::datasets::browsecomp_csv::load(&p)?;
+            if let Some(f) = filter {
+                tasks.retain(|t| t.id.contains(f));
+            }
+            return Ok(tasks);
+        }
         let raw = tokio::fs::read_to_string(&self.fixture_path)
             .await
             .map_err(EvalError::Io)?;
