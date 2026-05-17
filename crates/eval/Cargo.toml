@@ -41,6 +41,8 @@ directories = { workspace = true }
 
 bytes = "1"
 async-stream = "0.3"
+sha2 = "0.10"
+base64 = "0.22"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Threading"] }

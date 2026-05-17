@@ -18,6 +18,7 @@
 pub mod benchmarks;
 pub mod browser;
 pub mod daemon_client;
+pub mod datasets;
 pub mod error;
 pub mod judge;
 pub mod metrics;
