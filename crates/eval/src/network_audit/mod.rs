@@ -68,11 +68,15 @@ impl TcpdumpRecorder {
     }
 }
 
-/// Parse a pcap byte slice into outbound host names.
+/// Parse a pcap byte slice into outbound host strings.
 ///
-/// Phase 3d implementation: confirms the bytes are a well-formed pcap file
-/// (libpcap or pcapng magic), returns empty until Phase 4 wires in
-/// per-packet DNS/IP extraction.
+/// Phase 4 implementation: walks libpcap-format records, decodes the
+/// link-layer header (Ethernet / Linux cooked v1+v2 / raw), then the IPv4
+/// or IPv6 header to extract a destination IP per packet. Returns each
+/// unique destination IP as a string. PCAPng files and DNS-domain
+/// extraction remain Phase 5 work — for now we only recognise pcapng's
+/// magic and return an empty list (caller can still tell tcpdump
+/// produced a valid file).
 pub fn parse_pcap_hosts(bytes: &[u8]) -> Vec<String> {
     if !is_pcap_file(bytes) {
         if !bytes.is_empty() {
@@ -83,11 +87,117 @@ pub fn parse_pcap_hosts(bytes: &[u8]) -> Vec<String> {
         }
         return vec![];
     }
-    debug!(
-        bytes = bytes.len(),
-        "pcap recognised (per-packet host extraction deferred to Phase 4)"
-    );
-    vec![]
+    // pcapng → Phase 5.
+    if bytes.starts_with(&[0x0a, 0x0d, 0x0d, 0x0a]) {
+        debug!(
+            bytes = bytes.len(),
+            "pcapng recognised (record walking deferred to Phase 5)"
+        );
+        return vec![];
+    }
+    parse_libpcap_records(bytes).unwrap_or_default()
+}
+
+/// Walk libpcap-classic records and return unique destination IPs.
+/// Returns Err on malformed input so we don't return partial junk; the
+/// public entry point converts Err → empty vec.
+fn parse_libpcap_records(bytes: &[u8]) -> Result<Vec<String>, &'static str> {
+    use std::collections::BTreeSet;
+
+    // libpcap global header is 24 bytes:
+    //   u32 magic | u16 version_major | u16 version_minor |
+    //   i32 thiszone | u32 sigfigs | u32 snaplen | u32 network (linktype)
+    if bytes.len() < 24 {
+        return Err("truncated global header");
+    }
+    let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let big_endian = match magic {
+        0xa1b2c3d4 | 0xa1b23c4d => true,  // BE writer
+        0xd4c3b2a1 | 0x4d3cb2a1 => false, // LE writer
+        _ => return Err("unknown libpcap magic"),
+    };
+    let read_u32 = |off: usize| -> u32 {
+        let b = [bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]];
+        if big_endian {
+            u32::from_be_bytes(b)
+        } else {
+            u32::from_le_bytes(b)
+        }
+    };
+    let linktype = read_u32(20);
+
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    let mut off = 24usize;
+    while off + 16 <= bytes.len() {
+        // Record header: ts_sec | ts_usec | incl_len | orig_len
+        let incl_len = read_u32(off + 8) as usize;
+        let data_off = off + 16;
+        if data_off + incl_len > bytes.len() {
+            break; // truncated final record — stop, don't error.
+        }
+        let pkt = &bytes[data_off..data_off + incl_len];
+        if let Some(ip) = extract_dest_ip(linktype, pkt) {
+            out.insert(ip);
+        }
+        off = data_off + incl_len;
+    }
+    Ok(out.into_iter().collect())
+}
+
+/// Strip link-layer header for the link types we care about, then call
+/// `extract_dest_ip_from_l3`. Returns `None` for unknown link types or
+/// malformed packets.
+fn extract_dest_ip(linktype: u32, pkt: &[u8]) -> Option<String> {
+    // Common linktypes:
+    //   1   = LINKTYPE_ETHERNET           — 14-byte header
+    //   113 = LINKTYPE_LINUX_SLL          — 16-byte cooked v1
+    //   276 = LINKTYPE_LINUX_SLL2         — 20-byte cooked v2
+    //   12  = LINKTYPE_RAW (legacy)       — 0 bytes, packet starts at L3
+    //   101 = LINKTYPE_RAW                — same
+    let l3_offset = match linktype {
+        1 => 14,
+        113 => 16,
+        276 => 20,
+        12 | 101 => 0,
+        _ => return None,
+    };
+    if pkt.len() < l3_offset {
+        return None;
+    }
+    extract_dest_ip_from_l3(&pkt[l3_offset..])
+}
+
+fn extract_dest_ip_from_l3(l3: &[u8]) -> Option<String> {
+    if l3.is_empty() {
+        return None;
+    }
+    let version = (l3[0] >> 4) & 0x0f;
+    match version {
+        4 => {
+            if l3.len() < 20 {
+                return None;
+            }
+            Some(format!("{}.{}.{}.{}", l3[16], l3[17], l3[18], l3[19]))
+        }
+        6 => {
+            if l3.len() < 40 {
+                return None;
+            }
+            let mut groups = [0u16; 8];
+            for (i, g) in groups.iter_mut().enumerate() {
+                let off = 24 + i * 2;
+                *g = u16::from_be_bytes([l3[off], l3[off + 1]]);
+            }
+            Some(
+                groups
+                    .iter()
+                    .map(|g| format!("{:x}", g))
+                    .collect::<Vec<_>>()
+                    .join(":"),
+            )
+        }
+        _ => None,
+    }
 }
 
 /// True iff `bytes` begin with a libpcap or pcapng magic-number sequence.
@@ -143,5 +253,94 @@ mod tests {
     fn is_pcap_file_rejects_garbage() {
         assert!(!is_pcap_file(b"not pcap"));
         assert!(!is_pcap_file(&[]));
+    }
+
+    fn build_libpcap_with_ipv4_packet(dest: [u8; 4]) -> Vec<u8> {
+        let mut out = Vec::new();
+        // Global header — LE writer, linktype = 1 (Ethernet)
+        out.extend_from_slice(&0xd4c3b2a1u32.to_le_bytes()); // magic
+        out.extend_from_slice(&2u16.to_le_bytes()); // version major
+        out.extend_from_slice(&4u16.to_le_bytes()); // version minor
+        out.extend_from_slice(&0i32.to_le_bytes()); // thiszone
+        out.extend_from_slice(&0u32.to_le_bytes()); // sigfigs
+        out.extend_from_slice(&65535u32.to_le_bytes()); // snaplen
+        out.extend_from_slice(&1u32.to_le_bytes()); // linktype = Ethernet
+
+        // One record:
+        let mut pkt = Vec::new();
+        // Ethernet header (14 bytes): dst MAC, src MAC, ethertype 0x0800 (IPv4)
+        pkt.extend_from_slice(&[0; 6]);
+        pkt.extend_from_slice(&[0; 6]);
+        pkt.extend_from_slice(&[0x08, 0x00]);
+        // IPv4 header (20 bytes minimal): version=4, ihl=5 in byte 0.
+        let mut ip = vec![0u8; 20];
+        ip[0] = (4 << 4) | 5;
+        ip[16] = dest[0];
+        ip[17] = dest[1];
+        ip[18] = dest[2];
+        ip[19] = dest[3];
+        pkt.extend_from_slice(&ip);
+
+        // Record header (16 bytes): ts_sec, ts_usec, incl_len, orig_len
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(pkt.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(pkt.len() as u32).to_le_bytes());
+        out.extend_from_slice(&pkt);
+        out
+    }
+
+    #[test]
+    fn parse_pcap_hosts_extracts_ipv4_dest() {
+        let pcap = build_libpcap_with_ipv4_packet([10, 20, 30, 40]);
+        let hosts = parse_pcap_hosts(&pcap);
+        assert_eq!(hosts, vec!["10.20.30.40".to_string()]);
+    }
+
+    #[test]
+    fn parse_pcap_hosts_dedupes_repeated_dest() {
+        // Two records with the same destination → one entry in the output.
+        let one = build_libpcap_with_ipv4_packet([1, 2, 3, 4]);
+        // Append the same record section (skip the 24-byte global header).
+        let mut twice = one.clone();
+        twice.extend_from_slice(&one[24..]);
+        let hosts = parse_pcap_hosts(&twice);
+        assert_eq!(hosts, vec!["1.2.3.4".to_string()]);
+    }
+
+    #[test]
+    fn parse_pcap_hosts_ignores_unknown_linktype() {
+        // Build a libpcap with linktype = 999 (unknown), one byte of "data".
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0xd4c3b2a1u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&65535u32.to_le_bytes());
+        bytes.extend_from_slice(&999u32.to_le_bytes());
+        // One record with 1 byte of data
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.push(0xff);
+        let hosts = parse_pcap_hosts(&bytes);
+        assert!(hosts.is_empty());
+    }
+
+    #[test]
+    fn extract_dest_ip_from_l3_handles_ipv6() {
+        let mut l3 = vec![0u8; 40];
+        l3[0] = 6 << 4; // version = 6
+                        // Dest IP: 2001:db8::1
+        let dest_bytes: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
+        l3[24..40].copy_from_slice(&dest_bytes);
+        assert_eq!(
+            extract_dest_ip_from_l3(&l3),
+            Some("2001:db8:0:0:0:0:0:1".into())
+        );
     }
 }
