@@ -73,11 +73,21 @@ struct AnthropicMessage {
 #[derive(Debug, Deserialize)]
 struct AnthropicResponse {
     content: Vec<AnthropicContent>,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
 }
 
 #[derive(Debug, Deserialize)]
 struct AnthropicContent {
     text: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
 }
 
 fn build_prompt(task: &Task, final_answer: &str, evaluation_criteria: &str) -> String {
@@ -180,12 +190,23 @@ impl Judge for WebJudge {
             (false, 0.0)
         };
 
+        let judge_cost_usd = body
+            .usage
+            .as_ref()
+            .map(|u| {
+                crate::judge::pricing::estimate_cost_usd(
+                    &self.model,
+                    u.input_tokens,
+                    u.output_tokens,
+                )
+            })
+            .unwrap_or(0.0);
+
         Ok(Verdict {
             correct,
             score,
             explanation: trimmed.to_string(),
-            // Phase 3c will populate from response.usage; for now 0.
-            judge_cost_usd: 0.0,
+            judge_cost_usd,
         })
     }
 }
@@ -203,6 +224,7 @@ mod tests {
             post(move || async move {
                 Json(serde_json::json!({
                     "content": [{"type": "text", "text": canned_text}],
+                    "usage": {"input_tokens": 42, "output_tokens": 17},
                 }))
             }),
         );
@@ -291,5 +313,41 @@ mod tests {
             .await
             .unwrap();
         assert!(v.correct);
+    }
+
+    #[tokio::test]
+    async fn judge_cost_usd_reflects_usage_for_known_model() {
+        let addr = spawn_test_server("PASS — yes.").await;
+        let j = WebJudge::new().with_llm_config(
+            format!("http://{addr}"),
+            "test".into(),
+            "claude-3-5-sonnet-20240620".into(),
+        );
+        let v = j
+            .judge(&dummy_task(), &dummy_result("Cats are mammals."))
+            .await
+            .unwrap();
+        assert!(v.correct);
+        // 42 input * $0.003/1k + 17 output * $0.015/1k = 0.000126 + 0.000255 = 0.000381
+        assert!(
+            (v.judge_cost_usd - 0.000381).abs() < 1e-9,
+            "got {}",
+            v.judge_cost_usd
+        );
+    }
+
+    #[tokio::test]
+    async fn judge_cost_usd_zero_for_unknown_model() {
+        let addr = spawn_test_server("PASS — yes.").await;
+        let j = WebJudge::new().with_llm_config(
+            format!("http://{addr}"),
+            "test".into(),
+            "totally-unknown-model".into(),
+        );
+        let v = j
+            .judge(&dummy_task(), &dummy_result("any"))
+            .await
+            .unwrap();
+        assert_eq!(v.judge_cost_usd, 0.0);
     }
 }
