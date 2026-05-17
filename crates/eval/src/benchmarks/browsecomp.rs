@@ -6,10 +6,9 @@
 //! (XOR-encrypted to prevent training contamination — see
 //! `eval/README-DATASETS.md`).
 
-use crate::{benchmarks::Benchmark, Assertion, EvalError, EvalResult, NevoFluxMode, Task};
+use crate::{benchmarks::Benchmark, EvalResult, Task};
 use async_trait::async_trait;
 use nevoflux_protocol::subagent::ToolsConfig;
-use serde::Deserialize;
 use std::path::PathBuf;
 
 pub struct BrowseComp {
@@ -32,22 +31,6 @@ impl Default for BrowseComp {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct FixtureFile {
-    #[allow(dead_code)]
-    version: String,
-    #[allow(dead_code)]
-    source: String,
-    tasks: Vec<FixtureTask>,
-}
-
-#[derive(Debug, Deserialize)]
-struct FixtureTask {
-    id: String,
-    question: String,
-    answer: String,
 }
 
 #[async_trait]
@@ -84,45 +67,20 @@ impl Benchmark for BrowseComp {
             }
             return Ok(tasks);
         }
-        let raw = tokio::fs::read_to_string(&self.fixture_path)
-            .await
-            .map_err(EvalError::Io)?;
-        let file: FixtureFile = serde_json::from_str(&raw).map_err(|e| EvalError::TaskParse {
-            path: self.fixture_path.display().to_string(),
-            reason: e.to_string(),
-        })?;
-        let mut tasks = Vec::new();
-        for ft in file.tasks {
-            if let Some(f) = filter {
-                if !ft.id.contains(f) {
-                    continue;
-                }
-            }
-            tasks.push(Task {
-                id: ft.id,
-                category: "browsecomp".into(),
-                mode: NevoFluxMode::Agent,
-                prompt: format!(
-                    "{question}\n\nReply with just the short answer (1-5 words).",
-                    question = ft.question
-                ),
-                setup: vec![],
-                reference: Some(ft.answer.clone()),
-                assertions: vec![Assertion::ContainsAny {
-                    targets: vec![ft.answer.clone()],
-                }],
-                requires_browser: false,
-                metadata: Default::default(),
-                supports_platform: vec![],
-            });
-        }
-        Ok(tasks)
+        crate::benchmarks::fixture::load_qa_fixture(
+            &self.fixture_path,
+            "browsecomp",
+            "Reply with just the short answer (1-5 words).",
+            filter,
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NevoFluxMode;
 
     #[tokio::test]
     async fn loads_fixture() {

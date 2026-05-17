@@ -8,6 +8,7 @@ use nevoflux_protocol::subagent::ToolsConfig;
 
 pub mod browsecomp;
 pub mod browsecomp_zh;
+pub mod fixture;
 pub mod nevoflux_suite;
 pub mod online_mind2web;
 
