@@ -21,6 +21,7 @@ pub mod daemon_client;
 pub mod error;
 pub mod judge;
 pub mod metrics;
+pub mod network_audit;
 pub mod reporter;
 pub mod runner;
 pub mod termination;
