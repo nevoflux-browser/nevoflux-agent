@@ -1,6 +1,7 @@
 use crate::{EvalResult, Task, TaskResult};
 use async_trait::async_trait;
 
+pub mod pricing;
 pub mod programmatic;
 pub mod structured;
 pub mod webjudge;
