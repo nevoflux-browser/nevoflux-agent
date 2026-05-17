@@ -91,7 +91,25 @@ fn is_pid_alive(pid: u32) -> bool {
             .map(|s| s.success())
             .unwrap_or(false)
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: OpenProcess + CloseHandle are sound when given a valid
+        // PID and matching handle; a zero handle indicates the PID is
+        // unknown (or access denied) — either way we treat as "not alive".
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle == 0 {
+                return false;
+            }
+            CloseHandle(handle);
+            true
+        }
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
     {
         true
     }
