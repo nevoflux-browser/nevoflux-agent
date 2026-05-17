@@ -131,7 +131,10 @@ mod tests {
         // Walks up from CARGO_MANIFEST_DIR (crates/eval) to the workspace
         // root, then loads the checked-in fixture.
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let workspace = std::path::Path::new(manifest_dir).ancestors().nth(2).unwrap();
+        let workspace = std::path::Path::new(manifest_dir)
+            .ancestors()
+            .nth(2)
+            .unwrap();
         let path = workspace.join("eval/benchmarks/browsecomp-fixture.json");
         let bench = BrowseComp::with_fixture(path);
         let tasks = bench.load_tasks(None).await.unwrap();

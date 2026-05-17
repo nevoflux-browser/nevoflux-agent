@@ -344,10 +344,7 @@ mod tests {
             "test".into(),
             "totally-unknown-model".into(),
         );
-        let v = j
-            .judge(&dummy_task(), &dummy_result("any"))
-            .await
-            .unwrap();
+        let v = j.judge(&dummy_task(), &dummy_result("any")).await.unwrap();
         assert_eq!(v.judge_cost_usd, 0.0);
     }
 }
