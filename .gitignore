@@ -42,3 +42,6 @@ eval/reports/exploratory/
 eval/reports/failures/
 .cache/nevoflux-releases/
 
+# `just release-eval` tarball output
+/dist/
+

@@ -235,3 +235,22 @@ eval-fetch-bc:
         -o eval/benchmarks/browsecomp.csv
     @echo "Fetched $(wc -l < eval/benchmarks/browsecomp.csv) lines into eval/benchmarks/browsecomp.csv"
     @echo "Now run with: NEVOFLUX_BC_DATA_PATH=eval/benchmarks/browsecomp.csv just eval-mock browsecomp"
+
+# Build + package the nevoflux-eval binary into a distributable tarball.
+# Output: dist/nevoflux-eval-<host-triple>.tar.gz containing the binary,
+# the eval/ suites + fixtures, and the README-DATASETS playbook.
+release-eval:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p dist
+    cargo build --release -p nevoflux-eval
+    triple=$(rustc -vV | awk '/^host:/{print $2}')
+    stage="dist/staging-${triple}"
+    rm -rf "${stage}"
+    mkdir -p "${stage}/bin" "${stage}/eval"
+    cp target/release/nevoflux-eval "${stage}/bin/"
+    cp -R eval/nevoflux-suite eval/benchmarks "${stage}/eval/"
+    cp eval/README-DATASETS.md "${stage}/eval/" 2>/dev/null || true
+    tar -czf "dist/nevoflux-eval-${triple}.tar.gz" -C "${stage}" .
+    rm -rf "${stage}"
+    echo "Wrote dist/nevoflux-eval-${triple}.tar.gz"
