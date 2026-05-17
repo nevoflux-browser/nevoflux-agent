@@ -30,27 +30,30 @@ pub fn load(path: &Path) -> EvalResult<Vec<Task>> {
     })?;
     let headers = parse_csv_line(header_line);
 
-    let problem_idx = headers
-        .iter()
-        .position(|h| h == "problem")
-        .ok_or_else(|| EvalError::TaskParse {
-            path: path.display().to_string(),
-            reason: "missing 'problem' column".into(),
-        })?;
-    let answer_idx = headers
-        .iter()
-        .position(|h| h == "answer")
-        .ok_or_else(|| EvalError::TaskParse {
-            path: path.display().to_string(),
-            reason: "missing 'answer' column".into(),
-        })?;
-    let canary_idx = headers
-        .iter()
-        .position(|h| h == "canary")
-        .ok_or_else(|| EvalError::TaskParse {
-            path: path.display().to_string(),
-            reason: "missing 'canary' column".into(),
-        })?;
+    let problem_idx =
+        headers
+            .iter()
+            .position(|h| h == "problem")
+            .ok_or_else(|| EvalError::TaskParse {
+                path: path.display().to_string(),
+                reason: "missing 'problem' column".into(),
+            })?;
+    let answer_idx =
+        headers
+            .iter()
+            .position(|h| h == "answer")
+            .ok_or_else(|| EvalError::TaskParse {
+                path: path.display().to_string(),
+                reason: "missing 'answer' column".into(),
+            })?;
+    let canary_idx =
+        headers
+            .iter()
+            .position(|h| h == "canary")
+            .ok_or_else(|| EvalError::TaskParse {
+                path: path.display().to_string(),
+                reason: "missing 'canary' column".into(),
+            })?;
 
     let mut tasks = Vec::new();
     for (row_idx, line) in lines.enumerate() {

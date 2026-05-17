@@ -224,3 +224,14 @@ eval-fetch-data:
     @echo "Phase 3c ships 5-task fixtures for all three; this recipe is a"
     @echo "placeholder for the full integration in Phase 3d/4."
     @false
+
+# Fetch + cache the BrowseComp encrypted CSV from OpenAI blob storage.
+# After running, set NEVOFLUX_BC_DATA_PATH=eval/benchmarks/browsecomp.csv
+# and the browsecomp adapter will use the real 1266-task upstream data.
+eval-fetch-bc:
+    @mkdir -p eval/benchmarks
+    curl -fsSL \
+        "https://openaipublic.blob.core.windows.net/simple-evals/browse_comp_test_set.csv" \
+        -o eval/benchmarks/browsecomp.csv
+    @echo "Fetched $(wc -l < eval/benchmarks/browsecomp.csv) lines into eval/benchmarks/browsecomp.csv"
+    @echo "Now run with: NEVOFLUX_BC_DATA_PATH=eval/benchmarks/browsecomp.csv just eval-mock browsecomp"

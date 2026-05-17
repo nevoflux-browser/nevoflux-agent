@@ -31,9 +31,7 @@ pub fn load(path: &Path, category: &str, prompt_suffix: &str) -> EvalResult<Vec<
             reason: format!("line {idx}: {e}"),
         })?;
         emitted += 1;
-        let id = row
-            .id
-            .unwrap_or_else(|| format!("{category}-{emitted:04}"));
+        let id = row.id.unwrap_or_else(|| format!("{category}-{emitted:04}"));
         tasks.push(Task {
             id,
             category: category.into(),
