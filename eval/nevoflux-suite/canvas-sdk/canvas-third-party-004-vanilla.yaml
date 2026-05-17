@@ -1,0 +1,25 @@
+id: canvas-third-party-004
+category: canvas_sdk
+mode: agent
+requires_browser: true
+supports_platform: [linux, macos, windows]
+
+prompt: |
+  Render the template from templates/vanilla-todo/index.html inside a
+  Canvas micro-app, then via NevoFluxSDK.agent.chat() call
+  `add_todo("third-party test")` and then `list_todos()`. Confirm the
+  returned list contains "third-party test".
+
+assertions:
+  - type: daemon_event
+    event: canvas_app_created
+  - type: daemon_event
+    event: canvas_sdk_chat_invoked
+
+metadata:
+  template_path: templates/vanilla-todo/index.html
+  description: Third-party micro-app (TodoMVC) renders + responds to SDK calls
+  notes: |
+    Exercises Canvas SDK against a non-NevoFlux-origin micro-app pattern
+    (TodoMVC vanilla JS). Validates SDK round-trip with classic
+    list-add/toggle interactions.

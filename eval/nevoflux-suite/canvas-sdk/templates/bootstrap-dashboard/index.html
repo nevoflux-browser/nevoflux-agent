@@ -1,0 +1,59 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Dashboard</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; }
+    nav { background: #343a40; color: white; padding: 12px 16px;
+          display: flex; justify-content: space-between; align-items: center; }
+    nav h1 { margin: 0; font-size: 18px; font-weight: 500; }
+    main { padding: 16px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #dee2e6; }
+    th { background: #f8f9fa; }
+    .actions { margin-bottom: 12px; }
+    .actions button { padding: 6px 12px; border: 1px solid #0d6efd;
+                      background: #0d6efd; color: white; border-radius: 4px;
+                      cursor: pointer; }
+    .actions button:hover { background: #0b5ed7; }
+  </style>
+</head>
+<body>
+  <nav>
+    <h1>Dashboard</h1>
+    <span id="status">0 rows</span>
+  </nav>
+  <main>
+    <div class="actions">
+      <button id="refresh">Refresh</button>
+    </div>
+    <table>
+      <thead><tr><th>#</th><th>Label</th><th>Count</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </main>
+  <script>
+    const rows = [];
+    function render() {
+      const tbody = document.getElementById('rows');
+      tbody.innerHTML = '';
+      rows.forEach((r, i) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = '<td>' + (i + 1) + '</td><td>' + r.label + '</td><td>' + r.count + '</td>';
+        tbody.appendChild(tr);
+      });
+      document.getElementById('status').textContent = rows.length + ' rows';
+    }
+    window.add_row = (label, count) => {
+      rows.push({ label: String(label), count: Number(count) || 0 });
+      render();
+      return rows.length;
+    };
+    window.refresh_table = () => { render(); return rows.length; };
+    window.row_count = () => rows.length;
+    document.getElementById('refresh').addEventListener('click', window.refresh_table);
+    render();
+  </script>
+</body>
+</html>

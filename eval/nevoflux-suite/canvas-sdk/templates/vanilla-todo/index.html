@@ -1,0 +1,68 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Todos</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 480px;
+           margin: 32px auto; padding: 0 16px; }
+    h1 { font-size: 32px; color: rgba(175, 47, 47, 0.6); text-align: center;
+         font-weight: 300; }
+    .new-todo { width: 100%; padding: 12px; font-size: 18px;
+                border: 1px solid #ddd; border-radius: 4px;
+                box-sizing: border-box; }
+    ul { list-style: none; padding: 0; margin: 12px 0; }
+    li { display: flex; align-items: center; padding: 8px 0;
+         border-bottom: 1px solid #eee; }
+    li.done span { text-decoration: line-through; color: #888; }
+    li input { margin-right: 10px; }
+    li span { flex: 1; }
+    .footer { padding: 8px 0; color: #777; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h1>todos</h1>
+  <input class="new-todo" id="new-todo" placeholder="What needs to be done?">
+  <ul id="list"></ul>
+  <div class="footer"><span id="count">0</span> items</div>
+  <script>
+    const items = [];
+    function render() {
+      const ul = document.getElementById('list');
+      ul.innerHTML = '';
+      items.forEach((it, i) => {
+        const li = document.createElement('li');
+        if (it.done) li.className = 'done';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = it.done;
+        cb.addEventListener('change', () => window.toggle(i));
+        const span = document.createElement('span');
+        span.textContent = it.text;
+        li.appendChild(cb);
+        li.appendChild(span);
+        ul.appendChild(li);
+      });
+      document.getElementById('count').textContent = items.filter(i => !i.done).length;
+    }
+    window.add_todo = (text) => {
+      items.push({ text: String(text), done: false });
+      render();
+      return items.length;
+    };
+    window.toggle = (idx) => {
+      if (items[idx]) { items[idx].done = !items[idx].done; render(); return items[idx].done; }
+      return null;
+    };
+    window.list_todos = () => items.slice();
+
+    document.getElementById('new-todo').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && e.target.value.trim()) {
+        window.add_todo(e.target.value.trim());
+        e.target.value = '';
+      }
+    });
+    render();
+  </script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+id: canvas-third-party-002
+category: canvas_sdk
+mode: agent
+requires_browser: true
+supports_platform: [linux, macos, windows]
+
+prompt: |
+  Render the template from templates/codepen-calculator/index.html inside a
+  Canvas micro-app, then via NevoFluxSDK.agent.chat() call its `add(7)`
+  function. Verify the display reads 7.
+
+assertions:
+  - type: daemon_event
+    event: canvas_app_created
+  - type: daemon_event
+    event: canvas_sdk_chat_invoked
+
+metadata:
+  template_path: templates/codepen-calculator/index.html
+  description: Third-party micro-app (calculator) renders + responds to SDK calls
+  notes: |
+    Exercises Canvas SDK against a non-NevoFlux-origin micro-app pattern
+    (CodePen-style vanilla JS calculator). Validates 准则 (d) universality
+    of the Canvas SDK design specification.

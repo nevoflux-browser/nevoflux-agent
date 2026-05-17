@@ -1,0 +1,1 @@
+https://codepen.io/topic/vanilla-js-calculator (pattern only; not a verbatim snapshot)

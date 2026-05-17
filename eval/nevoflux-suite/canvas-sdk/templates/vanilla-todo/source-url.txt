@@ -1,0 +1,1 @@
+https://todomvc.com/examples/vanillajs/ (pattern only; not a verbatim snapshot)

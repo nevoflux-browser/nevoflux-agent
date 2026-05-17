@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Calculator</title>
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 16px; }
+    #display { font-size: 32px; padding: 12px; background: #f0f0f0;
+               border-radius: 4px; margin-bottom: 12px; text-align: right; }
+    #keypad { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    .key { padding: 16px; font-size: 18px; border: 1px solid #ccc;
+           border-radius: 4px; background: white; cursor: pointer; }
+    .key:hover { background: #e8e8e8; }
+  </style>
+</head>
+<body>
+  <div id="display">0</div>
+  <div id="keypad"></div>
+  <script>
+    let acc = 0;
+    function display() { document.getElementById('display').textContent = String(acc); }
+    window.add = (n) => { acc += Number(n) || 0; display(); return acc; };
+    window.subtract = (n) => { acc -= Number(n) || 0; display(); return acc; };
+    window.clear_acc = () => { acc = 0; display(); return acc; };
+    window.value = () => acc;
+
+    const keys = ['1','2','3','+','4','5','6','-','7','8','9','C'];
+    const pad = document.getElementById('keypad');
+    keys.forEach((k) => {
+      const b = document.createElement('button');
+      b.className = 'key';
+      b.textContent = k;
+      b.addEventListener('click', () => {
+        if (k === 'C') window.clear_acc();
+        else if (k === '+') {}
+        else if (k === '-') {}
+        else window.add(Number(k));
+      });
+      pad.appendChild(b);
+    });
+    display();
+  </script>
+</body>
+</html>
