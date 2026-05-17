@@ -1,0 +1,88 @@
+name: eval-fullstack
+
+on:
+  workflow_dispatch:
+    inputs:
+      benchmark:
+        description: "Which benchmark to run"
+        required: true
+        default: nevoflux-suite
+        type: choice
+        options:
+          - nevoflux-suite
+          - browsecomp
+          - browsecomp-zh
+          - online-mind2web
+      filter:
+        description: "Task ID substring filter (optional)"
+        required: false
+        type: string
+      use_real_browsecomp:
+        description: "Fetch + use real BrowseComp upstream CSV (XOR-encrypted)"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  eval-fullstack:
+    name: eval — full-stack ${{ inputs.benchmark }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Install just
+        uses: extractions/setup-just@v2
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-eval-fullstack-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-eval-fullstack-
+            ${{ runner.os }}-cargo-eval-
+
+      - name: Build daemon
+        run: cargo build --release --bin nevoflux-agent --features eval-mock-llm
+
+      - name: Build eval CLI
+        run: cargo build --release -p nevoflux-eval
+
+      - name: Fetch BrowseComp CSV (optional)
+        if: ${{ inputs.use_real_browsecomp == true && inputs.benchmark == 'browsecomp' }}
+        run: just eval-fetch-bc
+
+      - name: Run benchmark
+        env:
+          NEVOFLUX_EVAL_LLM_MODE: mock
+          NEVOFLUX_BC_DATA_PATH: ${{ inputs.use_real_browsecomp == true && 'eval/benchmarks/browsecomp.csv' || '' }}
+        run: |
+          FILTER_ARG=""
+          if [ -n "${{ inputs.filter }}" ]; then
+            FILTER_ARG="--filter ${{ inputs.filter }}"
+          fi
+          cargo run --release -p nevoflux-eval -- run \
+            --benchmark ${{ inputs.benchmark }} \
+            --browser-mode daemon-only \
+            --timeout 120 \
+            $FILTER_ARG \
+            --out-dir eval/reports/fullstack
+
+      - name: Upload report bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-fullstack-${{ inputs.benchmark }}
+          path: eval/reports/fullstack
+          retention-days: 30
