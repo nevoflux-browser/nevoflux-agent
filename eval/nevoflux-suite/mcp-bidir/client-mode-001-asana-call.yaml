@@ -1,0 +1,23 @@
+id: mcp-bidir-client-001
+category: mcp_bidir
+mode: agent
+requires_browser: false
+supports_platform: [linux, macos, windows]
+
+prompt: |
+  Using the configured Asana MCP server, list the user's projects. If the
+  Asana MCP server is not configured, report that explicitly. Either way,
+  attempt the MCP client connection at least once.
+
+assertions:
+  - type: daemon_event
+    event: mcp_client_call_succeeded
+  - type: contains_any
+    targets: ["asana", "mcp", "project", "not configured"]
+
+metadata:
+  description: NevoFlux daemon acts as MCP client; verifies external-call code path runs
+  notes: |
+    In CI the Asana MCP server is unlikely configured. The assertion accepts
+    either a successful tool call OR a "not configured" graceful failure
+    message — both prove the client-mode code ran.

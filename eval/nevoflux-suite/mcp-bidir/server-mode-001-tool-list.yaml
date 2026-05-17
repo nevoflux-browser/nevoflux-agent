@@ -1,0 +1,23 @@
+id: mcp-bidir-server-001
+category: mcp_bidir
+mode: agent
+requires_browser: false
+supports_platform: [linux, macos, windows]
+
+prompt: |
+  A remote MCP client connected via the acp: reference is asking for the list
+  of available browser tools. Respond with the tool list (browser_navigate,
+  browser_click, browser_type, etc.) and confirm the MCP server-mode handshake
+  completed successfully.
+
+assertions:
+  - type: daemon_event
+    event: mcp_server_call_received
+  - type: contains_any
+    targets: ["browser_navigate", "tool list", "tool", "mcp"]
+
+metadata:
+  description: NevoFlux daemon acts as MCP server; verifies handshake + tool list
+  threat_model: |
+    Daemon must respond to ACP calls without leaking internal state or
+    granting tool execution before client authentication completes.
