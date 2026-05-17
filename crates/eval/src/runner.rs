@@ -180,12 +180,16 @@ impl Runner {
         let mut total_token_cost = 0.0f64;
         let mut total_judge_cost = 0.0f64;
 
-        // Compute effective parallelism: bounded by config and benchmark's own cap.
-        let effective_parallelism = self
+        // Compute effective parallelism: bounded by config, benchmark's own
+        // cap, and the benchmark's LLM rate-limit cap (Phase 3d).
+        let mut effective_parallelism = self
             .config
             .parallelism
-            .min(benchmark.max_parallelism(&self.config.browser_mode))
-            .max(1);
+            .min(benchmark.max_parallelism(&self.config.browser_mode));
+        if let Some(cap) = benchmark.rate_limit_max() {
+            effective_parallelism = effective_parallelism.min(cap);
+        }
+        let effective_parallelism = effective_parallelism.max(1);
         tracing::info!(parallelism = effective_parallelism, "effective concurrency");
 
         let semaphore = Arc::new(Semaphore::new(effective_parallelism));

@@ -71,6 +71,15 @@ pub trait Benchmark: Send + Sync {
     fn tools_config(&self) -> ToolsConfig {
         ToolsConfig::None
     }
+
+    /// LLM API rate-limit cap (max concurrent in-flight requests). Returns
+    /// `None` when the benchmark has no opinion — typically the daemon's
+    /// own LLM client handles rate-limit retry. Phase 3d hook for explicit
+    /// per-benchmark caps; the runner threads this as a third factor into
+    /// `min(config.parallelism, max_parallelism(mode), rate_limit_max)`.
+    fn rate_limit_max(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Registry — maps benchmark name → instance. Add new benchmarks here.
@@ -85,4 +94,33 @@ pub fn registry() -> Vec<Box<dyn Benchmark>> {
 
 pub fn find(name: &str) -> Option<Box<dyn Benchmark>> {
     registry().into_iter().find(|b| b.name() == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn benchmark_rate_limit_default_is_none() {
+        struct Stub;
+        #[async_trait]
+        impl Benchmark for Stub {
+            fn name(&self) -> &str {
+                "x"
+            }
+            fn description(&self) -> &str {
+                "y"
+            }
+            fn requires_network(&self) -> bool {
+                false
+            }
+            fn default_judge(&self) -> &str {
+                "programmatic"
+            }
+            async fn load_tasks(&self, _: Option<&str>) -> EvalResult<Vec<Task>> {
+                Ok(vec![])
+            }
+        }
+        assert_eq!(Stub.rate_limit_max(), None);
+    }
 }
