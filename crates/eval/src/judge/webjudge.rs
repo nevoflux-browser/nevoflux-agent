@@ -37,7 +37,11 @@ impl WebJudge {
             api_key,
             model,
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                // 90s lines up with typical per-task eval timeout.  30s was
+                // tight once max_tokens grew to 2000 to support
+                // extended-thinking responses (mimo proxy + recent Claude
+                // emit ~150-token thinking blocks before the verdict text).
+                .timeout(std::time::Duration::from_secs(90))
                 .build()
                 .expect("reqwest client"),
         }
@@ -133,7 +137,12 @@ impl Judge for WebJudge {
         let prompt = build_prompt(task, final_answer, evaluation_criteria);
         let req = AnthropicRequest {
             model: self.model.clone(),
-            max_tokens: 200,
+            // Headroom for extended-thinking responses (mimo + recent Claude
+            // models): with max_tokens=200 the thinking block could exhaust
+            // the budget, leaving an empty text block and an empty
+            // verdict.explanation. 2000 tokens covers both thinking and a
+            // typical 1-sentence PASS/FAIL verdict comfortably.
+            max_tokens: 2000,
             messages: vec![AnthropicMessage {
                 role: "user",
                 content: prompt,

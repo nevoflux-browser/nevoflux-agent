@@ -1,6 +1,6 @@
 {
-  "version": "phase4-fixture-v1",
-  "source": "hand-written Phase 4 multi-hop fixture; replace with openai/simple-evals decrypted set via NEVOFLUX_BC_DATA_PATH for full upstream coverage (see eval/README-DATASETS.md)",
+  "version": "phase4-fixture-v2",
+  "source": "hand-written Phase 4 multi-hop fixture (v2 corrects bc-003/bc-005 factual errors flagged in 2026-05-18 manual smoke); replace with openai/simple-evals decrypted set via NEVOFLUX_BC_DATA_PATH for full upstream coverage (see eval/README-DATASETS.md)",
   "tasks": [
     {
       "id": "bc-fixture-001",
@@ -14,8 +14,8 @@
     },
     {
       "id": "bc-fixture-003",
-      "question": "How many years separate the founding of the oldest continuously operating university in the English-speaking world from the year Linux was first released to the public? Answer as a number.",
-      "answer": "905"
+      "question": "How many years separate the founding of the University of Cambridge (1209) from the year the Linux kernel was first released to the public (1991)? Answer as a number.",
+      "answer": "782"
     },
     {
       "id": "bc-fixture-004",
@@ -24,8 +24,8 @@
     },
     {
       "id": "bc-fixture-005",
-      "question": "The mathematician who proved Fermat's Last Theorem was awarded a knighthood in the same year a particular long-running British science fiction TV series was revived. What was that year? Answer as a 4-digit year.",
-      "answer": "2005"
+      "question": "The British mathematician who proved Fermat's Last Theorem was awarded a knighthood (KBE) in the same year as the Sydney Summer Olympic Games. What was that year? Answer as a 4-digit year.",
+      "answer": "2000"
     }
   ]
 }
