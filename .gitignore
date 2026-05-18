@@ -40,6 +40,7 @@ docs/testing/
 eval/.env
 eval/reports/exploratory/
 eval/reports/failures/
+eval/reports/nightly/
 .cache/nevoflux-releases/
 
 # `just release-eval` tarball output
