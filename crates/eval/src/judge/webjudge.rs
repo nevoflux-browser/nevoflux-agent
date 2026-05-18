@@ -79,7 +79,11 @@ struct AnthropicResponse {
 
 #[derive(Debug, Deserialize)]
 struct AnthropicContent {
-    text: String,
+    // Claude responses with extended thinking mix blocks: some carry `text`
+    // (the verdict we care about), others carry `thinking` or `tool_use` and
+    // omit `text` entirely. Make it optional and filter when collecting.
+    #[serde(default)]
+    text: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -172,7 +176,7 @@ impl Judge for WebJudge {
         let text = body
             .content
             .iter()
-            .map(|c| c.text.as_str())
+            .filter_map(|c| c.text.as_deref())
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -346,5 +350,53 @@ mod tests {
         );
         let v = j.judge(&dummy_task(), &dummy_result("any")).await.unwrap();
         assert_eq!(v.judge_cost_usd, 0.0);
+    }
+
+    /// Regression: Claude responses with extended-thinking enabled (and any
+    /// Anthropic-compatible proxy that surfaces it, e.g. the mimo proxy)
+    /// emit mixed content blocks where some carry `text` and others carry
+    /// `thinking` + `signature`. Before this fix, AnthropicContent required
+    /// `text: String` and parsing failed with "error decoding response body".
+    /// Caught in Phase 4 manual smoke against a real mimo endpoint.
+    #[tokio::test]
+    async fn judge_parses_mixed_text_and_thinking_blocks() {
+        use axum::{routing::post, Json, Router};
+        use tokio::net::TcpListener;
+        let app = Router::new().route(
+            "/v1/messages",
+            post(|| async {
+                Json(serde_json::json!({
+                    "id": "msg_x",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-3-5-sonnet-20240620",
+                    "stop_reason": "end_turn",
+                    "content": [
+                        {"type": "text", "text": "PASS — verdict matches."},
+                        {"type": "thinking", "thinking": "internal reasoning", "signature": ""}
+                    ],
+                    "usage": {"input_tokens": 100, "output_tokens": 20}
+                }))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let j = WebJudge::new().with_llm_config(
+            format!("http://{addr}"),
+            "test".into(),
+            "claude-3-5-sonnet-20240620".into(),
+        );
+        let v = j.judge(&dummy_task(), &dummy_result("any")).await.unwrap();
+        assert!(v.correct, "verdict should parse from text block");
+        assert!(v.explanation.starts_with("PASS"));
+        // 100 * 0.003/1k + 20 * 0.015/1k = 0.0003 + 0.0003 = 0.0006
+        assert!(
+            (v.judge_cost_usd - 0.0006).abs() < 1e-9,
+            "got {}",
+            v.judge_cost_usd
+        );
     }
 }
