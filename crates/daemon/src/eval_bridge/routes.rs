@@ -361,6 +361,23 @@ pub async fn stream_events(
                                 if payload_sid != Some(sid.as_str()) {
                                     return None;
                                 }
+                                // `agent:assistant_message` carries the
+                                // agent's full response text (Phase 5
+                                // wiring — see src/main.rs eval consumer).
+                                // Map to EvalEvent::Token so eval CLI's
+                                // AnswerExtractor can recover final_answer.
+                                if bus_evt.topic == "agent:assistant_message" {
+                                    if let Some(text) = bus_evt
+                                        .payload
+                                        .get("text")
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        return Some(EvalEvent::Token {
+                                            text: text.to_string(),
+                                        });
+                                    }
+                                    return None;
+                                }
                                 // `agent:turn_done` signals that dispatch_eval_turn
                                 // completed. Map it to EvalEvent::Stop so that the
                                 // NaturalStop termination strategy fires immediately

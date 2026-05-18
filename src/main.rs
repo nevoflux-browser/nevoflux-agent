@@ -636,7 +636,7 @@ async fn run_daemon(
                 let session_id = req.session_id.clone();
                 // Spawn each turn in its own task so the consumer keeps draining.
                 tokio::spawn(async move {
-                    let stop_reason = match nevoflux_daemon::eval_dispatch::dispatch_eval_turn(
+                    let (stop_reason, assistant_text) = match nevoflux_daemon::eval_dispatch::dispatch_eval_turn(
                         &services,
                         &req.session_id,
                         &req.prompt,
@@ -644,12 +644,13 @@ async fn run_daemon(
                     )
                     .await
                     {
-                        Ok(_output) => {
+                        Ok(output) => {
                             tracing::info!(
                                 session_id = %req.session_id,
+                                text_len = output.text.len(),
                                 "eval turn complete"
                             );
-                            "stop"
+                            ("stop", Some(output.text))
                         }
                         Err(e) => {
                             tracing::error!(
@@ -657,9 +658,36 @@ async fn run_daemon(
                                 error = %e,
                                 "eval agent dispatch failed"
                             );
-                            "error"
+                            ("error", None)
                         }
                     };
+
+                    // Phase 5 wiring: publish the assistant text as a bus
+                    // event BEFORE turn_done so the SSE bridge can map it to
+                    // EvalEvent::Token and the eval runner's AnswerExtractor
+                    // can populate TaskResult.final_answer. Without this,
+                    // final_answer is always null in daemon-only mode (the
+                    // streaming token sink in dispatch_eval_turn is /dev/null
+                    // because there's no sidebar to forward to).
+                    if let Some(text) = assistant_text {
+                        if !text.is_empty() {
+                            let msg_evt = nevoflux_daemon::event_bus::BusEvent::ephemeral(
+                                "agent:assistant_message",
+                                serde_json::json!({
+                                    "session_id": session_id,
+                                    "text": text,
+                                }),
+                                nevoflux_daemon::event_bus::PublisherIdentity::Internal,
+                            );
+                            if let Err(e) = bus.publish(msg_evt).await {
+                                tracing::warn!(
+                                    %session_id,
+                                    error = %e,
+                                    "eval: failed to publish agent:assistant_message"
+                                );
+                            }
+                        }
+                    }
 
                     // Publish agent:turn_done so the SSE consumer can emit Stop.
                     let evt = nevoflux_daemon::event_bus::BusEvent::ephemeral(
