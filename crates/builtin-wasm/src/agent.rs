@@ -700,6 +700,39 @@ The following skill instructions MUST be followed exactly. These instructions ta
             None => base_prompt,
         };
 
+        // When tools_config explicitly disables all tools (ToolsConfig::None),
+        // the mode-based system prompt still tells the model to call
+        // browser_get_markdown / web_search / etc.  Without an actual tool
+        // surface attached to the request, the model degrades to inline
+        // `<tool_call>` text — useless as an answer.  Append an explicit
+        // suppression block so the model knows to answer purely from its
+        // training knowledge for this turn.  (Caught in Phase 4 manual
+        // smoke: bc-0003 under mimo provider with NEVOFLUX_BC_NO_TOOLS=1
+        // returned raw `<tool_call><function=web_search>…` strings as the
+        // final answer.)
+        let system_prompt = if matches!(
+            input.tools_config,
+            Some(nevoflux_protocol::subagent::ToolsConfig::None)
+        ) {
+            format!(
+                "{system_prompt}\n\n\
+                 <CRITICAL_INSTRUCTIONS priority=\"highest\">\n\
+                 ## No tools available\n\n\
+                 For this turn you have NO tools available — every reference\n\
+                 above to `browser_*`, `web_search`, `web_fetch`, `read`,\n\
+                 `write`, `bash`, `memory_*`, MCP tools, sub-agents, etc.\n\
+                 must be ignored.  Do NOT output `<tool_call>`, `<function=…>`,\n\
+                 or any other tool-invocation syntax — those tags will not be\n\
+                 executed and will be shown to the user as your final answer.\n\
+                 Answer the user's question directly from your own training\n\
+                 knowledge.  If you genuinely cannot answer without external\n\
+                 information, say so plainly in one sentence.\n\
+                 </CRITICAL_INSTRUCTIONS>"
+            )
+        } else {
+            system_prompt
+        };
+
         let mut tools = if self.config.is_subagent {
             self.get_subagent_tools_for_mode(mode)
         } else {
