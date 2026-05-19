@@ -52,6 +52,15 @@ impl Benchmark for BrowseComp {
     }
 
     fn tools_config(&self) -> ToolsConfig {
+        // BrowseComp is designed for browsing; default exposes browser_*
+        // and web_search tools.  But in daemon-only browser mode those
+        // tools cannot succeed, and the agent typically hangs waiting on
+        // tool responses → 100% task timeout.  Setting
+        // NEVOFLUX_BC_NO_TOOLS=1 forces pure-knowledge mode (no tool
+        // surface), matching the openai/simple-evals 'no-browse' baseline.
+        if std::env::var("NEVOFLUX_BC_NO_TOOLS").is_ok() {
+            return ToolsConfig::None;
+        }
         ToolsConfig::Allow(vec!["browser_*".to_string(), "web_search".to_string()])
     }
 

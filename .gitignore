@@ -43,6 +43,11 @@ eval/reports/failures/
 eval/reports/nightly/
 .cache/nevoflux-releases/
 
+# Upstream BrowseComp encrypted CSV (downloaded by `just eval-fetch-bc`;
+# ~1.2 MB, OpenAI public blob — keep out of repo to avoid bloat + license
+# ambiguity).
+eval/benchmarks/browsecomp.csv
+
 # `just release-eval` tarball output
 /dist/
 
