@@ -391,6 +391,12 @@ async fn execute_anthropic_chat(
     provider: ProviderType,
     base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
+    if is_mimo_anthropic_compat_base_url(base_url) {
+        tracing::debug!(
+            "Anthropic provider with MiMo /anthropic base_url — routing through Anthropic-raw path for thinking-block round-trip"
+        );
+        return execute_anthropic_chat_raw(api_key, model, request, base_url).await;
+    }
     let mut builder = anthropic::Client::builder().api_key(api_key);
     if let Some(url) = base_url {
         builder = builder.base_url(url);
@@ -415,6 +421,12 @@ async fn execute_openai_chat(
     provider: ProviderType,
     base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
+    if is_mimo_base_url(base_url) {
+        tracing::debug!(
+            "OpenAI provider with MiMo base_url — routing through DeepSeek-raw path for reasoning_content round-trip"
+        );
+        return execute_deepseek_chat_raw(api_key, model, request, base_url).await;
+    }
     if let Some(url) = base_url {
         // Custom endpoint: use Chat Completions API (/chat/completions)
         let client: openai::CompletionsClient = openai::CompletionsClient::builder()
@@ -427,7 +439,11 @@ async fn execute_openai_chat(
         let completion_model = client.completion_model(model);
         execute_rig_completion(completion_model, request, provider).await
     } else {
-        // Official OpenAI: use rig's standard client (Responses API)
+        // Official OpenAI: use rig's standard client (Responses API).
+        // rig 0.29 hard-codes `strict: true` here (`responses_api/mod.rs:451`)
+        // so every tool's parameters schema must be strict-compliant.
+        let mut request = request;
+        sanitize_request_tools_for_openai_strict(&mut request);
         let client: openai::Client =
             openai::Client::builder()
                 .api_key(api_key)
@@ -476,6 +492,205 @@ fn is_image_generation_model(model: &str) -> bool {
     model.contains("image-preview")
         || model.contains("image-generation")
         || model.contains("imagen")
+}
+
+/// Check if a base URL targets Xiaomi MiMo (`*.xiaomimimo.com`).
+///
+/// Used **only on the OpenAI-provider path**. MiMo exposes two API
+/// surfaces on the same host: OpenAI Chat Completions at `/v1` and an
+/// Anthropic-compat Messages endpoint at `/anthropic`. For the OpenAI
+/// side, MiMo's thinking-mode models require DeepSeek-style
+/// `reasoning_content` round-tripping — every subsequent request must
+/// replay the `reasoning_content` from the previous turn on the same
+/// assistant message that carries `tool_calls`. rig 0.29's OpenAI
+/// converter splits that into two wire messages and drops
+/// `reasoning_content` from the tool-call message, so MiMo rejects with
+/// HTTP 400 (`"The reasoning_content in the thinking mode must be
+/// passed back to the API."`). When this returns true on the OpenAI
+/// path the caller routes through the DeepSeek-raw functions, which
+/// emit the wire JSON directly and keep `reasoning_content` on the
+/// same assistant message as `tool_calls`.
+///
+/// **Not used on the Anthropic-provider path**: an Anthropic-typed
+/// request is the user's explicit choice to use the Anthropic Messages
+/// API at whatever `base_url` they configured (typically
+/// `…/anthropic`), and forcing the OpenAI-compat URL pattern on top of
+/// that path produces 404.
+fn is_mimo_base_url(url: Option<&str>) -> bool {
+    url.map(|u| u.to_ascii_lowercase().contains("xiaomimimo.com"))
+        .unwrap_or(false)
+}
+
+/// Check if a base URL targets MiMo's **Anthropic-compatible** endpoint.
+///
+/// MiMo exposes Anthropic Messages API at `…/anthropic` on the same hosts
+/// that serve their OpenAI-compat API at `…/v1`. When a user picks the
+/// Anthropic provider type and points it at the `/anthropic` path, we
+/// must speak Anthropic Messages wire format (POST `{base}/v1/messages`
+/// with `{type:thinking,…}` content blocks), not OpenAI Chat Completions.
+///
+/// Like the OpenAI-compat path, MiMo's Anthropic-compat thinking-mode
+/// requires the previous turn's reasoning text to be replayed on the
+/// assistant message that carries `tool_use`. `build_rig_assistant_message`
+/// is explicitly "provider-agnostic: does not emit reasoning content", so
+/// rig's Anthropic converter drops `LlmMessage.reasoning` on the floor
+/// and MiMo rejects the next request. Hits to this URL are routed through
+/// `stream_anthropic_raw` / `execute_anthropic_chat_raw`, which emit the
+/// thinking block ourselves alongside `tool_use`.
+fn is_mimo_anthropic_compat_base_url(url: Option<&str>) -> bool {
+    url.map(|u| {
+        let lower = u.to_ascii_lowercase();
+        lower.contains("xiaomimimo.com") && lower.contains("/anthropic")
+    })
+    .unwrap_or(false)
+}
+
+/// Recursively rewrite a JSON Schema so it satisfies OpenAI Responses API
+/// strict-mode validation (`strict: true` is hard-coded by rig 0.29 at
+/// `responses_api/mod.rs:451`, with no public escape hatch on
+/// `rig::completion::ToolDefinition`).
+///
+/// Strict-mode rules enforced:
+/// - Every object's `required` must include every key in `properties`.
+/// - `additionalProperties: false` must be set on every object subschema.
+/// - Optional fields (originally absent from `required`) get their type
+///   expanded to include `"null"` so the model can still express
+///   "absent" by passing null. Enum-bearing fields also receive `null`
+///   as a valid enum value to keep the union internally consistent.
+///
+/// Limitations:
+/// - Bare `{"type":"object"}` subschemas without their own `properties`
+///   are left untouched: strict mode rejects them outright and no
+///   automatic rewrite would be both safe and correct (we can't invent
+///   field names). Such fields must be hand-fixed at the tool
+///   definition — typically by declaring `"type":"string"` and JSON-
+///   parsing on the handler side (see `canvas_create_from_visual_identity`
+///   and `loop_create.wrapped_skill` for the pattern).
+fn sanitize_schema_for_openai_strict(schema: &mut serde_json::Value) {
+    use serde_json::Value;
+    let Some(obj) = schema.as_object_mut() else {
+        return;
+    };
+
+    let is_object_schema = match obj.get("type") {
+        Some(Value::String(s)) => s == "object",
+        Some(Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some("object")),
+        _ => obj.contains_key("properties"),
+    };
+
+    if is_object_schema {
+        let prop_keys: Vec<String> = obj
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+
+        let current_required: std::collections::HashSet<String> = obj
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Originally-optional fields → expand type to include `"null"`.
+        if let Some(props) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
+            for (key, prop_schema) in props.iter_mut() {
+                if !current_required.contains(key) {
+                    expand_type_to_nullable(prop_schema);
+                }
+            }
+        }
+
+        // `required` now lists every property key.
+        obj.insert(
+            "required".to_string(),
+            Value::Array(
+                prop_keys
+                    .iter()
+                    .map(|k| Value::String(k.clone()))
+                    .collect(),
+            ),
+        );
+
+        // Required by strict mode on every object.
+        obj.insert("additionalProperties".to_string(), Value::Bool(false));
+
+        // Recurse into property subschemas.
+        if let Some(props) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
+            for prop_schema in props.values_mut() {
+                sanitize_schema_for_openai_strict(prop_schema);
+            }
+        }
+    }
+
+    // Recurse into array items.
+    if let Some(items) = obj.get_mut("items") {
+        if items.is_object() {
+            sanitize_schema_for_openai_strict(items);
+        } else if let Some(arr) = items.as_array_mut() {
+            for item in arr.iter_mut() {
+                sanitize_schema_for_openai_strict(item);
+            }
+        }
+    }
+
+    // Recurse into schema combinators.
+    for combinator in ["oneOf", "anyOf", "allOf"] {
+        if let Some(arr) = obj.get_mut(combinator).and_then(|v| v.as_array_mut()) {
+            for sub in arr.iter_mut() {
+                sanitize_schema_for_openai_strict(sub);
+            }
+        }
+    }
+}
+
+/// Make a property's type nullable for strict-mode compatibility:
+/// - `"T"` becomes `["T", "null"]`
+/// - `["T1", "T2"]` extends to include `"null"`
+/// - If the property has an `enum`, append `null` so the union stays
+///   internally consistent (the model needs a valid enum value for the
+///   null arm).
+fn expand_type_to_nullable(prop: &mut serde_json::Value) {
+    use serde_json::Value;
+    let Some(obj) = prop.as_object_mut() else {
+        return;
+    };
+
+    match obj.get("type").cloned() {
+        Some(Value::String(s)) if s != "null" => {
+            obj.insert(
+                "type".to_string(),
+                Value::Array(vec![Value::String(s), Value::String("null".into())]),
+            );
+        }
+        Some(Value::Array(arr)) => {
+            if !arr.iter().any(|v| v.as_str() == Some("null")) {
+                let mut new_arr = arr;
+                new_arr.push(Value::String("null".into()));
+                obj.insert("type".to_string(), Value::Array(new_arr));
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(enum_arr) = obj.get_mut("enum").and_then(|v| v.as_array_mut()) {
+        if !enum_arr.iter().any(|v| v.is_null()) {
+            enum_arr.push(Value::Null);
+        }
+    }
+}
+
+/// Sanitize every tool's `parameters` JSON Schema in-place. Call before
+/// dispatching to the OpenAI Responses API.
+fn sanitize_request_tools_for_openai_strict(request: &mut LlmChatRequest) {
+    if let Some(ref mut tools) = request.tools {
+        for tool in tools.iter_mut() {
+            sanitize_schema_for_openai_strict(&mut tool.parameters);
+        }
+    }
 }
 
 // ===== Raw HTTP types for parsing OpenRouter/OpenAI responses with images =====
@@ -802,6 +1017,159 @@ fn build_deepseek_request_body(
     body
 }
 
+/// Build an Anthropic Messages API request body, threading `thinking`
+/// content blocks onto assistant messages that also carry `tool_use`.
+///
+/// Mirrors `build_deepseek_request_body`'s role but for Anthropic's wire
+/// format. Used by `stream_anthropic_raw` / `execute_anthropic_chat_raw`
+/// when targeting MiMo's `/anthropic` compat endpoint, because rig 0.29's
+/// rig-Message → Anthropic-wire converter (and our
+/// `build_rig_assistant_message` upstream of it) discards
+/// `LlmMessage.reasoning`, which MiMo rejects.
+fn build_anthropic_messages_request_body(
+    model: &str,
+    request: &LlmChatRequest,
+    stream: bool,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "max_tokens": request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS_FALLBACK as u32),
+        "stream": stream,
+    });
+
+    if let Some(ref system) = request.system {
+        if !system.is_empty() {
+            body["system"] = serde_json::Value::String(system.clone());
+        }
+    }
+    if let Some(t) = request.temperature {
+        body["temperature"] = serde_json::json!(t);
+    }
+
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+
+    for msg in &request.messages {
+        match msg.role.as_str() {
+            "system" => {
+                // Anthropic has no `system` role inside messages — flatten
+                // into the top-level `system` field. Last writer wins.
+                body["system"] = serde_json::Value::String(msg.content.clone());
+            }
+            "user" => {
+                let mut parts: Vec<serde_json::Value> = Vec::new();
+                if !msg.content.is_empty() {
+                    parts.push(serde_json::json!({"type": "text", "text": msg.content}));
+                }
+                for att in &msg.attachments {
+                    if !att.mime_type.starts_with("image/") {
+                        continue;
+                    }
+                    // Strip optional data-URL prefix; Anthropic wants raw base64.
+                    let raw_b64 = if let Some(idx) = att.data.find(',') {
+                        if att.data.starts_with("data:") {
+                            &att.data[idx + 1..]
+                        } else {
+                            &att.data
+                        }
+                    } else {
+                        &att.data
+                    };
+                    parts.push(serde_json::json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": att.mime_type,
+                            "data": raw_b64,
+                        },
+                    }));
+                }
+                let content = if parts.len() == 1 && parts[0]["type"] == "text" {
+                    parts[0]["text"].clone()
+                } else if parts.is_empty() {
+                    serde_json::Value::String(String::new())
+                } else {
+                    serde_json::Value::Array(parts)
+                };
+                messages.push(serde_json::json!({"role": "user", "content": content}));
+            }
+            "tool" => {
+                // Anthropic models tool results as a user-role message
+                // containing `tool_result` content blocks.
+                let tool_call_id = msg.tool_call_id.clone().unwrap_or_default();
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_call_id,
+                        "content": msg.content,
+                    }],
+                }));
+            }
+            "assistant" => {
+                let mut parts: Vec<serde_json::Value> = Vec::new();
+                // Thinking block first — Anthropic requires it to precede
+                // text / tool_use on the same assistant turn for the
+                // round-trip to be accepted.
+                if let Some(ref r) = msg.reasoning {
+                    if !r.is_empty() {
+                        parts.push(serde_json::json!({
+                            "type": "thinking",
+                            "thinking": r,
+                        }));
+                    }
+                }
+                if !msg.content.is_empty() {
+                    parts.push(serde_json::json!({"type": "text", "text": msg.content}));
+                }
+                if let Some(ref tcs) = msg.tool_calls {
+                    for tc in tcs {
+                        parts.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.name,
+                            "input": tc.arguments,
+                        }));
+                    }
+                }
+                if parts.is_empty() {
+                    // Anthropic rejects empty assistant content; skip the
+                    // message entirely if there's truly nothing on it.
+                    continue;
+                }
+                messages.push(
+                    serde_json::json!({"role": "assistant", "content": parts}),
+                );
+            }
+            _ => {
+                messages.push(serde_json::json!({
+                    "role": msg.role,
+                    "content": msg.content,
+                }));
+            }
+        }
+    }
+
+    body["messages"] = serde_json::Value::Array(messages);
+
+    if let Some(ref tools) = request.tools {
+        if !tools.is_empty() {
+            let arr: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.parameters,
+                    })
+                })
+                .collect();
+            body["tools"] = serde_json::Value::Array(arr);
+        }
+    }
+
+    body
+}
+
 /// Execute a chat request using raw HTTP (bypassing rig) to capture `images` field.
 ///
 /// This is used for image generation models where rig's parser drops the `images` field.
@@ -908,6 +1276,13 @@ async fn execute_deepseek_chat_raw(
     let base = base_url.unwrap_or("https://api.deepseek.com/v1");
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
+    tracing::debug!(
+        base_url = base,
+        full_url = %url,
+        model = model,
+        "DeepSeek-raw chat POST"
+    );
+
     let client = reqwest::Client::new();
     let response = client
         .post(&url)
@@ -967,6 +1342,101 @@ async fn execute_deepseek_chat_raw(
         content,
         finish_reason,
         tool_calls,
+        usage: None,
+        images: vec![],
+    })
+}
+
+/// Non-streaming sibling of `stream_anthropic_raw`: POST Anthropic
+/// Messages API body via raw HTTP. Used when `execute_anthropic_chat`
+/// detects a MiMo `/anthropic` base_url.
+///
+/// Captures only the OUTGOING request shape (thinking-block round-trip)
+/// — the response side is parsed into the same `LlmChatResponse` we use
+/// elsewhere, currently dropping `reasoning_content` from the response
+/// (matches `execute_deepseek_chat_raw`'s known limitation). The
+/// streaming path is where reasoning actually flows back to the host.
+async fn execute_anthropic_chat_raw(
+    api_key: &str,
+    model: &str,
+    request: LlmChatRequest,
+    base_url: Option<&str>,
+) -> Result<LlmChatResponse> {
+    let body = build_anthropic_messages_request_body(model, &request, false);
+    let base = base_url
+        .ok_or_else(|| DaemonError::InternalError("Anthropic-raw requires base_url".into()))?;
+    let url = format!("{}/v1/messages", base.trim_end_matches('/'));
+
+    tracing::debug!(
+        base_url = base,
+        full_url = %url,
+        model = model,
+        "Anthropic-raw (MiMo) chat POST"
+    );
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&url)
+        .bearer_auth(api_key)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| DaemonError::InternalError(format!("Anthropic-raw request failed: {}", e)))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(DaemonError::InternalError(format!(
+            "Anthropic-raw HTTP {}: {}",
+            status,
+            &text[..text.len().min(500)]
+        )));
+    }
+
+    let raw: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| DaemonError::InternalError(format!("Failed to parse response: {}", e)))?;
+
+    // Anthropic response: { content: [{type: "thinking"|"text"|"tool_use", ...}], stop_reason: "...", ... }
+    let mut content_text = String::new();
+    let mut tool_calls: Vec<LlmToolCall> = Vec::new();
+    if let Some(arr) = raw["content"].as_array() {
+        for block in arr {
+            match block["type"].as_str().unwrap_or("") {
+                "text" => {
+                    if let Some(t) = block["text"].as_str() {
+                        content_text.push_str(t);
+                    }
+                }
+                "tool_use" => {
+                    let id = block["id"].as_str().unwrap_or("").to_string();
+                    let name = block["name"].as_str().unwrap_or("").to_string();
+                    let input = block["input"].clone();
+                    tool_calls.push(LlmToolCall {
+                        id: id.clone(),
+                        call_id: Some(id),
+                        name,
+                        arguments: input,
+                        signature: None,
+                    });
+                }
+                _ => {} // "thinking" blocks are surfaced through the streaming path; ignored here.
+            }
+        }
+    }
+
+    let finish_reason = raw["stop_reason"]
+        .as_str()
+        .unwrap_or("stop")
+        .to_string();
+
+    Ok(LlmChatResponse {
+        content: content_text,
+        finish_reason,
+        tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
         usage: None,
         images: vec![],
     })
@@ -1996,6 +2466,12 @@ async fn stream_anthropic(
     provider: ProviderType,
     base_url: Option<&str>,
 ) -> Result<()> {
+    if is_mimo_anthropic_compat_base_url(base_url) {
+        tracing::debug!(
+            "Anthropic provider with MiMo /anthropic base_url — streaming via Anthropic-raw path for thinking-block round-trip"
+        );
+        return stream_anthropic_raw(api_key, model, request, tx, base_url).await;
+    }
     let mut builder = anthropic::Client::builder().api_key(api_key);
     if let Some(url) = base_url {
         builder = builder.base_url(url);
@@ -2019,6 +2495,12 @@ async fn stream_openai(
     provider: ProviderType,
     base_url: Option<&str>,
 ) -> Result<()> {
+    if is_mimo_base_url(base_url) {
+        tracing::debug!(
+            "OpenAI provider with MiMo base_url — streaming via DeepSeek-raw path for reasoning_content round-trip"
+        );
+        return stream_deepseek_raw(api_key, model, request, tx, base_url).await;
+    }
     if let Some(url) = base_url {
         // Custom endpoint: use Chat Completions API (/chat/completions)
         let client: openai::CompletionsClient = openai::CompletionsClient::builder()
@@ -2031,7 +2513,11 @@ async fn stream_openai(
         let completion_model = client.completion_model(model);
         stream_rig_completion(completion_model, request, tx, provider).await
     } else {
-        // Official OpenAI: use rig's standard client (Responses API)
+        // Official OpenAI: use rig's standard client (Responses API).
+        // Sanitize tool schemas because rig 0.29 forces `strict: true`
+        // here — see `sanitize_schema_for_openai_strict` docs.
+        let mut request = request;
+        sanitize_request_tools_for_openai_strict(&mut request);
         let client: openai::Client =
             openai::Client::builder()
                 .api_key(api_key)
@@ -2383,6 +2869,13 @@ async fn stream_deepseek_raw(
     let base = base_url.unwrap_or("https://api.deepseek.com/v1");
     let url = format!("{}/chat/completions", base.trim_end_matches('/'));
 
+    tracing::debug!(
+        base_url = base,
+        full_url = %url,
+        model = model,
+        "DeepSeek-raw streaming POST"
+    );
+
     let http_client = reqwest::Client::new();
     let response = http_client
         .post(&url)
@@ -2513,6 +3006,238 @@ async fn stream_deepseek_raw(
                 arguments: serde_json::from_str(&tc.arguments)
                     .unwrap_or(serde_json::Value::Object(Default::default())),
                 signature: None,
+            })
+            .collect();
+        tool_calls.sort_by_key(|tc| tc.id.clone());
+        let _ = tx
+            .send(LlmStreamChunk {
+                text: None,
+                tool_calls,
+                done: false,
+                reasoning: None,
+                images: vec![],
+            })
+            .await;
+    }
+
+    let _ = tx
+        .send(LlmStreamChunk {
+            text: None,
+            tool_calls: vec![],
+            done: true,
+            reasoning: None,
+            images: vec![],
+        })
+        .await;
+
+    Ok(())
+}
+
+/// Stream from MiMo's Anthropic-compat endpoint using raw HTTP + Anthropic
+/// SSE parsing.
+///
+/// Sibling of `stream_deepseek_raw` but speaking Anthropic Messages API
+/// instead of OpenAI Chat Completions. Routed to from `stream_anthropic`
+/// when `is_mimo_anthropic_compat_base_url(base_url)` is true, because
+/// `build_rig_assistant_message` (used by `stream_rig_completion`) is
+/// "provider-agnostic: does not emit reasoning content" — meaning rig
+/// drops `LlmMessage.reasoning` on the floor, MiMo sees the round-trip
+/// missing the thinking block, and rejects with HTTP 400.
+///
+/// We emit Anthropic's wire JSON ourselves via
+/// `build_anthropic_messages_request_body`, which keeps the `thinking`
+/// block on the same assistant turn as `tool_use`. SSE events are parsed
+/// as Anthropic's documented event stream:
+///   - `content_block_delta` with `delta.type=text_delta` → text chunk
+///   - `content_block_delta` with `delta.type=thinking_delta` → reasoning chunk
+///   - `content_block_delta` with `delta.type=input_json_delta` → tool_call args (accumulated)
+///   - `content_block_start` with `content_block.type=tool_use` → tool_call id+name
+///   - `message_stop` → terminate
+///
+/// `signature_delta` for `thinking` blocks is currently ignored; if MiMo
+/// requires signatures (real Anthropic does for verification), we will
+/// need to extend `LlmMessage` to carry it.
+async fn stream_anthropic_raw(
+    api_key: &str,
+    model: &str,
+    request: LlmChatRequest,
+    tx: mpsc::Sender<LlmStreamChunk>,
+    base_url: Option<&str>,
+) -> Result<()> {
+    use futures::StreamExt;
+
+    let body = build_anthropic_messages_request_body(model, &request, true);
+    let base = base_url
+        .ok_or_else(|| DaemonError::InternalError("Anthropic-raw requires base_url".into()))?;
+    let url = format!("{}/v1/messages", base.trim_end_matches('/'));
+
+    tracing::debug!(
+        base_url = base,
+        full_url = %url,
+        model = model,
+        "Anthropic-raw (MiMo) streaming POST"
+    );
+
+    let http_client = reqwest::Client::new();
+    let response = http_client
+        .post(&url)
+        .bearer_auth(api_key)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            DaemonError::InternalError(format!("Anthropic-raw stream request failed: {}", e))
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(DaemonError::InternalError(format!(
+            "Anthropic-raw stream HTTP {}: {}",
+            status,
+            &text[..text.len().min(500)]
+        )));
+    }
+
+    // Accumulate tool_use blocks: id+name arrive on content_block_start,
+    // arguments arrive piecemeal via input_json_delta partial_json.
+    struct ToolUseAccum {
+        id: String,
+        name: String,
+        partial_input: String,
+    }
+    let mut tool_uses: HashMap<i64, ToolUseAccum> = HashMap::new();
+
+    let mut byte_stream = response.bytes_stream();
+    let mut line_buf = String::new();
+
+    while let Some(result) = byte_stream.next().await {
+        match result {
+            Ok(bytes) => {
+                line_buf.push_str(&String::from_utf8_lossy(&bytes));
+                while let Some(nl_pos) = line_buf.find('\n') {
+                    let line = line_buf[..nl_pos].trim_end_matches('\r').to_string();
+                    line_buf.drain(..=nl_pos);
+
+                    // Anthropic SSE: `event: <name>\ndata: <json>\n\n`. We
+                    // skip the `event:` line because the JSON's `"type"`
+                    // is self-describing.
+                    let data = match line.strip_prefix("data: ") {
+                        Some(d) => d.to_string(),
+                        None => continue,
+                    };
+                    if data == "[DONE]" {
+                        continue;
+                    }
+
+                    let event: serde_json::Value = match serde_json::from_str(&data) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let event_type = event["type"].as_str().unwrap_or("");
+
+                    match event_type {
+                        "content_block_start" => {
+                            let index = event["index"].as_i64().unwrap_or(0);
+                            let block = &event["content_block"];
+                            if block["type"] == "tool_use" {
+                                let id = block["id"].as_str().unwrap_or("").to_string();
+                                let name = block["name"].as_str().unwrap_or("").to_string();
+                                tool_uses.insert(
+                                    index,
+                                    ToolUseAccum {
+                                        id,
+                                        name,
+                                        partial_input: String::new(),
+                                    },
+                                );
+                            }
+                        }
+                        "content_block_delta" => {
+                            let index = event["index"].as_i64().unwrap_or(0);
+                            let delta = &event["delta"];
+                            match delta["type"].as_str().unwrap_or("") {
+                                "text_delta" => {
+                                    if let Some(text) = delta["text"].as_str() {
+                                        if !text.is_empty() {
+                                            let _ = tx
+                                                .send(LlmStreamChunk {
+                                                    text: Some(text.to_string()),
+                                                    tool_calls: vec![],
+                                                    done: false,
+                                                    reasoning: None,
+                                                    images: vec![],
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                }
+                                "thinking_delta" => {
+                                    if let Some(thinking) = delta["thinking"].as_str() {
+                                        if !thinking.is_empty() {
+                                            let _ = tx
+                                                .send(LlmStreamChunk {
+                                                    text: None,
+                                                    tool_calls: vec![],
+                                                    done: false,
+                                                    reasoning: Some(thinking.to_string()),
+                                                    images: vec![],
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                }
+                                "input_json_delta" => {
+                                    if let Some(partial) = delta["partial_json"].as_str() {
+                                        if let Some(accum) = tool_uses.get_mut(&index) {
+                                            accum.partial_input.push_str(partial);
+                                        }
+                                    }
+                                }
+                                // signature_delta: ignored (LlmMessage has no
+                                // signature slot for reasoning yet).
+                                _ => {}
+                            }
+                        }
+                        "message_stop" => break,
+                        "error" => {
+                            let err_msg = event["error"]["message"]
+                                .as_str()
+                                .unwrap_or("Anthropic-raw stream error event")
+                                .to_string();
+                            return Err(DaemonError::InternalError(err_msg));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Anthropic-raw stream chunk error: {}", e);
+                break;
+            }
+        }
+    }
+
+    // Emit accumulated tool calls before `done`.
+    if !tool_uses.is_empty() {
+        let mut tool_calls: Vec<LlmToolCall> = tool_uses
+            .into_values()
+            .map(|tu| {
+                let arguments = if tu.partial_input.is_empty() {
+                    serde_json::Value::Object(Default::default())
+                } else {
+                    serde_json::from_str(&tu.partial_input)
+                        .unwrap_or(serde_json::Value::Object(Default::default()))
+                };
+                LlmToolCall {
+                    id: tu.id.clone(),
+                    call_id: Some(tu.id),
+                    name: tu.name,
+                    arguments,
+                    signature: None,
+                }
             })
             .collect();
         tool_calls.sort_by_key(|tc| tc.id.clone());
@@ -4436,6 +5161,158 @@ mod tests {
         assert!(message.content.is_empty());
         assert!(message.tool_calls.is_some());
         assert_eq!(message.tool_calls.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_sanitize_schema_adds_missing_required_and_nullable() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "string" },
+                "b": { "type": "integer" }
+            },
+            "required": ["a"]
+        });
+        sanitize_schema_for_openai_strict(&mut schema);
+        // Both keys must be in required now.
+        let req: Vec<&str> = schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(req.contains(&"a"));
+        assert!(req.contains(&"b"));
+        // 'a' was originally required → keep type as-is.
+        assert_eq!(schema["properties"]["a"]["type"], "string");
+        // 'b' was originally optional → expanded to nullable union.
+        assert_eq!(
+            schema["properties"]["b"]["type"],
+            serde_json::json!(["integer", "null"])
+        );
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn test_sanitize_schema_optional_enum_gets_null() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "mode": { "type": "string", "enum": ["chat", "browser"] }
+            },
+            "required": []
+        });
+        sanitize_schema_for_openai_strict(&mut schema);
+        assert_eq!(
+            schema["properties"]["mode"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        assert_eq!(
+            schema["properties"]["mode"]["enum"],
+            serde_json::json!(["chat", "browser", null])
+        );
+        assert_eq!(schema["required"], serde_json::json!(["mode"]));
+    }
+
+    #[test]
+    fn test_sanitize_schema_recurses_into_nested_objects() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "target": {
+                    "type": "object",
+                    "properties": {
+                        "tab_id": { "type": "integer" },
+                        "url":    { "type": "string" }
+                    },
+                    "required": ["url"]
+                }
+            },
+            "required": ["target"]
+        });
+        sanitize_schema_for_openai_strict(&mut schema);
+        let inner = &schema["properties"]["target"];
+        let req: Vec<&str> = inner["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(req.contains(&"tab_id"));
+        assert!(req.contains(&"url"));
+        // tab_id was optional → nullable union.
+        assert_eq!(
+            inner["properties"]["tab_id"]["type"],
+            serde_json::json!(["integer", "null"])
+        );
+        assert_eq!(inner["additionalProperties"], false);
+    }
+
+    #[test]
+    fn test_sanitize_schema_empty_properties() {
+        // Like `loop_list`: `{"type":"object","properties":{}}` — strict
+        // mode still demands `required` + `additionalProperties:false`.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {}
+        });
+        sanitize_schema_for_openai_strict(&mut schema);
+        assert_eq!(schema["required"], serde_json::json!([]));
+        assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn test_sanitize_schema_leaves_bare_object_field() {
+        // Sanitizer cannot strict-fix `{"type":"object"}` without inner
+        // properties. The outer level still gets sanitized; the inner
+        // bare object is left to be hand-fixed at the tool definition.
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "blob": { "type": "object" }
+            },
+            "required": ["blob"]
+        });
+        sanitize_schema_for_openai_strict(&mut schema);
+        // Outer object got additionalProperties:false.
+        assert_eq!(schema["additionalProperties"], false);
+        // Inner bare object is unchanged in shape (still has no inner
+        // properties); strict mode will still reject this tool.
+        assert_eq!(schema["properties"]["blob"]["type"], "object");
+    }
+
+    #[test]
+    fn test_is_mimo_anthropic_compat_base_url() {
+        assert!(is_mimo_anthropic_compat_base_url(Some(
+            "https://token-plan-cn.xiaomimimo.com/anthropic"
+        )));
+        assert!(is_mimo_anthropic_compat_base_url(Some(
+            "HTTPS://TOKEN-PLAN-CN.XIAOMIMIMO.COM/anthropic"
+        )));
+        assert!(is_mimo_anthropic_compat_base_url(Some(
+            "https://platform.xiaomimimo.com/anthropic/v1"
+        )));
+        // MiMo URL but NOT Anthropic-compat path:
+        assert!(!is_mimo_anthropic_compat_base_url(Some(
+            "https://token-plan-cn.xiaomimimo.com/v1"
+        )));
+        // Non-MiMo hosts:
+        assert!(!is_mimo_anthropic_compat_base_url(Some(
+            "https://api.anthropic.com"
+        )));
+        assert!(!is_mimo_anthropic_compat_base_url(None));
+    }
+
+    #[test]
+    fn test_is_mimo_base_url() {
+        assert!(is_mimo_base_url(Some("https://platform.xiaomimimo.com/v1")));
+        assert!(is_mimo_base_url(Some(
+            "HTTPS://PLATFORM.XIAOMIMIMO.COM/v1"
+        )));
+        assert!(is_mimo_base_url(Some("https://xiaomimimo.com")));
+        assert!(!is_mimo_base_url(Some("https://api.deepseek.com/v1")));
+        assert!(!is_mimo_base_url(Some("https://api.openai.com/v1")));
+        assert!(!is_mimo_base_url(None));
     }
 
     #[test]

@@ -27,7 +27,7 @@ pub use types::{LoopId, LoopRuntime};
 ///
 /// Used by `IterationExecutor::execute` to back-fill
 /// `HostServices.loop_manager` into the per-iteration services clone.
-/// Without this, claude-code (ACP) tool calls to `loop.scratchpad.set` etc.
+/// Without this, claude-code (ACP) tool calls to `loop_scratchpad_set` etc.
 /// fail with "/loop tools are not available" because the LoopManager's
 /// pre-construction services snapshot has `loop_manager: None` (chicken-
 /// and-egg: services builds before LoopManager exists).

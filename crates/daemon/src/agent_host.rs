@@ -4795,8 +4795,27 @@ impl HostFunctions for DaemonHostFunctions {
                 message: "canvas_video service not wired".into(),
             })?
             .clone();
+        // The tool schema declares `visual_identity` as a JSON-stringified
+        // blob (instead of a bare `{type:object}`) so it survives OpenAI
+        // Responses API strict-mode validation. Decode the string back into
+        // a `serde_json::Value` so the downstream protocol struct
+        // (`CreateFromVisualIdentityRequest`) deserializes unchanged.
+        // Accepts either string or object — older direct-API callers may
+        // still pass the object form.
+        let mut request_owned = request.clone();
+        if let Some(vi_str) = request_owned
+            .get("visual_identity")
+            .and_then(|v| v.as_str())
+        {
+            let parsed: serde_json::Value =
+                serde_json::from_str(vi_str).map_err(|e| HostError {
+                    code: 4,
+                    message: format!("visual_identity field is not valid JSON: {e}"),
+                })?;
+            request_owned["visual_identity"] = parsed;
+        }
         let mut req: nevoflux_protocol::canvas_video::CreateFromVisualIdentityRequest =
-            serde_json::from_value(request.clone()).map_err(|e| HostError {
+            serde_json::from_value(request_owned).map_err(|e| HostError {
                 code: 4,
                 message: format!("invalid canvas_create_from_visual_identity args: {e}"),
             })?;
@@ -4846,7 +4865,7 @@ impl HostFunctions for DaemonHostFunctions {
     // =========================================================================
     // /loop skill tool functions (spec §10) — direct-API dispatch.
     //
-    // Anthropic / OpenAI / DeepSeek (direct providers) reach the `loop.*`
+    // Anthropic / OpenAI / DeepSeek (direct providers) reach the `loop_*`
     // family through `Agent::execute_tool` in builtin-wasm, which calls these
     // host functions. ACP-bridge providers (claude-code, gemini-cli, kimi,
     // openclaw) take a parallel path through
@@ -4862,7 +4881,7 @@ impl HostFunctions for DaemonHostFunctions {
     // The `is_iteration: false` ToolCallContext means main-session calls;
     // direct-API HostFunctions never runs inside a /loop iteration (those go
     // through AgentRunner with a dedicated iteration-scoped HostFunctions in
-    // a separate context). `loop.scratchpad.set` is gated to iteration-only
+    // a separate context). `loop_scratchpad_set` is gated to iteration-only
     // by `execute_loop_tool` and will surface a clear error to direct-API
     // callers — that's intentional per spec §10.2.
     // =========================================================================
@@ -4891,7 +4910,7 @@ impl HostFunctions for DaemonHostFunctions {
         let runtime = self.runtime.clone();
         let result = tokio::task::block_in_place(|| {
             runtime.block_on(async move {
-                crate::loops::execute_loop_tool("loop.create", &args, &ctx, &mgr, db.as_ref()).await
+                crate::loops::execute_loop_tool("loop_create", &args, &ctx, &mgr, db.as_ref()).await
             })
         });
         match result {
@@ -4924,7 +4943,7 @@ impl HostFunctions for DaemonHostFunctions {
         let args = serde_json::json!({});
         let result = tokio::task::block_in_place(|| {
             runtime.block_on(async move {
-                crate::loops::execute_loop_tool("loop.list", &args, &ctx, &mgr, db.as_ref()).await
+                crate::loops::execute_loop_tool("loop_list", &args, &ctx, &mgr, db.as_ref()).await
             })
         });
         match result {
@@ -4957,7 +4976,7 @@ impl HostFunctions for DaemonHostFunctions {
         let args = serde_json::json!({ "loop_id": loop_id });
         let result = tokio::task::block_in_place(|| {
             runtime.block_on(async move {
-                crate::loops::execute_loop_tool("loop.cancel", &args, &ctx, &mgr, db.as_ref()).await
+                crate::loops::execute_loop_tool("loop_cancel", &args, &ctx, &mgr, db.as_ref()).await
             })
         });
         match result {
@@ -4994,7 +5013,7 @@ impl HostFunctions for DaemonHostFunctions {
         let result = tokio::task::block_in_place(|| {
             runtime.block_on(async move {
                 crate::loops::execute_loop_tool(
-                    "loop.scratchpad.get",
+                    "loop_scratchpad_get",
                     &args,
                     &ctx,
                     &mgr,
@@ -5041,7 +5060,7 @@ impl HostFunctions for DaemonHostFunctions {
         let result = tokio::task::block_in_place(|| {
             runtime.block_on(async move {
                 crate::loops::execute_loop_tool(
-                    "loop.scratchpad.set",
+                    "loop_scratchpad_set",
                     &args,
                     &ctx,
                     &mgr,

@@ -306,14 +306,17 @@ pub async fn execute_mcp_tool(
     // so the gate has to live here too.
     if services.is_iteration {
         if matches!(name, "browser_ask_user" | "ask_user") {
-            return Err("ask_user is forbidden inside /loop iterations \
-                 (sidebar may be closed; nobody to answer). \
-                 Use loop.scratchpad.set to persist state instead."
-                .to_string());
-        }
-        if name == "loop.create" {
             return Err(
-                "loop.create is forbidden inside /loop iterations (no nested loops)".to_string(),
+                "ask_user is forbidden inside /loop iterations \
+                 (sidebar may be closed; nobody to answer). \
+                 Use loop_scratchpad_set to persist state instead."
+                    .to_string(),
+            );
+        }
+        if name == "loop_create" {
+            return Err(
+                "loop_create is forbidden inside /loop iterations (no nested loops)"
+                    .to_string(),
             );
         }
     }
@@ -417,7 +420,7 @@ pub async fn execute_mcp_tool(
     // (Phase 23 wires this; until then tool calls surface a clear error).
     if matches!(
         name,
-        "loop.create" | "loop.list" | "loop.cancel" | "loop.scratchpad.get" | "loop.scratchpad.set"
+        "loop_create" | "loop_list" | "loop_cancel" | "loop_scratchpad_get" | "loop_scratchpad_set"
     ) {
         let mgr = match services.loop_manager.as_ref() {
             Some(m) => m,
@@ -433,7 +436,7 @@ pub async fn execute_mcp_tool(
             is_iteration = services.is_iteration,
             iteration_loop_id = ?services.iteration_loop_id,
             session_id = %services.session_id,
-            "loop.* MCP dispatch ctx"
+            "loop_* MCP dispatch ctx"
         );
         let ctx = crate::loops::ToolCallContext {
             session_id: services.session_id.clone(),
@@ -752,9 +755,10 @@ async fn execute_browser_upload_orchestrated(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string());
 
-    let asset_server = browser_ctx.asset_server.as_ref().ok_or_else(|| {
-        "browser_upload_file: AssetServer is not running on this daemon".to_string()
-    })?;
+    let asset_server = browser_ctx
+        .asset_server
+        .as_ref()
+        .ok_or_else(|| "browser_upload_file: AssetServer is not running on this daemon".to_string())?;
     let file_url =
         asset_server.register_download(canonical, mime_type.clone(), file_name.clone(), TOKEN_TTL);
 
@@ -2128,7 +2132,9 @@ async fn resolve_attach_asset_payload(
             .unwrap_or_else(|| infer_mime_from_name(path_str));
         let size = bytes.len() as u64;
         let payload_b64 = encode_base64(&bytes);
-        let name_from_path = path.file_name().map(|n| n.to_string_lossy().to_string());
+        let name_from_path = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string());
         let name = pick_name(
             req.name.as_deref().or(name_from_path.as_deref()),
             &mime,
@@ -2268,9 +2274,7 @@ mod tests {
             role: None,
         };
 
-        let resolved = resolve_attach_asset_payload(&req)
-            .await
-            .expect("resolve ok");
+        let resolved = resolve_attach_asset_payload(&req).await.expect("resolve ok");
         assert_eq!(resolved.size_bytes, bytes.len() as u64);
         assert_eq!(resolved.mime_type, "image/png");
         assert_eq!(resolved.name, "hero.png");

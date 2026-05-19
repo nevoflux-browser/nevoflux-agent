@@ -35,11 +35,11 @@ pub async fn execute_loop_tool(
         return Err(format!("{name} is forbidden inside loop iterations"));
     }
     match name {
-        "loop.create" => loop_create(args, ctx, mgr).await,
-        "loop.list" => loop_list(args, ctx, db),
-        "loop.cancel" => loop_cancel(args, ctx, mgr).await,
-        "loop.scratchpad.get" => scratchpad_get(args, ctx, db),
-        "loop.scratchpad.set" => scratchpad_set(args, ctx, mgr, db).await,
+        "loop_create" => loop_create(args, ctx, mgr).await,
+        "loop_list" => loop_list(args, ctx, db),
+        "loop_cancel" => loop_cancel(args, ctx, mgr).await,
+        "loop_scratchpad_get" => scratchpad_get(args, ctx, db),
+        "loop_scratchpad_set" => scratchpad_set(args, ctx, mgr, db).await,
         _ => Err(format!("unknown loop tool: {name}")),
     }
 }
@@ -50,7 +50,7 @@ async fn loop_create(
     mgr: &LoopManager,
 ) -> Result<Value, String> {
     if ctx.is_iteration {
-        return Err("loop.create cannot be called from inside an iteration".into());
+        return Err("loop_create cannot be called from inside an iteration".into());
     }
     let trigger_expr_text = args
         .get("trigger_expr")
@@ -61,7 +61,15 @@ async fn loop_create(
         .get("prompt_text")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let wrapped_skill = args.get("wrapped_skill").map(|v| v.to_string());
+    // Accept either:
+    //  - a string (the schema's declared shape — strict-mode-friendly,
+    //    model is told to JSON.stringify the {name, args} blob), or
+    //  - an object (older direct-API callers may still pass it raw).
+    let wrapped_skill = args.get("wrapped_skill").map(|v| {
+        v.as_str()
+            .map(String::from)
+            .unwrap_or_else(|| v.to_string())
+    });
     // Optional `mode` arg: one of "chat" | "browser" | "agent". Defaults to
     // Chat (matches `server.rs::parse_agent_mode` semantics).
     let mode = args
@@ -142,7 +150,7 @@ async fn scratchpad_set(
     db: &Database,
 ) -> Result<Value, String> {
     if !ctx.is_iteration {
-        return Err("loop.scratchpad.set is only callable from inside an iteration".into());
+        return Err("loop_scratchpad_set is only callable from inside an iteration".into());
     }
     let own = ctx
         .own_loop_id
@@ -196,7 +204,7 @@ mod tests {
     async fn loop_create_then_list_includes_it() {
         let (storage, mgr) = setup();
         let res = execute_loop_tool(
-            "loop.create",
+            "loop_create",
             &json!({ "trigger_expr": "time:5m", "prompt_text": "x" }),
             &ctx(false, None),
             &mgr,
@@ -207,7 +215,7 @@ mod tests {
         let id = res.get("loop_id").unwrap().as_str().unwrap().to_string();
 
         let list = execute_loop_tool(
-            "loop.list",
+            "loop_list",
             &json!({}),
             &ctx(false, None),
             &mgr,
@@ -229,7 +237,7 @@ mod tests {
     async fn loop_create_blocked_in_iteration() {
         let (storage, mgr) = setup();
         let err = execute_loop_tool(
-            "loop.create",
+            "loop_create",
             &json!({ "trigger_expr": "time:5m", "prompt_text": "x" }),
             &ctx(true, Some("aaa")),
             &mgr,
@@ -247,7 +255,7 @@ mod tests {
     async fn scratchpad_set_rejects_oversize() {
         let (storage, mgr) = setup();
         let id = execute_loop_tool(
-            "loop.create",
+            "loop_create",
             &json!({ "trigger_expr": "time:5m", "prompt_text": "x" }),
             &ctx(false, None),
             &mgr,
@@ -263,7 +271,7 @@ mod tests {
 
         let big = "x".repeat(4097);
         let err = execute_loop_tool(
-            "loop.scratchpad.set",
+            "loop_scratchpad_set",
             &json!({ "content": big }),
             &ctx(true, Some(&id)),
             &mgr,
@@ -278,7 +286,7 @@ mod tests {
     async fn scratchpad_set_persists_under_limit() {
         let (storage, mgr) = setup();
         let id = execute_loop_tool(
-            "loop.create",
+            "loop_create",
             &json!({ "trigger_expr": "time:5m", "prompt_text": "x" }),
             &ctx(false, None),
             &mgr,
@@ -293,7 +301,7 @@ mod tests {
         .to_string();
 
         execute_loop_tool(
-            "loop.scratchpad.set",
+            "loop_scratchpad_set",
             &json!({ "content": "k=v" }),
             &ctx(true, Some(&id)),
             &mgr,
@@ -303,7 +311,7 @@ mod tests {
         .unwrap();
 
         let got = execute_loop_tool(
-            "loop.scratchpad.get",
+            "loop_scratchpad_get",
             &json!({ "loop_id": id }),
             &ctx(false, None),
             &mgr,
@@ -319,7 +327,7 @@ mod tests {
     async fn cancel_other_loop_from_iteration_rejected() {
         let (storage, mgr) = setup();
         let id = execute_loop_tool(
-            "loop.create",
+            "loop_create",
             &json!({ "trigger_expr": "time:5m", "prompt_text": "x" }),
             &ctx(false, None),
             &mgr,
@@ -334,7 +342,7 @@ mod tests {
         .to_string();
 
         let err = execute_loop_tool(
-            "loop.cancel",
+            "loop_cancel",
             &json!({ "loop_id": &id }),
             &ctx(true, Some("self")),
             &mgr,
@@ -349,7 +357,7 @@ mod tests {
     async fn scratchpad_set_outside_iteration_rejected() {
         let (storage, mgr) = setup();
         let id = execute_loop_tool(
-            "loop.create",
+            "loop_create",
             &json!({ "trigger_expr": "time:5m", "prompt_text": "x" }),
             &ctx(false, None),
             &mgr,
@@ -364,7 +372,7 @@ mod tests {
         .to_string();
 
         let err = execute_loop_tool(
-            "loop.scratchpad.set",
+            "loop_scratchpad_set",
             &json!({ "content": "k=v" }),
             &ctx(false, None),
             &mgr,
@@ -380,7 +388,7 @@ mod tests {
     async fn unknown_tool_name_errors() {
         let (storage, mgr) = setup();
         let err = execute_loop_tool(
-            "loop.invented",
+            "loop_invented",
             &json!({}),
             &ctx(false, None),
             &mgr,

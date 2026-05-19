@@ -25,10 +25,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "AGPL-3.0"
-repository = "https://github.com/user/nevoflux-agent"
+repository = "https://github.com/dorisgyl/nevoflux-agent"
 
 [workspace.dependencies]
 # LLM Framework
@@ -130,7 +130,7 @@ fs2 = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 tempfile = "3"
