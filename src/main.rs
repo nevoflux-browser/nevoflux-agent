@@ -389,6 +389,79 @@ async fn run_mcp(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Bind the current process into a Windows Job Object configured with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+///
+/// Why: when the daemon exits (Ctrl+C, force-kill, panic, or the explicit
+/// `std::process::exit(0)` at the end of `run_daemon`), Windows tears down
+/// its handle table. The Job's last handle is closed, the Job is destroyed,
+/// and KILL_ON_JOB_CLOSE causes every assigned subprocess to be terminated.
+/// Any child the daemon `spawn`s after this call inherits the Job
+/// automatically, so MCP servers, sub-agents, etc. cannot outlive us and
+/// keep the listening socket pinned.
+///
+/// Best-effort: failures are logged and ignored so a permissions edge-case
+/// (e.g. an outer Job that disallows nesting on very old Windows) doesn't
+/// prevent the daemon from starting.
+#[cfg(windows)]
+fn assign_self_to_kill_on_close_job() {
+    use std::mem;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            tracing::warn!(
+                "CreateJobObjectW failed (err={}); orphan children may survive daemon exit",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const _,
+            mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) == 0
+        {
+            tracing::warn!(
+                "SetInformationJobObject failed (err={}); orphan children may survive",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        if AssignProcessToJobObject(job, GetCurrentProcess()) == 0 {
+            tracing::warn!(
+                "AssignProcessToJobObject failed (err={}); orphan children may survive",
+                std::io::Error::last_os_error()
+            );
+            return;
+        }
+
+        // Deliberately leak the Job handle. We want it open for the entire
+        // process lifetime — on exit the kernel closes it, dropping the
+        // Job's last reference and firing KILL_ON_JOB_CLOSE.
+        let _ = job;
+    }
+}
+
+#[cfg(not(windows))]
+fn assign_self_to_kill_on_close_job() {
+    // No-op on Unix-like platforms: tokio + signal-based shutdown handle
+    // child termination on those targets. A future enhancement could use
+    // `prctl(PR_SET_PDEATHSIG)` per child on Linux.
+}
+
 /// Run the daemon.
 async fn run_daemon(
     verbose: bool,
@@ -411,6 +484,11 @@ async fn run_daemon(
         None
     };
     logging::init_logging(verbose, log_file);
+
+    // Install the kill-on-close Job binding before spawning any subprocess
+    // (MCP servers, sub-agents). Any child created after this point is
+    // automatically associated with the Job and dies when we do.
+    assign_self_to_kill_on_close_job();
 
     let trace_enabled = trace
         || std::env::var("NEVOFLUX_TRACE")
