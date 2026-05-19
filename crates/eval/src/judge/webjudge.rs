@@ -99,6 +99,23 @@ struct AnthropicUsage {
 }
 
 fn build_prompt(task: &Task, final_answer: &str, evaluation_criteria: &str) -> String {
+    // When the task carries a ground-truth `reference` (BrowseComp etc.), feed
+    // it to the judge so it can do an explicit equivalence check instead of
+    // judging from the prompt alone — without this, mimo / Claude were seen
+    // to PASS semantically-wrong answers because they re-interpret the
+    // question rather than verify the reference.
+    let reference_block = match task.reference.as_deref() {
+        Some(r) if !r.trim().is_empty() => format!(
+            "\n## Ground-truth reference answer\n\
+             {r}\n\
+             \n\
+             The agent's answer must be semantically equivalent to the \
+             reference. Treat formatting / phrasing differences as PASS \
+             only if the underlying fact matches. If the agent omitted a \
+             critical detail or substituted a different value, FAIL.\n",
+        ),
+        _ => String::new(),
+    };
     format!(
         "You are evaluating an AI agent's response to a browser-based task.\n\
          \n\
@@ -107,7 +124,7 @@ fn build_prompt(task: &Task, final_answer: &str, evaluation_criteria: &str) -> S
          \n\
          ## Evaluation criteria\n\
          {criteria}\n\
-         \n\
+         {reference_block}\
          ## Agent's final answer\n\
          {answer}\n\
          \n\
@@ -116,6 +133,7 @@ fn build_prompt(task: &Task, final_answer: &str, evaluation_criteria: &str) -> S
          followed by a one-sentence justification.",
         prompt = task.prompt,
         criteria = evaluation_criteria,
+        reference_block = reference_block,
         answer = final_answer,
     )
 }
@@ -128,6 +146,22 @@ impl Judge for WebJudge {
 
     async fn judge(&self, task: &Task, result: &TaskResult) -> EvalResult<Verdict> {
         let final_answer = result.final_answer.as_deref().unwrap_or("");
+
+        // Short-circuit: if the agent produced no final_answer, do not
+        // invoke the judge at all.  mimo (and other thinking-enabled
+        // proxies) were observed to HALLUCINATE an agent answer on the
+        // empty input and then PASS it, inflating accuracy with phantom
+        // verdicts (caught in Phase 4 manual smoke: bc-0008 / bc-0015
+        // got PASS for nonsense "answers" the agent never produced).
+        if final_answer.trim().is_empty() {
+            return Ok(Verdict {
+                correct: false,
+                score: 0.0,
+                explanation: "Agent produced no final_answer".into(),
+                judge_cost_usd: 0.0,
+            });
+        }
+
         let evaluation_criteria = task
             .metadata
             .get("evaluation_criteria")
@@ -406,6 +440,98 @@ mod tests {
             (v.judge_cost_usd - 0.0006).abs() < 1e-9,
             "got {}",
             v.judge_cost_usd
+        );
+    }
+
+    /// Regression: agent produced no final_answer must FAIL without
+    /// invoking the LLM judge. Caught in Phase 4 manual smoke — mimo in
+    /// thinking mode invented agent answers ("The Outsiders",
+    /// "Demographic Research") on empty input and PASSed them, inflating
+    /// accuracy with phantom verdicts (bc-0008, bc-0015 in pilot 2).
+    #[tokio::test]
+    async fn judge_short_circuits_on_empty_final_answer() {
+        // Point at an unroutable address — if the short-circuit didn't
+        // fire, the test would fail with a transport error (proving the
+        // judge attempted to reach the server).
+        let j = WebJudge::new().with_llm_config(
+            "http://127.0.0.1:1".into(),
+            "test".into(),
+            "claude-3-5-sonnet-20240620".into(),
+        );
+        let v = j.judge(&dummy_task(), &dummy_result("")).await.unwrap();
+        assert!(!v.correct, "empty answer must FAIL");
+        assert_eq!(v.score, 0.0);
+        assert_eq!(v.judge_cost_usd, 0.0, "no LLM call → no cost");
+        assert!(
+            v.explanation.contains("no final_answer"),
+            "explanation should mark the empty-answer case, got: {}",
+            v.explanation
+        );
+
+        // Also check whitespace-only is treated the same.
+        let v2 = j.judge(&dummy_task(), &dummy_result("   \n\t  ")).await.unwrap();
+        assert!(!v2.correct);
+    }
+
+    /// Regression: when task.reference is set, the judge prompt must
+    /// include it so the LLM verifies semantic equivalence instead of
+    /// re-interpreting the question. Caught in Phase 4 manual smoke —
+    /// bc-0001 reference "1988-96" was PASSed for an agent answer of
+    /// "1985 to 1986" because the judge had no ground truth to compare.
+    #[tokio::test]
+    async fn judge_prompt_includes_reference_when_present() {
+        use axum::{body::Bytes, extract::State, routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+        let app = Router::new()
+            .route(
+                "/v1/messages",
+                post(
+                    |State(captured): State<Arc<Mutex<Vec<String>>>>, body: Bytes| async move {
+                        captured
+                            .lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&body).into_owned());
+                        Json(serde_json::json!({
+                            "content": [{"type":"text","text":"PASS — yes."}],
+                            "usage": {"input_tokens": 10, "output_tokens": 5},
+                        }))
+                    },
+                ),
+            )
+            .with_state(captured.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Build a task that carries a non-empty reference.
+        let mut t = dummy_task();
+        t.reference = Some("1988-96".into());
+        let j = WebJudge::new().with_llm_config(
+            format!("http://{addr}"),
+            "test".into(),
+            "claude-3-5-sonnet-20240620".into(),
+        );
+        let _v = j.judge(&t, &dummy_result("1985 to 1986")).await.unwrap();
+
+        let bodies = captured.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "exactly one judge call expected");
+        let body = &bodies[0];
+        assert!(
+            body.contains("Ground-truth reference answer"),
+            "prompt must include the reference block, got: {body}"
+        );
+        assert!(
+            body.contains("1988-96"),
+            "prompt must include the reference text itself, got: {body}"
+        );
+        assert!(
+            body.contains("1985 to 1986"),
+            "prompt must include the agent's actual answer, got: {body}"
         );
     }
 }
