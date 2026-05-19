@@ -309,13 +309,13 @@ pub async fn execute_mcp_tool(
             return Err(
                 "ask_user is forbidden inside /loop iterations \
                  (sidebar may be closed; nobody to answer). \
-                 Use loop.scratchpad.set to persist state instead."
+                 Use loop_scratchpad_set to persist state instead."
                     .to_string(),
             );
         }
-        if name == "loop.create" {
+        if name == "loop_create" {
             return Err(
-                "loop.create is forbidden inside /loop iterations (no nested loops)"
+                "loop_create is forbidden inside /loop iterations (no nested loops)"
                     .to_string(),
             );
         }
@@ -420,7 +420,7 @@ pub async fn execute_mcp_tool(
     // (Phase 23 wires this; until then tool calls surface a clear error).
     if matches!(
         name,
-        "loop.create" | "loop.list" | "loop.cancel" | "loop.scratchpad.get" | "loop.scratchpad.set"
+        "loop_create" | "loop_list" | "loop_cancel" | "loop_scratchpad_get" | "loop_scratchpad_set"
     ) {
         let mgr = match services.loop_manager.as_ref() {
             Some(m) => m,
@@ -436,7 +436,7 @@ pub async fn execute_mcp_tool(
             is_iteration = services.is_iteration,
             iteration_loop_id = ?services.iteration_loop_id,
             session_id = %services.session_id,
-            "loop.* MCP dispatch ctx"
+            "loop_* MCP dispatch ctx"
         );
         let ctx = crate::loops::ToolCallContext {
             session_id: services.session_id.clone(),

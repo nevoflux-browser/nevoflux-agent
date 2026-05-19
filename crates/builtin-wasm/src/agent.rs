@@ -2344,19 +2344,19 @@ The following skill instructions MUST be followed exactly. These instructions ta
             }
             // /loop skill tools — direct-API dispatch (Anthropic / OpenAI direct
             // providers). The MCP/ACP path goes through
-            // `mcp_tool_executor::execute_mcp_tool::loop.*`.
-            "loop.create" => self
+            // `mcp_tool_executor::execute_mcp_tool::loop_*`.
+            "loop_create" => self
                 .host
                 .tool_loop_create(&serde_json::to_string(&tool_call.arguments).unwrap_or_default())?,
-            "loop.list" => self.host.tool_loop_list()?,
-            "loop.cancel" => {
+            "loop_list" => self.host.tool_loop_list()?,
+            "loop_cancel" => {
                 let loop_id = tool_call.arguments["loop_id"].as_str().unwrap_or("");
                 self.host.tool_loop_cancel(loop_id)?
             }
-            "loop.scratchpad.get" => self.host.tool_loop_scratchpad_get(
+            "loop_scratchpad_get" => self.host.tool_loop_scratchpad_get(
                 &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
             )?,
-            "loop.scratchpad.set" => self.host.tool_loop_scratchpad_set(
+            "loop_scratchpad_set" => self.host.tool_loop_scratchpad_set(
                 &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
             )?,
             _ => {
@@ -2430,11 +2430,11 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 | "tts_synthesize_api"
                 | "tts_synthesize_local"
                 | "tts_transcribe"
-                | "loop.create"
-                | "loop.list"
-                | "loop.cancel"
-                | "loop.scratchpad.get"
-                | "loop.scratchpad.set"
+                | "loop_create"
+                | "loop_list"
+                | "loop_cancel"
+                | "loop_scratchpad_get"
+                | "loop_scratchpad_set"
         ) || name.starts_with("computer_")
             || name.starts_with("browser_")
     }
@@ -3425,8 +3425,9 @@ The following skill instructions MUST be followed exactly. These instructions ta
                               DESIGN.md if the user wants further tweaks (e.g. \"make \
                               background black\") and then `canvas_apply_design_md` to \
                               refresh the brand layer.\n\n\
-                              Pass the VI JSON exactly as returned by \
-                              canvas_extract_visual_identity; do NOT re-render it.".into(),
+                              Pass the VI as a JSON string — call JSON.stringify on \
+                              canvas_extract_visual_identity's result before passing; \
+                              do NOT re-render fields manually.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -3449,11 +3450,11 @@ The following skill instructions MUST be followed exactly. These instructions ta
                             ]
                         },
                         "visual_identity": {
-                            "type": "object",
-                            "description": "VisualIdentity object as returned by canvas_extract_visual_identity. Must include `url`; other fields are optional but inform DESIGN.md output."
+                            "type": "string",
+                            "description": "JSON-stringified VisualIdentity blob returned by canvas_extract_visual_identity. Call JSON.stringify on its result before passing. Must include `url`; other fields are optional but inform DESIGN.md output. Sent as a string (not an object) because OpenAI Responses API strict-mode rejects subschemas of bare `{type:object}` without explicit `properties`."
                         }
                     },
-                    "required": ["title", "width", "height", "duration_sec", "fps", "template", "visual_identity"]
+                    "required": ["title", "width", "height", "duration_sec", "fps", "bg", "template", "visual_identity"]
                 }),
             },
             ToolDefinition {
@@ -3512,14 +3513,17 @@ The following skill instructions MUST be followed exactly. These instructions ta
             // to the generic "unknown tool" path. Wiring the builtin-wasm execution
             // arm requires extending `HostFunctions` and is deferred.
             ToolDefinition {
-                name: "loop.create".into(),
+                name: "loop_create".into(),
                 description: "Create a recurring task that re-runs a prompt or wrapped skill on a trigger. Trigger grammar: time:<5m|1h|...>, time:dynamic, event:<topic>, state:tab=current|<id>:<css>:change, with AND/OR up to depth 3. The `mode` arg picks the iteration's tool catalog: 'chat' (default, safe — reasoning + scratchpad), 'browser' (chat + browser interaction), 'agent' (browser + write/edit/bash).".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "trigger_expr": { "type": "string", "description": "trigger expression, e.g. 'time:5m' or 'event:ui:tab:click'" },
                         "prompt_text": { "type": "string", "description": "raw prompt re-issued each fire — XOR with wrapped_skill" },
-                        "wrapped_skill": { "type": "object", "description": "{name, args} — XOR with prompt_text" },
+                        "wrapped_skill": {
+                            "type": "string",
+                            "description": "JSON-stringified `{name, args}` blob — XOR with prompt_text. Call JSON.stringify before passing. Sent as a string (not an object) because OpenAI Responses API strict-mode rejects bare `{type:object}` subschemas."
+                        },
                         "mode": {
                             "type": "string",
                             "enum": ["chat", "browser", "agent"],
@@ -3530,12 +3534,12 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 }),
             },
             ToolDefinition {
-                name: "loop.list".into(),
+                name: "loop_list".into(),
                 description: "List loops in the current session.".into(),
                 input_schema: serde_json::json!({ "type": "object", "properties": {} }),
             },
             ToolDefinition {
-                name: "loop.cancel".into(),
+                name: "loop_cancel".into(),
                 description: "Cancel a loop. From inside an iteration you may only cancel your own loop_id.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -3544,7 +3548,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 }),
             },
             ToolDefinition {
-                name: "loop.scratchpad.get".into(),
+                name: "loop_scratchpad_get".into(),
                 description: "Read the loop's ≤4KB scratchpad. Defaults to current iteration's loop.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
@@ -3552,7 +3556,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
                 }),
             },
             ToolDefinition {
-                name: "loop.scratchpad.set".into(),
+                name: "loop_scratchpad_set".into(),
                 description: "Replace the loop's scratchpad (≤4096 bytes). Iteration-only.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",

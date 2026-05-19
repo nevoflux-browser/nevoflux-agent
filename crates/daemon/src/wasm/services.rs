@@ -187,8 +187,8 @@ pub struct HostServices {
     /// gating layer, and there is no sidebar to display dialogs to anyway.
     pub is_iteration: bool,
     /// When `is_iteration` is true, the loop_id of the running iteration.
-    /// Used by `mcp_tool_executor`'s `loop.*` dispatch to build a correct
-    /// `ToolCallContext` so `loop.scratchpad.set` etc. can target the right
+    /// Used by `mcp_tool_executor`'s `loop_*` dispatch to build a correct
+    /// `ToolCallContext` so `loop_scratchpad_set` etc. can target the right
     /// loop's scratchpad.
     pub iteration_loop_id: Option<String>,
     /// Tracks the most-recently-active sidebar proxy per session_id.
@@ -241,7 +241,7 @@ pub struct HostServices {
     pub asset_server: Option<crate::asset_server::AssetServer>,
 
     /// /loop skill manager. When set, the MCP tool executor dispatches the
-    /// `loop.*` family (create/list/cancel/scratchpad.{get,set}) through
+    /// `loop_*` family (create/list/cancel/scratchpad_{get,set}) through
     /// this manager. `None` means /loop is not configured for this daemon
     /// instance — tool calls return a clear ConfigMissing error.
     pub loop_manager: Option<Arc<crate::loops::LoopManager>>,
@@ -449,7 +449,7 @@ impl HostServices {
     /// Add the /loop manager to the services.
     ///
     /// Once set, `mcp_tool_executor::execute_mcp_tool` dispatches the
-    /// `loop.create / loop.list / loop.cancel / loop.scratchpad.{get,set}`
+    /// `loop_create / loop_list / loop_cancel / loop_scratchpad_{get,set}`
     /// family through this manager. Without it, those tool calls return a
     /// clear ConfigMissing error instead of being silently dropped.
     pub fn with_loop_manager(mut self, manager: Arc<crate::loops::LoopManager>) -> Self {

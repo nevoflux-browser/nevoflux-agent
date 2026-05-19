@@ -161,7 +161,7 @@ impl IterationExecutor {
 
         // Resolve the loop's AgentMode from its DB record. The mode picks
         // the iteration's tool catalog via `Agent::get_tools_for_mode`. Tools
-        // forbidden in iteration context (`ask_user`, `loop.create`) are
+        // forbidden in iteration context (`ask_user`, `loop_create`) are
         // stripped from the resulting allowlist.
         let iter_mode = db_str_to_agent_mode(&rec.mode);
         let user_message =
@@ -261,7 +261,7 @@ impl IterationExecutor {
         }
         // Back-fill loop_manager handle: the LoopManager's stored services
         // snapshot has `loop_manager: None` (chicken-and-egg at construction
-        // time), but the iteration's LLM may call loop.scratchpad.set / .get
+        // time), but the iteration's LLM may call loop_scratchpad_{set,get}
         // via the MCP tool surface, which dispatches through `mcp_tool_executor`
         // and needs `services.loop_manager`. Resolve via the process-global
         // OnceLock set by server.rs at daemon startup.
@@ -282,7 +282,7 @@ impl IterationExecutor {
         let agent = nevoflux_builtin_wasm::Agent::new(host);
         // Build the iteration's tool allowlist from the mode's canonical
         // tool catalog, then strip iteration-forbidden tools (ask_user,
-        // loop.create). Passing as `ToolsConfig::Allow(...)` ensures the
+        // loop_create). Passing as `ToolsConfig::Allow(...)` ensures the
         // filter is enforced even if `Agent::run`'s mode-default would
         // otherwise have included them.
         let allowlist: Vec<String> = agent

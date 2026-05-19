@@ -13,10 +13,10 @@
 //! left is [`is_forbidden_in_iteration`].
 
 /// Tools that are forbidden inside loop iterations regardless of mode.
-/// `loop.create` would let an iteration spawn nested loops; `ask_user` blocks
+/// `loop_create` would let an iteration spawn nested loops; `ask_user` blocks
 /// on a sidebar that may be closed.
 pub fn is_forbidden_in_iteration(tool_name: &str) -> bool {
-    matches!(tool_name, "loop.create" | "ask_user")
+    matches!(tool_name, "loop_create" | "ask_user")
 }
 
 #[cfg(test)]
@@ -25,10 +25,10 @@ mod tests {
 
     #[test]
     fn forbidden_set() {
-        assert!(is_forbidden_in_iteration("loop.create"));
+        assert!(is_forbidden_in_iteration("loop_create"));
         assert!(is_forbidden_in_iteration("ask_user"));
         assert!(!is_forbidden_in_iteration("read"));
-        assert!(!is_forbidden_in_iteration("loop.scratchpad.set"));
+        assert!(!is_forbidden_in_iteration("loop_scratchpad_set"));
         assert!(!is_forbidden_in_iteration("browser_get_content"));
     }
 }

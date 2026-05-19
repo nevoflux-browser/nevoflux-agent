@@ -1157,7 +1157,7 @@ pub async fn start_server(
     // with a `services` clone so its IterationExecutor can spawn a real
     // production agent (Phase 9c), then snap loop_manager back onto the
     // canonical services. The two have a chicken-and-egg dependency:
-    // services needs loop_manager for the loop.* MCP dispatch path, and
+    // services needs loop_manager for the loop_* MCP dispatch path, and
     // loop_manager needs services for `Agent::run`. HostServices is `Clone`
     // and Arc-backed, so the round-trip is cheap.
     //
@@ -1183,7 +1183,7 @@ pub async fn start_server(
         .with_session_proxy_tracker(session_proxy_tracker.clone());
 
     // Construct the /loop skill's LoopManager and inject into HostServices
-    // so the loop.* tool dispatcher (mcp_tool_executor + future direct-API
+    // so the loop_* tool dispatcher (mcp_tool_executor + future direct-API
     // path) can resolve `services.loop_manager`. Spec §4 architecture.
     // Pass the (loop_manager-less) services clone so the IterationExecutor
     // gets a real `Agent::run` invocation path.
@@ -1193,7 +1193,7 @@ pub async fn start_server(
         Some(services.clone()),
     ));
     // Publish process-global handle so IterationExecutor can back-fill
-    // services.loop_manager when claude-code (ACP) calls loop.* via MCP.
+    // services.loop_manager when claude-code (ACP) calls loop_* via MCP.
     let _ = crate::loops::CURRENT_LOOP_MANAGER.set(loop_manager.clone());
     services = services.with_loop_manager(loop_manager.clone());
     if let Some(retriever) = knowledge_retriever {
@@ -1907,7 +1907,7 @@ pub async fn start_server(
                                 info!("Created loop {} from /loop slash command", id);
                             }
                             Err(e) => {
-                                warn!("loop.create from /loop failed: {}", e);
+                                warn!("loop_create from /loop failed: {}", e);
                             }
                         }
                     } else {
