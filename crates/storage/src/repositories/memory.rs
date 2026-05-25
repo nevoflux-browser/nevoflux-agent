@@ -35,6 +35,20 @@ fn current_timestamp() -> i64 {
         .as_secs() as i64
 }
 
+/// A chunk that needs its embedding rewritten by the M1 #009 reindex
+/// task. Returned in batches by [`MemoryRepository::fetch_stale_chunk_batch`].
+#[derive(Debug, Clone)]
+pub struct StaleChunk {
+    /// Primary key of the `memory_chunks` row.
+    pub id: String,
+    /// Source text that needs re-embedding with [`nevoflux_llm::EmbedKind::Passage`].
+    pub content: String,
+}
+
+/// Current embedding-version value written by the prefix-aware embedding
+/// code path. Anything below this is treated as legacy / needs reindex.
+pub const CURRENT_EMBEDDING_VERSION: i64 = 1;
+
 /// Repository for memory chunk CRUD operations.
 pub struct MemoryRepository<'a> {
     db: &'a Database,
@@ -47,14 +61,26 @@ impl<'a> MemoryRepository<'a> {
     }
 
     /// Create a new memory chunk.
+    ///
+    /// When `chunk.embedding` is `Some`, the row is written with
+    /// `embedding_version = CURRENT_EMBEDDING_VERSION` because callers
+    /// must use the prefix-aware [`nevoflux_llm::EmbeddingProvider::embed_kind`]
+    /// API post-M1 #006. When `chunk.embedding` is `None` the column
+    /// defaults to 0 (legacy / needs reindex) so the M1 #009 reindex
+    /// task can pick it up after a later backfill writes one in.
     pub fn create(&self, chunk: &MemoryChunk) -> Result<()> {
         let metadata_json = serde_json::to_string(&chunk.metadata)?;
         let embedding_blob = chunk.embedding.as_ref().map(|e| embedding_to_blob(e));
+        let embedding_version: i64 = if chunk.embedding.is_some() {
+            CURRENT_EMBEDDING_VERSION
+        } else {
+            0
+        };
 
         self.db.with_connection(|conn| {
             conn.execute(
-                "INSERT INTO memory_chunks (id, content, embedding, metadata, created_at, updated_at, session_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO memory_chunks (id, content, embedding, metadata, created_at, updated_at, session_id, embedding_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     chunk.id,
                     chunk.content,
@@ -63,6 +89,7 @@ impl<'a> MemoryRepository<'a> {
                     chunk.created_at,
                     chunk.updated_at,
                     chunk.session_id,
+                    embedding_version,
                 ],
             )?;
             Ok(())
@@ -243,6 +270,8 @@ impl<'a> MemoryRepository<'a> {
 
     /// Update the embedding of a memory chunk.
     ///
+    /// Always bumps `embedding_version` to [`CURRENT_EMBEDDING_VERSION`],
+    /// because all in-tree callers feed prefix-aware vectors (see M1 #006).
     /// Returns `true` if the row was found and updated.
     pub fn update_embedding(&self, id: &str, embedding: &[f32]) -> Result<bool> {
         let now = current_timestamp();
@@ -250,10 +279,80 @@ impl<'a> MemoryRepository<'a> {
 
         self.db.with_connection(|conn| {
             let rows_affected = conn.execute(
-                "UPDATE memory_chunks SET embedding = ?1, updated_at = ?2 WHERE id = ?3",
-                params![embedding_blob, now, id],
+                "UPDATE memory_chunks
+                 SET embedding = ?1, updated_at = ?2, embedding_version = ?3
+                 WHERE id = ?4",
+                params![embedding_blob, now, CURRENT_EMBEDDING_VERSION, id],
             )?;
             Ok(rows_affected > 0)
+        })
+    }
+
+    // ============================================================
+    // M1 #009 — Reindex support
+    //
+    // Below this point: APIs consumed by the memory_reindex background
+    // task in crates/daemon. The task brings legacy `embedding_version = 0`
+    // rows (computed before the e5 "passage: " prefix was injected) up
+    // to `embedding_version = 1` (prefix-aware).
+    // ============================================================
+
+    /// Count chunks whose embedding predates the prefix-aware API.
+    ///
+    /// Used by the reindex task to size its progress reporting at startup.
+    /// Note: rows with `embedding IS NULL AND embedding_version = 0` are
+    /// also counted because they need an initial embedding anyway — the
+    /// existing `backfill_embeddings` path handles them, but counting them
+    /// here keeps the progress total consistent if both paths overlap.
+    pub fn count_stale_embeddings(&self) -> Result<u64> {
+        self.db.with_connection(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM memory_chunks
+                 WHERE embedding_version < ?1 AND embedding IS NOT NULL",
+                params![CURRENT_EMBEDDING_VERSION],
+                |row| row.get(0),
+            )?;
+            Ok(count as u64)
+        })
+    }
+
+    /// Fetch a cursor-paginated batch of stale chunks.
+    ///
+    /// Returns chunks with `embedding_version < CURRENT_EMBEDDING_VERSION`
+    /// AND `embedding IS NOT NULL` (no embedding means there's nothing to
+    /// "reindex" — leave that to the no-embedding backfill path), ordered
+    /// by primary key. Pass an empty string (`""`) for the first call;
+    /// subsequent calls should pass the last returned id.
+    ///
+    /// `batch_size` is clamped to a sane range to avoid pathological
+    /// queries.
+    pub fn fetch_stale_chunk_batch(
+        &self,
+        cursor: &str,
+        batch_size: usize,
+    ) -> Result<Vec<StaleChunk>> {
+        let limit = batch_size.clamp(1, 1000) as i64;
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, content FROM memory_chunks
+                 WHERE embedding_version < ?1
+                   AND embedding IS NOT NULL
+                   AND id > ?2
+                 ORDER BY id ASC
+                 LIMIT ?3",
+            )?;
+            let rows = stmt
+                .query_map(
+                    params![CURRENT_EMBEDDING_VERSION, cursor, limit],
+                    |row| {
+                        Ok(StaleChunk {
+                            id: row.get(0)?,
+                            content: row.get(1)?,
+                        })
+                    },
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
         })
     }
 }
@@ -705,6 +804,157 @@ mod tests {
         assert_eq!(sanitize_fts5_query("he\"llo"), "\"hello\"");
         assert_eq!(sanitize_fts5_query("NOT -bad"), "\"NOT\" \"-bad\"");
         assert_eq!(sanitize_fts5_query("foo*"), "\"foo*\"");
+    }
+
+    // ============================================================
+    // M1 #009 — Reindex API tests
+    // ============================================================
+
+    #[test]
+    fn count_stale_embeddings_initial_zero() {
+        let db = setup_db();
+        let repo = MemoryRepository::new(&db);
+        assert_eq!(repo.count_stale_embeddings().unwrap(), 0);
+    }
+
+    #[test]
+    fn create_with_embedding_writes_current_version() {
+        let db = setup_db();
+        let repo = MemoryRepository::new(&db);
+
+        let chunk = MemoryChunk::new("hello")
+            .with_id("v-cur")
+            .with_embedding(vec![0.1, 0.2]);
+        repo.create(&chunk).unwrap();
+
+        // A row with embedding written via create() is already at the
+        // current version, so should NOT show up as stale.
+        assert_eq!(repo.count_stale_embeddings().unwrap(), 0);
+    }
+
+    #[test]
+    fn legacy_rows_are_detected_as_stale() {
+        let db = setup_db();
+        let repo = MemoryRepository::new(&db);
+
+        let chunk = MemoryChunk::new("legacy text")
+            .with_id("legacy-1")
+            .with_embedding(vec![0.5, 0.5]);
+        repo.create(&chunk).unwrap();
+
+        // Simulate a row written by the pre-M1 code path: same embedding,
+        // but embedding_version = 0.
+        db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE memory_chunks SET embedding_version = 0 WHERE id = ?1",
+                params!["legacy-1"],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(repo.count_stale_embeddings().unwrap(), 1);
+
+        let batch = repo.fetch_stale_chunk_batch("", 10).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, "legacy-1");
+        assert_eq!(batch[0].content, "legacy text");
+    }
+
+    #[test]
+    fn update_embedding_bumps_version_and_clears_stale() {
+        let db = setup_db();
+        let repo = MemoryRepository::new(&db);
+
+        let chunk = MemoryChunk::new("retext me")
+            .with_id("bump-1")
+            .with_embedding(vec![0.0, 0.0]);
+        repo.create(&chunk).unwrap();
+        db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE memory_chunks SET embedding_version = 0 WHERE id = ?1",
+                params!["bump-1"],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(repo.count_stale_embeddings().unwrap(), 1);
+
+        // Re-embed with the prefix-aware API stand-in.
+        let new_emb = vec![0.9_f32, 0.8, 0.7];
+        assert!(repo.update_embedding("bump-1", &new_emb).unwrap());
+
+        // Row is no longer stale.
+        assert_eq!(repo.count_stale_embeddings().unwrap(), 0);
+
+        // And the embedding actually changed.
+        let stored = repo.get("bump-1").unwrap().unwrap();
+        assert_eq!(stored.embedding.unwrap(), new_emb);
+    }
+
+    #[test]
+    fn fetch_stale_chunk_batch_paginates_by_id() {
+        let db = setup_db();
+        let repo = MemoryRepository::new(&db);
+
+        for i in 0..5 {
+            let chunk = MemoryChunk::new(format!("legacy {i}"))
+                .with_id(format!("page-{i:02}"))
+                .with_embedding(vec![i as f32]);
+            repo.create(&chunk).unwrap();
+        }
+        // Mark all as legacy.
+        db.with_connection(|conn| {
+            conn.execute("UPDATE memory_chunks SET embedding_version = 0", [])?;
+            Ok(())
+        })
+        .unwrap();
+
+        let first = repo.fetch_stale_chunk_batch("", 2).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].id, "page-00");
+        assert_eq!(first[1].id, "page-01");
+
+        let second = repo.fetch_stale_chunk_batch(&first[1].id, 2).unwrap();
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0].id, "page-02");
+        assert_eq!(second[1].id, "page-03");
+
+        let third = repo.fetch_stale_chunk_batch(&second[1].id, 2).unwrap();
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].id, "page-04");
+
+        let empty = repo.fetch_stale_chunk_batch(&third[0].id, 2).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn fetch_stale_chunk_batch_skips_null_embeddings() {
+        let db = setup_db();
+        let repo = MemoryRepository::new(&db);
+
+        // No-embedding rows should NOT come back from the reindex query —
+        // those go through the separate `list_without_embeddings` path.
+        let no_emb = MemoryChunk::new("missing").with_id("no-emb");
+        repo.create(&no_emb).unwrap();
+
+        let with_emb = MemoryChunk::new("legacy")
+            .with_id("has-emb")
+            .with_embedding(vec![0.4_f32]);
+        repo.create(&with_emb).unwrap();
+        db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE memory_chunks SET embedding_version = 0 WHERE id = ?1",
+                params!["has-emb"],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let batch = repo.fetch_stale_chunk_batch("", 10).unwrap();
+        assert_eq!(batch.len(), 1, "should only see rows with embeddings");
+        assert_eq!(batch[0].id, "has-emb");
     }
 
     #[test]

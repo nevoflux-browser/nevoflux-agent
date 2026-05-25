@@ -20,7 +20,7 @@ pub use config::ConfigRepository;
 pub use knowledge::KnowledgeRepository;
 pub use learning_metrics::LearningMetricsRepository;
 pub use loop_record::LoopRepository;
-pub use memory::MemoryRepository;
+pub use memory::{MemoryRepository, StaleChunk, CURRENT_EMBEDDING_VERSION};
 pub use message::MessageRepository;
 pub use permission::PermissionRepository;
 pub use session::SessionRepository;

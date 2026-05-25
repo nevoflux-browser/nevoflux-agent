@@ -37,6 +37,7 @@ pub mod health;
 pub mod learning;
 pub mod llm_gateway;
 pub mod loops;
+pub mod memory_reindex;
 pub mod mcp_config;
 pub mod openclaw_setup;
 pub mod permission;
@@ -64,6 +65,7 @@ pub use permission::{Action, PermissionEnforcer, PermissionResult, ResourceType}
 pub use registry::{ActiveRequest, ProxyInfo, ProxyRegistry, RequestRegistry};
 pub use router::Router;
 pub use llm_gateway::{init_gateway, GatewayBoot, GatewayHandleSnapshot};
+pub use memory_reindex::{spawn_reindex, ReindexHandle, ReindexProgress, BATCH_SIZE};
 pub use server::{find_available_port, start_server, Server, ServerConfig};
 pub use session::SessionManager;
 pub use wasm::{

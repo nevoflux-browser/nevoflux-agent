@@ -285,6 +285,15 @@ impl Default for ServerConfig {
     }
 }
 
+/// Shared slot holding the memory-reindex progress receiver.
+///
+/// The receiver is populated asynchronously by the background embedding
+/// init task once it finishes loading the model and backfilling missing
+/// embeddings. Cloning the receiver is cheap; callers `.borrow()` to
+/// read the latest [`crate::memory_reindex::ReindexProgress`] snapshot.
+pub type ReindexProgressSlot =
+    Arc<std::sync::RwLock<Option<tokio::sync::watch::Receiver<crate::memory_reindex::ReindexProgress>>>>;
+
 /// The TCP server handle.
 pub struct Server {
     /// The bound port.
@@ -299,6 +308,11 @@ pub struct Server {
     /// downstream consumers (gbrain subprocess in M3). [`None`] when
     /// the gateway is disabled.
     gateway_snapshot: Option<crate::llm_gateway::GatewayHandleSnapshot>,
+    /// Shared slot populated by the background embedding-init task with
+    /// the memory-reindex progress receiver (M1 #009). [`None`] when
+    /// `knowledge_base.enabled = false`, the embedding subsystem is
+    /// disabled, or no stale chunks were found at startup.
+    reindex_progress: ReindexProgressSlot,
 }
 
 impl Server {
@@ -311,6 +325,17 @@ impl Server {
     /// `knowledge_base.enabled` was false at boot.
     pub fn gateway_snapshot(&self) -> Option<crate::llm_gateway::GatewayHandleSnapshot> {
         self.gateway_snapshot.clone()
+    }
+
+    /// Current memory-reindex progress snapshot (M1 #009).
+    ///
+    /// Returns `None` when no reindex was scheduled (knowledge base
+    /// disabled, embedding subsystem off, or no stale rows at boot) or
+    /// when the daemon is still in the small window between embedder
+    /// init starting and the reindex handle being published.
+    pub fn reindex_progress(&self) -> Option<crate::memory_reindex::ReindexProgress> {
+        let guard = self.reindex_progress.read().ok()?;
+        guard.as_ref().map(|rx| rx.borrow().clone())
     }
 
     /// Signal the server to shutdown.
@@ -727,6 +752,13 @@ pub async fn start_server(
         nevoflux_storage::SimpleVectorIndex::new(),
     ));
 
+    // M1 #009 — shared slot for the memory reindex task's progress
+    // receiver. Populated by the embedding-init task below once it has
+    // an embedder + the storage layer reports stale chunks. Read by
+    // `Server::reindex_progress()`.
+    let reindex_progress_slot: ReindexProgressSlot =
+        Arc::new(std::sync::RwLock::new(None));
+
     // Spawn background embedding init task — loads ONNX model, populates the
     // shared embedding slot, loads existing memory vectors, and starts backfill.
     // This avoids blocking daemon startup (~8-9s for model loading).
@@ -735,6 +767,12 @@ pub async fn start_server(
         let vi = Arc::clone(&vector_index);
         let db_arc = session_manager.storage().database().clone();
         let backfill_storage = session_manager.shared_storage();
+        let reindex_slot_clone = Arc::clone(&reindex_progress_slot);
+        // Knowledge-base toggle gates the reindex (decision per task spec):
+        // if the user has KB disabled there is no point upgrading
+        // embeddings yet — they'll get reindexed on the next boot once
+        // KB is enabled.
+        let knowledge_base_enabled = agent_config.read().unwrap().knowledge_base.enabled;
 
         #[cfg(feature = "embedding")]
         {
@@ -810,7 +848,51 @@ pub async fn start_server(
                         }
 
                         // Backfill entries that lack embeddings
-                        backfill_embeddings(Arc::clone(provider), backfill_storage, vi).await;
+                        backfill_embeddings(
+                            Arc::clone(provider),
+                            Arc::clone(&backfill_storage),
+                            vi,
+                        )
+                        .await;
+
+                        // M1 #009 — kick off the legacy-embedding reindex
+                        // task. Only when knowledge_base.enabled; we
+                        // deliberately skip it when the KB subsystem is
+                        // off because there is no consumer for the
+                        // upgraded vectors yet.
+                        if knowledge_base_enabled {
+                            match crate::memory_reindex::spawn_reindex(
+                                Arc::clone(&backfill_storage),
+                                Arc::clone(provider),
+                            )
+                            .await
+                            {
+                                Ok(Some(handle)) => {
+                                    info!("memory reindex task spawned (M1 #009)");
+                                    if let Ok(mut slot) = reindex_slot_clone.write() {
+                                        *slot = Some(handle.subscribe());
+                                    }
+                                    // Drop the handle on the floor —
+                                    // the spawned task keeps running
+                                    // and the receiver in the slot is
+                                    // what consumers read.
+                                    std::mem::drop(handle);
+                                }
+                                Ok(None) => {
+                                    // Nothing stale; nothing to do.
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        "memory reindex failed to spawn; legacy vectors remain"
+                                    );
+                                }
+                            }
+                        } else {
+                            info!(
+                                "knowledge_base.enabled = false — skipping memory reindex (M1 #009)"
+                            );
+                        }
                     }
                 });
             } else {
@@ -819,7 +901,14 @@ pub async fn start_server(
         }
         #[cfg(not(feature = "embedding"))]
         {
-            let _ = (embedding_slot, vi, db_arc, backfill_storage);
+            let _ = (
+                embedding_slot,
+                vi,
+                db_arc,
+                backfill_storage,
+                reindex_slot_clone,
+                knowledge_base_enabled,
+            );
             info!("Embedding support not compiled in, semantic search disabled");
         }
     }
@@ -3464,6 +3553,7 @@ pub async fn start_server(
         shutdown_tx: Some(shutdown_tx),
         gateway: gateway_handle,
         gateway_snapshot,
+        reindex_progress: reindex_progress_slot,
     })
 }
 

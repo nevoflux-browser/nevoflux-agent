@@ -61,7 +61,8 @@ pub use models::{
 pub use repositories::{
     ArtifactRepository, ConfigRepository, KnowledgeRepository, LearningMetricsRepository,
     MemoryRepository, MessageRepository, PermissionRepository, SessionRepository,
-    SiteAdaptationRepository, ToolStatsRepository, TraceRepository,
+    SiteAdaptationRepository, StaleChunk, ToolStatsRepository, TraceRepository,
+    CURRENT_EMBEDDING_VERSION,
 };
 
 pub use repositories::traces::{CreateTraceSpanParams, TraceSpanRecord};
