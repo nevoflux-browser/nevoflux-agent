@@ -19,6 +19,7 @@ members = [
     "crates/mcp",
     "crates/daemon",
     "crates/bridge",
+    "crates/brain",
     "crates/skills",
     "crates/computer",
     "crates/builtin-wasm",
