@@ -13,4 +13,5 @@
 //! the gate-C validation results and the model-remap / permissive-enum
 //! decisions (#25, #26) implemented in [`translate`].
 
+pub mod embedding_dim;
 pub mod translate;

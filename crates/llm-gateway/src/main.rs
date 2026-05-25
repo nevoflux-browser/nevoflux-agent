@@ -9,8 +9,9 @@
 //!
 //! * `GET  /healthz`             — un-authed liveness probe.
 //! * `POST /v1/chat/completions` — bearer-authed; OpenAI ChatCompletions.
-//! * `POST /v1/embeddings`       — bearer-authed; returns 503 until
-//!   M1 #008 wires the real handler.
+//! * `POST /v1/embeddings`       — bearer-authed; OpenAI-shaped, backed
+//!   by `nevoflux-llm`'s [`FastEmbedProvider`] (M1 #008). Native 384-d
+//!   e5-small vectors are zero-padded to 512 (附录 B 决策 #7).
 //!
 //! ## Configuration (environment variables)
 //!
@@ -42,11 +43,13 @@ use axum::{
     Json, Router,
 };
 use futures::StreamExt;
+use nevoflux_llm::embedding::{EmbedKind, EmbeddingConfig, EmbeddingProvider, FastEmbedProvider};
+use nevoflux_llm_gateway::embedding_dim::{zero_pad_to_gateway_dim, GATEWAY_OUTPUT_DIM};
 use nevoflux_llm_gateway::translate::{
     anthropic_to_openai_response, openai_to_anthropic_request, AnthropicResponse,
     OpenAIChatRequest, StreamTranslator,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     convert::Infallible,
     net::SocketAddr,
@@ -55,7 +58,7 @@ use std::{
         Arc,
     },
 };
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::OnceCell};
 
 /// Default upstream base URL — canonical Anthropic API.
 const DEFAULT_UPSTREAM_BASE: &str = "https://api.anthropic.com";
@@ -76,6 +79,39 @@ struct AppState {
     upstream_model_override: String,
     anthropic_version: String,
     http: reqwest::Client,
+    /// Lazily-initialized fastembed-backed embedder.
+    ///
+    /// Loading the ~120 MB ONNX weights is expensive, and gateways used
+    /// only for chat-completions should not pay that cost. The cell is
+    /// populated on first `/v1/embeddings` call via [`AppState::embedder`].
+    embedder: OnceCell<Arc<FastEmbedProvider>>,
+}
+
+impl AppState {
+    /// Return the shared [`FastEmbedProvider`], initializing it on the
+    /// first call. Subsequent calls reuse the cached instance.
+    ///
+    /// The `FastEmbedProvider::new` constructor is synchronous and can
+    /// load model weights from disk, so we wrap it in `spawn_blocking`
+    /// to avoid stalling the async runtime.
+    async fn embedder(&self) -> anyhow::Result<Arc<FastEmbedProvider>> {
+        self.embedder
+            .get_or_try_init(|| async {
+                tracing::info!(
+                    "initializing FastEmbedProvider (first /v1/embeddings call)"
+                );
+                let start = std::time::Instant::now();
+                let provider = tokio::task::spawn_blocking(|| {
+                    FastEmbedProvider::new(EmbeddingConfig::default())
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
+                tracing::info!("FastEmbedProvider ready in {:?}", start.elapsed());
+                Ok(Arc::new(provider))
+            })
+            .await
+            .cloned()
+    }
 }
 
 #[derive(Serialize)]
@@ -107,17 +143,143 @@ async fn auth_middleware(
     }
 }
 
-/// Stub embeddings handler.
+// =========================================================================
+// /v1/embeddings
+// =========================================================================
+
+/// OpenAI-compatible embeddings request body.
 ///
-/// Returns HTTP 503 until M1 #008 wires the real implementation against
-/// the `nevoflux-llm` embedding trait. Exposed as 503 (rather than a
-/// silent dummy response) so the "not yet wired" status is observable
-/// in integration tests and via curl.
-async fn embeddings_stub() -> (StatusCode, &'static str) {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        "embeddings handler not yet wired (M1 #008)",
-    )
+/// `input` is intentionally a `serde_json::Value` so we can accept either a
+/// single string (OpenAI's canonical shape) or an array of strings (also
+/// canonical) without two separate handlers. `input_type` is a Cohere
+/// extension we map to [`EmbedKind`] so e5-family prefixes flow through.
+#[derive(Deserialize)]
+struct EmbeddingsRequest {
+    #[allow(dead_code)]
+    model: String,
+    input: serde_json::Value,
+    #[serde(default)]
+    input_type: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    encoding_format: Option<String>,
+}
+
+#[derive(Serialize)]
+struct EmbeddingsResponse {
+    object: &'static str,
+    data: Vec<EmbeddingData>,
+    model: String,
+    usage: Usage,
+}
+
+#[derive(Serialize)]
+struct EmbeddingData {
+    object: &'static str,
+    index: usize,
+    embedding: Vec<f32>,
+}
+
+#[derive(Serialize)]
+struct Usage {
+    prompt_tokens: u32,
+    total_tokens: u32,
+}
+
+/// Real `/v1/embeddings` handler.
+///
+/// Accepts the OpenAI request shape, dispatches to the lazily-initialized
+/// [`FastEmbedProvider`] via the kind-aware [`EmbeddingProvider`] API, and
+/// zero-pads the native 384-d e5-small vectors up to
+/// [`GATEWAY_OUTPUT_DIM`] (= 512) so downstream consumers (e.g. gbrain
+/// 0.40.8.1's openai recipe) accept the response. See 附录 B 决策 #7.
+async fn embeddings(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EmbeddingsRequest>,
+) -> Result<Json<EmbeddingsResponse>, (StatusCode, String)> {
+    let inputs: Vec<String> = match req.input {
+        serde_json::Value::String(s) => vec![s],
+        serde_json::Value::Array(arr) => arr
+            .into_iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "field `input` must be a string or array of strings".into(),
+            ));
+        }
+    };
+
+    if inputs.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "field `input` resolved to zero strings".into(),
+        ));
+    }
+
+    // OpenAI itself doesn't distinguish query vs passage, but Cohere does
+    // via `input_type`. We honor "search_query" -> Query and treat any
+    // other value (including the OpenAI default of None and Cohere's
+    // "search_document") as Passage.
+    let kind = match req.input_type.as_deref() {
+        Some("search_query") => EmbedKind::Query,
+        _ => EmbedKind::Passage,
+    };
+
+    let embedder = state.embedder().await.map_err(|e| {
+        tracing::error!("embedder init failed: {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("embedder init failed: {e}"),
+        )
+    })?;
+
+    let raw_vectors = embedder
+        .embed_batch_kind(kind, &inputs)
+        .await
+        .map_err(|e| {
+            tracing::error!("embed_batch_kind failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("embedding error: {e}"),
+            )
+        })?;
+
+    // Sanity check: native dim should match what the provider advertises
+    // (384 for e5-small). A mismatch points at a model/config drift.
+    let native_dim = raw_vectors.first().map(|v| v.len()).unwrap_or(0);
+    if native_dim != embedder.dimensions() {
+        tracing::warn!(
+            "embedder returned dim={native_dim}, expected {}",
+            embedder.dimensions()
+        );
+    }
+
+    let data: Vec<EmbeddingData> = raw_vectors
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| EmbeddingData {
+            object: "embedding",
+            index: i,
+            embedding: zero_pad_to_gateway_dim(v),
+        })
+        .collect();
+
+    debug_assert!(
+        data.iter().all(|d| d.embedding.len() == GATEWAY_OUTPUT_DIM),
+        "all output vectors must be padded to GATEWAY_OUTPUT_DIM"
+    );
+
+    Ok(Json(EmbeddingsResponse {
+        object: "list",
+        data,
+        model: req.model,
+        usage: Usage {
+            prompt_tokens: 0,
+            total_tokens: 0,
+        },
+    }))
 }
 
 // =========================================================================
@@ -425,10 +587,11 @@ async fn main() -> anyhow::Result<()> {
         upstream_model_override,
         anthropic_version,
         http,
+        embedder: OnceCell::new(),
     });
 
     let protected = Router::new()
-        .route("/embeddings", post(embeddings_stub))
+        .route("/embeddings", post(embeddings))
         .route("/chat/completions", post(chat_completions))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
