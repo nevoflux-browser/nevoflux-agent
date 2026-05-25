@@ -36,3 +36,6 @@ docs/testing/
 # crates/storage/src/models/.
 /models/
 
+# Spike workspace (throwaway exploration; see spike/knowledge-base-v1 branch)
+spike/
+
