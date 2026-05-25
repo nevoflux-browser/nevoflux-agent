@@ -642,4 +642,126 @@ mod tests {
             "expected at least 100 differing dimensions between passage/query embeddings, got {differ_count}"
         );
     }
+
+    /// Ranking-correctness regression guard for e5 prefix injection.
+    ///
+    /// The sibling test `fastembed_passage_vs_query_produces_different_vectors`
+    /// only verifies that prefixes change the output. This test verifies they
+    /// change it in the **right direction** — that correctly-prefixed query
+    /// vectors retrieve correctly-prefixed passage vectors better than
+    /// semantically unrelated passages.
+    ///
+    /// 5 hand-curated (query, correct, wrong) triples spanning ML and cooking
+    /// domains. Hard floor: all 5 must rank correctly. Soft floor: average
+    /// cosine margin > 0.05 to catch silent prefix-stripping regressions.
+    ///
+    /// This test requires the model to be downloaded (~120 MB).
+    /// Run with: cargo test -p nevoflux-llm fastembed_prefix_ranks_correct_passages_above_wrong -- --ignored --nocapture
+    #[cfg(feature = "embedding")]
+    #[tokio::test]
+    #[ignore] // mirrors fastembed_passage_vs_query_produces_different_vectors gating
+    async fn fastembed_prefix_ranks_correct_passages_above_wrong() {
+        let provider = FastEmbedProvider::new(EmbeddingConfig::default())
+            .expect("FastEmbedProvider should initialize");
+
+        // 5 hand-curated (query, correct_passage, wrong_passage) triples covering
+        // distinct semantic clusters. The wrong passage is plausible enough that
+        // a no-prefix bag-of-words match could confuse the ranker; the prefix
+        // injection must do meaningfully better.
+        let triples: &[(&str, &str, &str)] = &[
+            (
+                "how does gradient descent converge",
+                "Gradient descent iteratively updates weights toward the local minimum of a loss surface.",
+                "Tokyo is the capital of Japan and houses the Imperial Palace.",
+            ),
+            (
+                "what is the maillard reaction",
+                "The Maillard reaction is the browning of amino acids and sugars when food is heated.",
+                "Backpropagation computes gradients via the chain rule.",
+            ),
+            (
+                "explain self-attention in transformers",
+                "Self-attention lets each token attend to every other token, producing context-aware representations.",
+                "Sourdough fermentation relies on wild yeasts and lactic acid bacteria.",
+            ),
+            (
+                "best way to braise short ribs",
+                "Braising short ribs requires searing first, then slow cooking with stock for several hours.",
+                "Adam optimizer adapts per-parameter learning rates using first and second moment estimates.",
+            ),
+            (
+                "what does an embedding model do",
+                "An embedding model maps discrete tokens or short texts into dense vectors in a continuous space.",
+                "Sous vide cooking holds food at a precisely controlled water bath temperature.",
+            ),
+        ];
+
+        // Helper: cosine similarity between two equal-length f32 vectors.
+        fn cosine(a: &[f32], b: &[f32]) -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if na == 0.0 || nb == 0.0 {
+                0.0
+            } else {
+                dot / (na * nb)
+            }
+        }
+
+        let mut wins = 0;
+        let mut margins = Vec::new();
+
+        for (query, correct, wrong) in triples {
+            let q_vec = provider
+                .embed_kind(EmbedKind::Query, query)
+                .await
+                .expect("query embed");
+            let correct_vec = provider
+                .embed_kind(EmbedKind::Passage, correct)
+                .await
+                .expect("correct passage embed");
+            let wrong_vec = provider
+                .embed_kind(EmbedKind::Passage, wrong)
+                .await
+                .expect("wrong passage embed");
+
+            let sim_correct = cosine(&q_vec, &correct_vec);
+            let sim_wrong = cosine(&q_vec, &wrong_vec);
+            let margin = sim_correct - sim_wrong;
+
+            eprintln!(
+                "query={query:?}\n  correct sim={sim_correct:.4}  wrong sim={sim_wrong:.4}  margin={margin:+.4}"
+            );
+
+            if sim_correct > sim_wrong {
+                wins += 1;
+            }
+            margins.push(margin);
+        }
+
+        // Hard floor: every single triple must rank correctly.
+        assert_eq!(
+            wins,
+            triples.len(),
+            "expected all {} triples to rank correct > wrong, got {} wins",
+            triples.len(),
+            wins
+        );
+
+        // Soft floor: average margin should be comfortably positive — if the
+        // prefix injection later breaks silently (e.g., someone removes the
+        // `passage: ` prefix but keeps the API shape), all margins would
+        // collapse toward zero and this assertion would catch it before the
+        // hard floor weakens.
+        let avg_margin: f32 = margins.iter().sum::<f32>() / margins.len() as f32;
+        assert!(
+            avg_margin > 0.05,
+            "average cosine margin too low ({avg_margin:.4}); prefix injection may have regressed"
+        );
+
+        eprintln!(
+            "\nall {} triples ranked correctly; avg margin = {:+.4}",
+            wins, avg_margin
+        );
+    }
 }
