@@ -12,6 +12,7 @@ use nevoflux_llm::providers::acp::mcp_bridge::{
     McpToolBridge, PendingArtifact, PermissionRequest, PermissionResponse, ToolCallRequest,
 };
 use nevoflux_protocol::BrowserToolAction;
+use nevoflux_llm::EmbedKind;
 use nevoflux_storage::{CreateKnowledgeParams, KnowledgeRepository};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -1493,8 +1494,12 @@ fn find_similar_hot_knowledge(services: &HostServices, content: &str) -> Option<
     let provider = get_embedding(&services.embedding)?;
     let content_owned = content.to_string();
 
+    // Passage: the candidate content is being deduped against existing stored
+    // hot knowledge passage embeddings; both sides of the cosine comparison
+    // should use the indexing prefix.
     let query_emb = match tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async { provider.embed(&content_owned).await })
+        tokio::runtime::Handle::current()
+            .block_on(async { provider.embed_kind(EmbedKind::Passage, &content_owned).await })
     }) {
         Ok(emb) => emb,
         Err(_) => return None,

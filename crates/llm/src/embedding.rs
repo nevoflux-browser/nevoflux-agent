@@ -7,12 +7,12 @@
 //! # Example
 //!
 //! ```no_run
-//! use nevoflux_llm::embedding::{EmbeddingConfig, FastEmbedProvider, EmbeddingProvider};
+//! use nevoflux_llm::embedding::{EmbedKind, EmbeddingConfig, FastEmbedProvider, EmbeddingProvider};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let config = EmbeddingConfig::default();
 //! let provider = FastEmbedProvider::new(config)?;
-//! let embedding = provider.embed("Hello, world!").await?;
+//! let embedding = provider.embed_kind(EmbedKind::Passage, "Hello, world!").await?;
 //! println!("Embedding dimensions: {}", embedding.len());
 //! # Ok(())
 //! # }
@@ -532,8 +532,11 @@ mod tests {
 
         assert_eq!(provider.dimensions(), 384);
 
+        // Passage: this smoke test just verifies the model produces a
+        // non-zero vector; using the indexing-side prefix matches the
+        // most-common production caller (memory chunk indexing).
         let embedding = provider
-            .embed("Hello, world!")
+            .embed_kind(EmbedKind::Passage, "Hello, world!")
             .await
             .expect("Failed to generate embedding");
 
@@ -568,8 +571,11 @@ mod tests {
             "The stock market crashed yesterday".to_string(),
         ];
 
+        // Passage: all three strings are treated as documents being
+        // compared pairwise — consistent indexing-side prefix keeps the
+        // cosine geometry meaningful.
         let embeddings = provider
-            .embed_batch(&texts)
+            .embed_batch_kind(EmbedKind::Passage, &texts)
             .await
             .expect("Failed to generate batch embeddings");
 

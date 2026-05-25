@@ -7,6 +7,7 @@
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
+use nevoflux_llm::EmbedKind;
 use nevoflux_storage::{cosine_similarity, Knowledge, SiteAdaptation, Storage};
 
 use crate::wasm::services::{get_embedding, SharedEmbedding};
@@ -241,10 +242,13 @@ impl KnowledgeRetriever {
         domain: Option<&str>,
         category: Option<&str>,
     ) -> crate::error::Result<RetrievalResult> {
-        // Generate query embedding (failure = None, graceful degradation)
+        // Generate query embedding (failure = None, graceful degradation).
+        // Query: this vector probes the indexed knowledge entries; e5 needs the
+        // `query: ` prefix so cosine vs stored `passage: `-prefixed vectors is
+        // meaningful.
         let query_emb = if !query.is_empty() {
             if let Some(provider) = get_embedding(&self.embedding) {
-                provider.embed(query).await.ok()
+                provider.embed_kind(EmbedKind::Query, query).await.ok()
             } else {
                 None
             }

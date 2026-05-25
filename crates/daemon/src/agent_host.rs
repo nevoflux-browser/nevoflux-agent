@@ -32,7 +32,7 @@ use nevoflux_builtin_wasm::{
     GrepMatch, GrepResult, HostError, HostFunctions, HostResult, LlmRequest, LlmResponse,
     MemoryChunk, ReadResult, SkillSummary, SubagentInfo, ToolSearchResult,
 };
-use nevoflux_llm::ProviderType;
+use nevoflux_llm::{EmbedKind, ProviderType};
 use nevoflux_mcp::ToolResultContent;
 use nevoflux_protocol::subagent::{
     AgentRoleSummary, SpawnSubagentConfig, SubagentResult as ProtocolSubagentResult,
@@ -315,9 +315,13 @@ impl DaemonHostFunctions {
         let runtime = self.runtime.clone();
         let content_owned = content.to_string();
 
-        // Generate embedding for the new content
+        // Generate embedding for the new content.
+        // Passage: the new content is being checked for duplicates against
+        // existing stored (passage-side) hot knowledge embeddings — both sides
+        // of the cosine comparison should use the indexing prefix so the
+        // similarity score is meaningful.
         let query_emb = match tokio::task::block_in_place(|| {
-            runtime.block_on(async { provider.embed(&content_owned).await })
+            runtime.block_on(async { provider.embed_kind(EmbedKind::Passage, &content_owned).await })
         }) {
             Ok(emb) => emb,
             Err(_) => return None,
@@ -1765,8 +1769,11 @@ impl HostFunctions for DaemonHostFunctions {
             if let Some(provider) = crate::wasm::services::get_embedding(&services.embedding) {
                 let runtime = self.runtime.clone();
                 let query_owned = query.to_string();
+                // Query: this is the user-search side of memory_search hybrid
+                // retrieval (FTS + vector); chunks were indexed as passages.
                 let embed_result = tokio::task::block_in_place(|| {
-                    runtime.block_on(async { provider.embed(&query_owned).await })
+                    runtime
+                        .block_on(async { provider.embed_kind(EmbedKind::Query, &query_owned).await })
                 });
                 match embed_result {
                     Ok(query_emb) => {

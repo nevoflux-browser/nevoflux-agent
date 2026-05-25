@@ -3477,15 +3477,18 @@ async fn backfill_embeddings(
     storage: Arc<nevoflux_storage::Storage>,
     vector_index: Arc<std::sync::RwLock<nevoflux_storage::SimpleVectorIndex>>,
 ) {
+    use nevoflux_llm::EmbedKind;
+
     // Small delay to let startup complete
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-    // Backfill MemoryChunks
+    // Backfill MemoryChunks — Passage: these embeddings are stored on chunks
+    // that will be probed later by query-side vectors.
     match storage.database().memory().list_without_embeddings(1000) {
         Ok(chunks) => {
             let mut count = 0;
             for chunk in chunks {
-                match provider.embed(&chunk.content).await {
+                match provider.embed_kind(EmbedKind::Passage, &chunk.content).await {
                     Ok(emb) => {
                         if storage
                             .database()
@@ -3520,7 +3523,9 @@ async fn backfill_embeddings(
             let mut count = 0;
             for entry in entries {
                 let text = format!("{} {}", entry.summary, entry.details);
-                match provider.embed(&text).await {
+                // Passage: backfilling stored knowledge entries that will later
+                // be searched against — indexing-side prefix is correct.
+                match provider.embed_kind(EmbedKind::Passage, &text).await {
                     Ok(emb) => {
                         if storage
                             .knowledge()

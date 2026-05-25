@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use nevoflux_llm::EmbedKind;
 use nevoflux_storage::{CreateKnowledgeParams, CreateLearningMetricParams, Storage};
 
 use crate::wasm::services::{get_embedding, SharedEmbedding};
@@ -313,8 +314,11 @@ impl LearningPipeline {
                         entry.summary,
                         entry.details.as_deref().unwrap_or("")
                     );
+                    // Passage: this embedding is being stored on a new knowledge entry
+                    // for later retrieval — indexing-side prefix is correct.
                     let emb_result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(provider.embed(&text))
+                        tokio::runtime::Handle::current()
+                            .block_on(provider.embed_kind(EmbedKind::Passage, &text))
                     });
                     match emb_result {
                         Ok(vec) => params.embedding = Some(vec),
@@ -347,8 +351,10 @@ impl LearningPipeline {
                         entry.summary,
                         entry.details.as_deref().unwrap_or("")
                     );
+                    // Passage: indexing a brand-new knowledge entry for later retrieval.
                     let emb_result = tokio::task::block_in_place(|| {
-                        tokio::runtime::Handle::current().block_on(provider.embed(&text))
+                        tokio::runtime::Handle::current()
+                            .block_on(provider.embed_kind(EmbedKind::Passage, &text))
                     });
                     match emb_result {
                         Ok(vec) => params.embedding = Some(vec),
