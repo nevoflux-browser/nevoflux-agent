@@ -83,17 +83,88 @@ impl Default for EmbeddingConfig {
     }
 }
 
+/// Distinguishes the side a vector is being computed for, so that asymmetric
+/// retrieval models (e5, BGE, Cohere) can apply the correct prefix or
+/// `input_type` per side.
+///
+/// Symmetric models may ignore this and produce identical vectors for both
+/// kinds.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum EmbedKind {
+    /// Document chunk side — stored for later retrieval.
+    /// e5 prefix: `passage: `, Cohere: `input_type=search_document`.
+    Passage,
+    /// Query side — single user input being matched against the index.
+    /// e5 prefix: `query: `, Cohere: `input_type=search_query`.
+    Query,
+}
+
 /// Trait for generating text embeddings.
 ///
 /// Implementations must be Send + Sync so they can be shared across
 /// async tasks and threads.
+///
+/// # Kind-aware API (preferred)
+///
+/// Asymmetric retrieval models (e5-small, BGE family, Cohere embed v3) require
+/// different prefixes / `input_type` values for the **document/passage** side
+/// vs the **query** side. New code should call [`embed_kind`](Self::embed_kind)
+/// or [`embed_batch_kind`](Self::embed_batch_kind) with an explicit
+/// [`EmbedKind`] so concrete providers can inject the correct prefix.
+///
+/// # Legacy API (deprecated)
+///
+/// The original [`embed`](Self::embed) / [`embed_batch`](Self::embed_batch)
+/// methods are kept temporarily for backward compatibility. They do **not**
+/// distinguish the embedding side and are retained until call sites are
+/// migrated (M1 #006). See
+/// `docs/plans/2026-05-24-knowledge-base-spike-plan.md` 附录 B.
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     /// Generate an embedding vector for a single text.
+    #[deprecated(
+        note = "use `embed_kind` with explicit EmbedKind. \
+        See docs/plans/2026-05-24-knowledge-base-spike-plan.md 附录 B."
+    )]
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError>;
 
     /// Generate embedding vectors for a batch of texts.
+    #[deprecated(note = "use `embed_batch_kind` with explicit EmbedKind.")]
     async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError>;
+
+    /// Generate an embedding vector for a single text, tagged with its
+    /// retrieval side.
+    ///
+    /// Concrete providers should override this to inject the model-specific
+    /// prefix (e.g. `passage: ` / `query: ` for e5-small).
+    ///
+    /// The default implementation delegates to the legacy [`embed`](Self::embed)
+    /// method and **ignores** `kind`. This preserves backward compatibility
+    /// for existing providers; #002 will give [`FastEmbedProvider`] a real
+    /// kind-aware override.
+    async fn embed_kind(
+        &self,
+        _kind: EmbedKind,
+        text: &str,
+    ) -> Result<Vec<f32>, EmbeddingError> {
+        #[allow(deprecated)]
+        self.embed(text).await
+    }
+
+    /// Generate embedding vectors for a batch of texts, tagged with their
+    /// retrieval side.
+    ///
+    /// Concrete providers should override this to inject the model-specific
+    /// prefix. The default implementation delegates to the legacy
+    /// [`embed_batch`](Self::embed_batch) method and **ignores** `kind`.
+    async fn embed_batch_kind(
+        &self,
+        _kind: EmbedKind,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        #[allow(deprecated)]
+        self.embed_batch(texts).await
+    }
 
     /// Returns the number of dimensions in the embedding vectors.
     fn dimensions(&self) -> usize;
@@ -306,6 +377,36 @@ impl EmbeddingProvider for FastEmbedProvider {
 
     fn dimensions(&self) -> usize {
         self.dims
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+
+    #[test]
+    fn embed_kind_is_copy_eq_hash() {
+        let a = EmbedKind::Passage;
+        let b = a; // Copy
+        assert_eq!(a, b);
+
+        let q = EmbedKind::Query;
+        assert_ne!(a, q);
+
+        let mut set = std::collections::HashSet::new();
+        set.insert(EmbedKind::Passage);
+        set.insert(EmbedKind::Query);
+        set.insert(EmbedKind::Passage); // duplicate
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn embed_kind_debug_renders() {
+        // Make sure Debug is implemented (compile-time check + smoke value).
+        let s = format!("{:?}", EmbedKind::Passage);
+        assert!(s.contains("Passage"));
+        let s = format!("{:?}", EmbedKind::Query);
+        assert!(s.contains("Query"));
     }
 }
 
