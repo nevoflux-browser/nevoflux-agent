@@ -1,0 +1,50 @@
+[package]
+name = "nevoflux-llm-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local OpenAI-compatible HTTP gateway translating to Anthropic Messages upstream"
+publish = false
+
+[lib]
+name = "nevoflux_llm_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nevoflux-llm-gateway"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP server
+axum = "0.7"
+tower-http = { version = "0.6", features = ["trace"] }
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-stream = "0.3"
+bytes = "1"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Errors / logging
+anyhow = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# HTTP client (for upstream)
+reqwest = { workspace = true }
+
+# IDs
+uuid = { workspace = true }
+
+# Internal deps (used by future M1 #008 embeddings handler; declared now so
+# the dependency surface is settled).
+nevoflux-llm = { path = "../llm", default-features = false, features = ["embedding"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

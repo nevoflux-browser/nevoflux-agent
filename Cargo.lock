@@ -3565,6 +3565,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "nevoflux-llm-gateway"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum",
+ "bytes",
+ "futures",
+ "nevoflux-llm",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "nevoflux-mcp"
 version = "0.2.1"
 dependencies = [
@@ -6153,6 +6174,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]

@@ -1,0 +1,66 @@
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_d64a9a7dbfba443686db9b3c","type":"message","role":"assistant","model":"mimo-v2.5-pro","content":[],"usage":{"input_tokens":0,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"The user is"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" asking about"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" the weather in Tokyo"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" and Paris."},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" These are two independent"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" queries"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":", so I can"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" make both"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" calls simultaneously"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"."},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"signature_delta","signature":""},"index":0}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"call_5cb56fe080114f40a912c20e","name":"get_weather","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"city\": \"Tokyo\"}"},"index":1}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call_0e47463e67d147f1bb59d3d2","name":"get_weather","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"city\": \"Paris\"}"},"index":2}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":2}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":289,"output_tokens":70,"cache_read_input_tokens":192}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
