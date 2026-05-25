@@ -62,6 +62,10 @@ pub struct AgentConfig {
     #[serde(default)]
     pub embedding: EmbeddingConfig,
 
+    /// Knowledge-base / in-process LLM gateway configuration (M1 #010).
+    #[serde(default)]
+    pub knowledge_base: KnowledgeBaseConfig,
+
     /// TTS subsystem configuration (umbrella spec §7).
     #[serde(default)]
     pub tts: TtsConfig,
@@ -1305,6 +1309,40 @@ impl Default for EmbeddingConfig {
             provider: default_embedding_provider(),
             model: default_embedding_model(),
             enabled: default_embedding_enabled(),
+        }
+    }
+}
+
+// ==================== KnowledgeBaseConfig ====================
+
+/// Configuration for the knowledge-base subsystem (M1 #010+).
+///
+/// The most visible side effect of enabling this is that the daemon
+/// boots an in-process [`nevoflux_llm_gateway`] task — a loopback-only
+/// HTTP server that translates OpenAI ChatCompletions/Embeddings
+/// requests to upstream Anthropic Messages. The gateway is what the
+/// gbrain subprocess (M3) will talk to.
+///
+/// Default: `enabled = true`. The gateway is cheap when idle — the
+/// fastembed ONNX weights only load on the first `/v1/embeddings`
+/// call — so booting it eagerly costs only an axum listener + bound
+/// loopback port. Setting `enabled = false` opts out for daemons that
+/// don't need the knowledge base.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeBaseConfig {
+    /// Whether the daemon spawns the in-process llm-gateway at startup.
+    #[serde(default = "default_knowledge_base_enabled")]
+    pub enabled: bool,
+}
+
+fn default_knowledge_base_enabled() -> bool {
+    true
+}
+
+impl Default for KnowledgeBaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_knowledge_base_enabled(),
         }
     }
 }

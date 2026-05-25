@@ -291,6 +291,14 @@ pub struct Server {
     port: u16,
     /// Shutdown signal sender.
     shutdown_tx: Option<mpsc::Sender<()>>,
+    /// In-process llm-gateway handle, if `knowledge_base.enabled` was
+    /// true at boot (M1 #010). Stored here so [`Self::shutdown`] can
+    /// gracefully stop the gateway task before the daemon exits.
+    gateway: Option<nevoflux_llm_gateway::GatewayHandle>,
+    /// Clone-safe snapshot of the gateway's URL + bearer token, for
+    /// downstream consumers (gbrain subprocess in M3). [`None`] when
+    /// the gateway is disabled.
+    gateway_snapshot: Option<crate::llm_gateway::GatewayHandleSnapshot>,
 }
 
 impl Server {
@@ -299,10 +307,20 @@ impl Server {
         self.port
     }
 
+    /// Clone-safe snapshot of the in-process llm-gateway, or `None` if
+    /// `knowledge_base.enabled` was false at boot.
+    pub fn gateway_snapshot(&self) -> Option<crate::llm_gateway::GatewayHandleSnapshot> {
+        self.gateway_snapshot.clone()
+    }
+
     /// Signal the server to shutdown.
     pub async fn shutdown(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(()).await;
+        }
+        if let Some(gateway) = self.gateway.take() {
+            tracing::info!("shutting down in-process llm-gateway");
+            gateway.shutdown().await;
         }
     }
 }
@@ -532,6 +550,29 @@ pub async fn start_server(
             AgentConfig::default()
         }
     };
+
+    // Boot the in-process llm-gateway (M1 #010). Done after loading
+    // agent config so we can read `knowledge_base.enabled` from it,
+    // but before any of the heavier subsystem inits below — the
+    // gateway only needs an OS-assigned loopback port and the listener
+    // binds in milliseconds.
+    let gateway_boot = match crate::llm_gateway::init_gateway(&agent_config.knowledge_base).await {
+        Ok(opt) => opt,
+        Err(e) => {
+            // Don't fail the whole daemon boot if the gateway can't
+            // come up — the knowledge-base path is degraded but the
+            // rest of the daemon remains usable.
+            error!(
+                "llm-gateway init failed: {e}; continuing with knowledge base disabled"
+            );
+            None
+        }
+    };
+    let (gateway_handle, gateway_snapshot) = match gateway_boot {
+        Some(boot) => (Some(boot.handle), Some(boot.snapshot)),
+        None => (None, None),
+    };
+
     let agent_config: SharedAgentConfig = Arc::new(RwLock::new(Arc::new(agent_config)));
 
     // Create host services with database from session manager
@@ -3421,6 +3462,8 @@ pub async fn start_server(
     Ok(Server {
         port,
         shutdown_tx: Some(shutdown_tx),
+        gateway: gateway_handle,
+        gateway_snapshot,
     })
 }
 

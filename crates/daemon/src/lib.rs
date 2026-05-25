@@ -35,6 +35,7 @@ pub mod event_bus;
 pub mod file_picker;
 pub mod health;
 pub mod learning;
+pub mod llm_gateway;
 pub mod loops;
 pub mod mcp_config;
 pub mod openclaw_setup;
@@ -53,8 +54,8 @@ pub mod validation;
 pub mod wasm;
 
 pub use config::{
-    AgentConfig, AuthConfig, ConfigError, ContextConfig, DaemonConfig, LlmConfig, LoggingConfig,
-    SessionConfig, StorageConfig,
+    AgentConfig, AuthConfig, ConfigError, ContextConfig, DaemonConfig, KnowledgeBaseConfig,
+    LlmConfig, LoggingConfig, SessionConfig, StorageConfig,
 };
 pub use config_watcher::{create_config_watcher, ConfigReceiver, ConfigWatcher, WatcherError};
 pub use error::{DaemonError, Result};
@@ -62,6 +63,7 @@ pub use mcp_config::{McpConfigError, McpServerConfigFile, McpServersConfig};
 pub use permission::{Action, PermissionEnforcer, PermissionResult, ResourceType};
 pub use registry::{ActiveRequest, ProxyInfo, ProxyRegistry, RequestRegistry};
 pub use router::Router;
+pub use llm_gateway::{init_gateway, GatewayBoot, GatewayHandleSnapshot};
 pub use server::{find_available_port, start_server, Server, ServerConfig};
 pub use session::SessionManager;
 pub use wasm::{
