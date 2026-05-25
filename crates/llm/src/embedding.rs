@@ -347,14 +347,44 @@ impl FastEmbedProvider {
     }
 }
 
+/// Returns the e5-family prefix string for the given embedding side.
+///
+/// `multilingual-e5-small` is an asymmetric retrieval model: the document
+/// (passage) and query sides must be prefixed differently for the cosine
+/// similarity to be meaningful. See the model card on Hugging Face.
+#[cfg(feature = "embedding")]
+fn kind_prefix(kind: EmbedKind) -> &'static str {
+    match kind {
+        EmbedKind::Passage => "passage: ",
+        EmbedKind::Query => "query: ",
+    }
+}
+
 #[cfg(feature = "embedding")]
 #[async_trait]
 impl EmbeddingProvider for FastEmbedProvider {
+    // Legacy methods — redirect to kind-aware methods with EmbedKind::Passage
+    // as the safe default (most existing callers are indexing-side). Query-side
+    // callers will surface via deprecation warnings and be migrated in #006.
+    // See docs/plans/2026-05-24-knowledge-base-spike-plan.md 附录 B 决策 #7.
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        let model = Arc::clone(&self.model);
-        let text = text.to_string();
+        self.embed_kind(EmbedKind::Passage, text).await
+    }
 
-        let result = tokio::task::spawn_blocking(move || model.embed(vec![text], None))
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        self.embed_batch_kind(EmbedKind::Passage, texts).await
+    }
+
+    async fn embed_kind(
+        &self,
+        kind: EmbedKind,
+        text: &str,
+    ) -> Result<Vec<f32>, EmbeddingError> {
+        let model = Arc::clone(&self.model);
+        let prefix = kind_prefix(kind);
+        let prefixed = format!("{prefix}{text}");
+
+        let result = tokio::task::spawn_blocking(move || model.embed(vec![prefixed], None))
             .await
             .map_err(|e| EmbeddingError::GenerationError(format!("Task join error: {}", e)))?
             .map_err(|e| EmbeddingError::GenerationError(e.to_string()))?;
@@ -365,11 +395,16 @@ impl EmbeddingProvider for FastEmbedProvider {
             .ok_or_else(|| EmbeddingError::GenerationError("Empty embedding result".to_string()))
     }
 
-    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+    async fn embed_batch_kind(
+        &self,
+        kind: EmbedKind,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
         let model = Arc::clone(&self.model);
-        let texts = texts.to_vec();
+        let prefix = kind_prefix(kind);
+        let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
 
-        tokio::task::spawn_blocking(move || model.embed(texts, None))
+        tokio::task::spawn_blocking(move || model.embed(prefixed, None))
             .await
             .map_err(|e| EmbeddingError::GenerationError(format!("Task join error: {}", e)))?
             .map_err(|e| EmbeddingError::GenerationError(e.to_string()))
@@ -561,6 +596,44 @@ mod tests {
              than to 'stock market' ({})",
             sim_cat_kitten,
             sim_cat_stock
+        );
+    }
+
+    /// Verifies that `EmbedKind::Passage` and `EmbedKind::Query` actually
+    /// produce different embeddings for the same input text — i.e. that the
+    /// e5 `passage: ` / `query: ` prefix injection is wired up correctly.
+    ///
+    /// This test requires the model to be downloaded (~120 MB).
+    /// Run with: cargo test -p nevoflux-llm fastembed_passage_vs_query_produces_different_vectors -- --ignored
+    #[cfg(feature = "embedding")]
+    #[tokio::test]
+    #[ignore]
+    async fn fastembed_passage_vs_query_produces_different_vectors() {
+        let provider = FastEmbedProvider::new(EmbeddingConfig::default())
+            .expect("FastEmbedProvider should initialize");
+        let text = "neural network training";
+        let passage_vec = provider
+            .embed_kind(EmbedKind::Passage, text)
+            .await
+            .expect("passage embed should succeed");
+        let query_vec = provider
+            .embed_kind(EmbedKind::Query, text)
+            .await
+            .expect("query embed should succeed");
+
+        assert_eq!(passage_vec.len(), 384);
+        assert_eq!(query_vec.len(), 384);
+
+        // Vectors should differ in at least some dimensions (different
+        // prefixes → different embeddings).
+        let differ_count = passage_vec
+            .iter()
+            .zip(query_vec.iter())
+            .filter(|(a, b)| (*a - *b).abs() > 1e-6)
+            .count();
+        assert!(
+            differ_count >= 100,
+            "expected at least 100 differing dimensions between passage/query embeddings, got {differ_count}"
         );
     }
 }
