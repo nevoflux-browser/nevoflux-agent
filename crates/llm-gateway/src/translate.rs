@@ -480,18 +480,16 @@ pub fn anthropic_to_openai_response(resp: AnthropicResponse) -> OpenAIChatComple
         }
     }
 
-    let finish_reason = match resp.stop_reason.as_deref() {
-        Some("tool_use") => "tool_calls".to_string(),
-        Some("end_turn") | None => {
-            if had_tool_use {
-                "tool_calls".to_string()
-            } else {
-                "stop".to_string()
-            }
-        }
-        Some("max_tokens") => "length".to_string(),
-        Some("stop_sequence") => "stop".to_string(),
-        Some(other) => other.to_string(),
+    // Translate via the shared helper, then layer the legacy override:
+    // some upstream Anthropic-compatible providers omit `tool_use` from
+    // `stop_reason` even when they emitted tool_use content blocks. If we
+    // saw any tool_use block and the mapped reason would otherwise be
+    // "stop", upgrade to "tool_calls" so OpenAI clients dispatch correctly.
+    let mapped = map_stop_reason(resp.stop_reason.as_deref());
+    let finish_reason = if had_tool_use && mapped == "stop" {
+        "tool_calls".to_string()
+    } else {
+        mapped.to_string()
     };
 
     let (prompt_tokens, completion_tokens) = match resp.usage {
@@ -715,7 +713,7 @@ impl StreamTranslator {
                     .pointer("/delta/stop_reason")
                     .and_then(|v| v.as_str())
                 {
-                    self.finish_reason = Some(map_stop_reason(sr));
+                    self.finish_reason = Some(map_stop_reason(Some(sr)).to_string());
                 }
             }
             "message_stop" => {
@@ -759,11 +757,48 @@ impl StreamTranslator {
     }
 }
 
-fn map_stop_reason(sr: &str) -> String {
-    match sr {
-        "tool_use" => "tool_calls".to_string(),
-        "end_turn" | "stop_sequence" => "stop".to_string(),
-        "max_tokens" => "length".to_string(),
-        other => other.to_string(),
+/// Maps an Anthropic `stop_reason` string to an OpenAI `finish_reason`.
+///
+/// See Anthropic docs:
+///   <https://docs.anthropic.com/claude/reference/messages>
+///
+/// All currently-documented values:
+///   - `end_turn`      -> `"stop"`           — normal completion
+///   - `max_tokens`    -> `"length"`         — hit max_tokens budget
+///   - `stop_sequence` -> `"stop"`           — hit a configured stop string
+///   - `tool_use`      -> `"tool_calls"`     — model wants to call a tool
+///   - `pause_turn`    -> `"pause"`          — newer Anthropic event emitted
+///                                              on very long single turns
+///                                              (e.g. extended thinking).
+///                                              OpenAI doesn't have this; we
+///                                              surface it verbatim so
+///                                              callers that integrate with
+///                                              the pause/resume flow can
+///                                              detect it. OpenAI-only
+///                                              clients see an unexpected
+///                                              value but most SDKs accept
+///                                              arbitrary string values in
+///                                              `finish_reason` without
+///                                              crashing. If strict OpenAI
+///                                              compatibility is required,
+///                                              a future M3 config knob can
+///                                              remap `pause` -> `stop`.
+///   - `refusal`       -> `"content_filter"` — safety classifier blocked
+///   - anything else or `None` -> `"stop"`   — conservative fallback; we
+///                                              log unknown values at WARN.
+pub fn map_stop_reason(anthropic: Option<&str>) -> &'static str {
+    match anthropic {
+        Some("end_turn") | Some("stop_sequence") | None => "stop",
+        Some("max_tokens") => "length",
+        Some("tool_use") => "tool_calls",
+        Some("pause_turn") => "pause",
+        Some("refusal") => "content_filter",
+        Some(other) => {
+            tracing::warn!(
+                unknown_stop_reason = other,
+                "unknown Anthropic stop_reason, defaulting to 'stop'"
+            );
+            "stop"
+        }
     }
 }

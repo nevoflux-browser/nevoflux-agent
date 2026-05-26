@@ -238,3 +238,89 @@ fn parse_sse(content: &str) -> Vec<(String, Value)> {
     }
     events
 }
+
+// -------------------------------------------------------------------------
+// M2-4: Anthropic stop_reason -> OpenAI finish_reason mapping.
+// -------------------------------------------------------------------------
+
+#[test]
+fn stop_reason_end_turn_maps_to_stop() {
+    assert_eq!(map_stop_reason(Some("end_turn")), "stop");
+}
+
+#[test]
+fn stop_reason_stop_sequence_maps_to_stop() {
+    assert_eq!(map_stop_reason(Some("stop_sequence")), "stop");
+}
+
+#[test]
+fn stop_reason_max_tokens_maps_to_length() {
+    assert_eq!(map_stop_reason(Some("max_tokens")), "length");
+}
+
+#[test]
+fn stop_reason_tool_use_maps_to_tool_calls() {
+    assert_eq!(map_stop_reason(Some("tool_use")), "tool_calls");
+}
+
+#[test]
+fn stop_reason_pause_turn_surfaces_as_pause() {
+    // `pause_turn` is newer (extended-thinking long single turns). OpenAI
+    // doesn't define a `pause` finish_reason, but we surface it verbatim
+    // so clients integrating with Anthropic's pause/resume flow can detect
+    // it. OpenAI-only clients tolerate unknown strings in `finish_reason`.
+    assert_eq!(map_stop_reason(Some("pause_turn")), "pause");
+}
+
+#[test]
+fn stop_reason_refusal_maps_to_content_filter() {
+    assert_eq!(map_stop_reason(Some("refusal")), "content_filter");
+}
+
+#[test]
+fn stop_reason_none_maps_to_stop() {
+    assert_eq!(map_stop_reason(None), "stop");
+}
+
+#[test]
+fn stop_reason_unknown_falls_back_to_stop() {
+    // Unknown future values must NOT panic and must NOT leak through;
+    // the conservative fallback is "stop" (with a WARN log).
+    assert_eq!(map_stop_reason(Some("some_future_value")), "stop");
+}
+
+#[test]
+fn anthropic_refusal_translates_to_content_filter_finish_reason() {
+    let raw = r#"{
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-4-5-20251001",
+        "content": [{"type": "text", "text": "I can't help with that."}],
+        "stop_reason": "refusal",
+        "usage": {"input_tokens": 10, "output_tokens": 8}
+    }"#;
+    let resp: AnthropicResponse = serde_json::from_str(raw).unwrap();
+    let openai = anthropic_to_openai_response(resp);
+    assert_eq!(openai.choices[0].finish_reason, "content_filter");
+    assert!(
+        openai.choices[0].message.content.is_some(),
+        "refusal still includes the model's explanation in content"
+    );
+}
+
+#[test]
+fn anthropic_pause_turn_translates_to_pause_finish_reason() {
+    let raw = r#"{
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-4-5-20251001",
+        "content": [{"type": "text", "text": "I'm thinking..."}],
+        "stop_reason": "pause_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5}
+    }"#;
+    let resp: AnthropicResponse = serde_json::from_str(raw).unwrap();
+    let openai = anthropic_to_openai_response(resp);
+    assert_eq!(openai.choices[0].finish_reason, "pause");
+}
