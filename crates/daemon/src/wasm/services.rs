@@ -260,6 +260,15 @@ pub struct HostServices {
     /// stash it here so they can build a host without having to reach into
     /// `Handle::current()` from a `'static`-spawned task.
     pub runtime_handle: Option<tokio::runtime::Handle>,
+
+    /// Live gbrain subprocess supervisor (M3-4). When set, the daemon's
+    /// tool dispatch routers (`mcp_tool_executor::execute_mcp_tool` and
+    /// `agent_host::tool_call_dynamic`) recognize the `brain_*` tool
+    /// prefix and forward calls through this supervisor to the running
+    /// gbrain subprocess. `None` means the brain subsystem failed to
+    /// boot or is disabled — brain tool calls surface a clear error
+    /// in that case.
+    pub brain_supervisor: Option<Arc<crate::gbrain::GbrainSupervisor>>,
 }
 
 impl HostServices {
@@ -322,6 +331,7 @@ impl HostServices {
             loop_manager: None,
             agent_config: None,
             runtime_handle: None,
+            brain_supervisor: None,
         }
     }
 
@@ -363,6 +373,7 @@ impl HostServices {
             loop_manager: None,
             agent_config: None,
             runtime_handle: None,
+            brain_supervisor: None,
         }
     }
 
@@ -472,6 +483,20 @@ impl HostServices {
     /// runtime that would deadlock against the dispatcher.
     pub fn with_runtime_handle(mut self, h: tokio::runtime::Handle) -> Self {
         self.runtime_handle = Some(h);
+        self
+    }
+
+    /// Attach the gbrain subprocess supervisor (M3-4).
+    ///
+    /// Once set, the daemon's tool dispatch routers recognize the
+    /// `brain_*` tool prefix and forward calls through this supervisor.
+    /// Without this, brain tool calls return a clear ConfigMissing-style
+    /// error instead of being silently dropped.
+    pub fn with_brain_supervisor(
+        mut self,
+        supervisor: Arc<crate::gbrain::GbrainSupervisor>,
+    ) -> Self {
+        self.brain_supervisor = Some(supervisor);
         self
     }
 
@@ -794,6 +819,10 @@ impl std::fmt::Debug for HostServices {
             .field(
                 "runtime_handle",
                 &self.runtime_handle.as_ref().map(|_| "Some(...)"),
+            )
+            .field(
+                "brain_supervisor",
+                &self.brain_supervisor.as_ref().map(|_| "Some(...)"),
             )
             .finish()
     }

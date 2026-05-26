@@ -3244,11 +3244,90 @@ impl HostFunctions for DaemonHostFunctions {
             }
         }
 
-        // Services and MCP manager required for dynamic tool dispatch
+        // Services required for dynamic tool dispatch
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
             message: "Services not available".into(),
         })?;
+
+        // Intercept brain_* tools (M3-4) before falling through to MCP
+        // manager. Brain tools live on the gbrain subprocess supervisor,
+        // not in the external MCP manager registry, so they need their
+        // own dispatch arm. See `brain_tools::DEFAULT_TOOLS` for the
+        // allowlist and `crates/mcp_tool_executor.rs` for the mirror
+        // dispatch on the ACP/MCP-HTTP path.
+        if tool_name.starts_with("brain_") {
+            let traced_name = format!("dynamic:{}", tool_name);
+            let Some(def) = crate::brain_tools::lookup_by_nevoflux_name(tool_name) else {
+                let msg = format!(
+                    "brain tool {tool_name} is not in the default allowlist; see crates/daemon/src/brain_tools.rs DEFAULT_TOOLS"
+                );
+                let duration_ms = start.elapsed().as_millis() as u64;
+                self.record_tool(
+                    &traced_name,
+                    Some(arguments.to_string()),
+                    false,
+                    Some("100".into()),
+                    Some(msg.clone()),
+                    duration_ms,
+                    Some(arguments.clone()),
+                    None,
+                );
+                return Err(HostError {
+                    code: 100,
+                    message: msg,
+                });
+            };
+            let supervisor = services.brain_supervisor.as_ref().ok_or_else(|| HostError {
+                code: 100,
+                message: format!(
+                    "brain tool {tool_name} requires the gbrain subsystem, but it is not running"
+                ),
+            })?;
+
+            let runtime = self.runtime.clone();
+            let supervisor = supervisor.clone();
+            let gbrain_name = def.gbrain_name;
+            let args = arguments.clone();
+            let result = tokio::task::block_in_place(|| {
+                runtime.block_on(async move {
+                    crate::brain_tools::invoke_brain_tool(&supervisor, gbrain_name, args).await
+                })
+            });
+
+            let duration_ms = start.elapsed().as_millis() as u64;
+            match result {
+                Ok(text) => {
+                    self.record_tool(
+                        &traced_name,
+                        Some(arguments.to_string()),
+                        true,
+                        None,
+                        None,
+                        duration_ms,
+                        Some(arguments.clone()),
+                        None,
+                    );
+                    return Ok(text);
+                }
+                Err(e) => {
+                    self.record_tool(
+                        &traced_name,
+                        Some(arguments.to_string()),
+                        false,
+                        Some("100".into()),
+                        Some(e.clone()),
+                        duration_ms,
+                        Some(arguments.clone()),
+                        None,
+                    );
+                    return Err(HostError {
+                        code: 100,
+                        message: e,
+                    });
+                }
+            }
+        }
 
         let mcp_manager = services.mcp_manager.as_ref().ok_or_else(|| HostError {
             code: 2,

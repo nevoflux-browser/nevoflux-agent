@@ -1382,6 +1382,17 @@ pub async fn start_server(
     if let Some(retriever) = knowledge_retriever {
         services = services.with_knowledge_retriever(retriever);
     }
+    // M3-4: Expose gbrain to the agent's tool dispatch routers. Only
+    // wired when init_brain succeeded; absence means the brain
+    // subsystem is disabled / failed to boot, and brain_* tool calls
+    // surface a clear error.
+    if let Some(supervisor) = brain_supervisor.as_ref() {
+        services = services.with_brain_supervisor(supervisor.clone());
+        info!(
+            "registered {} brain tools with the agent's MCP tool registry",
+            crate::brain_tools::DEFAULT_TOOLS.len()
+        );
+    }
     if let Some(computer) = crate::agent::computer_tools::create_computer() {
         services = services.with_computer_controller(Arc::new(computer));
         info!("Computer controller initialized");

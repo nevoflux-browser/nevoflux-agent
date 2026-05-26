@@ -322,6 +322,31 @@ pub async fn execute_mcp_tool(
         }
     }
 
+    // 0'. gbrain knowledge-base tools (M3-4).
+    //
+    // The agent calls these as `brain_*`. We translate to the gbrain-
+    // side tool name (no prefix) and forward through the running
+    // supervisor. If the brain subsystem isn't up (services.brain_supervisor
+    // is None), surface a clear error rather than falling through to the
+    // generic "unknown tool" branch — the agent gets a more actionable
+    // hint about what's misconfigured.
+    if name.starts_with("brain_") {
+        let Some(def) = crate::brain_tools::lookup_by_nevoflux_name(name) else {
+            return Err(format!(
+                "brain tool {name} is not in the default allowlist; see crates/daemon/src/brain_tools.rs DEFAULT_TOOLS"
+            ));
+        };
+        let supervisor = services.brain_supervisor.as_ref().ok_or_else(|| {
+            format!(
+                "brain tool {name} requires the gbrain subsystem, but it is not running \
+                 (check knowledge_base.brain.enabled in config, and that bun + gbrain CLI \
+                 are installed)"
+            )
+        })?;
+        return crate::brain_tools::invoke_brain_tool(supervisor, def.gbrain_name, arguments.clone())
+            .await;
+    }
+
     // 1. Browser tools
     if let Some(action) = tool_name_to_browser_action(name) {
         let browser_ctx = services
