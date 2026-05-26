@@ -1,0 +1,20 @@
+{
+  "model": "mimo-v2.5-pro",
+  "max_tokens": 500,
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "city": {"type": "string", "description": "City name"}
+        },
+        "required": ["city"]
+      }
+    }
+  ],
+  "messages": [
+    {"role": "user", "content": "What's the weather in Tokyo and Paris? Call the tool in parallel for both cities in a single turn."}
+  ]
+}

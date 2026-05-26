@@ -1,0 +1,40 @@
+{
+  "model": "mimo-v2.5-pro",
+  "max_tokens": 500,
+  "tools": [
+    {
+      "name": "add",
+      "description": "Add two integers",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "a": {"type": "integer"},
+          "b": {"type": "integer"}
+        },
+        "required": ["a", "b"]
+      }
+    },
+    {
+      "name": "multiply",
+      "description": "Multiply two integers",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "a": {"type": "integer"},
+          "b": {"type": "integer"}
+        },
+        "required": ["a", "b"]
+      }
+    }
+  ],
+  "messages": [
+    {"role": "user", "content": "What is (3 + 4) * 5? Use the tools step by step. After getting both results, answer with the final number."},
+    {"role": "assistant", "content": [
+      {"type": "text", "text": "I'll solve this step by step using the tools!\n\n**Step 1:** First, let's calculate 3 + 4:"},
+      {"type": "tool_use", "id": "call_c4f5d6696cae4b8d8e55ff80", "name": "add", "input": {"a": 3, "b": 4}}
+    ]},
+    {"role": "user", "content": [
+      {"type": "tool_result", "tool_use_id": "call_c4f5d6696cae4b8d8e55ff80", "content": "7"}
+    ]}
+  ]
+}

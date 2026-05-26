@@ -1,0 +1,1 @@
+{"id":"574a76a6c12942b385ceee89fa568c96","type":"message","role":"assistant","model":"mimo-v2.5-pro","stop_reason":"end_turn","content":[{"type":"text","text":"**Final answer:** (3 + 4) × 5 = **35**"},{"type":"thinking","thinking":"The final result is 35.","signature":""}],"usage":{"input_tokens":108,"output_tokens":29,"cache_read_input_tokens":704}}

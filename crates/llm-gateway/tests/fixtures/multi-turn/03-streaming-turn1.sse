@@ -1,0 +1,144 @@
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_f7794f3294384fc8b1a43fe6","type":"message","role":"assistant","model":"mimo-v2.5-pro","content":[],"usage":{"input_tokens":0,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"The"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" user"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" wants"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" me"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" to calculate (3"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" + 4)"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" * 5 using"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" the tools"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" step"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" by"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" step"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":".\n\n"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"First, I"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" need to calculate"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" 3 + "},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"4, then multiply"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" that"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" result by 5"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":".\n\nLet me start"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":" with the addition"},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"."},"index":0}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"signature_delta","signature":""},"index":0}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"I"},"index":1}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"'ll"},"index":1}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" help"},"index":1}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" you calculate"},"index":1}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" (3"},"index":1}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" + 4)"},"index":1}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" * 5 step"},"index":1}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" by"},"index":1}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" step"},"index":1}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" using the tools!\n\n"},"index":1}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"**Step 1"},"index":1}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":":**"},"index":1}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" First, let"},"index":1}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"'s add"},"index":1}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" 3 + "},"index":1}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"4"},"index":1}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call_85a1a988cf30403397fd693f","name":"add","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"a\": 3, \"b\": 4}"},"index":2}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":2}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"input_tokens":40,"output_tokens":114,"cache_read_input_tokens":576}}
+
+event: message_stop
+data: {"type":"message_stop"}
+

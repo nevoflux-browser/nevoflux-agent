@@ -1,0 +1,28 @@
+{
+  "model": "mimo-v2.5-pro",
+  "max_tokens": 500,
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "city": {"type": "string", "description": "City name"}
+        },
+        "required": ["city"]
+      }
+    }
+  ],
+  "messages": [
+    {"role": "user", "content": "What's the weather in Tokyo and Paris? Call the tool in parallel for both cities in a single turn."},
+    {"role": "assistant", "content": [
+      {"type": "tool_use", "id": "call_48a82ed8354a405b90b22737", "name": "get_weather", "input": {"city": "Tokyo"}},
+      {"type": "tool_use", "id": "call_dd174ceefda34da9838ca456", "name": "get_weather", "input": {"city": "Paris"}}
+    ]},
+    {"role": "user", "content": [
+      {"type": "tool_result", "tool_use_id": "call_48a82ed8354a405b90b22737", "content": "sunny, 22C"},
+      {"type": "tool_result", "tool_use_id": "call_dd174ceefda34da9838ca456", "content": "rainy, 14C"}
+    ]}
+  ]
+}
