@@ -308,6 +308,16 @@ pub struct Server {
     /// downstream consumers (gbrain subprocess in M3). [`None`] when
     /// the gateway is disabled.
     gateway_snapshot: Option<crate::llm_gateway::GatewayHandleSnapshot>,
+    /// Live gbrain supervisor, if `knowledge_base.brain.enabled = true`
+    /// at boot AND the gateway came up AND bun + gbrain cli were
+    /// reachable (M3-3). Stored here so [`Self::shutdown`] can
+    /// gracefully stop the subprocess before the daemon exits.
+    brain_supervisor: Option<Arc<crate::gbrain::GbrainSupervisor>>,
+    /// Trait-object handle for the active gbrain-backed knowledge base
+    /// (M3-3). Cloned and handed to downstream consumers (M3-4 tool
+    /// registry, M4 frontend). [`None`] when the brain subsystem is
+    /// disabled or failed to boot.
+    brain_engine: Option<Arc<dyn nevoflux_brain::BrainEngine>>,
     /// Shared slot populated by the background embedding-init task with
     /// the memory-reindex progress receiver (M1 #009). [`None`] when
     /// `knowledge_base.enabled = false`, the embedding subsystem is
@@ -327,6 +337,13 @@ impl Server {
         self.gateway_snapshot.clone()
     }
 
+    /// Trait-object handle for the active gbrain-backed knowledge base
+    /// (M3-3). `None` when the brain subsystem is disabled or failed to
+    /// boot. M3-4 wires this into the agent's tool registry.
+    pub fn brain(&self) -> Option<Arc<dyn nevoflux_brain::BrainEngine>> {
+        self.brain_engine.clone()
+    }
+
     /// Current memory-reindex progress snapshot (M1 #009).
     ///
     /// Returns `None` when no reindex was scheduled (knowledge base
@@ -343,6 +360,21 @@ impl Server {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(()).await;
         }
+        // Brain goes down before the gateway: gbrain talks TO the
+        // gateway, not the other way around, so we want gbrain to stop
+        // making upstream calls before we tear down the listener.
+        if let Some(supervisor) = self.brain_supervisor.take() {
+            tracing::info!("shutting down gbrain supervisor");
+            // shutdown() takes &self (see M3-3 refactor); the engine's
+            // Arc clone is still alive but that's fine — the supervisor
+            // owns the subprocess via Mutex<Option<JoinHandle>>, so the
+            // call cleanly tears down the child even with other Arcs
+            // outstanding.
+            supervisor.shutdown().await;
+        }
+        // Drop the engine's Arc clone too so subsequent accessor calls
+        // see None.
+        self.brain_engine = None;
         if let Some(gateway) = self.gateway.take() {
             tracing::info!("shutting down in-process llm-gateway");
             gateway.shutdown().await;
@@ -595,6 +627,27 @@ pub async fn start_server(
     };
     let (gateway_handle, gateway_snapshot) = match gateway_boot {
         Some(boot) => (Some(boot.handle), Some(boot.snapshot)),
+        None => (None, None),
+    };
+
+    // Boot the gbrain integration (M3-3). Depends on the gateway being
+    // up: gbrain reads its `OPENROUTER_*` env vars from the gateway
+    // snapshot at spawn time. Brain init failure is non-fatal — the
+    // daemon continues without the knowledge base; the user can fix
+    // their config (install bun, run the M3-5 install wizard) and
+    // restart.
+    let brain_boot =
+        match crate::init_brain::init_brain(&agent_config.knowledge_base, &gateway_snapshot)
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                error!("init_brain failed: {e}; continuing without brain");
+                None
+            }
+        };
+    let (brain_supervisor, brain_engine) = match brain_boot {
+        Some(b) => (Some(b.supervisor), Some(b.engine)),
         None => (None, None),
     };
 
@@ -3553,6 +3606,8 @@ pub async fn start_server(
         shutdown_tx: Some(shutdown_tx),
         gateway: gateway_handle,
         gateway_snapshot,
+        brain_supervisor,
+        brain_engine,
         reindex_progress: reindex_progress_slot,
     })
 }

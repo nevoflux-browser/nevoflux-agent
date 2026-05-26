@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::process::{Child, ChildStderr, Command};
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -165,6 +165,15 @@ pub enum SupervisorState {
 /// shutdown channel and the most-recent [`McpClient`] (which is
 /// replaced on every restart). Drop semantics: dropping the handle does
 /// NOT shut down the supervisor; call [`Self::shutdown`] for that.
+///
+/// `shutdown_tx` + `main_handle` are stored behind a `Mutex<Option<_>>`
+/// (rather than just `Option<_>`) because callers commonly hold the
+/// supervisor inside an `Arc` (e.g. [`crate::gbrain::GbrainEngine`]
+/// keeps an `Arc<dyn McpToolCaller>` clone), which means a consuming
+/// `shutdown(self)` is impossible without `Arc::try_unwrap` — and that
+/// fails as soon as another consumer holds a clone. Taking `&self` with
+/// interior mutability sidesteps the problem at the cost of two small
+/// async-aware mutexes.
 pub struct GbrainSupervisor {
     config: GbrainConfig,
     state: Arc<RwLock<SupervisorState>>,
@@ -172,8 +181,8 @@ pub struct GbrainSupervisor {
     /// Sender retained so callers using `watch::Receiver` (via
     /// [`Self::subscribe_state`]) can be notified of transitions.
     state_tx: watch::Sender<SupervisorState>,
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    main_handle: Option<JoinHandle<()>>,
+    shutdown_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    main_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl GbrainSupervisor {
@@ -210,8 +219,8 @@ impl GbrainSupervisor {
             state,
             client,
             state_tx,
-            shutdown_tx: Some(shutdown_tx),
-            main_handle: Some(main_handle),
+            shutdown_tx: Mutex::new(Some(shutdown_tx)),
+            main_handle: Mutex::new(Some(main_handle)),
         }
     }
 
@@ -292,9 +301,13 @@ impl GbrainSupervisor {
     /// EOF and exits cleanly), then waits up to 5 s for the supervisor
     /// task to exit.
     ///
-    /// Idempotent — calling twice is fine; subsequent calls are no-ops.
-    pub async fn shutdown(mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
+    /// Takes `&self` (not `self`) so it works when the supervisor is
+    /// held inside an [`Arc`] — see the struct-level docs. Internal
+    /// state lives behind a `Mutex<Option<_>>`, so calling twice is
+    /// idempotent (the second call observes `None` and returns
+    /// immediately).
+    pub async fn shutdown(&self) {
+        if let Some(tx) = self.shutdown_tx.lock().await.take() {
             let _ = tx.send(());
         }
         // Take the current client (if any) and gracefully close it; the
@@ -304,7 +317,8 @@ impl GbrainSupervisor {
         if let Some(client) = client_opt {
             client.shutdown().await;
         }
-        if let Some(handle) = self.main_handle.take() {
+        let handle_opt = self.main_handle.lock().await.take();
+        if let Some(handle) = handle_opt {
             let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
         }
     }

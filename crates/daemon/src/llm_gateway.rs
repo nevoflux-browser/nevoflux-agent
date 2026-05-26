@@ -361,6 +361,7 @@ mod tests {
         let cfg = KnowledgeBaseConfig {
             enabled: false,
             gateway: GatewayUpstreamConfig::default(),
+            brain: crate::config::BrainConfig::default(),
         };
         let result = init_gateway(&cfg).await.expect("disabled is not an error");
         assert!(
@@ -377,6 +378,7 @@ mod tests {
         let cfg = KnowledgeBaseConfig {
             enabled: true,
             gateway: GatewayUpstreamConfig::default(),
+            brain: crate::config::BrainConfig::default(),
         };
         let boot = init_gateway(&cfg)
             .await

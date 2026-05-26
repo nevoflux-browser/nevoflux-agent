@@ -35,6 +35,7 @@ pub mod event_bus;
 pub mod file_picker;
 pub mod gbrain;
 pub mod health;
+pub mod init_brain;
 pub mod learning;
 pub mod llm_gateway;
 pub mod loops;
@@ -56,9 +57,10 @@ pub mod validation;
 pub mod wasm;
 
 pub use config::{
-    AgentConfig, AuthConfig, ConfigError, ContextConfig, DaemonConfig, KnowledgeBaseConfig,
-    LlmConfig, LoggingConfig, SessionConfig, StorageConfig,
+    AgentConfig, AuthConfig, BrainConfig, ConfigError, ContextConfig, DaemonConfig,
+    KnowledgeBaseConfig, LlmConfig, LoggingConfig, SessionConfig, StorageConfig,
 };
+pub use init_brain::{init_brain, BrainBoot};
 pub use config_watcher::{create_config_watcher, ConfigReceiver, ConfigWatcher, WatcherError};
 pub use error::{DaemonError, Result};
 pub use mcp_config::{McpConfigError, McpServerConfigFile, McpServersConfig};

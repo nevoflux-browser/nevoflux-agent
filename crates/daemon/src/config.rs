@@ -1340,6 +1340,15 @@ pub struct KnowledgeBaseConfig {
     /// defaults on top.
     #[serde(default)]
     pub gateway: GatewayUpstreamConfig,
+
+    /// gbrain subprocess + integration configuration (M3-3). `enabled`
+    /// here is a finer-grained switch than [`Self::enabled`]: gateway
+    /// might be desired (for LLM routing) without the brain. Default is
+    /// `false` so existing daemons don't suddenly spawn an unexpected
+    /// subprocess just because they had `[knowledge_base] enabled = true`
+    /// for the gateway.
+    #[serde(default)]
+    pub brain: BrainConfig,
 }
 
 fn default_knowledge_base_enabled() -> bool {
@@ -1351,8 +1360,73 @@ impl Default for KnowledgeBaseConfig {
         Self {
             enabled: default_knowledge_base_enabled(),
             gateway: GatewayUpstreamConfig::default(),
+            brain: BrainConfig::default(),
         }
     }
+}
+
+/// Configuration for the gbrain subprocess + integration (M3-3).
+///
+/// `enabled` is a finer-grained switch than
+/// [`KnowledgeBaseConfig::enabled`]: gateway might be desired (for LLM
+/// routing) without the brain. Default is `false` so existing daemons
+/// don't suddenly spawn an unexpected subprocess.
+///
+/// Path resolution is layered: a non-empty config value wins; an empty
+/// value falls back to a built-in default (see
+/// `crates/daemon/src/init_brain.rs`).
+///
+/// ```toml
+/// [knowledge_base.brain]
+/// enabled = true
+/// bun_path = ""                  # empty = which::which("bun")
+/// gbrain_cli_path = ""           # empty = ~/.nevoflux/brain-tool/node_modules/gbrain/src/cli.ts
+/// brain_dir = ""                 # empty = ~/.gbrain (gbrain default)
+/// initialize_timeout_secs = 0    # 0 = 10s default
+/// request_timeout_secs = 0       # 0 = 30s
+/// max_restarts_within_window = 0 # 0 = 3
+/// restart_window_secs = 0        # 0 = 60s
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BrainConfig {
+    /// Whether to spawn the gbrain supervisor at daemon startup.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Absolute path to the bun executable. Empty = look up `bun` in
+    /// `$PATH` via `which::which`. On Windows expect
+    /// `C:\Users\<user>\.bun\bin\bun.exe`.
+    #[serde(default)]
+    pub bun_path: String,
+
+    /// Absolute path to gbrain's `cli.ts` inside `node_modules`. Empty =
+    /// derive from the standard install location
+    /// `~/.nevoflux/brain-tool/node_modules/gbrain/src/cli.ts` (where
+    /// the M3-5 install wizard will place it).
+    #[serde(default)]
+    pub gbrain_cli_path: String,
+
+    /// Override gbrain's brain repo dir. Empty = use the default
+    /// `~/.gbrain/` (which gbrain reads regardless of the `--brain-dir`
+    /// flag). Honored via `$GBRAIN_BRAIN_DIR` env var.
+    #[serde(default)]
+    pub brain_dir: String,
+
+    /// Initialize timeout (seconds). 0 = built-in default (10s).
+    #[serde(default)]
+    pub initialize_timeout_secs: u64,
+
+    /// Per-request timeout for `tools/call` (seconds). 0 = 30s default.
+    #[serde(default)]
+    pub request_timeout_secs: u64,
+
+    /// Max restarts within a sliding window before giving up. 0 = 3.
+    #[serde(default)]
+    pub max_restarts_within_window: u32,
+
+    /// Sliding window length (seconds) for the restart budget. 0 = 60s.
+    #[serde(default)]
+    pub restart_window_secs: u64,
 }
 
 /// Upstream LLM provider config for the in-process gateway (M2-5).
