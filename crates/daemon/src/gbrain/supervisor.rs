@@ -82,6 +82,46 @@ pub enum SupervisorError {
 /// Result alias for fallible supervisor operations.
 pub type SupervisorResult<T> = std::result::Result<T, SupervisorError>;
 
+/// Error type returned by [`McpToolCaller`] implementations.
+///
+/// Boxed `dyn Error + Send + Sync` so the trait stays generic over the
+/// underlying transport's error type (the production transport returns
+/// [`SupervisorError`]; test stubs can return anything). Callers
+/// typically convert these to [`nevoflux_brain::BrainError::Backend`].
+pub type McpToolCallerError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Abstraction over an MCP transport that can dispatch `tools/call`
+/// requests. Production callers use [`GbrainSupervisor`] (which spawns
+/// gbrain serve and tracks its lifecycle); tests can substitute an
+/// in-memory stub to avoid spawning the real subprocess.
+#[async_trait::async_trait]
+pub trait McpToolCaller: Send + Sync {
+    /// Dispatch an MCP `tools/call` and return the full JSON-RPC
+    /// response value (the outer envelope including `result`, `id`,
+    /// etc. — callers are responsible for pulling out `result.content`).
+    async fn call_tool_dyn(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, McpToolCallerError>;
+}
+
+#[async_trait::async_trait]
+impl McpToolCaller for GbrainSupervisor {
+    async fn call_tool_dyn(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, McpToolCallerError> {
+        // Delegate to the inherent method that already exists on
+        // GbrainSupervisor (defined below). Boxing SupervisorError as a
+        // dyn Error preserves the underlying chain via downcast.
+        self.call_tool(name, arguments)
+            .await
+            .map_err(|e| Box::new(e) as McpToolCallerError)
+    }
+}
+
 /// High-level supervisor lifecycle state.
 ///
 /// Transitions:

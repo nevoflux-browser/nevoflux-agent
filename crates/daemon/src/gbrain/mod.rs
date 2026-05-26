@@ -12,14 +12,22 @@
 //!   stdio client. Reader + writer each run in their own tokio task.
 //! - [`supervisor`] — [`GbrainSupervisor`], the lifecycle owner.
 //!
-//! The module intentionally does NOT depend on `nevoflux-brain`. The
-//! `BrainEngine` trait implementation that wraps this supervisor lives
-//! in `crates/brain/` (M3-2).
+//! M3-2 adds [`engine::GbrainEngine`] in this same module — a thin
+//! [`nevoflux_brain::BrainEngine`] implementation that dispatches every
+//! trait method to gbrain MCP `tools/call` requests via the supervisor.
+//! Architecturally the engine lives next to the supervisor (not in
+//! `crates/brain/`) because daemon owns gbrain's subprocess lifecycle
+//! and the engine is the natural extension of the supervisor; the brain
+//! crate stays trait-only.
 
 pub mod config;
+pub mod engine;
 pub mod mcp_client;
 pub mod supervisor;
 
 pub use config::GbrainConfig;
+pub use engine::GbrainEngine;
 pub use mcp_client::{McpClient, McpError, McpResult};
-pub use supervisor::{GbrainSupervisor, SupervisorError, SupervisorResult, SupervisorState};
+pub use supervisor::{
+    GbrainSupervisor, McpToolCaller, SupervisorError, SupervisorResult, SupervisorState,
+};

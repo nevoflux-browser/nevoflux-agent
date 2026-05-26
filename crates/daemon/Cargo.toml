@@ -23,6 +23,7 @@ nevoflux-llm = { path = "../llm", default-features = false }
 nevoflux-llm-gateway = { path = "../llm-gateway" }
 nevoflux-computer = { path = "../computer" }
 nevoflux-builtin-wasm = { path = "../builtin-wasm" }
+nevoflux-brain = { path = "../brain" }
 
 # LLM framework
 rig-core = { workspace = true }

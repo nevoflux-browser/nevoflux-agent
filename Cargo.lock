@@ -3517,6 +3517,7 @@ dependencies = [
  "ignore",
  "image",
  "monty",
+ "nevoflux-brain",
  "nevoflux-builtin-wasm",
  "nevoflux-computer",
  "nevoflux-llm",
