@@ -12,7 +12,8 @@ use std::{net::SocketAddr, time::Duration};
 
 use nevoflux_llm_gateway::{
     serve as serve_gateway, GatewayConfig, GatewayHandle, DEFAULT_ANTHROPIC_VERSION,
-    DEFAULT_UPSTREAM_BASE,
+    DEFAULT_UPSTREAM_BASE, DEFAULT_UPSTREAM_CONNECT_TIMEOUT, DEFAULT_UPSTREAM_REQUEST_TIMEOUT,
+    DEFAULT_UPSTREAM_RETRY_MAX_WAIT, DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT,
 };
 use rand::RngCore;
 use tracing::{info, warn};
@@ -109,6 +110,12 @@ pub async fn init_gateway(
         upstream_api_key,
         upstream_model_remap,
         anthropic_version,
+        // M2-3: use the gateway's documented defaults. When the daemon
+        // grows a TOML knob for these (M2-5), they'll flow through here.
+        upstream_request_timeout: DEFAULT_UPSTREAM_REQUEST_TIMEOUT,
+        upstream_connect_timeout: DEFAULT_UPSTREAM_CONNECT_TIMEOUT,
+        upstream_stream_idle_timeout: DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT,
+        upstream_retry_max_wait: DEFAULT_UPSTREAM_RETRY_MAX_WAIT,
     };
 
     let handle = serve_gateway(gateway_config)

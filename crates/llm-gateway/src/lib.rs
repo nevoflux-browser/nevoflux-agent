@@ -17,12 +17,15 @@
 //! decisions (#25, #26) implemented in [`translate`].
 
 pub mod embedding_dim;
+pub mod error;
 pub mod translate;
 
 mod handlers;
 mod server;
 
+pub use error::{GatewayError, TimeoutPhase};
 pub use server::{
     serve, GatewayConfig, GatewayHandle, DEFAULT_ANTHROPIC_VERSION, DEFAULT_PORT,
-    DEFAULT_UPSTREAM_BASE,
+    DEFAULT_UPSTREAM_BASE, DEFAULT_UPSTREAM_CONNECT_TIMEOUT, DEFAULT_UPSTREAM_REQUEST_TIMEOUT,
+    DEFAULT_UPSTREAM_RETRY_MAX_WAIT, DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT,
 };

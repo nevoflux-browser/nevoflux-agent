@@ -39,6 +39,9 @@ tracing-subscriber = { workspace = true }
 # HTTP client (for upstream)
 reqwest = { workspace = true }
 
+# HTTP-date parsing for `Retry-After` (RFC 7231 date format).
+httpdate = "1"
+
 # IDs
 uuid = { workspace = true }
 

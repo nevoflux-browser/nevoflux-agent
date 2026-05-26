@@ -29,6 +29,24 @@ pub const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Default loopback port used when running standalone via env vars.
 pub const DEFAULT_PORT: u16 = 19501;
 
+/// Default total budget for a non-stream upstream request (M2-3).
+pub const DEFAULT_UPSTREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default TCP/TLS connect budget (M2-3).
+pub const DEFAULT_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default per-chunk idle budget for streaming responses (M2-3).
+///
+/// If no chunk arrives from upstream within this window, the gateway
+/// emits a final OpenAI-compatible error chunk + `[DONE]` and closes
+/// the response cleanly.
+pub const DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Maximum `Retry-After` we'll honor before giving up and propagating
+/// the 429 directly to the client (M2-3). Anything longer is the
+/// client's problem to schedule.
+pub const DEFAULT_UPSTREAM_RETRY_MAX_WAIT: Duration = Duration::from_secs(5);
+
 /// Configuration for a single gateway instance.
 ///
 /// Built either from environment variables ([`GatewayConfig::from_env`])
@@ -53,6 +71,21 @@ pub struct GatewayConfig {
     pub upstream_model_remap: Option<String>,
     /// Value of the `anthropic-version` request header.
     pub anthropic_version: String,
+    /// Total budget for a non-stream upstream request (TCP/TLS + headers
+    /// + body). Wired to `reqwest::ClientBuilder::timeout` on the
+    /// non-stream client. Default: 60s.
+    pub upstream_request_timeout: Duration,
+    /// TCP/TLS connect budget for both clients. Default: 10s.
+    pub upstream_connect_timeout: Duration,
+    /// Per-chunk idle budget for streaming responses. Enforced manually
+    /// via `tokio::time::timeout` around each chunk read, because the
+    /// client-level `timeout()` is total-budget and would cap the whole
+    /// stream lifetime. Default: 60s.
+    pub upstream_stream_idle_timeout: Duration,
+    /// Maximum `Retry-After` we'll honor on a 429 before giving up and
+    /// propagating the 429 to our client. Past this, the client should
+    /// handle the longer wait itself. Default: 5s.
+    pub upstream_retry_max_wait: Duration,
 }
 
 impl GatewayConfig {
@@ -85,6 +118,25 @@ impl GatewayConfig {
             .unwrap_or(DEFAULT_PORT);
         let bind_addr = SocketAddr::from(([127, 0, 0, 1], port));
 
+        // M2-3: timeout knobs — all overridable via env vars, all
+        // expressed in whole seconds for simplicity.
+        let upstream_request_timeout = env_duration_secs(
+            "NEVOFLUX_LLM_GATEWAY_UPSTREAM_REQUEST_TIMEOUT_SECS",
+            DEFAULT_UPSTREAM_REQUEST_TIMEOUT,
+        );
+        let upstream_connect_timeout = env_duration_secs(
+            "NEVOFLUX_LLM_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_SECS",
+            DEFAULT_UPSTREAM_CONNECT_TIMEOUT,
+        );
+        let upstream_stream_idle_timeout = env_duration_secs(
+            "NEVOFLUX_LLM_GATEWAY_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS",
+            DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT,
+        );
+        let upstream_retry_max_wait = env_duration_secs(
+            "NEVOFLUX_LLM_GATEWAY_UPSTREAM_RETRY_MAX_WAIT_SECS",
+            DEFAULT_UPSTREAM_RETRY_MAX_WAIT,
+        );
+
         if upstream_api_key.is_empty() {
             tracing::warn!(
                 "NEVOFLUX_LLM_GATEWAY_UPSTREAM_API_KEY is unset — /v1/chat/completions will fail upstream"
@@ -98,7 +150,30 @@ impl GatewayConfig {
             upstream_api_key,
             upstream_model_remap,
             anthropic_version,
+            upstream_request_timeout,
+            upstream_connect_timeout,
+            upstream_stream_idle_timeout,
+            upstream_retry_max_wait,
         })
+    }
+}
+
+/// Read a `Duration` from an env var holding whole-second integer text,
+/// falling back to `default` if unset / unparsable. Helper for
+/// [`GatewayConfig::from_env`].
+fn env_duration_secs(name: &str, default: Duration) -> Duration {
+    match std::env::var(name) {
+        Ok(s) => match s.parse::<u64>() {
+            Ok(n) => Duration::from_secs(n),
+            Err(_) => {
+                tracing::warn!(
+                    "{name}={s:?} could not be parsed as u64 seconds, using default {:?}",
+                    default
+                );
+                default
+            }
+        },
+        Err(_) => default,
     }
 }
 
@@ -137,8 +212,20 @@ impl GatewayHandle {
 /// The actual `axum::serve(...)` call runs inside a spawned tokio task
 /// with a graceful-shutdown channel held by the returned handle.
 pub async fn serve(config: GatewayConfig) -> anyhow::Result<GatewayHandle> {
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
+    // M2-3: two clients with different timeout shapes.
+    //
+    // - `nonstream_http` has both `connect_timeout` and `timeout()`, so a
+    //   stuck non-stream request fails fast with a 504.
+    // - `stream_http` has only `connect_timeout`. The total-request
+    //   `timeout()` is too coarse for SSE (it would cap the whole stream
+    //   lifetime); instead we enforce an idle timeout per chunk via
+    //   `tokio::time::timeout` inside the streaming handler.
+    let nonstream_http = reqwest::Client::builder()
+        .connect_timeout(config.upstream_connect_timeout)
+        .timeout(config.upstream_request_timeout)
+        .build()?;
+    let stream_http = reqwest::Client::builder()
+        .connect_timeout(config.upstream_connect_timeout)
         .build()?;
 
     let bearer_token = config.bearer_token.clone();
@@ -150,7 +237,10 @@ pub async fn serve(config: GatewayConfig) -> anyhow::Result<GatewayHandle> {
         upstream_api_key: config.upstream_api_key,
         upstream_model_override: config.upstream_model_remap.unwrap_or_default(),
         anthropic_version: config.anthropic_version,
-        http,
+        nonstream_http,
+        stream_http,
+        upstream_stream_idle_timeout: config.upstream_stream_idle_timeout,
+        upstream_retry_max_wait: config.upstream_retry_max_wait,
         embedder: OnceCell::new(),
     });
 

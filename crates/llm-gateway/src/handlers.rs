@@ -6,7 +6,7 @@
 
 use axum::{
     extract::{Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -23,10 +23,12 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::Duration,
 };
 use tokio::sync::OnceCell;
 
 use crate::embedding_dim::{zero_pad_to_gateway_dim, GATEWAY_OUTPUT_DIM};
+use crate::error::{GatewayError, TimeoutPhase};
 use crate::translate::{
     anthropic_to_openai_response, openai_to_anthropic_request, AnthropicResponse,
     OpenAIChatRequest, StreamTranslator,
@@ -42,7 +44,19 @@ pub(crate) struct AppState {
     /// chat-completions request before hitting upstream. See 附录 B 决策 #25.
     pub(crate) upstream_model_override: String,
     pub(crate) anthropic_version: String,
-    pub(crate) http: reqwest::Client,
+    /// Client used for non-stream upstream calls. Has both
+    /// `connect_timeout` and `timeout()` set so a stuck request fails
+    /// fast with a 504.
+    pub(crate) nonstream_http: reqwest::Client,
+    /// Client used for streaming upstream calls. Only `connect_timeout`
+    /// is set on the client — total-request `timeout()` would cap the
+    /// whole stream lifetime, so per-chunk idle timeout is enforced via
+    /// `tokio::time::timeout` inside the SSE handler instead.
+    pub(crate) stream_http: reqwest::Client,
+    /// Per-chunk idle budget for streaming responses (M2-3).
+    pub(crate) upstream_stream_idle_timeout: Duration,
+    /// Maximum `Retry-After` we'll sleep on a 429 retry before giving up.
+    pub(crate) upstream_retry_max_wait: Duration,
     /// Lazily-initialized fastembed-backed embedder.
     ///
     /// Loading the ~120 MB ONNX weights is expensive, and gateways used
@@ -256,6 +270,34 @@ pub(crate) async fn chat_completions(
 ) -> Response {
     let req_idx = state.chat_request_count.fetch_add(1, Ordering::Relaxed) + 1;
     let stream = req.stream.unwrap_or(false);
+
+    match do_chat_completions(state, req, req_idx, stream).await {
+        Ok(response) => response,
+        Err(e) => {
+            // M2-3: log at severity appropriate to the failure class.
+            // Server-side problems (upstream 5xx, our own bugs) are
+            // errors; everything else (timeouts, 4xx, 429) is a warn.
+            match &e {
+                GatewayError::Internal { .. } | GatewayError::UpstreamServerError { .. } => {
+                    tracing::error!(req_idx, error = ?e, "chat_completions failed");
+                }
+                _ => {
+                    tracing::warn!(req_idx, error = ?e, "chat_completions failed");
+                }
+            }
+            error_to_response(&e)
+        }
+    }
+}
+
+/// Inner chat-completions implementation. Returns the success [`Response`]
+/// directly, or a [`GatewayError`] that the outer wrapper renders.
+async fn do_chat_completions(
+    state: Arc<AppState>,
+    req: OpenAIChatRequest,
+    req_idx: u64,
+    stream: bool,
+) -> Result<Response, GatewayError> {
     let model_for_chunks = req.model.clone();
 
     // Translate OpenAI -> Anthropic request shape.
@@ -265,9 +307,7 @@ pub(crate) async fn chat_completions(
     // Model remap (附录 B 决策 #25): some upstreams accept only a single
     // model name. The gateway is the abstraction layer where that mapping
     // happens. Driven by env var; empty = passthrough.
-    if !state.upstream_model_override.is_empty()
-        && anthr.model != state.upstream_model_override
-    {
+    if !state.upstream_model_override.is_empty() && anthr.model != state.upstream_model_override {
         tracing::debug!(
             req_idx,
             "remapping model {} -> {}",
@@ -288,98 +328,205 @@ pub(crate) async fn chat_completions(
         "chat_completions -> upstream"
     );
 
-    let upstream_body = match serde_json::to_vec(&anthr) {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!(req_idx, error = %e, "failed to encode upstream body");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "upstream encode failed"})),
-            )
-                .into_response();
-        }
+    let upstream_body = serde_json::to_vec(&anthr).map_err(|e| GatewayError::Internal {
+        detail: format!("upstream body encode failed: {e}"),
+    })?;
+
+    // Pick the right reqwest client: streaming needs no total-request
+    // timeout (we enforce a per-chunk idle timeout manually instead).
+    let client = if stream {
+        &state.stream_http
+    } else {
+        &state.nonstream_http
     };
 
-    let response = match state
-        .http
-        .post(&url)
-        .header("x-api-key", &state.upstream_api_key)
-        .header("anthropic-version", &state.anthropic_version)
-        .header("content-type", "application/json")
-        .body(upstream_body)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(req_idx, error = %e, "upstream POST failed");
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": format!("upstream POST failed: {e}")})),
-            )
-                .into_response();
-        }
-    };
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        tracing::error!(req_idx, %status, body = %body, "upstream non-2xx");
-        let code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        return (
-            code,
-            Json(serde_json::json!({
-                "error": "upstream error",
-                "status": status.as_u16(),
-                "body": body,
-            })),
-        )
-            .into_response();
-    }
+    let response = post_upstream(
+        client,
+        &url,
+        &state.upstream_api_key,
+        &state.anthropic_version,
+        upstream_body,
+        state.upstream_retry_max_wait,
+    )
+    .await?;
 
     if !stream {
         // Non-stream: read full body, parse, translate, return JSON.
-        let body = match response.text().await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::error!(req_idx, error = %e, "failed to read upstream body");
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({"error": "read upstream body failed"})),
-                )
-                    .into_response();
-            }
-        };
-        let anthr_resp: AnthropicResponse = match serde_json::from_str(&body) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!(req_idx, error = %e, raw = %body, "failed to parse anthropic response");
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "error": format!("parse upstream failed: {e}"),
-                        "raw": body,
-                    })),
-                )
-                    .into_response();
-            }
-        };
+        let body = response
+            .text()
+            .await
+            .map_err(|e| reqwest_to_gateway_error(&e))?;
+        let anthr_resp: AnthropicResponse =
+            serde_json::from_str(&body).map_err(|e| GatewayError::Internal {
+                detail: format!("parse upstream response failed: {e}"),
+            })?;
         let mut openai = anthropic_to_openai_response(anthr_resp);
         // Echo back the client's original model name so transcripts stay
         // consistent and clients don't reject the response.
         openai.model = original_model.clone();
         tracing::info!(req_idx, "chat_completions ok (non-stream)");
-        return Json(openai).into_response();
+        return Ok(Json(openai).into_response());
     }
 
     // Streaming: convert upstream byte stream -> Anthropic SSE events ->
     // OpenAI chunks -> outgoing SSE.
     let translator = StreamTranslator::new(model_for_chunks);
     let byte_stream = response.bytes_stream();
-    let sse_stream = build_sse_stream(byte_stream, translator, req_idx);
-    Sse::new(sse_stream)
+    let idle_timeout = state.upstream_stream_idle_timeout;
+    let sse_stream = build_sse_stream(byte_stream, translator, req_idx, idle_timeout);
+    Ok(Sse::new(sse_stream)
         .keep_alive(KeepAlive::new())
-        .into_response()
+        .into_response())
+}
+
+/// Render a [`GatewayError`] into an axum [`Response`] with the right
+/// status code, the OpenAI-compatible error envelope, and (for 429s) a
+/// `Retry-After` header echo.
+fn error_to_response(e: &GatewayError) -> Response {
+    let status = e.status_code();
+    let body = e.to_openai_body();
+    let mut resp = (status, Json(body)).into_response();
+    if let GatewayError::RateLimited {
+        retry_after: Some(d),
+        ..
+    } = e
+    {
+        let secs = d.as_secs();
+        if let Ok(hv) = HeaderValue::from_str(&secs.to_string()) {
+            resp.headers_mut().insert("Retry-After", hv);
+        }
+    }
+    resp
+}
+
+/// Send the upstream POST with one polite 429 retry.
+///
+/// On a 429 with `Retry-After` ≤ `retry_max_wait`, sleeps and retries
+/// once. Any other 429 (no `Retry-After`, or beyond max-wait) is
+/// propagated immediately so the client can schedule its own backoff.
+async fn post_upstream(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    anthropic_version: &str,
+    body: Vec<u8>,
+    retry_max_wait: Duration,
+) -> Result<reqwest::Response, GatewayError> {
+    let send = || async {
+        client
+            .post(url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", anthropic_version)
+            .header("content-type", "application/json")
+            .body(body.clone())
+            .send()
+            .await
+    };
+
+    let first = send().await.map_err(|e| reqwest_to_gateway_error(&e))?;
+    if first.status().as_u16() != 429 {
+        return classify_response(first).await;
+    }
+
+    // 429 path — check Retry-After. We MUST drain the headers + body
+    // before borrowing the response (else we drop it).
+    let retry_after = parse_retry_after(first.headers());
+    let body_text = first.text().await.unwrap_or_default();
+
+    match retry_after {
+        Some(d) if d <= retry_max_wait => {
+            tracing::info!(
+                retry_after_ms = d.as_millis() as u64,
+                "polite 429 retry"
+            );
+            tokio::time::sleep(d).await;
+            let second = send().await.map_err(|e| reqwest_to_gateway_error(&e))?;
+            if second.status().as_u16() == 429 {
+                let retry_after2 = parse_retry_after(second.headers());
+                let body_text2 = second.text().await.unwrap_or_default();
+                Err(GatewayError::RateLimited {
+                    retry_after: retry_after2,
+                    upstream_body: body_text2,
+                })
+            } else {
+                classify_response(second).await
+            }
+        }
+        // No Retry-After, or it exceeds our max — give up immediately
+        // and propagate. Client handles longer waits.
+        _ => Err(GatewayError::RateLimited {
+            retry_after,
+            upstream_body: body_text,
+        }),
+    }
+}
+
+/// Parse a `Retry-After` header value. Accepts either delta-seconds
+/// (`"5"`) or an HTTP-date (`"Wed, 21 Oct 2015 07:28:00 GMT"`) per
+/// RFC 7231 §7.1.3. Returns `None` if the header is missing or
+/// unparsable, or if the HTTP-date is in the past.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let v = headers.get("retry-after")?.to_str().ok()?;
+    let trimmed = v.trim();
+
+    // Try delta-seconds first — by far the most common form.
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+
+    // Fall through to HTTP-date format.
+    if let Ok(dt) = httpdate::parse_http_date(trimmed) {
+        let now = std::time::SystemTime::now();
+        return dt.duration_since(now).ok();
+    }
+
+    None
+}
+
+/// Inspect a `reqwest::Response` and either return it (2xx) or convert
+/// the upstream's non-2xx status into the appropriate [`GatewayError`].
+async fn classify_response(resp: reqwest::Response) -> Result<reqwest::Response, GatewayError> {
+    let status = resp.status().as_u16();
+    if (200..300).contains(&status) {
+        return Ok(resp);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    match status {
+        429 => Err(GatewayError::RateLimited {
+            retry_after: None,
+            upstream_body: body,
+        }),
+        s if (500..600).contains(&s) => Err(GatewayError::UpstreamServerError {
+            upstream_status: s,
+            upstream_body: body,
+        }),
+        s => Err(GatewayError::UpstreamClientError {
+            upstream_status: s,
+            upstream_body: body,
+        }),
+    }
+}
+
+/// Convert a `reqwest::Error` into a [`GatewayError`]. Connection
+/// failures map to `UpstreamUnreachable`, timeouts to `UpstreamTimeout`,
+/// everything else (decode failures, body errors) to `Internal`.
+fn reqwest_to_gateway_error(e: &reqwest::Error) -> GatewayError {
+    if e.is_timeout() {
+        // `reqwest::Error::is_timeout()` is true for both connect and
+        // request timeouts; we can't reliably distinguish without
+        // walking the source chain, so report as `Request`.
+        GatewayError::UpstreamTimeout {
+            phase: TimeoutPhase::Request,
+        }
+    } else if e.is_connect() {
+        GatewayError::UpstreamUnreachable {
+            detail: e.to_string(),
+        }
+    } else {
+        GatewayError::Internal {
+            detail: e.to_string(),
+        }
+    }
 }
 
 /// Build the outgoing SSE stream from upstream raw bytes + a translator.
@@ -387,10 +534,19 @@ pub(crate) async fn chat_completions(
 /// Parses upstream `event: <T>\ndata: <JSON>\n\n` frames, feeds each
 /// (event, data) into the translator, and emits OpenAI `data: {...}`
 /// payloads (and a final `data: [DONE]`).
+///
+/// M2-3 hardening:
+/// - Each `byte_stream.next().await` is wrapped in
+///   `tokio::time::timeout(idle_timeout, ...)`. If no chunk arrives
+///   inside that window, emit an OpenAI-compatible error chunk + DONE
+///   and close cleanly.
+/// - On `Err(reqwest_err)` from the byte stream (drop, TLS reset,
+///   etc.), emit the same shape of error chunk + DONE and close.
 fn build_sse_stream<S>(
     mut byte_stream: S,
     mut translator: StreamTranslator,
     req_idx: u64,
+    idle_timeout: Duration,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>>
 where
     S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin + Send + 'static,
@@ -399,8 +555,9 @@ where
         let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
 
         loop {
-            match byte_stream.next().await {
-                Some(Ok(chunk)) => {
+            let next = tokio::time::timeout(idle_timeout, byte_stream.next()).await;
+            match next {
+                Ok(Some(Ok(chunk))) => {
                     buf.extend_from_slice(&chunk);
 
                     // Process complete SSE frames (separated by blank line).
@@ -419,6 +576,38 @@ where
                             continue;
                         }
 
+                        // Upstream `event: error` frames carry a JSON
+                        // error payload; surface them as a final
+                        // OpenAI-compatible error chunk + DONE.
+                        if event_type == "error" {
+                            tracing::error!(
+                                req_idx,
+                                payload = %data_json,
+                                "upstream emitted SSE error event"
+                            );
+                            let err_msg = data_json
+                                .get("error")
+                                .and_then(|e| e.get("message"))
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("upstream sent error event")
+                                .to_string();
+                            let err_type = data_json
+                                .get("error")
+                                .and_then(|e| e.get("type"))
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("upstream_error")
+                                .to_string();
+                            let err_payload = serde_json::json!({
+                                "error": {
+                                    "type": err_type,
+                                    "message": err_msg,
+                                }
+                            });
+                            yield Ok(Event::default().data(err_payload.to_string()));
+                            yield Ok(Event::default().data("[DONE]"));
+                            return;
+                        }
+
                         let chunks = translator.translate_event(&event_type, &data_json);
                         for ck in chunks {
                             match serde_json::to_string(&ck) {
@@ -435,15 +624,47 @@ where
                         }
                     }
                 }
-                Some(Err(e)) => {
-                    tracing::error!(req_idx, error=%e, "upstream stream error");
+                Ok(Some(Err(e))) => {
+                    // M2-3: mid-stream upstream error. Surface it as a
+                    // final OpenAI-compatible error chunk so the client
+                    // sees *something* useful instead of a silently
+                    // truncated stream.
+                    tracing::error!(req_idx, error=%e, "upstream stream errored mid-flight");
+                    let err_payload = serde_json::json!({
+                        "error": {
+                            "type": "upstream_stream_error",
+                            "message": e.to_string(),
+                        }
+                    });
+                    yield Ok(Event::default().data(err_payload.to_string()));
                     yield Ok(Event::default().data("[DONE]"));
                     return;
                 }
-                None => {
+                Ok(None) => {
                     if !translator.is_done() {
                         tracing::warn!(req_idx, "upstream stream ended without message_stop");
                     }
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+                Err(_elapsed) => {
+                    // M2-3: idle timeout fired — no chunk arrived inside
+                    // the per-chunk window. Emit error + DONE and bail.
+                    tracing::warn!(
+                        req_idx,
+                        idle_timeout_secs = idle_timeout.as_secs(),
+                        "upstream stream idle timeout fired"
+                    );
+                    let err_payload = serde_json::json!({
+                        "error": {
+                            "type": "upstream_stream_idle_timeout",
+                            "message": format!(
+                                "no chunk received in {}s",
+                                idle_timeout.as_secs()
+                            ),
+                        }
+                    });
+                    yield Ok(Event::default().data(err_payload.to_string()));
                     yield Ok(Event::default().data("[DONE]"));
                     return;
                 }
