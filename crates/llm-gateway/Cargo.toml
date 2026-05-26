@@ -49,5 +49,21 @@ uuid = { workspace = true }
 # the dependency surface is settled).
 nevoflux-llm = { path = "../llm", default-features = false, features = ["embedding"] }
 
+[features]
+# Exposes `serve_test_router` + `GatewayConfig::test_default` for in-process
+# router testing via `tower::ServiceExt::oneshot`. Off by default so the
+# helpers aren't shipped to production consumers; turned on automatically
+# for the in-crate `tests/*.rs` binaries via the dev-dependency below.
+test-util = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# M2-1: needed by `models_test.rs` for `Router::oneshot` and to collect
+# response bodies into `Bytes`. Both crates are already transitive deps
+# of axum/reqwest, so this only pins the API surface for the tests.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# Re-pull our own crate as a dev-dep so the `test-util` feature is enabled
+# for the integration tests in `tests/*.rs` (which compile as their own
+# crates and don't otherwise see `cfg(test)` on the lib).
+nevoflux-llm-gateway = { path = ".", features = ["test-util"] }

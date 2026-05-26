@@ -7,12 +7,13 @@
 use axum::{
     extract::{Request, State},
     http::{HeaderMap, HeaderValue, StatusCode},
-    middleware::Next,
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    Json,
+    routing::{get, post},
+    Json, Router,
 };
 use futures::StreamExt;
 use nevoflux_llm::embedding::{EmbedKind, EmbeddingConfig, EmbeddingProvider, FastEmbedProvider};
@@ -29,6 +30,7 @@ use tokio::sync::OnceCell;
 
 use crate::embedding_dim::{zero_pad_to_gateway_dim, GATEWAY_OUTPUT_DIM};
 use crate::error::{GatewayError, TimeoutPhase};
+use crate::server::GatewayConfig;
 use crate::translate::{
     anthropic_to_openai_response, openai_to_anthropic_request, AnthropicResponse,
     OpenAIChatRequest, StreamTranslator,
@@ -63,9 +65,55 @@ pub(crate) struct AppState {
     /// only for chat-completions should not pay that cost. The cell is
     /// populated on first `/v1/embeddings` call via [`AppState::embedder`].
     pub(crate) embedder: OnceCell<Arc<FastEmbedProvider>>,
+    /// Models advertised by `GET /v1/models` (M2-1). The handler falls
+    /// back to a single-entry list synthesized from
+    /// `upstream_model_override` (or the sentinel `"default"`) when this
+    /// is empty, so naive clients calling list-models on a freshly-booted
+    /// gateway always get a valid response.
+    pub(crate) advertised_models: Vec<String>,
 }
 
 impl AppState {
+    /// Build an [`AppState`] from a [`GatewayConfig`].
+    ///
+    /// Factored out of `serve()` so tests (and the `serve_test_router`
+    /// helper) can construct exactly the same shared state without
+    /// binding a TCP listener. The two reqwest clients are built here
+    /// with the M2-3 timeout shapes.
+    pub(crate) async fn new(config: GatewayConfig) -> anyhow::Result<Self> {
+        // M2-3: two clients with different timeout shapes.
+        //
+        // - `nonstream_http` has both `connect_timeout` and `timeout()`,
+        //   so a stuck non-stream request fails fast with a 504.
+        // - `stream_http` has only `connect_timeout`. The total-request
+        //   `timeout()` is too coarse for SSE (it would cap the whole
+        //   stream lifetime); instead we enforce an idle timeout per
+        //   chunk via `tokio::time::timeout` inside the streaming
+        //   handler.
+        let nonstream_http = reqwest::Client::builder()
+            .connect_timeout(config.upstream_connect_timeout)
+            .timeout(config.upstream_request_timeout)
+            .build()?;
+        let stream_http = reqwest::Client::builder()
+            .connect_timeout(config.upstream_connect_timeout)
+            .build()?;
+
+        Ok(Self {
+            bearer_token: config.bearer_token,
+            chat_request_count: AtomicU64::new(0),
+            upstream_base_url: config.upstream_base_url,
+            upstream_api_key: config.upstream_api_key,
+            upstream_model_override: config.upstream_model_remap.unwrap_or_default(),
+            anthropic_version: config.anthropic_version,
+            nonstream_http,
+            stream_http,
+            upstream_stream_idle_timeout: config.upstream_stream_idle_timeout,
+            upstream_retry_max_wait: config.upstream_retry_max_wait,
+            embedder: OnceCell::new(),
+            advertised_models: config.advertised_models,
+        })
+    }
+
     /// Return the shared [`FastEmbedProvider`], initializing it on the
     /// first call. Subsequent calls reuse the cached instance.
     ///
@@ -75,9 +123,7 @@ impl AppState {
     async fn embedder(&self) -> anyhow::Result<Arc<FastEmbedProvider>> {
         self.embedder
             .get_or_try_init(|| async {
-                tracing::info!(
-                    "initializing FastEmbedProvider (first /v1/embeddings call)"
-                );
+                tracing::info!("initializing FastEmbedProvider (first /v1/embeddings call)");
                 let start = std::time::Instant::now();
                 let provider = tokio::task::spawn_blocking(|| {
                     FastEmbedProvider::new(EmbeddingConfig::default())
@@ -103,6 +149,25 @@ pub(crate) async fn healthz(State(state): State<Arc<AppState>>) -> Json<HealthRe
         status: "ok",
         chat_requests_so_far: state.chat_request_count.load(Ordering::Relaxed),
     })
+}
+
+/// Assemble the axum [`Router`] for this gateway from a constructed
+/// [`AppState`]. Factored out of `serve()` so tests can drive the same
+/// router via `tower::ServiceExt::oneshot` without binding a listener.
+pub(crate) fn build_router(state: Arc<AppState>) -> Router {
+    let protected = Router::new()
+        .route("/embeddings", post(embeddings))
+        .route("/chat/completions", post(chat_completions))
+        .route("/models", get(models))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    Router::new()
+        .route("/healthz", get(healthz))
+        .nest("/v1", protected)
+        .with_state(state)
 }
 
 pub(crate) async fn auth_middleware(
@@ -435,10 +500,7 @@ async fn post_upstream(
 
     match retry_after {
         Some(d) if d <= retry_max_wait => {
-            tracing::info!(
-                retry_after_ms = d.as_millis() as u64,
-                "polite 429 retry"
-            );
+            tracing::info!(retry_after_ms = d.as_millis() as u64, "polite 429 retry");
             tokio::time::sleep(d).await;
             let second = send().await.map_err(|e| reqwest_to_gateway_error(&e))?;
             if second.status().as_u16() == 429 {
@@ -725,4 +787,68 @@ fn parse_sse_frame(frame: &str) -> (String, serde_json::Value) {
         serde_json::from_str(&data_buf).unwrap_or(serde_json::Value::Null)
     };
     (event_type, data)
+}
+
+// =========================================================================
+// /v1/models  (M2-1)
+// =========================================================================
+
+/// OpenAI-standard `GET /v1/models` envelope.
+#[derive(Serialize)]
+pub(crate) struct ModelsList {
+    object: &'static str,
+    data: Vec<ModelEntry>,
+}
+
+/// One entry in the `data` array returned by `GET /v1/models`.
+#[derive(Serialize)]
+pub(crate) struct ModelEntry {
+    id: String,
+    object: &'static str,
+    /// Unix-seconds timestamp. Synthesized so the value is stable across
+    /// boots — clients sometimes cache by `(id, created)` and we don't
+    /// want the cache to bust every restart.
+    created: u64,
+    owned_by: &'static str,
+}
+
+/// `GET /v1/models` — OpenAI-standard model discovery.
+///
+/// Returns the list configured via [`AppState::advertised_models`]. If
+/// empty, returns a single entry derived from
+/// [`AppState::upstream_model_override`] (if set), otherwise a sentinel
+/// `"default"` placeholder so naive clients calling list-models on a
+/// freshly-booted gateway always get a valid response.
+///
+/// The `created` field is a fixed epoch plus a 1-second offset per
+/// entry — neither correctness nor freshness matters for OpenAI clients
+/// here, only that the value is stable.
+pub(crate) async fn models(State(state): State<Arc<AppState>>) -> Json<ModelsList> {
+    /// 2024-10-22, an unremarkable past date. Stable across boots so
+    /// clients caching by `(id, created)` see the same value.
+    const EPOCH: u64 = 1_729_600_000;
+
+    let models: Vec<String> = if !state.advertised_models.is_empty() {
+        state.advertised_models.clone()
+    } else if !state.upstream_model_override.is_empty() {
+        vec![state.upstream_model_override.clone()]
+    } else {
+        vec!["default".to_string()]
+    };
+
+    let data = models
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| ModelEntry {
+            id,
+            object: "model",
+            created: EPOCH + i as u64,
+            owned_by: "nevoflux-gateway",
+        })
+        .collect();
+
+    Json(ModelsList {
+        object: "list",
+        data,
+    })
 }

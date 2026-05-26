@@ -29,3 +29,6 @@ pub use server::{
     DEFAULT_UPSTREAM_BASE, DEFAULT_UPSTREAM_CONNECT_TIMEOUT, DEFAULT_UPSTREAM_REQUEST_TIMEOUT,
     DEFAULT_UPSTREAM_RETRY_MAX_WAIT, DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT,
 };
+
+#[cfg(any(test, feature = "test-util"))]
+pub use server::serve_test_router;

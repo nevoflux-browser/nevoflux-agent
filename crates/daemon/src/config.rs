@@ -1424,6 +1424,19 @@ pub struct GatewayUpstreamConfig {
     /// built-in default (5s).
     #[serde(default)]
     pub retry_max_wait_secs: u64,
+
+    /// Models advertised by `GET /v1/models`. Each entry becomes one
+    /// item in the list.
+    ///
+    /// Empty (the default) = the gateway advertises a single model with
+    /// id = `upstream_model_remap` (if set) otherwise a sentinel
+    /// `"default"` placeholder.
+    ///
+    /// Use this to expose multiple model names to clients (e.g., a UI
+    /// that wants the user to "pick a model" from a fixed set) when
+    /// the gateway is going to remap them all to one upstream anyway.
+    #[serde(default)]
+    pub advertised_models: Vec<String>,
 }
 
 // ==================== AuthConfig ====================

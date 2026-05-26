@@ -70,6 +70,10 @@ struct ResolvedUpstreamConfig {
     connect_timeout: Duration,
     stream_idle_timeout: Duration,
     retry_max_wait: Duration,
+    /// Models advertised by `GET /v1/models` (M2-1). Always non-empty by
+    /// the time this struct is constructed — see [`resolve_upstream_config`]
+    /// for the fallback rules.
+    advertised_models: Vec<String>,
 }
 
 /// Resolve upstream gateway settings using the M2-5 precedence order:
@@ -158,6 +162,23 @@ fn resolve_upstream_config(config: &GatewayUpstreamConfig) -> ResolvedUpstreamCo
         )
     };
 
+    // M2-1: synthesize a non-empty `advertised_models` list. Three
+    // sources, in priority order:
+    //   1. Non-empty TOML list — use verbatim.
+    //   2. Otherwise, single entry derived from `upstream_model_remap`
+    //      so naive clients calling `GET /v1/models` see at least the
+    //      model the gateway will actually forward as.
+    //   3. Otherwise, sentinel `"default"` so naive clients calling
+    //      list-models on a freshly-booted gateway always get a valid
+    //      response shape.
+    let advertised_models = if !config.advertised_models.is_empty() {
+        config.advertised_models.clone()
+    } else if let Some(remap) = upstream_model_remap.as_deref().filter(|s| !s.is_empty()) {
+        vec![remap.to_string()]
+    } else {
+        vec!["default".to_string()]
+    };
+
     ResolvedUpstreamConfig {
         upstream_base_url,
         upstream_api_key,
@@ -167,6 +188,7 @@ fn resolve_upstream_config(config: &GatewayUpstreamConfig) -> ResolvedUpstreamCo
         connect_timeout,
         stream_idle_timeout,
         retry_max_wait,
+        advertised_models,
     }
 }
 
@@ -231,6 +253,7 @@ pub async fn init_gateway(
         upstream_connect_timeout: resolved.connect_timeout,
         upstream_stream_idle_timeout: resolved.stream_idle_timeout,
         upstream_retry_max_wait: resolved.retry_max_wait,
+        advertised_models: resolved.advertised_models,
     };
 
     let handle = serve_gateway(gateway_config)
@@ -414,6 +437,9 @@ mod tests {
             DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT
         );
         assert_eq!(resolved.retry_max_wait, DEFAULT_UPSTREAM_RETRY_MAX_WAIT);
+        // M2-1: no advertised_models in TOML + no remap = single sentinel
+        // "default" entry so `GET /v1/models` never returns an empty list.
+        assert_eq!(resolved.advertised_models, vec!["default".to_string()]);
     }
 
     #[test]
@@ -459,6 +485,36 @@ mod tests {
         // And with no env set, falls all the way back to the built-in.
         let resolved = resolve_upstream_config(&GatewayUpstreamConfig::default());
         assert_eq!(resolved.request_timeout, DEFAULT_UPSTREAM_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn advertised_models_uses_toml_list_verbatim() {
+        // M2-1: TOML provides an explicit list — it wins, even over a
+        // populated `upstream_model_remap`.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_resolver_env();
+        let config = GatewayUpstreamConfig {
+            upstream_model_remap: "remap-loses".into(),
+            advertised_models: vec!["m-1".into(), "m-2".into(), "m-3".into()],
+            ..Default::default()
+        };
+        let resolved = resolve_upstream_config(&config);
+        assert_eq!(resolved.advertised_models, vec!["m-1", "m-2", "m-3"]);
+    }
+
+    #[test]
+    fn advertised_models_falls_back_to_remap_when_empty() {
+        // M2-1: empty TOML list + populated `upstream_model_remap` -> a
+        // single-entry list with the remap target.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_resolver_env();
+        let config = GatewayUpstreamConfig {
+            upstream_model_remap: "claude-haiku-4-5".into(),
+            advertised_models: Vec::new(),
+            ..Default::default()
+        };
+        let resolved = resolve_upstream_config(&config);
+        assert_eq!(resolved.advertised_models, vec!["claude-haiku-4-5"]);
     }
 
     #[test]

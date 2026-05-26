@@ -6,17 +6,8 @@
 //! binary in `src/main.rs` is now a thin Ctrl-C wrapper around this same
 //! [`serve`] function.
 
-use axum::{
-    middleware,
-    routing::{get, post},
-    Router,
-};
-use std::{
-    net::SocketAddr,
-    sync::{atomic::AtomicU64, Arc},
-    time::Duration,
-};
-use tokio::{net::TcpListener, sync::OnceCell, task::JoinHandle};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
+use tokio::{net::TcpListener, task::JoinHandle};
 
 use crate::handlers::{self, AppState};
 
@@ -86,6 +77,16 @@ pub struct GatewayConfig {
     /// propagating the 429 to our client. Past this, the client should
     /// handle the longer wait itself. Default: 5s.
     pub upstream_retry_max_wait: Duration,
+    /// Models advertised by `GET /v1/models` (M2-1).
+    ///
+    /// The daemon side is expected to compute a non-empty list before
+    /// constructing this struct (using `upstream_model_remap` or the
+    /// sentinel `"default"` as fallback). The standalone binary path
+    /// (see [`GatewayConfig::from_env`]) reads
+    /// `NEVOFLUX_LLM_GATEWAY_ADVERTISED_MODELS` as a comma-separated
+    /// list. If still empty, the handler synthesizes a fallback at
+    /// request time.
+    pub advertised_models: Vec<String>,
 }
 
 impl GatewayConfig {
@@ -137,6 +138,17 @@ impl GatewayConfig {
             DEFAULT_UPSTREAM_RETRY_MAX_WAIT,
         );
 
+        // M2-1: comma-separated list of models for `GET /v1/models`.
+        // Empty entries are dropped; an entirely missing/empty env var
+        // yields an empty Vec and the handler synthesizes a fallback.
+        let advertised_models: Vec<String> =
+            std::env::var("NEVOFLUX_LLM_GATEWAY_ADVERTISED_MODELS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
         if upstream_api_key.is_empty() {
             tracing::warn!(
                 "NEVOFLUX_LLM_GATEWAY_UPSTREAM_API_KEY is unset — /v1/chat/completions will fail upstream"
@@ -154,7 +166,30 @@ impl GatewayConfig {
             upstream_connect_timeout,
             upstream_stream_idle_timeout,
             upstream_retry_max_wait,
+            advertised_models,
         })
+    }
+
+    /// Minimal config for tests. Bearer token is a known value so test
+    /// clients can include it. `bind_addr` is `127.0.0.1:0` so the OS
+    /// can pick a free port if the test ever binds (the in-router tests
+    /// via [`serve_test_router`] don't, but the field still needs a
+    /// value).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn test_default() -> Self {
+        Self {
+            bind_addr: "127.0.0.1:0".parse().expect("loopback addr parse"),
+            bearer_token: "test-token".into(),
+            upstream_base_url: "https://test.example".into(),
+            upstream_api_key: String::new(),
+            upstream_model_remap: None,
+            anthropic_version: DEFAULT_ANTHROPIC_VERSION.to_string(),
+            upstream_request_timeout: DEFAULT_UPSTREAM_REQUEST_TIMEOUT,
+            upstream_connect_timeout: DEFAULT_UPSTREAM_CONNECT_TIMEOUT,
+            upstream_stream_idle_timeout: DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT,
+            upstream_retry_max_wait: DEFAULT_UPSTREAM_RETRY_MAX_WAIT,
+            advertised_models: Vec::new(),
+        }
     }
 }
 
@@ -212,58 +247,23 @@ impl GatewayHandle {
 /// The actual `axum::serve(...)` call runs inside a spawned tokio task
 /// with a graceful-shutdown channel held by the returned handle.
 pub async fn serve(config: GatewayConfig) -> anyhow::Result<GatewayHandle> {
-    // M2-3: two clients with different timeout shapes.
-    //
-    // - `nonstream_http` has both `connect_timeout` and `timeout()`, so a
-    //   stuck non-stream request fails fast with a 504.
-    // - `stream_http` has only `connect_timeout`. The total-request
-    //   `timeout()` is too coarse for SSE (it would cap the whole stream
-    //   lifetime); instead we enforce an idle timeout per chunk via
-    //   `tokio::time::timeout` inside the streaming handler.
-    let nonstream_http = reqwest::Client::builder()
-        .connect_timeout(config.upstream_connect_timeout)
-        .timeout(config.upstream_request_timeout)
-        .build()?;
-    let stream_http = reqwest::Client::builder()
-        .connect_timeout(config.upstream_connect_timeout)
-        .build()?;
-
+    let bind_addr_requested = config.bind_addr;
     let bearer_token = config.bearer_token.clone();
 
-    let state = Arc::new(AppState {
-        bearer_token: config.bearer_token,
-        chat_request_count: AtomicU64::new(0),
-        upstream_base_url: config.upstream_base_url,
-        upstream_api_key: config.upstream_api_key,
-        upstream_model_override: config.upstream_model_remap.unwrap_or_default(),
-        anthropic_version: config.anthropic_version,
-        nonstream_http,
-        stream_http,
-        upstream_stream_idle_timeout: config.upstream_stream_idle_timeout,
-        upstream_retry_max_wait: config.upstream_retry_max_wait,
-        embedder: OnceCell::new(),
-    });
-
-    let protected = Router::new()
-        .route("/embeddings", post(handlers::embeddings))
-        .route("/chat/completions", post(handlers::chat_completions))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            handlers::auth_middleware,
-        ));
-
-    let app = Router::new()
-        .route("/healthz", get(handlers::healthz))
-        .nest("/v1", protected)
-        .with_state(state.clone());
+    // M2-1: state + router construction is factored out so tests can drive
+    // the same router via `tower::ServiceExt::oneshot` without binding a
+    // TCP listener — see [`serve_test_router`].
+    let state = Arc::new(AppState::new(config).await?);
+    let upstream_base_url_log = state.upstream_base_url.clone();
+    let app = handlers::build_router(state);
 
     // Bind first so callers can read back the OS-assigned port (if any)
     // and start health-checking immediately.
-    let listener = TcpListener::bind(config.bind_addr).await?;
+    let listener = TcpListener::bind(bind_addr_requested).await?;
     let bind_addr = listener.local_addr()?;
     tracing::info!(
         "nevoflux-llm-gateway listening on {bind_addr} (upstream={})",
-        state.upstream_base_url
+        upstream_base_url_log
     );
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -287,4 +287,18 @@ pub async fn serve(config: GatewayConfig) -> anyhow::Result<GatewayHandle> {
         join,
         shutdown: shutdown_tx,
     })
+}
+
+/// Build the gateway's [`axum::Router`] for tests, without binding a TCP
+/// listener. Used by `tower::ServiceExt::oneshot`-based unit tests to
+/// fire requests directly into the router.
+///
+/// Gated behind `#[cfg(any(test, feature = "test-util"))]` so it doesn't
+/// pollute the public API in release builds while still being callable
+/// from `tests/*.rs` integration test binaries (which compile against
+/// the lib's `test` cfg via the standard `dev-dependencies` path).
+#[cfg(any(test, feature = "test-util"))]
+pub async fn serve_test_router(config: GatewayConfig) -> axum::Router {
+    let state = Arc::new(AppState::new(config).await.expect("AppState::new for test"));
+    handlers::build_router(state)
 }
