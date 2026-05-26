@@ -1333,6 +1333,13 @@ pub struct KnowledgeBaseConfig {
     /// Whether the daemon spawns the in-process llm-gateway at startup.
     #[serde(default = "default_knowledge_base_enabled")]
     pub enabled: bool,
+
+    /// Upstream LLM provider configuration for the in-process gateway
+    /// (M2-5). All fields have empty/zero defaults; the daemon's
+    /// `resolve_upstream_config` layers env-var fallbacks and built-in
+    /// defaults on top.
+    #[serde(default)]
+    pub gateway: GatewayUpstreamConfig,
 }
 
 fn default_knowledge_base_enabled() -> bool {
@@ -1343,8 +1350,80 @@ impl Default for KnowledgeBaseConfig {
     fn default() -> Self {
         Self {
             enabled: default_knowledge_base_enabled(),
+            gateway: GatewayUpstreamConfig::default(),
         }
     }
+}
+
+/// Upstream LLM provider config for the in-process gateway (M2-5).
+///
+/// Every field has a sensible empty/zero default and an env-var
+/// fallback applied by the daemon's `resolve_upstream_config` (in
+/// `crates/daemon/src/llm_gateway.rs`). A fresh config file with only
+///
+/// ```toml
+/// [knowledge_base]
+/// enabled = true
+/// ```
+///
+/// still works, assuming the appropriate `NEVOFLUX_LLM_GATEWAY_*` /
+/// `ANTHROPIC_API_KEY` env vars are set in the daemon's shell.
+///
+/// Resolution order per field:
+///   1. Non-empty value from this struct (i.e. the TOML config file).
+///   2. Non-empty value from the corresponding env var.
+///   3. Built-in default.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GatewayUpstreamConfig {
+    /// Upstream base URL (e.g. `https://api.anthropic.com`). Empty =
+    /// fall back to `NEVOFLUX_LLM_GATEWAY_UPSTREAM_BASE_URL` env var,
+    /// then the built-in Anthropic base URL.
+    #[serde(default)]
+    pub upstream_base_url: String,
+
+    /// Upstream API key. Empty = fall back to
+    /// `NEVOFLUX_LLM_GATEWAY_UPSTREAM_API_KEY` then `ANTHROPIC_API_KEY`.
+    /// **Many users prefer NOT to put their key in the config file** —
+    /// leave empty + use env vars instead.
+    #[serde(default)]
+    pub upstream_api_key: String,
+
+    /// If non-empty, rewrites every incoming `model` field on chat-
+    /// completion requests before hitting upstream (附录 B 决策 #25).
+    /// Empty = no remap (passthrough). Fallback env:
+    /// `NEVOFLUX_LLM_GATEWAY_UPSTREAM_MODEL`.
+    #[serde(default)]
+    pub upstream_model_remap: String,
+
+    /// Anthropic API version header. Empty = fall back to
+    /// `NEVOFLUX_LLM_GATEWAY_ANTHROPIC_VERSION`, then `"2023-06-01"`.
+    #[serde(default)]
+    pub anthropic_version: String,
+
+    /// Per-request total timeout (non-stream), in seconds. 0 = use env
+    /// override `NEVOFLUX_LLM_GATEWAY_UPSTREAM_REQUEST_TIMEOUT_SECS`,
+    /// then the built-in default (60s).
+    #[serde(default)]
+    pub request_timeout_secs: u64,
+
+    /// TCP/TLS connect timeout, in seconds. 0 = use env override
+    /// `NEVOFLUX_LLM_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_SECS`, then the
+    /// built-in default (10s).
+    #[serde(default)]
+    pub connect_timeout_secs: u64,
+
+    /// Per-chunk SSE idle timeout, in seconds. 0 = use env override
+    /// `NEVOFLUX_LLM_GATEWAY_UPSTREAM_STREAM_IDLE_TIMEOUT_SECS`, then
+    /// the built-in default (60s).
+    #[serde(default)]
+    pub stream_idle_timeout_secs: u64,
+
+    /// Max wait honored when upstream returns 429 `Retry-After`, in
+    /// seconds. 0 = use env override
+    /// `NEVOFLUX_LLM_GATEWAY_UPSTREAM_RETRY_MAX_WAIT_SECS`, then the
+    /// built-in default (5s).
+    #[serde(default)]
+    pub retry_max_wait_secs: u64,
 }
 
 // ==================== AuthConfig ====================
