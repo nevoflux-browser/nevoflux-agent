@@ -37,6 +37,7 @@ pub mod file_picker;
 pub mod gbrain;
 pub mod health;
 pub mod init_brain;
+pub mod kb_wizard;
 pub mod learning;
 pub mod llm_gateway;
 pub mod loops;

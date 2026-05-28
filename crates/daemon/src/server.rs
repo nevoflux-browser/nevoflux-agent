@@ -688,6 +688,17 @@ pub async fn start_server(
     };
     let subscription_router: SubscriptionRouter = Arc::new(Mutex::new(HashMap::new()));
 
+    // Publish process-global handles used by the M4-2 install wizard
+    // RPCs (kb.wizard.*). `set` is best-effort: a second daemon
+    // restart in the same process (rare; mostly tests) would re-use
+    // the previously published handles, which is benign.
+    let _ = crate::kb_wizard::CURRENT_WIZARD_STATE
+        .set(Arc::new(crate::kb_wizard::WizardState::new()));
+    let _ = crate::kb_wizard::CURRENT_EVENT_BUS.set(event_bus.clone());
+    if let Some(snap) = gateway_snapshot.as_ref() {
+        let _ = crate::kb_wizard::CURRENT_GATEWAY_SNAPSHOT.set(snap.clone());
+    }
+
     // Initialize MCP manager (empty) and tool search index.
     // Actual connections happen in a background task so the daemon starts fast.
     let mcp_manager = {
@@ -6279,6 +6290,22 @@ async fn handle_chat_message(
                 // Agent config file commands
                 "config.file.read" => handle_config_file_read(&params).await,
                 "config.file.write" => handle_config_file_write(&params).await,
+                // Knowledge Base install wizard (M4-2). The browser
+                // calls these in order: status -> install_bun ->
+                // install_gbrain -> init_brain. cancel aborts any
+                // in-flight step. Progress streams on the EventBus
+                // topic `system:kb-wizard:progress`.
+                "kb.wizard.status" => crate::kb_wizard::handle_status(&params).await,
+                "kb.wizard.install_bun" => {
+                    crate::kb_wizard::handle_install_bun(&params).await
+                }
+                "kb.wizard.install_gbrain" => {
+                    crate::kb_wizard::handle_install_gbrain(&params).await
+                }
+                "kb.wizard.init_brain" => {
+                    crate::kb_wizard::handle_init_brain(&params).await
+                }
+                "kb.wizard.cancel" => crate::kb_wizard::handle_cancel(&params).await,
                 // Artifact persistence commands
                 "artifact.get" => handle_artifact_get(session_manager, &params).await,
                 "artifact.list" => handle_artifact_list(session_manager, &params).await,
