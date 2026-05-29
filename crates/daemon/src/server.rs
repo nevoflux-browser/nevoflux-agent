@@ -6391,6 +6391,11 @@ async fn handle_chat_message(
                 "brain.stats" => crate::brain_rpc::handle_stats(&params).await,
                 "brain.list" => crate::brain_rpc::handle_list(&params).await,
                 "brain.get" => crate::brain_rpc::handle_get(&params).await,
+                "brain.put" => crate::brain_rpc::handle_put(&params).await,
+                "brain.save_webpage" => crate::brain_rpc::handle_save_webpage(&params).await,
+                "brain.save_conversation" => {
+                    crate::brain_rpc::handle_save_conversation(&params).await
+                }
                 // Artifact persistence commands
                 "artifact.get" => handle_artifact_get(session_manager, &params).await,
                 "artifact.list" => handle_artifact_list(session_manager, &params).await,
