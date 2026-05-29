@@ -89,16 +89,39 @@ fn default_gbrain_cli_path() -> PathBuf {
         .join("cli.ts")
 }
 
-/// Resolve the bun binary path. Non-empty config wins; empty falls back
-/// to `which::which("bun")`. Returns [`None`] if neither path resolves
-/// to an existing executable so [`init_brain`] can log a clear warning
-/// rather than the supervisor failing later on a generic spawn error.
+/// Resolve the bun binary path. Resolution order:
+///
+/// 1. `configured` (from `knowledge_base.brain.bun_path` TOML field) if
+///    non-empty and the file exists.
+/// 2. `which::which("bun")` — bun on PATH.
+/// 3. `~/.bun/bin/bun(.exe)` — the canonical install location used by
+///    the bun.sh installer (and what the wizard's `install_bun` step
+///    drops it into). This fallback matters because daemon processes
+///    spawned by the browser inherit a PATH frozen at browser launch
+///    time, which typically does NOT include `~/.bun/bin` even after
+///    the wizard has just installed bun there.
+///
+/// Returns [`None`] if none of the above resolves so [`init_brain`] can
+/// log a clear warning rather than the supervisor failing later on a
+/// generic spawn error.
 fn resolve_bun_path(configured: &str) -> Option<PathBuf> {
     if !configured.is_empty() {
         let p = PathBuf::from(configured);
         return if p.exists() { Some(p) } else { None };
     }
-    which::which("bun").ok()
+    if let Ok(p) = which::which("bun") {
+        return Some(p);
+    }
+    // Fallback: canonical install location, identical to the path
+    // `kb_wizard::resolve_bun_path` already probes — keeps both code
+    // paths in sync without sharing state.
+    let exe = if cfg!(windows) { "bun.exe" } else { "bun" };
+    let candidate = dirs::home_dir()?.join(".bun").join("bin").join(exe);
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 /// Convert an `(default, configured)` second-pair into a [`Duration`].
