@@ -124,17 +124,57 @@ fn read_llm_provider_section(llm: &LlmConfig, provider: &str) -> LlmProviderSnap
         "openclaw" | "open_claw" | "open-claw" => Some(&llm.openclaw),
         _ => None,
     };
+    let snapshot_base_url = match sub {
+        Some(p) => p.base_url.clone().unwrap_or_default(),
+        None => String::new(),
+    };
+    // M4-2.6 fix: when the per-provider section has no explicit base_url,
+    // use the canonical public endpoint for that provider instead of
+    // letting the resolver fall all the way through to DEFAULT_UPSTREAM_BASE
+    // (which is Anthropic-specific). Without this, a user with
+    // `provider = "openai"` and an empty `[llm.openai].base_url` would end
+    // up with the gateway pointed at api.anthropic.com while running the
+    // OpenAI passthrough handler — guaranteed 404.
+    let base_url = if snapshot_base_url.is_empty() {
+        provider_canonical_base_url(provider).to_string()
+    } else {
+        snapshot_base_url
+    };
     match sub {
         Some(p) => LlmProviderSnapshot {
             api_key: p.api_key.clone().unwrap_or_default(),
-            base_url: p.base_url.clone().unwrap_or_default(),
+            base_url,
             model: p.model.clone().unwrap_or_default(),
             protocol,
         },
         None => LlmProviderSnapshot {
             protocol,
+            base_url,
             ..Default::default()
         },
+    }
+}
+
+/// Canonical public endpoint for each supported provider name. Used as
+/// the per-provider base_url fallback when the user hasn't filled in
+/// `[llm.<provider>].base_url`. Empty string means "no idea — let the
+/// caller fall through to DEFAULT_UPSTREAM_BASE".
+fn provider_canonical_base_url(provider: &str) -> &'static str {
+    match provider.to_ascii_lowercase().as_str() {
+        "anthropic" | "claude_code" | "claude-code" => "https://api.anthropic.com",
+        "openai" => "https://api.openai.com",
+        "deepseek" => "https://api.deepseek.com",
+        "openrouter" => "https://openrouter.ai/api",
+        "qwen" => "https://dashscope.aliyuncs.com/compatible-mode",
+        "groq" => "https://api.groq.com/openai",
+        "mistral" => "https://api.mistral.ai",
+        "xai" | "grok" => "https://api.x.ai",
+        "cohere" => "https://api.cohere.ai",
+        "perplexity" => "https://api.perplexity.ai",
+        "together" => "https://api.together.xyz",
+        "gemini" | "gemini-cli" | "gemini_cli" => "https://generativelanguage.googleapis.com",
+        "ollama" => "http://localhost:11434",
+        _ => "",
     }
 }
 
