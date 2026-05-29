@@ -83,6 +83,11 @@ ignore = "0.4"
 dirs = "5.0"
 directories = { workspace = true }
 toml = "0.8"
+# Format-preserving TOML edits for `kb_wizard.rs::persist_brain_enabled`
+# (M4-2.5). Reused workspace pin (already in Cargo.lock via cargo's own
+# manifest tooling) so adding it does not pull a new version into the
+# dependency graph.
+toml_edit = "0.22"
 
 # SQLite (needed by event_bus persistent writer for params!)
 rusqlite = { workspace = true }

@@ -261,14 +261,17 @@ pub struct HostServices {
     /// `Handle::current()` from a `'static`-spawned task.
     pub runtime_handle: Option<tokio::runtime::Handle>,
 
-    /// Live gbrain subprocess supervisor (M3-4). When set, the daemon's
-    /// tool dispatch routers (`mcp_tool_executor::execute_mcp_tool` and
-    /// `agent_host::tool_call_dynamic`) recognize the `brain_*` tool
-    /// prefix and forward calls through this supervisor to the running
-    /// gbrain subprocess. `None` means the brain subsystem failed to
-    /// boot or is disabled — brain tool calls surface a clear error
-    /// in that case.
-    pub brain_supervisor: Option<Arc<crate::gbrain::GbrainSupervisor>>,
+    /// Hot-reloadable gbrain slot (M3-4 / M4-2.5). Shared with
+    /// [`crate::server::Server::brain_slot`] and
+    /// [`crate::init_brain::CURRENT_BRAIN_SLOT`] so reads on every brain
+    /// tool call see the install wizard's freshly-booted supervisor
+    /// without rebuilding services. The daemon's tool dispatch routers
+    /// (`mcp_tool_executor::execute_mcp_tool` and
+    /// `agent_host::tool_call_dynamic`) call [`Self::brain_supervisor`]
+    /// to resolve the current handle; `None` means the brain subsystem
+    /// failed to boot or has not been initialized yet, and brain tool
+    /// calls surface a clear error in that case.
+    pub brain_slot: Option<crate::init_brain::SharedBrainSlot>,
 }
 
 impl HostServices {
@@ -331,7 +334,7 @@ impl HostServices {
             loop_manager: None,
             agent_config: None,
             runtime_handle: None,
-            brain_supervisor: None,
+            brain_slot: None,
         }
     }
 
@@ -373,7 +376,7 @@ impl HostServices {
             loop_manager: None,
             agent_config: None,
             runtime_handle: None,
-            brain_supervisor: None,
+            brain_slot: None,
         }
     }
 
@@ -486,18 +489,39 @@ impl HostServices {
         self
     }
 
-    /// Attach the gbrain subprocess supervisor (M3-4).
+    /// Attach the shared, hot-reloadable brain slot (M3-4 / M4-2.5).
     ///
     /// Once set, the daemon's tool dispatch routers recognize the
-    /// `brain_*` tool prefix and forward calls through this supervisor.
-    /// Without this, brain tool calls return a clear ConfigMissing-style
-    /// error instead of being silently dropped.
-    pub fn with_brain_supervisor(
-        mut self,
-        supervisor: Arc<crate::gbrain::GbrainSupervisor>,
-    ) -> Self {
-        self.brain_supervisor = Some(supervisor);
+    /// `brain_*` tool prefix and forward calls through
+    /// [`Self::brain_supervisor`], which reads the slot live so a
+    /// wizard hot-reload is immediately visible. Without this, brain
+    /// tool calls return a clear ConfigMissing-style error instead of
+    /// being silently dropped.
+    pub fn with_brain_slot(mut self, slot: crate::init_brain::SharedBrainSlot) -> Self {
+        self.brain_slot = Some(slot);
         self
+    }
+
+    /// Synchronous read of the current gbrain supervisor (M3-4 /
+    /// M4-2.5). Returns `None` when:
+    ///
+    /// - the brain slot has not been wired into this `HostServices`
+    ///   (e.g. tests that build services standalone), OR
+    /// - the slot is currently empty (knowledge base disabled, wizard
+    ///   hasn't run yet, init_brain failed at boot), OR
+    /// - the slot is briefly held under a write lock by a concurrent
+    ///   hot-reload (`try_read` failure; the next call will see the
+    ///   fresh supervisor).
+    ///
+    /// The last case is acceptable: the read path is hit on every brain
+    /// tool dispatch and a one-call blip during hot-reload is preferable
+    /// to blocking the tool-call thread on a write lock.
+    pub fn brain_supervisor(&self) -> Option<Arc<crate::gbrain::GbrainSupervisor>> {
+        self.brain_slot
+            .as_ref()?
+            .try_read()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|s| s.supervisor.clone()))
     }
 
     /// Add browser sender to the services.
@@ -821,8 +845,8 @@ impl std::fmt::Debug for HostServices {
                 &self.runtime_handle.as_ref().map(|_| "Some(...)"),
             )
             .field(
-                "brain_supervisor",
-                &self.brain_supervisor.as_ref().map(|_| "Some(...)"),
+                "brain_slot",
+                &self.brain_slot.as_ref().map(|_| "Some(...)"),
             )
             .finish()
     }

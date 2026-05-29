@@ -336,14 +336,17 @@ pub async fn execute_mcp_tool(
                 "brain tool {name} is not in the default allowlist; see crates/daemon/src/brain_tools.rs DEFAULT_TOOLS"
             ));
         };
-        let supervisor = services.brain_supervisor.as_ref().ok_or_else(|| {
+        // M4-2.5: read through the hot-reloadable slot accessor so a
+        // post-wizard `install_brain` is immediately visible without a
+        // daemon restart.
+        let supervisor = services.brain_supervisor().ok_or_else(|| {
             format!(
                 "brain tool {name} requires the gbrain subsystem, but it is not running \
                  (check knowledge_base.brain.enabled in config, and that bun + gbrain CLI \
                  are installed)"
             )
         })?;
-        return crate::brain_tools::invoke_brain_tool(supervisor, def.gbrain_name, arguments.clone())
+        return crate::brain_tools::invoke_brain_tool(&supervisor, def.gbrain_name, arguments.clone())
             .await;
     }
 

@@ -12,16 +12,50 @@
 //! in `server.rs` is therefore strict: gateway first, then brain.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use nevoflux_brain::BrainEngine;
+use tokio::sync::RwLock;
 
 use crate::config::KnowledgeBaseConfig;
 use crate::gbrain::{
     supervisor::McpToolCaller, GbrainConfig, GbrainEngine, GbrainSupervisor, SupervisorState,
 };
 use crate::llm_gateway::GatewayHandleSnapshot;
+
+/// Live, hot-reloadable brain handles. Held inside the
+/// [`Server`](crate::server::Server) struct as
+/// `Arc<RwLock<Option<BrainSlot>>>` so the install wizard (M4-2.5) can
+/// drop a fresh boot in after the daemon has already started.
+///
+/// Cloning a `BrainSlot` is cheap (two `Arc` clones); the slot itself
+/// is wrapped in a tokio `RwLock` so concurrent reads (every brain tool
+/// call) don't contend with the rare hot-reload write.
+#[derive(Clone)]
+pub struct BrainSlot {
+    /// Live supervisor handle. Used by `services.brain_supervisor()` to
+    /// dispatch `brain_*` tool calls and by [`Server::shutdown`] to
+    /// gracefully tear the subprocess down at exit.
+    pub supervisor: Arc<GbrainSupervisor>,
+    /// Trait-object engine handle. Used by the (currently unused)
+    /// `Server::brain()` accessor; reserved for M4 frontend consumers.
+    pub engine: Arc<dyn BrainEngine>,
+}
+
+/// Shared, hot-reloadable brain slot. The daemon constructs this at
+/// startup, hands one clone to [`Server`](crate::server::Server) (read
+/// path) and registers another via
+/// [`crate::kb_wizard::set_current_brain_slot`] so the install wizard
+/// can write to it after `kb.wizard.init_brain` succeeds.
+pub type SharedBrainSlot = Arc<RwLock<Option<BrainSlot>>>;
+
+/// Process-global brain slot, published once at daemon startup so the
+/// install wizard's `handle_init_brain` can install the freshly-booted
+/// supervisor/engine without a daemon restart.
+///
+/// `None` until [`crate::kb_wizard::set_current_brain_slot`] runs.
+pub static CURRENT_BRAIN_SLOT: OnceLock<SharedBrainSlot> = OnceLock::new();
 
 /// Boxed error returned by brain init. Daemon doesn't depend on
 /// `anyhow`, so we use a plain trait object to stay light — same shape

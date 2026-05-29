@@ -308,16 +308,14 @@ pub struct Server {
     /// downstream consumers (gbrain subprocess in M3). [`None`] when
     /// the gateway is disabled.
     gateway_snapshot: Option<crate::llm_gateway::GatewayHandleSnapshot>,
-    /// Live gbrain supervisor, if `knowledge_base.brain.enabled = true`
-    /// at boot AND the gateway came up AND bun + gbrain cli were
-    /// reachable (M3-3). Stored here so [`Self::shutdown`] can
-    /// gracefully stop the subprocess before the daemon exits.
-    brain_supervisor: Option<Arc<crate::gbrain::GbrainSupervisor>>,
-    /// Trait-object handle for the active gbrain-backed knowledge base
-    /// (M3-3). Cloned and handed to downstream consumers (M3-4 tool
-    /// registry, M4 frontend). [`None`] when the brain subsystem is
-    /// disabled or failed to boot.
-    brain_engine: Option<Arc<dyn nevoflux_brain::BrainEngine>>,
+    /// Shared, hot-reloadable brain slot. Populated at boot if
+    /// `knowledge_base.brain.enabled = true` (M3-3) AND can be replaced
+    /// at runtime by the M4-2 install wizard on a successful
+    /// `kb.wizard.init_brain` step (M4-2.5). The same `Arc` is also
+    /// stashed in [`crate::kb_wizard::CURRENT_BRAIN_SLOT`] and in
+    /// `HostServices.brain_slot` so reads on every brain tool call see
+    /// the latest value without restarting the daemon.
+    brain_slot: crate::init_brain::SharedBrainSlot,
     /// Shared slot populated by the background embedding-init task with
     /// the memory-reindex progress receiver (M1 #009). [`None`] when
     /// `knowledge_base.enabled = false`, the embedding subsystem is
@@ -339,9 +337,43 @@ impl Server {
 
     /// Trait-object handle for the active gbrain-backed knowledge base
     /// (M3-3). `None` when the brain subsystem is disabled or failed to
-    /// boot. M3-4 wires this into the agent's tool registry.
+    /// boot. M3-4 wires this into the agent's tool registry. After
+    /// M4-2.5 the slot is hot-reloadable; this accessor reads the
+    /// current value via `try_read` so a concurrent hot-reload write
+    /// briefly causes it to return `None` (acceptable: the next call
+    /// sees the fresh engine).
     pub fn brain(&self) -> Option<Arc<dyn nevoflux_brain::BrainEngine>> {
-        self.brain_engine.clone()
+        self.brain_slot
+            .try_read()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|s| s.engine.clone()))
+    }
+
+    /// Async variant of [`Self::brain`] for callers that can await; never
+    /// returns spuriously `None` under contention.
+    pub async fn brain_async(&self) -> Option<Arc<dyn nevoflux_brain::BrainEngine>> {
+        let guard = self.brain_slot.read().await;
+        guard.as_ref().map(|s| s.engine.clone())
+    }
+
+    /// Install a freshly-booted brain into the slot, replacing any
+    /// previous occupant. The previous supervisor (if any) is shut down
+    /// in a detached task so callers don't block on subprocess teardown.
+    ///
+    /// Called both from the boot path in [`start_server`] and from the
+    /// install wizard's hot-reload helper (M4-2.5).
+    pub async fn install_brain(&self, boot: crate::init_brain::BrainBoot) {
+        let mut guard = self.brain_slot.write().await;
+        if let Some(old) = guard.take() {
+            let old_sup = old.supervisor.clone();
+            tokio::spawn(async move {
+                old_sup.shutdown().await;
+            });
+        }
+        *guard = Some(crate::init_brain::BrainSlot {
+            supervisor: boot.supervisor,
+            engine: boot.engine,
+        });
     }
 
     /// Current memory-reindex progress snapshot (M1 #009).
@@ -363,18 +395,20 @@ impl Server {
         // Brain goes down before the gateway: gbrain talks TO the
         // gateway, not the other way around, so we want gbrain to stop
         // making upstream calls before we tear down the listener.
-        if let Some(supervisor) = self.brain_supervisor.take() {
+        //
+        // After M4-2.5 the slot is hot-reloadable; take it under write
+        // lock so a concurrent wizard `install_brain` can't race us into
+        // double-shutting-down or leaving a dangling supervisor behind.
+        let prev = self.brain_slot.write().await.take();
+        if let Some(slot) = prev {
             tracing::info!("shutting down gbrain supervisor");
             // shutdown() takes &self (see M3-3 refactor); the engine's
             // Arc clone is still alive but that's fine — the supervisor
             // owns the subprocess via Mutex<Option<JoinHandle>>, so the
             // call cleanly tears down the child even with other Arcs
             // outstanding.
-            supervisor.shutdown().await;
+            slot.supervisor.shutdown().await;
         }
-        // Drop the engine's Arc clone too so subsequent accessor calls
-        // see None.
-        self.brain_engine = None;
         if let Some(gateway) = self.gateway.take() {
             tracing::info!("shutting down in-process llm-gateway");
             gateway.shutdown().await;
@@ -636,6 +670,16 @@ pub async fn start_server(
     // daemon continues without the knowledge base; the user can fix
     // their config (install bun, run the M3-5 install wizard) and
     // restart.
+    //
+    // After M4-2.5 the brain handle lives in a hot-reloadable slot so
+    // the install wizard's `kb.wizard.init_brain` step can drop a fresh
+    // supervisor in without a daemon restart. Construct the slot up
+    // front (empty), publish it for the wizard, then populate it from
+    // boot-time `init_brain()` below.
+    let brain_slot: crate::init_brain::SharedBrainSlot =
+        Arc::new(tokio::sync::RwLock::new(None));
+    let _ = crate::init_brain::CURRENT_BRAIN_SLOT.set(brain_slot.clone());
+
     let brain_boot =
         match crate::init_brain::init_brain(&agent_config.knowledge_base, &gateway_snapshot)
             .await
@@ -646,10 +690,13 @@ pub async fn start_server(
                 None
             }
         };
-    let (brain_supervisor, brain_engine) = match brain_boot {
-        Some(b) => (Some(b.supervisor), Some(b.engine)),
-        None => (None, None),
-    };
+    if let Some(boot) = brain_boot {
+        let mut guard = brain_slot.write().await;
+        *guard = Some(crate::init_brain::BrainSlot {
+            supervisor: boot.supervisor,
+            engine: boot.engine,
+        });
+    }
 
     let agent_config: SharedAgentConfig = Arc::new(RwLock::new(Arc::new(agent_config)));
 
@@ -1393,17 +1440,17 @@ pub async fn start_server(
     if let Some(retriever) = knowledge_retriever {
         services = services.with_knowledge_retriever(retriever);
     }
-    // M3-4: Expose gbrain to the agent's tool dispatch routers. Only
-    // wired when init_brain succeeded; absence means the brain
-    // subsystem is disabled / failed to boot, and brain_* tool calls
-    // surface a clear error.
-    if let Some(supervisor) = brain_supervisor.as_ref() {
-        services = services.with_brain_supervisor(supervisor.clone());
-        info!(
-            "registered {} brain tools with the agent's MCP tool registry",
-            crate::brain_tools::DEFAULT_TOOLS.len()
-        );
-    }
+    // M3-4 / M4-2.5: Expose gbrain to the agent's tool dispatch routers
+    // through the shared, hot-reloadable brain slot. Always wire the
+    // slot (even if currently empty); the dispatch path uses
+    // `services.brain_supervisor()` which reads the slot live, so a
+    // wizard hot-reload immediately becomes visible to subsequent
+    // tool calls without needing to rebuild services.
+    services = services.with_brain_slot(brain_slot.clone());
+    info!(
+        "registered {} brain tools with the agent's MCP tool registry",
+        crate::brain_tools::DEFAULT_TOOLS.len()
+    );
     if let Some(computer) = crate::agent::computer_tools::create_computer() {
         services = services.with_computer_controller(Arc::new(computer));
         info!("Computer controller initialized");
@@ -3628,8 +3675,7 @@ pub async fn start_server(
         shutdown_tx: Some(shutdown_tx),
         gateway: gateway_handle,
         gateway_snapshot,
-        brain_supervisor,
-        brain_engine,
+        brain_slot,
         reindex_progress: reindex_progress_slot,
     })
 }

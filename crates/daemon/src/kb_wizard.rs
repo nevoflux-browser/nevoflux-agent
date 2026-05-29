@@ -190,6 +190,155 @@ pub static CURRENT_GATEWAY_SNAPSHOT: std::sync::OnceLock<
     crate::llm_gateway::GatewayHandleSnapshot,
 > = std::sync::OnceLock::new();
 
+/// Path the daemon's TOML config is read from / persisted to.
+///
+/// `dirs::config_dir()` resolves to:
+/// - Linux:   `~/.config/nevoflux/config.toml`
+/// - macOS:   `~/Library/Application Support/nevoflux/config.toml`
+/// - Windows: `%APPDATA%\nevoflux\config.toml`
+///
+/// Returns `None` only when `dirs::config_dir()` itself fails (extremely
+/// unusual — a misconfigured CI box, for instance). All callers must
+/// treat that as "cannot persist, log + continue".
+fn config_toml_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("nevoflux").join("config.toml"))
+}
+
+/// Idempotently set `[knowledge_base.brain] enabled = true` in the given
+/// config file, preserving existing comments / whitespace / formatting
+/// via `toml_edit`. Creates the file (and parent dir) if missing.
+///
+/// Exposed for tests; the production wrapper [`persist_brain_enabled`]
+/// resolves the platform-specific path and delegates here.
+pub(crate) async fn persist_brain_enabled_at(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| format!("mkdir config dir failed: {e}"))?;
+        }
+    }
+
+    // Read existing content; an absent file or empty content is treated
+    // as a fresh document so the wizard works on first install.
+    let existing = tokio::fs::read_to_string(path).await.unwrap_or_default();
+    let mut doc = existing
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("could not parse existing config.toml: {e}"))?;
+
+    if !doc.contains_key("knowledge_base") {
+        doc["knowledge_base"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let kb = doc["knowledge_base"]
+        .as_table_mut()
+        .ok_or_else(|| "knowledge_base is not a table".to_string())?;
+    if !kb.contains_key("brain") {
+        kb["brain"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let brain = kb["brain"]
+        .as_table_mut()
+        .ok_or_else(|| "knowledge_base.brain is not a table".to_string())?;
+    brain["enabled"] = toml_edit::value(true);
+
+    tokio::fs::write(path, doc.to_string())
+        .await
+        .map_err(|e| format!("write config.toml failed: {e}"))?;
+    tracing::info!(
+        path = %path.display(),
+        "persisted knowledge_base.brain.enabled = true"
+    );
+    Ok(())
+}
+
+/// Production wrapper: persist `[knowledge_base.brain] enabled = true`
+/// to the user's standard daemon config (see [`config_toml_path`]).
+async fn persist_brain_enabled() -> Result<(), String> {
+    let path = config_toml_path().ok_or_else(|| "could not resolve config dir".to_string())?;
+    persist_brain_enabled_at(&path).await
+}
+
+/// Hot-reload the brain subsystem after a successful
+/// `kb.wizard.init_brain`. The function:
+///
+/// 1. Persists `[knowledge_base.brain] enabled = true` to the user's
+///    config.toml so the change survives daemon restarts.
+/// 2. Spawns the gbrain supervisor + builds a fresh
+///    [`crate::init_brain::BrainBoot`] via [`crate::init_brain::init_brain`].
+/// 3. Installs the boot into the shared brain slot (registered at
+///    daemon startup via [`set_current_brain_slot`]) so subsequent
+///    `services.brain_supervisor()` / `Server::brain()` calls see the
+///    live engine without a daemon restart.
+///
+/// Step 1 failure is logged but does NOT abort the in-memory install:
+/// the user still gets a working brain for this session and we'll
+/// surface the failure in logs so it can be fixed manually.
+async fn hot_reload_brain() -> Result<(), String> {
+    // 1. Persist config.
+    if let Err(e) = persist_brain_enabled().await {
+        tracing::warn!(
+            error = %e,
+            "persist brain config failed; proceeding with in-memory hot-reload \
+             (user will need to re-enable in config.toml manually to survive daemon restart)"
+        );
+    }
+
+    // 2. Build the minimum `KnowledgeBaseConfig` needed for init_brain.
+    //    Both `enabled` flags true; everything else default so
+    //    init_brain falls back to the canonical paths
+    //    (`~/.bun/bin/bun`, `~/.nevoflux/brain-tool/...`, `~/.gbrain/`).
+    let kb_config = crate::config::KnowledgeBaseConfig {
+        enabled: true,
+        gateway: crate::config::GatewayUpstreamConfig::default(),
+        brain: crate::config::BrainConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    };
+
+    // 3. Resolve the gateway snapshot published at daemon startup.
+    let gateway_snapshot = CURRENT_GATEWAY_SNAPSHOT
+        .get()
+        .cloned()
+        .ok_or_else(|| "gateway snapshot unavailable; cannot hot-reload brain".to_string())?;
+
+    // 4. Spawn the supervisor + build the engine.
+    let boot = match crate::init_brain::init_brain(&kb_config, &Some(gateway_snapshot)).await {
+        Ok(Some(b)) => b,
+        Ok(None) => {
+            // init_brain returns Ok(None) when it intentionally skipped
+            // (disabled flag, missing bun, missing cli.ts). We just set
+            // enabled=true above; a None return here means bun or
+            // gbrain cli isn't where we expect, which is a wizard bug.
+            return Err(
+                "init_brain returned Ok(None) despite enabled=true (bun or gbrain cli missing?)"
+                    .into(),
+            );
+        }
+        Err(e) => return Err(format!("init_brain failed: {e}")),
+    };
+
+    // 5. Install into the shared slot.
+    let slot = crate::init_brain::CURRENT_BRAIN_SLOT
+        .get()
+        .ok_or_else(|| "brain slot not registered (daemon startup bug?)".to_string())?;
+    let mut guard = slot.write().await;
+    if let Some(old) = guard.take() {
+        // Graceful shutdown of any previous supervisor — detached so the
+        // wizard task doesn't block on subprocess teardown.
+        let old_sup = old.supervisor.clone();
+        tokio::spawn(async move {
+            old_sup.shutdown().await;
+        });
+    }
+    *guard = Some(crate::init_brain::BrainSlot {
+        supervisor: boot.supervisor,
+        engine: boot.engine,
+    });
+
+    tracing::info!("brain hot-reload OK: supervisor running, engine installed");
+    Ok(())
+}
+
 /// Helper: return the (possibly initialized) global wizard state. If the
 /// daemon never called `init_wizard_state`, a fresh `WizardState` is
 /// returned — useful for tests.
@@ -726,9 +875,11 @@ pub async fn handle_install_bun(params: &serde_json::Value) -> serde_json::Value
         let emit = make_emit_for_global();
         match install_bun(&emit).await {
             Ok(_) => {
-                // Re-probe to update last_overall
-                let report = status_probe(&default_brain_dir()).await;
-                state.set_overall(report.overall).await;
+                // Clear last_overall so subsequent kb.wizard.status calls
+                // fall through to the disk-derived computed_overall. Setting
+                // it via status_probe() would re-read last_overall (still
+                // InProgress here) and stick at InProgress forever.
+                state.clear_overall().await;
             }
             Err(_) => {
                 state.set_overall(WizardOverall::Failed).await;
@@ -780,8 +931,8 @@ pub async fn handle_install_gbrain(params: &serde_json::Value) -> serde_json::Va
         let emit = make_emit_for_global();
         match install_gbrain(&bun_path, &emit).await {
             Ok(_) => {
-                let report = status_probe(&default_brain_dir()).await;
-                state.set_overall(report.overall).await;
+                // Clear last_overall (see install_bun for rationale).
+                state.clear_overall().await;
             }
             Err(_) => {
                 state.set_overall(WizardOverall::Failed).await;
@@ -865,8 +1016,21 @@ pub async fn handle_init_brain(params: &serde_json::Value) -> serde_json::Value 
         .await
         {
             Ok(()) => {
-                let report = status_probe(&brain_dir).await;
-                state.set_overall(report.overall).await;
+                // Clear last_overall (see install_bun for rationale).
+                state.clear_overall().await;
+                // M4-2.5: persist `[knowledge_base.brain] enabled = true`
+                // AND bring the brain online without requiring a daemon
+                // restart. A hot-reload failure is non-fatal here: the
+                // disk artifacts are sound (badge will show Ready),
+                // worst case the user has to restart the daemon to use
+                // brain tools.
+                if let Err(e) = hot_reload_brain().await {
+                    tracing::error!(
+                        error = %e,
+                        "brain hot-reload failed; wizard succeeded but agent \
+                         cannot query brain until daemon restart"
+                    );
+                }
             }
             Err(_) => {
                 state.set_overall(WizardOverall::Failed).await;
@@ -1068,5 +1232,115 @@ mod tests {
     async fn default_brain_dir_is_under_home_or_cwd() {
         let p = default_brain_dir();
         assert!(p.ends_with(".gbrain"));
+    }
+
+    // ── M4-2.5: persist_brain_enabled_at ─────────────────────────────
+    //
+    // These exercise the format-preserving config writer used by the
+    // wizard's hot-reload path. We don't unit-test `hot_reload_brain`
+    // itself because it requires a live bun + gbrain install; the
+    // existing init_brain tests cover those code paths, and the
+    // end-to-end install wizard flow is the integration proof.
+
+    #[tokio::test]
+    async fn persist_brain_enabled_creates_section_when_missing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nevoflux").join("config.toml");
+        persist_brain_enabled_at(&path)
+            .await
+            .expect("persist should succeed against a fresh path");
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            content.contains("[knowledge_base.brain]"),
+            "missing [knowledge_base.brain] header; got:\n{content}"
+        );
+        assert!(
+            content.contains("enabled = true"),
+            "missing enabled = true; got:\n{content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_brain_enabled_preserves_existing_content() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nevoflux").join("config.toml");
+        tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        let existing = "\
+# user comment about daemon
+[daemon]
+port_range_start = 19500
+
+[llm.openai]
+api_key = \"user-key\"
+";
+        tokio::fs::write(&path, existing).await.unwrap();
+
+        persist_brain_enabled_at(&path)
+            .await
+            .expect("persist should succeed against an existing config");
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            content.contains("# user comment about daemon"),
+            "user comment was lost; got:\n{content}"
+        );
+        assert!(
+            content.contains("api_key = \"user-key\""),
+            "existing llm.openai.api_key was lost; got:\n{content}"
+        );
+        assert!(
+            content.contains("port_range_start = 19500"),
+            "existing daemon.port_range_start was lost; got:\n{content}"
+        );
+        assert!(
+            content.contains("[knowledge_base.brain]"),
+            "[knowledge_base.brain] header was not appended; got:\n{content}"
+        );
+        assert!(
+            content.contains("enabled = true"),
+            "enabled = true was not written; got:\n{content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_brain_enabled_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        persist_brain_enabled_at(&path).await.unwrap();
+        let first = tokio::fs::read_to_string(&path).await.unwrap();
+        persist_brain_enabled_at(&path).await.unwrap();
+        let second = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(
+            first, second,
+            "second persist should be a no-op; first:\n{first}\n\nsecond:\n{second}"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_brain_enabled_flips_existing_false_to_true() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let existing = "\
+[knowledge_base.brain]
+enabled = false
+bun_path = \"/some/custom/bun\"
+";
+        tokio::fs::write(&path, existing).await.unwrap();
+
+        persist_brain_enabled_at(&path).await.unwrap();
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(
+            content.contains("enabled = true"),
+            "false was not flipped to true; got:\n{content}"
+        );
+        assert!(
+            !content.contains("enabled = false"),
+            "stale enabled = false still present; got:\n{content}"
+        );
+        assert!(
+            content.contains("bun_path = \"/some/custom/bun\""),
+            "sibling key bun_path was lost; got:\n{content}"
+        );
     }
 }

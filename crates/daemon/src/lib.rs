@@ -62,7 +62,7 @@ pub use config::{
     AgentConfig, AuthConfig, BrainConfig, ConfigError, ContextConfig, DaemonConfig,
     KnowledgeBaseConfig, LlmConfig, LoggingConfig, SessionConfig, StorageConfig,
 };
-pub use init_brain::{init_brain, BrainBoot};
+pub use init_brain::{init_brain, BrainBoot, BrainSlot, SharedBrainSlot, CURRENT_BRAIN_SLOT};
 pub use config_watcher::{create_config_watcher, ConfigReceiver, ConfigWatcher, WatcherError};
 pub use error::{DaemonError, Result};
 pub use mcp_config::{McpConfigError, McpServerConfigFile, McpServersConfig};

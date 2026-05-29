@@ -3278,7 +3278,10 @@ impl HostFunctions for DaemonHostFunctions {
                     message: msg,
                 });
             };
-            let supervisor = services.brain_supervisor.as_ref().ok_or_else(|| HostError {
+            // M4-2.5: read through the hot-reloadable slot accessor so a
+            // post-wizard `install_brain` is immediately visible without a
+            // daemon restart.
+            let supervisor = services.brain_supervisor().ok_or_else(|| HostError {
                 code: 100,
                 message: format!(
                     "brain tool {tool_name} requires the gbrain subsystem, but it is not running"
@@ -3286,7 +3289,6 @@ impl HostFunctions for DaemonHostFunctions {
             })?;
 
             let runtime = self.runtime.clone();
-            let supervisor = supervisor.clone();
             let gbrain_name = def.gbrain_name;
             let args = arguments.clone();
             let result = tokio::task::block_in_place(|| {
