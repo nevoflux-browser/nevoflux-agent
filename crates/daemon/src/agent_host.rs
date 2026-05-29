@@ -3253,14 +3253,14 @@ impl HostFunctions for DaemonHostFunctions {
         // Intercept brain_* tools (M3-4) before falling through to MCP
         // manager. Brain tools live on the gbrain subprocess supervisor,
         // not in the external MCP manager registry, so they need their
-        // own dispatch arm. See `brain_tools::DEFAULT_TOOLS` for the
-        // allowlist and `crates/mcp_tool_executor.rs` for the mirror
-        // dispatch on the ACP/MCP-HTTP path.
+        // own dispatch arm. See `brain_tools::BRAIN_TOOLS` for the full
+        // gbrain tool catalog and `crates/mcp_tool_executor.rs` for the
+        // mirror dispatch on the ACP/MCP-HTTP path.
         if tool_name.starts_with("brain_") {
             let traced_name = format!("dynamic:{}", tool_name);
             let Some(def) = crate::brain_tools::lookup_by_nevoflux_name(tool_name) else {
                 let msg = format!(
-                    "brain tool {tool_name} is not in the default allowlist; see crates/daemon/src/brain_tools.rs DEFAULT_TOOLS"
+                    "brain tool {tool_name} is not in the gbrain tool catalog; see crates/daemon/src/brain_tools.rs (resources/gbrain-tools.json)"
                 );
                 let duration_ms = start.elapsed().as_millis() as u64;
                 self.record_tool(
@@ -3289,11 +3289,11 @@ impl HostFunctions for DaemonHostFunctions {
             })?;
 
             let runtime = self.runtime.clone();
-            let gbrain_name = def.gbrain_name;
+            let gbrain_name = def.gbrain_name.clone();
             let args = arguments.clone();
             let result = tokio::task::block_in_place(|| {
                 runtime.block_on(async move {
-                    crate::brain_tools::invoke_brain_tool(&supervisor, gbrain_name, args).await
+                    crate::brain_tools::invoke_brain_tool(&supervisor, &gbrain_name, args).await
                 })
             });
 

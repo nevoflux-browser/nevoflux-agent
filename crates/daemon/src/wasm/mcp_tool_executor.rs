@@ -333,7 +333,7 @@ pub async fn execute_mcp_tool(
     if name.starts_with("brain_") {
         let Some(def) = crate::brain_tools::lookup_by_nevoflux_name(name) else {
             return Err(format!(
-                "brain tool {name} is not in the default allowlist; see crates/daemon/src/brain_tools.rs DEFAULT_TOOLS"
+                "brain tool {name} is not in the gbrain tool catalog; see crates/daemon/src/brain_tools.rs (resources/gbrain-tools.json)"
             ));
         };
         // M4-2.5: read through the hot-reloadable slot accessor so a
@@ -346,7 +346,7 @@ pub async fn execute_mcp_tool(
                  are installed)"
             )
         })?;
-        return crate::brain_tools::invoke_brain_tool(&supervisor, def.gbrain_name, arguments.clone())
+        return crate::brain_tools::invoke_brain_tool(&supervisor, &def.gbrain_name, arguments.clone())
             .await;
     }
 

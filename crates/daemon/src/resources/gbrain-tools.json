@@ -1,0 +1,1869 @@
+{
+  "id": 2,
+  "jsonrpc": "2.0",
+  "result": {
+    "tools": [
+      {
+        "description": "Read a page by slug (supports optional fuzzy matching). Soft-deleted pages are hidden by default; pass include_deleted: true to surface them with deleted_at populated (see v0.26.5 recovery window).",
+        "inputSchema": {
+          "properties": {
+            "fuzzy": {
+              "description": "Enable fuzzy slug resolution (default: false)",
+              "type": "boolean"
+            },
+            "include_deleted": {
+              "description": "v0.26.5: surface soft-deleted pages with deleted_at populated (default: false). Used by restore workflows.",
+              "type": "boolean"
+            },
+            "slug": {
+              "description": "Page slug",
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug"
+          ],
+          "type": "object"
+        },
+        "name": "get_page"
+      },
+      {
+        "description": "Write/update a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries.",
+        "inputSchema": {
+          "properties": {
+            "content": {
+              "description": "Full markdown content with YAML frontmatter",
+              "type": "string"
+            },
+            "ingested_via": {
+              "description": "Richer label paired with source_kind. Remote callers: SERVER-STAMPED.",
+              "type": "string"
+            },
+            "slug": {
+              "description": "Page slug",
+              "type": "string"
+            },
+            "source_kind": {
+              "description": "Ingestion channel taxonomy (capture-cli | put_page | webhook | …). Remote callers: SERVER-STAMPED, client value ignored.",
+              "type": "string"
+            },
+            "source_uri": {
+              "description": "Original URI/path/message-id the event carried. Remote callers: SERVER-STAMPED null.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug",
+            "content"
+          ],
+          "type": "object"
+        },
+        "name": "put_page"
+      },
+      {
+        "description": "Soft-delete a page. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed.",
+        "inputSchema": {
+          "properties": {
+            "slug": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug"
+          ],
+          "type": "object"
+        },
+        "name": "delete_page"
+      },
+      {
+        "description": "List pages with optional filters. For 'what's recent / what did I touch this week' questions, use list_pages with sort=updated_desc instead of semantic search.",
+        "inputSchema": {
+          "properties": {
+            "include_deleted": {
+              "description": "v0.26.5: include soft-deleted pages (default: false). Used by restore workflows and operator diagnostics.",
+              "type": "boolean"
+            },
+            "limit": {
+              "description": "Max results (default 50)",
+              "type": "number"
+            },
+            "sort": {
+              "description": "Sort order. Default updated_desc (matches pre-v0.29). Options: updated_desc, updated_asc, created_desc, slug.",
+              "enum": [
+                "updated_desc",
+                "updated_asc",
+                "created_desc",
+                "slug"
+              ],
+              "type": "string"
+            },
+            "tag": {
+              "description": "Filter by tag",
+              "type": "string"
+            },
+            "type": {
+              "description": "Filter by page type",
+              "type": "string"
+            },
+            "updated_after": {
+              "description": "ISO date (YYYY-MM-DD) or full timestamp. Returns pages with updated_at > value.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "list_pages"
+      },
+      {
+        "description": "v0.26.5 — restore a soft-deleted page (clear deleted_at). Returns success only if the page was actually soft-deleted. After this op, the page reappears in search and in get_page/list_pages without the include_deleted flag.",
+        "inputSchema": {
+          "properties": {
+            "slug": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug"
+          ],
+          "type": "object"
+        },
+        "name": "restore_page"
+      },
+      {
+        "description": "v0.26.5 — admin-only. Hard-deletes pages whose deleted_at is older than older_than_hours (default 72). Cascades through content_chunks, page_links, chunk_relations. Local CLI only (not exposed over HTTP MCP). Manual escape hatch alongside the autopilot purge phase.",
+        "inputSchema": {
+          "properties": {
+            "older_than_hours": {
+              "description": "Age cutoff in hours. Default 72.",
+              "type": "number"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "purge_deleted_pages"
+      },
+      {
+        "description": "Keyword search using full-text search. For personal/emotional questions, prefer get_recent_salience or find_anomalies — they surface activity bursts without needing a search term. For code-symbol questions (callers, callees, definitions, blast radius), use code_callers / code_callees / code_def / code_refs instead — those return structural graph data, not text chunks.",
+        "inputSchema": {
+          "properties": {
+            "limit": {
+              "description": "Max results (default 20)",
+              "type": "number"
+            },
+            "offset": {
+              "description": "Skip first N results (for pagination)",
+              "type": "number"
+            },
+            "query": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        },
+        "name": "search"
+      },
+      {
+        "description": "Hybrid search with vector + keyword + multi-query expansion. For personal/emotional questions ('what's going on with me', 'anything notable', 'how am I feeling'), prefer get_recent_salience, find_anomalies, or get_recent_transcripts. Semantic search returns polished pages and misses recent activity bursts. Do NOT assume words like 'crazy', 'notable', or 'big' mean impressive — they often mean difficult or emotionally charged.",
+        "inputSchema": {
+          "properties": {
+            "cross_modal": {
+              "description": "v0.36 cross-modal search routing.\n  'text' (default for non-image-intent queries) — text-only path, no behavior change vs v0.35.\n  'image' — route the query through Voyage multimodal-3 + the embedding_image column. Best for 'show me photos of...' phrasings.\n  'both' — run text AND image searches in parallel; merge via weighted RRF.\n  'auto' — same effect as omitting the field; intent classifier decides based on query phrasing.",
+              "enum": [
+                "text",
+                "image",
+                "both",
+                "auto"
+              ],
+              "type": "string"
+            },
+            "detail": {
+              "description": "Result detail level: low (compiled truth only), medium (default, all with dedup), high (all chunks)",
+              "type": "string"
+            },
+            "embedding_column": {
+              "description": "v0.36: route vector search through a non-default embedding column. Defaults to 'embedding' (OpenAI 1536d) unless `search_embedding_column` config sets a different default. Per-call override for A/B benchmarking across providers (e.g. 'embedding_voyage', 'embedding_zeroentropy'). Column MUST be declared in the `embedding_columns` config registry — unknown names throw with a paste-ready hint listing valid columns.",
+              "type": "string"
+            },
+            "expand": {
+              "description": "Enable multi-query expansion (default: true)",
+              "type": "boolean"
+            },
+            "image": {
+              "description": "Base64-encoded image bytes for image-similarity search (CLI: --image <path>).",
+              "type": "string"
+            },
+            "image_mime": {
+              "description": "MIME type for the image bytes (auto-derived from path on CLI; required when calling op directly).",
+              "type": "string"
+            },
+            "lang": {
+              "description": "Filter to chunks where content_chunks.language matches (e.g., typescript, python, ruby)",
+              "type": "string"
+            },
+            "limit": {
+              "description": "Max results (default 20)",
+              "type": "number"
+            },
+            "near_symbol": {
+              "description": "Anchor retrieval at this qualified symbol name (e.g., BrainEngine.searchKeyword). Enables A2 two-pass.",
+              "type": "string"
+            },
+            "offset": {
+              "description": "Skip first N results (for pagination)",
+              "type": "number"
+            },
+            "query": {
+              "type": "string"
+            },
+            "recency": {
+              "description": "v0.29.1 recency boost — per-prefix age decay, NO mattering signal.\n  'off' — default for canonical truth\n  'on'  — daily/, media/x/, chat/ decay aggressively; concepts/, originals/, writing/ stay evergreen\n  'strong' — multiplies the recency factor by 1.5 (use for 'today' / 'right now')\nOmit and gbrain auto-detects. Independent of `salience` (orthogonal axes).",
+              "enum": [
+                "off",
+                "on",
+                "strong"
+              ],
+              "type": "string"
+            },
+            "salience": {
+              "description": "v0.29.1 salience boost — emotional_weight + take_count, NO time component.\n  'off' — default for entity / canonical / definitional queries\n  'on'  — surface emotionally-weighted + take-rich pages\n  'strong' — aggressive mattering tilt\nOmit and gbrain auto-detects from query text. Independent of `recency`.",
+              "enum": [
+                "off",
+                "on",
+                "strong"
+              ],
+              "type": "string"
+            },
+            "since": {
+              "description": "v0.29.1 — filter to pages whose effective_date is >= this. ISO-8601 (YYYY-MM-DD or full timestamp) OR relative ('7d', '2w', '1y'). Replaces deprecated `afterDate`.",
+              "type": "string"
+            },
+            "source_id": {
+              "description": "v0.34: scope search to a single source. Defaults to OperationContext.sourceId (set from CLI --source / GBRAIN_SOURCE / .gbrain-source dotfile). Pass '__all__' to force cross-source search in multi-source brains.",
+              "type": "string"
+            },
+            "symbol_kind": {
+              "description": "Filter to chunks where content_chunks.symbol_type matches (e.g., function, class, method, type, interface)",
+              "type": "string"
+            },
+            "until": {
+              "description": "v0.29.1 — filter to effective_date <= this. Same format as `since`. Replaces deprecated `beforeDate`. YYYY-MM-DD lands at end-of-day.",
+              "type": "string"
+            },
+            "walk_depth": {
+              "description": "Structural walk depth 1-2. Default 0 (off). Expands anchors through code_edges with 1/(1+hop) decay.",
+              "type": "number"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "query"
+      },
+      {
+        "description": "v0.36 cross-modal Phase 2: image-as-query retrieval. Accepts a local path (CLI), data: URI, or http(s):// URL (SSRF-defended). Returns visually-similar image chunks plus any OCR text they carry. Optional `query` text refinement merges via weighted RRF (D13 hybrid intersect). True image→full-text-knowledge requires Phase 3 (`gbrain reindex --multimodal` + `search.unified_multimodal: true`).",
+        "inputSchema": {
+          "properties": {
+            "image_data": {
+              "description": "Base64-encoded image bytes (preferred for remote MCP callers). PNG/JPEG/WebP only.",
+              "type": "string"
+            },
+            "image_mime": {
+              "description": "Optional MIME hint when ambiguous. Magic-byte sniff is authoritative.",
+              "type": "string"
+            },
+            "image_path": {
+              "description": "Absolute path to image (local CLI callers only — rejected for remote MCP per D18).",
+              "type": "string"
+            },
+            "image_url": {
+              "description": "http(s):// URL to image. SSRF-defended; max 3 redirect hops; 10MB cap.",
+              "type": "string"
+            },
+            "limit": {
+              "description": "Max results (default 20)",
+              "type": "number"
+            },
+            "offset": {
+              "description": "Skip first N results (for pagination)",
+              "type": "number"
+            },
+            "query": {
+              "description": "Optional text refinement; runs hybrid intersect via D13 weighted RRF.",
+              "type": "string"
+            },
+            "source_id": {
+              "description": "Scope to a single source. Defaults to ctx.sourceId. '__all__' opts out.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "search_by_image"
+      },
+      {
+        "description": "Add tag to page",
+        "inputSchema": {
+          "properties": {
+            "slug": {
+              "type": "string"
+            },
+            "tag": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug",
+            "tag"
+          ],
+          "type": "object"
+        },
+        "name": "add_tag"
+      },
+      {
+        "description": "Remove tag from page",
+        "inputSchema": {
+          "properties": {
+            "slug": {
+              "type": "string"
+            },
+            "tag": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug",
+            "tag"
+          ],
+          "type": "object"
+        },
+        "name": "remove_tag"
+      },
+      {
+        "description": "List tags for a page",
+        "inputSchema": {
+          "properties": {
+            "slug": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug"
+          ],
+          "type": "object"
+        },
+        "name": "get_tags"
+      },
+      {
+        "description": "Create link between pages",
+        "inputSchema": {
+          "properties": {
+            "context": {
+              "description": "Context for the link",
+              "type": "string"
+            },
+            "from": {
+              "type": "string"
+            },
+            "link_type": {
+              "description": "Link type (e.g., invested_in, works_at)",
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "from",
+            "to"
+          ],
+          "type": "object"
+        },
+        "name": "add_link"
+      },
+      {
+        "description": "Remove link between pages",
+        "inputSchema": {
+          "properties": {
+            "from": {
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "from",
+            "to"
+          ],
+          "type": "object"
+        },
+        "name": "remove_link"
+      },
+      {
+        "description": "List outgoing links from a page",
+        "inputSchema": {
+          "properties": {
+            "slug": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug"
+          ],
+          "type": "object"
+        },
+        "name": "get_links"
+      },
+      {
+        "description": "List incoming links to a page",
+        "inputSchema": {
+          "properties": {
+            "slug": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug"
+          ],
+          "type": "object"
+        },
+        "name": "get_backlinks"
+      },
+      {
+        "description": "Traverse link graph from a page. With link_type/direction, returns edges (GraphPath[]) instead of nodes.",
+        "inputSchema": {
+          "properties": {
+            "depth": {
+              "description": "Max traversal depth (default 5, capped at 10)",
+              "type": "number"
+            },
+            "direction": {
+              "description": "Traversal direction (default out)",
+              "enum": [
+                "in",
+                "out",
+                "both"
+              ],
+              "type": "string"
+            },
+            "link_type": {
+              "description": "Filter to one link type (per-edge filter, traversal only follows matching edges)",
+              "type": "string"
+            },
+            "slug": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug"
+          ],
+          "type": "object"
+        },
+        "name": "traverse_graph"
+      },
+      {
+        "description": "Add timeline entry to a page",
+        "inputSchema": {
+          "properties": {
+            "date": {
+              "type": "string"
+            },
+            "detail": {
+              "type": "string"
+            },
+            "slug": {
+              "type": "string"
+            },
+            "source": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug",
+            "date",
+            "summary"
+          ],
+          "type": "object"
+        },
+        "name": "add_timeline_entry"
+      },
+      {
+        "description": "Get timeline entries for a page",
+        "inputSchema": {
+          "properties": {
+            "slug": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug"
+          ],
+          "type": "object"
+        },
+        "name": "get_timeline"
+      },
+      {
+        "description": "Brain statistics (page count, chunk count, etc.)",
+        "inputSchema": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "name": "get_stats"
+      },
+      {
+        "description": "Brain health dashboard (embed coverage, stale pages, orphans)",
+        "inputSchema": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "name": "get_health"
+      },
+      {
+        "description": "Run brain health checks and return a structured DoctorReport (thin-client doctor surface).",
+        "inputSchema": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "name": "run_doctor"
+      },
+      {
+        "description": "Page version history",
+        "inputSchema": {
+          "properties": {
+            "slug": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug"
+          ],
+          "type": "object"
+        },
+        "name": "get_versions"
+      },
+      {
+        "description": "Revert page to a previous version",
+        "inputSchema": {
+          "properties": {
+            "slug": {
+              "type": "string"
+            },
+            "version_id": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "slug",
+            "version_id"
+          ],
+          "type": "object"
+        },
+        "name": "revert_version"
+      },
+      {
+        "description": "Brain identity + counters for thin-client banner. Returns version, engine kind, and page/chunk counts. Read-scope.",
+        "inputSchema": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "name": "get_brain_identity"
+      },
+      {
+        "description": "Sync git repo to brain (incremental)",
+        "inputSchema": {
+          "properties": {
+            "dry_run": {
+              "description": "Preview changes without applying",
+              "type": "boolean"
+            },
+            "full": {
+              "description": "Full re-sync (ignore checkpoint)",
+              "type": "boolean"
+            },
+            "no_embed": {
+              "description": "Skip embedding generation",
+              "type": "boolean"
+            },
+            "no_pull": {
+              "description": "Skip git pull",
+              "type": "boolean"
+            },
+            "repo": {
+              "description": "Path to git repo (optional if configured)",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "sync_brain"
+      },
+      {
+        "description": "Store raw API response data for a page",
+        "inputSchema": {
+          "properties": {
+            "data": {
+              "description": "Raw data object",
+              "type": "object"
+            },
+            "slug": {
+              "type": "string"
+            },
+            "source": {
+              "description": "Data source (e.g., crustdata, happenstance)",
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug",
+            "source",
+            "data"
+          ],
+          "type": "object"
+        },
+        "name": "put_raw_data"
+      },
+      {
+        "description": "Retrieve raw data for a page",
+        "inputSchema": {
+          "properties": {
+            "slug": {
+              "type": "string"
+            },
+            "source": {
+              "description": "Filter by source",
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug"
+          ],
+          "type": "object"
+        },
+        "name": "get_raw_data"
+      },
+      {
+        "description": "Fuzzy-resolve a partial slug to matching page slugs",
+        "inputSchema": {
+          "properties": {
+            "partial": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "partial"
+          ],
+          "type": "object"
+        },
+        "name": "resolve_slugs"
+      },
+      {
+        "description": "Get content chunks for a page",
+        "inputSchema": {
+          "properties": {
+            "slug": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "slug"
+          ],
+          "type": "object"
+        },
+        "name": "get_chunks"
+      },
+      {
+        "description": "Log an ingestion event",
+        "inputSchema": {
+          "properties": {
+            "pages_updated": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "source_ref": {
+              "type": "string"
+            },
+            "source_type": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source_type",
+            "source_ref",
+            "pages_updated",
+            "summary"
+          ],
+          "type": "object"
+        },
+        "name": "log_ingest"
+      },
+      {
+        "description": "Get recent ingestion log entries",
+        "inputSchema": {
+          "properties": {
+            "limit": {
+              "description": "Max entries (default 20)",
+              "type": "number"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "get_ingest_log"
+      },
+      {
+        "description": "List stored files",
+        "inputSchema": {
+          "properties": {
+            "slug": {
+              "description": "Filter by page slug",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "file_list"
+      },
+      {
+        "description": "Upload a file to storage",
+        "inputSchema": {
+          "properties": {
+            "page_slug": {
+              "description": "Associate with page",
+              "type": "string"
+            },
+            "path": {
+              "description": "Local file path",
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "type": "object"
+        },
+        "name": "file_upload"
+      },
+      {
+        "description": "Get a URL for a stored file",
+        "inputSchema": {
+          "properties": {
+            "storage_path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "storage_path"
+          ],
+          "type": "object"
+        },
+        "name": "file_url"
+      },
+      {
+        "description": "Submit a background job to the Minions queue. Built-in types: sync, embed, lint, import, extract, backlinks, autopilot-cycle. The `shell` type is CLI-only and rejected over MCP.",
+        "inputSchema": {
+          "properties": {
+            "data": {
+              "description": "Job payload (JSON)",
+              "type": "object"
+            },
+            "delay": {
+              "description": "Delay in ms before eligible",
+              "type": "number"
+            },
+            "max_attempts": {
+              "description": "Max retry attempts (default: 3)",
+              "type": "number"
+            },
+            "name": {
+              "description": "Job type (sync, embed, lint, import, extract, backlinks, autopilot-cycle; shell is CLI-only)",
+              "type": "string"
+            },
+            "priority": {
+              "description": "Priority (0 = highest, default: 0)",
+              "type": "number"
+            },
+            "queue": {
+              "description": "Queue name (default: \"default\")",
+              "type": "string"
+            },
+            "timeout_ms": {
+              "description": "Per-job wall-clock timeout in ms; aborted job goes to dead",
+              "type": "number"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        },
+        "name": "submit_job"
+      },
+      {
+        "description": "Get job status and details by ID",
+        "inputSchema": {
+          "properties": {
+            "id": {
+              "description": "Job ID",
+              "type": "number"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "name": "get_job"
+      },
+      {
+        "description": "List jobs with optional filters",
+        "inputSchema": {
+          "properties": {
+            "limit": {
+              "description": "Max results (default: 50)",
+              "type": "number"
+            },
+            "name": {
+              "description": "Filter by job type",
+              "type": "string"
+            },
+            "queue": {
+              "description": "Filter by queue name",
+              "type": "string"
+            },
+            "status": {
+              "description": "Filter by status (waiting, active, completed, failed, delayed, dead, cancelled)",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "list_jobs"
+      },
+      {
+        "description": "Cancel a waiting, active, or delayed job",
+        "inputSchema": {
+          "properties": {
+            "id": {
+              "description": "Job ID",
+              "type": "number"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "name": "cancel_job"
+      },
+      {
+        "description": "Re-queue a failed or dead job for retry",
+        "inputSchema": {
+          "properties": {
+            "id": {
+              "description": "Job ID",
+              "type": "number"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "name": "retry_job"
+      },
+      {
+        "description": "Get structured progress for a running job",
+        "inputSchema": {
+          "properties": {
+            "id": {
+              "description": "Job ID",
+              "type": "number"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "name": "get_job_progress"
+      },
+      {
+        "description": "Pause a waiting, active, or delayed job",
+        "inputSchema": {
+          "properties": {
+            "id": {
+              "description": "Job ID",
+              "type": "number"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "name": "pause_job"
+      },
+      {
+        "description": "Resume a paused job back to waiting",
+        "inputSchema": {
+          "properties": {
+            "id": {
+              "description": "Job ID",
+              "type": "number"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "name": "resume_job"
+      },
+      {
+        "description": "Replay a completed/failed/dead job, optionally with modified data",
+        "inputSchema": {
+          "properties": {
+            "data_overrides": {
+              "description": "Data fields to override (merged with original)",
+              "type": "object"
+            },
+            "id": {
+              "description": "Source job ID to replay",
+              "type": "number"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "name": "replay_job"
+      },
+      {
+        "description": "Send a sidechannel message to a running job's inbox",
+        "inputSchema": {
+          "properties": {
+            "id": {
+              "description": "Job ID to message",
+              "type": "number"
+            },
+            "payload": {
+              "description": "Message payload (arbitrary JSON)",
+              "type": "object"
+            },
+            "sender": {
+              "description": "Sender identity (default: admin)",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "payload"
+          ],
+          "type": "object"
+        },
+        "name": "send_job_message"
+      },
+      {
+        "description": "Submit an LLM agent job that the worker dispatches via the gateway-native tool loop. Requires the `agent` OAuth scope. Tools, source, slug prefixes, max concurrency, and daily budget are bound at OAuth client registration time.",
+        "inputSchema": {
+          "properties": {
+            "allowed_slug_prefixes": {
+              "description": "Subset of bound_slug_prefixes for put_page writes",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "allowed_tools": {
+              "description": "Subset of bound_tools the agent may invoke",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "max_turns": {
+              "description": "Max LLM turns (default 20, hard cap 100)",
+              "type": "number"
+            },
+            "model": {
+              "description": "provider:model string (defaults to models.tier.subagent)",
+              "type": "string"
+            },
+            "prompt": {
+              "description": "User prompt for the agent",
+              "type": "string"
+            },
+            "queue": {
+              "description": "Queue name (default \"default\")",
+              "type": "string"
+            }
+          },
+          "required": [
+            "prompt"
+          ],
+          "type": "object"
+        },
+        "name": "submit_agent"
+      },
+      {
+        "description": "Find pages with no inbound wikilinks. Essential for content enrichment cycles.",
+        "inputSchema": {
+          "properties": {
+            "include_pseudo": {
+              "description": "Include auto-generated and pseudo pages (default: false)",
+              "type": "boolean"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "find_orphans"
+      },
+      {
+        "description": "Read the active calibration profile for a holder. Returns the latest row from calibration_profiles (per-source, per-holder) including Brier score, accuracy, pattern statements, and active bias tags. Source-scoped via sourceScopeOpts — federated_read scopes see the union of allowed sources, scalar source-bound clients see only their source. Returns null when no profile exists yet (cold-brain branch: builds after 5+ resolved takes + a calibration_profile phase run).",
+        "inputSchema": {
+          "properties": {
+            "holder": {
+              "description": "Holder slug, e.g. 'garry' or 'people/charlie-example'. Defaults to 'garry' when omitted.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "get_calibration_profile"
+      },
+      {
+        "description": "List takes (typed/weighted/attributed claims) filtered by holder/kind/active/etc.",
+        "inputSchema": {
+          "properties": {
+            "active": {
+              "description": "Active rows only (default true)",
+              "type": "boolean"
+            },
+            "holder": {
+              "description": "Filter to this holder (world|garry|brain|<slug>)",
+              "type": "string"
+            },
+            "kind": {
+              "description": "Filter to this kind (fact|take|bet|hunch)",
+              "type": "string"
+            },
+            "limit": {
+              "description": "Max rows (default 100, cap 500)",
+              "type": "number"
+            },
+            "offset": {
+              "description": "Skip first N rows",
+              "type": "number"
+            },
+            "page_slug": {
+              "description": "Filter to this page",
+              "type": "string"
+            },
+            "resolved": {
+              "description": "true → only resolved bets; false → only unresolved",
+              "type": "boolean"
+            },
+            "sort_by": {
+              "description": "weight | since_date | created_at (default created_at)",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "takes_list"
+      },
+      {
+        "description": "Keyword search across takes (pg_trgm similarity over claim text)",
+        "inputSchema": {
+          "properties": {
+            "limit": {
+              "description": "Max results (default 30, cap 100)",
+              "type": "number"
+            },
+            "query": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "query"
+          ],
+          "type": "object"
+        },
+        "name": "takes_search"
+      },
+      {
+        "description": "Multi-hop synthesis across pages + takes + graph. Pulls relevant evidence and produces a cited answer with conflict + gap analysis.",
+        "inputSchema": {
+          "properties": {
+            "anchor": {
+              "description": "Pull the entity subgraph around this slug",
+              "type": "string"
+            },
+            "model": {
+              "description": "Model override (alias or full id). Falls through models.think → models.default → GBRAIN_MODEL → opus.",
+              "type": "string"
+            },
+            "question": {
+              "description": "The question to think about",
+              "type": "string"
+            },
+            "rounds": {
+              "description": "Multi-pass: 1 (default). Round-loop scaffolding is in place; gap-driven retrieval ships in v0.29.",
+              "type": "number"
+            },
+            "save": {
+              "description": "Persist a synthesis page (local-CLI only; ignored for MCP)",
+              "type": "boolean"
+            },
+            "since": {
+              "description": "Start of temporal window (YYYY-MM-DD or YYYY-MM)",
+              "type": "string"
+            },
+            "take": {
+              "description": "Append a take row to the anchor page (requires anchor)",
+              "type": "boolean"
+            },
+            "until": {
+              "description": "End of temporal window",
+              "type": "string"
+            }
+          },
+          "required": [
+            "question"
+          ],
+          "type": "object"
+        },
+        "name": "think"
+      },
+      {
+        "description": "Calibration scorecard for resolved bets: counts, accuracy, Brier (correct ∨ incorrect only), partial_rate.",
+        "inputSchema": {
+          "properties": {
+            "domain_prefix": {
+              "description": "Slug prefix (e.g. companies/) to scope the scorecard",
+              "type": "string"
+            },
+            "holder": {
+              "description": "Filter to this holder (world|garry|brain|<slug>)",
+              "type": "string"
+            },
+            "since": {
+              "description": "Window start (YYYY-MM-DD)",
+              "type": "string"
+            },
+            "until": {
+              "description": "Window end (YYYY-MM-DD)",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "takes_scorecard"
+      },
+      {
+        "description": "Calibration curve: resolved correct/incorrect bets binned by stated weight; observed vs predicted per bucket.",
+        "inputSchema": {
+          "properties": {
+            "bucket_size": {
+              "description": "Bucket width in (0,1]; default 0.1",
+              "type": "number"
+            },
+            "holder": {
+              "description": "Filter to this holder",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "takes_calibration"
+      },
+      {
+        "description": "Introspect the calling identity. Returns one of three transport shapes: {transport: \"oauth\", client_id, client_name, scopes, expires_at}, {transport: \"legacy\", token_name, scopes, expires_at: null}, or {transport: \"local\", scopes: []}. Throws unknown_transport when the context is ambiguous (remote=true without auth) — fail-closed posture mirroring the v0.26.9 trust-boundary contract.",
+        "inputSchema": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "name": "whoami"
+      },
+      {
+        "description": "Register a new source. Supports either --path (existing v0.17 behavior) or --url (v0.28 federated remote-clone path: parses the URL through the SSRF gate, clones into $GBRAIN_HOME/clones/<id>/ via temp-dir + rename atomicity, and stores remote_url in sources.config). Pre-flight collision check on id; rollback on either-side failure.",
+        "inputSchema": {
+          "properties": {
+            "clone_dir": {
+              "description": "Override clone destination (only valid with url). Default: $GBRAIN_HOME/clones/<id>/.",
+              "type": "string"
+            },
+            "federated": {
+              "description": "true → cross-source default search. false → isolated.",
+              "type": "boolean"
+            },
+            "id": {
+              "description": "Source id ([a-z0-9-]{1,32}). Immutable citation key.",
+              "type": "string"
+            },
+            "name": {
+              "description": "Display name (defaults to id).",
+              "type": "string"
+            },
+            "path": {
+              "description": "Local path. Mutually optional with url.",
+              "type": "string"
+            },
+            "url": {
+              "description": "HTTPS git URL. Cloned into $GBRAIN_HOME/clones/<id>/. SSRF-guarded.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "name": "sources_add"
+      },
+      {
+        "description": "List registered sources with page counts and remote_url. v0.28 surfaces the new remote_url field so a remote MCP caller can confirm a source is managed by clone+pull rather than user-supplied path.",
+        "inputSchema": {
+          "properties": {
+            "include_archived": {
+              "description": "Include soft-deleted sources.",
+              "type": "boolean"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "sources_list"
+      },
+      {
+        "description": "Hard-remove a source (cascades pages/chunks/embeddings). Refuses to delete the auto-managed clone dir unless its resolved path is confined under $GBRAIN_HOME/clones/ (realpath+lstat — symlink-safe). For most workflows prefer sources_archive for the soft-delete path.",
+        "inputSchema": {
+          "properties": {
+            "confirm_destructive": {
+              "description": "Required when the source has data (pages, chunks). Without it the op refuses.",
+              "type": "boolean"
+            },
+            "dry_run": {
+              "description": "Preview impact without side effects.",
+              "type": "boolean"
+            },
+            "id": {
+              "type": "string"
+            },
+            "keep_storage": {
+              "description": "Skip clone-dir cleanup even when the source is auto-managed.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "name": "sources_remove"
+      },
+      {
+        "description": "Per-source diagnostic. Returns clone_state (\"healthy\" | \"missing\" | \"not-a-dir\" | \"no-git\" | \"url-drift\" | \"corrupted\" | \"not-applicable\") so a remote MCP caller can diagnose whether the on-disk clone is syncable without SSH access to the brain host.",
+        "inputSchema": {
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "name": "sources_status"
+      },
+      {
+        "description": "Returns pages recently touched and ranked by emotional + activity salience (deterministic 0..1 emotional_weight + take density + recency decay). Use this when the user asks what's been going on, what's notable, what's hot, anything crazy happening, or for any open-ended 'current state' question about themselves or their work. Do NOT run a semantic search for these — salience surfaces what's unusual without needing a search term.",
+        "inputSchema": {
+          "properties": {
+            "days": {
+              "description": "Window in days. Default 14.",
+              "type": "number"
+            },
+            "limit": {
+              "description": "Max results (default 20, capped at 100).",
+              "type": "number"
+            },
+            "recency_bias": {
+              "description": "v0.29.1: how to weight recency in the salience score.\n  'flat' (DEFAULT) — v0.29.0 behavior. Every page gets 1/(1+days_old).\n                     Stable, predictable; what most callers want.\n  'on'             — Per-prefix decay map. concepts/originals/writing/\n                     become evergreen (recency component = 0); daily/,\n                     media/x/, chat/ decay aggressively. Use when the\n                     user explicitly biases for recency-aware salience\n                     ('what's been salient lately' vs 'what matters\n                     in this brain regardless of when').",
+              "enum": [
+                "flat",
+                "on"
+              ],
+              "type": "string"
+            },
+            "slugPrefix": {
+              "description": "Optional slug-prefix filter, e.g. 'personal' or 'wiki/people'.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "get_recent_salience"
+      },
+      {
+        "description": "Returns statistical anomalies in recent page activity, grouped by cohort (tag or type). Use this for questions about what stood out, what's unusual, or what changed recently. Returns explanatory cohorts (e.g. '15 pages tagged wedding touched on 2026-04-28, baseline 0.3/day') so you can speak about patterns the user wouldn't have searched for. Cohort kinds: tag, type. Year cohort is deferred to a later release.",
+        "inputSchema": {
+          "properties": {
+            "lookback_days": {
+              "description": "Days of history for the baseline. Default 30.",
+              "type": "number"
+            },
+            "sigma": {
+              "description": "Sigma threshold. Default 3.0.",
+              "type": "number"
+            },
+            "since": {
+              "description": "ISO date YYYY-MM-DD. Default = today (UTC).",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "find_anomalies"
+      },
+      {
+        "description": "Returns one-line summaries of recent raw conversation transcripts (NOT polished reflections). Use this FIRST for questions about 'what's going on with me', 'what have I been thinking about', or anything personal/emotional. Raw transcripts are the canonical source for the user's own state — polished pages summarize and flatten. Local-only: rejects remote (MCP/HTTP) callers with a clear permission_denied; call via the gbrain CLI.",
+        "inputSchema": {
+          "properties": {
+            "days": {
+              "description": "Window in days. Default 7.",
+              "type": "number"
+            },
+            "limit": {
+              "description": "Max transcripts (default 50).",
+              "type": "number"
+            },
+            "summary": {
+              "description": "When true (default), return first ~300 chars per transcript. When false, full content (capped at 100 KB per file).",
+              "type": "boolean"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "get_recent_transcripts"
+      },
+      {
+        "description": "v0.31: extract personal-knowledge facts (events, preferences, commitments, beliefs) from a conversation turn into the per-source hot memory. Sanitizes turn_text via INJECTION_PATTERNS, calls Haiku to extract structured claims, runs the cosine fast-path + classifier dedup pipeline, INSERTs into facts. Returns counts by status. Skips extraction when the turn is dream-generated content (anti-loop).",
+        "inputSchema": {
+          "properties": {
+            "entity_hints": {
+              "description": "Existing canonical entity slugs the agent has already resolved. Helps the extractor pick the right slug.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "is_dream_generated": {
+              "description": "When true, extraction is skipped (anti-loop). Caller flips this on for pages with dream_generated:true frontmatter.",
+              "type": "boolean"
+            },
+            "session_id": {
+              "description": "Opaque session id (e.g. topic-id from MCP _meta.session_id, or CLI --session). Stored on each fact for the recall --session filter. Not an auth surface.",
+              "type": "string"
+            },
+            "turn_text": {
+              "description": "The user message or page body to extract facts from. Sanitized via INJECTION_PATTERNS before the LLM call.",
+              "type": "string"
+            },
+            "visibility": {
+              "description": "Default visibility for extracted facts. private (default) | world.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "turn_text"
+          ],
+          "type": "object"
+        },
+        "name": "extract_facts"
+      },
+      {
+        "description": "v0.31: query per-source hot memory (facts table). Filters by entity / since / session. Remote callers see only visibility=world facts. Returns most-recent first. v0.32 adds optional include_pending to return pending_consolidation_count alongside facts in one round trip.",
+        "inputSchema": {
+          "properties": {
+            "entity": {
+              "description": "Entity slug (canonical). Returns facts about this entity newest first.",
+              "type": "string"
+            },
+            "grep": {
+              "description": "Substring filter on fact text (case-insensitive). Applied client-side after recall.",
+              "type": "string"
+            },
+            "include_expired": {
+              "description": "When true, include expired_at IS NOT NULL rows. Default false.",
+              "type": "boolean"
+            },
+            "include_pending": {
+              "description": "v0.32: when true, response includes pending_consolidation_count (facts not yet promoted to takes by the dream-cycle consolidate phase). One round trip; backward-compatible (field omitted when false).",
+              "type": "boolean"
+            },
+            "limit": {
+              "description": "Max rows to return. Default 50, cap 100.",
+              "type": "number"
+            },
+            "session_id": {
+              "description": "Source session id (e.g. topic-A). Returns facts captured in that session.",
+              "type": "string"
+            },
+            "since": {
+              "description": "ISO datetime or duration shorthand (e.g. \"8 hours ago\"). Returns facts created since.",
+              "type": "string"
+            },
+            "supersessions": {
+              "description": "When true, return only the supersession audit log (expired_at + superseded_by both set).",
+              "type": "boolean"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "recall"
+      },
+      {
+        "description": "v0.32.2: forget a fact. Rewrites the page's `## Facts` fence to strike through the row and set valid_until=today (the DB's expired_at derives via valid_until + now() on the next reconcile so the forget survives `gbrain rebuild`). Falls back to legacy DB-only expire for pre-v51 / thin-client rows. Idempotent on already-expired or unknown ids.",
+        "inputSchema": {
+          "properties": {
+            "id": {
+              "description": "Fact id to forget.",
+              "type": "number"
+            },
+            "reason": {
+              "description": "Optional reason; written to the fence row's context cell as \"forgotten: <reason>\". Default: \"forgotten\".",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "name": "forget_fact"
+      },
+      {
+        "description": "v0.32.6 — return suspected-contradiction findings from the most recent `gbrain eval suspected-contradictions` probe run, optionally filtered by slug and/or severity. Use this when the user asks 'what's inconsistent in my brain', 'show me contradictions about Acme', 'high-severity issues only', or wants to act on the probe's findings without re-running it. Returns {contradictions: [{a, b, severity, axis, confidence, resolution_command}]}. Reads the cached run row — does NOT trigger a new probe; users run `gbrain eval suspected-contradictions` for that.",
+        "inputSchema": {
+          "properties": {
+            "limit": {
+              "description": "Max findings to return. Default 20.",
+              "type": "number"
+            },
+            "severity": {
+              "description": "Optional severity filter.",
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "type": "string"
+            },
+            "slug": {
+              "description": "Optional slug filter; matches either side of a pair (substring match on slug).",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "find_contradictions"
+      },
+      {
+        "description": "Answers 'who in my brain knows about <topic>'. Returns ranked person/company pages by expertise depth (sub-linear match score), relationship recency (exp decay with 6-month half-life), and salience. Use this for questions like 'who should I talk to about X', 'who knows about Y', 'find me someone who's worked on Z', or any expertise-routing intent. Filters at SQL to person + company pages — does NOT return notes or articles. Pair with --explain (CLI) to surface the per-result factor breakdown.",
+        "inputSchema": {
+          "properties": {
+            "explain": {
+              "description": "Include factor breakdown per result (expertise, recency, salience).",
+              "type": "boolean"
+            },
+            "limit": {
+              "description": "Max results (default 5).",
+              "type": "number"
+            },
+            "topic": {
+              "description": "The topic to route. Free-form natural language.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "find_experts"
+      },
+      {
+        "description": "v0.35.4 — return the chronological claim trajectory for an entity (typed metric values over time, plus auto-detected regressions and narrative drift). Use this when the user asks 'how has Acme's MRR trended', 'show me what alice-example said about runway over time', 'is this founder consistent', 'find regressions for fund-a's portfolio', or wants a time-series view of an entity's structured claims. Returns `{points: [{fact_id, valid_from, metric, value, unit, period, text, source_session, source_markdown_slug}], regressions: [{metric, from_value, from_date, to_value, to_date, delta_pct}], drift_score: number|null, schema_version: 1}`. Drift score 0 = stable narrative, 1 = every consecutive claim is unrelated; null when fewer than 3 typed points exist. Visibility-filtered for remote callers (world-only); source-scoped by the caller's OAuth source binding. Pair with `gbrain founder scorecard <slug>` for an aggregated rollup of the same data.",
+        "inputSchema": {
+          "properties": {
+            "entity_slug": {
+              "description": "Required. Entity slug to chart (e.g. \"companies/acme-example\", \"people/alice-example\").",
+              "type": "string"
+            },
+            "kind": {
+              "description": "Optional. Filter by row shape: \"metric\" (typed-claim rows only), \"event\" (event_type rows only), or \"all\" (default). v0.40.2.0+.",
+              "enum": [
+                "metric",
+                "event",
+                "all"
+              ],
+              "type": "string"
+            },
+            "limit": {
+              "description": "Max points returned. Default 100, max 500.",
+              "type": "number"
+            },
+            "metric": {
+              "description": "Optional. Filter to a single canonical metric (e.g. \"mrr\", \"arr\", \"team_size\"). When omitted, all metrics return.",
+              "type": "string"
+            },
+            "since": {
+              "description": "Optional lower bound on valid_from (YYYY-MM-DD or ISO).",
+              "type": "string"
+            },
+            "until": {
+              "description": "Optional upper bound on valid_from (YYYY-MM-DD or ISO).",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "find_trajectory"
+      },
+      {
+        "description": "BEFORE editing any function, run code_callers with the symbol name to find every caller (the people who'd be affected by your change). Returns direct callers from the v0.20+ tree-sitter call graph. Use during plan-mode to size the change. Defaults to source-scoped; for multi-source brains pass source_id or all_sources=true. Returns: `{symbol, count, callers: [{from_symbol_qualified, to_symbol_qualified, edge_type, resolved}]}`. Example: `{symbol:'parseMarkdown', count:4, callers:[{from_symbol_qualified:'callerInA', to_symbol_qualified:'parseMarkdown', edge_type:'calls', resolved:true}]}`.",
+        "inputSchema": {
+          "properties": {
+            "all_sources": {
+              "description": "Force cross-source search (equivalent to source_id=__all__).",
+              "type": "boolean"
+            },
+            "limit": {
+              "description": "Max edges returned. Default 100.",
+              "type": "number"
+            },
+            "source_id": {
+              "description": "Scope to a single source. Defaults to ctx.sourceId; pass '__all__' to force cross-source.",
+              "type": "string"
+            },
+            "symbol": {
+              "description": "Symbol to find callers of (bare or qualified name).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "symbol"
+          ],
+          "type": "object"
+        },
+        "name": "code_callers"
+      },
+      {
+        "description": "When tracing how a function flows to its dependencies (DB calls, HTTP calls, file I/O), run code_callees from the entry point. Forward view of the call graph: what does this symbol call? Use this when debugging unexpected behavior or when planning to extract / inline a function. Same shape as code_callers but the field is `callees` and the edge direction is reversed.",
+        "inputSchema": {
+          "properties": {
+            "all_sources": {
+              "description": "Force cross-source search.",
+              "type": "boolean"
+            },
+            "limit": {
+              "description": "Max edges returned. Default 100.",
+              "type": "number"
+            },
+            "source_id": {
+              "description": "Scope to a single source. Defaults to ctx.sourceId; pass '__all__' to force cross-source.",
+              "type": "string"
+            },
+            "symbol": {
+              "description": "Symbol to find callees of (bare or qualified name).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "symbol"
+          ],
+          "type": "object"
+        },
+        "name": "code_callees"
+      },
+      {
+        "description": "Where is this symbol defined? Returns one row per definition site (function, class, type, interface, enum, struct, trait, module, contract). Use this BEFORE reaching for grep when you want to read a definition. Single-result is the common case; multiple results indicate same-name symbols across files (which is information in itself). Returns: `{symbol, count, defs: [{slug, file, language, symbol_type, start_line, end_line, snippet}]}`. Filter by --lang to scope a polyglot brain (e.g., lang='typescript').",
+        "inputSchema": {
+          "properties": {
+            "lang": {
+              "description": "Filter by content_chunks.language (e.g. 'typescript', 'python').",
+              "type": "string"
+            },
+            "limit": {
+              "description": "Max definition sites returned. Default 20.",
+              "type": "number"
+            },
+            "symbol": {
+              "description": "Symbol name (bare token; e.g., parseMarkdown, BrainEngine).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "symbol"
+          ],
+          "type": "object"
+        },
+        "name": "code_def"
+      },
+      {
+        "description": "Find every reference to a symbol across the codebase (every file, every line). Differs from code_callers in two ways: (1) catches references in comments, strings, imports, type annotations — not just call sites; (2) returns line numbers, not symbol-qualified edges. Use this when planning a rename or deprecation where you need to touch every literal mention. Returns: `{symbol, count, refs: [{slug, file, language, line, context}]}`.",
+        "inputSchema": {
+          "properties": {
+            "lang": {
+              "description": "Filter by content_chunks.language.",
+              "type": "string"
+            },
+            "limit": {
+              "description": "Max references returned. Default 50.",
+              "type": "number"
+            },
+            "symbol": {
+              "description": "Symbol to find references to.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "symbol"
+          ],
+          "type": "object"
+        },
+        "name": "code_refs"
+      },
+      {
+        "description": "BEFORE editing any function, run code_blast with the symbol name to surface every transitive caller grouped by depth (direct → 2-hop → 3-hop). Use this during plan-mode to size the change. Returns up to 200 nodes. Returns: {result, depth_groups?, truncation?, cycles_detected?, did_you_mean?, candidates?}. Example ok: {result:\"ok\", depth_groups:[{depth:1, nodes:[{symbol,chunk_id}], confidence:0.77}], truncation:\"none\"}.",
+        "inputSchema": {
+          "properties": {
+            "depth": {
+              "description": "Hop cap (default 5, max 8)",
+              "type": "number"
+            },
+            "exact": {
+              "description": "Skip bare-name disambiguation; treat symbol as exact qualified name",
+              "type": "boolean"
+            },
+            "max_nodes": {
+              "description": "Result-set cap (default 200)",
+              "type": "number"
+            },
+            "symbol": {
+              "description": "Bare or qualified symbol name (e.g. \"performSync\" or \"src/foo::performSync\")",
+              "type": "string"
+            }
+          },
+          "required": [
+            "symbol"
+          ],
+          "type": "object"
+        },
+        "name": "code_blast"
+      },
+      {
+        "description": "When tracing how a request flows through the codebase from entry point to side effect (DB write, HTTP call, file I/O), run code_flow from the entry point. Returns ordered execution chain with terminal-node tags. Returns: same envelope as code_blast plus terminal_nodes: [{symbol, sink_kind}] where sink_kind ∈ \"db_call\"|\"http_call\"|\"file_io\"|\"process_exec\"|\"unknown\".",
+        "inputSchema": {
+          "properties": {
+            "depth": {
+              "description": "Hop cap (default 8, max 12)",
+              "type": "number"
+            },
+            "entry_point": {
+              "description": "Entry-point symbol name (bare or qualified)",
+              "type": "string"
+            },
+            "exact": {
+              "description": "Skip bare-name disambiguation",
+              "type": "boolean"
+            },
+            "max_nodes": {
+              "description": "Result-set cap (default 200)",
+              "type": "number"
+            }
+          },
+          "required": [
+            "entry_point"
+          ],
+          "type": "object"
+        },
+        "name": "code_flow"
+      },
+      {
+        "description": "Clear cached code_blast / code_flow traversal results. Source-scoped by default; pass all_sources=true to wipe everything (D8 destructive-guard).",
+        "inputSchema": {
+          "properties": {
+            "all_sources": {
+              "description": "Wipe cache across every source. Explicit opt-out of source-scoping.",
+              "type": "boolean"
+            },
+            "source_id": {
+              "description": "Source to clear. Required unless all_sources=true.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "code_traversal_cache_clear"
+      },
+      {
+        "description": "v0.40.6.0: cheap identity packet for the active schema pack. Returns {pack_name, version, sha8, page_types_count, link_types_count, primitive_summary, source_tier}. Useful for agents to know which pack they are operating against without paying full manifest load cost.",
+        "inputSchema": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "name": "get_active_schema_pack"
+      },
+      {
+        "description": "v0.40.6.0: list installed schema packs (bundled + user-installed). Returns {bundled: string[], installed: string[]}. Read-only directory listing.",
+        "inputSchema": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "name": "list_schema_packs"
+      },
+      {
+        "description": "v0.40.6.0: per-type page counts + typed-coverage from the DB. Returns {schema_version:1, pack_identity, aggregate, per_source, dead_prefixes}. Multi-source aware via ctx.sourceId/allowedSources.",
+        "inputSchema": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "name": "schema_stats"
+      },
+      {
+        "description": "v0.40.6.0: lint the active (or named) schema pack. File-plane rules only over MCP — the with_db option is rejected for remote callers (DB-aware rules require local CLI). Returns {ok, errors, warnings} structured report.",
+        "inputSchema": {
+          "properties": {
+            "pack": {
+              "description": "Pack name (default: active pack)",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "schema_lint"
+      },
+      {
+        "description": "v0.40.6.0: schema pack graph as JSON edges. Returns {nodes: [{name, primitive}], edges: [{from, verb, to}]} derived from link_types inference + frontmatter_links.",
+        "inputSchema": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "name": "schema_graph"
+      },
+      {
+        "description": "v0.40.6.0: resolved settings for a single page_type in the active pack. Returns {pack, type, primitive, path_prefixes, aliases, extractable, expert_routing}.",
+        "inputSchema": {
+          "properties": {
+            "type": {
+              "description": "Page type name to explain",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        "name": "schema_explain_type"
+      },
+      {
+        "description": "v0.40.6.0: list pages with no active-pack type match. Returns {orphan_count, orphans: [{slug, source_id}]}.",
+        "inputSchema": {
+          "properties": {
+            "limit": {
+              "description": "Max orphans to return (default 100)",
+              "type": "number"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "schema_review_orphans"
+      },
+      {
+        "description": "v0.40.7.0: batched schema pack mutation. ATOMIC: all mutations succeed or all roll back. Audit log records one batch_id. Admin scope; NOT localOnly so remote agents (your OpenClaw, etc.) can author packs over normal MCP. Mutation shape per ApplyMutationsRequest type — supports add_type / remove_type / update_type / add_alias / remove_alias / add_prefix / remove_prefix / add_link_type / remove_link_type / set_extractable / set_expert_routing.",
+        "inputSchema": {
+          "properties": {
+            "force": {
+              "description": "Steal stale per-pack lock",
+              "type": "boolean"
+            },
+            "mutations": {
+              "description": "Array of {op, ...args} mutation records to apply atomically",
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "pack": {
+              "description": "Pack to mutate (must not be bundled)",
+              "type": "string"
+            }
+          },
+          "required": [
+            "pack",
+            "mutations"
+          ],
+          "type": "object"
+        },
+        "name": "schema_apply_mutations"
+      },
+      {
+        "description": "v0.40.6.0: flush the in-process schema pack cache so the next loadActivePack re-reads from disk. Cascades through extends-chain (codex C6). Admin scope; NOT localOnly. Returns {invalidated: string[]}.",
+        "inputSchema": {
+          "properties": {
+            "pack": {
+              "description": "Pack name to invalidate (omit to flush all)",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "reload_schema_pack"
+      }
+    ]
+  }
+}

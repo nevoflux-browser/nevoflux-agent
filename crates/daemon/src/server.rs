@@ -756,6 +756,31 @@ pub async fn start_server(
         nevoflux_mcp::ToolSearchIndex::new(),
     ));
 
+    // M4-B: advertise the full gbrain tool catalog to the agent via the
+    // shared tool_search discovery index. The agent's baked tool list
+    // (in builtin-wasm) does NOT contain brain tools; instead the LLM
+    // discovers them with `tool_search` and invokes them through
+    // `tool_call_dynamic`, which routes any `brain_*` name to gbrain.
+    // Indexing here (Rust, hot-swappable via brain_tools.rs) means the
+    // 83-tool surface is exposed with no WASM rebuild. We seed these
+    // first; the MCP background task below adds external MCP tools
+    // additively (via `add`) so it does not clear the brain entries.
+    {
+        let brain_defs: Vec<nevoflux_mcp::ToolDefinition> = crate::brain_tools::tool_catalog()
+            .iter()
+            .map(|t| nevoflux_mcp::ToolDefinition {
+                name: t.nevoflux_name.clone(),
+                description: t.description.clone(),
+                input_schema: t.input_schema.clone(),
+            })
+            .collect();
+        let mut idx = tool_search_index.write().await;
+        for def in &brain_defs {
+            idx.add(def);
+        }
+        info!("Indexed {} brain tools for tool_search", brain_defs.len());
+    }
+
     // Spawn background task: load MCP configs, connect servers, index tools.
     {
         use nevoflux_mcp::ServerConfig as McpServerConfig;
@@ -836,7 +861,13 @@ pub async fn start_server(
                         let tool_defs: Vec<_> =
                             server_tools.iter().map(|st| st.tool.clone()).collect();
                         if !tool_defs.is_empty() {
-                            bg_tool_search.write().await.index(&tool_defs);
+                            // Additive: `add` (not `index`) so the brain
+                            // tools seeded at index creation (M4-B) are
+                            // preserved alongside external MCP tools.
+                            let mut idx = bg_tool_search.write().await;
+                            for def in &tool_defs {
+                                idx.add(def);
+                            }
                             info!("Indexed {} MCP tools for tool_search", tool_defs.len());
                         }
                     }
@@ -1449,7 +1480,7 @@ pub async fn start_server(
     services = services.with_brain_slot(brain_slot.clone());
     info!(
         "registered {} brain tools with the agent's MCP tool registry",
-        crate::brain_tools::DEFAULT_TOOLS.len()
+        crate::brain_tools::tool_catalog().len()
     );
     if let Some(computer) = crate::agent::computer_tools::create_computer() {
         services = services.with_computer_controller(Arc::new(computer));
