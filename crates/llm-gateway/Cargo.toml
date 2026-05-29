@@ -63,6 +63,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # of axum/reqwest, so this only pins the API surface for the tests.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# For `live_smoke_test.rs` reading the user's real config.toml.
+toml = "0.8"
+dirs = "5"
 # Re-pull our own crate as a dev-dep so the `test-util` feature is enabled
 # for the integration tests in `tests/*.rs` (which compile as their own
 # crates and don't otherwise see `cfg(test)` on the lib).
