@@ -647,7 +647,7 @@ pub async fn start_server(
     // but before any of the heavier subsystem inits below — the
     // gateway only needs an OS-assigned loopback port and the listener
     // binds in milliseconds.
-    let gateway_boot = match crate::llm_gateway::init_gateway(&agent_config.knowledge_base).await {
+    let gateway_boot = match crate::llm_gateway::init_gateway(&agent_config).await {
         Ok(opt) => opt,
         Err(e) => {
             // Don't fail the whole daemon boot if the gateway can't

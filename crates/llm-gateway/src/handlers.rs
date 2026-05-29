@@ -30,6 +30,7 @@ use tokio::sync::OnceCell;
 
 use crate::embedding_dim::{zero_pad_to_gateway_dim, GATEWAY_OUTPUT_DIM};
 use crate::error::{GatewayError, TimeoutPhase};
+use crate::protocol::UpstreamProtocol;
 use crate::server::GatewayConfig;
 use crate::translate::{
     anthropic_to_openai_response, openai_to_anthropic_request, AnthropicResponse,
@@ -71,6 +72,10 @@ pub(crate) struct AppState {
     /// is empty, so naive clients calling list-models on a freshly-booted
     /// gateway always get a valid response.
     pub(crate) advertised_models: Vec<String>,
+    /// Protocol the upstream LLM endpoint speaks (M4-2.6). Dispatched on
+    /// inside `chat_completions` to pick between the Anthropic translator
+    /// path and the OpenAI passthrough path.
+    pub(crate) upstream_protocol: UpstreamProtocol,
 }
 
 impl AppState {
@@ -111,6 +116,7 @@ impl AppState {
             upstream_retry_max_wait: config.upstream_retry_max_wait,
             embedder: OnceCell::new(),
             advertised_models: config.advertised_models,
+            upstream_protocol: config.upstream_protocol,
         })
     }
 
@@ -336,7 +342,20 @@ pub(crate) async fn chat_completions(
     let req_idx = state.chat_request_count.fetch_add(1, Ordering::Relaxed) + 1;
     let stream = req.stream.unwrap_or(false);
 
-    match do_chat_completions(state, req, req_idx, stream).await {
+    // M4-2.6: dispatch on the upstream protocol. The Anthropic path is
+    // the existing M2 translator; the OpenAI path is a thin passthrough
+    // that swaps auth + applies the optional model remap and reuses the
+    // same M2-3 retry/timeout/error-classification helpers.
+    let result = match state.upstream_protocol {
+        UpstreamProtocol::Anthropic => {
+            do_chat_completions_anthropic(state.clone(), req, req_idx, stream).await
+        }
+        UpstreamProtocol::OpenAi => {
+            do_chat_completions_openai(state.clone(), req, req_idx, stream).await
+        }
+    };
+
+    match result {
         Ok(response) => response,
         Err(e) => {
             // M2-3: log at severity appropriate to the failure class.
@@ -355,9 +374,10 @@ pub(crate) async fn chat_completions(
     }
 }
 
-/// Inner chat-completions implementation. Returns the success [`Response`]
-/// directly, or a [`GatewayError`] that the outer wrapper renders.
-async fn do_chat_completions(
+/// Inner chat-completions implementation for the Anthropic translator
+/// path. Translates OpenAI request → Anthropic Messages API, dispatches
+/// upstream via [`post_upstream`], then translates the response back.
+async fn do_chat_completions_anthropic(
     state: Arc<AppState>,
     req: OpenAIChatRequest,
     req_idx: u64,
@@ -386,6 +406,7 @@ async fn do_chat_completions(
     tracing::info!(
         req_idx,
         stream,
+        upstream = "anthropic",
         client_model = %original_model,
         upstream_model = %anthr.model,
         tool_count = anthr.tools.as_ref().map(|t| t.len()).unwrap_or(0),
@@ -405,12 +426,23 @@ async fn do_chat_completions(
         &state.nonstream_http
     };
 
+    let mut anthropic_headers = reqwest::header::HeaderMap::new();
+    if let Ok(hv) = reqwest::header::HeaderValue::from_str(&state.upstream_api_key) {
+        anthropic_headers.insert("x-api-key", hv);
+    }
+    if let Ok(hv) = reqwest::header::HeaderValue::from_str(&state.anthropic_version) {
+        anthropic_headers.insert("anthropic-version", hv);
+    }
+    anthropic_headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+
     let response = post_upstream(
         client,
         &url,
-        &state.upstream_api_key,
-        &state.anthropic_version,
         upstream_body,
+        anthropic_headers,
         state.upstream_retry_max_wait,
     )
     .await?;
@@ -444,6 +476,107 @@ async fn do_chat_completions(
         .into_response())
 }
 
+/// Inner chat-completions implementation for the OpenAI passthrough
+/// path (M4-2.6). Forwards the client request unchanged except for:
+///
+/// - applying [`AppState::upstream_model_override`] to the `model` field;
+/// - swapping auth to `Authorization: Bearer <upstream_api_key>`;
+/// - reusing M2-3's [`post_upstream`] for 429-retry + timeout + error
+///   classification;
+/// - re-emitting the upstream SSE stream verbatim (with per-chunk idle
+///   timeout) instead of running the Anthropic translator.
+async fn do_chat_completions_openai(
+    state: Arc<AppState>,
+    mut req: OpenAIChatRequest,
+    req_idx: u64,
+    stream: bool,
+) -> Result<Response, GatewayError> {
+    let original_model = req.model.clone();
+
+    // Model remap — same semantics as the Anthropic path, just applied
+    // directly to the OpenAI request body before we forward it.
+    if !state.upstream_model_override.is_empty() && req.model != state.upstream_model_override {
+        tracing::debug!(
+            req_idx,
+            "remapping model {} -> {}",
+            req.model,
+            state.upstream_model_override
+        );
+        req.model = state.upstream_model_override.clone();
+    }
+
+    let url = format!(
+        "{}/v1/chat/completions",
+        state.upstream_base_url.trim_end_matches('/')
+    );
+    tracing::info!(
+        req_idx,
+        stream,
+        upstream = "openai",
+        client_model = %original_model,
+        upstream_model = %req.model,
+        msg_count = req.messages.len(),
+        "chat_completions -> upstream"
+    );
+
+    let upstream_body = serde_json::to_vec(&req).map_err(|e| GatewayError::Internal {
+        detail: format!("upstream body encode failed: {e}"),
+    })?;
+
+    let client = if stream {
+        &state.stream_http
+    } else {
+        &state.nonstream_http
+    };
+
+    let mut openai_headers = reqwest::header::HeaderMap::new();
+    if let Ok(hv) =
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", state.upstream_api_key))
+    {
+        openai_headers.insert(reqwest::header::AUTHORIZATION, hv);
+    }
+    openai_headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        reqwest::header::HeaderValue::from_static("application/json"),
+    );
+
+    let response = post_upstream(
+        client,
+        &url,
+        upstream_body,
+        openai_headers,
+        state.upstream_retry_max_wait,
+    )
+    .await?;
+
+    if !stream {
+        // Non-stream: forward the upstream OpenAI JSON body verbatim. The
+        // upstream is already OpenAI-shape so we don't need to parse it.
+        let bytes = response.bytes().await.map_err(|e| GatewayError::Internal {
+            detail: format!("read upstream body: {e}"),
+        })?;
+        tracing::info!(req_idx, "chat_completions ok (non-stream)");
+        let resp = axum::http::Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(bytes))
+            .map_err(|e| GatewayError::Internal {
+                detail: format!("build response: {e}"),
+            })?;
+        return Ok(resp);
+    }
+
+    // Streaming: re-emit upstream SSE frames verbatim, with the same
+    // M2-3 per-chunk idle-timeout and mid-stream error-wrapping
+    // contract as the Anthropic path.
+    let byte_stream = response.bytes_stream();
+    let idle_timeout = state.upstream_stream_idle_timeout;
+    let sse_stream = build_openai_passthrough_sse_stream(byte_stream, req_idx, idle_timeout);
+    Ok(Sse::new(sse_stream)
+        .keep_alive(KeepAlive::new())
+        .into_response())
+}
+
 /// Render a [`GatewayError`] into an axum [`Response`] with the right
 /// status code, the OpenAI-compatible error envelope, and (for 429s) a
 /// `Retry-After` header echo.
@@ -469,20 +602,21 @@ fn error_to_response(e: &GatewayError) -> Response {
 /// On a 429 with `Retry-After` ≤ `retry_max_wait`, sleeps and retries
 /// once. Any other 429 (no `Retry-After`, or beyond max-wait) is
 /// propagated immediately so the client can schedule its own backoff.
+///
+/// The `headers` map is protocol-agnostic: the Anthropic path passes
+/// `x-api-key` + `anthropic-version`, the OpenAI passthrough path passes
+/// `Authorization: Bearer ...`. Both include `content-type`.
 async fn post_upstream(
     client: &reqwest::Client,
     url: &str,
-    api_key: &str,
-    anthropic_version: &str,
     body: Vec<u8>,
+    headers: reqwest::header::HeaderMap,
     retry_max_wait: Duration,
 ) -> Result<reqwest::Response, GatewayError> {
     let send = || async {
         client
             .post(url)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", anthropic_version)
-            .header("content-type", "application/json")
+            .headers(headers.clone())
             .body(body.clone())
             .send()
             .await
@@ -712,6 +846,110 @@ where
                 Err(_elapsed) => {
                     // M2-3: idle timeout fired — no chunk arrived inside
                     // the per-chunk window. Emit error + DONE and bail.
+                    tracing::warn!(
+                        req_idx,
+                        idle_timeout_secs = idle_timeout.as_secs(),
+                        "upstream stream idle timeout fired"
+                    );
+                    let err_payload = serde_json::json!({
+                        "error": {
+                            "type": "upstream_stream_idle_timeout",
+                            "message": format!(
+                                "no chunk received in {}s",
+                                idle_timeout.as_secs()
+                            ),
+                        }
+                    });
+                    yield Ok(Event::default().data(err_payload.to_string()));
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Build the outgoing SSE stream for the OpenAI passthrough path
+/// (M4-2.6). The upstream is already emitting OpenAI-shape
+/// `data: {...}` chunks + a final `data: [DONE]`, so we just re-emit
+/// each `data:` line as an axum [`Event`] unchanged. Non-`data:` lines
+/// (`event:`, `id:`, `retry:`, `:` comments) are stripped because the
+/// SSE event we emit downstream is opaque to OpenAI clients —
+/// `Event::default().data(...)` always renders as `data: <payload>\n\n`.
+///
+/// Same M2-3 hardening as the Anthropic path:
+/// - Each chunk read is wrapped in `tokio::time::timeout(idle_timeout, ...)`.
+/// - Mid-stream upstream errors emit a final OpenAI-shaped error envelope
+///   + `[DONE]` and close cleanly.
+fn build_openai_passthrough_sse_stream<S>(
+    mut byte_stream: S,
+    req_idx: u64,
+    idle_timeout: Duration,
+) -> impl futures::Stream<Item = Result<Event, Infallible>>
+where
+    S: futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin + Send + 'static,
+{
+    async_stream::stream! {
+        let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+        let mut saw_done = false;
+
+        loop {
+            let next = tokio::time::timeout(idle_timeout, byte_stream.next()).await;
+            match next {
+                Ok(Some(Ok(chunk))) => {
+                    buf.extend_from_slice(&chunk);
+
+                    loop {
+                        let frame_end_idx = find_frame_end(&buf);
+                        let Some(end) = frame_end_idx else { break };
+                        let frame_bytes = buf.drain(..end.end).collect::<Vec<u8>>();
+                        let frame_str = match std::str::from_utf8(&frame_bytes[..end.payload_len]) {
+                            Ok(s) => s,
+                            Err(_) => continue,
+                        };
+
+                        // Re-emit every `data:` line as its own SSE event.
+                        // OpenAI clients only care about `data:` payloads;
+                        // `event:` / `id:` / `retry:` lines are not part
+                        // of the Chat Completions wire format.
+                        for line in frame_str.lines() {
+                            if let Some(rest) = line.strip_prefix("data:") {
+                                let payload = rest.trim_start();
+                                if payload.is_empty() {
+                                    continue;
+                                }
+                                if payload == "[DONE]" {
+                                    saw_done = true;
+                                }
+                                yield Ok(Event::default().data(payload));
+                            }
+                        }
+
+                        if saw_done {
+                            return;
+                        }
+                    }
+                }
+                Ok(Some(Err(e))) => {
+                    tracing::error!(req_idx, error=%e, "upstream stream errored mid-flight");
+                    let err_payload = serde_json::json!({
+                        "error": {
+                            "type": "upstream_stream_error",
+                            "message": e.to_string(),
+                        }
+                    });
+                    yield Ok(Event::default().data(err_payload.to_string()));
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+                Ok(None) => {
+                    if !saw_done {
+                        tracing::warn!(req_idx, "upstream stream ended without [DONE]");
+                        yield Ok(Event::default().data("[DONE]"));
+                    }
+                    return;
+                }
+                Err(_elapsed) => {
                     tracing::warn!(
                         req_idx,
                         idle_timeout_secs = idle_timeout.as_secs(),

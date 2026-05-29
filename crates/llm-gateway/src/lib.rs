@@ -18,12 +18,14 @@
 
 pub mod embedding_dim;
 pub mod error;
+pub mod protocol;
 pub mod translate;
 
 mod handlers;
 mod server;
 
 pub use error::{GatewayError, TimeoutPhase};
+pub use protocol::UpstreamProtocol;
 pub use server::{
     serve, GatewayConfig, GatewayHandle, DEFAULT_ANTHROPIC_VERSION, DEFAULT_PORT,
     DEFAULT_UPSTREAM_BASE, DEFAULT_UPSTREAM_CONNECT_TIMEOUT, DEFAULT_UPSTREAM_REQUEST_TIMEOUT,

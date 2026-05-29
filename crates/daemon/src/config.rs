@@ -1511,6 +1511,16 @@ pub struct GatewayUpstreamConfig {
     /// the gateway is going to remap them all to one upstream anyway.
     #[serde(default)]
     pub advertised_models: Vec<String>,
+
+    /// Protocol the upstream LLM endpoint speaks (M4-2.6). Recognized
+    /// values: `"anthropic"` (default — gateway runs the OpenAI ↔
+    /// Anthropic translator) or `"openai"` (gateway forwards the
+    /// request unchanged, swapping auth to `Authorization: Bearer ...`).
+    /// Empty = fall back to `NEVOFLUX_LLM_GATEWAY_UPSTREAM_PROTOCOL`,
+    /// then the protocol derived from `[llm].provider`, else
+    /// `"anthropic"`.
+    #[serde(default)]
+    pub upstream_protocol: String,
 }
 
 // ==================== AuthConfig ====================

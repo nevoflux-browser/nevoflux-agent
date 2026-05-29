@@ -14,14 +14,15 @@
 use std::{net::SocketAddr, time::Duration};
 
 use nevoflux_llm_gateway::{
-    serve as serve_gateway, GatewayConfig, GatewayHandle, DEFAULT_ANTHROPIC_VERSION,
-    DEFAULT_UPSTREAM_BASE, DEFAULT_UPSTREAM_CONNECT_TIMEOUT, DEFAULT_UPSTREAM_REQUEST_TIMEOUT,
-    DEFAULT_UPSTREAM_RETRY_MAX_WAIT, DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT,
+    serve as serve_gateway, GatewayConfig, GatewayHandle, UpstreamProtocol,
+    DEFAULT_ANTHROPIC_VERSION, DEFAULT_UPSTREAM_BASE, DEFAULT_UPSTREAM_CONNECT_TIMEOUT,
+    DEFAULT_UPSTREAM_REQUEST_TIMEOUT, DEFAULT_UPSTREAM_RETRY_MAX_WAIT,
+    DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT,
 };
 use rand::RngCore;
 use tracing::{info, warn};
 
-use crate::config::{GatewayUpstreamConfig, KnowledgeBaseConfig};
+use crate::config::{AgentConfig, GatewayUpstreamConfig, KnowledgeBaseConfig, LlmConfig};
 
 /// Clone-safe snapshot of a running gateway, suitable for storing in
 /// places that don't own the [`GatewayHandle`] itself (which holds the
@@ -57,7 +58,8 @@ pub type InitError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Fully-resolved upstream configuration produced by
 /// [`resolve_upstream_config`]. Every field has a concrete value with
-/// the layered fallback (config → env → default) already applied.
+/// the layered fallback (config → env → `[llm.<provider>]` → default)
+/// already applied.
 #[derive(Debug, Clone)]
 struct ResolvedUpstreamConfig {
     upstream_base_url: String,
@@ -74,47 +76,136 @@ struct ResolvedUpstreamConfig {
     /// the time this struct is constructed — see [`resolve_upstream_config`]
     /// for the fallback rules.
     advertised_models: Vec<String>,
+    /// Protocol the upstream LLM endpoint speaks (M4-2.6). Determines
+    /// whether the gateway runs the Anthropic translator path or the
+    /// OpenAI passthrough path inside `chat_completions`.
+    upstream_protocol: UpstreamProtocol,
 }
 
-/// Resolve upstream gateway settings using the M2-5 precedence order:
+/// Snapshot of the active `[llm.<provider>]` section, used as the
+/// third resolution layer (M4-2.6) so users don't have to duplicate
+/// `api_key` / `base_url` / `model` into `[knowledge_base.gateway]`
+/// just to enable brain.
+#[derive(Debug, Default, Clone)]
+struct LlmProviderSnapshot {
+    api_key: String,
+    base_url: String,
+    model: String,
+    protocol: UpstreamProtocol,
+}
+
+/// Read the configured `[llm.<provider>]` section into a flat snapshot.
+///
+/// Maps the provider name (normalized to lowercase) to its sub-struct
+/// inside [`LlmConfig`]. Anthropic + claude_code are Anthropic-protocol;
+/// every other recognized provider is treated as OpenAI-compatible by
+/// convention. An unknown provider name yields an empty snapshot with
+/// the default protocol (Anthropic), which then falls through to the
+/// built-in defaults inside [`resolve_upstream_config`].
+fn read_llm_provider_section(llm: &LlmConfig, provider: &str) -> LlmProviderSnapshot {
+    let protocol = UpstreamProtocol::from_provider_name(provider);
+    let sub = match provider.to_ascii_lowercase().as_str() {
+        "anthropic" => Some(&llm.anthropic),
+        "openai" => Some(&llm.openai),
+        "qwen" => Some(&llm.qwen),
+        "deepseek" => Some(&llm.deepseek),
+        "openrouter" => Some(&llm.openrouter),
+        "claude-code" | "claude_code" => Some(&llm.claude_code),
+        "gemini-cli" | "gemini_cli" => Some(&llm.gemini_cli),
+        "gemini" => Some(&llm.gemini),
+        "groq" => Some(&llm.groq),
+        "ollama" => Some(&llm.ollama),
+        "mistral" => Some(&llm.mistral),
+        "xai" | "grok" => Some(&llm.xai),
+        "cohere" => Some(&llm.cohere),
+        "perplexity" => Some(&llm.perplexity),
+        "together" => Some(&llm.together),
+        "kimi-agent" | "kimi_agent" | "kimi" => Some(&llm.kimi_agent),
+        "openclaw" | "open_claw" | "open-claw" => Some(&llm.openclaw),
+        _ => None,
+    };
+    match sub {
+        Some(p) => LlmProviderSnapshot {
+            api_key: p.api_key.clone().unwrap_or_default(),
+            base_url: p.base_url.clone().unwrap_or_default(),
+            model: p.model.clone().unwrap_or_default(),
+            protocol,
+        },
+        None => LlmProviderSnapshot {
+            protocol,
+            ..Default::default()
+        },
+    }
+}
+
+/// Resolve upstream gateway settings using the M2-5 + M4-2.6
+/// precedence order:
 ///
 ///   1. Non-empty value from the TOML config (`[knowledge_base.gateway]`).
 ///   2. Non-empty value from the corresponding env var.
-///   3. Built-in default (the `DEFAULT_*` constants exported by the
+///   3. M4-2.6: non-empty value from the active `[llm.<provider>]`
+///      section (where `<provider>` is `[llm].provider`).
+///   4. Built-in default (the `DEFAULT_*` constants exported by the
 ///      `nevoflux-llm-gateway` crate).
 ///
 /// `upstream_api_key` additionally chains through `ANTHROPIC_API_KEY`
 /// as a final env fallback (preserved from M1 for backward compat).
-fn resolve_upstream_config(config: &GatewayUpstreamConfig) -> ResolvedUpstreamConfig {
+fn resolve_upstream_config(
+    config: &GatewayUpstreamConfig,
+    agent: &AgentConfig,
+) -> ResolvedUpstreamConfig {
+    // M4-2.6: read the active `[llm.<provider>]` section once so we can
+    // use its api_key / base_url / model as a third fallback layer.
+    let llm_snapshot = agent
+        .llm
+        .provider
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or(agent.llm.default_provider.as_deref())
+        .filter(|s| !s.is_empty())
+        .map(|p| read_llm_provider_section(&agent.llm, p))
+        .unwrap_or_default();
+
     let upstream_base_url = if !config.upstream_base_url.is_empty() {
         config.upstream_base_url.clone()
+    } else if let Some(v) = std::env::var("NEVOFLUX_LLM_GATEWAY_UPSTREAM_BASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        v
+    } else if !llm_snapshot.base_url.is_empty() {
+        llm_snapshot.base_url.clone()
     } else {
-        std::env::var("NEVOFLUX_LLM_GATEWAY_UPSTREAM_BASE_URL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| DEFAULT_UPSTREAM_BASE.to_string())
+        DEFAULT_UPSTREAM_BASE.to_string()
     };
 
     let upstream_api_key = if !config.upstream_api_key.is_empty() {
         config.upstream_api_key.clone()
+    } else if let Some(v) = std::env::var("NEVOFLUX_LLM_GATEWAY_UPSTREAM_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        v
+    } else if !llm_snapshot.api_key.is_empty() {
+        llm_snapshot.api_key.clone()
     } else {
-        std::env::var("NEVOFLUX_LLM_GATEWAY_UPSTREAM_API_KEY")
+        std::env::var("ANTHROPIC_API_KEY")
             .ok()
             .filter(|s| !s.is_empty())
-            .or_else(|| {
-                std::env::var("ANTHROPIC_API_KEY")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-            })
             .unwrap_or_default()
     };
 
     let upstream_model_remap = if !config.upstream_model_remap.is_empty() {
         Some(config.upstream_model_remap.clone())
+    } else if let Some(v) = std::env::var("NEVOFLUX_LLM_GATEWAY_UPSTREAM_MODEL")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        Some(v)
+    } else if !llm_snapshot.model.is_empty() {
+        Some(llm_snapshot.model.clone())
     } else {
-        std::env::var("NEVOFLUX_LLM_GATEWAY_UPSTREAM_MODEL")
-            .ok()
-            .filter(|s| !s.is_empty())
+        None
     };
 
     let anthropic_version = if !config.anthropic_version.is_empty() {
@@ -124,6 +215,20 @@ fn resolve_upstream_config(config: &GatewayUpstreamConfig) -> ResolvedUpstreamCo
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_ANTHROPIC_VERSION.to_string())
+    };
+
+    // Protocol resolution (M4-2.6): explicit kb_gateway value wins,
+    // then env, then derived from the active `[llm].provider`, else
+    // the built-in default (Anthropic).
+    let upstream_protocol = if !config.upstream_protocol.is_empty() {
+        UpstreamProtocol::parse_label(&config.upstream_protocol)
+    } else if let Some(v) = std::env::var("NEVOFLUX_LLM_GATEWAY_UPSTREAM_PROTOCOL")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        UpstreamProtocol::parse_label(&v)
+    } else {
+        llm_snapshot.protocol
     };
 
     let request_timeout = if config.request_timeout_secs > 0 {
@@ -189,6 +294,7 @@ fn resolve_upstream_config(config: &GatewayUpstreamConfig) -> ResolvedUpstreamCo
         stream_idle_timeout,
         retry_max_wait,
         advertised_models,
+        upstream_protocol,
     }
 }
 
@@ -221,8 +327,9 @@ fn env_duration_secs(name: &str, default: Duration) -> Duration {
 /// 5. Poll `/healthz` up to 20 times at 100 ms intervals before
 ///    declaring success.
 pub async fn init_gateway(
-    config: &KnowledgeBaseConfig,
+    agent_config: &AgentConfig,
 ) -> Result<Option<GatewayBoot>, InitError> {
+    let config = &agent_config.knowledge_base;
     if !config.enabled {
         info!("knowledge_base.enabled = false — skipping llm-gateway start");
         return Ok(None);
@@ -232,13 +339,14 @@ pub async fn init_gateway(
 
     let bearer_token = generate_random_token();
 
-    let resolved = resolve_upstream_config(&config.gateway);
+    let resolved = resolve_upstream_config(&config.gateway, agent_config);
 
     if resolved.upstream_api_key.is_empty() {
         warn!(
             "no upstream API key found in TOML [knowledge_base.gateway].upstream_api_key, \
-             NEVOFLUX_LLM_GATEWAY_UPSTREAM_API_KEY, or ANTHROPIC_API_KEY — gateway \
-             /v1/chat/completions will 401 from upstream until one is supplied"
+             NEVOFLUX_LLM_GATEWAY_UPSTREAM_API_KEY, [llm.<provider>].api_key, or \
+             ANTHROPIC_API_KEY — gateway /v1/chat/completions will 401 from upstream \
+             until one is supplied"
         );
     }
 
@@ -254,6 +362,7 @@ pub async fn init_gateway(
         upstream_stream_idle_timeout: resolved.stream_idle_timeout,
         upstream_retry_max_wait: resolved.retry_max_wait,
         advertised_models: resolved.advertised_models,
+        upstream_protocol: resolved.upstream_protocol,
     };
 
     let handle = serve_gateway(gateway_config)
@@ -337,6 +446,23 @@ mod tests {
         for var in RESOLVER_ENV_VARS {
             std::env::remove_var(var);
         }
+        // M4-2.6: also clear the new protocol env var so tests start from
+        // a clean slate.
+        std::env::remove_var("NEVOFLUX_LLM_GATEWAY_UPSTREAM_PROTOCOL");
+    }
+
+    /// Build a minimal `AgentConfig` for resolver tests. Most tests don't
+    /// care about anything but `knowledge_base.gateway` and (for M4-2.6)
+    /// `llm.<provider>`, so default everything else.
+    fn test_agent_config(gateway: GatewayUpstreamConfig) -> AgentConfig {
+        AgentConfig {
+            knowledge_base: KnowledgeBaseConfig {
+                enabled: true,
+                gateway,
+                brain: crate::config::BrainConfig::default(),
+            },
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -358,11 +484,8 @@ mod tests {
 
     #[tokio::test]
     async fn init_gateway_disabled_returns_none() {
-        let cfg = KnowledgeBaseConfig {
-            enabled: false,
-            gateway: GatewayUpstreamConfig::default(),
-            brain: crate::config::BrainConfig::default(),
-        };
+        let mut cfg = AgentConfig::default();
+        cfg.knowledge_base.enabled = false;
         let result = init_gateway(&cfg).await.expect("disabled is not an error");
         assert!(
             result.is_none(),
@@ -375,11 +498,8 @@ mod tests {
         // Use defaults across the board — the resolver will pick a
         // reasonable base URL + empty key, and /healthz is un-authed
         // so the test passes without real Anthropic creds.
-        let cfg = KnowledgeBaseConfig {
-            enabled: true,
-            gateway: GatewayUpstreamConfig::default(),
-            brain: crate::config::BrainConfig::default(),
-        };
+        let mut cfg = AgentConfig::default();
+        cfg.knowledge_base.enabled = true;
         let boot = init_gateway(&cfg)
             .await
             .expect("enabled init should succeed")
@@ -399,11 +519,11 @@ mod tests {
             "NEVOFLUX_LLM_GATEWAY_UPSTREAM_BASE_URL",
             "https://env-loses.example",
         );
-        let config = GatewayUpstreamConfig {
+        let agent = test_agent_config(GatewayUpstreamConfig {
             upstream_base_url: "https://config-wins.example".into(),
             ..Default::default()
-        };
-        let resolved = resolve_upstream_config(&config);
+        });
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
         assert_eq!(resolved.upstream_base_url, "https://config-wins.example");
         clear_resolver_env();
     }
@@ -416,8 +536,8 @@ mod tests {
             "NEVOFLUX_LLM_GATEWAY_UPSTREAM_BASE_URL",
             "https://from-env.example",
         );
-        let config = GatewayUpstreamConfig::default();
-        let resolved = resolve_upstream_config(&config);
+        let agent = test_agent_config(GatewayUpstreamConfig::default());
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
         assert_eq!(resolved.upstream_base_url, "https://from-env.example");
         clear_resolver_env();
     }
@@ -426,8 +546,8 @@ mod tests {
     fn resolve_upstream_config_falls_back_to_builtin_default() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         clear_resolver_env();
-        let config = GatewayUpstreamConfig::default();
-        let resolved = resolve_upstream_config(&config);
+        let agent = test_agent_config(GatewayUpstreamConfig::default());
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
         assert_eq!(resolved.upstream_base_url, DEFAULT_UPSTREAM_BASE);
         assert_eq!(resolved.anthropic_version, DEFAULT_ANTHROPIC_VERSION);
         assert!(resolved.upstream_model_remap.is_none());
@@ -442,6 +562,8 @@ mod tests {
         // M2-1: no advertised_models in TOML + no remap = single sentinel
         // "default" entry so `GET /v1/models` never returns an empty list.
         assert_eq!(resolved.advertised_models, vec!["default".to_string()]);
+        // M4-2.6: default protocol is Anthropic when nothing else applies.
+        assert_eq!(resolved.upstream_protocol, UpstreamProtocol::Anthropic);
     }
 
     #[test]
@@ -450,8 +572,8 @@ mod tests {
         clear_resolver_env();
         // Config empty, NEVOFLUX_*_API_KEY empty, ANTHROPIC_API_KEY set.
         std::env::set_var("ANTHROPIC_API_KEY", "fallback-key");
-        let config = GatewayUpstreamConfig::default();
-        let resolved = resolve_upstream_config(&config);
+        let agent = test_agent_config(GatewayUpstreamConfig::default());
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
         assert_eq!(resolved.upstream_api_key, "fallback-key");
         clear_resolver_env();
     }
@@ -465,8 +587,8 @@ mod tests {
             "nevoflux-wins",
         );
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic-loses");
-        let config = GatewayUpstreamConfig::default();
-        let resolved = resolve_upstream_config(&config);
+        let agent = test_agent_config(GatewayUpstreamConfig::default());
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
         assert_eq!(resolved.upstream_api_key, "nevoflux-wins");
         clear_resolver_env();
     }
@@ -479,13 +601,14 @@ mod tests {
             "NEVOFLUX_LLM_GATEWAY_UPSTREAM_REQUEST_TIMEOUT_SECS",
             "120",
         );
-        let config = GatewayUpstreamConfig::default();
-        let resolved = resolve_upstream_config(&config);
+        let agent = test_agent_config(GatewayUpstreamConfig::default());
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
         assert_eq!(resolved.request_timeout, Duration::from_secs(120));
         clear_resolver_env();
 
         // And with no env set, falls all the way back to the built-in.
-        let resolved = resolve_upstream_config(&GatewayUpstreamConfig::default());
+        let agent = test_agent_config(GatewayUpstreamConfig::default());
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
         assert_eq!(resolved.request_timeout, DEFAULT_UPSTREAM_REQUEST_TIMEOUT);
     }
 
@@ -495,12 +618,12 @@ mod tests {
         // populated `upstream_model_remap`.
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         clear_resolver_env();
-        let config = GatewayUpstreamConfig {
+        let agent = test_agent_config(GatewayUpstreamConfig {
             upstream_model_remap: "remap-loses".into(),
             advertised_models: vec!["m-1".into(), "m-2".into(), "m-3".into()],
             ..Default::default()
-        };
-        let resolved = resolve_upstream_config(&config);
+        });
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
         assert_eq!(resolved.advertised_models, vec!["m-1", "m-2", "m-3"]);
     }
 
@@ -510,12 +633,12 @@ mod tests {
         // single-entry list with the remap target.
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         clear_resolver_env();
-        let config = GatewayUpstreamConfig {
+        let agent = test_agent_config(GatewayUpstreamConfig {
             upstream_model_remap: "claude-haiku-4-5".into(),
             advertised_models: Vec::new(),
             ..Default::default()
-        };
-        let resolved = resolve_upstream_config(&config);
+        });
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
         assert_eq!(resolved.advertised_models, vec!["claude-haiku-4-5"]);
     }
 
@@ -527,12 +650,135 @@ mod tests {
             "NEVOFLUX_LLM_GATEWAY_UPSTREAM_REQUEST_TIMEOUT_SECS",
             "999",
         );
-        let config = GatewayUpstreamConfig {
+        let agent = test_agent_config(GatewayUpstreamConfig {
             request_timeout_secs: 30,
             ..Default::default()
-        };
-        let resolved = resolve_upstream_config(&config);
+        });
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
         assert_eq!(resolved.request_timeout, Duration::from_secs(30));
         clear_resolver_env();
+    }
+
+    // ====================================================================
+    // M4-2.6 — `[llm.<provider>]` fallback layer + protocol selection.
+    // ====================================================================
+
+    #[test]
+    fn resolve_falls_back_to_llm_anthropic_when_active() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_resolver_env();
+        let mut agent = test_agent_config(GatewayUpstreamConfig::default());
+        agent.llm.provider = Some("anthropic".into());
+        agent.llm.anthropic.api_key = Some("from-llm-anthropic".into());
+        agent.llm.anthropic.base_url = Some("https://test.anthropic".into());
+        agent.llm.anthropic.model = Some("claude-test".into());
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
+        assert_eq!(resolved.upstream_api_key, "from-llm-anthropic");
+        assert_eq!(resolved.upstream_base_url, "https://test.anthropic");
+        assert_eq!(
+            resolved.upstream_model_remap,
+            Some("claude-test".to_string())
+        );
+        assert_eq!(resolved.upstream_protocol, UpstreamProtocol::Anthropic);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_llm_openai_when_active_and_uses_openai_protocol() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_resolver_env();
+        let mut agent = test_agent_config(GatewayUpstreamConfig::default());
+        agent.llm.provider = Some("openai".into());
+        agent.llm.openai.api_key = Some("from-llm-openai".into());
+        agent.llm.openai.base_url = Some("https://api.openai.example".into());
+        agent.llm.openai.model = Some("gpt-4o".into());
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
+        assert_eq!(resolved.upstream_api_key, "from-llm-openai");
+        assert_eq!(resolved.upstream_base_url, "https://api.openai.example");
+        assert_eq!(resolved.upstream_model_remap, Some("gpt-4o".to_string()));
+        assert_eq!(resolved.upstream_protocol, UpstreamProtocol::OpenAi);
+    }
+
+    #[test]
+    fn resolve_uses_openai_protocol_for_other_compatible_providers() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_resolver_env();
+        for provider in ["qwen", "deepseek", "groq", "openrouter"] {
+            let mut agent = test_agent_config(GatewayUpstreamConfig::default());
+            agent.llm.provider = Some(provider.to_string());
+            let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
+            assert_eq!(
+                resolved.upstream_protocol,
+                UpstreamProtocol::OpenAi,
+                "provider {provider} should map to OpenAI protocol"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_kb_gateway_value_overrides_llm_anthropic() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_resolver_env();
+        let mut agent = test_agent_config(GatewayUpstreamConfig {
+            upstream_api_key: "explicit".into(),
+            ..Default::default()
+        });
+        agent.llm.provider = Some("anthropic".into());
+        agent.llm.anthropic.api_key = Some("from-llm-anthropic".into());
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
+        assert_eq!(resolved.upstream_api_key, "explicit");
+    }
+
+    #[test]
+    fn env_var_overrides_llm_anthropic_fallback() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_resolver_env();
+        std::env::set_var(
+            "NEVOFLUX_LLM_GATEWAY_UPSTREAM_API_KEY",
+            "env-wins",
+        );
+        let mut agent = test_agent_config(GatewayUpstreamConfig::default());
+        agent.llm.provider = Some("anthropic".into());
+        agent.llm.anthropic.api_key = Some("from-llm-anthropic".into());
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
+        assert_eq!(resolved.upstream_api_key, "env-wins");
+        clear_resolver_env();
+    }
+
+    #[test]
+    fn explicit_protocol_overrides_derived_protocol() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_resolver_env();
+        // active provider = anthropic (would derive Anthropic protocol),
+        // but explicit config says openai — explicit wins.
+        let mut agent = test_agent_config(GatewayUpstreamConfig {
+            upstream_protocol: "openai".into(),
+            ..Default::default()
+        });
+        agent.llm.provider = Some("anthropic".into());
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
+        assert_eq!(resolved.upstream_protocol, UpstreamProtocol::OpenAi);
+    }
+
+    #[test]
+    fn env_protocol_overrides_derived_protocol() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_resolver_env();
+        std::env::set_var("NEVOFLUX_LLM_GATEWAY_UPSTREAM_PROTOCOL", "openai");
+        let mut agent = test_agent_config(GatewayUpstreamConfig::default());
+        agent.llm.provider = Some("anthropic".into());
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
+        assert_eq!(resolved.upstream_protocol, UpstreamProtocol::OpenAi);
+        clear_resolver_env();
+    }
+
+    #[test]
+    fn no_active_provider_yields_anthropic_protocol_default() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_resolver_env();
+        let agent = test_agent_config(GatewayUpstreamConfig::default());
+        // No `[llm].provider` set at all.
+        assert!(agent.llm.provider.is_none());
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
+        assert_eq!(resolved.upstream_protocol, UpstreamProtocol::Anthropic);
     }
 }

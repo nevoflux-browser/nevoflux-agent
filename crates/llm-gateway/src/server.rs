@@ -10,6 +10,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, task::JoinHandle};
 
 use crate::handlers::{self, AppState};
+use crate::protocol::UpstreamProtocol;
 
 /// Default upstream base URL — canonical Anthropic API.
 pub const DEFAULT_UPSTREAM_BASE: &str = "https://api.anthropic.com";
@@ -87,6 +88,12 @@ pub struct GatewayConfig {
     /// list. If still empty, the handler synthesizes a fallback at
     /// request time.
     pub advertised_models: Vec<String>,
+    /// Protocol the upstream LLM endpoint speaks (M4-2.6). Determines
+    /// whether `chat_completions` runs the OpenAI ↔ Anthropic translator
+    /// path (existing M2 behavior) or forwards the request unchanged to
+    /// an OpenAI-compatible upstream. Defaults to
+    /// [`UpstreamProtocol::Anthropic`] for back-compat.
+    pub upstream_protocol: UpstreamProtocol,
 }
 
 impl GatewayConfig {
@@ -149,6 +156,15 @@ impl GatewayConfig {
                 .filter(|s| !s.is_empty())
                 .collect();
 
+        // M4-2.6: protocol selector. "anthropic" (default) keeps the
+        // existing M2 translator path; "openai" runs the passthrough
+        // path against an OpenAI Chat Completions upstream.
+        let upstream_protocol = std::env::var("NEVOFLUX_LLM_GATEWAY_UPSTREAM_PROTOCOL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| UpstreamProtocol::parse_label(&s))
+            .unwrap_or_default();
+
         if upstream_api_key.is_empty() {
             tracing::warn!(
                 "NEVOFLUX_LLM_GATEWAY_UPSTREAM_API_KEY is unset — /v1/chat/completions will fail upstream"
@@ -167,6 +183,7 @@ impl GatewayConfig {
             upstream_stream_idle_timeout,
             upstream_retry_max_wait,
             advertised_models,
+            upstream_protocol,
         })
     }
 
@@ -189,6 +206,7 @@ impl GatewayConfig {
             upstream_stream_idle_timeout: DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT,
             upstream_retry_max_wait: DEFAULT_UPSTREAM_RETRY_MAX_WAIT,
             advertised_models: Vec::new(),
+            upstream_protocol: UpstreamProtocol::Anthropic,
         }
     }
 }
