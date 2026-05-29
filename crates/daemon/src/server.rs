@@ -6352,6 +6352,14 @@ async fn handle_chat_message(
                     crate::kb_wizard::handle_init_brain(&params).await
                 }
                 "kb.wizard.cancel" => crate::kb_wizard::handle_cancel(&params).await,
+                // Browser-facing brain RPCs (M4-4a). The future
+                // `nevoflux://brain` page and the settings page call
+                // these to talk to the live BrainEngine without going
+                // through the LLM agent's tool-call loop.
+                "brain.health" => crate::brain_rpc::handle_health(&params).await,
+                "brain.stats" => crate::brain_rpc::handle_stats(&params).await,
+                "brain.list" => crate::brain_rpc::handle_list(&params).await,
+                "brain.get" => crate::brain_rpc::handle_get(&params).await,
                 // Artifact persistence commands
                 "artifact.get" => handle_artifact_get(session_manager, &params).await,
                 "artifact.list" => handle_artifact_list(session_manager, &params).await,

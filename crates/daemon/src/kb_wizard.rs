@@ -773,7 +773,11 @@ where
 // `system_response` envelope so the dispatcher only has to forward it.
 
 /// Build a `system_response` success envelope for command `cmd`.
-fn ok_response(request_id: &str, cmd: &str, data: serde_json::Value) -> serde_json::Value {
+pub(crate) fn ok_response(
+    request_id: &str,
+    cmd: &str,
+    data: serde_json::Value,
+) -> serde_json::Value {
     serde_json::json!({
         "type": "system_response",
         "payload": {
@@ -786,7 +790,7 @@ fn ok_response(request_id: &str, cmd: &str, data: serde_json::Value) -> serde_js
 }
 
 /// Build a `system_response` error envelope for command `cmd`.
-fn err_response(
+pub(crate) fn err_response(
     request_id: &str,
     cmd: &str,
     code: &str,
