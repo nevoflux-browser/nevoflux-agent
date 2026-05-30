@@ -35,6 +35,26 @@ use tracing::debug;
 
 use super::supervisor::McpToolCaller;
 
+/// Reduce a source name to a slug-safe segment (lowercase alnum + dashes).
+fn sanitize(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = s.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "source".into()
+    } else {
+        trimmed
+    }
+}
+
 /// BrainEngine implementation that dispatches every operation to a gbrain
 /// MCP server via an [`McpToolCaller`].
 ///
@@ -360,11 +380,42 @@ impl BrainEngine for GbrainEngine {
 
     async fn import_snapshot(
         &self,
-        _bundle: NbrainBundle,
-        _opts: ImportOpts,
+        bundle: NbrainBundle,
+        opts: ImportOpts,
     ) -> BrainResult<ImportReport> {
-        // TODO(M5): decrypt bundle + replay via put_page.
-        Err(BrainError::NotImplemented)
+        use nevoflux_brain::ImportTrust;
+
+        // 1. Open + verify the artifact.
+        let (_manifest, files) = crate::brain_share::open(&bundle.artifact, &opts.unlock)?;
+
+        // 2. Determine the landing slug prefix.
+        //    ReadOnly (default) → isolated namespace; FullMerge → main tree.
+        let prefix = match opts.trust {
+            ImportTrust::ReadOnly => format!("imported/{}/", sanitize(&opts.source_name)),
+            ImportTrust::FullMerge => String::new(),
+        };
+
+        // 3. Replay each file via put_page; record slug conflicts (FullMerge).
+        let mut report = ImportReport::default();
+        for f in files {
+            let rel_slug = f.path.strip_suffix(".md").unwrap_or(&f.path);
+            let slug = format!("{prefix}{rel_slug}");
+            if matches!(opts.trust, ImportTrust::FullMerge) {
+                // Conflict = a page already exists at this slug.
+                if self.get(&slug).await.is_ok() {
+                    report.conflicts.push(slug.clone());
+                    continue;
+                }
+            }
+            let content = String::from_utf8_lossy(&f.bytes).into_owned();
+            let page = BrainPage::from_markdown(slug, content);
+            self.put(page).await?;
+            report.files_imported += 1;
+        }
+
+        // 4. Reindex.
+        self.sync().await?;
+        Ok(report)
     }
 
     async fn add_source(&self, _src: SourceSpec) -> BrainResult<()> {
@@ -802,5 +853,56 @@ mod export_import_tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "concepts/yc.md");
         assert!(String::from_utf8_lossy(&files[0].bytes).contains("Startup accelerator"));
+    }
+
+    #[tokio::test]
+    async fn export_then_import_roundtrip() {
+        // Export from one engine.
+        let src = engine_with(&[
+            ("concepts/yc", "# YC\nAccelerator."),
+            ("people/pg", "# PG\nFounder."),
+        ]);
+        let bundle = src
+            .export_snapshot(
+                Selection::Directory(String::new()), // all pages
+                StripRules::default(),
+            )
+            .await
+            .unwrap();
+        let key = bundle.key.unwrap();
+
+        // Import into a fresh (empty) engine.
+        let dst_stub = Arc::new(StubGbrain {
+            pages: HashMap::new(),
+            puts: Mutex::new(Vec::new()),
+            syncs: Mutex::new(0),
+        });
+        let dst = GbrainEngine::new(dst_stub.clone());
+
+        let report = dst
+            .import_snapshot(
+                NbrainBundle {
+                    artifact: bundle.artifact,
+                    key: None,
+                },
+                ImportOpts {
+                    source_name: "Alice".into(),
+                    trust: ImportTrust::ReadOnly,
+                    unlock: Unlock::Key(key),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.files_imported, 2);
+        assert!(report.conflicts.is_empty());
+
+        // Files landed under the isolated namespace and sync ran.
+        let puts = dst_stub.puts.lock().unwrap();
+        assert_eq!(puts.len(), 2);
+        assert!(puts
+            .iter()
+            .all(|(slug, _)| slug.starts_with("imported/alice/")));
+        assert_eq!(*dst_stub.syncs.lock().unwrap(), 1);
     }
 }
