@@ -14,6 +14,8 @@ export interface Env {
   MAX_LIFETIME_SECS: string;
   /** Allowed CORS origin pattern. */
   CORS_ORIGIN: string;
+  /** Maximum brain bundle size in bytes (default: 52428800 = 50 MB). */
+  MAX_BRAIN_BUNDLE_SIZE: string;
 }
 
 /**
@@ -83,4 +85,23 @@ export interface ExtendRequest {
 export interface DeleteRequest {
   /** Raw owner token (base64url-encoded, 32 bytes). */
   owner_token: string;
+}
+
+/** Metadata stored in KV under `brain:<share_id>`. */
+export interface BrainShareKVMeta {
+  created_at: string;
+  expires_at: string;
+  size_bytes: number;
+  /** SHA-256(share_id || owner_token), hex. */
+  owner_token_hash: string;
+  view_count: number;
+  ip_hash: string;
+}
+
+/** Response body for POST /api/brain/share. */
+export interface BrainUploadResponse {
+  share_id: string;
+  expires_at: string;
+  size_bytes: number;
+  url: string;
 }

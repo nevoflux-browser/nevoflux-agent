@@ -70,6 +70,22 @@ export async function verifyOwnerToken(
   }
 }
 
+/**
+ * Validate that a payload begins with the `.nbrain` magic bytes `NBRN`
+ * (0x4E 0x42 0x52 0x4E). The body is otherwise opaque ciphertext; this is
+ * the only structural check the zero-knowledge worker performs.
+ */
+export function isValidNbrainMagic(body: ArrayBuffer): boolean {
+  if (body.byteLength < 4) return false;
+  const magic = new Uint8Array(body.slice(0, 4));
+  return (
+    magic[0] === 0x4e && // N
+    magic[1] === 0x42 && // B
+    magic[2] === 0x52 && // R
+    magic[3] === 0x4e // N
+  );
+}
+
 /** Decode a base64url string (no padding) to Uint8Array. */
 export function base64UrlDecode(input: string): Uint8Array {
   // Convert base64url to standard base64
