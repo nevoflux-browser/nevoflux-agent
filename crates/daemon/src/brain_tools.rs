@@ -151,6 +151,33 @@ pub fn lookup_by_nevoflux_name(name: &str) -> Option<&'static BrainToolDef> {
     BRAIN_TOOLS.iter().find(|t| t.nevoflux_name == name)
 }
 
+/// Chinese keyword string to append to a brain tool's BM25-indexed text
+/// so Chinese queries (e.g. "我的知识库有多少页") match the English-only
+/// tool descriptions. This does NOT change the tool itself — only its
+/// searchability in the `tool_search` discovery index.
+///
+/// Every brain tool gets a shared base of generic knowledge-base terms;
+/// the common tools additionally get per-tool intent hints.
+pub fn chinese_search_keywords(nevoflux_name: &str) -> &'static str {
+    // Per-tool hints for the most commonly asked-about tools. Matched on
+    // the nevoflux-side name (with or without the `brain_` prefix so it is
+    // robust to either form being passed). The generic base terms shared by
+    // every tool live in [`chinese_search_keywords_base`].
+    match nevoflux_name.trim_start_matches("brain_") {
+        "search" | "query" => " 搜索 查询 检索 知识库",
+        "get_stats" | "stats" => " 统计 数量 多少 页数 知识库",
+        "list" | "list_pages" => " 列表 列出 所有 页面 知识库",
+        "get_page" => " 读取 查看 页面 内容",
+        "put_page" => " 保存 写入 添加 页面",
+        _ => "",
+    }
+}
+
+/// The generic Chinese keyword base appended to *every* brain tool.
+pub fn chinese_search_keywords_base() -> &'static str {
+    " 知识库 笔记 大脑 brain 检索 搜索 页面 保存"
+}
+
 /// Translate an `arguments` object from the agent into a gbrain
 /// tools/call invocation, then route the response back. Returns a
 /// JSON-string tool result that the agent can ingest, OR an error
@@ -263,7 +290,11 @@ mod tests {
         names.sort_unstable();
         let count_before = names.len();
         names.dedup();
-        assert_eq!(count_before, names.len(), "duplicate nevoflux_name in catalog");
+        assert_eq!(
+            count_before,
+            names.len(),
+            "duplicate nevoflux_name in catalog"
+        );
     }
 
     #[test]
@@ -363,6 +394,22 @@ mod tests {
                 "read-only tool brain_{name} must remain in the catalog"
             );
         }
+    }
+
+    #[test]
+    fn chinese_search_keywords_cover_common_tools() {
+        // Per-tool hints are returned for the common knowledge-base tools,
+        // matched with or without the `brain_` prefix.
+        assert!(chinese_search_keywords("brain_get_stats").contains("统计"));
+        assert!(chinese_search_keywords("get_stats").contains("统计"));
+        assert!(chinese_search_keywords("brain_search").contains("搜索"));
+        assert!(chinese_search_keywords("brain_list").contains("列表"));
+        assert!(chinese_search_keywords("brain_get_page").contains("页面"));
+        assert!(chinese_search_keywords("brain_put_page").contains("保存"));
+        // Unknown tools get no per-tool hint (but still get the shared base).
+        assert_eq!(chinese_search_keywords("brain_whoami"), "");
+        // Base is non-empty and shared by every tool.
+        assert!(chinese_search_keywords_base().contains("知识库"));
     }
 
     #[test]

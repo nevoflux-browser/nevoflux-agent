@@ -291,8 +291,9 @@ impl Default for ServerConfig {
 /// init task once it finishes loading the model and backfilling missing
 /// embeddings. Cloning the receiver is cheap; callers `.borrow()` to
 /// read the latest [`crate::memory_reindex::ReindexProgress`] snapshot.
-pub type ReindexProgressSlot =
-    Arc<std::sync::RwLock<Option<tokio::sync::watch::Receiver<crate::memory_reindex::ReindexProgress>>>>;
+pub type ReindexProgressSlot = Arc<
+    std::sync::RwLock<Option<tokio::sync::watch::Receiver<crate::memory_reindex::ReindexProgress>>>,
+>;
 
 /// The TCP server handle.
 pub struct Server {
@@ -653,9 +654,7 @@ pub async fn start_server(
             // Don't fail the whole daemon boot if the gateway can't
             // come up — the knowledge-base path is degraded but the
             // rest of the daemon remains usable.
-            error!(
-                "llm-gateway init failed: {e}; continuing with knowledge base disabled"
-            );
+            error!("llm-gateway init failed: {e}; continuing with knowledge base disabled");
             None
         }
     };
@@ -676,20 +675,21 @@ pub async fn start_server(
     // supervisor in without a daemon restart. Construct the slot up
     // front (empty), publish it for the wizard, then populate it from
     // boot-time `init_brain()` below.
-    let brain_slot: crate::init_brain::SharedBrainSlot =
-        Arc::new(tokio::sync::RwLock::new(None));
+    let brain_slot: crate::init_brain::SharedBrainSlot = Arc::new(tokio::sync::RwLock::new(None));
     let _ = crate::init_brain::CURRENT_BRAIN_SLOT.set(brain_slot.clone());
 
-    let brain_boot =
-        match crate::init_brain::init_brain(&agent_config.knowledge_base, &gateway_snapshot)
-            .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                error!("init_brain failed: {e}; continuing without brain");
-                None
-            }
-        };
+    let brain_boot = match crate::init_brain::init_brain(
+        &agent_config.knowledge_base,
+        &gateway_snapshot,
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            error!("init_brain failed: {e}; continuing without brain");
+            None
+        }
+    };
     if let Some(boot) = brain_boot {
         let mut guard = brain_slot.write().await;
         *guard = Some(crate::init_brain::BrainSlot {
@@ -739,8 +739,8 @@ pub async fn start_server(
     // RPCs (kb.wizard.*). `set` is best-effort: a second daemon
     // restart in the same process (rare; mostly tests) would re-use
     // the previously published handles, which is benign.
-    let _ = crate::kb_wizard::CURRENT_WIZARD_STATE
-        .set(Arc::new(crate::kb_wizard::WizardState::new()));
+    let _ =
+        crate::kb_wizard::CURRENT_WIZARD_STATE.set(Arc::new(crate::kb_wizard::WizardState::new()));
     let _ = crate::kb_wizard::CURRENT_EVENT_BUS.set(event_bus.clone());
     if let Some(snap) = gateway_snapshot.as_ref() {
         let _ = crate::kb_wizard::CURRENT_GATEWAY_SNAPSHOT.set(snap.clone());
@@ -766,11 +766,20 @@ pub async fn start_server(
     // first; the MCP background task below adds external MCP tools
     // additively (via `add`) so it does not clear the brain entries.
     {
+        // Append Chinese keywords to each brain tool's *indexed* description so
+        // Chinese queries (e.g. "我的知识库有多少页") match the English-only
+        // descriptions in the BM25 index. The tool behavior is unchanged — this
+        // text only feeds tool_search ranking.
         let brain_defs: Vec<nevoflux_mcp::ToolDefinition> = crate::brain_tools::tool_catalog()
             .iter()
             .map(|t| nevoflux_mcp::ToolDefinition {
                 name: t.nevoflux_name.clone(),
-                description: t.description.clone(),
+                description: format!(
+                    "{}{}{}",
+                    t.description,
+                    crate::brain_tools::chinese_search_keywords_base(),
+                    crate::brain_tools::chinese_search_keywords(&t.nevoflux_name),
+                ),
                 input_schema: t.input_schema.clone(),
             })
             .collect();
@@ -898,8 +907,7 @@ pub async fn start_server(
     // receiver. Populated by the embedding-init task below once it has
     // an embedder + the storage layer reports stale chunks. Read by
     // `Server::reindex_progress()`.
-    let reindex_progress_slot: ReindexProgressSlot =
-        Arc::new(std::sync::RwLock::new(None));
+    let reindex_progress_slot: ReindexProgressSlot = Arc::new(std::sync::RwLock::new(None));
 
     // Spawn background embedding init task — loads ONNX model, populates the
     // shared embedding slot, loads existing memory vectors, and starts backfill.
@@ -3732,7 +3740,10 @@ async fn backfill_embeddings(
         Ok(chunks) => {
             let mut count = 0;
             for chunk in chunks {
-                match provider.embed_kind(EmbedKind::Passage, &chunk.content).await {
+                match provider
+                    .embed_kind(EmbedKind::Passage, &chunk.content)
+                    .await
+                {
                     Ok(emb) => {
                         if storage
                             .database()
@@ -6284,12 +6295,9 @@ async fn handle_chat_message(
                         Some(asset_server) => {
                             // If the extension reported its origin in this
                             // status call, lock the CORS allow-origin to it.
-                            if let Some(origin) =
-                                params.get("origin").and_then(|v| v.as_str())
-                            {
+                            if let Some(origin) = params.get("origin").and_then(|v| v.as_str()) {
                                 if !origin.is_empty() {
-                                    asset_server
-                                        .set_allowed_origin(Some(origin.to_string()));
+                                    asset_server.set_allowed_origin(Some(origin.to_string()));
                                 }
                             }
                             serde_json::to_value(asset_server.asset_plane_info())
@@ -6373,15 +6381,11 @@ async fn handle_chat_message(
                 // in-flight step. Progress streams on the EventBus
                 // topic `system:kb-wizard:progress`.
                 "kb.wizard.status" => crate::kb_wizard::handle_status(&params).await,
-                "kb.wizard.install_bun" => {
-                    crate::kb_wizard::handle_install_bun(&params).await
-                }
+                "kb.wizard.install_bun" => crate::kb_wizard::handle_install_bun(&params).await,
                 "kb.wizard.install_gbrain" => {
                     crate::kb_wizard::handle_install_gbrain(&params).await
                 }
-                "kb.wizard.init_brain" => {
-                    crate::kb_wizard::handle_init_brain(&params).await
-                }
+                "kb.wizard.init_brain" => crate::kb_wizard::handle_init_brain(&params).await,
                 "kb.wizard.cancel" => crate::kb_wizard::handle_cancel(&params).await,
                 // Browser-facing brain RPCs (M4-4a). The future
                 // `nevoflux://brain` page and the settings page call
@@ -9423,8 +9427,8 @@ fn promote_image_local_files_to_attachments(
     attachments: &mut Vec<Attachment>,
     local_files: &mut Vec<nevoflux_protocol::FileInfo>,
 ) {
-    use base64::{engine::general_purpose::STANDARD, Engine};
     use crate::canvas_video::asset_resize::{maybe_resize_bytes, ResizeOutcome};
+    use base64::{engine::general_purpose::STANDARD, Engine};
 
     const MAX_INPUT_BYTES: u64 = 20 * 1024 * 1024;
     const LLM_STAGE_MAX: u32 = 1024;
@@ -9434,8 +9438,7 @@ fn promote_image_local_files_to_attachments(
     // under this — guard rejects pathological cases.
     const MAX_LLM_BYTES: usize = 5 * 1024 * 1024;
 
-    let mut promoted_paths: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut promoted_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for f in local_files.iter() {
         if f.is_directory {
@@ -9478,8 +9481,7 @@ fn promote_image_local_files_to_attachments(
         // Resize to LLM-friendly dimensions. The 1024×1024 box is what
         // Claude vision tools internally normalise to anyway; sending
         // anything bigger spends bandwidth without improving recognition.
-        let (resized_bytes, outcome) =
-            maybe_resize_bytes(&raw_bytes, LLM_STAGE_MAX, LLM_STAGE_MAX);
+        let (resized_bytes, outcome) = maybe_resize_bytes(&raw_bytes, LLM_STAGE_MAX, LLM_STAGE_MAX);
         let (final_bytes, final_mime): (Vec<u8>, String) = match &outcome {
             ResizeOutcome::Resized { format, .. } => {
                 let new_mime = match format {
@@ -9658,7 +9660,10 @@ mod tests {
         assert_eq!(attachments.len(), 1, "image should have been promoted");
         assert_eq!(attachments[0].mime_type, "image/png");
         assert_eq!(attachments[0].name, "hero.png");
-        assert!(!attachments[0].data.is_empty(), "data must be base64-encoded");
+        assert!(
+            !attachments[0].data.is_empty(),
+            "data must be base64-encoded"
+        );
         // Decode and compare round-trip.
         use base64::{engine::general_purpose::STANDARD, Engine};
         let round_trip = STANDARD.decode(&attachments[0].data).unwrap();
@@ -9667,7 +9672,11 @@ mod tests {
         // canvas_attach_asset({ local_path: ... }) afterwards. Earlier
         // versions dropped the entry and the agent ended up globbing
         // /tmp blindly looking for the path it could no longer see.
-        assert_eq!(local_files.len(), 1, "promoted entry must STAY in local_files for canvas_attach_asset(local_path=...)");
+        assert_eq!(
+            local_files.len(),
+            1,
+            "promoted entry must STAY in local_files for canvas_attach_asset(local_path=...)"
+        );
         assert_eq!(local_files[0].path, path.to_string_lossy().to_string());
 
         // Reuse: writing a tmpfile guard
@@ -9759,23 +9768,32 @@ mod tests {
         let mut rgb = Vec::with_capacity((w * h * 3) as usize);
         for y in 0..h {
             for x in 0..w {
-                let r = x.wrapping_mul(2654435761).wrapping_add(y.wrapping_mul(40503)) as u8;
-                let g = y.wrapping_mul(2246822519).wrapping_add(x.wrapping_mul(16807)) as u8;
+                let r = x
+                    .wrapping_mul(2654435761)
+                    .wrapping_add(y.wrapping_mul(40503)) as u8;
+                let g = y
+                    .wrapping_mul(2246822519)
+                    .wrapping_add(x.wrapping_mul(16807)) as u8;
                 let b = (x ^ y).wrapping_mul(1597334677) as u8;
                 rgb.extend_from_slice(&[r, g, b]);
             }
         }
         let mut png_bytes = Vec::new();
         let encoder = PngEncoder::new(&mut png_bytes);
-        encoder.write_image(&rgb, w, h, image::ColorType::Rgb8.into()).unwrap();
+        encoder
+            .write_image(&rgb, w, h, image::ColorType::Rgb8.into())
+            .unwrap();
         std::fs::write(&path, &png_bytes).unwrap();
 
         let original_size = png_bytes.len();
         // Sanity: the test fixture really exceeds the LLM-payload cap
         // when sent raw. Otherwise the test wouldn't be exercising the
         // resize path.
-        assert!(original_size > 5 * 1024 * 1024,
-            "fixture only {} bytes — expected > 5 MB to trigger LLM size guard", original_size);
+        assert!(
+            original_size > 5 * 1024 * 1024,
+            "fixture only {} bytes — expected > 5 MB to trigger LLM size guard",
+            original_size
+        );
 
         let mut attachments: Vec<Attachment> = Vec::new();
         let mut local_files = vec![nevoflux_protocol::FileInfo {
@@ -9788,15 +9806,24 @@ mod tests {
         promote_image_local_files_to_attachments(&mut attachments, &mut local_files);
 
         assert_eq!(attachments.len(), 1, "image must be promoted (with resize)");
-        assert_eq!(local_files.len(), 1, "promoted entry preserved for canvas_attach_asset(local_path)");
+        assert_eq!(
+            local_files.len(),
+            1,
+            "promoted entry preserved for canvas_attach_asset(local_path)"
+        );
 
         // Decode the output and verify it's much smaller AND inside the
         // LLM cap. Opaque photo PNG → JPEG q=85 path.
         let llm_bytes = STANDARD.decode(&attachments[0].data).unwrap();
-        assert!(llm_bytes.len() < 1 * 1024 * 1024,
-            "LLM payload {} bytes; should be < 1 MB after resize", llm_bytes.len());
-        assert_eq!(attachments[0].mime_type, "image/jpeg",
-            "opaque PNG should convert to JPEG");
+        assert!(
+            llm_bytes.len() < 1 * 1024 * 1024,
+            "LLM payload {} bytes; should be < 1 MB after resize",
+            llm_bytes.len()
+        );
+        assert_eq!(
+            attachments[0].mime_type, "image/jpeg",
+            "opaque PNG should convert to JPEG"
+        );
         let _ = &dir;
     }
 

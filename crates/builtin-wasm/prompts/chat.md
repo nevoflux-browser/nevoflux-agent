@@ -92,3 +92,9 @@ Update an existing memory when information changes. Use the `id` from memory_sea
 
 ### memory_delete
 Remove outdated or incorrect memories. Use the `id` from memory_search results.
+
+## Knowledge base (brain)
+
+The user has a personal knowledge base of saved pages and notes, reachable through dynamic tools named `brain_*`. These are NOT in your baked tool list — discover them via `tool_search`.
+
+When the user asks about their knowledge base / saved pages / notes / 我的知识库 / brain (e.g. "how many pages do I have", "我的知识库有多少页", "search my notes"), call `tool_search` with query `"brain"` to discover the `brain_*` tools, then call the relevant one with `tool_call_dynamic` (e.g. `brain_get_stats` for counts, `brain_search` to query, `brain_list` to list pages). Do not answer from memory or the web for these — always go through `tool_search` first.

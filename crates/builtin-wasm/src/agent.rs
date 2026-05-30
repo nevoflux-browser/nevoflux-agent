@@ -2345,9 +2345,9 @@ The following skill instructions MUST be followed exactly. These instructions ta
             // /loop skill tools — direct-API dispatch (Anthropic / OpenAI direct
             // providers). The MCP/ACP path goes through
             // `mcp_tool_executor::execute_mcp_tool::loop_*`.
-            "loop_create" => self
-                .host
-                .tool_loop_create(&serde_json::to_string(&tool_call.arguments).unwrap_or_default())?,
+            "loop_create" => self.host.tool_loop_create(
+                &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
+            )?,
             "loop_list" => self.host.tool_loop_list()?,
             "loop_cancel" => {
                 let loop_id = tool_call.arguments["loop_id"].as_str().unwrap_or("");
@@ -2745,7 +2745,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
 
     /// Get available tools for chat mode.
     fn get_chat_tools(&self) -> Vec<ToolDefinition> {
-        vec![
+        let mut tools = vec![
             ToolDefinition {
                 name: "think".into(),
                 description: "Use this tool to think through problems step by step before acting. Analyze the situation, reason about the best approach, reflect on results, or plan your next move. This tool has no side effects - it simply records your thought process.".into(),
@@ -3564,7 +3564,63 @@ The following skill instructions MUST be followed exactly. These instructions ta
                     "required": ["content"]
                 }),
             },
-        ]
+        ];
+
+        // Dynamic tool discovery is available in every mode (including Chat) so
+        // users can reach the knowledge base (brain_*) and any other MCP/dynamic
+        // tools. Browser/Agent modes inherit these via get_chat_tools().
+        tools.push(Self::tool_search_def());
+        tools.push(Self::tool_call_dynamic_def());
+
+        tools
+    }
+
+    /// ToolDefinition for the dynamic MCP tool-discovery meta-tool.
+    /// Shared by all mode builders (Chat inherits, Browser/Agent reuse).
+    fn tool_search_def() -> ToolDefinition {
+        ToolDefinition {
+            name: "tool_search".into(),
+            description: "Search for external/dynamic tools (NOT built-in tools like web_search, browser_*, read, write). This includes MCP server tools AND the knowledge-base tools (brain_*). Use when you need tools from connected MCP servers, or when the user asks about their knowledge base / saved pages / notes / 我的知识库 / brain — search query=\"brain\" to discover brain_get_stats, brain_search, brain_list, etc. Always search first — never guess tool names or schemas.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Keywords to search for (e.g., 'git', 'database', 'image', 'brain')"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of results to return (default: 5)",
+                        "default": 5
+                    }
+                },
+                "required": ["query"]
+            }),
+        }
+    }
+
+    /// ToolDefinition for invoking a tool discovered via `tool_search`.
+    /// Shared by all mode builders (Chat inherits, Browser/Agent reuse).
+    fn tool_call_dynamic_def() -> ToolDefinition {
+        ToolDefinition {
+            name: "tool_call_dynamic".into(),
+            description: "Call a tool discovered via tool_search. Read the returned schema carefully before calling.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tool_name": {
+                        "type": "string",
+                        "description": "The exact name of the tool to call"
+                    },
+                    "arguments": {
+                        "type": "string",
+                        "description": "JSON string of arguments to pass to the tool (e.g., '{\"key\": \"value\"}')"
+                    }
+                },
+                "required": ["tool_name", "arguments"],
+                "additionalProperties": false
+            }),
+        }
     }
 
     /// Get available tools for browser mode (without orchestrate). Used by
@@ -4056,46 +4112,8 @@ Set workspace_dir to the directory containing the file to allow uploads from any
             }),
         });
 
-        // Dynamic MCP tool discovery (available in Browser and Agent modes)
-        tools.push(ToolDefinition {
-            name: "tool_search".into(),
-            description: "Search for external MCP server tools only (NOT built-in tools like web_search, browser_*, read, write). Use when you need tools from connected MCP servers. Always search first — never guess tool names or schemas.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Keywords to search for (e.g., 'git', 'database', 'image')"
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return (default: 5)",
-                        "default": 5
-                    }
-                },
-                "required": ["query"]
-            }),
-        });
-
-        tools.push(ToolDefinition {
-            name: "tool_call_dynamic".into(),
-            description: "Call a tool discovered via tool_search. Read the returned schema carefully before calling.".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "tool_name": {
-                        "type": "string",
-                        "description": "The exact name of the tool to call"
-                    },
-                    "arguments": {
-                        "type": "string",
-                        "description": "JSON string of arguments to pass to the tool (e.g., '{\"key\": \"value\"}')"
-                    }
-                },
-                "required": ["tool_name", "arguments"],
-                "additionalProperties": false
-            }),
-        });
+        // tool_search + tool_call_dynamic are inherited from get_chat_tools()
+        // (every mode now exposes dynamic tool discovery, including Chat).
 
         tools
     }
@@ -5750,6 +5768,40 @@ mod tests {
     }
 
     #[test]
+    fn chat_mode_exposes_tool_search() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+
+        // Fix#2: chat mode must expose dynamic tool discovery so chat-mode
+        // users can reach the knowledge base (brain_*) and other dynamic tools.
+        let tools = agent.get_tools_for_mode(AgentMode::Chat);
+        assert!(
+            tools.iter().any(|t| t.name == "tool_search"),
+            "chat mode missing tool_search"
+        );
+        assert!(
+            tools.iter().any(|t| t.name == "tool_call_dynamic"),
+            "chat mode missing tool_call_dynamic"
+        );
+
+        // Browser/Agent must still expose them exactly once (no duplicates from
+        // factoring the defs into get_chat_tools()).
+        for mode in [AgentMode::Browser, AgentMode::Agent] {
+            let mt = agent.get_tools_for_mode(mode);
+            assert_eq!(
+                mt.iter().filter(|t| t.name == "tool_search").count(),
+                1,
+                "{mode:?} should have exactly one tool_search"
+            );
+            assert_eq!(
+                mt.iter().filter(|t| t.name == "tool_call_dynamic").count(),
+                1,
+                "{mode:?} should have exactly one tool_call_dynamic"
+            );
+        }
+    }
+
+    #[test]
     fn test_agent_get_tools() {
         let mock = MockHostFunctions::new();
         let agent = Agent::new(mock);
@@ -6143,14 +6195,17 @@ mod tests {
 
         let browser_tools = agent.get_browser_tools();
         let chat_tools = agent.get_chat_tools();
-        // Browser tools = chat tools + 23 browser-specific tools
+        // Browser tools = chat tools + 21 browser-specific tools
         // (15 browser interaction tools + 2 PR #2.5 strategy engine tools
         //  (browser_input + browser_probe) + 1 load_computer_use_tools
-        //  meta-tool + 1 orchestrate + 2 MCP dynamic tools: tool_search,
-        //  tool_call_dynamic + 2 additional browser-specific tools)
+        //  meta-tool + 1 orchestrate + 2 additional browser-specific tools)
         // (browser_get_content, browser_get_markdown, browser_screenshot are
         //  already in chat tools)
-        assert_eq!(browser_tools.len(), chat_tools.len() + 23);
+        // NOTE (Fix#2): tool_search + tool_call_dynamic moved into
+        // get_chat_tools() so chat mode can reach the knowledge base. They are
+        // now part of the chat baseline (inherited by browser/agent), no longer
+        // counted among browser-specific tools — hence +21, was +23.
+        assert_eq!(browser_tools.len(), chat_tools.len() + 21);
     }
 
     #[test]
