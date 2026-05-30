@@ -16,7 +16,23 @@ The server never sees plaintext canvas data or the share password: the client en
 | GET    | `/c/:id`                    | HTML landing page with `nevoflux://import/{id}`  |
 | GET    | `/health`                   | Health check                                     |
 
-A cron trigger (every 6h) sweeps KV/R2 for expired entries.
+A cron trigger (every 6h) sweeps KV/R2 for expired entries (both the `share:`/`share_assets` and `brain:`/`brain_assets` keyspaces).
+
+## Brain shares (`.nbrain`)
+
+A parallel zero-knowledge channel for encrypted `.nbrain` knowledge-base bundles, reusing the same R2 bucket (key prefix `brain_assets/`) and KV namespace (key prefix `brain:`). The worker validates the `NBRN` magic on upload (the brain analogue of canvas's `NFEB`) and enforces a 50 MB ciphertext cap (`MAX_BRAIN_BUNDLE_SIZE`). It never sees the content key — that travels only in the share URL `#fragment`.
+
+| Method | Path                            | Purpose                                          |
+| ------ | ------------------------------- | ------------------------------------------------ |
+| POST   | `/api/brain/share`              | Upload encrypted NBRN bundle (query-param auth)  |
+| GET    | `/api/brain/share/:id/bundle`   | Download encrypted bundle                        |
+| PATCH  | `/api/brain/share/:id`          | Extend TTL (requires `owner_token`)              |
+| DELETE | `/api/brain/share/:id`          | Revoke share (requires `owner_token`)            |
+| GET    | `/api/brain/list-mine`          | Deferred: always returns `{ shares: [] }`        |
+
+The public share URL the daemon emits is `/b/:id#<base32-key>`; the `/api/brain/*` paths are the transport.
+
+> **`list-mine` is deferred in v1.** Server-side per-sender enumeration would require a KV secondary index. The sender's own list of created shares is maintained locally by the daemon (`brain_shares` table, via `brain.share_list`). The route exists so the contract resolves, but always returns an empty list.
 
 ## Setup
 

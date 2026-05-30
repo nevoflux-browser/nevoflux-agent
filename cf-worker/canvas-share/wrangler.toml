@@ -42,3 +42,6 @@ MAX_BRAIN_BUNDLE_SIZE = "52428800"
 #   - Period: 1 minute
 #   - Requests: 30
 #   - Action: block (429)
+#
+# Rule 4: Brain upload rate limit — POST /api/brain/share, 10/min, block
+# Rule 5: Brain fetch rate limit — GET /api/brain/share/*/bundle, 30/min, block

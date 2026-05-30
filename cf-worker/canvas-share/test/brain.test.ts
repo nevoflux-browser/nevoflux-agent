@@ -65,3 +65,80 @@ describe('POST /api/brain/share', () => {
     expect(res.status).toBe(404);
   });
 });
+
+async function uploadWithToken(shareId: string) {
+  const token = new Uint8Array(32).fill(7);
+  const enc = new TextEncoder();
+  const combined = new Uint8Array(shareId.length + 32);
+  combined.set(enc.encode(shareId));
+  combined.set(token, shareId.length);
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', combined));
+  const hash = [...digest].map((b) => b.toString(16).padStart(2, '0')).join('');
+  const tokenB64 = btoa(String.fromCharCode(...token))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+  const blob = new Uint8Array(64);
+  blob.set([0x4e, 0x42, 0x52, 0x4e]);
+  await SELF.fetch(
+    `https://share.nevoflux.app/api/brain/share?share_id=${shareId}&owner_token_hash=${hash}`,
+    { method: 'POST', body: blob }
+  );
+  return tokenB64;
+}
+
+describe('PATCH /api/brain/share/:id (renew)', () => {
+  it('extends expiry with a valid owner token', async () => {
+    const tok = await uploadWithToken('rnw1111110');
+    const res = await SELF.fetch('https://share.nevoflux.app/api/brain/share/rnw1111110', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ owner_token: tok, extend_secs: 86400 }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json<{ share_id: string; expires_at: string }>();
+    expect(body.share_id).toBe('rnw1111110');
+  });
+
+  it('rejects a wrong owner token with 403', async () => {
+    await uploadWithToken('rnw2222220');
+    const wrong = btoa(String.fromCharCode(...new Uint8Array(32).fill(9)))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+    const res = await SELF.fetch('https://share.nevoflux.app/api/brain/share/rnw2222220', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ owner_token: wrong, extend_secs: 86400 }),
+    });
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('DELETE /api/brain/share/:id (revoke)', () => {
+  it('deletes with a valid owner token then 404s the bundle', async () => {
+    // Note: share IDs must be valid Crockford base32 (no i/l/o/u).
+    const tok = await uploadWithToken('den1111110');
+    const del = await SELF.fetch('https://share.nevoflux.app/api/brain/share/den1111110', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ owner_token: tok }),
+    });
+    expect(del.status).toBe(200);
+    const fetched = await SELF.fetch(
+      'https://share.nevoflux.app/api/brain/share/den1111110/bundle'
+    );
+    expect(fetched.status).toBe(404);
+  });
+});
+
+describe('GET /api/brain/list-mine', () => {
+  it('returns an empty shares array (server-side enumeration deferred)', async () => {
+    const res = await SELF.fetch('https://share.nevoflux.app/api/brain/list-mine', {
+      headers: { 'X-Sender-Auth': 'anything' },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json<{ shares: unknown[] }>();
+    expect(Array.isArray(body.shares)).toBe(true);
+  });
+});

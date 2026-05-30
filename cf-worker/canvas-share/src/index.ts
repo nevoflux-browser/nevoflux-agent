@@ -9,6 +9,9 @@ import { handleDelete } from './handlers/delete';
 import { handleLanding } from './handlers/landing';
 import { handleBrainUpload } from './handlers/brain_upload';
 import { handleBrainFetch } from './handlers/brain_fetch';
+import { handleBrainRenew } from './handlers/brain_renew';
+import { handleBrainDelete } from './handlers/brain_delete';
+import { handleBrainListMine } from './handlers/brain_list_mine';
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -28,7 +31,7 @@ app.use(
       return '';
     },
     allowMethods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowHeaders: ['Content-Type', 'X-Owner-Token'],
+    allowHeaders: ['Content-Type', 'X-Owner-Token', 'X-Sender-Auth', 'X-Revoke-Token'],
     maxAge: 86400,
   })
 );
@@ -43,6 +46,9 @@ app.delete('/api/share/:id', handleDelete);
 // Brain-share API routes (parallel `.nbrain` channel; brain_assets/ + brain: prefixes)
 app.post('/api/brain/share', handleBrainUpload);
 app.get('/api/brain/share/:id/bundle', handleBrainFetch);
+app.patch('/api/brain/share/:id', handleBrainRenew);
+app.delete('/api/brain/share/:id', handleBrainDelete);
+app.get('/api/brain/list-mine', handleBrainListMine);
 
 // Landing page
 app.get('/c/:id', handleLanding);
@@ -62,16 +68,25 @@ export default {
 /**
  * Remove expired shares from KV and R2.
  *
- * Lists all KV keys with prefix "share:" and deletes any whose
- * expires_at timestamp is in the past.
+ * Sweeps both the canvas (`share:` / `share_assets`) and brain
+ * (`brain:` / `brain_assets`) keyspaces; the two prefixes are disjoint.
  */
 async function cleanupExpiredShares(env: Env): Promise<void> {
+  await sweepPrefix(env, 'share:', 'share_assets');
+  await sweepPrefix(env, 'brain:', 'brain_assets');
+}
+
+/**
+ * List all KV keys with the given prefix and delete any (plus their R2
+ * object under `r2Dir/`) whose `expires_at` timestamp is in the past.
+ */
+async function sweepPrefix(env: Env, kvPrefix: string, r2Dir: string): Promise<void> {
   const now = new Date().toISOString();
   let cursor: string | undefined;
 
   do {
     const list: KVNamespaceListResult<unknown, string> = await env.SHARE_KV.list({
-      prefix: 'share:',
+      prefix: kvPrefix,
       cursor,
       limit: 100,
     });
@@ -83,12 +98,10 @@ async function cleanupExpiredShares(env: Env): Promise<void> {
       try {
         const meta = JSON.parse(metaStr) as { expires_at: string };
         if (meta.expires_at < now) {
-          // Extract share_id from key "share:{share_id}"
-          const shareId = key.name.replace('share:', '');
-
+          const shareId = key.name.replace(kvPrefix, '');
           // Delete from R2 and KV in parallel
           await Promise.all([
-            env.SHARE_BUCKET.delete(`share_assets/${shareId}.bin`),
+            env.SHARE_BUCKET.delete(`${r2Dir}/${shareId}.bin`),
             env.SHARE_KV.delete(key.name),
           ]);
         }
