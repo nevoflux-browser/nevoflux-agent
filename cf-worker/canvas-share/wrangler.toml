@@ -19,6 +19,7 @@ MAX_BUNDLE_SIZE = "57671680"
 DEFAULT_EXPIRY_SECS = "2592000"
 MAX_LIFETIME_SECS = "31536000"
 CORS_ORIGIN = "moz-extension://*"
+MAX_BRAIN_BUNDLE_SIZE = "52428800"
 
 # Rate Limiting Configuration
 # These rules are configured in the Cloudflare Dashboard under Security > WAF > Rate limiting rules.

@@ -7,6 +7,8 @@ import { handleMeta } from './handlers/meta';
 import { handleExtend } from './handlers/extend';
 import { handleDelete } from './handlers/delete';
 import { handleLanding } from './handlers/landing';
+import { handleBrainUpload } from './handlers/brain_upload';
+import { handleBrainFetch } from './handlers/brain_fetch';
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -37,6 +39,10 @@ app.get('/api/share/:id/bundle', handleFetchBundle);
 app.get('/api/share/:id/meta', handleMeta);
 app.patch('/api/share/:id', handleExtend);
 app.delete('/api/share/:id', handleDelete);
+
+// Brain-share API routes (parallel `.nbrain` channel; brain_assets/ + brain: prefixes)
+app.post('/api/brain/share', handleBrainUpload);
+app.get('/api/brain/share/:id/bundle', handleBrainFetch);
 
 // Landing page
 app.get('/c/:id', handleLanding);
