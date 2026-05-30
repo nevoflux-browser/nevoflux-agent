@@ -4,10 +4,15 @@
 //! strip pipeline, tar+zstd packing, and the `seal`/`open` orchestration.
 
 pub mod crypto;
+pub mod http_client;
 pub mod manifest;
 pub mod nbrain_format;
 pub mod pack;
 pub mod strip;
+
+pub use http_client::{
+    BrainRenewResponse, BrainShareHttpClient, BrainUploadResponse, DEFAULT_BASE_URL,
+};
 
 use nevoflux_brain::{BrainError, Unlock};
 
