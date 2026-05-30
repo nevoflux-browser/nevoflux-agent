@@ -26,6 +26,7 @@ pub mod agent_host;
 pub mod asset_server;
 pub mod brain_rpc;
 pub mod brain_share;
+pub mod brain_share_rpc;
 pub mod brain_tools;
 pub mod canvas_persist;
 pub mod canvas_tools;
