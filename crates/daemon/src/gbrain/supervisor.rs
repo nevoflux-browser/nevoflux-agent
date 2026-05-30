@@ -432,6 +432,11 @@ async fn spawn_and_supervise(
     state_tx: &watch::Sender<SupervisorState>,
     shutdown_rx: &mut tokio::sync::oneshot::Receiver<()>,
 ) -> Result<ChildExit, SupervisorError> {
+    // Clear any stale PGLite lock before EVERY spawn attempt (including
+    // supervisor restarts) so a lock left by a non-graceful exit — or by
+    // a previous attempt in this same crash loop — never blocks startup.
+    clean_stale_pglite_lock(&config.brain_dir);
+
     let mut cmd = Command::new(&config.bun_path);
     cmd.arg("run")
         .arg(&config.gbrain_cli_path)
@@ -577,6 +582,89 @@ fn apply_platform_isolation(_cmd: &mut Command) {
     // shutdown.
 }
 
+/// Remove a stale PGLite/Postgres `postmaster.pid` lock left behind when a
+/// previous gbrain serve exited non-gracefully (crash / force-kill / power
+/// loss). Without this, the fresh gbrain serve hits the stale lock and
+/// fails to open the PGLite database, which the supervisor then sees as a
+/// crash loop and eventually gives up — leaving the brain disabled.
+///
+/// The lock lives at `<brain_dir>/brain.pglite/postmaster.pid`. Its first
+/// line is a pid. PGLite (WASM Postgres) writes a fake NEGATIVE pid (e.g.
+/// -42) since WASM has no real OS process, so that pid never corresponds to
+/// a live process and is always stale on restart. For real-pid cases we
+/// also check liveness and only remove when the process is gone.
+///
+/// Best-effort: any IO error is logged and ignored — a missing or
+/// unreadable lock must not block spawning.
+fn clean_stale_pglite_lock(brain_dir: &std::path::Path) {
+    let lock = brain_dir.join("brain.pglite").join("postmaster.pid");
+    if !lock.exists() {
+        return;
+    }
+    let contents = match std::fs::read_to_string(&lock) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(path = %lock.display(), error = %e,
+                "could not read postmaster.pid; leaving it");
+            return;
+        }
+    };
+    let first_line = contents.lines().next().unwrap_or("").trim();
+    let pid: i64 = first_line.parse().unwrap_or(0);
+
+    let is_stale = if pid <= 0 {
+        // PGLite fake pid (e.g. -42) or unparseable -> never a live OS proc.
+        true
+    } else {
+        !pid_is_alive(pid as u32)
+    };
+
+    if is_stale {
+        match std::fs::remove_file(&lock) {
+            Ok(()) => info!(path = %lock.display(), pid,
+                "removed stale PGLite postmaster.pid before spawning gbrain serve"),
+            Err(e) => warn!(path = %lock.display(), error = %e,
+                "failed to remove stale postmaster.pid"),
+        }
+    } else {
+        // A live process holds the lock — do NOT remove; another gbrain
+        // serve is genuinely running. Log so the operator can see why a
+        // spawn might fail.
+        warn!(path = %lock.display(), pid,
+            "postmaster.pid held by a LIVE process (pid={pid}); not removing");
+    }
+}
+
+/// Cross-platform check whether a pid corresponds to a live process.
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    // /proc is the cheapest check on Linux; macOS has no /proc, so fall
+    // back to `kill -0 <pid>` (signal 0 = existence/permission probe).
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+        || std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+}
+
+/// Cross-platform check whether a pid corresponds to a live process.
+#[cfg(windows)]
+fn pid_is_alive(pid: u32) -> bool {
+    // tasklist /FI "PID eq <pid>" — if the pid is present, the CSV output
+    // contains it quoted. Avoid extra deps; tasklist is always present.
+    match std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output()
+    {
+        Ok(out) => {
+            let s = String::from_utf8_lossy(&out.stdout);
+            s.contains(&format!("\"{pid}\""))
+        }
+        Err(_) => false, // can't determine -> treat as not-alive (allow cleanup)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +764,49 @@ mod tests {
         );
 
         supervisor.shutdown().await;
+    }
+
+    #[test]
+    fn clean_stale_pglite_lock_removes_negative_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let pglite = dir.path().join("brain.pglite");
+        std::fs::create_dir_all(&pglite).unwrap();
+        let lock = pglite.join("postmaster.pid");
+        std::fs::write(&lock, "-42\n/pglite/data\n").unwrap();
+        clean_stale_pglite_lock(dir.path());
+        assert!(!lock.exists(), "negative-pid (PGLite fake) lock should be removed");
+    }
+
+    #[test]
+    fn clean_stale_pglite_lock_removes_dead_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let pglite = dir.path().join("brain.pglite");
+        std::fs::create_dir_all(&pglite).unwrap();
+        let lock = pglite.join("postmaster.pid");
+        // pid 999999 almost certainly not a live process
+        std::fs::write(&lock, "999999\n/pglite/data\n").unwrap();
+        clean_stale_pglite_lock(dir.path());
+        assert!(!lock.exists(), "dead-pid lock should be removed");
+    }
+
+    #[test]
+    fn clean_stale_pglite_lock_keeps_live_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let pglite = dir.path().join("brain.pglite");
+        std::fs::create_dir_all(&pglite).unwrap();
+        let lock = pglite.join("postmaster.pid");
+        // our own pid is definitely alive
+        let me = std::process::id();
+        std::fs::write(&lock, format!("{me}\n/pglite/data\n")).unwrap();
+        clean_stale_pglite_lock(dir.path());
+        assert!(lock.exists(), "lock held by a live process must NOT be removed");
+    }
+
+    #[test]
+    fn clean_stale_pglite_lock_noop_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // no brain.pglite dir at all
+        clean_stale_pglite_lock(dir.path()); // must not panic
     }
 
     #[test]
