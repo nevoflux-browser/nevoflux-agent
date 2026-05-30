@@ -3403,7 +3403,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -3432,7 +3432,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-brain"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3445,7 +3445,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-bridge"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "directories",
@@ -3464,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-builtin-wasm"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "nevoflux-protocol",
  "rmp-serde",
@@ -3474,7 +3474,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-computer"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3494,7 +3494,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-daemon"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -3559,7 +3559,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-llm"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "dirs 5.0.1",
@@ -3582,7 +3582,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-llm-gateway"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3609,7 +3609,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-mcp"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "futures",
@@ -3625,7 +3625,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-protocol"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "proptest",
  "rmp-serde",
@@ -3637,7 +3637,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-skills"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "directories",
@@ -3653,7 +3653,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-storage"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "base64 0.22.1",
  "nevoflux-protocol",
@@ -3668,7 +3668,7 @@ dependencies = [
 
 [[package]]
 name = "nevoflux-testing"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "nevoflux-daemon",

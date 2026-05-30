@@ -37,11 +37,14 @@ pub struct GbrainConfig {
     /// this env var (spike 附录 B operational quirk #1).
     pub brain_dir: PathBuf,
 
-    /// Upstream LLM gateway base URL (e.g.
-    /// `http://127.0.0.1:54321/v1`). Forwarded as `OPENROUTER_BASE_URL`
-    /// because gbrain 0.40.8.1 reads its OpenAI-compatible recipe via
-    /// the `openrouter:` prefix, which expects `OPENROUTER_*` env vars
-    /// (spike 附录 B operational quirk #2).
+    /// Bare upstream gateway bind address (e.g. `http://127.0.0.1:54321`,
+    /// no path). The supervisor appends `/v1` before forwarding it as
+    /// `OPENAI_BASE_URL` (native `openai` embedding recipe) and
+    /// `OPENROUTER_BASE_URL` (OpenAI-compatible `openrouter` chat recipe),
+    /// because gbrain's OpenAI-protocol SDKs assume the base URL already
+    /// includes the `/v1` segment and only append the operation path, while
+    /// the gateway nests every route under `/v1`. Omitting the suffix makes
+    /// embeds 404 as `[embed(...)] Not Found`.
     pub upstream_base_url: String,
 
     /// Bearer token gbrain presents on every upstream request.
@@ -82,7 +85,7 @@ impl GbrainConfig {
             bun_path: PathBuf::from("/nonexistent/bun"),
             gbrain_cli_path: PathBuf::from("/nonexistent/gbrain/cli.ts"),
             brain_dir: PathBuf::from("/nonexistent/brain"),
-            upstream_base_url: "http://127.0.0.1:1/v1".into(),
+            upstream_base_url: "http://127.0.0.1:1".into(),
             upstream_api_key: "test-key".into(),
             initialize_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(30),

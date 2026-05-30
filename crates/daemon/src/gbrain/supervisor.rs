@@ -437,18 +437,29 @@ async fn spawn_and_supervise(
     // a previous attempt in this same crash loop — never blocks startup.
     clean_stale_pglite_lock(&config.brain_dir);
 
+    // The gateway snapshot URL is the bare bind address
+    // (`http://127.0.0.1:<port>`, no path). gbrain's OpenAI-protocol clients
+    // (@ai-sdk/openai for the native `openai` embedding recipe, and
+    // @ai-sdk/openai-compatible for the `openrouter` chat recipe) treat the
+    // base URL as already including the `/v1` segment and only append the
+    // operation path (`/embeddings`, `/chat/completions`). The gateway nests
+    // every route under `/v1`, so the base URL MUST carry the `/v1` suffix —
+    // otherwise the SDK calls `<gw>/embeddings` (no `/v1`) and the router
+    // returns 404, surfacing as `[embed(...)] Not Found`.
+    let gateway_v1 = format!("{}/v1", config.upstream_base_url.trim_end_matches('/'));
+
     let mut cmd = Command::new(&config.bun_path);
     cmd.arg("run")
         .arg(&config.gbrain_cli_path)
         .arg("serve")
         // Embedding (openai recipe) reads OPENAI_*; chat (openrouter recipe)
         // reads OPENROUTER_*. gbrain serve does put_page/sync embedding via
-        // the openai recipe, so OPENAI_BASE_URL must point at the gateway or
-        // embeds fail with `[embed(...)] Not Found`. Both point at the same
-        // in-process gateway. (spike S3 embedding / S4 chat; 附录 B quirk #2)
-        .env("OPENAI_BASE_URL", &config.upstream_base_url)
+        // the openai recipe, so OPENAI_BASE_URL must point at the gateway's
+        // `/v1` mount or embeds fail with `[embed(...)] Not Found`. Both
+        // point at the same in-process gateway. (spike S3 embedding / S4 chat)
+        .env("OPENAI_BASE_URL", &gateway_v1)
         .env("OPENAI_API_KEY", &config.upstream_api_key)
-        .env("OPENROUTER_BASE_URL", &config.upstream_base_url)
+        .env("OPENROUTER_BASE_URL", &gateway_v1)
         .env("OPENROUTER_API_KEY", &config.upstream_api_key)
         .env("GBRAIN_BRAIN_DIR", &config.brain_dir)
         .stdin(Stdio::piped())

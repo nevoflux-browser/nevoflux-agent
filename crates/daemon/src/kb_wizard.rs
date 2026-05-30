@@ -702,6 +702,14 @@ where
     std::fs::create_dir_all(brain_dir)
         .map_err(|e| format!("mkdir brain_dir failed: {e}"))?;
 
+    // `gateway_url` is the bare gateway bind address (`http://127.0.0.1:<port>`,
+    // no path). gbrain's OpenAI-protocol SDKs treat the base URL as already
+    // including the `/v1` segment and only append the operation path, while
+    // the gateway nests every route under `/v1`. The base URL must therefore
+    // carry the `/v1` suffix or calls 404 (`[embed(...)] Not Found`). Mirror
+    // of the same wiring in `gbrain::supervisor::spawn_and_supervise`.
+    let gateway_v1 = format!("{}/v1", gateway_url.trim_end_matches('/'));
+
     let mut cmd = Command::new(bun_path);
     cmd.arg("run")
         .arg(cli_path)
@@ -712,10 +720,10 @@ where
         .arg("--embedding-model")
         .arg("openai:text-embedding-3-small")
         // Embedding (openai recipe) reads OPENAI_*; chat (openrouter recipe)
-        // reads OPENROUTER_*. Both point at the same in-process gateway.
-        .env("OPENAI_BASE_URL", gateway_url)
+        // reads OPENROUTER_*. Both point at the same in-process gateway `/v1`.
+        .env("OPENAI_BASE_URL", &gateway_v1)
         .env("OPENAI_API_KEY", gateway_token)
-        .env("OPENROUTER_BASE_URL", gateway_url)
+        .env("OPENROUTER_BASE_URL", &gateway_v1)
         .env("OPENROUTER_API_KEY", gateway_token)
         .env("GBRAIN_BRAIN_DIR", brain_dir)
         .current_dir(brain_dir);
