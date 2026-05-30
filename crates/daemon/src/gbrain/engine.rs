@@ -159,26 +159,13 @@ impl BrainEngine for GbrainEngine {
         let array = payload
             .as_array()
             .cloned()
-            .or_else(|| {
-                payload
-                    .get("results")
-                    .and_then(|r| r.as_array())
-                    .cloned()
-            })
-            .ok_or_else(|| {
-                BrainError::Backend(format!("expected hits array in: {payload}"))
-            })?;
+            .or_else(|| payload.get("results").and_then(|r| r.as_array()).cloned())
+            .ok_or_else(|| BrainError::Backend(format!("expected hits array in: {payload}")))?;
         let mut hits = Vec::with_capacity(array.len());
         for h in &array {
             let page_meta = Self::meta_from_entry(h);
-            let score = h
-                .get("score")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0) as f32;
-            let snippet = h
-                .get("snippet")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            let score = h.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+            let snippet = h.get("snippet").and_then(|v| v.as_str()).map(String::from);
             hits.push(Hit {
                 page_meta,
                 score,
@@ -269,15 +256,8 @@ impl BrainEngine for GbrainEngine {
         let array = payload
             .as_array()
             .cloned()
-            .or_else(|| {
-                payload
-                    .get("pages")
-                    .and_then(|p| p.as_array())
-                    .cloned()
-            })
-            .ok_or_else(|| {
-                BrainError::Backend(format!("expected pages array in: {payload}"))
-            })?;
+            .or_else(|| payload.get("pages").and_then(|p| p.as_array()).cloned())
+            .ok_or_else(|| BrainError::Backend(format!("expected pages array in: {payload}")))?;
         let dir_prefix = dir.trim_end_matches('/');
         let mut metas = Vec::with_capacity(array.len());
         for item in &array {
@@ -393,10 +373,7 @@ mod tests {
             name: &str,
             arguments: Value,
         ) -> Result<Value, super::super::supervisor::McpToolCallerError> {
-            self.calls
-                .lock()
-                .await
-                .push((name.to_string(), arguments));
+            self.calls.lock().await.push((name.to_string(), arguments));
             match self.responses.lock().await.get(name).cloned() {
                 Some(v) => Ok(v),
                 None => Err(format!("no stub response configured for {name}").into()),
@@ -512,10 +489,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_sends_slug_and_content_with_separator() {
-        let stub = Arc::new(StubToolCaller::new(vec![(
-            "put_page",
-            wrap_text("ok"),
-        )]));
+        let stub = Arc::new(StubToolCaller::new(vec![("put_page", wrap_text("ok"))]));
         let engine = GbrainEngine::new(stub.clone());
         let page = BrainPage {
             slug: "test".into(),
@@ -541,10 +515,7 @@ mod tests {
 
     #[tokio::test]
     async fn put_with_empty_timeline_omits_separator() {
-        let stub = Arc::new(StubToolCaller::new(vec![(
-            "put_page",
-            wrap_text("ok"),
-        )]));
+        let stub = Arc::new(StubToolCaller::new(vec![("put_page", wrap_text("ok"))]));
         let engine = GbrainEngine::new(stub.clone());
         let page = BrainPage {
             slug: "test".into(),
@@ -584,27 +555,18 @@ mod tests {
 
     #[tokio::test]
     async fn delete_calls_delete_page_with_slug() {
-        let stub = Arc::new(StubToolCaller::new(vec![(
-            "delete_page",
-            wrap_text("ok"),
-        )]));
+        let stub = Arc::new(StubToolCaller::new(vec![("delete_page", wrap_text("ok"))]));
         let engine = GbrainEngine::new(stub.clone());
         engine.delete("doomed").await.unwrap();
         let calls = stub.calls().await;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "delete_page");
-        assert_eq!(
-            calls[0].1.get("slug").unwrap().as_str().unwrap(),
-            "doomed"
-        );
+        assert_eq!(calls[0].1.get("slug").unwrap().as_str().unwrap(), "doomed");
     }
 
     #[tokio::test]
     async fn sync_calls_sync_brain_with_no_args() {
-        let stub = Arc::new(StubToolCaller::new(vec![(
-            "sync_brain",
-            wrap_text("ok"),
-        )]));
+        let stub = Arc::new(StubToolCaller::new(vec![("sync_brain", wrap_text("ok"))]));
         let engine = GbrainEngine::new(stub.clone());
         let report = engine.sync().await.unwrap();
         assert_eq!(report.added, 0);
@@ -628,12 +590,13 @@ mod tests {
         let import = engine
             .import_snapshot(
                 nevoflux_brain::NbrainBundle {
-                    ciphertext: vec![],
-                    manifest_json: "{}".into(),
+                    artifact: vec![],
+                    key: None,
                 },
                 ImportOpts {
                     source_name: "x".into(),
                     trust: ImportTrust::ReadOnly,
+                    unlock: nevoflux_brain::Unlock::Key([0u8; 32]),
                 },
             )
             .await;
@@ -662,7 +625,10 @@ mod tests {
         let result = engine.get("x").await;
         match result {
             Err(BrainError::Backend(msg)) => {
-                assert!(msg.contains("get_page"), "expected tool name in error: {msg}");
+                assert!(
+                    msg.contains("get_page"),
+                    "expected tool name in error: {msg}"
+                );
             }
             other => panic!("expected Backend error, got {other:?}"),
         }

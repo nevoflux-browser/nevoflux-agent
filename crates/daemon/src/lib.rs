@@ -25,6 +25,7 @@ pub mod agent;
 pub mod agent_host;
 pub mod asset_server;
 pub mod brain_rpc;
+pub mod brain_share;
 pub mod brain_tools;
 pub mod canvas_persist;
 pub mod canvas_tools;
@@ -42,8 +43,8 @@ pub mod kb_wizard;
 pub mod learning;
 pub mod llm_gateway;
 pub mod loops;
-pub mod memory_reindex;
 pub mod mcp_config;
+pub mod memory_reindex;
 pub mod openclaw_setup;
 pub mod permission;
 pub mod registry;
@@ -63,19 +64,19 @@ pub use config::{
     AgentConfig, AuthConfig, BrainConfig, ConfigError, ContextConfig, DaemonConfig,
     KnowledgeBaseConfig, LlmConfig, LoggingConfig, SessionConfig, StorageConfig,
 };
-pub use init_brain::{init_brain, BrainBoot, BrainSlot, SharedBrainSlot, CURRENT_BRAIN_SLOT};
 pub use config_watcher::{create_config_watcher, ConfigReceiver, ConfigWatcher, WatcherError};
 pub use error::{DaemonError, Result};
-pub use mcp_config::{McpConfigError, McpServerConfigFile, McpServersConfig};
-pub use permission::{Action, PermissionEnforcer, PermissionResult, ResourceType};
-pub use registry::{ActiveRequest, ProxyInfo, ProxyRegistry, RequestRegistry};
-pub use router::Router;
 pub use gbrain::{
     GbrainConfig, GbrainSupervisor, McpClient, McpError, McpResult, SupervisorError,
     SupervisorResult, SupervisorState,
 };
+pub use init_brain::{init_brain, BrainBoot, BrainSlot, SharedBrainSlot, CURRENT_BRAIN_SLOT};
 pub use llm_gateway::{init_gateway, GatewayBoot, GatewayHandleSnapshot};
+pub use mcp_config::{McpConfigError, McpServerConfigFile, McpServersConfig};
 pub use memory_reindex::{spawn_reindex, ReindexHandle, ReindexProgress, BATCH_SIZE};
+pub use permission::{Action, PermissionEnforcer, PermissionResult, ResourceType};
+pub use registry::{ActiveRequest, ProxyInfo, ProxyRegistry, RequestRegistry};
+pub use router::Router;
 pub use server::{find_available_port, start_server, Server, ServerConfig};
 pub use session::SessionManager;
 pub use wasm::{
