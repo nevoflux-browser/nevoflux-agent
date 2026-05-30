@@ -32,6 +32,7 @@ pub use ingest::{
     SaveSource,
 };
 pub use types::{
-    BrainPage, Hit, ImportOpts, ImportReport, ImportTrust, NbrainBundle, PageMeta, PutResult,
-    SearchOpts, Selection, SourceMeta, SourceSpec, StripRules, SyncReport,
+    BrainPage, BrokenLinkPolicy, Hit, ImportOpts, ImportReport, ImportTrust, NbrainBundle,
+    PageMeta, PutResult, SearchOpts, Selection, SourceMeta, SourceSpec, StripRules, SyncReport,
+    Unlock,
 };

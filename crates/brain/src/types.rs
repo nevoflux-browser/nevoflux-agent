@@ -155,6 +155,13 @@ pub struct StripRules {
     pub frontmatter_whitelist: Vec<String>,
     /// If true, raw / unprocessed sections are removed entirely.
     pub raw_excluded: bool,
+    /// Frontmatter keys explicitly stripped even if otherwise allowed.
+    pub frontmatter_redacted: Vec<String>,
+    /// How to handle links pointing outside the exported set.
+    pub broken_link_policy: BrokenLinkPolicy,
+    /// Directory prefixes excluded from export. `.raw` is always excluded
+    /// regardless of this list (invariant A.3).
+    pub directories_excluded: Vec<String>,
 }
 
 impl Default for StripRules {
@@ -163,20 +170,44 @@ impl Default for StripRules {
             compiled_only: true,
             frontmatter_whitelist: Vec::new(),
             raw_excluded: true,
+            frontmatter_redacted: Vec::new(),
+            broken_link_policy: BrokenLinkPolicy::default(),
+            directories_excluded: Vec::new(),
         }
     }
 }
 
-/// Opaque shareable bundle produced by `export_snapshot`.
-///
-/// v1 stores a ciphertext blob and a JSON manifest; M5 will define the
-/// full encrypted envelope format.
+/// How to handle wiki-style links that point outside the exported set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BrokenLinkPolicy {
+    /// Leave `[[link]]` as literal text (default).
+    KeepAsText,
+}
+
+impl Default for BrokenLinkPolicy {
+    fn default() -> Self {
+        BrokenLinkPolicy::KeepAsText
+    }
+}
+
+/// Shareable artifact produced by `export_snapshot`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NbrainBundle {
-    /// Encrypted payload (format TBD in M5).
-    pub ciphertext: Vec<u8>,
-    /// JSON-encoded manifest describing the bundle.
-    pub manifest_json: String,
+    /// Complete `.nbrain` artifact bytes (header + ciphertext). Write to
+    /// disk or upload as-is.
+    pub artifact: Vec<u8>,
+    /// Random 256-bit content key (zero-knowledge mode). Distribute
+    /// out-of-band / in a URL fragment. `None` in password mode.
+    pub key: Option<[u8; 32]>,
+}
+
+/// Material a receiver supplies to unlock a `.nbrain` artifact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Unlock {
+    /// Raw 256-bit content key (zero-knowledge mode).
+    Key([u8; 32]),
+    /// User password (advanced fallback); key re-derived via Argon2id.
+    Password(String),
 }
 
 /// Trust level granted to an imported source.
@@ -195,6 +226,8 @@ pub struct ImportOpts {
     pub source_name: String,
     /// Trust level to apply.
     pub trust: ImportTrust,
+    /// Material to unlock the artifact.
+    pub unlock: Unlock,
 }
 
 /// Summary of an `import_snapshot` call.

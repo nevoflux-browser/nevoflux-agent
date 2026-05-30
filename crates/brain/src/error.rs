@@ -23,6 +23,22 @@ pub enum BrainError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// `.nbrain` magic or version not recognized.
+    #[error("unsupported .nbrain format: {0}")]
+    UnsupportedFormat(String),
+
+    /// AEAD verification failed — wrong key/password or corrupted bytes.
+    #[error("decryption failed: wrong key/password or corrupted artifact")]
+    DecryptFailed,
+
+    /// A file's SHA-256 did not match the manifest entry.
+    #[error("integrity check failed for {0}")]
+    IntegrityMismatch(String),
+
+    /// tar/zstd decode failure or missing manifest.
+    #[error("malformed .nbrain archive: {0}")]
+    MalformedArchive(String),
+
     /// Catch-all for backend-reported failures (e.g., gbrain CLI errors).
     #[error("backend error: {0}")]
     Backend(String),
