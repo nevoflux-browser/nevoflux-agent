@@ -441,6 +441,13 @@ async fn spawn_and_supervise(
     cmd.arg("run")
         .arg(&config.gbrain_cli_path)
         .arg("serve")
+        // Embedding (openai recipe) reads OPENAI_*; chat (openrouter recipe)
+        // reads OPENROUTER_*. gbrain serve does put_page/sync embedding via
+        // the openai recipe, so OPENAI_BASE_URL must point at the gateway or
+        // embeds fail with `[embed(...)] Not Found`. Both point at the same
+        // in-process gateway. (spike S3 embedding / S4 chat; 附录 B quirk #2)
+        .env("OPENAI_BASE_URL", &config.upstream_base_url)
+        .env("OPENAI_API_KEY", &config.upstream_api_key)
         .env("OPENROUTER_BASE_URL", &config.upstream_base_url)
         .env("OPENROUTER_API_KEY", &config.upstream_api_key)
         .env("GBRAIN_BRAIN_DIR", &config.brain_dir)

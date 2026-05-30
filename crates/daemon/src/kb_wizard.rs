@@ -661,11 +661,22 @@ where
 }
 
 /// Run `gbrain init --pglite --embedding-dimensions 512 \
-///         --embedding-model openrouter:claude-haiku-4-5`.
+///         --embedding-model openai:text-embedding-3-small`.
 ///
-/// `gateway_url` + `gateway_token` are wired in as `OPENROUTER_*` env
-/// vars so the gbrain init step can call the upstream LLM through the
-/// daemon's in-process gateway (附录 B operational quirk #2).
+/// CRITICAL — embedding vs chat use DIFFERENT gbrain recipes (spike S3/S4):
+/// - **Embedding** uses gbrain's `openai` recipe, which DOES read
+///   `OPENAI_BASE_URL`. We point it at the daemon's in-process gateway,
+///   whose `/v1/embeddings` returns local fastembed vectors (ignoring the
+///   model name, zero-padded 384→512). So embedding-model must be
+///   `openai:text-embedding-3-small`, NOT an openrouter chat model — gbrain
+///   put_page/sync embed calls a chat model otherwise and gets
+///   `[embed(openrouter:claude-haiku-4-5)] Not Found`.
+/// - **Chat** (gbrain's internal LLM for enrich/synthesis) uses the
+///   `openrouter` recipe, because gbrain's `openai` CHAT recipe ignores
+///   `OPENAI_BASE_URL` (附录 B operational quirk #2). That's wired via
+///   `OPENROUTER_*`.
+///
+/// Both `OPENAI_*` and `OPENROUTER_*` therefore point at the same gateway.
 ///
 /// `GBRAIN_BRAIN_DIR` is also set so the initialization writes
 /// `brain.pglite` into the daemon's configured location rather than
@@ -699,7 +710,11 @@ where
         .arg("--embedding-dimensions")
         .arg("512")
         .arg("--embedding-model")
-        .arg("openrouter:claude-haiku-4-5")
+        .arg("openai:text-embedding-3-small")
+        // Embedding (openai recipe) reads OPENAI_*; chat (openrouter recipe)
+        // reads OPENROUTER_*. Both point at the same in-process gateway.
+        .env("OPENAI_BASE_URL", gateway_url)
+        .env("OPENAI_API_KEY", gateway_token)
         .env("OPENROUTER_BASE_URL", gateway_url)
         .env("OPENROUTER_API_KEY", gateway_token)
         .env("GBRAIN_BRAIN_DIR", brain_dir)
