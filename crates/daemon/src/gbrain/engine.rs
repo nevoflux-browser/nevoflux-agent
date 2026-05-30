@@ -293,11 +293,69 @@ impl BrainEngine for GbrainEngine {
 
     async fn export_snapshot(
         &self,
-        _sel: Selection,
-        _rules: StripRules,
+        sel: Selection,
+        rules: StripRules,
     ) -> BrainResult<NbrainBundle> {
-        // TODO(M5): build encrypted bundle (architecture doc §6.4).
-        Err(BrainError::NotImplemented)
+        use crate::brain_share::{manifest as mf, pack::Entry, seal, strip, SealMode};
+
+        // 1. Resolve the selection to a slug list.
+        let mut slugs: Vec<String> = match sel {
+            Selection::Files(f) => f,
+            Selection::Directory(d) => self.list(&d).await?.into_iter().map(|m| m.slug).collect(),
+            Selection::Mixed { files, directories } => {
+                let mut all = files;
+                for d in directories {
+                    all.extend(self.list(&d).await?.into_iter().map(|m| m.slug));
+                }
+                all
+            }
+        };
+        slugs.retain(|s| !strip::is_excluded(s, &rules)); // invariant A.3
+        slugs.sort();
+        slugs.dedup();
+
+        // 2. Pull each page, strip, build file entries + manifest files.
+        let mut files = Vec::new();
+        let mut manifest_files = Vec::new();
+        for slug in &slugs {
+            let page = match self.get(slug).await {
+                Ok(p) => p,
+                Err(BrainError::NotFound(_)) => continue, // skip missing
+                Err(e) => return Err(e),
+            };
+            let body = strip::strip_page(&page, &rules);
+            let path = format!("{slug}.md");
+            let bytes = body.into_bytes();
+            manifest_files.push(crate::brain_share::file_entry(&path, &bytes));
+            files.push(Entry { path, bytes });
+        }
+
+        // 3. Build manifest.
+        let manifest = mf::Manifest {
+            format: mf::FORMAT.into(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            sender: mf::Sender {
+                fingerprint: None,
+                display_name: String::new(),
+                signature: None,
+            },
+            files: manifest_files,
+            strip_rules_applied: mf::StripRulesApplied {
+                compiled_only: rules.compiled_only,
+                frontmatter_whitelist: rules.frontmatter_whitelist.clone(),
+                frontmatter_redacted: rules.frontmatter_redacted.clone(),
+                raw_excluded: rules.raw_excluded,
+                directories_excluded: rules.directories_excluded.clone(),
+            },
+            title: String::new(),
+            description: String::new(),
+            tags: Vec::new(),
+            expires_at: None,
+        };
+
+        // 4. Seal (random-key zero-knowledge default).
+        let (artifact, key) = seal(&manifest, &files, SealMode::RandomKey)?;
+        Ok(NbrainBundle { artifact, key })
     }
 
     async fn import_snapshot(
@@ -650,5 +708,99 @@ mod tests {
         let engine = GbrainEngine::new(stub);
         let result = engine.get("missing").await;
         assert!(matches!(result, Err(BrainError::Backend(_))));
+    }
+}
+
+#[cfg(test)]
+mod export_import_tests {
+    use super::*;
+    use crate::gbrain::supervisor::{McpToolCaller, McpToolCallerError};
+    use nevoflux_brain::{ImportOpts, ImportTrust, Selection, StripRules, Unlock};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// A stub gbrain that answers get_page/list_pages and records put_page +
+    /// sync_brain calls.
+    struct StubGbrain {
+        pages: HashMap<String, String>,     // slug -> markdown content
+        puts: Mutex<Vec<(String, String)>>, // (slug, content)
+        syncs: Mutex<u32>,
+    }
+
+    fn text_envelope(text: &str) -> serde_json::Value {
+        json!({ "result": { "content": [{ "type": "text", "text": text }] } })
+    }
+
+    #[async_trait]
+    impl McpToolCaller for StubGbrain {
+        async fn call_tool_dyn(
+            &self,
+            name: &str,
+            arguments: Value,
+        ) -> Result<Value, McpToolCallerError> {
+            match name {
+                "get_page" => {
+                    let slug = arguments["slug"].as_str().unwrap_or_default();
+                    match self.pages.get(slug) {
+                        Some(content) => Ok(text_envelope(content)),
+                        None => Ok(
+                            json!({ "result": { "isError": true, "content": [{ "type": "text", "text": "not found" }] } }),
+                        ),
+                    }
+                }
+                "list_pages" => {
+                    let arr: Vec<Value> = self
+                        .pages
+                        .keys()
+                        .map(|s| json!({ "slug": s, "title": s }))
+                        .collect();
+                    Ok(text_envelope(&serde_json::to_string(&arr).unwrap()))
+                }
+                "put_page" => {
+                    let slug = arguments["slug"].as_str().unwrap_or_default().to_string();
+                    let content = arguments["content"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    self.puts.lock().unwrap().push((slug, content));
+                    Ok(text_envelope("ok"))
+                }
+                "sync_brain" => {
+                    *self.syncs.lock().unwrap() += 1;
+                    Ok(text_envelope("synced"))
+                }
+                other => Ok(text_envelope(&format!("unhandled {other}"))),
+            }
+        }
+    }
+
+    fn engine_with(pages: &[(&str, &str)]) -> GbrainEngine {
+        let pages = pages
+            .iter()
+            .map(|(s, c)| (s.to_string(), c.to_string()))
+            .collect();
+        GbrainEngine::new(Arc::new(StubGbrain {
+            pages,
+            puts: Mutex::new(Vec::new()),
+            syncs: Mutex::new(0),
+        }))
+    }
+
+    #[tokio::test]
+    async fn export_produces_openable_artifact() {
+        let engine = engine_with(&[("concepts/yc", "# YC\nStartup accelerator.")]);
+        let bundle = engine
+            .export_snapshot(
+                Selection::Files(vec!["concepts/yc".into()]),
+                StripRules::default(),
+            )
+            .await
+            .unwrap();
+        let key = bundle.key.expect("random-key mode");
+        let (m, files) = crate::brain_share::open(&bundle.artifact, &Unlock::Key(key)).unwrap();
+        assert_eq!(m.format, "nbrain/1");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "concepts/yc.md");
+        assert!(String::from_utf8_lossy(&files[0].bytes).contains("Startup accelerator"));
     }
 }
