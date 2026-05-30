@@ -8,10 +8,14 @@ pub mod http_client;
 pub mod manifest;
 pub mod nbrain_format;
 pub mod pack;
+pub mod service;
 pub mod strip;
 
 pub use http_client::{
     BrainRenewResponse, BrainShareHttpClient, BrainUploadResponse, DEFAULT_BASE_URL,
+};
+pub use service::{
+    parse_share_url, BrainShareInfo, BrainShareResult, BrainShareService, DEFAULT_TTL_SECS,
 };
 
 use nevoflux_brain::{BrainError, Unlock};
