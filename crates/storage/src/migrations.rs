@@ -63,6 +63,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "019_memory_embedding_version",
         include_str!("migrations/019_memory_embedding_version.sql"),
     ),
+    (
+        "020_brain_shares",
+        include_str!("migrations/020_brain_shares.sql"),
+    ),
 ];
 
 /// Run all pending migrations on the given connection.
@@ -131,9 +135,9 @@ mod tests {
         let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        // 17 SQL migrations (001-012, 014, 015, 016, 017, 018, 019) + 1 Rust post-migration
-        // marker (016b_composition_assets_data) = 19.
-        assert_eq!(count, 19);
+        // 18 SQL migrations (001-012, 014, 015, 016, 017, 018, 019, 020) + 1 Rust
+        // post-migration marker (016b_composition_assets_data) = 20.
+        assert_eq!(count, 20);
     }
 
     #[test]
@@ -548,5 +552,19 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "Index {} should exist", idx);
         }
+    }
+
+    #[test]
+    fn migration_020_creates_brain_shares_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_all(&mut conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='brain_shares'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "brain_shares table must exist after migrations");
     }
 }
