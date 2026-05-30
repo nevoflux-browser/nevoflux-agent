@@ -16,8 +16,11 @@ use axum::{
     Json, Router,
 };
 use futures::StreamExt;
+#[cfg(feature = "embedding")]
 use nevoflux_llm::embedding::{EmbedKind, EmbeddingConfig, EmbeddingProvider, FastEmbedProvider};
-use serde::{Deserialize, Serialize};
+#[cfg(feature = "embedding")]
+use serde::Deserialize;
+use serde::Serialize;
 use std::{
     convert::Infallible,
     sync::{
@@ -26,8 +29,10 @@ use std::{
     },
     time::Duration,
 };
+#[cfg(feature = "embedding")]
 use tokio::sync::OnceCell;
 
+#[cfg(feature = "embedding")]
 use crate::embedding_dim::{zero_pad_to_gateway_dim, GATEWAY_OUTPUT_DIM};
 use crate::error::{GatewayError, TimeoutPhase};
 use crate::protocol::UpstreamProtocol;
@@ -65,6 +70,7 @@ pub(crate) struct AppState {
     /// Loading the ~120 MB ONNX weights is expensive, and gateways used
     /// only for chat-completions should not pay that cost. The cell is
     /// populated on first `/v1/embeddings` call via [`AppState::embedder`].
+    #[cfg(feature = "embedding")]
     pub(crate) embedder: OnceCell<Arc<FastEmbedProvider>>,
     /// Models advertised by `GET /v1/models` (M2-1). The handler falls
     /// back to a single-entry list synthesized from
@@ -114,6 +120,7 @@ impl AppState {
             stream_http,
             upstream_stream_idle_timeout: config.upstream_stream_idle_timeout,
             upstream_retry_max_wait: config.upstream_retry_max_wait,
+            #[cfg(feature = "embedding")]
             embedder: OnceCell::new(),
             advertised_models: config.advertised_models,
             upstream_protocol: config.upstream_protocol,
@@ -126,6 +133,7 @@ impl AppState {
     /// The `FastEmbedProvider::new` constructor is synchronous and can
     /// load model weights from disk, so we wrap it in `spawn_blocking`
     /// to avoid stalling the async runtime.
+    #[cfg(feature = "embedding")]
     async fn embedder(&self) -> anyhow::Result<Arc<FastEmbedProvider>> {
         self.embedder
             .get_or_try_init(|| async {
@@ -202,6 +210,7 @@ pub(crate) async fn auth_middleware(
 /// single string (OpenAI's canonical shape) or an array of strings (also
 /// canonical) without two separate handlers. `input_type` is a Cohere
 /// extension we map to [`EmbedKind`] so e5-family prefixes flow through.
+#[cfg(feature = "embedding")]
 #[derive(Deserialize)]
 pub(crate) struct EmbeddingsRequest {
     #[allow(dead_code)]
@@ -214,6 +223,7 @@ pub(crate) struct EmbeddingsRequest {
     encoding_format: Option<String>,
 }
 
+#[cfg(feature = "embedding")]
 #[derive(Serialize)]
 pub(crate) struct EmbeddingsResponse {
     object: &'static str,
@@ -222,6 +232,7 @@ pub(crate) struct EmbeddingsResponse {
     usage: Usage,
 }
 
+#[cfg(feature = "embedding")]
 #[derive(Serialize)]
 pub(crate) struct EmbeddingData {
     object: &'static str,
@@ -229,6 +240,7 @@ pub(crate) struct EmbeddingData {
     embedding: Vec<f32>,
 }
 
+#[cfg(feature = "embedding")]
 #[derive(Serialize)]
 pub(crate) struct Usage {
     prompt_tokens: u32,
@@ -242,6 +254,7 @@ pub(crate) struct Usage {
 /// zero-pads the native 384-d e5-small vectors up to
 /// [`GATEWAY_OUTPUT_DIM`] (= 512) so downstream consumers (e.g. gbrain
 /// 0.40.8.1's openai recipe) accept the response. See 附录 B 决策 #7.
+#[cfg(feature = "embedding")]
 pub(crate) async fn embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbeddingsRequest>,
@@ -329,6 +342,23 @@ pub(crate) async fn embeddings(
             total_tokens: 0,
         },
     }))
+}
+
+/// Fallback `/v1/embeddings` handler for builds compiled without the
+/// `embedding` feature (e.g. aarch64 release builds where `ort` can't
+/// link). Returns 503 with an OpenAI-shaped error envelope so callers
+/// can distinguish "this build can't embed" from a transient failure.
+#[cfg(not(feature = "embedding"))]
+pub(crate) async fn embeddings() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": {
+                "type": "embedding_unavailable",
+                "message": "this build was compiled without the embedding feature"
+            }
+        })),
+    )
 }
 
 // =========================================================================

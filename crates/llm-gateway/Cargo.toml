@@ -45,11 +45,19 @@ httpdate = "1"
 # IDs
 uuid = { workspace = true }
 
-# Internal deps (used by future M1 #008 embeddings handler; declared now so
-# the dependency surface is settled).
-nevoflux-llm = { path = "../llm", default-features = false, features = ["embedding"] }
+# Internal deps. `embedding` is forwarded through this crate's own
+# `embedding` feature (see `[features]` below) so `--no-default-features`
+# can sever the fastembed -> ort pull-in on targets where ort can't link
+# (aarch64-windows / cross-compiled aarch64-linux).
+nevoflux-llm = { path = "../llm", default-features = false }
 
 [features]
+default = ["embedding"]
+# Pulls in the fastembed-backed `/v1/embeddings` handler via
+# `nevoflux-llm`'s `embedding` feature (fastembed -> ort). When off, the
+# `/v1/embeddings` route returns 503 `embedding_unavailable`. Kept optional
+# so aarch64 release builds can compile with `--no-default-features`.
+embedding = ["nevoflux-llm/embedding"]
 # Exposes `serve_test_router` + `GatewayConfig::test_default` for in-process
 # router testing via `tower::ServiceExt::oneshot`. Off by default so the
 # helpers aren't shipped to production consumers; turned on automatically
@@ -69,4 +77,4 @@ dirs = "5"
 # Re-pull our own crate as a dev-dep so the `test-util` feature is enabled
 # for the integration tests in `tests/*.rs` (which compile as their own
 # crates and don't otherwise see `cfg(test)` on the lib).
-nevoflux-llm-gateway = { path = ".", features = ["test-util"] }
+nevoflux-llm-gateway = { path = ".", features = ["test-util", "embedding"] }

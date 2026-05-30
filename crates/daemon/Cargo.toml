@@ -11,7 +11,7 @@ description = "Core daemon for NevoFlux Agent"
 
 [features]
 default = ["embedding"]
-embedding = ["nevoflux-llm/embedding"]
+embedding = ["nevoflux-llm/embedding", "nevoflux-llm-gateway/embedding"]
 
 [dependencies]
 # Internal crates
@@ -20,7 +20,7 @@ nevoflux-storage = { path = "../storage" }
 nevoflux-mcp = { path = "../mcp" }
 nevoflux-skills = { path = "../skills" }
 nevoflux-llm = { path = "../llm", default-features = false }
-nevoflux-llm-gateway = { path = "../llm-gateway" }
+nevoflux-llm-gateway = { path = "../llm-gateway", default-features = false }
 nevoflux-computer = { path = "../computer" }
 nevoflux-builtin-wasm = { path = "../builtin-wasm" }
 nevoflux-brain = { path = "../brain" }
