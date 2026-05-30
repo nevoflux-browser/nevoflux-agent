@@ -178,16 +178,11 @@ impl Default for StripRules {
 }
 
 /// How to handle wiki-style links that point outside the exported set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum BrokenLinkPolicy {
     /// Leave `[[link]]` as literal text (default).
+    #[default]
     KeepAsText,
-}
-
-impl Default for BrokenLinkPolicy {
-    fn default() -> Self {
-        BrokenLinkPolicy::KeepAsText
-    }
 }
 
 /// Shareable artifact produced by `export_snapshot`.

@@ -441,10 +441,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use nevoflux_brain::{
-        BrainEngine, BrainError, BrainPage, ImportOpts, ImportTrust, SearchOpts, Selection,
-        StripRules,
-    };
+    use nevoflux_brain::{BrainEngine, BrainError, BrainPage, ImportTrust, SearchOpts};
     use serde_json::{json, Value};
     use tokio::sync::Mutex;
 
@@ -687,29 +684,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_and_source_methods_return_not_implemented() {
+    async fn source_methods_return_not_implemented() {
+        // NOTE: `export_snapshot` / `import_snapshot` are now implemented
+        // (M5-A) and are exercised by `mod export_import_tests`. The
+        // remaining gbrain source-management methods (`add_source`,
+        // `remove_source`, `list_sources`) are still deferred.
         let stub = Arc::new(StubToolCaller::new(vec![]));
         let engine = GbrainEngine::new(stub);
-
-        let export = engine
-            .export_snapshot(Selection::Files(vec![]), StripRules::default())
-            .await;
-        assert!(matches!(export, Err(BrainError::NotImplemented)));
-
-        let import = engine
-            .import_snapshot(
-                nevoflux_brain::NbrainBundle {
-                    artifact: vec![],
-                    key: None,
-                },
-                ImportOpts {
-                    source_name: "x".into(),
-                    trust: ImportTrust::ReadOnly,
-                    unlock: nevoflux_brain::Unlock::Key([0u8; 32]),
-                },
-            )
-            .await;
-        assert!(matches!(import, Err(BrainError::NotImplemented)));
 
         let add = engine
             .add_source(nevoflux_brain::SourceSpec {
