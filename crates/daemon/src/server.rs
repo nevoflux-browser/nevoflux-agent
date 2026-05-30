@@ -1402,6 +1402,25 @@ pub async fn start_server(
         Arc::new(CanvasShareService::new(storage_arc, http, master_key))
     };
 
+    // Brain Share service (M5-B). Reuses the shared storage and the same
+    // local-credential master key as canvas share; targets the brain-share
+    // CF Worker routes. Registered in a process-global slot so the thin
+    // `brain.share_*` RPC handlers can reach it (mirrors CURRENT_BRAIN_SLOT).
+    {
+        use crate::brain_share::{BrainShareHttpClient, BrainShareService};
+        let storage_arc = session_manager.shared_storage();
+        let http = BrainShareHttpClient::with_default_url().unwrap_or_else(|_| {
+            BrainShareHttpClient::new("https://share.nevoflux.app").expect("valid fallback URL")
+        });
+        let master_key: [u8; 32] = {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&[0x42u8; 32]); // TODO: derive from config (matches canvas share)
+            k
+        };
+        let svc = Arc::new(BrainShareService::new(storage_arc, http, master_key));
+        let _ = crate::brain_share_rpc::CURRENT_BRAIN_SHARE_SLOT.set(svc);
+    }
+
     // Canvas Persist Service (My Canvas)
     let canvas_persist_service = {
         let storage_arc = session_manager.shared_storage();
@@ -6400,6 +6419,14 @@ async fn handle_chat_message(
                 "brain.save_conversation" => {
                     crate::brain_rpc::handle_save_conversation(&params).await
                 }
+                // Brain Share (M5-B) — online `.nbrain` delivery.
+                "brain.share_create" => crate::brain_share_rpc::handle_share_create(&params).await,
+                "brain.share_import_url" => {
+                    crate::brain_share_rpc::handle_share_import_url(&params).await
+                }
+                "brain.share_list" => crate::brain_share_rpc::handle_share_list(&params).await,
+                "brain.share_renew" => crate::brain_share_rpc::handle_share_renew(&params).await,
+                "brain.share_revoke" => crate::brain_share_rpc::handle_share_revoke(&params).await,
                 // Artifact persistence commands
                 "artifact.get" => handle_artifact_get(session_manager, &params).await,
                 "artifact.list" => handle_artifact_list(session_manager, &params).await,
