@@ -4,4 +4,5 @@
 //! strip pipeline, tar+zstd packing, and the `seal`/`open` orchestration.
 
 pub mod crypto;
+pub mod manifest;
 pub mod nbrain_format;
