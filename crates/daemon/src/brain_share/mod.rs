@@ -6,3 +6,4 @@
 pub mod crypto;
 pub mod manifest;
 pub mod nbrain_format;
+pub mod strip;
