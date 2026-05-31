@@ -401,9 +401,7 @@ fn env_duration_secs(name: &str, default: Duration) -> Duration {
 /// 4. Call [`nevoflux_llm_gateway::serve`] to spawn the task.
 /// 5. Poll `/healthz` up to 20 times at 100 ms intervals before
 ///    declaring success.
-pub async fn init_gateway(
-    agent_config: &AgentConfig,
-) -> Result<Option<GatewayBoot>, InitError> {
+pub async fn init_gateway(agent_config: &AgentConfig) -> Result<Option<GatewayBoot>, InitError> {
     let config = &agent_config.knowledge_base;
     if !config.enabled {
         info!("knowledge_base.enabled = false — skipping llm-gateway start");
@@ -466,11 +464,9 @@ pub async fn init_gateway(
                 break;
             }
             _ if tries >= max_tries => {
-                return Err(format!(
-                    "llm-gateway failed /healthz after {} tries",
-                    max_tries
-                )
-                .into());
+                return Err(
+                    format!("llm-gateway failed /healthz after {} tries", max_tries).into(),
+                );
             }
             _ => {
                 tries = tries.saturating_add(1);
@@ -658,10 +654,7 @@ mod tests {
     fn anthropic_api_key_prefers_nevoflux_env_over_anthropic_env() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         clear_resolver_env();
-        std::env::set_var(
-            "NEVOFLUX_LLM_GATEWAY_UPSTREAM_API_KEY",
-            "nevoflux-wins",
-        );
+        std::env::set_var("NEVOFLUX_LLM_GATEWAY_UPSTREAM_API_KEY", "nevoflux-wins");
         std::env::set_var("ANTHROPIC_API_KEY", "anthropic-loses");
         let agent = test_agent_config(GatewayUpstreamConfig::default());
         let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
@@ -673,10 +666,7 @@ mod tests {
     fn timeout_zero_falls_back_to_env_or_default() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         clear_resolver_env();
-        std::env::set_var(
-            "NEVOFLUX_LLM_GATEWAY_UPSTREAM_REQUEST_TIMEOUT_SECS",
-            "120",
-        );
+        std::env::set_var("NEVOFLUX_LLM_GATEWAY_UPSTREAM_REQUEST_TIMEOUT_SECS", "120");
         let agent = test_agent_config(GatewayUpstreamConfig::default());
         let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
         assert_eq!(resolved.request_timeout, Duration::from_secs(120));
@@ -722,10 +712,7 @@ mod tests {
     fn timeout_nonzero_config_wins_over_env() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         clear_resolver_env();
-        std::env::set_var(
-            "NEVOFLUX_LLM_GATEWAY_UPSTREAM_REQUEST_TIMEOUT_SECS",
-            "999",
-        );
+        std::env::set_var("NEVOFLUX_LLM_GATEWAY_UPSTREAM_REQUEST_TIMEOUT_SECS", "999");
         let agent = test_agent_config(GatewayUpstreamConfig {
             request_timeout_secs: 30,
             ..Default::default()
@@ -808,10 +795,7 @@ mod tests {
     fn env_var_overrides_llm_anthropic_fallback() {
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         clear_resolver_env();
-        std::env::set_var(
-            "NEVOFLUX_LLM_GATEWAY_UPSTREAM_API_KEY",
-            "env-wins",
-        );
+        std::env::set_var("NEVOFLUX_LLM_GATEWAY_UPSTREAM_API_KEY", "env-wins");
         let mut agent = test_agent_config(GatewayUpstreamConfig::default());
         agent.llm.provider = Some("anthropic".into());
         agent.llm.anthropic.api_key = Some("from-llm-anthropic".into());
