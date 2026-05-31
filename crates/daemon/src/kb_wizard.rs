@@ -768,6 +768,12 @@ where
         return Err(msg);
     }
 
+    // gbrain init leaves the repo in a state `sync_brain` cannot use: a bare
+    // `*` .gitignore (hides even `atlas/`) and zero commits. sync_brain needs
+    // a content whitelist + a HEAD to diff against, or it fails with
+    // "No commits in repo" / silently imports nothing. Make it sync-ready.
+    make_brain_repo_sync_ready(brain_dir, emit).await;
+
     emit(WizardProgress {
         step: WizardStep::InitBrain,
         status: WizardStatus::Ok,
@@ -775,6 +781,80 @@ where
         log: format!("brain initialized at {}", pglite.display()),
     });
     Ok(())
+}
+
+/// Run a `git` subcommand in `dir`, capturing output.
+async fn git_in(dir: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    Command::new("git").current_dir(dir).args(args).output().await
+}
+
+/// Leave a freshly `gbrain init`-ed repo in a state `sync_brain` can run
+/// against:
+/// 1. a `.gitignore` that whitelists the content dirs — gbrain init writes a
+///    bare `*` that hides even `atlas/`, so `git ls-files --others
+///    --exclude-standard` (how sync collects files) returns nothing;
+/// 2. at least one commit, so sync has a HEAD to diff against — without it
+///    sync errors `No commits in repo`.
+///
+/// Best-effort: failures are logged, not fatal, since `brain.pglite` already
+/// exists and the user can repair git manually.
+async fn make_brain_repo_sync_ready<F>(brain_dir: &Path, emit: &F)
+where
+    F: Fn(WizardProgress) + Send + Sync,
+{
+    let log = |msg: String| {
+        emit(WizardProgress {
+            step: WizardStep::InitBrain,
+            status: WizardStatus::Running,
+            progress_pct: 95,
+            log: msg,
+        });
+    };
+
+    // 1. Whitelist .gitignore (overwrites gbrain init's bare `*`). Only
+    //    `atlas/` and `journal/` are tracked; brain.pglite / audit stay ignored.
+    const GITIGNORE: &str = "*\n!atlas/\n!atlas/**/*\n!journal/\n!journal/**/*\n!.gitignore\n";
+    if let Err(e) = std::fs::write(brain_dir.join(".gitignore"), GITIGNORE) {
+        log(format!("warn: could not write brain .gitignore: {e}"));
+    }
+    let _ = std::fs::create_dir_all(brain_dir.join("atlas"));
+    let _ = std::fs::create_dir_all(brain_dir.join("journal"));
+
+    // 2. Ensure a git repo exists (idempotent — gbrain init usually did this).
+    let _ = git_in(brain_dir, &["init"]).await;
+
+    // 3. If the repo has no commits yet, create a baseline so sync has a HEAD.
+    //    Inline identity avoids failing on a machine without user.name/email
+    //    configured (a common cause of the wizard's earlier git failures).
+    let has_head = git_in(brain_dir, &["rev-parse", "--verify", "HEAD"])
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if has_head {
+        return;
+    }
+    let _ = git_in(brain_dir, &["add", "-A"]).await;
+    match git_in(
+        brain_dir,
+        &[
+            "-c",
+            "user.email=brain@nevoflux.local",
+            "-c",
+            "user.name=NevoFlux Brain",
+            "commit",
+            "-m",
+            "chore: initialize brain repo (sync baseline)",
+        ],
+    )
+    .await
+    {
+        Ok(o) if o.status.success() => log("brain git repo committed (sync-ready)".into()),
+        Ok(o) => log(format!(
+            "warn: brain baseline commit skipped: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => log(format!("warn: brain baseline commit failed (git missing?): {e}")),
+    }
 }
 
 /// Build the canonical `~/.gbrain` directory path. Returns `.gbrain`
@@ -1131,6 +1211,55 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn sync_ready_writes_whitelist_gitignore_and_baseline_commit() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+
+        make_brain_repo_sync_ready(dir, &|_p: WizardProgress| {}).await;
+
+        // 1. .gitignore whitelists atlas/ + journal/ (not gbrain's bare `*`).
+        let gi = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(gi.starts_with("*"), "must keep the catch-all ignore: {gi:?}");
+        assert!(gi.contains("!atlas/"), "must whitelist atlas/: {gi:?}");
+        assert!(gi.contains("!journal/"), "must whitelist journal/: {gi:?}");
+
+        // 2. Defensive content dirs exist.
+        assert!(dir.join("atlas").is_dir());
+        assert!(dir.join("journal").is_dir());
+
+        // 3. A baseline commit exists, so sync_brain has a HEAD to diff against.
+        let head = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["rev-parse", "--verify", "HEAD"])
+            .output()
+            .expect("git must be available to run this test");
+        assert!(
+            head.status.success(),
+            "expected a baseline commit (HEAD); git stderr: {}",
+            String::from_utf8_lossy(&head.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_ready_is_idempotent_and_keeps_existing_head() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        make_brain_repo_sync_ready(dir, &|_p: WizardProgress| {}).await;
+        let head_of = |d: &std::path::Path| {
+            let o = std::process::Command::new("git")
+                .current_dir(d)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        let first = head_of(dir);
+        // Second run must not fail and must not add a new baseline commit.
+        make_brain_repo_sync_ready(dir, &|_p: WizardProgress| {}).await;
+        assert_eq!(first, head_of(dir), "re-run must keep the same HEAD");
+    }
 
     #[tokio::test]
     async fn status_probe_returns_not_initialized_for_empty_brain_dir() {
