@@ -202,9 +202,11 @@ impl AcpUpstream {
     }
 }
 
+use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::{
+    response::sse::{Event, KeepAlive, Sse},
     response::{IntoResponse, Response},
     Json,
 };
@@ -277,17 +279,91 @@ pub async fn do_chat_completions_acp(
     }
 }
 
+/// Build the streaming SSE response from an ACP update receiver.
+///
+/// Emits an `OpenAIChatChunk` per `AcpUpdate::Text` (first chunk also
+/// sets `delta.role = "assistant"`); ignores `Thought`; on `Complete`
+/// emits a final chunk carrying `finish_reason` then `[DONE]`; on `Error`
+/// (or an early-closed receiver) emits an OpenAI-shaped error chunk +
+/// `[DONE]`. Reuses the same `Sse` + keep-alive contract as the
+/// Anthropic/OpenAI paths in `handlers.rs`.
 fn stream_response(
-    _receiver: tokio::sync::mpsc::Receiver<AcpUpdate>,
-    _model: String,
-    _req_idx: u64,
+    mut receiver: tokio::sync::mpsc::Receiver<AcpUpdate>,
+    model: String,
+    req_idx: u64,
 ) -> Response {
-    // Replaced in Task 4 with real SSE plumbing.
-    (
-        axum::http::StatusCode::NOT_IMPLEMENTED,
-        "streaming not yet wired",
-    )
-        .into_response()
+    use crate::translate::{OpenAIChatChunk, OpenAIChunkChoice, OpenAIDelta};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let id = format!("chatcmpl-acp-{created}");
+
+    let sse = async_stream::stream! {
+        let mut role_emitted = false;
+
+        let make = |delta: OpenAIDelta, finish: Option<String>| -> OpenAIChatChunk {
+            OpenAIChatChunk {
+                id: id.clone(),
+                object: "chat.completion.chunk",
+                created,
+                model: model.clone(),
+                choices: vec![OpenAIChunkChoice { index: 0, delta, finish_reason: finish }],
+            }
+        };
+        let emit = |chunk: OpenAIChatChunk| -> Result<Event, Infallible> {
+            match serde_json::to_string(&chunk) {
+                Ok(s) => Ok(Event::default().data(s)),
+                Err(e) => {
+                    tracing::error!(req_idx, error = %e, "failed to encode acp chunk");
+                    Ok(Event::default().data("{}"))
+                }
+            }
+        };
+
+        loop {
+            match receiver.recv().await {
+                Some(AcpUpdate::Text(text)) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let delta = OpenAIDelta {
+                        role: if !role_emitted { Some("assistant".to_string()) } else { None },
+                        content: Some(text),
+                        tool_calls: None,
+                    };
+                    role_emitted = true;
+                    yield emit(make(delta, None));
+                }
+                Some(AcpUpdate::Thought(_)) => {}
+                Some(AcpUpdate::Complete(stop)) => {
+                    let fr = stop_reason_to_finish_reason(stop).to_string();
+                    yield emit(make(OpenAIDelta::default(), Some(fr)));
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+                Some(AcpUpdate::Error(e)) => {
+                    tracing::error!(req_idx, error = %e, "acp stream error mid-flight");
+                    let err = serde_json::json!({
+                        "error": { "type": "acp_stream_error", "message": e }
+                    });
+                    yield Ok(Event::default().data(err.to_string()));
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+                None => {
+                    // Receiver closed without an explicit Complete/Error.
+                    tracing::warn!(req_idx, "acp stream ended without completion");
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+            }
+        }
+    };
+
+    Sse::new(sse).keep_alive(KeepAlive::new()).into_response()
 }
 
 #[cfg(test)]
@@ -464,5 +540,59 @@ mod tests {
             .await
             .expect("acp completion");
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn streaming_emits_role_then_content_then_done() {
+        use axum::body::to_bytes;
+        use nevoflux_llm::providers::acp::AcpUpdate;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(AcpUpdate::Text("Hel".to_string())).await.unwrap();
+        tx.send(AcpUpdate::Thought("ignored".to_string()))
+            .await
+            .unwrap();
+        tx.send(AcpUpdate::Text("lo".to_string())).await.unwrap();
+        tx.send(AcpUpdate::Complete(StopReason::EndTurn))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let resp = super::stream_response(rx, "echo".to_string(), 7);
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        // First content chunk carries the assistant role; later chunks don't.
+        assert!(text.contains("\"role\":\"assistant\""));
+        assert!(text.contains("\"content\":\"Hel\""));
+        assert!(text.contains("\"content\":\"lo\""));
+        // Thought is dropped.
+        assert!(!text.contains("ignored"));
+        // Final chunk has finish_reason; stream terminates with [DONE].
+        assert!(text.contains("\"finish_reason\":\"stop\""));
+        assert!(text.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn streaming_error_emits_error_chunk_then_done() {
+        use axum::body::to_bytes;
+        use nevoflux_llm::providers::acp::AcpUpdate;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(AcpUpdate::Text("partial".to_string()))
+            .await
+            .unwrap();
+        tx.send(AcpUpdate::Error("kaboom".to_string()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let resp = super::stream_response(rx, "echo".to_string(), 8);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("acp_stream_error"));
+        assert!(text.contains("kaboom"));
+        assert!(text.contains("[DONE]"));
     }
 }
