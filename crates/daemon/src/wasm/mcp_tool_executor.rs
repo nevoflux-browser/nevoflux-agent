@@ -428,6 +428,45 @@ pub async fn execute_mcp_tool(
         _ => {}
     }
 
+    // 5'. Dynamic tool dispatch for ACP/MCP-HTTP-bridge providers
+    // (claude-code, gemini-cli, ...). These external agents reach the 83
+    // gbrain tools ONLY through `tool_search` + `tool_call_dynamic` — the
+    // individual `brain_*` tools are not advertised over the bridge. The
+    // in-daemon WASM agent routes `tool_call_dynamic` via
+    // `AgentHost::tool_call_dynamic` (agent_host.rs); mirror that here by
+    // unwrapping the inner tool and re-dispatching through THIS executor,
+    // which already handles `brain_*` (via the gbrain supervisor) and
+    // external MCP tools. Without this arm the bridge falls through to
+    // "unknown tool: tool_call_dynamic".
+    if name == "tool_call_dynamic" {
+        let inner_name = arguments
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "tool_call_dynamic: missing required 'tool_name'".to_string())?
+            .to_string();
+        if inner_name == "tool_call_dynamic" {
+            return Err("tool_call_dynamic cannot call itself".to_string());
+        }
+        // The schema declares `arguments` as a JSON *string*; tolerate an
+        // already-parsed object (some bridges pass objects) and an empty value.
+        let inner_args: serde_json::Value = match arguments.get("arguments") {
+            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
+                serde_json::from_str(s).map_err(|e| {
+                    format!("tool_call_dynamic: 'arguments' is not valid JSON: {e}")
+                })?
+            }
+            Some(serde_json::Value::String(_)) | None => serde_json::json!({}),
+            Some(other) => other.clone(),
+        };
+        return Box::pin(execute_mcp_tool(
+            &inner_name,
+            &inner_args,
+            services,
+            tool_bridge,
+        ))
+        .await;
+    }
+
     // 6. Subagent tools
     match name {
         "subagent_spawn" | "subagent_status" | "subagent_wait" | "subagent_wait_all"
@@ -2547,6 +2586,72 @@ mod tests {
             &bridge,
         ));
         assert_eq!(result, Err("unknown tool: nonexistent_tool".to_string()));
+    }
+
+    #[test]
+    fn test_tool_call_dynamic_requires_tool_name() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let services = HostServices::new(db);
+        let bridge = make_test_bridge();
+        let result = rt.block_on(execute_mcp_tool(
+            "tool_call_dynamic",
+            &serde_json::json!({ "arguments": "{}" }),
+            &services,
+            &bridge,
+        ));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing required 'tool_name'"));
+    }
+
+    #[test]
+    fn test_tool_call_dynamic_self_call_rejected() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let services = HostServices::new(db);
+        let bridge = make_test_bridge();
+        let result = rt.block_on(execute_mcp_tool(
+            "tool_call_dynamic",
+            &serde_json::json!({ "tool_name": "tool_call_dynamic", "arguments": "{}" }),
+            &services,
+            &bridge,
+        ));
+        assert_eq!(result, Err("tool_call_dynamic cannot call itself".to_string()));
+    }
+
+    #[test]
+    fn test_tool_call_dynamic_unwraps_and_dispatches_inner() {
+        // Proves the ACP-bridge fix: tool_call_dynamic re-dispatches the INNER
+        // tool through this executor — the failure surfaces the inner name, not
+        // "unknown tool: tool_call_dynamic".
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let services = HostServices::new(db);
+        let bridge = make_test_bridge();
+        let result = rt.block_on(execute_mcp_tool(
+            "tool_call_dynamic",
+            &serde_json::json!({ "tool_name": "nonexistent_tool", "arguments": "{}" }),
+            &services,
+            &bridge,
+        ));
+        assert_eq!(result, Err("unknown tool: nonexistent_tool".to_string()));
+    }
+
+    #[test]
+    fn test_tool_call_dynamic_parses_json_string_args_and_runs_inner() {
+        // `arguments` is a JSON *string* per the tool schema; it must be parsed
+        // and the inner tool ("think") executed successfully.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let services = HostServices::new(db);
+        let bridge = make_test_bridge();
+        let result = rt.block_on(execute_mcp_tool(
+            "tool_call_dynamic",
+            &serde_json::json!({ "tool_name": "think", "arguments": "{}" }),
+            &services,
+            &bridge,
+        ));
+        assert_eq!(result, Ok("Thought recorded.".to_string()));
     }
 
     #[test]
