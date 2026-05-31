@@ -25,6 +25,12 @@ pub enum UpstreamProtocol {
     /// swap and an optional model remap.
     #[serde(rename = "openai")]
     OpenAi,
+    /// Upstream is a Claude Code **ACP** session driven in-process by
+    /// the gateway. Chat requests are served by spawning/reusing a single
+    /// `claude-agent-acp` subprocess and opening a new ACP session per
+    /// request (tool-less, headless), reusing Claude Code's own auth.
+    /// See `acp_upstream.rs`. The `/v1/embeddings` path never uses this.
+    Acp,
 }
 
 impl Default for UpstreamProtocol {
@@ -37,11 +43,13 @@ impl Default for UpstreamProtocol {
 
 impl UpstreamProtocol {
     /// Map a nevoflux provider name (from `[llm].provider`) to its
-    /// canonical protocol. Anthropic + claude_code use the Anthropic
-    /// Messages API; everything else is OpenAI-compatible by convention.
+    /// canonical protocol. `anthropic` uses the Anthropic Messages API;
+    /// `claude_code`/`claude-code`/`acp` drive an in-process Claude Code
+    /// ACP session; everything else is OpenAI-compatible by convention.
     pub fn from_provider_name(name: &str) -> Self {
         match name.to_ascii_lowercase().as_str() {
-            "anthropic" | "claude_code" | "claude-code" => UpstreamProtocol::Anthropic,
+            "anthropic" => UpstreamProtocol::Anthropic,
+            "claude_code" | "claude-code" | "acp" => UpstreamProtocol::Acp,
             _ => UpstreamProtocol::OpenAi,
         }
     }
@@ -54,6 +62,7 @@ impl UpstreamProtocol {
         match label.trim().to_ascii_lowercase().as_str() {
             "anthropic" => UpstreamProtocol::Anthropic,
             "openai" | "open_ai" | "open-ai" => UpstreamProtocol::OpenAi,
+            "acp" => UpstreamProtocol::Acp,
             _ => UpstreamProtocol::default(),
         }
     }

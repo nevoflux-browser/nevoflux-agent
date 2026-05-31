@@ -383,6 +383,13 @@ pub(crate) async fn chat_completions(
         UpstreamProtocol::OpenAi => {
             do_chat_completions_openai(state.clone(), req, req_idx, stream).await
         }
+        // The ACP dispatch arm is wired in a later task. Until then the
+        // gateway never constructs an Acp AppState, so this branch is
+        // unreachable in practice; we return an Internal error rather than
+        // panic if it is somehow hit.
+        UpstreamProtocol::Acp => Err(GatewayError::Internal {
+            detail: "upstream_protocol=Acp is not yet wired into the gateway".to_string(),
+        }),
     };
 
     match result {

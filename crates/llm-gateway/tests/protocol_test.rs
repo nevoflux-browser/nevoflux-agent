@@ -18,19 +18,50 @@ fn provider_name_anthropic_variants_map_to_anthropic() {
         UpstreamProtocol::from_provider_name("ANTHROPIC"),
         UpstreamProtocol::Anthropic
     );
+}
+
+#[test]
+fn provider_name_claude_code_maps_to_acp() {
+    // Core behavior change: claude_code now drives an ACP session
+    // (reusing Claude Code's own auth) instead of HTTP-proxying to
+    // api.anthropic.com.
     assert_eq!(
         UpstreamProtocol::from_provider_name("claude_code"),
-        UpstreamProtocol::Anthropic
+        UpstreamProtocol::Acp
     );
     assert_eq!(
         UpstreamProtocol::from_provider_name("claude-code"),
-        UpstreamProtocol::Anthropic
+        UpstreamProtocol::Acp
+    );
+    assert_eq!(
+        UpstreamProtocol::from_provider_name("CLAUDE-CODE"),
+        UpstreamProtocol::Acp
+    );
+    assert_eq!(
+        UpstreamProtocol::from_provider_name("acp"),
+        UpstreamProtocol::Acp
+    );
+}
+
+#[test]
+fn parse_label_accepts_acp() {
+    assert_eq!(UpstreamProtocol::parse_label("acp"), UpstreamProtocol::Acp);
+    assert_eq!(
+        UpstreamProtocol::parse_label("  ACP  "),
+        UpstreamProtocol::Acp
     );
 }
 
 #[test]
 fn provider_name_openai_compatible_maps_to_openai() {
-    for p in ["openai", "qwen", "deepseek", "openrouter", "groq", "mistral"] {
+    for p in [
+        "openai",
+        "qwen",
+        "deepseek",
+        "openrouter",
+        "groq",
+        "mistral",
+    ] {
         assert_eq!(
             UpstreamProtocol::from_provider_name(p),
             UpstreamProtocol::OpenAi,
