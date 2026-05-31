@@ -1,0 +1,318 @@
+//! ACP-backed chat upstream for the gateway.
+//!
+//! Serves OpenAI-compatible `/v1/chat/completions` by driving a Claude
+//! Code **ACP** session instead of HTTP-proxying to Anthropic. The
+//! gateway holds its own headless, tool-less `AcpProvider`: a single
+//! `claude-agent-acp` subprocess (lazy-spawned on the first `Acp` chat
+//! request) and a NEW ACP session per request.
+//!
+//! Translation/aggregation is factored into pure functions so it can be
+//! unit-tested without spawning claude (feed a constructed `Vec<AcpUpdate>`).
+
+use nevoflux_llm::providers::acp::{AcpUpdate, ContentBlock, StopReason, TextContent};
+use serde_json::Value;
+
+use crate::translate::{
+    OpenAIChatCompletion, OpenAIChatRequest, OpenAIChoice, OpenAIRespMessage, OpenAIUsage,
+};
+
+/// Coerce one OpenAI message `content` (string, array of parts, or null)
+/// into a single plain string. Mirrors `translate::openai_content_to_string`
+/// but kept local so the ACP path is self-contained (spec section 4).
+fn content_to_string(content: &Option<Value>) -> String {
+    match content {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => {
+            let mut out = String::new();
+            for p in parts {
+                if let Some(text) = p.get("text").and_then(|t| t.as_str()) {
+                    out.push_str(text);
+                } else if let Some(s) = p.as_str() {
+                    out.push_str(s);
+                }
+            }
+            out
+        }
+        Some(other) => other.to_string(),
+    }
+}
+
+/// Flatten an OpenAI multi-turn `messages[]` into a single prompt string.
+///
+/// Layout: every `system` message first (joined), then each remaining
+/// turn rendered with a `Role:` label, blank-line separated. The
+/// request's `tools` / `tool_choice` are intentionally ignored
+/// (tool-less plain-text completion; spec section 6).
+pub fn flatten_messages(req: &OpenAIChatRequest) -> String {
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut turns: Vec<String> = Vec::new();
+
+    for msg in &req.messages {
+        let text = content_to_string(&msg.content);
+        match msg.role.as_str() {
+            "system" => {
+                if !text.is_empty() {
+                    system_parts.push(text);
+                }
+            }
+            "assistant" => turns.push(format!("Assistant: {text}")),
+            "user" => turns.push(format!("User: {text}")),
+            other => turns.push(format!("{other}: {text}")),
+        }
+    }
+
+    let mut out = String::new();
+    if !system_parts.is_empty() {
+        out.push_str(&system_parts.join("\n\n"));
+    }
+    if !turns.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&turns.join("\n\n"));
+    }
+    out
+}
+
+/// Build the single-block prompt content for an ACP `prompt()` call.
+pub fn prompt_content(prompt: String) -> Vec<ContentBlock> {
+    vec![ContentBlock::Text(TextContent::new(prompt))]
+}
+
+/// Map an ACP [`StopReason`] to an OpenAI `finish_reason`.
+///
+/// `StopReason` is `#[non_exhaustive]`, so the wildcard arm is required
+/// and future variants degrade to `"stop"`.
+pub fn stop_reason_to_finish_reason(stop: StopReason) -> &'static str {
+    match stop {
+        StopReason::EndTurn => "stop",
+        StopReason::MaxTokens => "length",
+        StopReason::Refusal => "content_filter",
+        StopReason::Cancelled => "stop",
+        StopReason::MaxTurnRequests => "stop",
+        _ => "stop",
+    }
+}
+
+/// Outcome of aggregating an ACP update stream.
+pub enum Aggregated {
+    /// Assistant text + the finish reason derived from the stop reason.
+    Done {
+        content: String,
+        finish_reason: &'static str,
+    },
+    /// An `AcpUpdate::Error(_)` was seen, or the stream ended without a
+    /// `Complete`. Carries the error message for a 502 body.
+    Failed(String),
+}
+
+/// Drain an ACP update stream into a single assistant string.
+///
+/// `Text` chunks concatenate; `Thought` is ignored; `Error` short-circuits
+/// to [`Aggregated::Failed`]; `Complete(stop)` finishes. A stream that ends
+/// without `Complete` and without `Error` is treated as `Failed`.
+pub fn aggregate_updates(updates: impl IntoIterator<Item = AcpUpdate>) -> Aggregated {
+    let mut content = String::new();
+    for update in updates {
+        match update {
+            AcpUpdate::Text(t) => content.push_str(&t),
+            AcpUpdate::Thought(_) => {}
+            AcpUpdate::Error(e) => return Aggregated::Failed(e),
+            AcpUpdate::Complete(stop) => {
+                return Aggregated::Done {
+                    content,
+                    finish_reason: stop_reason_to_finish_reason(stop),
+                };
+            }
+        }
+    }
+    Aggregated::Failed("ACP stream ended without completion".to_string())
+}
+
+/// Build the non-stream OpenAI completion body from an aggregated result.
+///
+/// `model` echoes the client's request model (ACP always uses claude).
+/// Usage is zeroed (ACP does not report token counts; spec section 9).
+pub fn build_completion(
+    model: String,
+    content: String,
+    finish_reason: &str,
+) -> OpenAIChatCompletion {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    OpenAIChatCompletion {
+        id: format!("chatcmpl-acp-{created}"),
+        object: "chat.completion",
+        created,
+        model,
+        choices: vec![OpenAIChoice {
+            index: 0,
+            message: OpenAIRespMessage {
+                role: "assistant".to_string(),
+                content: Some(content),
+                tool_calls: None,
+            },
+            finish_reason: finish_reason.to_string(),
+        }],
+        usage: OpenAIUsage::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::translate::{OpenAIChatRequest, OpenAIMessage};
+    use std::collections::BTreeMap;
+
+    fn msg(role: &str, content: &str) -> OpenAIMessage {
+        OpenAIMessage {
+            role: role.to_string(),
+            content: Some(Value::String(content.to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn req_with(messages: Vec<OpenAIMessage>) -> OpenAIChatRequest {
+        OpenAIChatRequest {
+            model: "claude-anything".to_string(),
+            messages,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            stream: None,
+            tools: None,
+            tool_choice: None,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn flatten_system_then_turns() {
+        let req = req_with(vec![
+            msg("system", "You are terse."),
+            msg("user", "Hello"),
+            msg("assistant", "Hi"),
+            msg("user", "Bye"),
+        ]);
+        let out = flatten_messages(&req);
+        assert_eq!(
+            out,
+            "You are terse.\n\nUser: Hello\n\nAssistant: Hi\n\nUser: Bye"
+        );
+    }
+
+    #[test]
+    fn flatten_no_system_just_user() {
+        let req = req_with(vec![msg("user", "Just this")]);
+        assert_eq!(flatten_messages(&req), "User: Just this");
+    }
+
+    #[test]
+    fn flatten_array_content_parts() {
+        let mut m = msg("user", "");
+        m.content = Some(serde_json::json!([
+            { "type": "text", "text": "part-a " },
+            { "type": "text", "text": "part-b" }
+        ]));
+        let req = req_with(vec![m]);
+        assert_eq!(flatten_messages(&req), "User: part-a part-b");
+    }
+
+    #[test]
+    fn flatten_empty_messages_is_empty() {
+        let req = req_with(vec![]);
+        assert_eq!(flatten_messages(&req), "");
+    }
+
+    #[test]
+    fn tools_are_ignored_no_panic() {
+        // A request carrying tools must flatten exactly as if tools were
+        // absent (tool-less completion; spec section 6).
+        use crate::translate::{OpenAIFunctionDef, OpenAITool};
+        let mut req = req_with(vec![msg("user", "Q")]);
+        req.tools = Some(vec![OpenAITool {
+            kind: "function".to_string(),
+            function: OpenAIFunctionDef {
+                name: "do_thing".to_string(),
+                description: Some("desc".to_string()),
+                parameters: Some(serde_json::json!({"type": "object"})),
+            },
+        }]);
+        req.tool_choice = Some(serde_json::json!("auto"));
+        assert_eq!(flatten_messages(&req), "User: Q");
+    }
+
+    #[test]
+    fn stop_reason_mapping_table() {
+        assert_eq!(stop_reason_to_finish_reason(StopReason::EndTurn), "stop");
+        assert_eq!(
+            stop_reason_to_finish_reason(StopReason::MaxTokens),
+            "length"
+        );
+        assert_eq!(
+            stop_reason_to_finish_reason(StopReason::Refusal),
+            "content_filter"
+        );
+        assert_eq!(stop_reason_to_finish_reason(StopReason::Cancelled), "stop");
+        assert_eq!(
+            stop_reason_to_finish_reason(StopReason::MaxTurnRequests),
+            "stop"
+        );
+    }
+
+    #[test]
+    fn aggregate_text_chunks_then_complete() {
+        let updates = vec![
+            AcpUpdate::Text("Hello, ".to_string()),
+            AcpUpdate::Thought("(thinking)".to_string()),
+            AcpUpdate::Text("world".to_string()),
+            AcpUpdate::Complete(StopReason::EndTurn),
+        ];
+        match aggregate_updates(updates) {
+            Aggregated::Done {
+                content,
+                finish_reason,
+            } => {
+                assert_eq!(content, "Hello, world");
+                assert_eq!(finish_reason, "stop");
+            }
+            Aggregated::Failed(e) => panic!("expected Done, got Failed({e})"),
+        }
+    }
+
+    #[test]
+    fn aggregate_error_short_circuits() {
+        let updates = vec![
+            AcpUpdate::Text("partial".to_string()),
+            AcpUpdate::Error("boom".to_string()),
+        ];
+        match aggregate_updates(updates) {
+            Aggregated::Failed(e) => assert_eq!(e, "boom"),
+            Aggregated::Done { .. } => panic!("expected Failed"),
+        }
+    }
+
+    #[test]
+    fn aggregate_no_complete_is_failed() {
+        let updates = vec![AcpUpdate::Text("dangling".to_string())];
+        assert!(matches!(aggregate_updates(updates), Aggregated::Failed(_)));
+    }
+
+    #[test]
+    fn build_completion_shape() {
+        let c = build_completion("echo-model".to_string(), "answer".to_string(), "stop");
+        assert_eq!(c.object, "chat.completion");
+        assert_eq!(c.model, "echo-model");
+        assert_eq!(c.choices.len(), 1);
+        assert_eq!(c.choices[0].message.role, "assistant");
+        assert_eq!(c.choices[0].message.content.as_deref(), Some("answer"));
+        assert_eq!(c.choices[0].finish_reason, "stop");
+        assert_eq!(c.usage.total_tokens, 0);
+    }
+}

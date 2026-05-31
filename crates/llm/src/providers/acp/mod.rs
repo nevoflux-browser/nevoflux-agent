@@ -13,13 +13,13 @@ pub mod tools;
 
 // Re-export key schema types so downstream crates (e.g. nevoflux-daemon)
 // can construct ContentBlock values without a direct sacp dependency.
-pub use sacp::schema::{ContentBlock, TextContent};
+pub use sacp::schema::{ContentBlock, StopReason, TextContent};
 
 use sacp::schema::{
     ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
     PromptRequest, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
     RequestPermissionResponse, SessionId, SessionNotification, SessionUpdate,
-    SetSessionModeRequest, StopReason,
+    SetSessionModeRequest,
 };
 use sacp::{ClientToAgent, JrConnectionCx, JrMessage};
 use std::path::PathBuf;
