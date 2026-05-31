@@ -487,35 +487,56 @@ where
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
 
-    let mut stdout_reader = tokio::io::BufReader::new(stdout).lines();
-    let mut stderr_reader = tokio::io::BufReader::new(stderr).lines();
+    // Read stdout/stderr as raw bytes split on '\n' and decode lossily.
+    // Subprocess installers — notably the Windows bun installer driven via
+    // PowerShell — emit non-UTF-8 bytes on their pipes (OEM/ANSI console code
+    // page, progress glyphs). A strict UTF-8 line decoder (`.lines()`) then
+    // errors with "stream did not contain valid UTF-8" and aborts an
+    // otherwise-successful install. Lossy decoding keeps the log readable and
+    // never fails on encoding.
+    let mut stdout_reader = tokio::io::BufReader::new(stdout);
+    let mut stderr_reader = tokio::io::BufReader::new(stderr);
 
+    let mut stdout_buf: Vec<u8> = Vec::new();
+    let mut stderr_buf: Vec<u8> = Vec::new();
     let mut stdout_done = false;
     let mut stderr_done = false;
 
     while !stdout_done || !stderr_done {
         tokio::select! {
-            line = stdout_reader.next_line(), if !stdout_done => {
-                match line {
-                    Ok(Some(text)) => emit(WizardProgress {
-                        step,
-                        status: WizardStatus::Running,
-                        progress_pct: 50,
-                        log: text,
-                    }),
-                    Ok(None) => stdout_done = true,
+            n = stdout_reader.read_until(b'\n', &mut stdout_buf), if !stdout_done => {
+                match n {
+                    Ok(0) => stdout_done = true,
+                    Ok(_) => {
+                        let text = String::from_utf8_lossy(&stdout_buf)
+                            .trim_end_matches(|c| c == '\n' || c == '\r')
+                            .to_string();
+                        stdout_buf.clear();
+                        emit(WizardProgress {
+                            step,
+                            status: WizardStatus::Running,
+                            progress_pct: 50,
+                            log: text,
+                        });
+                    }
                     Err(e) => return Err(format!("stdout read: {e}").into()),
                 }
             }
-            line = stderr_reader.next_line(), if !stderr_done => {
-                match line {
-                    Ok(Some(text)) => emit(WizardProgress {
-                        step,
-                        status: WizardStatus::Running,
-                        progress_pct: 50,
-                        log: text,
-                    }),
-                    Ok(None) => stderr_done = true,
+            n = stderr_reader.read_until(b'\n', &mut stderr_buf), if !stderr_done => {
+                match n {
+                    Ok(0) => stderr_done = true,
+                    Ok(_) => {
+                        let text = String::from_utf8_lossy(&stderr_buf)
+                            .trim_end_matches(|c| c == '\n' || c == '\r')
+                            .to_string();
+                        stderr_buf.clear();
+                        emit(WizardProgress {
+                            step,
+                            status: WizardStatus::Running,
+                            progress_pct: 50,
+                            log: text,
+                        });
+                    }
                     Err(e) => return Err(format!("stderr read: {e}").into()),
                 }
             }
