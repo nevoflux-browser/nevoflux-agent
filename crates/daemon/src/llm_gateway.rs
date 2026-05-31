@@ -14,7 +14,7 @@
 use std::{net::SocketAddr, time::Duration};
 
 use nevoflux_llm_gateway::{
-    serve as serve_gateway, GatewayConfig, GatewayHandle, UpstreamProtocol,
+    serve as serve_gateway, AcpProviderConfig, GatewayConfig, GatewayHandle, UpstreamProtocol,
     DEFAULT_ANTHROPIC_VERSION, DEFAULT_UPSTREAM_BASE, DEFAULT_UPSTREAM_CONNECT_TIMEOUT,
     DEFAULT_UPSTREAM_REQUEST_TIMEOUT, DEFAULT_UPSTREAM_RETRY_MAX_WAIT,
     DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT,
@@ -80,6 +80,11 @@ struct ResolvedUpstreamConfig {
     /// whether the gateway runs the Anthropic translator path or the
     /// OpenAI passthrough path inside `chat_completions`.
     upstream_protocol: UpstreamProtocol,
+    /// ACP agent config, `Some` only when `upstream_protocol == Acp`
+    /// (provider `claude-code`). Built from
+    /// `nevoflux_llm::providers::acp::claude::build_config` with the MCP
+    /// bridge disabled (the gateway's ACP session is headless + tool-less).
+    acp_config: Option<AcpProviderConfig>,
 }
 
 /// Snapshot of the active `[llm.<provider>]` section, used as the
@@ -324,6 +329,20 @@ fn resolve_upstream_config(
         vec!["default".to_string()]
     };
 
+    // M4 ACP upstream: when the resolved protocol is Acp (provider
+    // claude-code), build a headless/tool-less AcpProviderConfig so the
+    // gateway can drive a Claude Code ACP session instead of HTTP-proxying.
+    let acp_config = if upstream_protocol == UpstreamProtocol::Acp {
+        let work_dir = acp_work_dir();
+        let mut cfg = nevoflux_llm::providers::acp::claude::build_config(work_dir);
+        // Headless, tool-less session: no MCP bridge / sidebar prompts.
+        cfg.use_mcp_bridge = false;
+        cfg.inject_mcp_url = false;
+        Some(cfg)
+    } else {
+        None
+    };
+
     ResolvedUpstreamConfig {
         upstream_base_url,
         upstream_api_key,
@@ -335,7 +354,23 @@ fn resolve_upstream_config(
         retry_max_wait,
         advertised_models,
         upstream_protocol,
+        acp_config,
     }
+}
+
+/// Working directory for the gateway's headless ACP session. Reuses the
+/// daemon data dir's `workspace/` (same place `wasm::llm` uses for ACP).
+fn acp_work_dir() -> std::path::PathBuf {
+    let data_dir = std::env::var("NEVOFLUX_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            directories::ProjectDirs::from("com", "nevoflux", "nevoflux")
+                .map(|dirs| dirs.data_dir().to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+        });
+    let workspace = data_dir.join("workspace");
+    std::fs::create_dir_all(&workspace).ok();
+    workspace
 }
 
 /// Read a `Duration` from an env var holding whole-second integer text.
@@ -403,6 +438,7 @@ pub async fn init_gateway(
         upstream_retry_max_wait: resolved.retry_max_wait,
         advertised_models: resolved.advertised_models,
         upstream_protocol: resolved.upstream_protocol,
+        acp_config: resolved.acp_config,
     };
 
     let handle = serve_gateway(gateway_config)
@@ -809,6 +845,34 @@ mod tests {
         let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
         assert_eq!(resolved.upstream_protocol, UpstreamProtocol::OpenAi);
         clear_resolver_env();
+    }
+
+    #[test]
+    fn resolve_claude_code_yields_acp_protocol_and_config() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_resolver_env();
+        let mut agent = test_agent_config(GatewayUpstreamConfig::default());
+        agent.llm.provider = Some("claude-code".into());
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
+        assert_eq!(resolved.upstream_protocol, UpstreamProtocol::Acp);
+        let cfg = resolved
+            .acp_config
+            .expect("Acp protocol must carry acp_config");
+        assert!(!cfg.use_mcp_bridge, "gateway ACP session must be tool-less");
+        assert!(
+            !cfg.inject_mcp_url,
+            "gateway ACP session must not inject MCP URL"
+        );
+    }
+
+    #[test]
+    fn resolve_non_acp_has_no_acp_config() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_resolver_env();
+        let mut agent = test_agent_config(GatewayUpstreamConfig::default());
+        agent.llm.provider = Some("openai".into());
+        let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
+        assert!(resolved.acp_config.is_none());
     }
 
     #[test]
