@@ -115,6 +115,7 @@ fn build_config(api_key: String, base_url: String, model_remap: String) -> Gatew
         upstream_retry_max_wait: Duration::from_secs(5),
         advertised_models: vec![],
         upstream_protocol: UpstreamProtocol::OpenAi,
+        acp_config: None,
     }
 }
 

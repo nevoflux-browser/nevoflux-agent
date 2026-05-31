@@ -202,6 +202,94 @@ impl AcpUpstream {
     }
 }
 
+use std::sync::Arc;
+
+use axum::{
+    response::{IntoResponse, Response},
+    Json,
+};
+
+use crate::error::GatewayError;
+
+/// Drive one chat request through the gateway's ACP session.
+///
+/// Lazy-connects the subprocess (guarded by the caller's `Mutex`), opens
+/// a NEW session, sends the flattened prompt, drains the update stream,
+/// and returns an OpenAI completion (non-stream) -- see the streaming
+/// variant for `stream: true`.
+pub async fn do_chat_completions_acp(
+    acp: Arc<tokio::sync::Mutex<AcpUpstream>>,
+    req: OpenAIChatRequest,
+    req_idx: u64,
+    stream: bool,
+) -> Result<Response, GatewayError> {
+    let model = req.model.clone();
+    let prompt = flatten_messages(&req);
+
+    // Lazy connect + new session + prompt, all under the holder lock so
+    // the subprocess spawns exactly once. We collect the receiver while
+    // holding the lock (cheap: prompt() just enqueues a request and
+    // returns the mpsc Receiver), then release before draining.
+    let mut receiver = {
+        let mut guard = acp.lock().await;
+        let provider = guard
+            .ensure_connected()
+            .await
+            .map_err(|detail| GatewayError::UpstreamUnreachable { detail })?;
+        let session =
+            provider
+                .new_session()
+                .await
+                .map_err(|e| GatewayError::UpstreamUnreachable {
+                    detail: format!("ACP new_session failed: {e}"),
+                })?;
+        provider
+            .prompt(session, prompt_content(prompt))
+            .await
+            .map_err(|e| GatewayError::UpstreamUnreachable {
+                detail: format!("ACP prompt failed: {e}"),
+            })?
+    };
+
+    tracing::info!(req_idx, stream, upstream = "acp", "chat_completions -> ACP");
+
+    if stream {
+        return Ok(stream_response(receiver, model, req_idx));
+    }
+
+    // Non-stream: drain all updates, aggregate, build the completion.
+    let mut updates = Vec::new();
+    while let Some(u) = receiver.recv().await {
+        updates.push(u);
+    }
+    match aggregate_updates(updates) {
+        Aggregated::Done {
+            content,
+            finish_reason,
+        } => {
+            tracing::info!(req_idx, "chat_completions ok (non-stream, acp)");
+            Ok(Json(build_completion(model, content, finish_reason)).into_response())
+        }
+        Aggregated::Failed(detail) => Err(GatewayError::UpstreamServerError {
+            upstream_status: 502,
+            upstream_body: detail,
+        }),
+    }
+}
+
+fn stream_response(
+    _receiver: tokio::sync::mpsc::Receiver<AcpUpdate>,
+    _model: String,
+    _req_idx: u64,
+) -> Response {
+    // Replaced in Task 4 with real SSE plumbing.
+    (
+        axum::http::StatusCode::NOT_IMPLEMENTED,
+        "streaming not yet wired",
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +442,27 @@ mod tests {
         assert_eq!(c.choices[0].message.content.as_deref(), Some("answer"));
         assert_eq!(c.choices[0].finish_reason, "stop");
         assert_eq!(c.usage.total_tokens, 0);
+    }
+
+    /// Live round-trip through a real `claude-agent-acp` binary. Ignored
+    /// by default; run on a machine where Claude Code is installed and
+    /// authenticated:
+    ///   cargo test -p nevoflux-llm-gateway acp_live -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires a live, authenticated claude-agent-acp binary"]
+    async fn acp_live_one_shot() {
+        use nevoflux_llm::providers::acp::claude;
+        use std::sync::Arc;
+
+        let mut cfg = claude::build_config(std::env::current_dir().unwrap());
+        cfg.use_mcp_bridge = false;
+        cfg.inject_mcp_url = false;
+        let acp = Arc::new(tokio::sync::Mutex::new(AcpUpstream::new(cfg)));
+
+        let req = req_with(vec![msg("user", "Reply with exactly the word: pong")]);
+        let resp = super::do_chat_completions_acp(acp, req, 1, false)
+            .await
+            .expect("acp completion");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 }
