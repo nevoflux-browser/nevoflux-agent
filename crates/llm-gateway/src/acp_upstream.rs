@@ -162,6 +162,46 @@ pub fn build_completion(
     }
 }
 
+use nevoflux_llm::providers::acp::{AcpProvider, AcpProviderConfig};
+
+/// Gateway-owned ACP holder: a single lazily-connected `AcpProvider`.
+///
+/// Guarded by an outer `tokio::sync::Mutex` in [`crate::handlers::AppState`]
+/// so concurrent first-requests connect exactly once. A failed connect
+/// leaves `provider == None` so the next request retries the spawn
+/// (the Mutex is not poisoned).
+pub struct AcpUpstream {
+    config: AcpProviderConfig,
+    provider: Option<AcpProvider>,
+}
+
+impl AcpUpstream {
+    pub fn new(config: AcpProviderConfig) -> Self {
+        Self {
+            config,
+            provider: None,
+        }
+    }
+
+    /// Ensure the subprocess is connected, spawning it on first use.
+    /// Returns a shared reference to the live provider.
+    pub async fn ensure_connected(&mut self) -> Result<&AcpProvider, String> {
+        let needs_connect = match &self.provider {
+            None => true,
+            Some(p) => !p.is_alive(),
+        };
+        if needs_connect {
+            let mut provider = AcpProvider::new(self.config.clone());
+            provider
+                .connect()
+                .await
+                .map_err(|e| format!("ACP connect failed: {e}"))?;
+            self.provider = Some(provider);
+        }
+        Ok(self.provider.as_ref().expect("provider set above"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

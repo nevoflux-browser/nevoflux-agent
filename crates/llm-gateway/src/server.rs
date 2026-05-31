@@ -11,6 +11,7 @@ use tokio::{net::TcpListener, task::JoinHandle};
 
 use crate::handlers::{self, AppState};
 use crate::protocol::UpstreamProtocol;
+use nevoflux_llm::providers::acp::AcpProviderConfig;
 
 /// Default upstream base URL — canonical Anthropic API.
 pub const DEFAULT_UPSTREAM_BASE: &str = "https://api.anthropic.com";
@@ -94,6 +95,11 @@ pub struct GatewayConfig {
     /// an OpenAI-compatible upstream. Defaults to
     /// [`UpstreamProtocol::Anthropic`] for back-compat.
     pub upstream_protocol: UpstreamProtocol,
+    /// ACP agent config used when `upstream_protocol == Acp`. `None` for
+    /// every other protocol. Supplied by the daemon (built from
+    /// `nevoflux_llm::providers::acp::claude::build_config`). The gateway
+    /// lazily spawns this subprocess on the first `Acp` chat request.
+    pub acp_config: Option<AcpProviderConfig>,
 }
 
 impl GatewayConfig {
@@ -184,6 +190,7 @@ impl GatewayConfig {
             upstream_retry_max_wait,
             advertised_models,
             upstream_protocol,
+            acp_config: None,
         })
     }
 
@@ -207,6 +214,7 @@ impl GatewayConfig {
             upstream_retry_max_wait: DEFAULT_UPSTREAM_RETRY_MAX_WAIT,
             advertised_models: Vec::new(),
             upstream_protocol: UpstreamProtocol::Anthropic,
+            acp_config: None,
         }
     }
 }

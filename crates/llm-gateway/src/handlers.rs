@@ -32,6 +32,7 @@ use std::{
 #[cfg(feature = "embedding")]
 use tokio::sync::OnceCell;
 
+use crate::acp_upstream::AcpUpstream;
 #[cfg(feature = "embedding")]
 use crate::embedding_dim::{zero_pad_to_gateway_dim, GATEWAY_OUTPUT_DIM};
 use crate::error::{GatewayError, TimeoutPhase};
@@ -82,6 +83,10 @@ pub(crate) struct AppState {
     /// inside `chat_completions` to pick between the Anthropic translator
     /// path and the OpenAI passthrough path.
     pub(crate) upstream_protocol: UpstreamProtocol,
+    /// Lazy ACP holder, present only when `upstream_protocol == Acp`.
+    /// The outer `Mutex` serializes the lazy connect so the subprocess
+    /// is spawned exactly once across concurrent first-requests.
+    pub(crate) acp: Option<Arc<tokio::sync::Mutex<AcpUpstream>>>,
 }
 
 impl AppState {
@@ -109,6 +114,11 @@ impl AppState {
             .connect_timeout(config.upstream_connect_timeout)
             .build()?;
 
+        let acp = config
+            .acp_config
+            .clone()
+            .map(|cfg| Arc::new(tokio::sync::Mutex::new(AcpUpstream::new(cfg))));
+
         Ok(Self {
             bearer_token: config.bearer_token,
             chat_request_count: AtomicU64::new(0),
@@ -124,6 +134,7 @@ impl AppState {
             embedder: OnceCell::new(),
             advertised_models: config.advertised_models,
             upstream_protocol: config.upstream_protocol,
+            acp,
         })
     }
 

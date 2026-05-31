@@ -35,3 +35,5 @@ pub use server::{
 
 #[cfg(any(test, feature = "test-util"))]
 pub use server::serve_test_router;
+
+pub use nevoflux_llm::providers::acp::AcpProviderConfig;
