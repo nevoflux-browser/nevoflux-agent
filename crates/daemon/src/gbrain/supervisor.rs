@@ -229,6 +229,14 @@ impl GbrainSupervisor {
         self.state.read().await.clone()
     }
 
+    /// The brain repository directory this supervisor was configured with.
+    /// The KB page index walks `<brain_dir>/atlas` to build its complete
+    /// page list (gbrain `list_pages` caps at 100, so the daemon enumerates
+    /// the on-disk source of truth itself).
+    pub fn brain_dir(&self) -> &std::path::Path {
+        &self.config.brain_dir
+    }
+
     /// Subscribe to state transitions. The returned receiver is
     /// guaranteed to observe at least the next state change after the
     /// call.
@@ -287,11 +295,7 @@ impl GbrainSupervisor {
     }
 
     /// MCP `tools/call` convenience wrapper.
-    pub async fn call_tool(
-        &self,
-        name: &str,
-        arguments: Value,
-    ) -> SupervisorResult<Value> {
+    pub async fn call_tool(&self, name: &str, arguments: Value) -> SupervisorResult<Value> {
         let params = serde_json::json!({"name": name, "arguments": arguments});
         self.request("tools/call", params).await
     }
@@ -364,19 +368,12 @@ async fn run_supervisor_loop(
                 window = ?config.restart_window,
                 "gbrain restart budget exceeded; giving up"
             );
-            set_state(
-                &state,
-                &state_tx,
-                SupervisorState::Failed { reason },
-            )
-            .await;
+            set_state(&state, &state_tx, SupervisorState::Failed { reason }).await;
             return;
         }
 
         set_state(&state, &state_tx, SupervisorState::Starting).await;
-        match spawn_and_supervise(&config, &client, &state, &state_tx, &mut shutdown_rx)
-            .await
-        {
+        match spawn_and_supervise(&config, &client, &state, &state_tx, &mut shutdown_rx).await {
             Ok(ChildExit::Graceful) => {
                 info!("gbrain serve exited cleanly; supervisor returning");
                 set_state(&state, &state_tx, SupervisorState::Shutdown).await;
@@ -727,9 +724,7 @@ mod tests {
         // Right after spawn, before any child is ready, request() must
         // return NotRunning.
         let supervisor = GbrainSupervisor::spawn(fast_failing_config()).await;
-        let result = supervisor
-            .request("ping", serde_json::json!({}))
-            .await;
+        let result = supervisor.request("ping", serde_json::json!({})).await;
         match result {
             Err(SupervisorError::NotRunning { .. }) => {}
             other => panic!("expected NotRunning, got {other:?}"),
@@ -792,7 +787,10 @@ mod tests {
         let lock = pglite.join("postmaster.pid");
         std::fs::write(&lock, "-42\n/pglite/data\n").unwrap();
         clean_stale_pglite_lock(dir.path());
-        assert!(!lock.exists(), "negative-pid (PGLite fake) lock should be removed");
+        assert!(
+            !lock.exists(),
+            "negative-pid (PGLite fake) lock should be removed"
+        );
     }
 
     #[test]
@@ -817,7 +815,10 @@ mod tests {
         let me = std::process::id();
         std::fs::write(&lock, format!("{me}\n/pglite/data\n")).unwrap();
         clean_stale_pglite_lock(dir.path());
-        assert!(lock.exists(), "lock held by a live process must NOT be removed");
+        assert!(
+            lock.exists(),
+            "lock held by a live process must NOT be removed"
+        );
     }
 
     #[test]

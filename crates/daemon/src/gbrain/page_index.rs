@@ -16,10 +16,11 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
 use nevoflux_brain::PageMeta;
+use tokio::sync::Mutex as AsyncMutex;
 
 use super::supervisor::McpToolCaller;
 
@@ -345,6 +346,93 @@ pub async fn build_page_set(atlas_dir: &Path, transport: &Arc<dyn McpToolCaller>
     let walked = walk_atlas(atlas_dir);
     let extra = list_pages_crosscheck(transport).await;
     union_by_slug(walked, extra)
+}
+
+/// Default cache TTL. Short enough that a save shows up almost immediately,
+/// long enough to absorb rapid list/preview/back navigation without
+/// re-walking a large atlas each time.
+pub const CACHE_TTL: Duration = Duration::from_secs(15);
+
+struct CacheEntry {
+    atlas_dir: PathBuf,
+    built_at: Instant,
+    pages: Vec<PageMeta>,
+}
+
+/// A short-TTL cache over [`build_page_set`], keyed by atlas dir. Held by the
+/// RPC layer (one per process, behind an `Arc`). [`Self::invalidate`] is
+/// called after writes (`brain.put` / `save_webpage` / `save_conversation` /
+/// sync) so a freshly-saved page appears without waiting out the TTL.
+pub struct PageIndex {
+    inner: AsyncMutex<Option<CacheEntry>>,
+    ttl: Duration,
+}
+
+impl Default for PageIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PageIndex {
+    pub fn new() -> Self {
+        Self {
+            inner: AsyncMutex::new(None),
+            ttl: CACHE_TTL,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            inner: AsyncMutex::new(None),
+            ttl,
+        }
+    }
+
+    /// Drop any cached set so the next query rebuilds. Cheap; call after any
+    /// mutating brain RPC.
+    pub async fn invalidate(&self) {
+        *self.inner.lock().await = None;
+    }
+
+    /// Return the complete page set, rebuilding from disk + gbrain if the
+    /// cache is empty, stale (older than the TTL), or built for a different
+    /// atlas dir. Clones the cached Vec for the caller (the slice is small
+    /// relative to the walk cost).
+    pub async fn page_set(
+        &self,
+        atlas_dir: &Path,
+        transport: &Arc<dyn McpToolCaller>,
+    ) -> Vec<PageMeta> {
+        let mut guard = self.inner.lock().await;
+        let fresh = match guard.as_ref() {
+            Some(e) => e.atlas_dir == atlas_dir && e.built_at.elapsed() < self.ttl,
+            None => false,
+        };
+        if fresh {
+            return guard.as_ref().unwrap().pages.clone();
+        }
+        let pages = build_page_set(atlas_dir, transport).await;
+        *guard = Some(CacheEntry {
+            atlas_dir: atlas_dir.to_path_buf(),
+            built_at: Instant::now(),
+            pages: pages.clone(),
+        });
+        pages
+    }
+
+    /// Convenience: build/get the set then run the filter/sort/paginate
+    /// pipeline. This is the single entry point the RPC handler calls.
+    pub async fn query(
+        &self,
+        atlas_dir: &Path,
+        transport: &Arc<dyn McpToolCaller>,
+        query: &ListQuery,
+    ) -> ListSlice {
+        let all = self.page_set(atlas_dir, transport).await;
+        query_pages(all, query)
+    }
 }
 
 #[cfg(test)]
@@ -785,5 +873,49 @@ mod tests {
             "walk (disk) entry wins on slug conflict"
         );
         assert!(pages.iter().any(|p| p.slug == "db/recent"));
+    }
+
+    // ── TTL cache (Task 2) ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cache_serves_then_rebuilds_after_invalidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let atlas = tmp.path().join("atlas");
+        fs::create_dir_all(&atlas).unwrap();
+        fs::write(atlas.join("one.md"), "# One").unwrap();
+
+        // list_pages returns empty so the set == the walk.
+        let transport =
+            StubToolCaller::ok(vec![("list_pages", list_envelope(serde_json::json!([])))]);
+        let index = PageIndex::new();
+
+        let first = index.page_set(&atlas, &transport).await;
+        assert_eq!(first.len(), 1);
+
+        // Add a file on disk; cache still serves the stale (1-entry) set.
+        fs::write(atlas.join("two.md"), "# Two").unwrap();
+        let cached = index.page_set(&atlas, &transport).await;
+        assert_eq!(cached.len(), 1, "within TTL the cache serves the stale set");
+
+        // After invalidate the next call rebuilds and sees both.
+        index.invalidate().await;
+        let rebuilt = index.page_set(&atlas, &transport).await;
+        assert_eq!(rebuilt.len(), 2, "invalidate forces a rebuild");
+    }
+
+    #[tokio::test]
+    async fn cache_rebuilds_after_ttl_expiry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let atlas = tmp.path().join("atlas");
+        fs::create_dir_all(&atlas).unwrap();
+        fs::write(atlas.join("one.md"), "# One").unwrap();
+        let transport =
+            StubToolCaller::ok(vec![("list_pages", list_envelope(serde_json::json!([])))]);
+        let index = PageIndex::with_ttl(Duration::from_millis(0)); // everything is instantly stale
+
+        let _ = index.page_set(&atlas, &transport).await;
+        fs::write(atlas.join("two.md"), "# Two").unwrap();
+        let rebuilt = index.page_set(&atlas, &transport).await;
+        assert_eq!(rebuilt.len(), 2, "expired TTL forces a rebuild");
     }
 }

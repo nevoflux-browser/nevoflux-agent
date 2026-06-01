@@ -29,7 +29,7 @@ pub mod supervisor;
 pub use config::GbrainConfig;
 pub use engine::GbrainEngine;
 pub use mcp_client::{McpClient, McpError, McpResult};
-pub use page_index::{ListQuery, ListSlice, SortOrder};
+pub use page_index::{ListQuery, ListSlice, PageIndex, SortOrder};
 pub use supervisor::{
     GbrainSupervisor, McpToolCaller, SupervisorError, SupervisorResult, SupervisorState,
 };
