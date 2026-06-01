@@ -1382,7 +1382,7 @@ impl Default for KnowledgeBaseConfig {
 /// bun_path = ""                  # empty = which::which("bun")
 /// gbrain_cli_path = ""           # empty = ~/.nevoflux/brain-tool/node_modules/gbrain/src/cli.ts
 /// brain_dir = ""                 # empty = ~/.gbrain (gbrain default)
-/// initialize_timeout_secs = 0    # 0 = 10s default
+/// initialize_timeout_secs = 0    # 0 = 120s default (gbrain startup on a large brain is slow)
 /// request_timeout_secs = 0       # 0 = 30s
 /// max_restarts_within_window = 0 # 0 = 3
 /// restart_window_secs = 0        # 0 = 60s

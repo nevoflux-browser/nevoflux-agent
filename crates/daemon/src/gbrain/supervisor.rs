@@ -248,6 +248,23 @@ impl GbrainSupervisor {
     /// client. Returns [`SupervisorError::NotRunning`] if the
     /// supervisor isn't in [`SupervisorState::Running`] right now.
     pub async fn request(&self, method: &str, params: Value) -> SupervisorResult<Value> {
+        self.request_with_timeout(method, params, self.config.request_timeout)
+            .await
+    }
+
+    /// Like [`Self::request`] but with an explicit per-call timeout. Used by
+    /// [`Self::initialize`], whose handshake can be slow — gbrain's bun cold
+    /// start plus opening PGLite on a large brain easily exceeds the normal
+    /// `request_timeout`, so the handshake uses the generous
+    /// `initialize_timeout` instead (previously it incorrectly shared
+    /// `request_timeout`, causing `initialize ... timed out after 30s` on
+    /// large brains).
+    async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> SupervisorResult<Value> {
         let client_guard = self.client.read().await;
         let client = match client_guard.as_ref() {
             Some(c) => c,
@@ -257,9 +274,7 @@ impl GbrainSupervisor {
                 });
             }
         };
-        let resp = client
-            .request(method, params, self.config.request_timeout)
-            .await?;
+        let resp = client.request(method, params, timeout).await?;
         Ok(resp)
     }
 
@@ -275,7 +290,9 @@ impl GbrainSupervisor {
                 "version": env!("CARGO_PKG_VERSION"),
             },
         });
-        let resp = self.request("initialize", init_params).await?;
+        let resp = self
+            .request_with_timeout("initialize", init_params, self.config.initialize_timeout)
+            .await?;
         // Best-effort notification ping; MCP spec recommends sending
         // `notifications/initialized` after a successful `initialize`.
         // gbrain 0.40.8.1 didn't require it in the spike but it's

@@ -87,7 +87,7 @@ impl GbrainConfig {
             brain_dir: PathBuf::from("/nonexistent/brain"),
             upstream_base_url: "http://127.0.0.1:1".into(),
             upstream_api_key: "test-key".into(),
-            initialize_timeout: Duration::from_secs(10),
+            initialize_timeout: Duration::from_secs(120),
             request_timeout: Duration::from_secs(30),
             max_restarts_within_window: 3,
             restart_window: Duration::from_secs(60),

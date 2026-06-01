@@ -217,7 +217,12 @@ pub async fn init_brain(
         brain_dir,
         upstream_base_url: gw.url.clone(),
         upstream_api_key: gw.bearer_token.clone(),
-        initialize_timeout: dur_secs_or(10, cfg.initialize_timeout_secs),
+        // gbrain's bun cold start + PGLite open grows with brain size; a
+        // large brain (hundreds of pages) can take well over 30s to answer
+        // the MCP `initialize` handshake. Default generously (120s) so the
+        // daemon doesn't give up and run "without brain"; override via
+        // `knowledge_base.brain.initialize_timeout_secs`.
+        initialize_timeout: dur_secs_or(120, cfg.initialize_timeout_secs),
         request_timeout: dur_secs_or(30, cfg.request_timeout_secs),
         max_restarts_within_window: if cfg.max_restarts_within_window > 0 {
             cfg.max_restarts_within_window
