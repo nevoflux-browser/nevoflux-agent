@@ -172,15 +172,13 @@ impl Default for WizardState {
 }
 
 /// Process-global wizard state, set once at daemon startup.
-pub static CURRENT_WIZARD_STATE: std::sync::OnceLock<Arc<WizardState>> =
-    std::sync::OnceLock::new();
+pub static CURRENT_WIZARD_STATE: std::sync::OnceLock<Arc<WizardState>> = std::sync::OnceLock::new();
 
 /// Process-global EventBus handle, set once at daemon startup by
 /// `server.rs`. The wizard publishes progress frames through this; if
 /// it is unset (e.g., in unit tests that don't boot the full daemon),
 /// progress emission falls back to a tracing log line.
-pub static CURRENT_EVENT_BUS: std::sync::OnceLock<Arc<EventBus>> =
-    std::sync::OnceLock::new();
+pub static CURRENT_EVENT_BUS: std::sync::OnceLock<Arc<EventBus>> = std::sync::OnceLock::new();
 
 /// Process-global gateway snapshot, set once at daemon startup by
 /// `server.rs` (or never, if `knowledge_base.enabled = false`). The
@@ -353,11 +351,9 @@ pub fn current_wizard_state() -> Arc<WizardState> {
 /// Matches the location used by `bun.sh/install.{ps1,sh}`.
 fn default_bun_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| {
-        h.join(".bun").join("bin").join(if cfg!(windows) {
-            "bun.exe"
-        } else {
-            "bun"
-        })
+        h.join(".bun")
+            .join("bin")
+            .join(if cfg!(windows) { "bun.exe" } else { "bun" })
     })
 }
 
@@ -568,11 +564,7 @@ where
 
     let install_cmd: Command = if cfg!(windows) {
         let mut c = Command::new("powershell");
-        c.args([
-            "-NoProfile",
-            "-Command",
-            "irm bun.sh/install.ps1 | iex",
-        ]);
+        c.args(["-NoProfile", "-Command", "irm bun.sh/install.ps1 | iex"]);
         c
     } else {
         let mut c = Command::new("sh");
@@ -633,8 +625,7 @@ where
         .ok_or_else(|| "no home dir".to_string())?
         .join(".nevoflux")
         .join("brain-tool");
-    std::fs::create_dir_all(&install_dir)
-        .map_err(|e| format!("mkdir brain-tool failed: {e}"))?;
+    std::fs::create_dir_all(&install_dir).map_err(|e| format!("mkdir brain-tool failed: {e}"))?;
 
     // 1. bun init -y  (creates package.json so `bun add` has somewhere
     //    to record the dependency)
@@ -646,9 +637,7 @@ where
 
     // 2. bun add github:garrytan/gbrain#<pinned>
     let mut add_cmd = Command::new(bun_path);
-    add_cmd
-        .args(["add", GBRAIN_PIN])
-        .current_dir(&install_dir);
+    add_cmd.args(["add", GBRAIN_PIN]).current_dir(&install_dir);
     run_with_progress(add_cmd, WizardStep::InstallGbrain, emit)
         .await
         .map_err(|e| format!("bun add gbrain failed: {e}"))?;
@@ -659,10 +648,7 @@ where
         .join("src")
         .join("cli.ts");
     if !cli_path.exists() {
-        let msg = format!(
-            "gbrain cli.ts not at expected path: {}",
-            cli_path.display()
-        );
+        let msg = format!("gbrain cli.ts not at expected path: {}", cli_path.display());
         emit(WizardProgress {
             step: WizardStep::InstallGbrain,
             status: WizardStatus::Failed,
@@ -720,8 +706,7 @@ where
         log: "gbrain init --pglite (one-time setup)".into(),
     });
 
-    std::fs::create_dir_all(brain_dir)
-        .map_err(|e| format!("mkdir brain_dir failed: {e}"))?;
+    std::fs::create_dir_all(brain_dir).map_err(|e| format!("mkdir brain_dir failed: {e}"))?;
 
     // `gateway_url` is the bare gateway bind address (`http://127.0.0.1:<port>`,
     // no path). gbrain's OpenAI-protocol SDKs treat the base URL as already
@@ -755,10 +740,7 @@ where
 
     let pglite = brain_dir.join("brain.pglite");
     if !pglite.exists() {
-        let msg = format!(
-            "brain.pglite not at expected path: {}",
-            pglite.display()
-        );
+        let msg = format!("brain.pglite not at expected path: {}", pglite.display());
         emit(WizardProgress {
             step: WizardStep::InitBrain,
             status: WizardStatus::Failed,
@@ -772,7 +754,7 @@ where
     // `*` .gitignore (hides even `atlas/`) and zero commits. sync_brain needs
     // a content whitelist + a HEAD to diff against, or it fails with
     // "No commits in repo" / silently imports nothing. Make it sync-ready.
-    make_brain_repo_sync_ready(brain_dir, emit).await;
+    make_brain_repo_sync_ready(bun_path, cli_path, brain_dir, emit).await;
 
     emit(WizardProgress {
         step: WizardStep::InitBrain,
@@ -785,7 +767,11 @@ where
 
 /// Run a `git` subcommand in `dir`, capturing output.
 async fn git_in(dir: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    Command::new("git").current_dir(dir).args(args).output().await
+    Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .await
 }
 
 /// Leave a freshly `gbrain init`-ed repo in a state `sync_brain` can run
@@ -798,7 +784,7 @@ async fn git_in(dir: &Path, args: &[&str]) -> std::io::Result<std::process::Outp
 ///
 /// Best-effort: failures are logged, not fatal, since `brain.pglite` already
 /// exists and the user can repair git manually.
-async fn make_brain_repo_sync_ready<F>(brain_dir: &Path, emit: &F)
+async fn make_brain_repo_sync_ready<F>(bun_path: &Path, cli_path: &Path, brain_dir: &Path, emit: &F)
 where
     F: Fn(WizardProgress) + Send + Sync,
 {
@@ -830,30 +816,122 @@ where
         .await
         .map(|o| o.status.success())
         .unwrap_or(false);
-    if has_head {
+    if !has_head {
+        let _ = git_in(brain_dir, &["add", "-A"]).await;
+        match git_in(
+            brain_dir,
+            &[
+                "-c",
+                "user.email=brain@nevoflux.local",
+                "-c",
+                "user.name=NevoFlux Brain",
+                "commit",
+                "-m",
+                "chore: initialize brain repo (sync baseline)",
+            ],
+        )
+        .await
+        {
+            Ok(o) if o.status.success() => log("brain git repo committed (sync-ready)".into()),
+            Ok(o) => log(format!(
+                "warn: brain baseline commit skipped: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            )),
+            Err(e) => log(format!(
+                "warn: brain baseline commit failed (git missing?): {e}"
+            )),
+        }
+    }
+
+    // Ensure write-through lands files on disk so the KB page index sees them.
+    ensure_repo_path(bun_path, cli_path, brain_dir, emit).await;
+}
+
+/// Build the argv for a gbrain CLI `config` subcommand:
+/// `["run", "<cli.ts>", "config", <action>, <key>, <value?>...]`.
+/// Pure + unit-testable (no subprocess). `value` is appended only when Some.
+fn gbrain_config_args<'a>(
+    cli_path: &'a str,
+    action: &'a str,
+    key: &'a str,
+    value: Option<&'a str>,
+) -> Vec<String> {
+    let mut args = vec![
+        "run".to_string(),
+        cli_path.to_string(),
+        "config".to_string(),
+        action.to_string(),
+        key.to_string(),
+    ];
+    if let Some(v) = value {
+        args.push(v.to_string());
+    }
+    args
+}
+
+/// Ensure gbrain's `sync.repo_path` config key points at `brain_dir` so
+/// put_page write-through always persists markdown to disk (operations.ts:712;
+/// without it, pages are DB-only and the KB list's atlas walk misses them).
+///
+/// `config` is a CLI-only command (no MCP tool), so this shells out to
+/// `bun run <cli.ts> config get/set sync.repo_path`. Best-effort: every
+/// failure is logged via `emit` and swallowed — the brain still works, write-
+/// through just may not be active until the user sets it manually.
+async fn ensure_repo_path<F>(bun_path: &Path, cli_path: &Path, brain_dir: &Path, emit: &F)
+where
+    F: Fn(WizardProgress) + Send + Sync,
+{
+    let log = |msg: String| {
+        emit(WizardProgress {
+            step: WizardStep::InitBrain,
+            status: WizardStatus::Running,
+            progress_pct: 97,
+            log: msg,
+        });
+    };
+    let cli = cli_path.to_string_lossy();
+    let dir = brain_dir.to_string_lossy();
+
+    // GET: prints the value on stdout (exit 0) or exits 1 + stderr when unset.
+    let get_args = gbrain_config_args(&cli, "get", "sync.repo_path", None);
+    let get_out = Command::new(bun_path)
+        .args(&get_args)
+        .current_dir(brain_dir)
+        .env("GBRAIN_BRAIN_DIR", brain_dir)
+        .output()
+        .await;
+    let already_set = match &get_out {
+        Ok(o) if o.status.success() => {
+            let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            !v.is_empty()
+        }
+        _ => false, // exit 1 (not found) / spawn error -> treat as unset
+    };
+    if already_set {
+        log("sync.repo_path already configured; write-through active".into());
         return;
     }
-    let _ = git_in(brain_dir, &["add", "-A"]).await;
-    match git_in(
-        brain_dir,
-        &[
-            "-c",
-            "user.email=brain@nevoflux.local",
-            "-c",
-            "user.name=NevoFlux Brain",
-            "commit",
-            "-m",
-            "chore: initialize brain repo (sync baseline)",
-        ],
-    )
-    .await
+
+    // SET sync.repo_path = <brain_dir>. sync.repo_path is a KNOWN_CONFIG_KEY,
+    // so no --force needed.
+    let set_args = gbrain_config_args(&cli, "set", "sync.repo_path", Some(&dir));
+    match Command::new(bun_path)
+        .args(&set_args)
+        .current_dir(brain_dir)
+        .env("GBRAIN_BRAIN_DIR", brain_dir)
+        .output()
+        .await
     {
-        Ok(o) if o.status.success() => log("brain git repo committed (sync-ready)".into()),
+        Ok(o) if o.status.success() => log(format!(
+            "set sync.repo_path = {dir} (write-through enabled)"
+        )),
         Ok(o) => log(format!(
-            "warn: brain baseline commit skipped: {}",
+            "warn: could not set sync.repo_path: {}",
             String::from_utf8_lossy(&o.stderr).trim()
         )),
-        Err(e) => log(format!("warn: brain baseline commit failed (git missing?): {e}")),
+        Err(e) => log(format!(
+            "warn: gbrain config set failed (bun missing?): {e}"
+        )),
     }
 }
 
@@ -1188,7 +1266,7 @@ pub async fn handle_cancel(params: &serde_json::Value) -> serde_json::Value {
         // progress spinner without waiting for the next probe.
         if let Some(bus) = CURRENT_EVENT_BUS.get() {
             let frame = WizardProgress {
-                step: WizardStep::InstallBun, // step name is informational; UI
+                step: WizardStep::InstallBun,    // step name is informational; UI
                 status: WizardStatus::Cancelled, // can reset all step states.
                 progress_pct: 0,
                 log: "wizard step cancelled".into(),
@@ -1217,11 +1295,15 @@ mod tests {
         let tmp = tempdir().unwrap();
         let dir = tmp.path();
 
-        make_brain_repo_sync_ready(dir, &|_p: WizardProgress| {}).await;
+        let nonexistent = std::path::Path::new("/nonexistent/bun");
+        make_brain_repo_sync_ready(nonexistent, nonexistent, dir, &|_p: WizardProgress| {}).await;
 
         // 1. .gitignore whitelists atlas/ + journal/ (not gbrain's bare `*`).
         let gi = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
-        assert!(gi.starts_with("*"), "must keep the catch-all ignore: {gi:?}");
+        assert!(
+            gi.starts_with("*"),
+            "must keep the catch-all ignore: {gi:?}"
+        );
         assert!(gi.contains("!atlas/"), "must whitelist atlas/: {gi:?}");
         assert!(gi.contains("!journal/"), "must whitelist journal/: {gi:?}");
 
@@ -1246,7 +1328,8 @@ mod tests {
     async fn sync_ready_is_idempotent_and_keeps_existing_head() {
         let tmp = tempdir().unwrap();
         let dir = tmp.path();
-        make_brain_repo_sync_ready(dir, &|_p: WizardProgress| {}).await;
+        let nonexistent = std::path::Path::new("/nonexistent/bun");
+        make_brain_repo_sync_ready(nonexistent, nonexistent, dir, &|_p: WizardProgress| {}).await;
         let head_of = |d: &std::path::Path| {
             let o = std::process::Command::new("git")
                 .current_dir(d)
@@ -1257,8 +1340,42 @@ mod tests {
         };
         let first = head_of(dir);
         // Second run must not fail and must not add a new baseline commit.
-        make_brain_repo_sync_ready(dir, &|_p: WizardProgress| {}).await;
+        make_brain_repo_sync_ready(nonexistent, nonexistent, dir, &|_p: WizardProgress| {}).await;
         assert_eq!(first, head_of(dir), "re-run must keep the same HEAD");
+    }
+
+    #[test]
+    fn gbrain_config_args_get_and_set() {
+        assert_eq!(
+            gbrain_config_args("/c/cli.ts", "get", "sync.repo_path", None),
+            vec!["run", "/c/cli.ts", "config", "get", "sync.repo_path"]
+        );
+        assert_eq!(
+            gbrain_config_args("/c/cli.ts", "set", "sync.repo_path", Some("/home/.gbrain")),
+            vec![
+                "run",
+                "/c/cli.ts",
+                "config",
+                "set",
+                "sync.repo_path",
+                "/home/.gbrain"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_repo_path_is_nonfatal_when_bun_missing() {
+        // Spawn failure (bun path nonexistent) must NOT panic; emits a warn frame.
+        let tmp = tempdir().unwrap();
+        let nonexistent = std::path::Path::new("/nonexistent/bun");
+        ensure_repo_path(
+            nonexistent,
+            nonexistent,
+            tmp.path(),
+            &|_p: WizardProgress| {},
+        )
+        .await;
+        // No assertion beyond "did not panic" — best-effort contract.
     }
 
     #[tokio::test]
@@ -1332,8 +1449,7 @@ mod tests {
     async fn run_with_progress_streams_output() {
         // `echo hello` should succeed on both Windows (cmd /c) and Unix
         // (sh -c) and emit at least one frame containing 'hello'.
-        let frames: Arc<StdMutex<Vec<WizardProgress>>> =
-            Arc::new(StdMutex::new(Vec::new()));
+        let frames: Arc<StdMutex<Vec<WizardProgress>>> = Arc::new(StdMutex::new(Vec::new()));
         let frames_clone = frames.clone();
         let emit = move |p: WizardProgress| {
             frames_clone.lock().unwrap().push(p);
@@ -1365,8 +1481,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_with_progress_returns_err_on_nonzero_exit() {
-        let frames: Arc<StdMutex<Vec<WizardProgress>>> =
-            Arc::new(StdMutex::new(Vec::new()));
+        let frames: Arc<StdMutex<Vec<WizardProgress>>> = Arc::new(StdMutex::new(Vec::new()));
         let frames_clone = frames.clone();
         let emit = move |p: WizardProgress| {
             frames_clone.lock().unwrap().push(p);
@@ -1442,7 +1557,9 @@ mod tests {
     async fn persist_brain_enabled_preserves_existing_content() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nevoflux").join("config.toml");
-        tokio::fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
         let existing = "\
 # user comment about daemon
 [daemon]
