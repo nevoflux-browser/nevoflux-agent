@@ -9385,7 +9385,37 @@ const BUILTIN_TOOLS: &[&str] = &[
     "computer_type",
     "computer_key",
     "computer_scroll",
+    // Dynamic tool-discovery pair (added to every agent mode's tool set in
+    // builtin-wasm get_chat/browser/agent_tools). They MUST be listed here so
+    // the skill tool-availability gate (gather_available_tools →
+    // check_tool_availability) recognizes skills that declare them in
+    // `allowed_tools` (e.g. the `brain` skill). Omitting them made `/brain`
+    // fail with "requires unavailable tools: [tool_search, tool_call_dynamic]".
+    "tool_search",
+    "tool_call_dynamic",
 ];
+
+#[cfg(test)]
+mod builtin_tools_gate_tests {
+    use super::BUILTIN_TOOLS;
+
+    /// Regression: the `brain` skill declares `tool_search` +
+    /// `tool_call_dynamic` in `allowed_tools`; the skill-availability gate
+    /// (`gather_available_tools` → `check_tool_availability`) checks against
+    /// `BUILTIN_TOOLS`. When these were missing, `/brain` failed with
+    /// "requires unavailable tools: [tool_search, tool_call_dynamic]".
+    #[test]
+    fn builtin_tools_include_dynamic_discovery_pair() {
+        assert!(
+            BUILTIN_TOOLS.contains(&"tool_search"),
+            "tool_search must be in BUILTIN_TOOLS for the skill gate"
+        );
+        assert!(
+            BUILTIN_TOOLS.contains(&"tool_call_dynamic"),
+            "tool_call_dynamic must be in BUILTIN_TOOLS for the skill gate"
+        );
+    }
+}
 
 /// Gather all available tools from MCP servers and built-in tools.
 ///
