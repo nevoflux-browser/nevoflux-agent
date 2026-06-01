@@ -6405,6 +6405,8 @@ async fn handle_chat_message(
                     crate::kb_wizard::handle_install_gbrain(&params).await
                 }
                 "kb.wizard.init_brain" => crate::kb_wizard::handle_init_brain(&params).await,
+                "kb.wizard.restart" => crate::kb_wizard::handle_restart(&params).await,
+                "kb.wizard.update_gbrain" => crate::kb_wizard::handle_update_gbrain(&params).await,
                 "kb.wizard.cancel" => crate::kb_wizard::handle_cancel(&params).await,
                 // Browser-facing brain RPCs (M4-4a). The future
                 // `nevoflux://brain` page and the settings page call

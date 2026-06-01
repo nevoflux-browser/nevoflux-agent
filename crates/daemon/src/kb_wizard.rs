@@ -49,6 +49,45 @@ pub const PROGRESS_TOPIC: &str = "system:kb-wizard:progress";
 /// Gbrain pin captured by spike S0 (semver 0.40.8.1).
 pub const GBRAIN_PIN: &str = "github:garrytan/gbrain#af5ee1e";
 
+/// Validate a user-supplied gbrain ref/spec against a strict allowlist.
+/// Mirrors `^[A-Za-z0-9._/#:-]+$` — rejects spaces, `;`, `&`, `$`,
+/// backticks, and anything else that could be abused if the value ever
+/// reached a shell. (We pass it to `bun add` as a separate arg, so this
+/// is defence-in-depth, not the only barrier.)
+fn validate_gbrain_ref(r: &str) -> Result<(), String> {
+    if r.is_empty() {
+        return Err("ref must not be empty".to_string());
+    }
+    let ok = r
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '#' | ':' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "ref contains disallowed characters (allowed: A-Z a-z 0-9 . _ / # : -): {r}"
+        ))
+    }
+}
+
+/// Resolve the `bun add` package spec from an optional user ref.
+/// - `None` -> the pinned [`GBRAIN_PIN`] (reinstall current version).
+/// - `Some("github:…")` -> used verbatim (after validation).
+/// - `Some(bare)` -> `github:garrytan/gbrain#<bare>`.
+fn resolve_gbrain_spec(user_ref: Option<&str>) -> Result<String, String> {
+    match user_ref {
+        None => Ok(GBRAIN_PIN.to_string()),
+        Some(r) => {
+            validate_gbrain_ref(r)?;
+            if r.starts_with("github:") {
+                Ok(r.to_string())
+            } else {
+                Ok(format!("github:garrytan/gbrain#{r}"))
+            }
+        }
+    }
+}
+
 /// Frame published on the [`PROGRESS_TOPIC`] EventBus channel.
 #[derive(Debug, Clone, Serialize)]
 pub struct WizardProgress {
@@ -737,6 +776,53 @@ where
     Ok(cli_path)
 }
 
+/// Update (or reinstall) the gbrain package via `bun add <spec>` inside
+/// the existing brain-tool directory. Streams `bun` output as
+/// [`WizardProgress`] frames under [`WizardStep::UpdateGbrain`].
+///
+/// Unlike [`install_gbrain`] this does NOT run `bun init` — the dir must
+/// already be initialised (gbrain installed at least once).
+pub async fn update_gbrain<F>(bun_path: &Path, spec: &str, emit: &F) -> Result<(), String>
+where
+    F: Fn(WizardProgress) + Send + Sync,
+{
+    let install_dir = dirs::home_dir()
+        .ok_or_else(|| "no home dir".to_string())?
+        .join(".nevoflux")
+        .join("brain-tool");
+    update_gbrain_in(&install_dir, bun_path, spec, emit).await
+}
+
+/// Inner form with an explicit install dir, for testability.
+async fn update_gbrain_in<F>(
+    install_dir: &Path,
+    bun_path: &Path,
+    spec: &str,
+    emit: &F,
+) -> Result<(), String>
+where
+    F: Fn(WizardProgress) + Send + Sync,
+{
+    if !install_dir.exists() {
+        return Err(format!(
+            "brain-tool dir not found at {}; install gbrain first",
+            install_dir.display()
+        ));
+    }
+    emit(WizardProgress {
+        step: WizardStep::UpdateGbrain,
+        status: WizardStatus::Running,
+        progress_pct: 0,
+        log: format!("bun add {spec} (may take 60-180s)"),
+    });
+    let mut add_cmd = Command::new(bun_path);
+    add_cmd.args(["add", spec]).current_dir(install_dir);
+    run_with_progress(add_cmd, WizardStep::UpdateGbrain, emit)
+        .await
+        .map_err(|e| format!("bun add {spec} failed: {e}"))?;
+    Ok(())
+}
+
 /// Run `gbrain init --pglite --embedding-dimensions 512 \
 ///         --embedding-model openai:text-embedding-3-small`.
 ///
@@ -1224,6 +1310,160 @@ pub async fn handle_install_gbrain(params: &serde_json::Value) -> serde_json::Va
     )
 }
 
+/// `kb.wizard.restart` — rebuild the brain slot (recovers from
+/// Failed/Shutdown). Streams progress under `WizardStep::Restart`.
+pub async fn handle_restart(params: &serde_json::Value) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let bus = match CURRENT_EVENT_BUS.get().cloned() {
+        Some(b) => b,
+        None => {
+            return err_response(
+                &request_id,
+                "kb.wizard.restart",
+                "NO_EVENT_BUS",
+                "EventBus not initialized; cannot stream progress",
+            );
+        }
+    };
+    let state = current_wizard_state();
+
+    spawn_step(state.clone(), bus, move |_bus| async move {
+        let emit = make_emit_for_global();
+        emit(WizardProgress {
+            step: WizardStep::Restart,
+            status: WizardStatus::Running,
+            progress_pct: 10,
+            log: "restarting gbrain server…".to_string(),
+        });
+        match hot_reload_brain().await {
+            Ok(_) => {
+                state.clear_overall().await;
+                emit(WizardProgress {
+                    step: WizardStep::Restart,
+                    status: WizardStatus::Ok,
+                    progress_pct: 100,
+                    log: "gbrain server restarted".to_string(),
+                });
+            }
+            Err(e) => {
+                state.set_overall(WizardOverall::Failed).await;
+                emit(WizardProgress {
+                    step: WizardStep::Restart,
+                    status: WizardStatus::Failed,
+                    progress_pct: 100,
+                    log: format!("restart failed: {e}"),
+                });
+            }
+        }
+    })
+    .await;
+
+    ok_response(
+        &request_id,
+        "kb.wizard.restart",
+        serde_json::json!({ "started": true }),
+    )
+}
+
+/// `kb.wizard.update_gbrain` — `bun add <spec>` then hot-reload.
+/// Param `ref` is optional (omitted = reinstall the pinned version).
+/// Streams progress under `WizardStep::UpdateGbrain`.
+pub async fn handle_update_gbrain(params: &serde_json::Value) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Validate + resolve the spec FIRST (before any side effects), so a
+    // bad ref fails deterministically.
+    let user_ref = params
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    let spec = match resolve_gbrain_spec(user_ref) {
+        Ok(s) => s,
+        Err(e) => {
+            return err_response(&request_id, "kb.wizard.update_gbrain", "BAD_REF", e);
+        }
+    };
+
+    let bun_path = match resolve_bun_path() {
+        Some(p) => p,
+        None => {
+            return err_response(
+                &request_id,
+                "kb.wizard.update_gbrain",
+                "BUN_NOT_FOUND",
+                "bun is not installed; run the install wizard first",
+            );
+        }
+    };
+    let bus = match CURRENT_EVENT_BUS.get().cloned() {
+        Some(b) => b,
+        None => {
+            return err_response(
+                &request_id,
+                "kb.wizard.update_gbrain",
+                "NO_EVENT_BUS",
+                "EventBus not initialized; cannot stream progress",
+            );
+        }
+    };
+    let state = current_wizard_state();
+
+    spawn_step(state.clone(), bus, move |_bus| async move {
+        let emit = make_emit_for_global();
+        match update_gbrain(&bun_path, &spec, &emit).await {
+            Ok(_) => {
+                // Reload the slot so the new version is actually running.
+                match hot_reload_brain().await {
+                    Ok(_) => {
+                        state.clear_overall().await;
+                        emit(WizardProgress {
+                            step: WizardStep::UpdateGbrain,
+                            status: WizardStatus::Ok,
+                            progress_pct: 100,
+                            log: "gbrain updated and restarted".to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        state.set_overall(WizardOverall::Failed).await;
+                        emit(WizardProgress {
+                            step: WizardStep::UpdateGbrain,
+                            status: WizardStatus::Failed,
+                            progress_pct: 100,
+                            log: format!("updated, but restart failed: {e}"),
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                // Install failed -> do NOT restart; keep the running version.
+                state.set_overall(WizardOverall::Failed).await;
+                emit(WizardProgress {
+                    step: WizardStep::UpdateGbrain,
+                    status: WizardStatus::Failed,
+                    progress_pct: 100,
+                    log: format!("update failed: {e}"),
+                });
+            }
+        }
+    })
+    .await;
+
+    ok_response(
+        &request_id,
+        "kb.wizard.update_gbrain",
+        serde_json::json!({ "started": true }),
+    )
+}
+
 /// Handle `kb.wizard.init_brain`. Resolves bun + cli + gateway snapshot.
 pub async fn handle_init_brain(params: &serde_json::Value) -> serde_json::Value {
     let request_id = params
@@ -1409,6 +1649,58 @@ mod tests {
             serde_json::to_value(WizardStep::UpdateGbrain).unwrap(),
             serde_json::json!("update_gbrain")
         );
+    }
+
+    #[test]
+    fn validate_gbrain_ref_accepts_safe_and_rejects_injection() {
+        assert!(validate_gbrain_ref("af5ee1e").is_ok());
+        assert!(validate_gbrain_ref("v0.40.8.1").is_ok());
+        assert!(validate_gbrain_ref("github:garrytan/gbrain#main").is_ok());
+        assert!(validate_gbrain_ref("").is_err());
+        assert!(validate_gbrain_ref("af5;rm -rf /").is_err());
+        assert!(validate_gbrain_ref("a b").is_err());
+        assert!(validate_gbrain_ref("$(whoami)").is_err());
+        assert!(validate_gbrain_ref("a&b").is_err());
+        assert!(validate_gbrain_ref("a`b`").is_err());
+    }
+
+    #[test]
+    fn resolve_gbrain_spec_handles_omitted_bare_and_full() {
+        assert_eq!(resolve_gbrain_spec(None).unwrap(), GBRAIN_PIN);
+        assert_eq!(
+            resolve_gbrain_spec(Some("main")).unwrap(),
+            "github:garrytan/gbrain#main"
+        );
+        assert_eq!(
+            resolve_gbrain_spec(Some("github:garrytan/gbrain#abc123")).unwrap(),
+            "github:garrytan/gbrain#abc123"
+        );
+        assert!(resolve_gbrain_spec(Some("bad;ref")).is_err());
+    }
+
+    #[tokio::test]
+    async fn update_gbrain_errors_when_brain_tool_dir_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let noop = |_p: WizardProgress| {};
+        let res = update_gbrain_in(
+            &missing,
+            &PathBuf::from("/nonexistent/bun"),
+            "github:garrytan/gbrain#af5ee1e",
+            &noop,
+        )
+        .await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("brain-tool"));
+    }
+
+    #[tokio::test]
+    async fn handle_update_gbrain_rejects_bad_ref_before_side_effects() {
+        let params = serde_json::json!({ "request_id": "r1", "ref": "bad;ref" });
+        let resp = handle_update_gbrain(&params).await;
+        let payload = &resp["payload"];
+        assert_eq!(payload["success"], serde_json::json!(false));
+        assert_eq!(payload["error"]["code"], serde_json::json!("BAD_REF"));
     }
 
     #[tokio::test]
