@@ -347,12 +347,26 @@ pub async fn list_pages_crosscheck(transport: &Arc<dyn McpToolCaller>) -> Vec<Pa
     array.iter().filter_map(meta_from_list_entry).collect()
 }
 
-/// Build the complete page set: walk the atlas, union the gbrain `list_pages`
-/// cross-check by slug. This is the input to [`query_pages`]. The TTL cache
-/// (Task 2) wraps this so rapid page flips don't re-walk.
+/// Build the complete page set: walk the atlas, then union the gbrain
+/// `list_pages` cross-check by slug — but ONLY cross-check entries whose
+/// markdown file actually exists on disk at `brain_dir/<slug>.md`.
+///
+/// gbrain's DB can retain stale/orphan rows whose files were moved or deleted
+/// (e.g. after relocating a directory; a full `sync` does not always prune
+/// them). Unfiltered, those ghost rows were added as "DB-only" pages and
+/// inflated the count (observed: 321 on disk + 31 ghosts = 352). The
+/// file-existence guard keeps the cross-check's real value — surfacing genuine
+/// on-disk pages the atlas walk didn't cover (gbrain slugs are repo-relative,
+/// so the file is at `brain_dir/<slug>.md`) — while dropping ghosts. The TTL
+/// cache (Task 2) wraps this so rapid page flips don't re-walk.
 pub async fn build_page_set(atlas_dir: &Path, transport: &Arc<dyn McpToolCaller>) -> Vec<PageMeta> {
     let walked = walk_atlas(atlas_dir);
-    let extra = list_pages_crosscheck(transport).await;
+    let brain_dir = atlas_dir.parent().unwrap_or(atlas_dir);
+    let extra: Vec<PageMeta> = list_pages_crosscheck(transport)
+        .await
+        .into_iter()
+        .filter(|p| brain_dir.join(format!("{}.md", p.slug)).is_file())
+        .collect();
     union_by_slug(walked, extra)
 }
 
@@ -855,14 +869,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_page_set_unions_walk_with_db_only_slug() {
-        // Regression for the "321 -> 421" bug: gbrain's list_pages slugs are
-        // repo-relative and INCLUDE the `atlas/` segment (resolvePageFilePath
-        // joins brainDir + slug + ".md"). The walk must produce the SAME
-        // `atlas/...` slug so the union dedups instead of counting every
-        // gbrain slug as new (+100 = the list_pages cap).
-        // Atlas has atlas/wiki/a on disk; list_pages reports atlas/wiki/a (dup)
-        // + atlas/db/recent (new, DB-only).
+    async fn build_page_set_skips_ghost_db_rows_keeps_on_disk() {
+        // Two regressions in one:
+        // (1) "321 -> 421": gbrain slugs INCLUDE the atlas/ segment
+        //     (resolvePageFilePath joins brainDir + slug + .md); the walk must
+        //     produce the same `atlas/...` slug so duplicates dedup.
+        // (2) "321 -> 352": a gbrain list_pages row whose .md file no longer
+        //     exists (stale/orphan that even a full sync didn't prune) must NOT
+        //     be added — the file-existence guard drops it. A row whose file DOES
+        //     exist on disk (even outside atlas/) is still surfaced.
         let tmp = tempfile::tempdir().unwrap();
         let atlas = tmp.path().join("atlas");
         fs::create_dir_all(atlas.join("wiki")).unwrap();
@@ -871,12 +886,16 @@ mod tests {
             "---\ntitle: On Disk\n---\nbody",
         )
         .unwrap();
+        // A real page on disk OUTSIDE atlas/ (gbrain slug = repo-relative).
+        fs::create_dir_all(tmp.path().join("extra")).unwrap();
+        fs::write(tmp.path().join("extra").join("real.md"), "# Real").unwrap();
 
         let transport = StubToolCaller::ok(vec![(
             "list_pages",
             list_envelope(serde_json::json!([
-                { "slug": "atlas/wiki/a", "title": "From DB", "updated_at": "2026-05-25T00:00:00Z" },
-                { "slug": "atlas/db/recent", "title": "Recent DB-only", "updated_at": "2026-05-26T00:00:00Z" }
+                { "slug": "atlas/wiki/a", "title": "From DB", "updated_at": "2026-05-25T00:00:00Z" }, // dup of walk
+                { "slug": "extra/real",   "title": "Real",    "updated_at": "2026-05-26T00:00:00Z" }, // file exists -> kept
+                { "slug": "ghost/gone",   "title": "Orphan",  "updated_at": "2026-05-27T00:00:00Z" }  // no file -> skipped
             ])),
         )]);
         let mut pages = build_page_set(&atlas, &transport).await;
@@ -884,14 +903,21 @@ mod tests {
         assert_eq!(
             pages.len(),
             2,
-            "atlas/wiki/a deduped (gbrain + walk both atlas-prefixed), atlas/db/recent added"
+            "atlas/wiki/a (deduped) + extra/real (file exists); ghost/gone has no file -> skipped"
         );
         let a = pages.iter().find(|p| p.slug == "atlas/wiki/a").unwrap();
         assert_eq!(
             a.title, "On Disk",
             "walk (disk) entry wins on slug conflict"
         );
-        assert!(pages.iter().any(|p| p.slug == "atlas/db/recent"));
+        assert!(
+            pages.iter().any(|p| p.slug == "extra/real"),
+            "on-disk page outside atlas/ is surfaced"
+        );
+        assert!(
+            !pages.iter().any(|p| p.slug == "ghost/gone"),
+            "orphan DB row (no file on disk) must be skipped"
+        );
     }
 
     // ── TTL cache (Task 2) ────────────────────────────────────────
