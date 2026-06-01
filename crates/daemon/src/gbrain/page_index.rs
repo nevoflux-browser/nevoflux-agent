@@ -15,10 +15,13 @@
 //! matching the existing `atlas/`-only convention.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use nevoflux_brain::PageMeta;
+
+use super::supervisor::McpToolCaller;
 
 /// Sort order for the page list. `UpdatedDesc` is the default (matches the
 /// pre-pagination `list_pages { sort: "updated_desc" }` behavior).
@@ -262,6 +265,88 @@ pub fn query_pages(all: Vec<PageMeta>, query: &ListQuery) -> ListSlice {
     paginate(filtered, query)
 }
 
+/// Parse one gbrain `list_pages` entry into a [`PageMeta`]. gbrain returns
+/// `{ slug, type, title, updated_at, deleted_at? }` (operations.ts list_pages
+/// handler). Mirrors `GbrainEngine::meta_from_entry`: tolerant of missing
+/// fields, `updated_at` parsed as RFC3339 (else now), `source` always None
+/// for v1 (DB-only cross-check pages).
+fn meta_from_list_entry(item: &serde_json::Value) -> Option<PageMeta> {
+    let slug = item.get("slug").and_then(|v| v.as_str())?.to_string();
+    if slug.is_empty() {
+        return None;
+    }
+    let title = item
+        .get("title")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&slug)
+        .to_string();
+    let updated_at = item
+        .get("updated_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now);
+    Some(PageMeta {
+        slug,
+        title,
+        updated_at,
+        source: None,
+    })
+}
+
+/// Fetch up to 100 most-recent pages via gbrain `list_pages` for the
+/// cross-check. Unwraps the MCP `{ result: { content: [{ text }] } }`
+/// envelope (the text is a JSON array of entries). Best-effort: any transport
+/// / parse failure returns an empty Vec so the caller degrades to the
+/// filesystem-only index.
+pub async fn list_pages_crosscheck(transport: &Arc<dyn McpToolCaller>) -> Vec<PageMeta> {
+    let args = serde_json::json!({ "limit": 100, "sort": "updated_desc" });
+    let resp = match transport.call_tool_dyn("list_pages", args).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "page_index: list_pages cross-check failed; \
+                serving filesystem-only index");
+            return Vec::new();
+        }
+    };
+    // Unwrap result.content[0].text -> JSON array (same shape GbrainEngine uses).
+    let text = resp
+        .get("result")
+        .filter(|r| !r.get("isError").and_then(|v| v.as_bool()).unwrap_or(false))
+        .and_then(|r| r.get("content"))
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+        .and_then(|first| first.get("text"))
+        .and_then(|t| t.as_str());
+    let Some(text) = text else {
+        tracing::warn!("page_index: list_pages response missing result.content[0].text");
+        return Vec::new();
+    };
+    let payload: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "page_index: list_pages text was not JSON");
+            return Vec::new();
+        }
+    };
+    let array = payload
+        .as_array()
+        .cloned()
+        .or_else(|| payload.get("pages").and_then(|p| p.as_array()).cloned())
+        .unwrap_or_default();
+    array.iter().filter_map(meta_from_list_entry).collect()
+}
+
+/// Build the complete page set: walk the atlas, union the gbrain `list_pages`
+/// cross-check by slug. This is the input to [`query_pages`]. The TTL cache
+/// (Task 2) wraps this so rapid page flips don't re-walk.
+pub async fn build_page_set(atlas_dir: &Path, transport: &Arc<dyn McpToolCaller>) -> Vec<PageMeta> {
+    let walked = walk_atlas(atlas_dir);
+    let extra = list_pages_crosscheck(transport).await;
+    union_by_slug(walked, extra)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,7 +370,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let atlas = tmp.path().join("atlas");
         fs::create_dir_all(atlas.join("wiki").join("people")).unwrap();
-        fs::write(atlas.join("wiki").join("people").join("alice.md"), "# Alice").unwrap();
+        fs::write(
+            atlas.join("wiki").join("people").join("alice.md"),
+            "# Alice",
+        )
+        .unwrap();
         fs::write(atlas.join("root-note.md"), "# Root").unwrap();
 
         let mut pages = walk_atlas(&atlas);
@@ -327,7 +416,11 @@ mod tests {
             "---\ntitle: Real Title\ntags: [x]\n---\n# Body heading\nbody",
         )
         .unwrap();
-        fs::write(atlas.join("dir").join("nofm.md"), "## Just a heading\nno frontmatter").unwrap();
+        fs::write(
+            atlas.join("dir").join("nofm.md"),
+            "## Just a heading\nno frontmatter",
+        )
+        .unwrap();
 
         let mut pages = walk_atlas(&atlas);
         pages.sort_by(|a, b| a.slug.cmp(&b.slug));
@@ -357,13 +450,19 @@ mod tests {
 
     #[test]
     fn frontmatter_without_title_returns_none() {
-        assert_eq!(parse_frontmatter_title("---\ntags: [a, b]\n---\nbody"), None);
+        assert_eq!(
+            parse_frontmatter_title("---\ntags: [a, b]\n---\nbody"),
+            None
+        );
     }
 
     #[test]
     fn frontmatter_unterminated_returns_none() {
         // No closing fence -> not a valid block -> None (don't parse body).
-        assert_eq!(parse_frontmatter_title("---\ntitle: X\nbody with no fence"), None);
+        assert_eq!(
+            parse_frontmatter_title("---\ntitle: X\nbody with no fence"),
+            None
+        );
     }
 
     // ── slug_from_relpath ─────────────────────────────────────────
@@ -418,7 +517,11 @@ mod tests {
     fn filter_by_q_substring_on_slug_and_title_case_insensitive() {
         let pages = vec![
             meta("notes/rustlang", "Systems", "2026-05-01T00:00:00Z"),
-            meta("notes/python", "Scripting in RUST too", "2026-05-02T00:00:00Z"),
+            meta(
+                "notes/python",
+                "Scripting in RUST too",
+                "2026-05-02T00:00:00Z",
+            ),
             meta("notes/go", "Concurrency", "2026-05-03T00:00:00Z"),
         ];
         let q = ListQuery {
@@ -446,15 +549,24 @@ mod tests {
         ];
         let mut desc = base.clone();
         sort_pages(&mut desc, SortOrder::UpdatedDesc);
-        assert_eq!(desc.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(), ["a", "c", "b"]);
+        assert_eq!(
+            desc.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(),
+            ["a", "c", "b"]
+        );
 
         let mut asc = base.clone();
         sort_pages(&mut asc, SortOrder::UpdatedAsc);
-        assert_eq!(asc.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(), ["b", "c", "a"]);
+        assert_eq!(
+            asc.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(),
+            ["b", "c", "a"]
+        );
 
         let mut slug = base.clone();
         sort_pages(&mut slug, SortOrder::Slug);
-        assert_eq!(slug.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+        assert_eq!(
+            slug.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
     }
 
     #[test]
@@ -464,7 +576,10 @@ mod tests {
             meta("a", "A", "2026-05-01T00:00:00Z"),
         ];
         sort_pages(&mut pages, SortOrder::UpdatedDesc);
-        assert_eq!(pages[0].slug, "a", "same-timestamp ties order by slug ascending");
+        assert_eq!(
+            pages[0].slug, "a",
+            "same-timestamp ties order by slug ascending"
+        );
     }
 
     // ── paginate ──────────────────────────────────────────────────
@@ -552,5 +667,123 @@ mod tests {
         assert_eq!(slice.total, 2, "two wiki/* pass the dir filter");
         assert_eq!(slice.pages.len(), 1, "limit 1");
         assert_eq!(slice.pages[0].slug, "wiki/a", "newest first");
+    }
+
+    // ── list_pages cross-check union (Task 1) ─────────────────────
+
+    use super::super::supervisor::McpToolCallerError;
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+
+    /// Minimal McpToolCaller stub (same shape as gbrain/engine.rs tests):
+    /// returns a canned response per tool name, records calls.
+    struct StubToolCaller {
+        responses: HashMap<String, serde_json::Value>,
+        calls: StdMutex<Vec<(String, serde_json::Value)>>,
+        fail: bool,
+    }
+    impl StubToolCaller {
+        fn ok(responses: Vec<(&str, serde_json::Value)>) -> Arc<dyn McpToolCaller> {
+            Arc::new(Self {
+                responses: responses
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect(),
+                calls: StdMutex::new(Vec::new()),
+                fail: false,
+            })
+        }
+        fn failing() -> Arc<dyn McpToolCaller> {
+            Arc::new(Self {
+                responses: HashMap::new(),
+                calls: StdMutex::new(Vec::new()),
+                fail: true,
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl McpToolCaller for StubToolCaller {
+        async fn call_tool_dyn(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, McpToolCallerError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), arguments));
+            if self.fail {
+                return Err("stub transport failure".into());
+            }
+            match self.responses.get(name).cloned() {
+                Some(v) => Ok(v),
+                None => Err(format!("no stub for {name}").into()),
+            }
+        }
+    }
+    fn list_envelope(entries: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "result": { "content": [{ "type": "text", "text": entries.to_string() }] }
+        })
+    }
+
+    #[tokio::test]
+    async fn crosscheck_parses_entries() {
+        let transport = StubToolCaller::ok(vec![(
+            "list_pages",
+            list_envelope(serde_json::json!([
+                { "slug": "db/only", "title": "DB Only", "updated_at": "2026-05-20T00:00:00Z" },
+                { "slug": "no/title", "updated_at": "2026-05-21T00:00:00Z" }
+            ])),
+        )]);
+        let pages = list_pages_crosscheck(&transport).await;
+        assert_eq!(pages.len(), 2);
+        let dbonly = pages.iter().find(|p| p.slug == "db/only").unwrap();
+        assert_eq!(dbonly.title, "DB Only");
+        let notitle = pages.iter().find(|p| p.slug == "no/title").unwrap();
+        assert_eq!(
+            notitle.title, "no/title",
+            "missing title falls back to slug"
+        );
+    }
+
+    #[tokio::test]
+    async fn crosscheck_failure_degrades_to_empty() {
+        let transport = StubToolCaller::failing();
+        let pages = list_pages_crosscheck(&transport).await;
+        assert!(
+            pages.is_empty(),
+            "transport failure must NOT panic; returns empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_page_set_unions_walk_with_db_only_slug() {
+        // Atlas has wiki/a on disk; list_pages reports wiki/a (dup) + db/recent (new).
+        let tmp = tempfile::tempdir().unwrap();
+        let atlas = tmp.path().join("atlas");
+        fs::create_dir_all(atlas.join("wiki")).unwrap();
+        fs::write(
+            atlas.join("wiki").join("a.md"),
+            "---\ntitle: On Disk\n---\nbody",
+        )
+        .unwrap();
+
+        let transport = StubToolCaller::ok(vec![(
+            "list_pages",
+            list_envelope(serde_json::json!([
+                { "slug": "wiki/a", "title": "From DB", "updated_at": "2026-05-25T00:00:00Z" },
+                { "slug": "db/recent", "title": "Recent DB-only", "updated_at": "2026-05-26T00:00:00Z" }
+            ])),
+        )]);
+        let mut pages = build_page_set(&atlas, &transport).await;
+        pages.sort_by(|a, b| a.slug.cmp(&b.slug));
+        assert_eq!(pages.len(), 2, "wiki/a deduped, db/recent added");
+        let a = pages.iter().find(|p| p.slug == "wiki/a").unwrap();
+        assert_eq!(
+            a.title, "On Disk",
+            "walk (disk) entry wins on slug conflict"
+        );
+        assert!(pages.iter().any(|p| p.slug == "db/recent"));
     }
 }
