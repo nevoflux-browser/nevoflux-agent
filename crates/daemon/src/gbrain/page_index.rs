@@ -148,7 +148,15 @@ pub fn walk_atlas(atlas_dir: &Path) -> Vec<PageMeta> {
     if !atlas_dir.is_dir() {
         return out;
     }
-    walk_into(atlas_dir, atlas_dir, &mut out);
+    // Slugs MUST include the `atlas/` segment to match gbrain's slug format.
+    // gbrain stores slug = path relative to `sync.repo_path` (the brain dir),
+    // e.g. `atlas/中医/yc` — `resolvePageFilePath` joins `brainDir + slug + ".md"`.
+    // So we strip the brain root (atlas's parent), NOT atlas_dir itself. Stripping
+    // atlas_dir produced `中医/yc`, which (a) never deduped against gbrain's
+    // `atlas/中医/yc` in the list_pages cross-check (counted them as new →
+    // e.g. 321 + 100 = 421) and (b) wouldn't resolve in gbrain `get_page`.
+    let strip_root = atlas_dir.parent().unwrap_or(atlas_dir);
+    walk_into(strip_root, atlas_dir, &mut out);
     out
 }
 
@@ -468,8 +476,9 @@ mod tests {
         let mut pages = walk_atlas(&atlas);
         pages.sort_by(|a, b| a.slug.cmp(&b.slug));
         assert_eq!(pages.len(), 2);
-        assert_eq!(pages[0].slug, "root-note");
-        assert_eq!(pages[1].slug, "wiki/people/alice");
+        // Slugs include the `atlas/` segment to match gbrain's slug format.
+        assert_eq!(pages[0].slug, "atlas/root-note");
+        assert_eq!(pages[1].slug, "atlas/wiki/people/alice");
     }
 
     #[test]
@@ -491,7 +500,7 @@ mod tests {
         fs::write(atlas.join("notes.json"), "{}").unwrap();
         let pages = walk_atlas(&atlas);
         assert_eq!(pages.len(), 1);
-        assert_eq!(pages[0].slug, "keep");
+        assert_eq!(pages[0].slug, "atlas/keep");
     }
 
     #[test]
@@ -513,10 +522,10 @@ mod tests {
         let mut pages = walk_atlas(&atlas);
         pages.sort_by(|a, b| a.slug.cmp(&b.slug));
         // nofm: fallback to last slug segment
-        assert_eq!(pages[0].slug, "dir/nofm");
+        assert_eq!(pages[0].slug, "atlas/dir/nofm");
         assert_eq!(pages[0].title, "nofm");
         // withfm: frontmatter title
-        assert_eq!(pages[1].slug, "dir/withfm");
+        assert_eq!(pages[1].slug, "atlas/dir/withfm");
         assert_eq!(pages[1].title, "Real Title");
     }
 
@@ -847,7 +856,13 @@ mod tests {
 
     #[tokio::test]
     async fn build_page_set_unions_walk_with_db_only_slug() {
-        // Atlas has wiki/a on disk; list_pages reports wiki/a (dup) + db/recent (new).
+        // Regression for the "321 -> 421" bug: gbrain's list_pages slugs are
+        // repo-relative and INCLUDE the `atlas/` segment (resolvePageFilePath
+        // joins brainDir + slug + ".md"). The walk must produce the SAME
+        // `atlas/...` slug so the union dedups instead of counting every
+        // gbrain slug as new (+100 = the list_pages cap).
+        // Atlas has atlas/wiki/a on disk; list_pages reports atlas/wiki/a (dup)
+        // + atlas/db/recent (new, DB-only).
         let tmp = tempfile::tempdir().unwrap();
         let atlas = tmp.path().join("atlas");
         fs::create_dir_all(atlas.join("wiki")).unwrap();
@@ -860,19 +875,23 @@ mod tests {
         let transport = StubToolCaller::ok(vec![(
             "list_pages",
             list_envelope(serde_json::json!([
-                { "slug": "wiki/a", "title": "From DB", "updated_at": "2026-05-25T00:00:00Z" },
-                { "slug": "db/recent", "title": "Recent DB-only", "updated_at": "2026-05-26T00:00:00Z" }
+                { "slug": "atlas/wiki/a", "title": "From DB", "updated_at": "2026-05-25T00:00:00Z" },
+                { "slug": "atlas/db/recent", "title": "Recent DB-only", "updated_at": "2026-05-26T00:00:00Z" }
             ])),
         )]);
         let mut pages = build_page_set(&atlas, &transport).await;
         pages.sort_by(|a, b| a.slug.cmp(&b.slug));
-        assert_eq!(pages.len(), 2, "wiki/a deduped, db/recent added");
-        let a = pages.iter().find(|p| p.slug == "wiki/a").unwrap();
+        assert_eq!(
+            pages.len(),
+            2,
+            "atlas/wiki/a deduped (gbrain + walk both atlas-prefixed), atlas/db/recent added"
+        );
+        let a = pages.iter().find(|p| p.slug == "atlas/wiki/a").unwrap();
         assert_eq!(
             a.title, "On Disk",
             "walk (disk) entry wins on slug conflict"
         );
-        assert!(pages.iter().any(|p| p.slug == "db/recent"));
+        assert!(pages.iter().any(|p| p.slug == "atlas/db/recent"));
     }
 
     // ── TTL cache (Task 2) ────────────────────────────────────────
