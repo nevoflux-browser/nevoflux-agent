@@ -19,13 +19,29 @@
 //! M4-4b `nevoflux://brain` page needs.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use nevoflux_brain::{BrainEngine, BrainError};
 use serde_json::Value;
 
+use crate::gbrain::page_index::{ListQuery, PageIndex, SortOrder};
+use crate::gbrain::supervisor::McpToolCaller;
 use crate::gbrain::GbrainSupervisor;
 use crate::init_brain::CURRENT_BRAIN_SLOT;
 use crate::kb_wizard::{err_response, ok_response};
+
+/// Process-global KB page index cache. Lazily created; persists across
+/// `brain.list` calls so a large atlas isn't re-walked on every page flip.
+/// Invalidated by the mutating brain handlers (put / save_*).
+fn page_index() -> &'static PageIndex {
+    static INDEX: OnceLock<PageIndex> = OnceLock::new();
+    INDEX.get_or_init(PageIndex::new)
+}
+
+/// Public so the put/save handlers can force-refresh the list after a write.
+pub(crate) async fn invalidate_page_index() {
+    page_index().invalidate().await;
+}
 
 /// Look up the live brain engine handle. Returns `None` when the brain
 /// slot is empty (either not initialized yet or
@@ -133,15 +149,12 @@ pub async fn handle_stats(params: &Value) -> Value {
                 .and_then(|c| c.as_array())
                 .and_then(|a| a.first())
                 .and_then(|first| {
-                    first
-                        .get("data")
-                        .cloned()
-                        .or_else(|| {
-                            first
-                                .get("text")
-                                .and_then(|t| t.as_str())
-                                .and_then(|s| serde_json::from_str(s).ok())
-                        })
+                    first.get("data").cloned().or_else(|| {
+                        first
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .and_then(|s| serde_json::from_str(s).ok())
+                    })
                 })
                 .unwrap_or_else(|| serde_json::json!({}));
             ok_response(request_id, "brain.stats", stats)
@@ -155,33 +168,73 @@ pub async fn handle_stats(params: &Value) -> Value {
     }
 }
 
-/// `brain.list` — list page metadata for the sidebar.
+/// `brain.list` — paginated + filtered page metadata for the browse list and
+/// the share dialog.
 ///
-/// `dir` defaults to the brain root (`""`).
+/// Params (all optional): `dir` (slug-prefix), `q` (case-insensitive substring
+/// on slug OR title), `sort` (`updated_desc` default | `updated_asc` | `slug`),
+/// `offset` (default 0), `limit` (default 50, capped 200). Returns
+/// `{ pages, total, offset, limit }` where `total` is the post-filter,
+/// pre-slice count (drives the page-count UI). Backward-compatible: omitting
+/// every new param yields the first 50 sorted by updated_desc.
+///
+/// Pages come from the daemon's own complete page index (atlas walk + a gbrain
+/// `list_pages` <=100 cross-check), NOT `BrainEngine::list` — gbrain caps
+/// `list_pages` at 100 with no offset, which cannot drive real pagination.
 pub async fn handle_list(params: &Value) -> Value {
     let request_id = params
         .get("request_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let dir = params.get("dir").and_then(|v| v.as_str()).unwrap_or("");
 
-    let Some(engine) = current_engine().await else {
+    let dir = params
+        .get("dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let q = params
+        .get("q")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let sort = SortOrder::parse(params.get("sort").and_then(|v| v.as_str()));
+    // JSON numbers arrive as u64/i64/f64; coerce defensively, clamp negatives
+    // to 0. limit==0/absent -> default; >200 -> capped (in ListQuery::clamp).
+    let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(ListQuery::DEFAULT_LIMIT);
+    let query = ListQuery {
+        dir,
+        q,
+        sort,
+        offset,
+        limit,
+    }
+    .clamp();
+
+    // We need the supervisor (for the gbrain cross-check transport + the
+    // brain_dir to walk). Empty slot -> disabled.
+    let Some(supervisor) = current_supervisor().await else {
         return brain_disabled_err(request_id, "brain.list");
     };
+    let atlas_dir = supervisor.brain_dir().join("atlas");
+    let transport: Arc<dyn McpToolCaller> = supervisor.clone();
 
-    match engine.list(dir).await {
-        Ok(pages) => ok_response(
-            request_id,
-            "brain.list",
-            serde_json::json!({ "pages": pages }),
-        ),
-        Err(e) => err_response(
-            request_id,
-            "brain.list",
-            "BRAIN_BACKEND_ERROR",
-            format!("list failed: {e}"),
-        ),
-    }
+    let slice = page_index().query(&atlas_dir, &transport, &query).await;
+
+    ok_response(
+        request_id,
+        "brain.list",
+        serde_json::json!({
+            "pages": slice.pages,
+            "total": slice.total,
+            "offset": slice.offset,
+            "limit": slice.limit,
+        }),
+    )
 }
 
 /// `brain.get` — fetch a single page's compiled markdown by slug.
@@ -282,11 +335,14 @@ pub async fn handle_put(params: &Value) -> Value {
     };
     let page = nevoflux_brain::BrainPage::from_markdown(slug, markdown);
     match engine.put(page).await {
-        Ok(result) => ok_response(
-            request_id,
-            "brain.put",
-            serde_json::to_value(&result).unwrap_or_else(|_| serde_json::json!({})),
-        ),
+        Ok(result) => {
+            invalidate_page_index().await;
+            ok_response(
+                request_id,
+                "brain.put",
+                serde_json::to_value(&result).unwrap_or_else(|_| serde_json::json!({})),
+            )
+        }
         Err(e) => err_response(
             request_id,
             "brain.put",
@@ -308,10 +364,7 @@ pub async fn handle_save_webpage(params: &Value) -> Value {
         .unwrap_or("");
     let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("");
     let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("");
-    let content = params
-        .get("content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
     let directory = params
         .get("directory")
         .and_then(|v| v.as_str())
@@ -347,11 +400,14 @@ pub async fn handle_save_webpage(params: &Value) -> Value {
 
     let page = nevoflux_brain::BrainPage::from_markdown(full_slug, raw);
     match engine.put(page).await {
-        Ok(result) => ok_response(
-            request_id,
-            "brain.save_webpage",
-            serde_json::to_value(&result).unwrap_or_else(|_| serde_json::json!({})),
-        ),
+        Ok(result) => {
+            invalidate_page_index().await;
+            ok_response(
+                request_id,
+                "brain.save_webpage",
+                serde_json::to_value(&result).unwrap_or_else(|_| serde_json::json!({})),
+            )
+        }
         Err(e) => err_response(
             request_id,
             "brain.save_webpage",
@@ -372,10 +428,7 @@ pub async fn handle_save_conversation(params: &Value) -> Value {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("");
-    let content = params
-        .get("content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
     let conversation_id = params
         .get("conversation_id")
         .and_then(|v| v.as_str())
@@ -404,11 +457,14 @@ pub async fn handle_save_conversation(params: &Value) -> Value {
 
     let page = nevoflux_brain::BrainPage::from_markdown(full_slug, raw);
     match engine.put(page).await {
-        Ok(result) => ok_response(
-            request_id,
-            "brain.save_conversation",
-            serde_json::to_value(&result).unwrap_or_else(|_| serde_json::json!({})),
-        ),
+        Ok(result) => {
+            invalidate_page_index().await;
+            ok_response(
+                request_id,
+                "brain.save_conversation",
+                serde_json::to_value(&result).unwrap_or_else(|_| serde_json::json!({})),
+            )
+        }
         Err(e) => err_response(
             request_id,
             "brain.save_conversation",
@@ -450,6 +506,21 @@ mod tests {
     async fn list_returns_error_envelope_when_brain_disabled() {
         let resp = handle_list(&serde_json::json!({ "request_id": "test-3" })).await;
         assert_eq!(resp["payload"]["error"]["code"], "BRAIN_DISABLED");
+    }
+
+    #[tokio::test]
+    async fn list_disabled_envelope_has_command_and_code() {
+        let resp = handle_list(&serde_json::json!({
+            "request_id": "t-list",
+            "q": "anything",
+            "sort": "slug",
+            "offset": 10,
+            "limit": 25
+        }))
+        .await;
+        assert_eq!(resp["payload"]["success"], false);
+        assert_eq!(resp["payload"]["error"]["code"], "BRAIN_DISABLED");
+        assert_eq!(resp["payload"]["command"], "brain.list");
     }
 
     #[tokio::test]
