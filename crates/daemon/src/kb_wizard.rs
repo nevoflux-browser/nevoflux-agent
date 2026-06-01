@@ -67,6 +67,10 @@ pub enum WizardStep {
     InstallBun,
     InstallGbrain,
     InitBrain,
+    /// Manual "restart gbrain server" action (rebuild the brain slot).
+    Restart,
+    /// Manual "update gbrain package" action (`bun add <spec>`).
+    UpdateGbrain,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -91,6 +95,8 @@ pub struct WizardStatusReport {
     pub brain_initialized: bool,
     pub brain_dir: PathBuf,
     pub overall: WizardOverall,
+    /// Live supervisor runtime status (running / failed / disabled / …).
+    pub runtime: RuntimeStatus,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -106,6 +112,69 @@ pub enum WizardOverall {
     InProgress,
     /// Last attempt failed; user must retry.
     Failed,
+}
+
+/// Live runtime status of the gbrain supervisor, surfaced inside
+/// [`WizardStatusReport`] so the settings page can show whether the
+/// server is actually running — not just installed.
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeStatus {
+    /// "running" | "starting" | "restarting" | "failed" | "shutdown" | "disabled".
+    pub state: String,
+    /// Present only when `state == "restarting"`: 1-based attempt counter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_attempt: Option<u32>,
+    /// Present only when `state == "failed"`: why the supervisor gave up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_reason: Option<String>,
+    /// Present only when `state == "running"`: ms from spawn to Running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initialized_ms: Option<u64>,
+}
+
+/// Pure mapping from an optional [`SupervisorState`] to a [`RuntimeStatus`].
+/// `None` (no brain slot / no live supervisor) maps to `"disabled"`.
+fn runtime_from_state(state: Option<crate::gbrain::supervisor::SupervisorState>) -> RuntimeStatus {
+    use crate::gbrain::supervisor::SupervisorState;
+    let mut rs = RuntimeStatus {
+        state: "disabled".to_string(),
+        restart_attempt: None,
+        failed_reason: None,
+        initialized_ms: None,
+    };
+    match state {
+        None => {}
+        Some(SupervisorState::Starting) => rs.state = "starting".to_string(),
+        Some(SupervisorState::Running {
+            initialized_at_elapsed_ms,
+        }) => {
+            rs.state = "running".to_string();
+            rs.initialized_ms = Some(initialized_at_elapsed_ms as u64);
+        }
+        Some(SupervisorState::Restarting { attempt }) => {
+            rs.state = "restarting".to_string();
+            rs.restart_attempt = Some(attempt);
+        }
+        Some(SupervisorState::Failed { reason }) => {
+            rs.state = "failed".to_string();
+            rs.failed_reason = Some(reason);
+        }
+        Some(SupervisorState::Shutdown) => rs.state = "shutdown".to_string(),
+    }
+    rs
+}
+
+/// Read the live supervisor state from the global brain slot and map it
+/// to a [`RuntimeStatus`]. Returns `"disabled"` when no slot/supervisor.
+pub async fn runtime_status() -> RuntimeStatus {
+    let supervisor = match crate::init_brain::CURRENT_BRAIN_SLOT.get() {
+        Some(slot) => slot.read().await.as_ref().map(|b| b.supervisor.clone()),
+        None => None,
+    };
+    match supervisor {
+        Some(sup) => runtime_from_state(Some(sup.state().await)),
+        None => runtime_from_state(None),
+    }
 }
 
 /// Per-process state: tracks the currently running wizard task so
@@ -443,6 +512,7 @@ pub async fn status_probe(brain_dir: &Path) -> WizardStatusReport {
         brain_initialized,
         brain_dir: brain_dir.to_path_buf(),
         overall,
+        runtime: runtime_status().await,
     }
 }
 
@@ -1289,6 +1359,57 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
     use tempfile::tempdir;
+
+    #[test]
+    fn runtime_from_state_maps_every_variant() {
+        use crate::gbrain::supervisor::SupervisorState;
+        let d = runtime_from_state(None);
+        assert_eq!(d.state, "disabled");
+        assert!(
+            d.restart_attempt.is_none() && d.failed_reason.is_none() && d.initialized_ms.is_none()
+        );
+        let starting = runtime_from_state(Some(SupervisorState::Starting));
+        assert_eq!(starting.state, "starting");
+        let running = runtime_from_state(Some(SupervisorState::Running {
+            initialized_at_elapsed_ms: 1234,
+        }));
+        assert_eq!(running.state, "running");
+        assert_eq!(running.initialized_ms, Some(1234));
+        let restarting = runtime_from_state(Some(SupervisorState::Restarting { attempt: 2 }));
+        assert_eq!(restarting.state, "restarting");
+        assert_eq!(restarting.restart_attempt, Some(2));
+        let failed = runtime_from_state(Some(SupervisorState::Failed {
+            reason: "boom".into(),
+        }));
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.failed_reason.as_deref(), Some("boom"));
+        let shutdown = runtime_from_state(Some(SupervisorState::Shutdown));
+        assert_eq!(shutdown.state, "shutdown");
+    }
+
+    #[test]
+    fn runtime_status_serializes_omitting_none() {
+        let v = serde_json::to_value(runtime_from_state(Some(
+            crate::gbrain::supervisor::SupervisorState::Starting,
+        )))
+        .unwrap();
+        assert_eq!(v["state"], "starting");
+        assert!(v.get("restart_attempt").is_none());
+        assert!(v.get("failed_reason").is_none());
+        assert!(v.get("initialized_ms").is_none());
+    }
+
+    #[test]
+    fn wizard_step_new_variants_serialize_snake_case() {
+        assert_eq!(
+            serde_json::to_value(WizardStep::Restart).unwrap(),
+            serde_json::json!("restart")
+        );
+        assert_eq!(
+            serde_json::to_value(WizardStep::UpdateGbrain).unwrap(),
+            serde_json::json!("update_gbrain")
+        );
+    }
 
     #[tokio::test]
     async fn sync_ready_writes_whitelist_gitignore_and_baseline_commit() {
