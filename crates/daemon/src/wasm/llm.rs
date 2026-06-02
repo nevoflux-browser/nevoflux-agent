@@ -3611,7 +3611,7 @@ async fn stream_kimi_agent(
 async fn stream_acp_completion(
     _api_key: &str,
     model: &str,
-    request: LlmChatRequest,
+    mut request: LlmChatRequest,
     tx: mpsc::Sender<LlmStreamChunk>,
     provider: ProviderType,
     _base_url: Option<&str>,
@@ -3777,6 +3777,15 @@ async fn stream_acp_completion(
     // tool XML into the prompt (it would bloat context by ~30KB and may exceed
     // the model's context window).
     let skip_tool_xml = use_mcp_bridge || matches!(provider, ProviderType::OpenClaw);
+
+    // Explicit `/skillname` invocations bypass the native slash router in
+    // server.rs when an ACP provider is active. Resolve and inject the skill
+    // (and its declared convention files) here — the single chokepoint every
+    // ACP-bound prompt passes through — so explicit invocations work
+    // deterministically. No-op when there's no leading slash command.
+    if let Some(services) = host_services.as_ref() {
+        apply_acp_skill_command(&mut request, services).await;
+    }
 
     // Retry with progressive compression on context length errors.
     for level in 0..=2u8 {
@@ -4060,6 +4069,190 @@ fn build_acp_content_mcp(
     }
 
     blocks
+}
+
+// ---------------------------------------------------------------------------
+// ACP `/skill` router
+//
+// ACP providers (claude-code, gemini-cli, openclaw) delegate the turn to an
+// external agent and bypass the native `/skill` slash router in `server.rs`.
+// Without help, an explicit `/skillname …` arrives at that agent as raw text
+// and is treated as a normal question. The helpers below resolve the skill at
+// the single ACP send chokepoint and fold its instructions (and any declared
+// convention files) into the request, so explicit invocations work
+// deterministically regardless of provider.
+// ---------------------------------------------------------------------------
+
+/// Parse a leading `/skillname args` slash command from a user message.
+///
+/// Returns `(skill_name, args)` when the message begins with `/` followed by a
+/// non-empty name; `args` is the trimmed remainder after the first whitespace
+/// (possibly empty). Returns `None` for messages that don't start with `/`, or
+/// for a bare `/`.
+fn parse_slash_command(message: &str) -> Option<(&str, &str)> {
+    let rest = message.trim_start().strip_prefix('/')?;
+    let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let name = &rest[..name_end];
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, rest[name_end..].trim()))
+}
+
+/// Build the system-prompt prefix and cleaned user message for an explicitly
+/// invoked skill. The prefix mirrors the native agent's `CRITICAL_INSTRUCTIONS`
+/// block (see `builtin-wasm/src/agent.rs`) so the ACP agent treats the skill
+/// body as highest-priority guidance; resolved `conventions` are appended so
+/// they're guaranteed in context rather than relying on the agent to read them.
+fn build_skill_injection(
+    skill_name: &str,
+    args: &str,
+    skill_body: &str,
+    conventions: &[(String, String)],
+) -> (String, String) {
+    let mut prefix = format!(
+        "<CRITICAL_INSTRUCTIONS priority=\"highest\">\n\
+         The user invoked the \"{name}\" skill. These instructions MUST be followed exactly and \
+         take priority over all other guidance.\n\n<skill name=\"{name}\">\n{body}\n</skill>\n",
+        name = skill_name,
+        body = skill_body,
+    );
+    for (label, content) in conventions {
+        prefix.push_str(&format!(
+            "\n<convention source=\"{label}\">\n{content}\n</convention>\n"
+        ));
+    }
+    prefix.push_str("</CRITICAL_INSTRUCTIONS>");
+
+    let cleaned = if args.is_empty() {
+        format!("(Invoked the {skill_name} skill — follow its instructions.)")
+    } else {
+        args.to_string()
+    };
+    (prefix, cleaned)
+}
+
+/// When the last user message is an explicit `/skillname` invocation, fold the
+/// skill's instructions (and its declared convention files) into the request so
+/// they reach ACP agents that bypass the native `/skill` router. No-op when
+/// there is no leading slash command or the skill is unknown — so messages
+/// already routed natively (slash already stripped) are left untouched, which
+/// avoids double injection.
+async fn apply_acp_skill_command(
+    request: &mut LlmChatRequest,
+    services: &crate::wasm::services::HostServices,
+) {
+    let Some(idx) = request.messages.iter().rposition(|m| m.role == "user") else {
+        return;
+    };
+    let (name, args) = match parse_slash_command(&request.messages[idx].content) {
+        Some((n, a)) => (n.to_string(), a.to_string()),
+        None => return,
+    };
+
+    // Resolve the skill + its convention dependencies, cloning owned strings so
+    // we don't hold the registry lock while mutating the request.
+    let (skill_body, conventions) = {
+        let registry = services.skills.read().await;
+        let Some(skill) = registry.get(&name) else {
+            tracing::debug!(
+                "ACP skill router: '/{}' is not a known skill, leaving as-is",
+                name
+            );
+            return;
+        };
+        let body = skill.content.clone();
+        let mut conv: Vec<(String, String)> = Vec::new();
+        for dep in &skill.metadata.dependencies {
+            match dep.split_once(':') {
+                // "skill:relative/path.md" — a specific convention file.
+                Some((dep_skill, rel)) => match registry.read_auxiliary_file(dep_skill, rel) {
+                    Ok(content) => conv.push((dep.clone(), content)),
+                    Err(e) => tracing::warn!(
+                        "ACP skill router: skill '{}' dependency '{}' unreadable: {}",
+                        name,
+                        dep,
+                        e
+                    ),
+                },
+                // Bare "skill" — inject that skill's whole body.
+                None => {
+                    if let Some(dep_skill) = registry.get(dep) {
+                        conv.push((dep.clone(), dep_skill.content.clone()));
+                    }
+                }
+            }
+        }
+        (body, conv)
+    };
+
+    let conv_count = conventions.len();
+    let (prefix, cleaned) = build_skill_injection(&name, &args, &skill_body, &conventions);
+    request.system = Some(match request.system.take() {
+        Some(existing) => format!("{prefix}\n\n{existing}"),
+        None => prefix,
+    });
+    request.messages[idx].content = cleaned;
+
+    tracing::info!(
+        "ACP skill router: injected skill '{}' ({} convention file(s))",
+        name,
+        conv_count
+    );
+}
+
+#[cfg(test)]
+mod acp_skill_router_tests {
+    use super::{build_skill_injection, parse_slash_command};
+
+    #[test]
+    fn parses_basic_slash_command() {
+        assert_eq!(
+            parse_slash_command("/brain-recall 感冒刮哪里"),
+            Some(("brain-recall", "感冒刮哪里"))
+        );
+        assert_eq!(parse_slash_command("/brain-recall"), Some(("brain-recall", "")));
+        assert_eq!(
+            parse_slash_command("  /brain-recall   hi  "),
+            Some(("brain-recall", "hi"))
+        );
+    }
+
+    #[test]
+    fn rejects_non_commands() {
+        assert_eq!(parse_slash_command("what do I know about X"), None);
+        assert_eq!(parse_slash_command("/"), None);
+        assert_eq!(parse_slash_command("/   "), None);
+        assert_eq!(parse_slash_command("https://example.com"), None);
+    }
+
+    #[test]
+    fn injection_wraps_body_and_cleans_message() {
+        let (prefix, cleaned) =
+            build_skill_injection("brain-recall", "感冒刮哪里", "SKILL BODY", &[]);
+        assert!(prefix.contains("CRITICAL_INSTRUCTIONS"));
+        assert!(prefix.contains("<skill name=\"brain-recall\">"));
+        assert!(prefix.contains("SKILL BODY"));
+        assert_eq!(cleaned, "感冒刮哪里");
+    }
+
+    #[test]
+    fn injection_includes_conventions() {
+        let conv = vec![(
+            "brain:conventions/brain-first.md".to_string(),
+            "PAGE MODEL".to_string(),
+        )];
+        let (prefix, _) = build_skill_injection("brain-recall", "q", "BODY", &conv);
+        assert!(prefix.contains("<convention source=\"brain:conventions/brain-first.md\">"));
+        assert!(prefix.contains("PAGE MODEL"));
+    }
+
+    #[test]
+    fn injection_empty_args_gets_hint_not_slash() {
+        let (_, cleaned) = build_skill_injection("brain-recall", "", "BODY", &[]);
+        assert!(cleaned.contains("brain-recall"));
+        assert!(!cleaned.starts_with('/'));
+    }
 }
 
 /// Build a kimi-agent prompt string from an LLM chat request.
