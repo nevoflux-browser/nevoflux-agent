@@ -121,3 +121,53 @@ pub fn handle_pack_validate(params: &Value) -> Value {
         }
     }
 }
+
+/// pack.list — enumerate installed packs by reading {config}/packs/*/receipt.json.
+pub fn handle_pack_list(params: &Value) -> Value {
+    let request_id = params.get("request_id").and_then(|v| v.as_str()).unwrap_or("");
+    let paths = crate::paths::resolve_from_daemon();
+    let mut packs = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(paths.packs_dir()) {
+        for e in entries.flatten() {
+            let receipt = e.path().join("receipt.json");
+            if let Ok(s) = std::fs::read_to_string(&receipt) {
+                if let Ok(r) = serde_json::from_str::<nevoflux_pack::receipt::Receipt>(&s) {
+                    packs.push(serde_json::json!({
+                        "name": r.pack, "version": r.version.to_string(),
+                        "installed_at": r.installed_at
+                    }));
+                }
+            }
+        }
+    }
+    ok(request_id, "pack.list", serde_json::json!({ "packs": packs }))
+}
+
+/// pack.status — receipt summary for one pack.
+pub fn handle_pack_status(params: &Value) -> Value {
+    let request_id = params.get("request_id").and_then(|v| v.as_str()).unwrap_or("");
+    let name = match params.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return err(request_id, "pack.status", "MISSING_PARAM", "name required"),
+    };
+    let paths = crate::paths::resolve_from_daemon();
+    match std::fs::read_to_string(paths.receipt_path(name)) {
+        Ok(s) => match serde_json::from_str::<nevoflux_pack::receipt::Receipt>(&s) {
+            Ok(r) => ok(
+                request_id,
+                "pack.status",
+                serde_json::json!({
+                    "installed": true, "version": r.version.to_string(),
+                    "files": r.files.len(), "artifacts": r.artifacts,
+                    "seeded_pages": r.seeded_pages
+                }),
+            ),
+            Err(e) => err(request_id, "pack.status", "BAD_RECEIPT", &e.to_string()),
+        },
+        Err(_) => ok(
+            request_id,
+            "pack.status",
+            serde_json::json!({ "installed": false }),
+        ),
+    }
+}
