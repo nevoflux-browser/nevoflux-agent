@@ -294,8 +294,27 @@ pub async fn handle_pack_install(
             Err(e) => err(&request_id, "pack.install", "JOIN_ERROR", &e.to_string()),
         }
     } else {
+        let op_id2 = op_id.clone();
+        let bus = crate::kb_wizard::CURRENT_EVENT_BUS.get().cloned();
         tokio::spawn(async move {
-            let _ = tokio::task::spawn_blocking(run).await;
+            let failure = match tokio::task::spawn_blocking(run).await {
+                Ok(Ok(_)) => None, // success: lifecycle already emitted a terminal Ok frame
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(e) => Some(format!("join error: {e}")),
+            };
+            // Early lifecycle returns (compat/capability/idempotency) don't emit a
+            // terminal frame; publish one here so a UI awaiting completion via the
+            // progress stream never hangs.
+            if let (Some(log), Some(bus)) = (failure, bus) {
+                let frame = PackProgress {
+                    op_id: op_id2,
+                    phase: "Commit".to_string(),
+                    status: "Failed".to_string(),
+                    progress_pct: 100,
+                    log,
+                };
+                publish_progress(&bus, &frame).await;
+            }
         });
         ok(
             &request_id,

@@ -183,9 +183,11 @@ impl PackHost for PackHostImpl {
         ))
     }
     fn remove_source(&self, _n: &str) -> PackResult<()> {
-        Err(PackError::Host(
-            "knowledge source removal deferred (M5)".into(),
-        ))
+        // Knowledge import is rejected at install time, so no pack-owned source
+        // can exist; removal is a no-op until gbrain source-mapping lands (M5).
+        // Returning Ok keeps uninstall robust even against a hand-crafted receipt.
+        tracing::warn!("pack remove_source called but source management is deferred (M5); no-op");
+        Ok(())
     }
     fn upsert_artifact(&self, spec: &ArtifactSpec) -> PackResult<()> {
         use nevoflux_storage::{ArtifactRepository, CreateArtifactParams};
