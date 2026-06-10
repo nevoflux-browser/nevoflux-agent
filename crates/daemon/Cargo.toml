@@ -129,6 +129,9 @@ chacha20poly1305 = { workspace = true }
 tar = "0.4"
 zstd = "0.13"
 
+# Pack GitHub install — gunzip GitHub codeload tarballs (tempfile already a dep).
+flate2 = "1"
+
 # Native file dialog
 rfd = "0.15"
 

@@ -75,6 +75,7 @@ entry = "index.html"
     let opts = InstallOpts {
         force: false,
         now_utc: "2026-06-09T00:00:00Z".into(),
+        ..Default::default()
     };
     let handle = tokio::runtime::Handle::current();
     let receipt = {
