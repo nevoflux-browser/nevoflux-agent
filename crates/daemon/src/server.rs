@@ -6358,6 +6358,9 @@ async fn handle_chat_message(
                 "mcp.disconnect" => handle_mcp_disconnect(&params).await,
                 "file.pick" => handle_file_pick(&params).await,
                 "skill.list" => handle_skill_list(services, &params).await,
+                // Pack protocol foundations (H1/H2).
+                "daemon.info" => handle_daemon_info(&params),
+                "skill.reload" => handle_skill_reload(services, &params).await,
                 // LLM provider configuration commands
                 "config.llm.list" => handle_config_llm_list(&params).await,
                 "config.llm.get" => handle_config_llm_get(&params).await,
@@ -8340,6 +8343,96 @@ async fn handle_skill_list(
             "data": { "skills": skills }
         }
     })
+}
+
+/// H1: report the daemon's authoritative `ResolvedPaths` (version + every path
+/// a pack install resolves against). The config/data dirs are resolved the same
+/// way the rest of the daemon resolves them, then aggregated by
+/// `crate::paths::build_resolved_paths`.
+fn handle_daemon_info(params: &serde_json::Value) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Config dir: ~/.config/nevoflux (see config.rs).
+    let config_dir = dirs::config_dir()
+        .map(|d| d.join("nevoflux"))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    // Data dir: NEVOFLUX_DATA_DIR override, else the platform data dir
+    // (mirrors the resolution used for the trace writer in this file).
+    let data_dir = std::env::var("NEVOFLUX_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            directories::ProjectDirs::from("com", "nevoflux", "nevoflux")
+                .map(|dirs| dirs.data_dir().to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+        });
+
+    let paths = crate::paths::build_resolved_paths(&config_dir, &data_dir);
+
+    serde_json::json!({
+        "type": "system_response",
+        "payload": {
+            "request_id": request_id,
+            "command": "daemon.info",
+            "success": true,
+            "data": {
+                "version": paths.version.to_string(),
+                "config_dir": paths.config_dir,
+                "skills_dir": paths.skills_dir,
+                "canvas_tools_dir": paths.canvas_tools_dir,
+                "config_file": paths.config_file,
+                "data_dir": paths.data_dir,
+                "db_path": paths.db_path,
+            }
+        }
+    })
+}
+
+/// H2: re-scan the skills registry so a pack's freshly-placed (or removed)
+/// skill files activate without a daemon restart. Reuses the same shared
+/// `SkillRegistry` that `skill.list` reads, mirroring `SkillsManager::reload`.
+async fn handle_skill_reload(
+    services: &HostServices,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let result = {
+        let mut registry = services.skills.write().await;
+        registry.reload().map(|_| registry.len())
+    };
+
+    match result {
+        Ok(loaded) => {
+            info!("skill.reload: reloaded {} skills", loaded);
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "skill.reload",
+                    "success": true,
+                    "data": { "loaded": loaded }
+                }
+            })
+        }
+        Err(e) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "skill.reload",
+                "success": false,
+                "error": { "code": "SKILL_RELOAD_FAILED", "message": e.to_string() }
+            }
+        }),
+    }
 }
 
 // ============================================
