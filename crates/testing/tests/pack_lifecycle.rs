@@ -56,7 +56,7 @@ fn install_places_files_and_seeds() {
     let dir = write_fixture();
     let m = Manifest::parse(MANIFEST).unwrap();
     let host = MockPackHost::new(paths());
-    let opts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into() };
+    let opts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into(), ..Default::default() };
 
     let receipt = install(&host, &m, MANIFEST, dir.path(), &opts).unwrap();
 
@@ -72,7 +72,7 @@ fn install_seed_is_idempotent_against_existing_user_page() {
     let m = Manifest::parse(MANIFEST).unwrap();
     let host = MockPackHost::new(paths());
     host.seed_user_page("demo/cv", "USER EDITED");
-    let opts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into() };
+    let opts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into(), ..Default::default() };
 
     let receipt = install(&host, &m, MANIFEST, dir.path(), &opts).unwrap();
 
@@ -85,7 +85,7 @@ fn duplicate_install_same_version_is_rejected() {
     let dir = write_fixture();
     let m = Manifest::parse(MANIFEST).unwrap();
     let host = MockPackHost::new(paths());
-    let opts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into() };
+    let opts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into(), ..Default::default() };
     install(&host, &m, MANIFEST, dir.path(), &opts).unwrap();
 
     let err = install(&host, &m, MANIFEST, dir.path(), &opts).unwrap_err();
@@ -99,7 +99,7 @@ fn uninstall_removes_pack_files_but_keeps_seed_by_default() {
     let dir = write_fixture();
     let m = Manifest::parse(MANIFEST).unwrap();
     let host = MockPackHost::new(paths());
-    let iopts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into() };
+    let iopts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into(), ..Default::default() };
     install(&host, &m, MANIFEST, dir.path(), &iopts).unwrap();
     assert_eq!(host.file_count(), 1);
 
@@ -115,7 +115,7 @@ fn purge_data_removes_seed_pages() {
     let dir = write_fixture();
     let m = Manifest::parse(MANIFEST).unwrap();
     let host = MockPackHost::new(paths());
-    let iopts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into() };
+    let iopts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into(), ..Default::default() };
     install(&host, &m, MANIFEST, dir.path(), &iopts).unwrap();
 
     uninstall(&host, "demo", &UninstallOpts { purge_data: true, force: false }).unwrap();
@@ -156,7 +156,7 @@ unlock = { password = "x" }
 "#;
     let m = Manifest::parse(man).unwrap();
     let host = MockPackHost::new(paths());
-    let opts = InstallOpts { force: false, now_utc: "t".into() };
+    let opts = InstallOpts { force: false, now_utc: "t".into(), ..Default::default() };
 
     let receipt = install(&host, &m, man, dir.path(), &opts).unwrap();
     assert_eq!(host.source_count(), 1, "ReadOnly source registered on install");
@@ -173,7 +173,7 @@ fn update_refreshes_files_keeps_user_data() {
     let dir = write_fixture();
     let m = Manifest::parse(MANIFEST).unwrap();
     let host = MockPackHost::new(paths());
-    let iopts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into() };
+    let iopts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into(), ..Default::default() };
     install(&host, &m, MANIFEST, dir.path(), &iopts).unwrap();
 
     // Simulate the user editing their seeded page.
@@ -213,7 +213,7 @@ fn install_skips_symlinks_in_skills_dir() {
 
     let m = Manifest::parse(MANIFEST).unwrap();
     let host = MockPackHost::new(paths());
-    let opts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into() };
+    let opts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into(), ..Default::default() };
     install(&host, &m, MANIFEST, dir.path(), &opts).unwrap();
 
     // Only the one legit SKILL.md should have been placed; symlinks skipped.
@@ -228,7 +228,7 @@ fn failed_update_does_not_leave_stale_receipt() {
     let dir = write_fixture();
     let m = Manifest::parse(MANIFEST).unwrap();
     let host = MockPackHost::new(paths());
-    let iopts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into() };
+    let iopts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into(), ..Default::default() };
     install(&host, &m, MANIFEST, dir.path(), &iopts).unwrap();
     assert!(host.read_receipt("demo").unwrap().is_some(), "installed receipt present");
 

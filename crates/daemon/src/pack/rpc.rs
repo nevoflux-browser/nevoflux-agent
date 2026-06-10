@@ -271,7 +271,11 @@ pub async fn handle_pack_install(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let opts = InstallOpts { force, now_utc };
+    let opts = InstallOpts {
+        force,
+        now_utc,
+        ..Default::default()
+    };
 
     // Capture the runtime handle BEFORE spawn_blocking so the host's brain/bus
     // block_on bridges always resolve a runtime (Handle::current() inside a

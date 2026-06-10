@@ -38,6 +38,14 @@ pub struct Receipt {
     pub seeded_pages: Vec<String>,
     #[serde(default)]
     pub imported_sources: Vec<String>,
+    /// Provenance: where this pack came from (e.g. "github:u/r@ref"). None for
+    /// local-directory installs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// sha256 (hex) of the downloaded source tarball, when installed from a
+    /// remote source. None for local installs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tarball_sha256: Option<String>,
 }
 
 impl Receipt {
@@ -69,6 +77,8 @@ mod tests {
             artifacts: vec!["demo-dashboard".into()],
             seeded_pages: vec!["demo/cv".into()],
             imported_sources: vec!["demo".into()],
+            source: None,
+            tarball_sha256: None,
         };
         let json = serde_json::to_string_pretty(&r).unwrap();
         let back: Receipt = serde_json::from_str(&json).unwrap();
@@ -81,5 +91,41 @@ mod tests {
             Receipt::sha256_hex(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn receipt_round_trips_with_source_provenance() {
+        let mut r = Receipt {
+            receipt_version: RECEIPT_VERSION.into(),
+            protocol: "pack-protocol/0.1".into(),
+            pack: "demo".into(),
+            namespace: "demo".into(),
+            version: Version::new(0, 1, 0),
+            installed_at: "t".into(),
+            nevoflux_version: Version::new(0, 3, 0),
+            paths_source: PathsSource::Daemon,
+            files: vec![],
+            artifacts: vec![],
+            seeded_pages: vec![],
+            imported_sources: vec![],
+            source: Some("github:u/r/sub@v1".into()),
+            tarball_sha256: Some("ab".into()),
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        let back: Receipt = serde_json::from_str(&json).unwrap();
+        assert_eq!(r, back);
+
+        // Backward compat: a receipt JSON missing the new fields still parses.
+        r.source = None;
+        r.tarball_sha256 = None;
+        let legacy = serde_json::json!({
+            "receipt_version": "1", "protocol": "pack-protocol/0.1", "pack": "demo",
+            "namespace": "demo", "version": "0.1.0", "installed_at": "t",
+            "nevoflux_version": "0.3.0", "paths_source": "daemon"
+        })
+        .to_string();
+        let parsed: Receipt = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(parsed.source, None);
+        assert_eq!(parsed.tarball_sha256, None);
     }
 }

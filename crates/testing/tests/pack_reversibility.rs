@@ -59,7 +59,7 @@ proptest! {
         let m = Manifest::parse(&man).unwrap();
         let host = MockPackHost::new(paths());
 
-        install(&host, &m, &man, dir.path(), &InstallOpts { force: false, now_utc: "t".into() }).unwrap();
+        install(&host, &m, &man, dir.path(), &InstallOpts { force: false, now_utc: "t".into(), ..Default::default() }).unwrap();
         uninstall(&host, "demo", &UninstallOpts { purge_data: true, force: false }).unwrap();
 
         prop_assert_eq!(host.file_count(), 0);

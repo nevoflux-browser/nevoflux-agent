@@ -15,6 +15,11 @@ pub struct InstallOpts {
     pub force: bool,
     /// Caller-supplied UTC timestamp (engine is time-free for determinism).
     pub now_utc: String,
+    /// Provenance string recorded into the receipt (daemon supplies it for
+    /// remote installs; None for local).
+    pub source: Option<String>,
+    /// sha256 of the source tarball, recorded into the receipt for remote installs.
+    pub tarball_sha256: Option<String>,
 }
 
 /// Records what was applied so we can roll back in reverse.
@@ -79,6 +84,8 @@ pub fn install(
         artifacts: Vec::new(),
         seeded_pages: Vec::new(),
         imported_sources: Vec::new(),
+        source: opts.source.clone(),
+        tarball_sha256: opts.tarball_sha256.clone(),
     };
 
     // Run the mutating phases; on any error, roll back and abort.
@@ -354,7 +361,11 @@ pub fn update(
 
     // Fresh install (force=true so the same-version guard doesn't block). Seed
     // is only-if-absent, so existing user pages survive untouched.
-    let opts = InstallOpts { force: true, now_utc: now_utc.to_string() };
+    let opts = InstallOpts {
+        force: true,
+        now_utc: now_utc.to_string(),
+        ..Default::default()
+    };
     match install(host, manifest, raw_toml, pack_dir, &opts) {
         Ok(receipt) => Ok(receipt),
         Err(e) => {
