@@ -31,3 +31,5 @@ thiserror.workspace = true
 # Testing
 proptest.workspace = true
 test-case.workspace = true
+tempfile = "3"
+semver = { version = "1", features = ["serde"] }
