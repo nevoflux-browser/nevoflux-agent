@@ -39,3 +39,6 @@ docs/testing/
 # Spike workspace (throwaway exploration; see spike/knowledge-base-v1 branch)
 spike/
 
+# Eval run reports (generated artifacts; keep eval/benchmarks tracked)
+eval/reports/
+

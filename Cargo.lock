@@ -3534,6 +3534,7 @@ dependencies = [
  "directories",
  "dirs 5.0.1",
  "ffmpeg-sidecar",
+ "flate2",
  "futures",
  "glob",
  "grep-matcher",
