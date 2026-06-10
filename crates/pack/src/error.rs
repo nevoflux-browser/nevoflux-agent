@@ -2,6 +2,8 @@
 
 use semver::Version;
 
+use crate::capability::Violation;
+
 pub type PackResult<T> = Result<T, PackError>;
 
 #[derive(Debug, thiserror::Error)]
@@ -18,4 +20,6 @@ pub enum PackError {
     NotInstalled(String),
     #[error("install rolled back: {reason}")]
     RolledBack { reason: String },
+    #[error("capability check failed: {0:?}")]
+    Capability(Vec<Violation>),
 }
