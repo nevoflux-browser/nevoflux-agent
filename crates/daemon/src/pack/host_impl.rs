@@ -108,16 +108,49 @@ impl PackHost for PackHostImpl {
         Ok(())
     }
 
-    // --- filled in C2 (artifacts), C3 (brain), C4 (skills/progress) ---
-    fn page_exists(&self, _slug: &str) -> PackResult<bool> {
-        unimplemented!("C3")
+    // --- brain seed ops (async via block_on, valid on a spawn_blocking thread) ---
+    fn page_exists(&self, slug: &str) -> PackResult<bool> {
+        let engine = self
+            .brain
+            .as_ref()
+            .ok_or_else(|| PackError::Host("GBrain not available; cannot seed pages".into()))?
+            .clone();
+        let slug = slug.to_string();
+        let res = self.handle.block_on(async move { engine.get(&slug).await });
+        match res {
+            Ok(_) => Ok(true),
+            Err(nevoflux_brain::BrainError::NotFound(_)) => Ok(false),
+            Err(e) => Err(Self::io_err("page_exists", e)),
+        }
     }
-    fn put_page(&self, _slug: &str, _body: &str) -> PackResult<()> {
-        unimplemented!("C3")
+
+    fn put_page(&self, slug: &str, body: &str) -> PackResult<()> {
+        let engine = self
+            .brain
+            .as_ref()
+            .ok_or_else(|| PackError::Host("GBrain not available; cannot seed pages".into()))?
+            .clone();
+        // `BrainPage::from_markdown` takes owned String values.
+        let page = nevoflux_brain::BrainPage::from_markdown(slug.to_string(), body.to_string());
+        self.handle
+            .block_on(async move { engine.put(page).await })
+            .map_err(|e| Self::io_err("put_page", e))?;
+        Ok(())
     }
-    fn delete_page(&self, _slug: &str) -> PackResult<()> {
-        unimplemented!("C3")
+
+    fn delete_page(&self, slug: &str) -> PackResult<()> {
+        let engine = self
+            .brain
+            .as_ref()
+            .ok_or_else(|| PackError::Host("GBrain not available".into()))?
+            .clone();
+        let slug = slug.to_string();
+        self.handle
+            .block_on(async move { engine.delete(&slug).await })
+            .map_err(|e| Self::io_err("delete_page", e))?;
+        Ok(())
     }
+
     fn import_source(&self, _n: &str, _b: &[u8], _u: &PackUnlock) -> PackResult<ImportOutcome> {
         Err(PackError::Host(
             "knowledge import is deferred until gbrain source-mapping lands (M5)".into(),
