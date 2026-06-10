@@ -143,7 +143,7 @@ fn place_phase(
     if let Some(ct) = &manifest.components.canvas_tools {
         for f in &ct.files {
             let src = pack_dir.join(f);
-            let bytes = std::fs::read(&src).map_err(|e| PackError::Host(format!("{}: {e}", src.display())))?;
+            let bytes = read_nonsymlink_file(&src)?;
             let base = Path::new(f).file_name().ok_or_else(|| PackError::Manifest(format!("bad canvas-tool path {f}")))?;
             let dest = paths.canvas_tools_dir.join(base);
             // Defense-in-depth: writes must stay under the canvas-tools root.
@@ -174,6 +174,31 @@ fn assert_under(dest: &Path, root: &Path) -> PackResult<()> {
     }
 }
 
+/// Read a single pack source file, refusing symlinks. A pack's manifest is
+/// UNTRUSTED: even when a `from`/`files` path is lexically in-bounds (no `..`),
+/// it can name a symlink whose target is outside the pack (e.g. `evil ->
+/// /etc/passwd`). `read_dir_flat` already skips symlinks during directory
+/// scans, but the seed/knowledge/canvas-tool reads address a file by path, so
+/// they must guard here too. We use `symlink_metadata` (does NOT traverse the
+/// link) and reject before reading.
+fn read_nonsymlink_file(path: &Path) -> PackResult<Vec<u8>> {
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| PackError::Host(format!("{}: {e}", path.display())))?;
+    if meta.file_type().is_symlink() {
+        return Err(PackError::Host(format!(
+            "refusing to read symlinked pack file: {}",
+            path.display()
+        )));
+    }
+    std::fs::read(path).map_err(|e| PackError::Host(format!("{}: {e}", path.display())))
+}
+
+/// String variant of `read_nonsymlink_file` (refuses symlinks, then UTF-8).
+fn read_nonsymlink_to_string(path: &Path) -> PackResult<String> {
+    let bytes = read_nonsymlink_file(path)?;
+    String::from_utf8(bytes).map_err(|e| PackError::Host(format!("{}: {e}", path.display())))
+}
+
 /// Resolve `.`/`..` components lexically (no FS access, no symlink resolution).
 fn lexical_normalize(p: &Path) -> PathBuf {
     use std::path::Component;
@@ -202,7 +227,7 @@ fn seed_phase(
         if host.page_exists(&s.slug)? {
             continue; // idempotent: only-if-absent
         }
-        let body = std::fs::read_to_string(pack_dir.join(&s.from))
+        let body = read_nonsymlink_to_string(&pack_dir.join(&s.from))
             .map_err(|e| PackError::Host(format!("seed {}: {e}", s.from)))?;
         host.put_page(&s.slug, &body)?;
         applied.pages.push(s.slug.clone());
@@ -220,7 +245,7 @@ fn knowledge_phase(
 ) -> PackResult<()> {
     if let Some(k) = &manifest.components.knowledge {
         emit(host, PackPhase::Knowledge, PhaseStatus::Running, 65, "importing knowledge");
-        let bytes = std::fs::read(pack_dir.join(&k.from))
+        let bytes = read_nonsymlink_file(&pack_dir.join(&k.from))
             .map_err(|e| PackError::Host(format!("knowledge {}: {e}", k.from)))?;
         let unlock = match &k.unlock {
             UnlockSpec::Key { key } => PackUnlock::KeyHex(key.clone()),

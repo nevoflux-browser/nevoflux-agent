@@ -9,6 +9,9 @@ use nevoflux_pack::paths::ResolvedPaths;
 use semver::Version;
 use std::path::PathBuf;
 
+use nevoflux_pack::lifecycle::{install, InstallOpts};
+use nevoflux_testing::MockPackHost;
+
 fn paths() -> ResolvedPaths {
     ResolvedPaths {
         version: Version::new(0, 3, 0),
@@ -130,5 +133,48 @@ fn dashboard_artifact_id_with_pack_prefix_is_valid() {
     assert!(
         capability::validate(&m, &paths(), &raw).is_ok(),
         "artifact id prefixed by pack name must validate"
+    );
+}
+
+// --- M2: source-FILE reads must refuse symlinks. ---
+//
+// The lexical `normalize_rel`/capability check passes for `from = "evil"` when
+// `evil` is a symlink (it's not a traversal *string*), so a remote pack could
+// point a seed/knowledge/canvas-tool file at a symlink to e.g. /etc/passwd and
+// have the target read + seeded into GBrain. The lifecycle must reject symlinks
+// at read time, not just skip them during directory scans.
+#[cfg(unix)]
+#[test]
+fn seed_from_symlink_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("components/skills/x")).unwrap();
+    std::fs::write(root.join("components/skills/x/SKILL.md"), "# x").unwrap();
+    std::fs::create_dir_all(root.join("components/seed")).unwrap();
+
+    // A secret outside the pack, and a seed `from` that is a symlink to it.
+    let secret = root.join("secret.txt");
+    std::fs::write(&secret, "TOP SECRET").unwrap();
+    symlink(&secret, root.join("components/seed/cv.md")).unwrap();
+
+    let man = "[pack]\nname=\"demo\"\nversion=\"0.1.0\"\nprotocol=\"pack-protocol/0.1\"\nmin_nevoflux=\"0.3.0\"\n\
+        [components.skills]\ndir=\"components/skills\"\n\
+        [[components.seed]]\nslug=\"demo/cv\"\nfrom=\"components/seed/cv.md\"\n\
+        [components.protected]\nprefixes=[\"demo/\"]\n";
+    let m = Manifest::parse(man).unwrap();
+    let host = MockPackHost::new(paths());
+    let opts = InstallOpts { force: false, now_utc: "t".into(), ..Default::default() };
+
+    let err = install(&host, &m, man, root, &opts).unwrap_err();
+    // Install rolls back on the seed read error; the secret must not be seeded.
+    assert!(
+        matches!(err, nevoflux_pack::PackError::RolledBack { .. }),
+        "symlinked seed.from must fail the install, got {err:?}"
+    );
+    assert!(
+        !host.has_page("demo/cv"),
+        "symlink target must never be seeded into GBrain"
     );
 }
