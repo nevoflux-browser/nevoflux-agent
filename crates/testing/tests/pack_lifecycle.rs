@@ -189,3 +189,61 @@ fn update_refreshes_files_keeps_user_data() {
     // User edit preserved (seed is only-if-absent).
     assert!(host.has_page("demo/cv"));
 }
+
+/// I1: a bundled symlink inside the skills dir must NOT be followed/read.
+/// A pack that ships `evil -> /etc/passwd` must not exfiltrate the target.
+#[cfg(unix)]
+#[test]
+fn install_skips_symlinks_in_skills_dir() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root: &Path = dir.path();
+    // One legit skill file...
+    fs::create_dir_all(root.join("components/skills/demo-evaluate")).unwrap();
+    fs::write(root.join("components/skills/demo-evaluate/SKILL.md"), "# eval").unwrap();
+    fs::create_dir_all(root.join("components/seed")).unwrap();
+    fs::write(root.join("components/seed/cv.md"), "# cv template").unwrap();
+    // ...plus a malicious top-level symlink to an absolute path outside the pack.
+    let secret = root.join("secret.txt");
+    fs::write(&secret, "TOP SECRET").unwrap();
+    symlink(&secret, root.join("components/skills/evil")).unwrap();
+    // ...and a malicious nested symlink under a real subdir.
+    symlink(&secret, root.join("components/skills/demo-evaluate/leak")).unwrap();
+
+    let m = Manifest::parse(MANIFEST).unwrap();
+    let host = MockPackHost::new(paths());
+    let opts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into() };
+    install(&host, &m, MANIFEST, dir.path(), &opts).unwrap();
+
+    // Only the one legit SKILL.md should have been placed; symlinks skipped.
+    assert_eq!(host.file_count(), 1, "symlinks must be skipped, only real file placed");
+}
+
+/// M1: a failed update must not leave a receipt that references deleted files.
+/// After removing the old pack's bits, if the fresh install fails (and rolls
+/// back its own work), `update` must leave a consistent state: no stale receipt.
+#[test]
+fn failed_update_does_not_leave_stale_receipt() {
+    let dir = write_fixture();
+    let m = Manifest::parse(MANIFEST).unwrap();
+    let host = MockPackHost::new(paths());
+    let iopts = InstallOpts { force: false, now_utc: "2026-06-09T00:00:00Z".into() };
+    install(&host, &m, MANIFEST, dir.path(), &iopts).unwrap();
+    assert!(host.read_receipt("demo").unwrap().is_some(), "installed receipt present");
+
+    // Bump version but point skills.dir at a directory that does NOT exist on
+    // disk, so the fresh install fails during the place phase.
+    let broken = MANIFEST
+        .replace("0.1.0", "0.2.0")
+        .replace("dir = \"components/skills\"", "dir = \"components/does-not-exist\"");
+    let m2 = Manifest::parse(&broken).unwrap();
+    let err = update(&host, &m2, &broken, dir.path(), "2026-06-10T00:00:00Z").unwrap_err();
+    assert!(matches!(err, nevoflux_pack::PackError::RolledBack { .. }));
+
+    // No lying receipt: the stale receipt referencing now-deleted files is gone.
+    assert!(
+        host.read_receipt("demo").unwrap().is_none(),
+        "failed update must not leave a receipt pointing at deleted files"
+    );
+}

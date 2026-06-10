@@ -122,6 +122,11 @@ fn place_phase(
         let src_root = pack_dir.join(&s.dir);
         for (rel, bytes) in read_dir_flat(&src_root)? {
             let dest = paths.skills_dir.join(&rel);
+            // Defense-in-depth: the destination must stay under the whitelisted
+            // skills root even if `read_dir_flat` (or a future change) yields an
+            // escaping relative name. Capability validation already guards the
+            // source path; this guarantees writes can never escape the sandbox.
+            assert_under(&dest, &paths.skills_dir)?;
             let fr = host.place_file(&dest, &bytes)?;
             applied.files.push(fr.path.clone());
             receipt.files.push(fr);
@@ -134,12 +139,48 @@ fn place_phase(
             let bytes = std::fs::read(&src).map_err(|e| PackError::Host(format!("{}: {e}", src.display())))?;
             let base = Path::new(f).file_name().ok_or_else(|| PackError::Manifest(format!("bad canvas-tool path {f}")))?;
             let dest = paths.canvas_tools_dir.join(base);
+            // Defense-in-depth: writes must stay under the canvas-tools root.
+            assert_under(&dest, &paths.canvas_tools_dir)?;
             let fr = host.place_file(&dest, &bytes)?;
             applied.files.push(fr.path.clone());
             receipt.files.push(fr);
         }
     }
     Ok(())
+}
+
+/// Lexically assert that `dest` is contained within `root` (no FS access). The
+/// caller built `dest` by joining a relative name onto `root`, so a normalized
+/// `dest` that still starts with `root` cannot have escaped via `..`.
+fn assert_under(dest: &Path, root: &Path) -> PackResult<()> {
+    let norm = lexical_normalize(dest);
+    let root_norm = lexical_normalize(root);
+    if norm.starts_with(&root_norm) {
+        Ok(())
+    } else {
+        Err(PackError::Capability(vec![
+            crate::capability::Violation::OutsideWhitelistDir {
+                component: "place".into(),
+                dest: dest.to_path_buf(),
+            },
+        ]))
+    }
+}
+
+/// Resolve `.`/`..` components lexically (no FS access, no symlink resolution).
+fn lexical_normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn seed_phase(
@@ -314,28 +355,59 @@ pub fn update(
     // Fresh install (force=true so the same-version guard doesn't block). Seed
     // is only-if-absent, so existing user pages survive untouched.
     let opts = InstallOpts { force: true, now_utc: now_utc.to_string() };
-    install(host, manifest, raw_toml, pack_dir, &opts)
+    match install(host, manifest, raw_toml, pack_dir, &opts) {
+        Ok(receipt) => Ok(receipt),
+        Err(e) => {
+            // The install failed and rolled back its OWN work, but we had already
+            // removed the old pack's files/artifacts/sources above. Restoring the
+            // old receipt now would make it reference files that no longer exist,
+            // so delete it instead — leaving the pack cleanly uninstalled rather
+            // than recorded-but-broken. Limitation: the previously installed
+            // version's files are already gone; a fully transactional update
+            // (stage-then-swap) is a follow-up.
+            let _ = host.delete_receipt(&manifest.pack.name);
+            Err(e)
+        }
+    }
 }
 
 /// Read a directory one level deep, returning (relative-name, bytes). Skills
 /// and canvas-app bundles are flattened to a single level by the loader.
+///
+/// Symlinks are NEVER followed: a bundled symlink (e.g. `evil -> /etc/passwd`)
+/// would otherwise let a pack exfiltrate files outside its own directory. We
+/// use `entry.file_type()` (which does NOT traverse symlinks, unlike `is_file`/
+/// `is_dir`) and skip any entry that is itself a symlink at every level.
 fn read_dir_flat(root: &Path) -> PackResult<Vec<(String, Vec<u8>)>> {
     let mut out = Vec::new();
     let entries = std::fs::read_dir(root)
         .map_err(|e| PackError::Host(format!("read_dir {}: {e}", root.display())))?;
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() {
+        let ft = entry
+            .file_type()
+            .map_err(|e| PackError::Host(format!("file_type {}: {e}", path.display())))?;
+        if ft.is_symlink() {
+            continue; // never follow symlinks: a pack could point outside its dir
+        }
+        if ft.is_file() {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             let bytes = std::fs::read(&path)
                 .map_err(|e| PackError::Host(format!("read {}: {e}", path.display())))?;
             out.push((name, bytes));
-        } else if path.is_dir() {
+        } else if ft.is_dir() {
             // One nested level (e.g. skills/<name>/SKILL.md, conventions/*).
             let sub = path.file_name().unwrap().to_string_lossy().into_owned();
             for inner in std::fs::read_dir(&path).map_err(|e| PackError::Host(e.to_string()))?.flatten() {
-                let ip = inner.path();
-                if ip.is_file() {
+                let ift = match inner.file_type() {
+                    Ok(t) => t,
+                    Err(e) => return Err(PackError::Host(e.to_string())),
+                };
+                if ift.is_symlink() {
+                    continue; // skip nested symlinks too
+                }
+                if ift.is_file() {
+                    let ip = inner.path();
                     let name = format!("{sub}/{}", ip.file_name().unwrap().to_string_lossy());
                     let bytes = std::fs::read(&ip).map_err(|e| PackError::Host(e.to_string()))?;
                     out.push((name, bytes));
