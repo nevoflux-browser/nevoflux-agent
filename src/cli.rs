@@ -134,16 +134,24 @@ pub enum ConfigAction {
 pub enum PackAction {
     /// Validate a pack manifest without installing (capability check)
     Validate {
-        /// Path to the pack manifest (pack.toml)
-        manifest: String,
+        /// manifest path or github:user/repo[/sub][@ref]
+        source: String,
     },
-    /// Install a pack from a local pack.toml
+    /// Fetch + preview a pack (local path or github:user/repo[/sub][@ref]) without installing
+    Inspect {
+        /// manifest path or github:user/repo[/sub][@ref]
+        source: String,
+    },
+    /// Install a pack from a local pack.toml or a github source
     Install {
-        /// Path to the pack manifest (pack.toml)
-        manifest: String,
+        /// manifest path or github:user/repo[/sub][@ref]
+        source: String,
         /// Overwrite an existing installation
         #[arg(long)]
         force: bool,
+        /// Skip the remote-source preview/confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// Uninstall a pack by name
     Uninstall {
@@ -156,10 +164,10 @@ pub enum PackAction {
         #[arg(long)]
         force: bool,
     },
-    /// Update an installed pack from a local pack.toml
+    /// Update an installed pack from a local pack.toml or a github source
     Update {
-        /// Path to the pack manifest (pack.toml)
-        manifest: String,
+        /// manifest path or github:user/repo[/sub][@ref]
+        source: String,
     },
     /// List installed packs
     List,

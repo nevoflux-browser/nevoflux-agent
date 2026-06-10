@@ -817,66 +817,43 @@ fn handle_config_command(action: ConfigAction) {
     }
 }
 
-/// Handle `nevoflux pack <action>` by issuing a `pack.*` RPC to the daemon.
-///
-/// Uses the same length-prefixed JSON transport (`DaemonClient`) the daemon
-/// speaks. The CLI uses `wait:true` so install/uninstall/update block until the
-/// lifecycle finishes and the final result is returned inline.
-async fn handle_pack_command(action: PackAction) -> Result<(), Box<dyn std::error::Error>> {
+/// Connect to whichever daemon is running: a manually-started dev daemon
+/// (daemon.port) or a proxy-managed one (daemon-managed.port). Resolves the
+/// data dir the same way the daemon does so NEVOFLUX_DATA_DIR is honored.
+async fn connect_pack_client(
+) -> Result<nevoflux_bridge::DaemonClient, Box<dyn std::error::Error>> {
     use nevoflux_bridge::{BridgeConfig, ConnectionMode, DaemonClient};
 
-    // Build the (command, params) pair. Per-command args go inside `params`,
-    // which the daemon's handler reads flat.
-    let (command, params): (&str, serde_json::Value) = match &action {
-        PackAction::Validate { manifest } => (
-            "pack.validate",
-            serde_json::json!({ "manifest_path": manifest }),
-        ),
-        PackAction::Install { manifest, force } => (
-            "pack.install",
-            serde_json::json!({ "manifest_path": manifest, "force": force, "wait": true }),
-        ),
-        PackAction::Uninstall {
-            name,
-            purge_data,
-            force,
-        } => (
-            "pack.uninstall",
-            serde_json::json!({ "name": name, "purge_data": purge_data, "force": force }),
-        ),
-        PackAction::Update { manifest } => (
-            "pack.update",
-            serde_json::json!({ "manifest_path": manifest }),
-        ),
-        PackAction::List => ("pack.list", serde_json::json!({})),
-        PackAction::Status { name } => ("pack.status", serde_json::json!({ "name": name })),
-    };
-
-    // Connect to whichever daemon is running: a manually-started dev daemon
-    // (daemon.port) or a proxy-managed one (daemon-managed.port). Resolve the
-    // data dir the same way the daemon does so NEVOFLUX_DATA_DIR is honored.
     let data_dir = get_data_dir();
-    let mut client = {
-        let mut connected = None;
-        let mut last_err = String::new();
-        for mode in [ConnectionMode::Dev, ConnectionMode::Prod] {
-            let cfg = BridgeConfig::new()
-                .with_mode(mode)
-                .with_data_dir(data_dir.clone())
-                .with_auto_launch(false);
-            let mut c = DaemonClient::new("pack-cli", cfg);
-            match c.connect().await {
-                Ok(()) => {
-                    connected = Some(c);
-                    break;
-                }
-                Err(e) => last_err = e.to_string(),
+    let mut connected = None;
+    let mut last_err = String::new();
+    for mode in [ConnectionMode::Dev, ConnectionMode::Prod] {
+        let cfg = BridgeConfig::new()
+            .with_mode(mode)
+            .with_data_dir(data_dir.clone())
+            .with_auto_launch(false);
+        let mut c = DaemonClient::new("pack-cli", cfg);
+        match c.connect().await {
+            Ok(()) => {
+                connected = Some(c);
+                break;
             }
+            Err(e) => last_err = e.to_string(),
         }
-        connected.ok_or_else(|| {
-            format!("cannot reach daemon (is it running? start it with `nevoflux --daemon`): {last_err}")
-        })?
-    };
+    }
+    connected.ok_or_else(|| {
+        format!("cannot reach daemon (is it running? start it with `nevoflux --daemon`): {last_err}")
+            .into()
+    })
+}
+
+/// Send one `pack.*` command on a fresh connection and return the unwrapped
+/// `data` from the matching `system_response` (or an error).
+async fn send_pack_rpc(
+    command: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let mut client = connect_pack_client().await?;
 
     let request_id = format!("pack-cli-{command}");
     let payload = serde_json::json!({
@@ -901,16 +878,78 @@ async fn handle_pack_command(action: PackAction) -> Result<(), Box<dyn std::erro
         {
             let inner = &p["payload"];
             if inner["success"].as_bool().unwrap_or(false) {
-                println!("{}", serde_json::to_string_pretty(&inner["data"]).unwrap());
-            } else {
-                let msg = inner["error"]["message"]
-                    .as_str()
-                    .unwrap_or("unknown error");
-                return Err(format!("{command} failed: {msg}").into());
+                return Ok(inner["data"].clone());
             }
-            break;
+            let msg = inner["error"]["message"]
+                .as_str()
+                .unwrap_or("unknown error");
+            return Err(format!("{command} failed: {msg}").into());
         }
     }
+}
+
+/// True for sources the daemon must fetch over the network.
+fn is_remote_source(source: &str) -> bool {
+    source.starts_with("github:") || source.starts_with("https://github.com/")
+}
+
+/// Handle `nevoflux pack <action>` by issuing a `pack.*` RPC to the daemon.
+///
+/// Uses the same length-prefixed JSON transport (`DaemonClient`) the daemon
+/// speaks. The CLI uses `wait:true` so install/uninstall/update block until the
+/// lifecycle finishes and the final result is returned inline.
+async fn handle_pack_command(action: PackAction) -> Result<(), Box<dyn std::error::Error>> {
+    // Remote install: preview + confirm unless --yes.
+    if let PackAction::Install { source, yes, .. } = &action {
+        if is_remote_source(source) && !yes {
+            // Inspect first so the user sees what they're about to trust.
+            let preview =
+                send_pack_rpc("pack.inspect", serde_json::json!({ "source": source })).await?;
+            println!("{}", serde_json::to_string_pretty(&preview).unwrap());
+            eprintln!(
+                "\n⚠  Unreviewed source. Installing trusts the author: skills can direct the agent and canvas-tools can run commands on your machine."
+            );
+            eprint!("Proceed with install? [y/N] ");
+            use std::io::Write as _;
+            std::io::stderr().flush().ok();
+            use std::io::BufRead as _;
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line)?;
+            if !matches!(line.trim(), "y" | "Y" | "yes") {
+                eprintln!("Aborted.");
+                return Ok(());
+            }
+        }
+    }
+
+    // Build the (command, params) pair. Per-command args go inside `params`,
+    // which the daemon's handler reads flat.
+    let (command, params): (&str, serde_json::Value) = match &action {
+        PackAction::Validate { source } => {
+            ("pack.validate", serde_json::json!({ "source": source }))
+        }
+        PackAction::Inspect { source } => {
+            ("pack.inspect", serde_json::json!({ "source": source }))
+        }
+        PackAction::Install { source, force, .. } => (
+            "pack.install",
+            serde_json::json!({ "source": source, "force": force, "wait": true }),
+        ),
+        PackAction::Uninstall {
+            name,
+            purge_data,
+            force,
+        } => (
+            "pack.uninstall",
+            serde_json::json!({ "name": name, "purge_data": purge_data, "force": force }),
+        ),
+        PackAction::Update { source } => ("pack.update", serde_json::json!({ "source": source })),
+        PackAction::List => ("pack.list", serde_json::json!({})),
+        PackAction::Status { name } => ("pack.status", serde_json::json!({ "name": name })),
+    };
+
+    let data = send_pack_rpc(command, params).await?;
+    println!("{}", serde_json::to_string_pretty(&data).unwrap());
     Ok(())
 }
 
