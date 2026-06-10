@@ -409,8 +409,9 @@ fn env_duration_secs(name: &str, default: Duration) -> Duration {
 ///    chat-completions will fail upstream until a key is supplied, which
 ///    is fine: boot only needs the listener up.
 /// 4. Call [`nevoflux_llm_gateway::serve`] to spawn the task.
-/// 5. Best-effort poll `/healthz` up to 20×100 ms as a readiness signal;
-///    on timeout, warn and keep the gateway anyway.
+/// 5. Spawn a best-effort `/healthz` readiness probe (up to 20×100 ms) in the
+///    background — it's non-fatal and boot does NOT wait on it. The listener
+///    is already bound/serving, so boot returns as soon as the handle exists.
 pub async fn init_gateway(agent_config: &AgentConfig) -> Result<Option<GatewayBoot>, InitError> {
     // NOTE: deliberately NO `knowledge_base.enabled` gate here — the
     // gateway is always started (see fn docs). We still read the
@@ -456,47 +457,48 @@ pub async fn init_gateway(agent_config: &AgentConfig) -> Result<Option<GatewayBo
         handle.url()
     );
 
-    // Health-check the gateway before declaring boot done. Use a fresh
-    // reqwest client (the gateway's own internal one is on the server
-    // side, not shareable here).
-    let url = format!("{}/healthz", handle.url());
-    let client = reqwest::Client::new();
-    let max_tries = 20u32;
-    let mut tries = 0u32;
-    loop {
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                info!(
-                    "llm-gateway /healthz OK after {} tries",
-                    tries.saturating_add(1)
-                );
-                break;
-            }
-            _ if tries >= max_tries => {
-                // Non-fatal. The gateway task is already serving on a
-                // bound listener; `/healthz` can lag under load (debug
-                // build, saturated runtime) without the gateway being
-                // broken. Crucially, returning Err here would drop the
-                // GatewayHandle, and dropping it fires its
-                // graceful-shutdown channel (see llm-gateway server.rs) —
-                // i.e. a slow probe would TEAR DOWN a live gateway. Keep
-                // the handle and warn instead.
-                warn!(
-                    url = %handle.url(),
-                    "llm-gateway /healthz did not pass within {}ms; keeping the \
-                     gateway anyway (it may still be warming up)",
-                    max_tries.saturating_mul(100)
-                );
-                break;
-            }
-            _ => {
-                tries = tries.saturating_add(1);
-                tokio::time::sleep(Duration::from_millis(100)).await;
+    let snapshot = GatewayHandleSnapshot::from_handle(&handle);
+
+    // Health-check runs OFF the boot path. The gateway listener is already
+    // bound and serving (above), the probe is non-fatal (it only warns on
+    // timeout), and nothing in boot depends on it — gbrain reads the snapshot
+    // (URL + token), not `/healthz`. Blocking boot here cost up to
+    // 20×(send + 100 ms) ≈ several seconds under a debug build / saturated
+    // runtime, so spawn it instead and let boot proceed the moment the
+    // listener binds. We clone the URL into the task; the GatewayHandle stays
+    // with GatewayBoot (so it is NOT dropped here — dropping it would fire the
+    // gateway's graceful-shutdown channel and tear down the live gateway).
+    let health_url = format!("{}/healthz", handle.url());
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let max_tries = 20u32;
+        let mut tries = 0u32;
+        loop {
+            match client.get(&health_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    info!(
+                        "llm-gateway /healthz OK after {} tries",
+                        tries.saturating_add(1)
+                    );
+                    break;
+                }
+                _ if tries >= max_tries => {
+                    warn!(
+                        url = %health_url,
+                        "llm-gateway /healthz did not pass within {}ms; keeping the \
+                         gateway anyway (it may still be warming up)",
+                        max_tries.saturating_mul(100)
+                    );
+                    break;
+                }
+                _ => {
+                    tries = tries.saturating_add(1);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
         }
-    }
+    });
 
-    let snapshot = GatewayHandleSnapshot::from_handle(&handle);
     Ok(Some(GatewayBoot { handle, snapshot }))
 }
 
@@ -604,6 +606,22 @@ mod tests {
             .expect("enabled config must yield Some");
         assert!(boot.snapshot.url.starts_with("http://127.0.0.1:"));
         assert_eq!(boot.snapshot.bearer_token.len(), 64);
+        boot.handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn init_gateway_returns_without_blocking_on_health_probe() {
+        // The `/healthz` readiness probe is spawned off the boot path, so
+        // init_gateway returns as soon as the listener binds (ms) instead of
+        // waiting out the probe (up to ~2s+). Guard against a regression that
+        // re-blocks boot on the probe.
+        let cfg = AgentConfig::default();
+        let boot = tokio::time::timeout(Duration::from_secs(2), init_gateway(&cfg))
+            .await
+            .expect("init_gateway must not block on the health probe")
+            .expect("init should succeed")
+            .expect("gateway must start");
+        assert!(boot.snapshot.url.starts_with("http://127.0.0.1:"));
         boot.handle.shutdown().await;
     }
 
