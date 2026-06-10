@@ -33,6 +33,32 @@ pub struct PackHostImpl {
 }
 
 impl PackHostImpl {
+    /// Construct a host against concrete daemon services.
+    ///
+    /// `pack::rpc` builds this via `PackHostImplBuild::into_host`; external
+    /// callers (the end-to-end integration test) use this public constructor
+    /// since the fields themselves are `pub(crate)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        paths: ResolvedPaths,
+        db: Arc<Database>,
+        skills: Arc<RwLock<SkillRegistry>>,
+        brain: Option<Arc<dyn nevoflux_brain::BrainEngine>>,
+        bus: Option<Arc<crate::event_bus::EventBus>>,
+        handle: tokio::runtime::Handle,
+        op_id: String,
+    ) -> Self {
+        Self {
+            paths,
+            db,
+            skills,
+            brain,
+            bus,
+            handle,
+            op_id,
+        }
+    }
+
     fn io_err(ctx: &str, e: impl std::fmt::Display) -> PackError {
         PackError::Host(format!("{ctx}: {e}"))
     }
