@@ -823,7 +823,7 @@ fn handle_config_command(action: ConfigAction) {
 /// speaks. The CLI uses `wait:true` so install/uninstall/update block until the
 /// lifecycle finishes and the final result is returned inline.
 async fn handle_pack_command(action: PackAction) -> Result<(), Box<dyn std::error::Error>> {
-    use nevoflux_bridge::{BridgeConfig, DaemonClient};
+    use nevoflux_bridge::{BridgeConfig, ConnectionMode, DaemonClient};
 
     // Build the (command, params) pair. Per-command args go inside `params`,
     // which the daemon's handler reads flat.
@@ -852,11 +852,31 @@ async fn handle_pack_command(action: PackAction) -> Result<(), Box<dyn std::erro
         PackAction::Status { name } => ("pack.status", serde_json::json!({ "name": name })),
     };
 
-    let mut client = DaemonClient::new("pack-cli", BridgeConfig::new());
-    client
-        .connect()
-        .await
-        .map_err(|e| format!("cannot reach daemon (is it running?): {e}"))?;
+    // Connect to whichever daemon is running: a manually-started dev daemon
+    // (daemon.port) or a proxy-managed one (daemon-managed.port). Resolve the
+    // data dir the same way the daemon does so NEVOFLUX_DATA_DIR is honored.
+    let data_dir = get_data_dir();
+    let mut client = {
+        let mut connected = None;
+        let mut last_err = String::new();
+        for mode in [ConnectionMode::Dev, ConnectionMode::Prod] {
+            let cfg = BridgeConfig::new()
+                .with_mode(mode)
+                .with_data_dir(data_dir.clone())
+                .with_auto_launch(false);
+            let mut c = DaemonClient::new("pack-cli", cfg);
+            match c.connect().await {
+                Ok(()) => {
+                    connected = Some(c);
+                    break;
+                }
+                Err(e) => last_err = e.to_string(),
+            }
+        }
+        connected.ok_or_else(|| {
+            format!("cannot reach daemon (is it running? start it with `nevoflux --daemon`): {last_err}")
+        })?
+    };
 
     let request_id = format!("pack-cli-{command}");
     let payload = serde_json::json!({
