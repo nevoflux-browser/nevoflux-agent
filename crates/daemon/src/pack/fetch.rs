@@ -223,6 +223,129 @@ pub fn locate_pack_dir(root: &Path, subdir: Option<&str>) -> PackResult<PathBuf>
     Ok(dir)
 }
 
+/// A source resolved to a local pack directory, plus provenance. Holds a
+/// TempDir guard (for remote sources) that deletes the extracted files on drop.
+pub struct ResolvedSource {
+    pub pack_dir: PathBuf,
+    pub origin: Option<String>, // "github:owner/repo[/sub]@ref" for remote; None for local
+    pub tarball_sha256: Option<String>,
+    pub _temp: Option<tempfile::TempDir>,
+}
+
+const MAX_TARBALL_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
+const FETCH_TIMEOUT_SECS: u64 = 60;
+const UA: &str = "nevoflux-pack";
+
+/// Turn a source string into a local pack dir. Local sources pass through;
+/// github sources are fetched, sha256'd, extracted, and located.
+pub async fn resolve_source(source: &str, data_dir: &Path) -> PackResult<ResolvedSource> {
+    match parse_source(source).map_err(PackError::Manifest)? {
+        Source::Local(path) => {
+            // A path may point at pack.toml or its parent dir.
+            let pack_dir = if path.is_file() {
+                path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+            } else {
+                path
+            };
+            Ok(ResolvedSource {
+                pack_dir,
+                origin: None,
+                tarball_sha256: None,
+                _temp: None,
+            })
+        }
+        Source::Remote(r) => resolve_remote(r, data_dir).await,
+    }
+}
+
+async fn resolve_remote(r: RemoteRef, data_dir: &Path) -> PackResult<ResolvedSource> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(FETCH_TIMEOUT_SECS))
+        .user_agent(UA)
+        .build()
+        .map_err(|e| PackError::Host(format!("http client: {e}")))?;
+
+    // Resolve default branch when no ref was given.
+    let git_ref = match r.git_ref.clone() {
+        Some(r) => r,
+        None => {
+            let url = format!("https://api.github.com/repos/{}/{}", r.owner, r.repo);
+            let resp = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| PackError::Host(format!("FETCH_NETWORK: {e}")))?;
+            if !resp.status().is_success() {
+                return Err(PackError::Host(format!(
+                    "REPO_OR_REF_NOT_FOUND: {} ({})",
+                    url,
+                    resp.status()
+                )));
+            }
+            let v: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| PackError::Host(format!("bad api response: {e}")))?;
+            v.get("default_branch")
+                .and_then(|b| b.as_str())
+                .ok_or_else(|| PackError::Host("no default_branch".into()))?
+                .to_string()
+        }
+    };
+
+    // Download the codeload tarball, capped.
+    let url = format!(
+        "https://codeload.github.com/{}/{}/tar.gz/{}",
+        r.owner, r.repo, git_ref
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| PackError::Host(format!("FETCH_NETWORK: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(PackError::Host(format!(
+            "REPO_OR_REF_NOT_FOUND: {} ({})",
+            url,
+            resp.status()
+        )));
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    use futures::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| PackError::Host(format!("FETCH_NETWORK: {e}")))?;
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() as u64 > MAX_TARBALL_BYTES {
+            return Err(PackError::Host("tarball exceeds size limit".into()));
+        }
+    }
+    let sha = nevoflux_pack::receipt::Receipt::sha256_hex(&bytes);
+
+    // Extract to a temp dir under {data_dir}/pack-cache/.
+    let cache = data_dir.join("pack-cache");
+    std::fs::create_dir_all(&cache).map_err(|e| PackError::Host(e.to_string()))?;
+    let temp =
+        tempfile::tempdir_in(&cache).map_err(|e| PackError::Host(format!("tempdir: {e}")))?;
+    let root = extract_tarball(&bytes, temp.path())?;
+    let pack_dir = locate_pack_dir(&root, r.subdir.as_deref())?;
+
+    let mut origin = format!("github:{}/{}", r.owner, r.repo);
+    if let Some(sub) = &r.subdir {
+        origin.push('/');
+        origin.push_str(sub);
+    }
+    origin.push('@');
+    origin.push_str(&git_ref);
+
+    Ok(ResolvedSource {
+        pack_dir,
+        origin: Some(origin),
+        tarball_sha256: Some(sha),
+        _temp: Some(temp),
+    })
+}
+
 #[cfg(test)]
 mod core_tests {
     use std::io::Write;
