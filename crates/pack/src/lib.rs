@@ -6,6 +6,7 @@ pub mod capability;
 pub mod error;
 pub mod paths;
 pub mod manifest;
+pub mod receipt;
 
 pub use error::{PackError, PackResult};
 pub use paths::ResolvedPaths;
