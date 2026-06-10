@@ -24,6 +24,10 @@ nevoflux-llm-gateway = { path = "../llm-gateway", default-features = false }
 nevoflux-computer = { path = "../computer" }
 nevoflux-builtin-wasm = { path = "../builtin-wasm" }
 nevoflux-brain = { path = "../brain" }
+nevoflux-pack = { path = "../pack" }
+
+# Pack protocol: semantic versioning for resolved paths / compatibility checks
+semver = { version = "1", features = ["serde"] }
 
 # LLM framework
 rig-core = { workspace = true }
@@ -124,6 +128,9 @@ data-encoding = "2"
 chacha20poly1305 = { workspace = true }
 tar = "0.4"
 zstd = "0.13"
+
+# Pack GitHub install — gunzip GitHub codeload tarballs (tempfile already a dep).
+flate2 = "1"
 
 # Native file dialog
 rfd = "0.15"

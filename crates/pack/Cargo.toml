@@ -1,0 +1,17 @@
+[package]
+name = "nevoflux-pack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "0.8"
+semver = { version = "1", features = ["serde"] }
+sha2 = "0.10"
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"

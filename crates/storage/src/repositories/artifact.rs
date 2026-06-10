@@ -177,6 +177,16 @@ impl<'a> ArtifactRepository<'a> {
         })
     }
 
+    /// Delete an artifact by id regardless of persistence. Returns true if a
+    /// row was removed. Used by pack uninstall to remove a pack-installed
+    /// dashboard.
+    pub fn delete(&self, id: &str) -> Result<bool> {
+        self.db.with_connection(|conn| {
+            let n = conn.execute("DELETE FROM artifacts WHERE id = ?1", params![id])?;
+            Ok(n > 0)
+        })
+    }
+
     /// List artifacts for a session (summaries only — empty content, no files).
     pub fn list_by_session(&self, session_id: &str) -> Result<Vec<ArtifactRecord>> {
         self.db.with_connection(|conn| {
@@ -618,6 +628,21 @@ mod tests {
             repo.get("n").unwrap().is_none(),
             "non-persistent artifact must be deleted"
         );
+    }
+
+    /// Verifies `delete(id)` removes a row regardless of persistence and
+    /// reports whether a row was actually removed (used by pack uninstall).
+    #[test]
+    fn delete_removes_artifact_by_id() {
+        let storage = Storage::open_in_memory().unwrap();
+        let repo = ArtifactRepository::new(storage.database());
+        repo.create(CreateArtifactParams::new_orphan("art-x", "T", "project"))
+            .unwrap();
+        assert!(repo.get("art-x").unwrap().is_some());
+        let removed = repo.delete("art-x").unwrap();
+        assert!(removed);
+        assert!(repo.get("art-x").unwrap().is_none());
+        assert!(!repo.delete("art-x").unwrap()); // second delete: false
     }
 
     /// Verifies that creating an artifact with `session_id = None` succeeds and round-trips correctly.

@@ -6385,6 +6385,22 @@ async fn handle_chat_message(
                 "mcp.disconnect" => handle_mcp_disconnect(&params).await,
                 "file.pick" => handle_file_pick(&params).await,
                 "skill.list" => handle_skill_list(services, &params).await,
+                // Pack protocol foundations (H1/H2).
+                "daemon.info" => handle_daemon_info(&params),
+                "skill.reload" => handle_skill_reload(services, &params).await,
+                // Pack install protocol (Plan 02). Sync ops return inline;
+                // install/uninstall/update run the lifecycle inside
+                // spawn_blocking and (in wait:false mode) stream progress on
+                // `system:pack:progress`.
+                "pack.validate" => crate::pack::rpc::handle_pack_validate(&params).await,
+                "pack.inspect" => crate::pack::rpc::handle_pack_inspect(&params).await,
+                "pack.list" => crate::pack::rpc::handle_pack_list(&params),
+                "pack.status" => crate::pack::rpc::handle_pack_status(&params),
+                "pack.install" => crate::pack::rpc::handle_pack_install(services, &params).await,
+                "pack.uninstall" => {
+                    crate::pack::rpc::handle_pack_uninstall(services, &params).await
+                }
+                "pack.update" => crate::pack::rpc::handle_pack_update(services, &params).await,
                 // LLM provider configuration commands
                 "config.llm.list" => handle_config_llm_list(&params).await,
                 "config.llm.get" => handle_config_llm_get(&params).await,
@@ -8367,6 +8383,85 @@ async fn handle_skill_list(
             "data": { "skills": skills }
         }
     })
+}
+
+/// H1: report the daemon's authoritative `ResolvedPaths` (version + every path
+/// a pack install resolves against). The config/data dirs are resolved the same
+/// way the rest of the daemon resolves them, then aggregated by
+/// `crate::paths::build_resolved_paths`.
+fn handle_daemon_info(params: &serde_json::Value) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Resolve from the SAME source of truth the pack handlers use, so
+    // daemon.info and pack.* never drift (config dir from
+    // AgentConfig::default_config_path incl. the macOS XDG fallback, data dir
+    // from NEVOFLUX_DATA_DIR/platform data dir).
+    let paths = crate::paths::resolve_from_daemon();
+
+    serde_json::json!({
+        "type": "system_response",
+        "payload": {
+            "request_id": request_id,
+            "command": "daemon.info",
+            "success": true,
+            "data": {
+                "version": paths.version.to_string(),
+                "config_dir": paths.config_dir,
+                "skills_dir": paths.skills_dir,
+                "canvas_tools_dir": paths.canvas_tools_dir,
+                "config_file": paths.config_file,
+                "data_dir": paths.data_dir,
+                "db_path": paths.db_path,
+            }
+        }
+    })
+}
+
+/// H2: re-scan the skills registry so a pack's freshly-placed (or removed)
+/// skill files activate without a daemon restart. Reuses the same shared
+/// `SkillRegistry` that `skill.list` reads, mirroring `SkillsManager::reload`.
+async fn handle_skill_reload(
+    services: &HostServices,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let result = {
+        let mut registry = services.skills.write().await;
+        registry.reload().map(|_| registry.len())
+    };
+
+    match result {
+        Ok(loaded) => {
+            info!("skill.reload: reloaded {} skills", loaded);
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "skill.reload",
+                    "success": true,
+                    "data": { "loaded": loaded }
+                }
+            })
+        }
+        Err(e) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "skill.reload",
+                "success": false,
+                "error": { "code": "SKILL_RELOAD_FAILED", "message": e.to_string() }
+            }
+        }),
+    }
 }
 
 // ============================================

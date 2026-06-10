@@ -3534,6 +3534,7 @@ dependencies = [
  "directories",
  "dirs 5.0.1",
  "ffmpeg-sidecar",
+ "flate2",
  "futures",
  "glob",
  "grep-matcher",
@@ -3549,6 +3550,7 @@ dependencies = [
  "nevoflux-llm",
  "nevoflux-llm-gateway",
  "nevoflux-mcp",
+ "nevoflux-pack",
  "nevoflux-protocol",
  "nevoflux-skills",
  "nevoflux-storage",
@@ -3563,6 +3565,7 @@ dependencies = [
  "rfd",
  "rig-core",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -3652,6 +3655,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nevoflux-pack"
+version = "0.3.0"
+dependencies = [
+ "proptest",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "toml",
+]
+
+[[package]]
 name = "nevoflux-protocol"
 version = "0.3.0"
 dependencies = [
@@ -3700,11 +3717,14 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "nevoflux-daemon",
+ "nevoflux-pack",
  "nevoflux-protocol",
  "nevoflux-storage",
  "proptest",
+ "semver",
  "serde",
  "serde_json",
+ "tempfile",
  "test-case",
  "thiserror 2.0.18",
  "tokio",

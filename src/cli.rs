@@ -79,6 +79,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Pack install protocol
+    Pack {
+        #[command(subcommand)]
+        action: PackAction,
+    },
     /// Run interactive setup wizard
     Setup,
     /// Generate shell completions
@@ -121,6 +126,55 @@ pub enum ConfigAction {
         /// Optional prefix to filter keys (e.g., "app.")
         #[arg(default_value = "")]
         prefix: String,
+    },
+}
+
+/// Pack subcommand actions.
+#[derive(Subcommand, Debug)]
+pub enum PackAction {
+    /// Validate a pack manifest without installing (capability check)
+    Validate {
+        /// manifest path or github:user/repo[/sub][@ref]
+        source: String,
+    },
+    /// Fetch + preview a pack (local path or github:user/repo[/sub][@ref]) without installing
+    Inspect {
+        /// manifest path or github:user/repo[/sub][@ref]
+        source: String,
+    },
+    /// Install a pack from a local pack.toml or a github source
+    Install {
+        /// manifest path or github:user/repo[/sub][@ref]
+        source: String,
+        /// Overwrite an existing installation
+        #[arg(long)]
+        force: bool,
+        /// Skip the remote-source preview/confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Uninstall a pack by name
+    Uninstall {
+        /// Name of the installed pack
+        name: String,
+        /// Also remove pack-owned data (e.g. seeded pages)
+        #[arg(long)]
+        purge_data: bool,
+        /// Force removal even if integrity checks fail
+        #[arg(long)]
+        force: bool,
+    },
+    /// Update an installed pack from a local pack.toml or a github source
+    Update {
+        /// manifest path or github:user/repo[/sub][@ref]
+        source: String,
+    },
+    /// List installed packs
+    List,
+    /// Show status of one pack
+    Status {
+        /// Name of the installed pack
+        name: String,
     },
 }
 
