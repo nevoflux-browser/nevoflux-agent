@@ -4,6 +4,7 @@
 
 pub mod error;
 pub mod paths;
+pub mod manifest;
 
 pub use error::{PackError, PackResult};
 pub use paths::ResolvedPaths;
