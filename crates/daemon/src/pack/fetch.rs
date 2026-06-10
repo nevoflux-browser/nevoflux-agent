@@ -1,7 +1,9 @@
 //! Resolve a pack "source" (local path or github:…) to a local pack directory.
 //! `crates/pack` stays network-free; this daemon-side layer turns remote into local.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use nevoflux_pack::error::{PackError, PackResult};
 
 /// A classified pack source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,5 +184,100 @@ mod tests {
         assert!(parse_source("github:u/r/../etc").is_err());
         assert!(parse_source("github:u /r").is_err());
         assert!(parse_source("github:u/r@a b").is_err());
+    }
+}
+
+/// Gunzip + untar `bytes` into `dest`. GitHub tarballs contain exactly one
+/// top-level directory; returns that directory's path.
+pub fn extract_tarball(bytes: &[u8], dest: &Path) -> PackResult<PathBuf> {
+    let gz = flate2::read::GzDecoder::new(bytes);
+    let mut ar = tar::Archive::new(gz);
+    ar.unpack(dest)
+        .map_err(|e| PackError::Host(format!("extract tarball: {e}")))?;
+    // Find the single top-level directory.
+    let mut top: Option<PathBuf> = None;
+    for entry in std::fs::read_dir(dest).map_err(|e| PackError::Host(e.to_string()))? {
+        let p = entry.map_err(|e| PackError::Host(e.to_string()))?.path();
+        if p.is_dir() {
+            if top.is_some() {
+                return Err(PackError::Host("archive has multiple top-level dirs".into()));
+            }
+            top = Some(p);
+        }
+    }
+    top.ok_or_else(|| PackError::Host("archive has no top-level dir".into()))
+}
+
+/// `root[/subdir]`, verifying `pack.toml` is present.
+pub fn locate_pack_dir(root: &Path, subdir: Option<&str>) -> PackResult<PathBuf> {
+    let dir = match subdir {
+        Some(s) => root.join(s),
+        None => root.to_path_buf(),
+    };
+    if !dir.join("pack.toml").is_file() {
+        return Err(PackError::Host(format!(
+            "pack.toml not found in {}",
+            dir.display()
+        )));
+    }
+    Ok(dir)
+}
+
+#[cfg(test)]
+mod core_tests {
+    use std::io::Write;
+
+    use super::*;
+
+    /// Build a gzip+tar archive in memory with the given (path, contents) files.
+    fn make_tarball(files: &[(&str, &str)]) -> Vec<u8> {
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            for (path, contents) in files {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(contents.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, path, contents.as_bytes())
+                    .unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let mut gz =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar_buf).unwrap();
+        gz.finish().unwrap()
+    }
+
+    #[test]
+    fn extract_finds_single_top_dir_and_locates_root_pack() {
+        let bytes = make_tarball(&[("repo-main/pack.toml", "[pack]\n"), ("repo-main/x.md", "x")]);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = extract_tarball(&bytes, tmp.path()).unwrap();
+        assert!(root.ends_with("repo-main"));
+        let pack_dir = locate_pack_dir(&root, None).unwrap();
+        assert!(pack_dir.join("pack.toml").is_file());
+    }
+
+    #[test]
+    fn locates_pack_in_subdir() {
+        let bytes = make_tarball(&[
+            ("repo-main/readme", "hi"),
+            ("repo-main/packs/a/pack.toml", "[pack]\n"),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = extract_tarball(&bytes, tmp.path()).unwrap();
+        let pack_dir = locate_pack_dir(&root, Some("packs/a")).unwrap();
+        assert!(pack_dir.join("pack.toml").is_file());
+    }
+
+    #[test]
+    fn missing_manifest_errors() {
+        let bytes = make_tarball(&[("repo-main/nope.txt", "x")]);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = extract_tarball(&bytes, tmp.path()).unwrap();
+        assert!(locate_pack_dir(&root, None).is_err());
     }
 }
