@@ -15,6 +15,7 @@ mod logging;
 
 use clap::Parser;
 use cli::{Cli, Commands, ConfigAction};
+use cli::PackAction;
 use fs2::FileExt;
 use nevoflux_storage::Storage;
 use std::fs::File;
@@ -816,6 +817,83 @@ fn handle_config_command(action: ConfigAction) {
     }
 }
 
+/// Handle `nevoflux pack <action>` by issuing a `pack.*` RPC to the daemon.
+///
+/// Uses the same length-prefixed JSON transport (`DaemonClient`) the daemon
+/// speaks. The CLI uses `wait:true` so install/uninstall/update block until the
+/// lifecycle finishes and the final result is returned inline.
+async fn handle_pack_command(action: PackAction) -> Result<(), Box<dyn std::error::Error>> {
+    use nevoflux_bridge::{BridgeConfig, DaemonClient};
+
+    // Build the (command, params) pair. Per-command args go inside `params`,
+    // which the daemon's handler reads flat.
+    let (command, params): (&str, serde_json::Value) = match &action {
+        PackAction::Validate { manifest } => (
+            "pack.validate",
+            serde_json::json!({ "manifest_path": manifest }),
+        ),
+        PackAction::Install { manifest, force } => (
+            "pack.install",
+            serde_json::json!({ "manifest_path": manifest, "force": force, "wait": true }),
+        ),
+        PackAction::Uninstall {
+            name,
+            purge_data,
+            force,
+        } => (
+            "pack.uninstall",
+            serde_json::json!({ "name": name, "purge_data": purge_data, "force": force }),
+        ),
+        PackAction::Update { manifest } => (
+            "pack.update",
+            serde_json::json!({ "manifest_path": manifest }),
+        ),
+        PackAction::List => ("pack.list", serde_json::json!({})),
+        PackAction::Status { name } => ("pack.status", serde_json::json!({ "name": name })),
+    };
+
+    let mut client = DaemonClient::new("pack-cli", BridgeConfig::new());
+    client
+        .connect()
+        .await
+        .map_err(|e| format!("cannot reach daemon (is it running?): {e}"))?;
+
+    let request_id = format!("pack-cli-{command}");
+    let payload = serde_json::json!({
+        "type": "system_command",
+        "payload": {
+            "command": command,
+            "request_id": request_id,
+            "params": params,
+        }
+    });
+    client.send_chat(&request_id, payload).await?;
+
+    // Read responses until we see the matching system_response.
+    loop {
+        let env = client.recv().await?;
+        let p = &env.payload;
+        if p.get("type").and_then(|t| t.as_str()) == Some("system_response")
+            && p.get("payload")
+                .and_then(|x| x.get("command"))
+                .and_then(|c| c.as_str())
+                == Some(command)
+        {
+            let inner = &p["payload"];
+            if inner["success"].as_bool().unwrap_or(false) {
+                println!("{}", serde_json::to_string_pretty(&inner["data"]).unwrap());
+            } else {
+                let msg = inner["error"]["message"]
+                    .as_str()
+                    .unwrap_or("unknown error");
+                return Err(format!("{command} failed: {msg}").into());
+            }
+            break;
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -825,6 +903,13 @@ async fn main() {
         match command {
             Commands::Config { action } => {
                 handle_config_command(action);
+                return;
+            }
+            Commands::Pack { action } => {
+                if let Err(e) = handle_pack_command(action).await {
+                    eprintln!("pack: {e}");
+                    std::process::exit(1);
+                }
                 return;
             }
             Commands::Setup => {
