@@ -8356,9 +8356,13 @@ fn handle_daemon_info(params: &serde_json::Value) -> serde_json::Value {
         .unwrap_or("")
         .to_string();
 
-    // Config dir: ~/.config/nevoflux (see config.rs).
-    let config_dir = dirs::config_dir()
-        .map(|d| d.join("nevoflux"))
+    // Config dir: derive from the SAME source of truth the daemon uses to load
+    // config (AgentConfig::default_config_path), not a divergent re-derivation.
+    // This includes the macOS XDG fallback, so daemon.info reports the dir the
+    // daemon actually reads from. config_file is `<config_dir>/config.toml`.
+    let config_dir = AgentConfig::default_config_path()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
 
     // Data dir: NEVOFLUX_DATA_DIR override, else the platform data dir
