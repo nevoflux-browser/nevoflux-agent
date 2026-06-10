@@ -1,7 +1,7 @@
 //! Pure capability sandbox: the 5 structural invariants the platform enforces
 //! before any mutating host call. No I/O — reads manifest + ResolvedPaths only.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::manifest::Manifest;
 use crate::paths::ResolvedPaths;
@@ -13,6 +13,7 @@ pub enum Violation {
     SlugOutsideNamespace { slug: String, ns: String },
     SeedNotProtected { slug: String },
     PathTraversal { raw: String },
+    ArtifactIdNotNamespaced { id: String },
 }
 
 /// Validate a manifest against resolved paths. `raw_toml` is the original
@@ -20,7 +21,10 @@ pub enum Violation {
 /// otherwise silently ignore it). Returns all violations at once.
 pub fn validate(
     manifest: &Manifest,
-    paths: &ResolvedPaths,
+    // Kept in the signature for API stability and future destination checks;
+    // source-path validation is purely lexical (see `normalize_rel`), and
+    // destination containment is enforced at placement time in `lifecycle`.
+    _paths: &ResolvedPaths,
     raw_toml: &str,
 ) -> Result<(), Vec<Violation>> {
     let mut v = Vec::new();
@@ -37,15 +41,39 @@ pub fn validate(
         }
     }
 
-    // (1)+(2) skills dir destination must stay within skills_dir.
+    // (1)+(2) Every manifest-supplied SOURCE path is joined onto the pack dir
+    // and read, so each must be a safe relative path that cannot escape the
+    // pack (no `..` underflow, no absolute paths, no `\` separators). The
+    // manifest is untrusted; reject traversal on every platform.
+    let mut check_source = |raw: &str| {
+        if normalize_rel(raw).is_err() {
+            v.push(Violation::PathTraversal { raw: raw.to_string() });
+        }
+    };
     if let Some(s) = &manifest.components.skills {
-        check_dest(&mut v, "skills", &paths.skills_dir, &s.dir);
+        check_source(&s.dir);
     }
-    // (1)+(2) each canvas-tool file must stay within canvas_tools_dir.
     if let Some(ct) = &manifest.components.canvas_tools {
         for f in &ct.files {
-            // canvas-tool TOMLs are flattened to canvas_tools_dir/<basename>.
-            check_dest(&mut v, "canvas_tools", &paths.canvas_tools_dir, f);
+            check_source(f);
+        }
+    }
+    for s in &manifest.components.seed {
+        check_source(&s.from);
+    }
+    if let Some(k) = &manifest.components.knowledge {
+        check_source(&k.from);
+    }
+    if let Some(d) = &manifest.components.dashboard {
+        check_source(&d.files_from);
+    }
+
+    // (6) dashboard artifact id must be namespaced under the pack name, so a
+    // pack can't clobber another pack's (or the platform's) artifact. The
+    // convention is `<pack-name>-dashboard`; require the `<pack-name>` prefix.
+    if let Some(d) = &manifest.components.dashboard {
+        if !d.artifact_id.starts_with(&manifest.pack.name) {
+            v.push(Violation::ArtifactIdNotNamespaced { id: d.artifact_id.clone() });
         }
     }
 
@@ -87,34 +115,42 @@ fn in_namespace(slug: &str, ns: &str) -> bool {
     slug == ns || slug.starts_with(&format!("{ns}/"))
 }
 
-/// Lexically normalize `rel` (resolving `.`/`..` without touching the FS) and
-/// confirm it stays within `root`. Pushes PathTraversal/OutsideWhitelistDir.
-fn check_dest(v: &mut Vec<Violation>, component: &str, root: &Path, rel: &str) {
+/// Lexically normalize an untrusted relative source path, resolving `.`/`..`
+/// without touching the filesystem. Treats BOTH `/` and `\` as separators on
+/// every platform, so `..\..\etc` is rejected on Linux too (where `\` is
+/// otherwise a legal filename character and `std::path` would not split on it).
+///
+/// Returns `Err(())` if the input is empty, absolute (leading `/` or a Windows
+/// drive prefix like `C:`), contains a literal NUL, or escapes the start via a
+/// `..` underflow. On success returns the normalized relative `PathBuf`.
+fn normalize_rel(raw: &str) -> Result<PathBuf, ()> {
+    if raw.is_empty() || raw.contains('\0') {
+        return Err(());
+    }
+    // Absolute (POSIX) path.
+    if raw.starts_with('/') || raw.starts_with('\\') {
+        return Err(());
+    }
+    // Windows drive-letter prefix, e.g. `C:` / `c:\...`.
+    let bytes = raw.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return Err(());
+    }
+
+    // Split on both separators ourselves so `\` is always treated as one.
     let mut normalized = PathBuf::new();
-    for comp in Path::new(rel).components() {
-        match comp {
-            Component::ParentDir => {
+    for seg in raw.split(['/', '\\']) {
+        match seg {
+            "" | "." => {} // empty (from doubled separators) or current dir: skip
+            ".." => {
                 if !normalized.pop() {
-                    v.push(Violation::PathTraversal { raw: rel.to_string() });
-                    return;
+                    return Err(()); // underflow past the start: traversal
                 }
             }
-            Component::CurDir => {}
-            Component::Normal(c) => normalized.push(c),
-            Component::RootDir | Component::Prefix(_) => {
-                // Absolute path inside a manifest is always out of bounds.
-                v.push(Violation::OutsideWhitelistDir {
-                    component: component.to_string(),
-                    dest: PathBuf::from(rel),
-                });
-                return;
-            }
+            other => normalized.push(other),
         }
     }
-    // Destinations are always rooted at the whitelisted dir, so a normalized
-    // relative path that never underflowed is in-bounds. (Underflow already
-    // pushed PathTraversal above.)
-    let _ = root;
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -186,5 +222,41 @@ mod tests {
         let (m, raw) = manifest("[components.config]\nkey=\"value\"\n");
         let errs = validate(&m, &paths(), &raw).unwrap_err();
         assert!(errs.contains(&Violation::ConfigComponentForbidden));
+    }
+
+    #[test]
+    fn normalize_rel_accepts_clean_relative_paths() {
+        assert_eq!(normalize_rel("a/b/c").unwrap(), PathBuf::from("a/b/c"));
+        assert_eq!(normalize_rel("./a//b").unwrap(), PathBuf::from("a/b"));
+        assert_eq!(normalize_rel("a/./b/../c").unwrap(), PathBuf::from("a/c"));
+    }
+
+    #[test]
+    fn normalize_rel_rejects_traversal_and_absolute() {
+        assert!(normalize_rel("").is_err());
+        assert!(normalize_rel("..").is_err());
+        assert!(normalize_rel("../x").is_err());
+        assert!(normalize_rel("a/../../b").is_err());
+        assert!(normalize_rel("/etc/passwd").is_err());
+        // Backslash separators are rejected on every platform.
+        assert!(normalize_rel("..\\..\\etc").is_err());
+        assert!(normalize_rel("\\\\server\\share").is_err());
+        // Windows drive-letter prefix.
+        assert!(normalize_rel("C:\\Windows").is_err());
+        assert!(normalize_rel("c:relative").is_err());
+    }
+
+    #[test]
+    fn dashboard_artifact_id_namespacing() {
+        let (m, raw) = manifest(
+            "[components.dashboard]\nartifact_id=\"evil-dashboard\"\ncontent_type=\"text/html\"\nfiles_from=\"d\"\nentry=\"i.html\"\n",
+        );
+        let errs = validate(&m, &paths(), &raw).unwrap_err();
+        assert!(errs.contains(&Violation::ArtifactIdNotNamespaced { id: "evil-dashboard".into() }));
+
+        let (m, raw) = manifest(
+            "[components.dashboard]\nartifact_id=\"demo-dashboard\"\ncontent_type=\"text/html\"\nfiles_from=\"d\"\nentry=\"i.html\"\n",
+        );
+        assert!(validate(&m, &paths(), &raw).is_ok());
     }
 }
