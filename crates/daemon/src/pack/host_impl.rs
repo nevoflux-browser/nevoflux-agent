@@ -185,9 +185,22 @@ impl PackHost for PackHostImpl {
             .map_err(|e| Self::io_err("remove_artifact", e))?;
         Ok(())
     }
+    // --- activation + progress ---
     fn reload_skills(&self) -> PackResult<ReloadReport> {
-        unimplemented!("C4")
+        // We are on a spawn_blocking thread → blocking_write is allowed.
+        let mut reg = self.skills.blocking_write();
+        let loaded = reg.reload().map_err(|e| Self::io_err("reload_skills", e))?;
+        Ok(ReloadReport { loaded })
     }
-    fn report(&self, _p: EnginePackProgress) { /* filled in C4 */
+
+    fn report(&self, p: EnginePackProgress) {
+        if let Some(bus) = &self.bus {
+            let frame = crate::pack::rpc::PackProgress::from_engine(&self.op_id, &p);
+            let bus = bus.clone();
+            // Fire-and-forget publish on the runtime.
+            self.handle.block_on(async move {
+                crate::pack::rpc::publish_progress(&bus, &frame).await;
+            });
+        }
     }
 }
