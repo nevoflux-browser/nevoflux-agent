@@ -6361,6 +6361,18 @@ async fn handle_chat_message(
                 // Pack protocol foundations (H1/H2).
                 "daemon.info" => handle_daemon_info(&params),
                 "skill.reload" => handle_skill_reload(services, &params).await,
+                // Pack install protocol (Plan 02). Sync ops return inline;
+                // install/uninstall/update run the lifecycle inside
+                // spawn_blocking and (in wait:false mode) stream progress on
+                // `system:pack:progress`.
+                "pack.validate" => crate::pack::rpc::handle_pack_validate(&params),
+                "pack.list" => crate::pack::rpc::handle_pack_list(&params),
+                "pack.status" => crate::pack::rpc::handle_pack_status(&params),
+                "pack.install" => crate::pack::rpc::handle_pack_install(services, &params).await,
+                "pack.uninstall" => {
+                    crate::pack::rpc::handle_pack_uninstall(services, &params).await
+                }
+                "pack.update" => crate::pack::rpc::handle_pack_update(services, &params).await,
                 // LLM provider configuration commands
                 "config.llm.list" => handle_config_llm_list(&params).await,
                 "config.llm.get" => handle_config_llm_get(&params).await,
