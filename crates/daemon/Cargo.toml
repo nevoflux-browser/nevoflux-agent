@@ -24,6 +24,10 @@ nevoflux-llm-gateway = { path = "../llm-gateway", default-features = false }
 nevoflux-computer = { path = "../computer" }
 nevoflux-builtin-wasm = { path = "../builtin-wasm" }
 nevoflux-brain = { path = "../brain" }
+nevoflux-pack = { path = "../pack" }
+
+# Pack protocol: semantic versioning for resolved paths / compatibility checks
+semver = { version = "1", features = ["serde"] }
 
 # LLM framework
 rig-core = { workspace = true }

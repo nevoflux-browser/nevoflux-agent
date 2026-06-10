@@ -47,6 +47,7 @@ pub mod loops;
 pub mod mcp_config;
 pub mod memory_reindex;
 pub mod openclaw_setup;
+pub mod paths;
 pub mod permission;
 pub mod registry;
 pub mod retry;
