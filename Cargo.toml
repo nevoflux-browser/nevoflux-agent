@@ -21,6 +21,7 @@ members = [
     "crates/bridge",
     "crates/brain",
     "crates/skills",
+    "crates/pack",
     "crates/computer",
     "crates/builtin-wasm",
 ]
