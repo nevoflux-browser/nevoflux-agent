@@ -6365,7 +6365,8 @@ async fn handle_chat_message(
                 // install/uninstall/update run the lifecycle inside
                 // spawn_blocking and (in wait:false mode) stream progress on
                 // `system:pack:progress`.
-                "pack.validate" => crate::pack::rpc::handle_pack_validate(&params),
+                "pack.validate" => crate::pack::rpc::handle_pack_validate(&params).await,
+                "pack.inspect" => crate::pack::rpc::handle_pack_inspect(&params).await,
                 "pack.list" => crate::pack::rpc::handle_pack_list(&params),
                 "pack.status" => crate::pack::rpc::handle_pack_status(&params),
                 "pack.install" => crate::pack::rpc::handle_pack_install(services, &params).await,

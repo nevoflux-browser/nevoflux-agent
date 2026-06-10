@@ -2,8 +2,8 @@
 //! protected is reported as a violation.
 use serde_json::json;
 
-#[test]
-fn validate_reports_violation_for_unprotected_seed() {
+#[tokio::test]
+async fn validate_reports_violation_for_unprotected_seed() {
     let dir = tempfile::tempdir().unwrap();
     let manifest = dir.path().join("pack.toml");
     std::fs::write(
@@ -19,7 +19,7 @@ fn validate_reports_violation_for_unprotected_seed() {
         "request_id": "r1",
         "manifest_path": manifest.to_str().unwrap()
     });
-    let resp = nevoflux_daemon::pack::rpc::handle_pack_validate(&params);
+    let resp = nevoflux_daemon::pack::rpc::handle_pack_validate(&params).await;
     let payload = &resp["payload"];
     assert_eq!(payload["success"], true);
     assert_eq!(payload["data"]["ok"], false);

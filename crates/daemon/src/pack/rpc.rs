@@ -87,39 +87,69 @@ fn load_manifest(
 }
 
 /// pack.validate — pure capability check, no mutation. Used by `--dry-run`.
-pub fn handle_pack_validate(params: &Value) -> Value {
-    let request_id = params.get("request_id").and_then(|v| v.as_str()).unwrap_or("");
-    let manifest_path = match params.get("manifest_path").and_then(|v| v.as_str()) {
-        Some(p) => p,
+/// Accepts a `source` (local path OR github:…) or the legacy `manifest_path`.
+pub async fn handle_pack_validate(params: &Value) -> Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    // Accept `source` (local path OR github:…) or legacy `manifest_path`.
+    let source = params
+        .get("source")
+        .and_then(|v| v.as_str())
+        .or_else(|| params.get("manifest_path").and_then(|v| v.as_str()));
+    let source = match source {
+        Some(s) => s.to_string(),
         None => {
             return err(
-                request_id,
+                &request_id,
                 "pack.validate",
                 "MISSING_PARAM",
-                "manifest_path required",
+                "source or manifest_path required",
             )
         }
     };
-    let (m, raw, _dir) = match load_manifest(manifest_path) {
-        Ok(t) => t,
-        Err(e) => return err(request_id, "pack.validate", "BAD_MANIFEST", &e),
+    let data_dir = crate::paths::resolve_from_daemon().data_dir;
+    // `resolved` (with its TempDir guard, for remote sources) is held until the
+    // end of this function — the capability check below reads `pack.toml`
+    // synchronously, so the extracted files must stay alive that long.
+    let resolved = match crate::pack::fetch::resolve_source(&source, &data_dir).await {
+        Ok(r) => r,
+        Err(e) => return err(&request_id, "pack.validate", "FETCH_FAILED", &e.to_string()),
+    };
+    let raw = match std::fs::read_to_string(resolved.pack_dir.join("pack.toml")) {
+        Ok(s) => s,
+        Err(e) => {
+            return err(
+                &request_id,
+                "pack.validate",
+                "MANIFEST_NOT_FOUND",
+                &e.to_string(),
+            )
+        }
+    };
+    let m = match Manifest::parse(&raw) {
+        Ok(m) => m,
+        Err(e) => return err(&request_id, "pack.validate", "BAD_MANIFEST", &e),
     };
     let paths = crate::paths::resolve_from_daemon();
     match capability::validate(&m, &paths, &raw) {
         Ok(()) => ok(
-            request_id,
+            &request_id,
             "pack.validate",
             serde_json::json!({ "ok": true, "violations": [] }),
         ),
         Err(violations) => {
             let v: Vec<String> = violations.iter().map(|x| format!("{x:?}")).collect();
             ok(
-                request_id,
+                &request_id,
                 "pack.validate",
                 serde_json::json!({ "ok": false, "violations": v }),
             )
         }
     }
+    // `resolved` (and its TempDir) drops here.
 }
 
 /// pack.list — enumerate installed packs by reading {config}/packs/*/receipt.json.
@@ -236,22 +266,64 @@ pub async fn handle_pack_install(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let manifest_path = match params.get("manifest_path").and_then(|v| v.as_str()) {
+    // Accept `source` (local path OR github:…) or legacy `manifest_path`.
+    let source = params
+        .get("source")
+        .and_then(|v| v.as_str())
+        .or_else(|| params.get("manifest_path").and_then(|v| v.as_str()));
+    let source = match source {
         Some(s) => s.to_string(),
         None => {
             return err(
                 &request_id,
                 "pack.install",
                 "MISSING_PARAM",
-                "manifest_path required",
+                "source or manifest_path required",
             )
         }
     };
     let force = params.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
     let wait = params.get("wait").and_then(|v| v.as_bool()).unwrap_or(true); // CLI default
 
-    let (manifest, raw, pack_dir) = match load_manifest(&manifest_path) {
-        Ok(t) => t,
+    let op_id = new_op_id();
+
+    // For background (`wait:false`) installs, surface a Fetch frame so the UI
+    // shows download progress while `resolve_source` runs.
+    if !wait {
+        if let Some(bus) = crate::kb_wizard::CURRENT_EVENT_BUS.get().cloned() {
+            publish_progress(
+                &bus,
+                &PackProgress {
+                    op_id: op_id.clone(),
+                    phase: "Fetch".into(),
+                    status: "Running".into(),
+                    progress_pct: 5,
+                    log: format!("fetching {source}"),
+                },
+            )
+            .await;
+        }
+    }
+
+    let data_dir = crate::paths::resolve_from_daemon().data_dir;
+    let resolved = match crate::pack::fetch::resolve_source(&source, &data_dir).await {
+        Ok(r) => r,
+        Err(e) => return err(&request_id, "pack.install", "FETCH_FAILED", &e.to_string()),
+    };
+    let pack_dir = resolved.pack_dir.clone();
+    let raw = match std::fs::read_to_string(pack_dir.join("pack.toml")) {
+        Ok(s) => s,
+        Err(e) => {
+            return err(
+                &request_id,
+                "pack.install",
+                "MANIFEST_NOT_FOUND",
+                &e.to_string(),
+            )
+        }
+    };
+    let manifest = match Manifest::parse(&raw) {
+        Ok(m) => m,
         Err(e) => return err(&request_id, "pack.install", "BAD_MANIFEST", &e),
     };
     // Knowledge deferred: reject up front with a helpful message.
@@ -264,7 +336,6 @@ pub async fn handle_pack_install(
         );
     }
 
-    let op_id = new_op_id();
     let build = build_host(services, op_id.clone());
     let now_utc = params
         .get("now_utc")
@@ -274,14 +345,21 @@ pub async fn handle_pack_install(
     let opts = InstallOpts {
         force,
         now_utc,
-        ..Default::default()
+        source: resolved.origin.clone(),
+        tarball_sha256: resolved.tarball_sha256.clone(),
     };
 
     // Capture the runtime handle BEFORE spawn_blocking so the host's brain/bus
     // block_on bridges always resolve a runtime (Handle::current() inside a
     // blocking thread can be fragile; capture it on the async task instead).
     let handle = tokio::runtime::Handle::current();
+    // CRITICAL: `resolved` owns the TempDir that holds the extracted remote pack
+    // files. `lifecycle::install` reads those files synchronously inside the
+    // blocking closure, so `resolved` MUST be moved INTO the closure and outlive
+    // the install. We bind it here and reference it (a no-op read) so the
+    // closure captures it by move rather than letting it drop early.
     let run = move || {
+        let _keep_alive = &resolved; // hold the TempDir until install finishes
         let host = build.into_host(handle);
         lifecycle::install(&host, &manifest, &raw, &pack_dir, &opts)
     };
