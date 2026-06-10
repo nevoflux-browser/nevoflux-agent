@@ -323,11 +323,16 @@ pub async fn handle_pack_install(
     }
 
     let build = build_host(services, op_id.clone());
-    let now_utc = params
+    // The pure engine is time-free; the daemon stamps install time. The CLI
+    // doesn't send `now_utc`, so fall back to the current UTC time here.
+    let mut now_utc = params
         .get("now_utc")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    if now_utc.is_empty() {
+        now_utc = chrono::Utc::now().to_rfc3339();
+    }
     let opts = InstallOpts {
         force,
         now_utc,
@@ -432,6 +437,23 @@ pub async fn handle_pack_uninstall(
     }
 }
 
+/// Re-read the receipt at `receipt_path`, set its provenance fields, and write
+/// it back. Returns an error on any I/O or (de)serialization failure so the
+/// caller can warn about lost provenance.
+fn patch_receipt_provenance(
+    receipt_path: &std::path::Path,
+    origin: Option<String>,
+    tarball_sha256: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let s = std::fs::read_to_string(receipt_path)?;
+    let mut rec = serde_json::from_str::<nevoflux_pack::receipt::Receipt>(&s)?;
+    rec.source = origin;
+    rec.tarball_sha256 = tarball_sha256;
+    let out = serde_json::to_string_pretty(&rec)?;
+    std::fs::write(receipt_path, out)?;
+    Ok(())
+}
+
 pub async fn handle_pack_update(
     services: &crate::wasm::services::HostServices,
     params: &Value,
@@ -486,11 +508,16 @@ pub async fn handle_pack_update(
             "[components.knowledge] not supported yet",
         );
     }
-    let now_utc = params
+    // The pure engine is time-free; the daemon stamps update time. The CLI
+    // doesn't send `now_utc`, so fall back to the current UTC time here.
+    let mut now_utc = params
         .get("now_utc")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    if now_utc.is_empty() {
+        now_utc = chrono::Utc::now().to_rfc3339();
+    }
     let pack_name = manifest.pack.name.clone();
     // Carry provenance from the resolved source into the refreshed receipt.
     // `lifecycle::update` builds its own InstallOpts internally (it does not
@@ -511,19 +538,18 @@ pub async fn handle_pack_update(
     match tokio::task::spawn_blocking(run).await {
         Ok(Ok(r)) => {
             // Persist provenance onto the freshly written receipt (best-effort).
+            // A failure here loses provenance (source/tarball_sha256) for an
+            // otherwise-successful update, so warn rather than fail silently.
             if origin.is_some() || tarball_sha256.is_some() {
                 let paths = crate::paths::resolve_from_daemon();
                 let receipt_path = paths.receipt_path(&pack_name);
-                if let Ok(s) = std::fs::read_to_string(&receipt_path) {
-                    if let Ok(mut rec) =
-                        serde_json::from_str::<nevoflux_pack::receipt::Receipt>(&s)
-                    {
-                        rec.source = origin;
-                        rec.tarball_sha256 = tarball_sha256;
-                        if let Ok(out) = serde_json::to_string_pretty(&rec) {
-                            let _ = std::fs::write(&receipt_path, out);
-                        }
-                    }
+                if let Err(e) = patch_receipt_provenance(&receipt_path, origin, tarball_sha256) {
+                    tracing::warn!(
+                        error = %e,
+                        pack = %pack_name,
+                        receipt = %receipt_path.display(),
+                        "failed to patch update receipt provenance; source/tarball_sha256 not recorded"
+                    );
                 }
             }
             ok(
