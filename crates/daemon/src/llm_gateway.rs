@@ -22,7 +22,7 @@ use nevoflux_llm_gateway::{
 use rand::RngCore;
 use tracing::{info, warn};
 
-use crate::config::{AgentConfig, GatewayUpstreamConfig, KnowledgeBaseConfig, LlmConfig};
+use crate::config::{AgentConfig, GatewayUpstreamConfig, LlmConfig};
 
 /// Clone-safe snapshot of a running gateway, suitable for storing in
 /// places that don't own the [`GatewayHandle`] itself (which holds the
@@ -384,29 +384,38 @@ fn env_duration_secs(name: &str, default: Duration) -> Duration {
         .unwrap_or(default)
 }
 
-/// Initialize the in-process llm-gateway, if enabled by config.
+/// Initialize the in-process llm-gateway.
 ///
-/// Returns `Ok(None)` when `knowledge_base.enabled = false`. Returns
-/// `Err(_)` if the listener fails to bind or `/healthz` never returns
-/// 2xx within the polling window.
+/// The gateway starts **unconditionally** — it is intentionally NOT gated
+/// on `knowledge_base.enabled`. Although today its only consumers are the
+/// knowledge-base subsystem (the gbrain subprocess, the install wizard,
+/// and the embedding path), the gateway is shared infrastructure that
+/// other current/future services may route LLM traffic through, so the
+/// daemon always brings it up. An idle gateway is cheap: a bound loopback
+/// listener with no upstream traffic.
+///
+/// Returns `Err(_)` only if the listener fails to bind. A slow or failing
+/// `/healthz` probe is **non-fatal**: the gateway task is already serving
+/// on a bound listener, so we keep the live handle and only warn — see the
+/// health-check loop below for why discarding it would actively tear down
+/// a working gateway.
 ///
 /// Behavior:
 /// 1. Bind `127.0.0.1:0` so the OS picks a free port.
 /// 2. Generate a 32-byte hex bearer token via `rand::thread_rng`.
 /// 3. Resolve upstream config via [`resolve_upstream_config`] (M2-5):
-///    TOML config file → env vars → built-in defaults. Empty
-///    `upstream_api_key` is tolerated for boot — chat-completions will
-///    fail upstream until a key is supplied, which is fine: M1 #010
-///    only needs the listener up.
+///    TOML config file → env vars → `[llm.<provider>]` → built-in
+///    defaults. Empty `upstream_api_key` is tolerated for boot —
+///    chat-completions will fail upstream until a key is supplied, which
+///    is fine: boot only needs the listener up.
 /// 4. Call [`nevoflux_llm_gateway::serve`] to spawn the task.
-/// 5. Poll `/healthz` up to 20 times at 100 ms intervals before
-///    declaring success.
+/// 5. Best-effort poll `/healthz` up to 20×100 ms as a readiness signal;
+///    on timeout, warn and keep the gateway anyway.
 pub async fn init_gateway(agent_config: &AgentConfig) -> Result<Option<GatewayBoot>, InitError> {
+    // NOTE: deliberately NO `knowledge_base.enabled` gate here — the
+    // gateway is always started (see fn docs). We still read the
+    // `[knowledge_base.gateway]` section below for upstream settings.
     let config = &agent_config.knowledge_base;
-    if !config.enabled {
-        info!("knowledge_base.enabled = false — skipping llm-gateway start");
-        return Ok(None);
-    }
 
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("loopback addr parse");
 
@@ -464,9 +473,21 @@ pub async fn init_gateway(agent_config: &AgentConfig) -> Result<Option<GatewayBo
                 break;
             }
             _ if tries >= max_tries => {
-                return Err(
-                    format!("llm-gateway failed /healthz after {} tries", max_tries).into(),
+                // Non-fatal. The gateway task is already serving on a
+                // bound listener; `/healthz` can lag under load (debug
+                // build, saturated runtime) without the gateway being
+                // broken. Crucially, returning Err here would drop the
+                // GatewayHandle, and dropping it fires its
+                // graceful-shutdown channel (see llm-gateway server.rs) —
+                // i.e. a slow probe would TEAR DOWN a live gateway. Keep
+                // the handle and warn instead.
+                warn!(
+                    url = %handle.url(),
+                    "llm-gateway /healthz did not pass within {}ms; keeping the \
+                     gateway anyway (it may still be warming up)",
+                    max_tries.saturating_mul(100)
                 );
+                break;
             }
             _ => {
                 tries = tries.saturating_add(1);
@@ -528,7 +549,7 @@ mod tests {
     /// `llm.<provider>`, so default everything else.
     fn test_agent_config(gateway: GatewayUpstreamConfig) -> AgentConfig {
         AgentConfig {
-            knowledge_base: KnowledgeBaseConfig {
+            knowledge_base: crate::config::KnowledgeBaseConfig {
                 enabled: true,
                 gateway,
                 brain: crate::config::BrainConfig::default(),
@@ -555,14 +576,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_gateway_disabled_returns_none() {
+    async fn init_gateway_starts_even_when_kb_disabled() {
+        // The llm-gateway is decoupled from `knowledge_base.enabled`: it
+        // must start unconditionally so non-KB consumers can rely on it.
+        // (Previously this returned None when KB was disabled.)
         let mut cfg = AgentConfig::default();
         cfg.knowledge_base.enabled = false;
-        let result = init_gateway(&cfg).await.expect("disabled is not an error");
-        assert!(
-            result.is_none(),
-            "disabled config must yield None, got Some"
-        );
+        let boot = init_gateway(&cfg)
+            .await
+            .expect("init should succeed")
+            .expect("gateway must start even when knowledge_base is disabled");
+        assert!(boot.snapshot.url.starts_with("http://127.0.0.1:"));
+        assert_eq!(boot.snapshot.bearer_token.len(), 64);
+        boot.handle.shutdown().await;
     }
 
     #[tokio::test]

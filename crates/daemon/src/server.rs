@@ -643,18 +643,22 @@ pub async fn start_server(
         }
     };
 
-    // Boot the in-process llm-gateway (M1 #010). Done after loading
-    // agent config so we can read `knowledge_base.enabled` from it,
-    // but before any of the heavier subsystem inits below — the
-    // gateway only needs an OS-assigned loopback port and the listener
-    // binds in milliseconds.
+    // Boot the in-process llm-gateway (M1 #010). Started UNCONDITIONALLY
+    // (not gated on knowledge_base.enabled) — it's shared infra that the
+    // knowledge base and other services route LLM traffic through. Done
+    // after loading agent config so the gateway can resolve its upstream
+    // settings from `[knowledge_base.gateway]` / `[llm.<provider>]`, but
+    // before the heavier subsystem inits below — it only needs an
+    // OS-assigned loopback port and the listener binds in milliseconds.
     let gateway_boot = match crate::llm_gateway::init_gateway(&agent_config).await {
         Ok(opt) => opt,
         Err(e) => {
-            // Don't fail the whole daemon boot if the gateway can't
-            // come up — the knowledge-base path is degraded but the
-            // rest of the daemon remains usable.
-            error!("llm-gateway init failed: {e}; continuing with knowledge base disabled");
+            // Only a listener BIND failure reaches here now — the
+            // `/healthz` probe is non-fatal, so a slow gateway is no
+            // longer discarded. Without the gateway, the knowledge base
+            // and any other gateway-dependent features are degraded, but
+            // the rest of the daemon remains usable.
+            error!("llm-gateway failed to bind: {e}; continuing without llm-gateway");
             None
         }
     };
@@ -663,38 +667,61 @@ pub async fn start_server(
         None => (None, None),
     };
 
-    // Boot the gbrain integration (M3-3). Depends on the gateway being
-    // up: gbrain reads its `OPENROUTER_*` env vars from the gateway
-    // snapshot at spawn time. Brain init failure is non-fatal — the
-    // daemon continues without the knowledge base; the user can fix
-    // their config (install bun, run the M3-5 install wizard) and
-    // restart.
+    // Boot the gbrain integration (M3-3) OFF the critical boot path.
     //
-    // After M4-2.5 the brain handle lives in a hot-reloadable slot so
-    // the install wizard's `kb.wizard.init_brain` step can drop a fresh
-    // supervisor in without a daemon restart. Construct the slot up
-    // front (empty), publish it for the wizard, then populate it from
-    // boot-time `init_brain()` below.
+    // gbrain reads its `OPENROUTER_*` / `OPENAI_*` env vars from the
+    // gateway snapshot at spawn time, so this still depends on the
+    // gateway being up (init_gateway ran above). Brain init failure is
+    // non-fatal — the daemon continues without the knowledge base; the
+    // user can fix their config (install bun, run the M3-5 install
+    // wizard) and restart.
+    //
+    // The brain handle lives in a hot-reloadable `Option` slot
+    // (constructed empty here, published for the install wizard's
+    // `kb.wizard.init_brain` step which can drop a fresh supervisor in
+    // without a daemon restart). We populate it from a *background* task
+    // rather than inline: gbrain's bun cold start + PGLite open + MCP
+    // `initialize` handshake can take tens of seconds (up to
+    // `initialize_timeout`, default 120s) on a large brain. Running that
+    // inline blocked the TCP accept loop (spawned far below) behind it,
+    // so the sidebar couldn't become ready for input or load session
+    // history until the brain finished initializing. Every brain consumer
+    // already treats an empty slot as a transient "brain not available
+    // yet" state (see `brain_rpc.rs` and `services.brain_supervisor()`),
+    // so deferring population is safe — brain tools + `brain.*` RPCs light
+    // up a few seconds after the rest of the daemon is already serving
+    // chat and session history.
     let brain_slot: crate::init_brain::SharedBrainSlot = Arc::new(tokio::sync::RwLock::new(None));
     let _ = crate::init_brain::CURRENT_BRAIN_SLOT.set(brain_slot.clone());
 
-    let brain_boot = match crate::init_brain::init_brain(
-        &agent_config.knowledge_base,
-        &gateway_snapshot,
-    )
-    .await
     {
-        Ok(b) => b,
-        Err(e) => {
-            error!("init_brain failed: {e}; continuing without brain");
-            None
-        }
-    };
-    if let Some(boot) = brain_boot {
-        let mut guard = brain_slot.write().await;
-        *guard = Some(crate::init_brain::BrainSlot {
-            supervisor: boot.supervisor,
-            engine: boot.engine,
+        let brain_slot_boot = brain_slot.clone();
+        let kb_config_boot = agent_config.knowledge_base.clone();
+        let gateway_snapshot_boot = gateway_snapshot.clone();
+        tokio::spawn(async move {
+            match crate::init_brain::init_brain(&kb_config_boot, &gateway_snapshot_boot).await {
+                Ok(Some(boot)) => {
+                    let mut guard = brain_slot_boot.write().await;
+                    *guard = Some(crate::init_brain::BrainSlot {
+                        supervisor: boot.supervisor,
+                        engine: boot.engine,
+                    });
+                    info!(
+                        "gbrain background init complete; brain tools + brain.* RPCs now available"
+                    );
+                }
+                // Skipped: KB/brain disabled or prerequisites missing (bun /
+                // gbrain cli not installed). init_brain already logged the
+                // specific reason at WARN/INFO.
+                Ok(None) => {
+                    debug!(
+                        "gbrain background init skipped (brain disabled or prerequisites missing)"
+                    );
+                }
+                Err(e) => {
+                    error!("gbrain background init failed: {e}; continuing without brain");
+                }
+            }
         });
     }
 
