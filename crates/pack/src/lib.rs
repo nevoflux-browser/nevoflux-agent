@@ -3,5 +3,7 @@
 //! are added by their respective tasks (B2–B8).
 
 pub mod error;
+pub mod paths;
 
 pub use error::{PackError, PackResult};
+pub use paths::ResolvedPaths;
