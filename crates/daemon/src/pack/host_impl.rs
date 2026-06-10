@@ -128,11 +128,29 @@ impl PackHost for PackHostImpl {
             "knowledge source removal deferred (M5)".into(),
         ))
     }
-    fn upsert_artifact(&self, _spec: &ArtifactSpec) -> PackResult<()> {
-        unimplemented!("C2")
+    fn upsert_artifact(&self, spec: &ArtifactSpec) -> PackResult<()> {
+        use nevoflux_storage::{ArtifactRepository, CreateArtifactParams};
+        let files: std::collections::HashMap<String, String> =
+            spec.files.iter().cloned().collect();
+        let params = CreateArtifactParams::new_orphan(
+            &spec.artifact_id,
+            &spec.artifact_id,
+            &spec.content_type,
+        )
+        .with_files(files)
+        .with_entry(&spec.entry);
+        let repo = ArtifactRepository::new(&self.db);
+        repo.create(params)
+            .map_err(|e| Self::io_err("upsert_artifact", e))?;
+        Ok(())
     }
-    fn remove_artifact(&self, _id: &str) -> PackResult<()> {
-        unimplemented!("C2")
+
+    fn remove_artifact(&self, id: &str) -> PackResult<()> {
+        use nevoflux_storage::ArtifactRepository;
+        let repo = ArtifactRepository::new(&self.db);
+        repo.delete(id)
+            .map_err(|e| Self::io_err("remove_artifact", e))?;
+        Ok(())
     }
     fn reload_skills(&self) -> PackResult<ReloadReport> {
         unimplemented!("C4")
