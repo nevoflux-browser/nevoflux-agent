@@ -33,6 +33,8 @@
 pub mod fixtures;
 pub mod helpers;
 pub mod mocks;
+pub mod mock_pack_host;
+pub use mock_pack_host::MockPackHost;
 
 // Re-export commonly used types for convenience
 pub use fixtures::{sample_session, EnvelopeBuilder};
