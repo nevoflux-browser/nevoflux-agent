@@ -35,10 +35,12 @@ pub fn parse_source(input: &str) -> Result<Source, String> {
     if let Some(rest) = s.strip_prefix("github:") {
         return parse_github_short(rest);
     }
-    if let Some(rest) = s
-        .strip_prefix("https://github.com/")
-        .or_else(|| s.strip_prefix("http://github.com/"))
-    {
+    // HTTPS-only: do NOT accept `http://github.com/`. The CLI's trust prompt
+    // only treats `github:`/`https://github.com/` as remote, so accepting plain
+    // HTTP here would let an `http://github.com/...` source skip the prompt yet
+    // still be fetched remotely. An `http://...` string falls through to the
+    // local-path branch (and simply fails to find pack.toml).
+    if let Some(rest) = s.strip_prefix("https://github.com/") {
         return parse_github_url(rest);
     }
     // Anything else is a local path.
@@ -104,7 +106,10 @@ fn finish(
         }
     }
     if let Some(r) = &git_ref {
+        // No traversal: a ref like `../../x` must not be able to climb out of
+        // the repo (mirrors the subdir `..` check above).
         if r.is_empty()
+            || r.split('/').any(|seg| seg == "..")
             || !r
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
@@ -178,12 +183,30 @@ mod tests {
         );
     }
 
+    /// I1: the daemon is HTTPS-only. An `http://github.com/...` source must NOT
+    /// be treated as Remote (which would skip the CLI trust prompt while the
+    /// daemon still fetched it). It falls through to the local-path branch.
+    #[test]
+    fn http_github_is_local_not_remote() {
+        assert_eq!(
+            parse_source("http://github.com/u/r").unwrap(),
+            Source::Local("http://github.com/u/r".into()),
+        );
+    }
+
     #[test]
     fn rejects_injection_and_traversal() {
         assert!(parse_source("github:u/r@a;rm -rf").is_err());
         assert!(parse_source("github:u/r/../etc").is_err());
         assert!(parse_source("github:u /r").is_err());
         assert!(parse_source("github:u/r@a b").is_err());
+    }
+
+    /// M1: a git ref must not be able to traverse out of the repo. A ref whose
+    /// `/`-split contains a `..` segment is rejected (mirrors the subdir check).
+    #[test]
+    fn rejects_ref_with_parent_segment() {
+        assert!(parse_source("github:u/r@../../x").is_err());
     }
 }
 
@@ -402,5 +425,72 @@ mod core_tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = extract_tarball(&bytes, tmp.path()).unwrap();
         assert!(locate_pack_dir(&root, None).is_err());
+    }
+
+    /// Build a gzip+tar archive whose ONE entry has a raw, unvalidated path
+    /// written directly into the 512-byte header name field. `tar::Builder`
+    /// rejects `..` paths at *creation* time, so we hand-roll the header to
+    /// smuggle a traversal path into the archive (what a malicious server can
+    /// craft). Path length must fit the 100-byte name field.
+    fn make_evil_tarball(name: &str, contents: &str) -> Vec<u8> {
+        assert!(name.len() <= 100, "name must fit the ustar name field");
+        let mut header = [0u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        // mode (octal, 8 bytes incl NUL), e.g. "0000644\0"
+        header[100..108].copy_from_slice(b"0000644\0");
+        // uid / gid
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        // size (octal, 12 bytes incl trailing space/NUL)
+        let size = format!("{:011o}\0", contents.len());
+        header[124..136].copy_from_slice(size.as_bytes());
+        // mtime
+        header[136..148].copy_from_slice(b"00000000000\0");
+        // typeflag '0' = regular file
+        header[156] = b'0';
+        // ustar magic + version
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        // checksum: blanks while computing, then octal sum.
+        header[148..156].copy_from_slice(b"        ");
+        let sum: u32 = header.iter().map(|&b| b as u32).sum();
+        let cksum = format!("{sum:06o}\0 ");
+        header[148..156].copy_from_slice(cksum.as_bytes());
+
+        let mut tar_buf = Vec::new();
+        tar_buf.extend_from_slice(&header);
+        tar_buf.extend_from_slice(contents.as_bytes());
+        // pad data to a 512-byte block boundary
+        let pad = (512 - (contents.len() % 512)) % 512;
+        tar_buf.extend(std::iter::repeat(0u8).take(pad));
+        // two zero blocks terminate the archive
+        tar_buf.extend(std::iter::repeat(0u8).take(1024));
+
+        let mut gz =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar_buf).unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// M3: zip-slip regression. A tarball entry whose path escapes the dest dir
+    /// via `../` must NOT be written outside the dest. We rely on the `tar`
+    /// crate's internal traversal protection; this pins that guarantee so a
+    /// future `tar` change can't silently regress it.
+    #[test]
+    fn extract_does_not_escape_dest_via_parent_traversal() {
+        let bytes = make_evil_tarball("../escape.txt", "PWNED");
+        // dest is a nested subdir so we can inspect its parent for an escapee.
+        let outer = tempfile::tempdir().unwrap();
+        let dest = outer.path().join("dest");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // Extraction may succeed or error; either is fine, as long as nothing
+        // landed outside `dest`.
+        let _ = extract_tarball(&bytes, &dest);
+
+        assert!(
+            !outer.path().join("escape.txt").exists(),
+            "tarball entry escaped the dest dir via ../"
+        );
     }
 }
