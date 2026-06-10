@@ -131,6 +131,11 @@ impl PackHost for PackHostImpl {
         if p.exists() {
             std::fs::remove_file(&p).map_err(|e| Self::io_err("rm receipt", e))?;
         }
+        // Prune the now-empty per-pack dir ({config}/packs/<name>/) so a full
+        // uninstall leaves no trace. Leave {config}/packs/ itself (other packs).
+        if let Some(pack_dir) = p.parent() {
+            let _ = std::fs::remove_dir(pack_dir); // only succeeds if empty
+        }
         Ok(())
     }
 
