@@ -421,3 +421,73 @@ pub async fn handle_pack_update(
         Err(e) => err(&request_id, "pack.update", "JOIN_ERROR", &e.to_string()),
     }
 }
+
+/// Build the pack.inspect preview JSON from the parsed manifest, the gathered
+/// skill names, the canvas-tool (name, binary) pairs, capability violations,
+/// and the resolved origin. Pure — all I/O is done by the caller.
+pub fn summarize_inspect(
+    manifest: &nevoflux_pack::manifest::Manifest,
+    skill_names: &[String],
+    tool_binaries: &[(String, Option<String>)],
+    violations: &[String],
+    origin: Option<&str>,
+    tarball_sha256: Option<&str>,
+) -> serde_json::Value {
+    let tools: Vec<serde_json::Value> = tool_binaries
+        .iter()
+        .map(|(name, bin)| serde_json::json!({ "name": name, "binary": bin }))
+        .collect();
+    serde_json::json!({
+        "source": origin,
+        "tarball_sha256": tarball_sha256,
+        "pack": {
+            "name": manifest.pack.name,
+            "version": manifest.pack.version.to_string(),
+            "description": manifest.pack.description,
+            "authors": manifest.pack.authors,
+        },
+        "components": {
+            "skills": skill_names,
+            "canvas_tools": tools,
+            "seed": manifest.components.seed.iter().map(|s| s.slug.clone()).collect::<Vec<_>>(),
+            "dashboard": manifest.components.dashboard.as_ref().map(|d| d.artifact_id.clone()),
+            "knowledge": manifest.components.knowledge.is_some(),
+        },
+        "violations": violations,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn summarize_inspect_lists_components_and_flags_binary() {
+        let src = r#"
+[pack]
+name = "demo"
+version = "0.1.0"
+protocol = "pack-protocol/0.1"
+min_nevoflux = "0.3.0"
+[components.skills]
+dir = "components/skills"
+[[components.seed]]
+slug = "demo/cv"
+from = "s.md"
+[components.protected]
+prefixes = ["demo/"]
+"#;
+        let m = nevoflux_pack::manifest::Manifest::parse(src).unwrap();
+        let v = super::summarize_inspect(
+            &m,
+            &["demo-x".to_string()],
+            &[("pdf.render".to_string(), Some("weasyprint".to_string()))],
+            &[],
+            Some("github:u/r@v1"),
+            Some("abc"),
+        );
+        assert_eq!(v["pack"]["name"], "demo");
+        assert_eq!(v["components"]["skills"][0], "demo-x");
+        assert_eq!(v["components"]["canvas_tools"][0]["binary"], "weasyprint");
+        assert_eq!(v["components"]["seed"][0], "demo/cv");
+        assert_eq!(v["source"], "github:u/r@v1");
+    }
+}
