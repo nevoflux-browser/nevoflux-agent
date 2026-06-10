@@ -457,6 +457,98 @@ pub fn summarize_inspect(
     })
 }
 
+/// Read a pack dir's skill subdir names (one level) for the inspect preview.
+fn gather_skill_names(
+    pack_dir: &std::path::Path,
+    manifest: &nevoflux_pack::manifest::Manifest,
+) -> Vec<String> {
+    let Some(skills) = &manifest.components.skills else {
+        return Vec::new();
+    };
+    let dir = pack_dir.join(&skills.dir);
+    let mut names = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                names.push(p.file_name().unwrap().to_string_lossy().into_owned());
+            } else if p.extension().map(|x| x == "md").unwrap_or(false) {
+                names.push(p.file_stem().unwrap().to_string_lossy().into_owned());
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Read each declared canvas-tool TOML and extract (name, binary).
+fn gather_tool_binaries(
+    pack_dir: &std::path::Path,
+    manifest: &nevoflux_pack::manifest::Manifest,
+) -> Vec<(String, Option<String>)> {
+    let Some(ct) = &manifest.components.canvas_tools else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for f in &ct.files {
+        let path = pack_dir.join(f);
+        let (mut name, mut binary) = (f.clone(), None);
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            if let Ok(toml::Value::Table(t)) = s.parse::<toml::Value>() {
+                if let Some(n) = t.get("name").and_then(|v| v.as_str()) {
+                    name = n.to_string();
+                }
+                binary = t.get("binary").and_then(|v| v.as_str()).map(|x| x.to_string());
+            }
+        }
+        out.push((name, binary));
+    }
+    out
+}
+
+/// pack.inspect — fetch (if remote) + parse + capability check + preview. No install.
+pub async fn handle_pack_inspect(params: &Value) -> Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let source = match params.get("source").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => return err(&request_id, "pack.inspect", "MISSING_PARAM", "source required"),
+    };
+    let data_dir = crate::paths::resolve_from_daemon().data_dir;
+    let resolved = match crate::pack::fetch::resolve_source(&source, &data_dir).await {
+        Ok(r) => r,
+        Err(e) => return err(&request_id, "pack.inspect", "FETCH_FAILED", &e.to_string()),
+    };
+    let raw = match std::fs::read_to_string(resolved.pack_dir.join("pack.toml")) {
+        Ok(s) => s,
+        Err(e) => return err(&request_id, "pack.inspect", "MANIFEST_NOT_FOUND", &e.to_string()),
+    };
+    let manifest = match nevoflux_pack::manifest::Manifest::parse(&raw) {
+        Ok(m) => m,
+        Err(e) => return err(&request_id, "pack.inspect", "BAD_MANIFEST", &e),
+    };
+    let paths = crate::paths::resolve_from_daemon();
+    let violations: Vec<String> = match capability::validate(&manifest, &paths, &raw) {
+        Ok(()) => Vec::new(),
+        Err(vs) => vs.iter().map(|v| format!("{v:?}")).collect(),
+    };
+    let skills = gather_skill_names(&resolved.pack_dir, &manifest);
+    let tools = gather_tool_binaries(&resolved.pack_dir, &manifest);
+    let data = summarize_inspect(
+        &manifest,
+        &skills,
+        &tools,
+        &violations,
+        resolved.origin.as_deref(),
+        resolved.tarball_sha256.as_deref(),
+    );
+    ok(&request_id, "pack.inspect", data)
+    // `resolved` (and its TempDir) drops here, cleaning up the fetched files.
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
