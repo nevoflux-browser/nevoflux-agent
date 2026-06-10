@@ -8356,26 +8356,11 @@ fn handle_daemon_info(params: &serde_json::Value) -> serde_json::Value {
         .unwrap_or("")
         .to_string();
 
-    // Config dir: derive from the SAME source of truth the daemon uses to load
-    // config (AgentConfig::default_config_path), not a divergent re-derivation.
-    // This includes the macOS XDG fallback, so daemon.info reports the dir the
-    // daemon actually reads from. config_file is `<config_dir>/config.toml`.
-    let config_dir = AgentConfig::default_config_path()
-        .ok()
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-
-    // Data dir: NEVOFLUX_DATA_DIR override, else the platform data dir
-    // (mirrors the resolution used for the trace writer in this file).
-    let data_dir = std::env::var("NEVOFLUX_DATA_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            directories::ProjectDirs::from("com", "nevoflux", "nevoflux")
-                .map(|dirs| dirs.data_dir().to_path_buf())
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-        });
-
-    let paths = crate::paths::build_resolved_paths(&config_dir, &data_dir);
+    // Resolve from the SAME source of truth the pack handlers use, so
+    // daemon.info and pack.* never drift (config dir from
+    // AgentConfig::default_config_path incl. the macOS XDG fallback, data dir
+    // from NEVOFLUX_DATA_DIR/platform data dir).
+    let paths = crate::paths::resolve_from_daemon();
 
     serde_json::json!({
         "type": "system_response",

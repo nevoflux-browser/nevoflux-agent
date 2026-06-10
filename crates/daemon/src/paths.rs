@@ -2,7 +2,7 @@
 //! `ResolvedPaths` value, the single authority every pack install resolves
 //! against (kills path drift).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use nevoflux_pack::ResolvedPaths;
 
@@ -24,10 +24,34 @@ pub fn build_resolved_paths(config_dir: &Path, data_dir: &Path) -> ResolvedPaths
     }
 }
 
+/// Resolve the authoritative paths the way the daemon actually resolves them:
+/// config dir from `AgentConfig::default_config_path()`'s parent (matching how
+/// config is loaded, incl. the macOS XDG fallback), data dir from the same
+/// logic `main.rs::get_data_dir` uses.
+///
+/// This is the single source of truth both `daemon.info` and the pack handlers
+/// resolve against, killing path drift between the two.
+pub fn resolve_from_daemon() -> ResolvedPaths {
+    let config_dir = crate::config::AgentConfig::default_config_path()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let data_dir = std::env::var_os("NEVOFLUX_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            directories::ProjectDirs::from("com", "nevoflux", "nevoflux")
+                .map(|d| d.data_dir().to_path_buf())
+        })
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".nevoflux")
+        });
+    build_resolved_paths(&config_dir, &data_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn derives_subpaths_from_config_and_data_dirs() {
