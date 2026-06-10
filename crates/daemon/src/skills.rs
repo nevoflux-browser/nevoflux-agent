@@ -37,6 +37,17 @@ impl SkillsManager {
         Ok(registry.len())
     }
 
+    /// Re-scan the configured skill directories, replacing the registry's
+    /// contents. Used after a pack places or removes skill files so installs
+    /// activate without a daemon restart.
+    pub async fn reload(&self) -> Result<usize> {
+        let mut registry = self.registry.write().await;
+        registry
+            .reload()
+            .map_err(|e| DaemonError::InternalError(format!("Failed to reload skills: {}", e)))?;
+        Ok(registry.len())
+    }
+
     /// List all available skills (Level 1).
     pub async fn list(&self) -> Vec<SkillSummary> {
         let registry = self.registry.read().await;
@@ -99,5 +110,15 @@ mod tests {
         let manager = SkillsManager::new();
         let skill = manager.get("nonexistent").await;
         assert!(skill.is_none());
+    }
+
+    #[tokio::test]
+    async fn reload_rescans_registry_without_panicking() {
+        let mgr = SkillsManager::new();
+        // First load (may find 0 skills in a clean test env — that's fine).
+        let _ = mgr.load().await;
+        // reload() must succeed and return the current count.
+        let count = mgr.reload().await.expect("reload should succeed");
+        assert_eq!(count, mgr.len().await);
     }
 }
