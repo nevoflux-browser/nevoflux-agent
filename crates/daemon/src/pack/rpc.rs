@@ -72,20 +72,6 @@ fn err(request_id: &str, command: &str, code: &str, message: &str) -> Value {
     })
 }
 
-/// Read + parse a manifest file; returns (Manifest, raw_toml, pack_dir).
-fn load_manifest(
-    manifest_path: &str,
-) -> Result<(Manifest, String, std::path::PathBuf), String> {
-    let path = std::path::Path::new(manifest_path);
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("read {manifest_path}: {e}"))?;
-    let m = Manifest::parse(&raw).map_err(|e| format!("parse manifest: {e}"))?;
-    let pack_dir = path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .to_path_buf();
-    Ok((m, raw, pack_dir))
-}
-
 /// pack.validate — pure capability check, no mutation. Used by `--dry-run`.
 /// Accepts a `source` (local path OR github:…) or the legacy `manifest_path`.
 pub async fn handle_pack_validate(params: &Value) -> Value {
@@ -164,7 +150,7 @@ pub fn handle_pack_list(params: &Value) -> Value {
                 if let Ok(r) = serde_json::from_str::<nevoflux_pack::receipt::Receipt>(&s) {
                     packs.push(serde_json::json!({
                         "name": r.pack, "version": r.version.to_string(),
-                        "installed_at": r.installed_at
+                        "installed_at": r.installed_at, "source": r.source
                     }));
                 }
             }
@@ -189,7 +175,7 @@ pub fn handle_pack_status(params: &Value) -> Value {
                 serde_json::json!({
                     "installed": true, "version": r.version.to_string(),
                     "files": r.files.len(), "artifacts": r.artifacts,
-                    "seeded_pages": r.seeded_pages
+                    "seeded_pages": r.seeded_pages, "source": r.source
                 }),
             ),
             Err(e) => err(request_id, "pack.status", "BAD_RECEIPT", &e.to_string()),
@@ -455,19 +441,41 @@ pub async fn handle_pack_update(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let manifest_path = match params.get("manifest_path").and_then(|v| v.as_str()) {
+    // Accept `source` (local path OR github:…) or legacy `manifest_path`.
+    let source = params
+        .get("source")
+        .and_then(|v| v.as_str())
+        .or_else(|| params.get("manifest_path").and_then(|v| v.as_str()));
+    let source = match source {
         Some(s) => s.to_string(),
         None => {
             return err(
                 &request_id,
                 "pack.update",
                 "MISSING_PARAM",
-                "manifest_path required",
+                "source or manifest_path required",
             )
         }
     };
-    let (manifest, raw, pack_dir) = match load_manifest(&manifest_path) {
-        Ok(t) => t,
+    let data_dir = crate::paths::resolve_from_daemon().data_dir;
+    let resolved = match crate::pack::fetch::resolve_source(&source, &data_dir).await {
+        Ok(r) => r,
+        Err(e) => return err(&request_id, "pack.update", "FETCH_FAILED", &e.to_string()),
+    };
+    let pack_dir = resolved.pack_dir.clone();
+    let raw = match std::fs::read_to_string(pack_dir.join("pack.toml")) {
+        Ok(s) => s,
+        Err(e) => {
+            return err(
+                &request_id,
+                "pack.update",
+                "MANIFEST_NOT_FOUND",
+                &e.to_string(),
+            )
+        }
+    };
+    let manifest = match Manifest::parse(&raw) {
+        Ok(m) => m,
         Err(e) => return err(&request_id, "pack.update", "BAD_MANIFEST", &e),
     };
     if manifest.components.knowledge.is_some() {
@@ -483,18 +491,47 @@ pub async fn handle_pack_update(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let pack_name = manifest.pack.name.clone();
+    // Carry provenance from the resolved source into the refreshed receipt.
+    // `lifecycle::update` builds its own InstallOpts internally (it does not
+    // accept provenance), so we patch the written receipt afterwards.
+    let origin = resolved.origin.clone();
+    let tarball_sha256 = resolved.tarball_sha256.clone();
     let build = build_host(services, new_op_id());
     let handle = tokio::runtime::Handle::current();
+    // CRITICAL: `resolved` owns the TempDir holding the extracted remote pack
+    // files; `lifecycle::update` reads those files synchronously inside the
+    // blocking closure, so `resolved` MUST be moved INTO the closure and outlive
+    // the update.
     let run = move || {
+        let _keep_alive = &resolved; // hold the TempDir until update finishes
         let host = build.into_host(handle);
         lifecycle::update(&host, &manifest, &raw, &pack_dir, &now_utc)
     };
     match tokio::task::spawn_blocking(run).await {
-        Ok(Ok(r)) => ok(
-            &request_id,
-            "pack.update",
-            serde_json::json!({ "success": true, "version": r.version.to_string() }),
-        ),
+        Ok(Ok(r)) => {
+            // Persist provenance onto the freshly written receipt (best-effort).
+            if origin.is_some() || tarball_sha256.is_some() {
+                let paths = crate::paths::resolve_from_daemon();
+                let receipt_path = paths.receipt_path(&pack_name);
+                if let Ok(s) = std::fs::read_to_string(&receipt_path) {
+                    if let Ok(mut rec) =
+                        serde_json::from_str::<nevoflux_pack::receipt::Receipt>(&s)
+                    {
+                        rec.source = origin;
+                        rec.tarball_sha256 = tarball_sha256;
+                        if let Ok(out) = serde_json::to_string_pretty(&rec) {
+                            let _ = std::fs::write(&receipt_path, out);
+                        }
+                    }
+                }
+            }
+            ok(
+                &request_id,
+                "pack.update",
+                serde_json::json!({ "success": true, "version": r.version.to_string() }),
+            )
+        }
         Ok(Err(e)) => err(&request_id, "pack.update", "UPDATE_FAILED", &e.to_string()),
         Err(e) => err(&request_id, "pack.update", "JOIN_ERROR", &e.to_string()),
     }
