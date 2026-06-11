@@ -1427,6 +1427,27 @@ pub struct BrainConfig {
     /// Sliding window length (seconds) for the restart budget. 0 = 60s.
     #[serde(default)]
     pub restart_window_secs: u64,
+
+    /// Model gbrain resolves for its LLM ops (synthesis / chat / expansion),
+    /// forwarded to the subprocess as the `GBRAIN_MODEL` env var so every
+    /// gbrain LLM call routes through the in-process llm-gateway instead of
+    /// trying to reach a provider directly.
+    ///
+    /// Empty = use the built-in default (`openrouter:anthropic/claude-opus-4.7`).
+    /// The `openrouter:` prefix is what matters: it sidesteps gbrain's
+    /// `ANTHROPIC_API_KEY` short-circuit (which only fires for `anthropic:`
+    /// models) and makes gbrain send OpenAI-shape chat completions to the
+    /// gateway. The gateway then dispatches to whatever upstream the active
+    /// `[llm].provider` resolves to (Anthropic translator / OpenAI passthrough
+    /// / ACP Claude Code session), so the concrete model name is usually
+    /// cosmetic — set `[knowledge_base.gateway].upstream_model_remap` if your
+    /// upstream needs a specific id.
+    ///
+    /// Set to the sentinel `"none"` to disable injection entirely (gbrain then
+    /// uses its own model resolution, which requires `ANTHROPIC_API_KEY` in the
+    /// daemon environment for `brain_think` synthesis).
+    #[serde(default)]
+    pub model: String,
 }
 
 /// Upstream LLM provider config for the in-process gateway (M2-5).

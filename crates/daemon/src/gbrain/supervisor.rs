@@ -481,6 +481,15 @@ async fn spawn_and_supervise(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
+    // Force every gbrain LLM op (brain_think synthesis, chat, expansion) onto
+    // a model whose provider routes through the in-process gateway, so the
+    // subprocess never needs a direct ANTHROPIC_API_KEY. Empty = leave unset
+    // (gbrain uses its own resolution). See `BrainConfig::model` /
+    // `init_brain::resolve_gbrain_model`.
+    if !config.gbrain_model.is_empty() {
+        cmd.env("GBRAIN_MODEL", &config.gbrain_model);
+    }
+
     apply_platform_isolation(&mut cmd);
 
     let mut child: Child = cmd.spawn().map_err(SupervisorError::Spawn)?;

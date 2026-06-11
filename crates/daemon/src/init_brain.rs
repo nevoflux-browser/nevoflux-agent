@@ -131,6 +131,34 @@ fn dur_secs_or(default: u64, configured: u64) -> Duration {
     Duration::from_secs(if configured > 0 { configured } else { default })
 }
 
+/// Built-in `GBRAIN_MODEL` value used when `[knowledge_base.brain].model` is
+/// empty. The `openrouter:` prefix is the load-bearing part: it dodges
+/// gbrain's `ANTHROPIC_API_KEY` short-circuit (which only triggers for
+/// `anthropic:` provider ids) so synthesis routes through the gateway. The
+/// concrete model id is cosmetic for ACP / remapped upstreams — the gateway
+/// dispatches by the daemon's configured upstream protocol, not this string.
+const DEFAULT_GBRAIN_MODEL: &str = "openrouter:anthropic/claude-opus-4.7";
+
+/// Resolve the value forwarded to the gbrain subprocess as `GBRAIN_MODEL`.
+///
+/// - Empty / whitespace-only → [`DEFAULT_GBRAIN_MODEL`] (route through the
+///   gateway out of the box).
+/// - The sentinel `"none"` (case-insensitive) → empty string, which tells the
+///   supervisor to set NO env var so gbrain uses its own model resolution
+///   (requires `ANTHROPIC_API_KEY` in the daemon env for synthesis).
+/// - Anything else → the trimmed value verbatim (e.g. `openai:gpt-5.4` or a
+///   user-chosen `openrouter:<provider>/<model>`).
+fn resolve_gbrain_model(configured: &str) -> String {
+    let trimmed = configured.trim();
+    if trimmed.is_empty() {
+        DEFAULT_GBRAIN_MODEL.to_string()
+    } else if trimmed.eq_ignore_ascii_case("none") {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Bring up the gbrain integration if config enables it AND gateway is
 /// up.
 ///
@@ -217,6 +245,7 @@ pub async fn init_brain(
         brain_dir,
         upstream_base_url: gw.url.clone(),
         upstream_api_key: gw.bearer_token.clone(),
+        gbrain_model: resolve_gbrain_model(&cfg.model),
         // gbrain's bun cold start + PGLite open grows with brain size; a
         // large brain (hundreds of pages) can take well over 30s to answer
         // the MCP `initialize` handshake. Default generously (120s) so the
@@ -304,6 +333,52 @@ pub async fn init_brain(
 mod tests {
     use super::*;
     use crate::config::{BrainConfig, GatewayUpstreamConfig, KnowledgeBaseConfig};
+
+    #[test]
+    fn resolve_gbrain_model_empty_yields_builtin_default() {
+        // Out of the box (no TOML override) the daemon forwards a non-Anthropic
+        // model so gbrain routes synthesis through the gateway instead of
+        // hitting its ANTHROPIC_API_KEY short-circuit.
+        assert_eq!(resolve_gbrain_model(""), DEFAULT_GBRAIN_MODEL);
+    }
+
+    #[test]
+    fn resolve_gbrain_model_builtin_default_is_not_anthropic_prefixed() {
+        // The whole point of the default is to NOT be an `anthropic:` model —
+        // that prefix is exactly what gbrain's short-circuit keys on. Guard
+        // against a future edit silently breaking the gateway route.
+        assert!(
+            !DEFAULT_GBRAIN_MODEL.starts_with("anthropic:"),
+            "default GBRAIN_MODEL must not be anthropic-prefixed, got {DEFAULT_GBRAIN_MODEL}"
+        );
+    }
+
+    #[test]
+    fn resolve_gbrain_model_whitespace_only_yields_default() {
+        // A config value that is only whitespace is treated as unset.
+        assert_eq!(resolve_gbrain_model("   \t "), DEFAULT_GBRAIN_MODEL);
+    }
+
+    #[test]
+    fn resolve_gbrain_model_none_sentinel_disables_injection() {
+        // `"none"` (any case) opts out: the supervisor then sets no env var so
+        // gbrain uses its own resolution. Resolver signals this with an empty
+        // string.
+        assert_eq!(resolve_gbrain_model("none"), "");
+        assert_eq!(resolve_gbrain_model("NONE"), "");
+        assert_eq!(resolve_gbrain_model("  None  "), "");
+    }
+
+    #[test]
+    fn resolve_gbrain_model_custom_value_passes_through_trimmed() {
+        // An explicit override is forwarded verbatim (after trimming) so users
+        // can point gbrain at e.g. the openai recipe or a specific OR model.
+        assert_eq!(resolve_gbrain_model("openai:gpt-5.4"), "openai:gpt-5.4");
+        assert_eq!(
+            resolve_gbrain_model("  openrouter:google/gemini-3-flash-preview  "),
+            "openrouter:google/gemini-3-flash-preview"
+        );
+    }
 
     fn disabled_kb() -> KnowledgeBaseConfig {
         KnowledgeBaseConfig {

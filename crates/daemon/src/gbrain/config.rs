@@ -51,6 +51,15 @@ pub struct GbrainConfig {
     /// Forwarded as `OPENROUTER_API_KEY` (see [`Self::upstream_base_url`]).
     pub upstream_api_key: String,
 
+    /// Value forwarded to the gbrain subprocess as the `GBRAIN_MODEL` env var.
+    ///
+    /// Empty = do NOT set the env var (gbrain falls back to its own model
+    /// resolution, whose default `anthropic:` model needs `ANTHROPIC_API_KEY`).
+    /// Non-empty (typically `openrouter:<provider>/<model>`) makes every gbrain
+    /// LLM op resolve to a non-Anthropic provider that routes through the
+    /// gateway. Populated by [`crate::init_brain`] via `resolve_gbrain_model`.
+    pub gbrain_model: String,
+
     /// Max time to wait for the MCP `initialize` handshake after spawn.
     /// Spike S5 measured cold-start spawn -> initialize at ~3 s on a
     /// warm Bun cache; 10 s is a comfortable production default.
@@ -87,6 +96,7 @@ impl GbrainConfig {
             brain_dir: PathBuf::from("/nonexistent/brain"),
             upstream_base_url: "http://127.0.0.1:1".into(),
             upstream_api_key: "test-key".into(),
+            gbrain_model: String::new(),
             initialize_timeout: Duration::from_secs(120),
             request_timeout: Duration::from_secs(30),
             max_restarts_within_window: 3,
