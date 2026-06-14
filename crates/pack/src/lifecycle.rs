@@ -223,7 +223,25 @@ fn seed_phase(
     applied: &mut Applied,
 ) -> PackResult<()> {
     emit(host, PackPhase::Seed, PhaseStatus::Running, 50, "seeding pages");
-    for s in &manifest.components.seed {
+    // Emit incremental progress through the loop so the install's progress
+    // stream stays live during a large seed (hundreds of gbrain round-trips).
+    // Without this the only Seed frame is the 50% above; the long silent gap
+    // before the next phase lets the UI's event-bus subscription time out
+    // (~5 min) and the terminal frame is dropped — the install then appears to
+    // hang at "Seed 50%". Updates map into the 50–64% band (Knowledge = 65%).
+    let total = manifest.components.seed.len();
+    let step = (total / 20).max(1).min(25);
+    for (i, s) in manifest.components.seed.iter().enumerate() {
+        if i > 0 && i % step == 0 {
+            let pct = 50 + (i as u64 * 14 / total.max(1) as u64) as u8;
+            emit(
+                host,
+                PackPhase::Seed,
+                PhaseStatus::Running,
+                pct,
+                &format!("seeding pages {i}/{total}"),
+            );
+        }
         if host.page_exists(&s.slug)? {
             continue; // idempotent: only-if-absent
         }
