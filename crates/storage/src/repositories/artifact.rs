@@ -108,6 +108,33 @@ impl<'a> ArtifactRepository<'a> {
         })
     }
 
+    /// Promote an artifact to persistent ("My Canvas"), mirroring
+    /// `CanvasPersistService::save`. Idempotent: an already-persistent row
+    /// keeps its original `persisted_at` (via `COALESCE`); `updated_at` is
+    /// always refreshed. Returns `Ok(false)` if no row matched `id`.
+    ///
+    /// `create()` deliberately never sets `is_persistent` (it preserves the
+    /// flag across re-renders), so callers that must surface an artifact in
+    /// My Canvas — e.g. a pack-installed dashboard — promote it explicitly
+    /// after creating it.
+    pub fn mark_persistent(&self, id: &str) -> Result<bool> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.db.with_connection(|conn| {
+            let n = conn.execute(
+                "UPDATE artifacts
+                 SET is_persistent = 1,
+                     persisted_at  = COALESCE(persisted_at, ?2),
+                     updated_at    = ?2
+                 WHERE id = ?1",
+                params![id, now],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
     /// Update only the `files` map of an existing artifact, with `content`
     /// auto-derived from `files[entry]` (the row's existing entry value).
     /// Leaves title / session_id / entry / description / content_type /
@@ -574,6 +601,45 @@ mod tests {
             Some(999),
             "persisted_at must be preserved across upsert"
         );
+    }
+
+    /// Verifies that `mark_persistent` promotes a freshly created (orphan)
+    /// artifact so it would surface in My Canvas, and is idempotent: a second
+    /// call preserves the original `persisted_at`.
+    #[test]
+    fn mark_persistent_promotes_and_is_idempotent() {
+        let storage = Storage::open_in_memory().unwrap();
+        let repo = ArtifactRepository::new(storage.database());
+
+        // Orphan artifact, like a pack-installed dashboard.
+        repo.create(
+            CreateArtifactParams::new_orphan("dash", "Dashboard", "project")
+                .with_content("<html></html>"),
+        )
+        .unwrap();
+
+        let before = repo.get("dash").unwrap().unwrap();
+        assert!(!before.is_persistent, "create() must not set is_persistent");
+        assert!(before.persisted_at.is_none());
+
+        // Promote → persistent with a non-null persisted_at.
+        assert!(repo.mark_persistent("dash").unwrap(), "row must match");
+        let after = repo.get("dash").unwrap().unwrap();
+        assert!(after.is_persistent, "must be persistent after promotion");
+        let pinned_at = after.persisted_at.expect("persisted_at must be set");
+
+        // Idempotent: a second promotion keeps the original persisted_at.
+        assert!(repo.mark_persistent("dash").unwrap());
+        let again = repo.get("dash").unwrap().unwrap();
+        assert!(again.is_persistent);
+        assert_eq!(
+            again.persisted_at,
+            Some(pinned_at),
+            "persisted_at must be preserved across re-promotion"
+        );
+
+        // Missing id → Ok(false), no panic.
+        assert!(!repo.mark_persistent("nope").unwrap());
     }
 
     /// Verifies that `delete_non_persistent_by_session` removes only non-persistent rows

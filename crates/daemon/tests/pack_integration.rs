@@ -98,9 +98,17 @@ entry = "index.html"
 
     // Skill file placed.
     assert!(paths.skills_dir.join("demo-x/SKILL.md").exists());
-    // Dashboard artifact row present.
+    // Dashboard artifact row present AND persistent, so it surfaces in
+    // "My Canvas" (CanvasPersistService lists only is_persistent = 1 rows).
     let repo = nevoflux_storage::ArtifactRepository::new(&db);
-    assert!(repo.get("demo-dashboard").unwrap().is_some());
+    let dash = repo
+        .get("demo-dashboard")
+        .unwrap()
+        .expect("dashboard artifact row present");
+    assert!(
+        dash.is_persistent,
+        "installed dashboard must be is_persistent=1 to appear in My Canvas"
+    );
     assert_eq!(receipt.artifacts, vec!["demo-dashboard".to_string()]);
 
     // --- Uninstall (fresh host).

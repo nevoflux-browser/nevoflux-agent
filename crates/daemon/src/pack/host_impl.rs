@@ -151,6 +151,11 @@ impl PackHost for PackHostImpl {
         match res {
             Ok(_) => Ok(true),
             Err(nevoflux_brain::BrainError::NotFound(_)) => Ok(false),
+            // Belt-and-suspenders: a remote gbrain may surface "page not
+            // found" as a generic Backend error rather than the typed
+            // NotFound. Treat that as "absent" too, so the only-if-absent
+            // seed check never rolls the install back on a fresh brain.
+            Err(e) if e.to_string().contains("page_not_found") => Ok(false),
             Err(e) => Err(Self::io_err("page_exists", e)),
         }
     }
@@ -208,6 +213,12 @@ impl PackHost for PackHostImpl {
         let repo = ArtifactRepository::new(&self.db);
         repo.create(params)
             .map_err(|e| Self::io_err("upsert_artifact", e))?;
+        // A pack dashboard must surface in "My Canvas", which lists only
+        // `is_persistent = 1` rows. `create()` never sets that flag (it
+        // preserves persistence across re-renders), so promote the artifact
+        // explicitly here — otherwise the installed dashboard is invisible.
+        repo.mark_persistent(&spec.artifact_id)
+            .map_err(|e| Self::io_err("mark_persistent", e))?;
         Ok(())
     }
 

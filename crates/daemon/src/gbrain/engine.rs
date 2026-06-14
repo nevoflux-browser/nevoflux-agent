@@ -226,6 +226,29 @@ impl BrainEngine for GbrainEngine {
     async fn get(&self, slug: &str) -> BrainResult<BrainPage> {
         let args = json!({ "slug": slug });
         let resp = self.call_tool("get_page", args).await?;
+        // gbrain signals a missing page with isError=true + a
+        // {"error":"page_not_found"} payload. Map that to the typed
+        // NotFound so callers like the pack-install idempotency check
+        // (page_exists) treat "absent" as Ok(false) instead of a fatal
+        // backend error that rolls the whole install back.
+        if resp
+            .get("result")
+            .and_then(|r| r.get("isError"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let body = resp
+                .get("result")
+                .and_then(|r| r.get("content"))
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first())
+                .and_then(|f| f.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            if body.contains("page_not_found") {
+                return Err(BrainError::NotFound(slug.to_string()));
+            }
+        }
         // gbrain's `get_page` returns either a JSON object with the
         // page fields (preferred) or a raw markdown string. Try JSON
         // first; fall back to markdown.
