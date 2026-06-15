@@ -1107,12 +1107,28 @@ pub fn default_brain_dir() -> PathBuf {
 ///
 /// Registers the abort handle with [`WizardState`] so
 /// `kb.wizard.cancel` can interrupt it.
-pub async fn spawn_step<F, Fut>(state: Arc<WizardState>, bus: Arc<EventBus>, work: F)
+///
+/// Re-entrancy guard: only one step may run at a time. If a step is
+/// already in flight this returns `false` WITHOUT spawning anything;
+/// callers should surface that as a "busy" error. Without this guard a
+/// duplicated `kb.wizard.install_*` request would launch two concurrent
+/// `bun add` runs racing the same bun cache, corrupting it (observed as
+/// bun `Unexpected HTTP` / `TarballFailedToDownload` errors).
+#[must_use = "a false return means the step was refused (wizard busy); surface it to the caller"]
+pub async fn spawn_step<F, Fut>(state: Arc<WizardState>, bus: Arc<EventBus>, work: F) -> bool
 where
     F: FnOnce(Arc<EventBus>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
-    state.set_overall(WizardOverall::InProgress).await;
+    // Atomically check-and-reserve the in-flight slot: hold the
+    // `current_task` lock across the spawn so two concurrent callers
+    // cannot both pass the check and start a step.
+    let mut guard = state.current_task.lock().await;
+    if guard.as_ref().is_some_and(|h| !h.is_finished()) {
+        // A step is already running — refuse rather than start a second.
+        return false;
+    }
+
     let state_clone = state.clone();
     let handle = tokio::spawn(async move {
         work(bus).await;
@@ -1121,7 +1137,11 @@ where
         // just set the slot to None.)
         state_clone.clear_current().await;
     });
-    state.set_current(handle.abort_handle()).await;
+    *guard = Some(handle.abort_handle());
+    drop(guard);
+
+    state.set_overall(WizardOverall::InProgress).await;
+    true
 }
 
 // ── RPC dispatch glue ────────────────────────────────────────────────
@@ -1166,6 +1186,19 @@ pub(crate) fn err_response(
             }
         }
     })
+}
+
+/// Standard `WIZARD_BUSY` error response, returned when a wizard step is
+/// requested while another is already in flight (see [`spawn_step`]). The
+/// client should wait for the running step to finish (subscribe to
+/// `system:kb-wizard:progress`) or call `kb.wizard.cancel`.
+fn busy_response(request_id: &str, cmd: &str) -> serde_json::Value {
+    err_response(
+        request_id,
+        cmd,
+        "WIZARD_BUSY",
+        "another wizard step is already running; wait for it to finish or call kb.wizard.cancel",
+    )
 }
 
 /// Handle `kb.wizard.status`. Pure read; no side effects.
@@ -1233,7 +1266,7 @@ pub async fn handle_install_bun(params: &serde_json::Value) -> serde_json::Value
         }
     };
 
-    spawn_step(state.clone(), bus, move |_bus| async move {
+    let started = spawn_step(state.clone(), bus, move |_bus| async move {
         let emit = make_emit_for_global();
         match install_bun(&emit).await {
             Ok(_) => {
@@ -1249,6 +1282,9 @@ pub async fn handle_install_bun(params: &serde_json::Value) -> serde_json::Value
         }
     })
     .await;
+    if !started {
+        return busy_response(&request_id, "kb.wizard.install_bun");
+    }
 
     ok_response(
         &request_id,
@@ -1289,7 +1325,7 @@ pub async fn handle_install_gbrain(params: &serde_json::Value) -> serde_json::Va
         }
     };
 
-    spawn_step(state.clone(), bus, move |_bus| async move {
+    let started = spawn_step(state.clone(), bus, move |_bus| async move {
         let emit = make_emit_for_global();
         match install_gbrain(&bun_path, &emit).await {
             Ok(_) => {
@@ -1302,6 +1338,9 @@ pub async fn handle_install_gbrain(params: &serde_json::Value) -> serde_json::Va
         }
     })
     .await;
+    if !started {
+        return busy_response(&request_id, "kb.wizard.install_gbrain");
+    }
 
     ok_response(
         &request_id,
@@ -1332,7 +1371,7 @@ pub async fn handle_restart(params: &serde_json::Value) -> serde_json::Value {
     };
     let state = current_wizard_state();
 
-    spawn_step(state.clone(), bus, move |_bus| async move {
+    let started = spawn_step(state.clone(), bus, move |_bus| async move {
         let emit = make_emit_for_global();
         emit(WizardProgress {
             step: WizardStep::Restart,
@@ -1362,6 +1401,9 @@ pub async fn handle_restart(params: &serde_json::Value) -> serde_json::Value {
         }
     })
     .await;
+    if !started {
+        return busy_response(&request_id, "kb.wizard.restart");
+    }
 
     ok_response(
         &request_id,
@@ -1417,7 +1459,7 @@ pub async fn handle_update_gbrain(params: &serde_json::Value) -> serde_json::Val
     };
     let state = current_wizard_state();
 
-    spawn_step(state.clone(), bus, move |_bus| async move {
+    let started = spawn_step(state.clone(), bus, move |_bus| async move {
         let emit = make_emit_for_global();
         match update_gbrain(&bun_path, &spec, &emit).await {
             Ok(_) => {
@@ -1456,6 +1498,9 @@ pub async fn handle_update_gbrain(params: &serde_json::Value) -> serde_json::Val
         }
     })
     .await;
+    if !started {
+        return busy_response(&request_id, "kb.wizard.update_gbrain");
+    }
 
     ok_response(
         &request_id,
@@ -1519,7 +1564,7 @@ pub async fn handle_init_brain(params: &serde_json::Value) -> serde_json::Value 
     };
 
     let brain_dir = default_brain_dir();
-    spawn_step(state.clone(), bus, move |_bus| async move {
+    let started = spawn_step(state.clone(), bus, move |_bus| async move {
         let emit = make_emit_for_global();
         match init_brain_repo(
             &bun_path,
@@ -1554,6 +1599,9 @@ pub async fn handle_init_brain(params: &serde_json::Value) -> serde_json::Value 
         }
     })
     .await;
+    if !started {
+        return busy_response(&request_id, "kb.wizard.init_brain");
+    }
 
     ok_response(
         &request_id,
@@ -1701,6 +1749,69 @@ mod tests {
         let payload = &resp["payload"];
         assert_eq!(payload["success"], serde_json::json!(false));
         assert_eq!(payload["error"]["code"], serde_json::json!("BAD_REF"));
+    }
+
+    #[tokio::test]
+    async fn spawn_step_refuses_second_step_while_one_is_in_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let state = Arc::new(WizardState::new());
+        let bus = Arc::new(EventBus::new());
+
+        // Counts how many work futures actually begin executing — a proxy
+        // for "how many `bun add` subprocesses would have launched".
+        let started = Arc::new(AtomicUsize::new(0));
+        // Keeps the first step "in flight" until we release it, so the
+        // second spawn_step call genuinely overlaps a running step.
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        let s1 = started.clone();
+        let r1 = release.clone();
+        let first_started = spawn_step(state.clone(), bus.clone(), move |_bus| async move {
+            s1.fetch_add(1, Ordering::SeqCst);
+            r1.notified().await; // stay in flight until released
+        })
+        .await;
+        assert!(first_started, "first step should start");
+
+        // Wait (bounded) for the first step to actually begin running so the
+        // overlap is real and the test isn't racing the scheduler.
+        for _ in 0..100 {
+            if started.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "first step should be running before we launch the second"
+        );
+
+        // Second step while the first is still in flight: must be refused.
+        let s2 = started.clone();
+        let second_started = spawn_step(state.clone(), bus.clone(), move |_bus| async move {
+            s2.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        assert!(
+            !second_started,
+            "second step must be refused while one is in flight"
+        );
+
+        // Give any (wrongly) spawned second task time to run.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "a second step must be refused while one is in flight \
+             (only one bun add should run)"
+        );
+
+        // Cleanup: release the first step so its task can finish.
+        release.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
     #[tokio::test]
