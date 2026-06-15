@@ -9491,12 +9491,27 @@ async fn handle_config_file_write(params: &serde_json::Value) -> serde_json::Val
 
 /// Built-in tools that are always available.
 /// These correspond to the core tools provided by the agent runtime.
+///
+/// Names MUST match the actual `ToolDefinition` names exposed to the LLM
+/// (lowercase `read`/`bash`/… from `builtin-wasm::get_chat_tools`). The
+/// skill-availability gate (`check_tool_availability`) matches exactly and
+/// case-sensitively, so a skill that legitimately gates on `read` or `bash`
+/// is only recognized if those lowercase names appear here. The capitalized
+/// aliases (`Read`, `Bash`, …) are kept so Claude-Code-style skills that gate
+/// on those names still pass the check.
 const BUILTIN_TOOLS: &[&str] = &[
+    // Core file/shell tools: real lowercase names + capitalized Claude-Code aliases.
+    "read",
     "Read",
+    "write",
     "Write",
+    "edit",
     "Edit",
+    "bash",
     "Bash",
+    "glob",
     "Glob",
+    "grep",
     "Grep",
     "browser_navigate",
     "browser_click",
@@ -9506,7 +9521,7 @@ const BUILTIN_TOOLS: &[&str] = &[
     "browser_get_content",
     "computer_screenshot",
     "computer_click",
-    "computer_type",
+    "computer_type_text",
     "computer_key",
     "computer_scroll",
     // Dynamic tool-discovery pair (added to every agent mode's tool set in
@@ -9539,12 +9554,31 @@ mod builtin_tools_gate_tests {
             "tool_call_dynamic must be in BUILTIN_TOOLS for the skill gate"
         );
     }
+
+    /// Regression: `BUILTIN_TOOLS` once listed only capitalized `Read`/`Bash`/…
+    /// while the real `ToolDefinition` names (builtin-wasm) are lowercase. The
+    /// gate matches exactly, so a skill gating on `read`/`bash` was falsely
+    /// rejected. These must stay present so the real tool names are recognized.
+    #[test]
+    fn builtin_tools_include_real_lowercase_core_names() {
+        for name in ["read", "write", "edit", "bash", "glob", "grep"] {
+            assert!(
+                BUILTIN_TOOLS.contains(&name),
+                "real lowercase tool name {name:?} must be in BUILTIN_TOOLS for the skill gate"
+            );
+        }
+        // The computer-use type tool is `computer_type_text`, not `computer_type`.
+        assert!(
+            BUILTIN_TOOLS.contains(&"computer_type_text"),
+            "computer_type_text must be in BUILTIN_TOOLS for the skill gate"
+        );
+    }
 }
 
 /// Gather all available tools from MCP servers and built-in tools.
 ///
 /// Returns a list of tool names in the format:
-/// - Built-in tools: just the tool name (e.g., "Read", "Write")
+/// - Built-in tools: just the tool name (e.g., "read", "write")
 /// - MCP tools: "server_name:tool_name" format (e.g., "notion:search")
 async fn gather_available_tools(services: &HostServices) -> Vec<String> {
     let mut tools = Vec::new();
