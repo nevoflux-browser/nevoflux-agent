@@ -363,6 +363,24 @@ async fn persist_brain_enabled() -> Result<(), String> {
     persist_brain_enabled_at(&path).await
 }
 
+/// Gracefully shut down a previous gbrain supervisor (if any), AWAITING
+/// completion before returning.
+///
+/// gbrain's PGLite is a single-writer database, so the old `gbrain serve`
+/// MUST fully exit and release `<brain_dir>/brain.pglite` BEFORE a
+/// replacement serve is spawned. Otherwise the new serve cannot open the
+/// DB, exits with a non-zero status, and the daemon's MCP `initialize`
+/// handshake against it times out (observed: 120s timeout on
+/// `kb.wizard.update_gbrain` / `kb.wizard.restart`). [`hot_reload_brain`]
+/// therefore calls this — and awaits it — before [`init_brain`], rather
+/// than the previous fire-and-forget `tokio::spawn(shutdown)` that let the
+/// two serves race for the lock.
+async fn shutdown_old_supervisor(old: Option<Arc<crate::gbrain::GbrainSupervisor>>) {
+    if let Some(sup) = old {
+        sup.shutdown().await;
+    }
+}
+
 /// Hot-reload the brain subsystem after a successful
 /// `kb.wizard.init_brain`. The function:
 ///
@@ -407,7 +425,24 @@ async fn hot_reload_brain() -> Result<(), String> {
         .cloned()
         .ok_or_else(|| "gateway snapshot unavailable; cannot hot-reload brain".to_string())?;
 
-    // 4. Spawn the supervisor + build the engine.
+    let slot = crate::init_brain::CURRENT_BRAIN_SLOT
+        .get()
+        .ok_or_else(|| "brain slot not registered (daemon startup bug?)".to_string())?;
+
+    // 4. Tear down the previous brain FIRST and WAIT for it. gbrain's
+    //    PGLite is single-writer, so the old `gbrain serve` must release
+    //    `brain.pglite` before the new one (spawned by init_brain below)
+    //    tries to open it — otherwise the new serve exits and the MCP
+    //    initialize handshake times out. We take the old supervisor out of
+    //    the slot before awaiting shutdown so the slot reflects "no brain"
+    //    while the swap is in flight. Trade-off: if init_brain then fails,
+    //    the brain is left disabled (slot stays None) and the user must
+    //    re-run init/restart — acceptable, since keeping the old serve
+    //    alive is exactly what caused the lock contention.
+    let old_supervisor = slot.write().await.take().map(|b| b.supervisor);
+    shutdown_old_supervisor(old_supervisor).await;
+
+    // 5. Spawn the new supervisor + build the engine (PGLite is now free).
     let boot = match crate::init_brain::init_brain(&kb_config, &Some(gateway_snapshot)).await {
         Ok(Some(b)) => b,
         Ok(None) => {
@@ -423,20 +458,8 @@ async fn hot_reload_brain() -> Result<(), String> {
         Err(e) => return Err(format!("init_brain failed: {e}")),
     };
 
-    // 5. Install into the shared slot.
-    let slot = crate::init_brain::CURRENT_BRAIN_SLOT
-        .get()
-        .ok_or_else(|| "brain slot not registered (daemon startup bug?)".to_string())?;
-    let mut guard = slot.write().await;
-    if let Some(old) = guard.take() {
-        // Graceful shutdown of any previous supervisor — detached so the
-        // wizard task doesn't block on subprocess teardown.
-        let old_sup = old.supervisor.clone();
-        tokio::spawn(async move {
-            old_sup.shutdown().await;
-        });
-    }
-    *guard = Some(crate::init_brain::BrainSlot {
+    // 6. Install the freshly-booted brain into the shared slot.
+    *slot.write().await = Some(crate::init_brain::BrainSlot {
         supervisor: boot.supervisor,
         engine: boot.engine,
     });
@@ -1812,6 +1835,26 @@ mod tests {
         // Cleanup: release the first step so its task can finish.
         release.notify_one();
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_old_supervisor_awaits_full_shutdown() {
+        use crate::gbrain::{GbrainConfig, GbrainSupervisor, SupervisorState};
+
+        // None must be a harmless no-op (no panic / no hang).
+        shutdown_old_supervisor(None).await;
+
+        // Some must AWAIT the supervisor all the way to a terminal Shutdown
+        // state before returning. In production that wait is exactly what
+        // releases the single-writer PGLite lock before hot_reload_brain
+        // spawns the replacement serve.
+        let sup = Arc::new(GbrainSupervisor::spawn(GbrainConfig::test_default()).await);
+        shutdown_old_supervisor(Some(sup.clone())).await;
+        assert!(
+            matches!(sup.state().await, SupervisorState::Shutdown),
+            "old supervisor must be fully shut down after the call, got {:?}",
+            sup.state().await
+        );
     }
 
     #[tokio::test]
