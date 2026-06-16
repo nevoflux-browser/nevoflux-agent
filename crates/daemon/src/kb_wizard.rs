@@ -46,8 +46,12 @@ use crate::event_bus::{types::PublisherIdentity, BusEvent, EventBus};
 /// publishes — see `event_bus::permissions::PermissionChecker`.
 pub const PROGRESS_TOPIC: &str = "system:kb-wizard:progress";
 
-/// Gbrain pin captured by spike S0 (semver 0.40.8.1).
-pub const GBRAIN_PIN: &str = "github:garrytan/gbrain#af5ee1e";
+/// Pinned gbrain commit (semver 0.42.44.0, master HEAD as of 2026-06-16;
+/// gbrain ships no version tags, so we pin the release commit SHA). Bumped
+/// from 0.40.8.1 (`af5ee1e`) — see the 0.42 upgrade work (apply-migrations
+/// runs in `hot_reload_brain` before serve; tool-snapshot regen + teardown
+/// timing still pending).
+pub const GBRAIN_PIN: &str = "github:garrytan/gbrain#090bb53";
 
 /// Validate a user-supplied gbrain ref/spec against a strict allowlist.
 /// Mirrors `^[A-Za-z0-9._/#:-]+$` — rejects spaces, `;`, `&`, `$`,
