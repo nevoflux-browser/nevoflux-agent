@@ -442,6 +442,40 @@ async fn hot_reload_brain() -> Result<(), String> {
     let old_supervisor = slot.write().await.take().map(|b| b.supervisor);
     shutdown_old_supervisor(old_supervisor).await;
 
+    // 4b. Apply any pending PGLite schema migrations to the existing brain
+    //     BEFORE the new serve opens it. gbrain `serve` does not auto-migrate,
+    //     so a brain.pglite created by an older gbrain must be migrated first
+    //     after a version bump; PGLite is single-writer and the old serve is
+    //     now down (step 4). Idempotent / a no-op on a current-schema brain.
+    //     Best-effort: a failure is logged but does NOT abort the reload, so
+    //     it cannot regress the common same-version path (no pending
+    //     migrations). A genuinely-required migration that fails surfaces
+    //     downstream as an init_brain `initialize` error.
+    let brain_dir = default_brain_dir();
+    if brain_dir.join("brain.pglite").exists() {
+        if let (Some(bun), Some(cli)) = (
+            resolve_bun_path(),
+            default_gbrain_cli_path().filter(|p| p.exists()),
+        ) {
+            let emit = make_emit_for_global();
+            if let Err(e) = apply_brain_migrations(
+                &bun,
+                &cli,
+                &brain_dir,
+                &gateway_snapshot.url,
+                &gateway_snapshot.bearer_token,
+                &emit,
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    "gbrain apply-migrations failed; continuing reload (brain may need manual migration)"
+                );
+            }
+        }
+    }
+
     // 5. Spawn the new supervisor + build the engine (PGLite is now free).
     let boot = match crate::init_brain::init_brain(&kb_config, &Some(gateway_snapshot)).await {
         Ok(Some(b)) => b,
@@ -1046,6 +1080,67 @@ fn gbrain_config_args<'a>(
         args.push(v.to_string());
     }
     args
+}
+
+/// Build the `bun run <cli> apply-migrations --yes --non-interactive` args.
+///
+/// Applies any pending PGLite schema migrations to an existing brain. gbrain
+/// `serve` does NOT auto-migrate, so after a gbrain version bump the brain
+/// must be migrated before the new serve opens it. Split out for
+/// unit-testability, mirroring [`gbrain_config_args`].
+fn gbrain_apply_migrations_args(cli_path: &str) -> Vec<String> {
+    vec![
+        "run".to_string(),
+        cli_path.to_string(),
+        "apply-migrations".to_string(),
+        "--yes".to_string(),
+        "--non-interactive".to_string(),
+    ]
+}
+
+/// Run `bun run <cli> apply-migrations --yes --non-interactive` against the
+/// brain at `brain_dir`, applying any pending PGLite schema migrations.
+///
+/// gbrain `serve` does NOT auto-migrate, so after a gbrain version bump the
+/// existing `brain.pglite` must be migrated before the new serve opens it.
+/// The caller MUST have shut the old serve down first (PGLite is
+/// single-writer). Idempotent: a no-op when the schema is already current.
+///
+/// Env mirrors [`init_brain_repo`] (gateway `/v1` + `GBRAIN_BRAIN_DIR`) so a
+/// migration that needs the embedding/LLM recipe still resolves.
+async fn apply_brain_migrations<F>(
+    bun_path: &Path,
+    cli_path: &Path,
+    brain_dir: &Path,
+    gateway_url: &str,
+    gateway_token: &str,
+    emit: &F,
+) -> Result<(), String>
+where
+    F: Fn(WizardProgress) + Send + Sync,
+{
+    emit(WizardProgress {
+        step: WizardStep::InitBrain,
+        status: WizardStatus::Running,
+        progress_pct: 0,
+        log: "gbrain apply-migrations (schema upgrade)".into(),
+    });
+
+    let gateway_v1 = format!("{}/v1", gateway_url.trim_end_matches('/'));
+    let cli = cli_path.to_string_lossy();
+    let mut cmd = Command::new(bun_path);
+    cmd.args(gbrain_apply_migrations_args(&cli))
+        .env("OPENAI_BASE_URL", &gateway_v1)
+        .env("OPENAI_API_KEY", gateway_token)
+        .env("OPENROUTER_BASE_URL", &gateway_v1)
+        .env("OPENROUTER_API_KEY", gateway_token)
+        .env("GBRAIN_BRAIN_DIR", brain_dir)
+        .current_dir(brain_dir);
+
+    run_with_progress(cmd, WizardStep::InitBrain, emit)
+        .await
+        .map_err(|e| format!("gbrain apply-migrations failed: {e}"))?;
+    Ok(())
 }
 
 /// Ensure gbrain's `sync.repo_path` config key points at `brain_dir` so
@@ -1909,6 +2004,20 @@ mod tests {
         // Second run must not fail and must not add a new baseline commit.
         make_brain_repo_sync_ready(nonexistent, nonexistent, dir, &|_p: WizardProgress| {}).await;
         assert_eq!(first, head_of(dir), "re-run must keep the same HEAD");
+    }
+
+    #[test]
+    fn gbrain_apply_migrations_args_builds_command() {
+        assert_eq!(
+            gbrain_apply_migrations_args("/c/cli.ts"),
+            vec![
+                "run",
+                "/c/cli.ts",
+                "apply-migrations",
+                "--yes",
+                "--non-interactive"
+            ]
+        );
     }
 
     #[test]
