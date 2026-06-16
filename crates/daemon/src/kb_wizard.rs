@@ -874,14 +874,43 @@ where
         step: WizardStep::UpdateGbrain,
         status: WizardStatus::Running,
         progress_pct: 0,
-        log: format!("bun add {spec} (may take 60-180s)"),
+        log: format!("bun add {spec} (clean reinstall, may take 60-180s)"),
     });
+
+    // A gbrain version change cannot be applied in place: `bun add <newref>`
+    // over a package.json that still pins a different gbrain commit fails with
+    // bun's DependencyLoop. Reset the brain-tool to a clean slate, then
+    // `bun init` + `bun add <spec>` — equivalent to a fresh install.
+    reset_brain_tool_dir(install_dir);
+
+    let mut init_cmd = Command::new(bun_path);
+    init_cmd.args(["init", "-y"]).current_dir(install_dir);
+    run_with_progress(init_cmd, WizardStep::UpdateGbrain, emit)
+        .await
+        .map_err(|e| format!("bun init failed: {e}"))?;
+
     let mut add_cmd = Command::new(bun_path);
     add_cmd.args(["add", spec]).current_dir(install_dir);
     run_with_progress(add_cmd, WizardStep::UpdateGbrain, emit)
         .await
         .map_err(|e| format!("bun add {spec} failed: {e}"))?;
     Ok(())
+}
+
+/// Remove bun's resolution state (`node_modules`, lockfile, `package.json`)
+/// from a brain-tool dir so the next `bun init` + `bun add` resolves cleanly.
+///
+/// A gbrain *version change* cannot be applied in place: `bun add <newref>`
+/// over a `package.json` that still pins `"gbrain": "github:...#<oldref>"`
+/// fails with bun's `DependencyLoop`. Removing node_modules + the lockfile
+/// alone is NOT enough — the stale `package.json` dependency entry is the
+/// trigger. Best-effort: absent entries are fine. Unrelated files (e.g.
+/// `index.ts` left by `bun init`) are preserved.
+fn reset_brain_tool_dir(install_dir: &Path) {
+    let _ = std::fs::remove_dir_all(install_dir.join("node_modules"));
+    for f in ["bun.lock", "bun.lockb", "package.json"] {
+        let _ = std::fs::remove_file(install_dir.join(f));
+    }
 }
 
 /// Run `gbrain init --pglite --embedding-dimensions 512 \
@@ -2008,6 +2037,38 @@ mod tests {
         // Second run must not fail and must not add a new baseline commit.
         make_brain_repo_sync_ready(nonexistent, nonexistent, dir, &|_p: WizardProgress| {}).await;
         assert_eq!(first, head_of(dir), "re-run must keep the same HEAD");
+    }
+
+    #[test]
+    fn reset_brain_tool_dir_clears_node_modules_lock_and_package_json() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path();
+        std::fs::create_dir_all(dir.join("node_modules").join("gbrain")).unwrap();
+        std::fs::write(dir.join("node_modules").join("gbrain").join("x"), b"old").unwrap();
+        std::fs::write(dir.join("bun.lock"), b"lock").unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            br#"{"dependencies":{"gbrain":"github:garrytan/gbrain#af5ee1e"}}"#,
+        )
+        .unwrap();
+        // A non-bun file (e.g. index.ts from `bun init`) must be preserved.
+        std::fs::write(dir.join("index.ts"), b"keep").unwrap();
+
+        reset_brain_tool_dir(dir);
+
+        assert!(
+            !dir.join("node_modules").exists(),
+            "node_modules must be removed"
+        );
+        assert!(!dir.join("bun.lock").exists(), "bun.lock must be removed");
+        assert!(
+            !dir.join("package.json").exists(),
+            "stale package.json (the DependencyLoop trigger) must be removed"
+        );
+        assert!(
+            dir.join("index.ts").exists(),
+            "unrelated files must be kept"
+        );
     }
 
     #[test]
