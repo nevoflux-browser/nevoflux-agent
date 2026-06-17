@@ -490,6 +490,63 @@ impl LlmConfig {
             .or(self.default_provider.as_deref())
     }
 
+    /// Returns `true` if at least one LLM provider is usable.
+    ///
+    /// A provider counts as usable when it has an explicit API key, or when a
+    /// keyless provider (ollama / claude-code / gemini-cli / kimi-agent) is
+    /// selected as the active provider.
+    ///
+    /// This is the single source of truth behind the daemon's
+    /// `status.first_run` flag and the proxy's early "Start Setup" hint, so
+    /// both agree on whether onboarding is required. It only consults the
+    /// loaded config (never environment variables) — matching
+    /// `AgentConfig::load`, which does no env merging — so the result is
+    /// identical whether computed in the daemon or in the separately-launched
+    /// proxy process reading the same `config.toml`.
+    ///
+    /// Keep the provider list in sync with `get_provider_config` in server.rs.
+    pub fn has_any_configured_provider(&self) -> bool {
+        let any_key = [
+            &self.anthropic,
+            &self.openai,
+            &self.deepseek,
+            &self.qwen,
+            &self.gemini,
+            &self.groq,
+            &self.openrouter,
+            &self.mistral,
+            &self.xai,
+            &self.cohere,
+            &self.perplexity,
+            &self.together,
+            &self.ollama,
+            &self.claude_code,
+            &self.gemini_cli,
+            &self.kimi_agent,
+            &self.openclaw,
+        ]
+        .iter()
+        .any(|pc| pc.api_key.is_some());
+        if any_key {
+            return true;
+        }
+
+        // Keyless providers are usable simply by being selected as active.
+        const KEYLESS_PROVIDERS: &[&str] = &[
+            "ollama",
+            "claude-code",
+            "claude_code",
+            "gemini-cli",
+            "gemini_cli",
+            "kimi-agent",
+            "kimi_agent",
+            "kimi",
+        ];
+        self.active_provider()
+            .map(|active| KEYLESS_PROVIDERS.contains(&active))
+            .unwrap_or(false)
+    }
+
     /// Get the API key for the active provider.
     pub fn active_api_key(&self) -> Option<&str> {
         match self.active_provider()? {
@@ -1838,6 +1895,38 @@ level = "warn"
 
         assert_eq!(config.active_provider(), Some("anthropic"));
         assert_eq!(config.active_api_key(), Some("sk-ant-xxx"));
+    }
+
+    #[test]
+    fn test_has_any_configured_provider_false_when_empty() {
+        // A fresh config with no provider and no keys requires onboarding.
+        let config = LlmConfig::default();
+        assert!(!config.has_any_configured_provider());
+    }
+
+    #[test]
+    fn test_has_any_configured_provider_true_with_any_key() {
+        // A key on any provider counts, even if it is not the active one.
+        let mut config = LlmConfig::default();
+        config.openai.api_key = Some("sk-test".to_string());
+        assert!(config.has_any_configured_provider());
+    }
+
+    #[test]
+    fn test_has_any_configured_provider_true_for_active_keyless() {
+        // Keyless providers are usable purely by being selected as active.
+        let mut config = LlmConfig::default();
+        config.provider = Some("ollama".to_string());
+        assert!(config.has_any_configured_provider());
+    }
+
+    #[test]
+    fn test_has_any_configured_provider_false_for_inactive_keyless() {
+        // A keyed-but-inactive selection with no keys anywhere is not usable:
+        // anthropic is active but has no key, and ollama (keyless) is inactive.
+        let mut config = LlmConfig::default();
+        config.provider = Some("anthropic".to_string());
+        assert!(!config.has_any_configured_provider());
     }
 
     #[test]

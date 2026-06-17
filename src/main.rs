@@ -301,10 +301,31 @@ async fn run_proxy(verbose: bool, dev_mode: bool) -> Result<(), Box<dyn std::err
     // returns normally.
     let pid_slot: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
 
+    // Optimistic onboarding hint. Read "is a provider configured?" from the
+    // same config file the daemon reads (AgentConfig::load does no env
+    // merging), so this matches the daemon's authoritative `status.first_run`.
+    // When nothing is configured, hand the proxy a `setup_status` message to
+    // emit immediately — the sidebar can render "Start Setup" during the
+    // daemon's cold boot instead of waiting for it. A configured user gets
+    // `None`, leaving the startup sequence unchanged.
+    let early_setup_status = match nevoflux_daemon::AgentConfig::load() {
+        Ok(cfg) if cfg.llm.has_any_configured_provider() => None,
+        _ => Some(serde_json::json!({
+            "type": "setup_status",
+            "payload": {
+                "first_run": true,
+                "has_configured_provider": false,
+                "optimistic": true,
+                "version": env!("CARGO_PKG_VERSION"),
+            }
+        })),
+    };
+
     let bridge_config = BridgeConfig::new().with_mode(mode).with_data_dir(data_dir);
     let config = AsyncProxyConfig::new()
         .with_bridge(bridge_config)
-        .with_spawned_pid_slot(pid_slot.clone());
+        .with_spawned_pid_slot(pid_slot.clone())
+        .with_early_setup_status(early_setup_status);
 
     let proxy_fut = run_async_proxy(stdin(), stdout(), config);
 

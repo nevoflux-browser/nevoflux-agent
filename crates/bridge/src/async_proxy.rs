@@ -63,6 +63,9 @@ pub enum StdoutMessage {
     Error { code: String, message: String },
     /// Initial connection message.
     Connected { version: String, proxy_id: String },
+    /// A pre-serialized message forwarded verbatim to the sidebar. Used for the
+    /// optimistic "Start Setup" hint emitted before the daemon connects.
+    Raw(serde_json::Value),
     /// Shutdown signal.
     Shutdown,
 }
@@ -78,6 +81,12 @@ pub struct AsyncProxyConfig {
     /// known. Used by the caller to clean up a spawned daemon if the proxy
     /// future is cancelled (e.g. via Ctrl+C) before returning normally.
     pub spawned_pid_slot: Option<SpawnedPidSlot>,
+    /// Optional message emitted to the sidebar *before* connecting to the
+    /// daemon, so onboarding UI ("Start Setup") can render during the daemon's
+    /// cold boot instead of after it. The daemon's authoritative `status`
+    /// response reconciles this once it is up. `None` skips the early hint
+    /// (e.g. when a provider is already configured), leaving startup unchanged.
+    pub early_setup_status: Option<serde_json::Value>,
 }
 
 impl Default for AsyncProxyConfig {
@@ -86,6 +95,7 @@ impl Default for AsyncProxyConfig {
             bridge: BridgeConfig::default(),
             channel_buffer_size: 100,
             spawned_pid_slot: None,
+            early_setup_status: None,
         }
     }
 }
@@ -113,6 +123,13 @@ impl AsyncProxyConfig {
     /// path (e.g. Ctrl+C) to clean up the daemon.
     pub fn with_spawned_pid_slot(mut self, slot: SpawnedPidSlot) -> Self {
         self.spawned_pid_slot = Some(slot);
+        self
+    }
+
+    /// Set the optimistic onboarding message emitted before the daemon
+    /// connects. Pass `None` to skip it (no behavioral change to startup).
+    pub fn with_early_setup_status(mut self, msg: Option<serde_json::Value>) -> Self {
+        self.early_setup_status = msg;
         self
     }
 }
@@ -148,6 +165,32 @@ where
     let (stdout_tx, stdout_rx) = mpsc::channel::<StdoutMessage>(config.channel_buffer_size);
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
+    // Spawn the stdout task up front, before connecting to the daemon. The
+    // daemon connection can block for seconds on a cold start (process spawn,
+    // config/skill/DB init); spawning stdout first lets us push the optimistic
+    // onboarding hint to the sidebar during that window instead of after it.
+    let stdout_shutdown_rx = shutdown_tx.subscribe();
+    let stdout_handle = tokio::spawn(stdout_task(
+        BufWriter::new(writer),
+        stdout_rx,
+        stdout_shutdown_rx,
+    ));
+
+    // Optimistic "Start Setup" hint: when no provider is configured yet, tell
+    // the sidebar immediately so onboarding UI renders during the daemon's
+    // cold boot. The daemon's authoritative `status` reconciles this once it
+    // is up. Skipped (None) when a provider is already configured, leaving the
+    // startup sequence unchanged.
+    if let Some(setup_msg) = config.early_setup_status.clone() {
+        if stdout_tx
+            .send(StdoutMessage::Raw(setup_msg))
+            .await
+            .is_err()
+        {
+            return Err(BridgeError::ChannelClosed);
+        }
+    }
+
     // Create daemon client
     let mut daemon_client = DaemonClient::new(&proxy_id, config.bridge.clone());
 
@@ -180,7 +223,6 @@ where
 
     // Clone for tasks
     let stdin_shutdown_rx = shutdown_tx.subscribe();
-    let stdout_shutdown_rx = shutdown_tx.subscribe();
     let socket_shutdown_rx = shutdown_tx.subscribe();
     let proxy_id_for_socket = proxy_id.clone();
 
@@ -189,13 +231,6 @@ where
         BufReader::new(reader),
         stdin_tx,
         stdin_shutdown_rx,
-    ));
-
-    // Spawn stdout task
-    let stdout_handle = tokio::spawn(stdout_task(
-        BufWriter::new(writer),
-        stdout_rx,
-        stdout_shutdown_rx,
     ));
 
     // Spawn socket task
@@ -425,6 +460,9 @@ where
                         });
                         write_message(&mut writer, &connected).await?;
                     }
+                    Some(StdoutMessage::Raw(value)) => {
+                        write_message(&mut writer, &value).await?;
+                    }
                     Some(StdoutMessage::Shutdown) | None => {
                         debug!("stdout task: channel closed or shutdown");
                         break;
@@ -549,6 +587,20 @@ mod tests {
     }
 
     #[test]
+    fn test_async_proxy_config_early_setup_status() {
+        let msg = serde_json::json!({"type": "setup_status"});
+        let config = AsyncProxyConfig::new().with_early_setup_status(Some(msg.clone()));
+        assert_eq!(config.early_setup_status, Some(msg));
+
+        // Default and explicit-None both leave the hint unset.
+        assert!(AsyncProxyConfig::new().early_setup_status.is_none());
+        assert!(AsyncProxyConfig::new()
+            .with_early_setup_status(None)
+            .early_setup_status
+            .is_none());
+    }
+
+    #[test]
     fn test_stdin_message_debug() {
         let msg = StdinMessage::SidebarMessage {
             request_id: "req-001".into(),
@@ -649,5 +701,58 @@ mod tests {
 
         let result = handle.await.unwrap();
         assert!(result.is_ok());
+    }
+
+    /// The optimistic onboarding hint must reach the sidebar *before* the
+    /// `connected` message — i.e. before/while the daemon connection is being
+    /// established — so "Start Setup" can render during the daemon's cold boot.
+    #[tokio::test]
+    async fn test_early_setup_status_emitted_before_connected() {
+        use tokio::net::TcpListener;
+
+        // Stand up a fake daemon: accept one TCP connection and hold it open so
+        // the proxy's connect succeeds (it only needs the socket, no response).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _daemon = tokio::spawn(async move {
+            let _conn = listener.accept().await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+
+        let setup_msg = serde_json::json!({
+            "type": "setup_status",
+            "payload": { "first_run": true, "has_configured_provider": false, "optimistic": true }
+        });
+
+        // Dev mode connects to a fixed port without auto-launching a daemon;
+        // point it at our fake listener.
+        let bridge = BridgeConfig::new()
+            .with_mode(ConnectionMode::Dev)
+            .with_port_range(port, port);
+        let config = AsyncProxyConfig::new()
+            .with_bridge(bridge)
+            .with_early_setup_status(Some(setup_msg));
+
+        // stdin: keep the write end alive so the reader never EOFs (which would
+        // shut the proxy down before we read its output).
+        let (_stdin_keep, stdin_for_proxy) = tokio::io::duplex(1024);
+        // stdout: the proxy writes framed messages we read back here.
+        let (writer_for_proxy, mut test_reader) = tokio::io::duplex(64 * 1024);
+
+        let proxy =
+            tokio::spawn(
+                async move { run_async_proxy(stdin_for_proxy, writer_for_proxy, config).await },
+            );
+
+        // First framed message must be the optimistic setup hint…
+        let first: serde_json::Value = read_message(&mut test_reader).await.unwrap();
+        assert_eq!(first["type"], "setup_status");
+        assert_eq!(first["payload"]["first_run"], true);
+
+        // …and only then the `connected` handshake.
+        let second: serde_json::Value = read_message(&mut test_reader).await.unwrap();
+        assert_eq!(second["type"], "connected");
+
+        proxy.abort();
     }
 }

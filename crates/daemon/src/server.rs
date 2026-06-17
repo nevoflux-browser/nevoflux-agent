@@ -6330,7 +6330,7 @@ async fn handle_chat_message(
             match command {
                 "status" => {
                     let config = AgentConfig::load().unwrap_or_default();
-                    let has_configured = has_any_configured_provider(&config.llm);
+                    let has_configured = config.llm.has_any_configured_provider();
 
                     // Asset & Stream Plane handshake (bridge:hello.asset_plane).
                     // The extension caches `port` + `bearer_token`; on session
@@ -8616,40 +8616,9 @@ fn get_provider_config<'a>(
     }
 }
 
-/// Check if any LLM provider is configured and usable.
-/// Providers with API keys are always considered configured.
-/// Keyless providers (ollama, claude-code, gemini-cli, kimi-agent) are
-/// considered configured when they are the active provider.
-fn has_any_configured_provider(llm: &crate::config::LlmConfig) -> bool {
-    // Check if any provider has an explicit API key
-    let has_key = PROVIDER_METAS.iter().any(|meta| {
-        get_provider_config(llm, meta.id)
-            .map(|pc| pc.api_key.is_some())
-            .unwrap_or(false)
-    });
-    if has_key {
-        return true;
-    }
-
-    // Keyless providers are usable simply by being selected as active
-    const KEYLESS_PROVIDERS: &[&str] = &[
-        "ollama",
-        "claude-code",
-        "claude_code",
-        "gemini-cli",
-        "gemini_cli",
-        "kimi-agent",
-        "kimi_agent",
-        "kimi",
-    ];
-    if let Some(active) = llm.active_provider() {
-        if KEYLESS_PROVIDERS.contains(&active) {
-            return true;
-        }
-    }
-
-    false
-}
+// Note: the "is any provider usable?" check lives on `LlmConfig` as
+// `has_any_configured_provider()` (see config.rs) so the daemon's `status`
+// handler and the proxy's early setup hint share one implementation.
 
 /// Get a mutable reference to the ProviderConfig for a given provider id.
 fn get_provider_config_mut<'a>(
