@@ -28,7 +28,7 @@
         "name": "get_page"
       },
       {
-        "description": "Write/update a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries.",
+        "description": "Write/update a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries. For large content on Windows (pipe-buffer limit ~45KB) or any file-as-input workflow, use `gbrain capture --file PATH --slug SLUG` — capture reads the file as a Buffer with a binary-NUL guard and adds provenance write-through (v0.39.3.0).",
         "inputSchema": {
           "properties": {
             "content": {
@@ -152,6 +152,10 @@
               "description": "Max results (default 20)",
               "type": "number"
             },
+            "mode": {
+              "description": "Search mode (conservative|balanced|tokenmax). Local callers only.",
+              "type": "string"
+            },
             "offset": {
               "description": "Skip first N results (for pagination)",
               "type": "number"
@@ -171,6 +175,14 @@
         "description": "Hybrid search with vector + keyword + multi-query expansion. For personal/emotional questions ('what's going on with me', 'anything notable', 'how am I feeling'), prefer get_recent_salience, find_anomalies, or get_recent_transcripts. Semantic search returns polished pages and misses recent activity bursts. Do NOT assume words like 'crazy', 'notable', or 'big' mean impressive — they often mean difficult or emotionally charged.",
         "inputSchema": {
           "properties": {
+            "adaptive_return": {
+              "description": "v0.41.33 — return a TIGHT, intent-sized result set instead of the full top-K. YOU (the agent) set this per query to serve the user well:\n  TRUE when the user's question has a small, specific answer — a lookup ('what is X', 'who is Y', 'what's my <thing>', 'what did Z decide'), a single-fact recall, or when you'll route the result into a precise downstream step (a classifier, a decision, an exact citation). The user gets the answer, not a wall of loosely-related pages, and you spend fewer tokens reading noise.\n  Omit / FALSE for breadth — 'everything about X', 'list all', 'what do I know about Y', exploration, brainstorming, or any time you'd rather see more candidates and judge for yourself. Recall matters more there, so take the full top-K.\nSafe by construction: it NEVER returns empty when there are matches (you always get at least the top hit), and it only applies to the first page (omit when paginating). Caps come from config (search.adaptive_return_entity_max / _other_max; default 2 / 6) — pass `limit` 1 alongside this for a hard single-answer cap.",
+              "type": "boolean"
+            },
+            "autocut": {
+              "description": "v0.42.3.0 — autocut is the SMART DEFAULT (already ON when the reranker runs, which it does in the default search mode). It returns only the confident cluster by cutting where the relevance score drops off a cliff, so an obvious single answer comes back as 1 result and a genuine handful comes back as that handful — not a fixed wall of 20+.\n  You almost never set this. Pass FALSE only to FORCE the full top-K when you deliberately want breadth — broad exploration, 'show me everything about X', enumeration where you'd rather over-collect and judge for yourself, or when you suspect the top hit is wrong and want to see the alternatives.\n  TRUE is redundant in default mode (it's already on); it only matters to override a brain whose config turned autocut off.\nSafe by construction: never returns empty when there are matches, only applies to the first page (omit when paginating), and is a no-op when no reranker scored the results (so it can't cut on an untrustworthy signal). Distinct from `adaptive_return`: autocut cuts on the score cliff; adaptive_return caps by question intent. Leave both unset for the smart default.",
+              "type": "boolean"
+            },
             "cross_modal": {
               "description": "v0.36 cross-modal search routing.\n  'text' (default for non-image-intent queries) — text-only path, no behavior change vs v0.35.\n  'image' — route the query through Voyage multimodal-3 + the embedding_image column. Best for 'show me photos of...' phrasings.\n  'both' — run text AND image searches in parallel; merge via weighted RRF.\n  'auto' — same effect as omitting the field; intent classifier decides based on query phrasing.",
               "enum": [
@@ -209,6 +221,10 @@
               "description": "Max results (default 20)",
               "type": "number"
             },
+            "mode": {
+              "description": "Search mode (conservative|balanced|tokenmax). Local callers only; remote uses configured mode.",
+              "type": "string"
+            },
             "near_symbol": {
               "description": "Anchor retrieval at this qualified symbol name (e.g., BrainEngine.searchKeyword). Enables A2 two-pass.",
               "type": "string"
@@ -229,6 +245,10 @@
               ],
               "type": "string"
             },
+            "relational": {
+              "description": "v0.43 — relational recall arm. SMART DEFAULT (on in balanced/tokenmax). When the question is about a RELATIONSHIP ('who invested in widget-co', 'who introduced me to alice', 'what connects fund-a and fund-b'), the brain resolves the named entity and walks its typed-edge graph (invested_in, works_at, founded, …), surfacing the answer even when no passage mentions both sides. Pure no-op for non-relational questions. Pass FALSE to force lexical/vector-only retrieval (e.g. debugging why a graph answer appeared). You almost never set this.",
+              "type": "boolean"
+            },
             "salience": {
               "description": "v0.29.1 salience boost — emotional_weight + take_count, NO time component.\n  'off' — default for entity / canonical / definitional queries\n  'on'  — surface emotionally-weighted + take-rich pages\n  'strong' — aggressive mattering tilt\nOmit and gbrain auto-detects from query text. Independent of `recency`.",
               "enum": [
@@ -243,7 +263,7 @@
               "type": "string"
             },
             "source_id": {
-              "description": "v0.34: scope search to a single source. Defaults to OperationContext.sourceId (set from CLI --source / GBRAIN_SOURCE / .gbrain-source dotfile). Pass '__all__' to force cross-source search in multi-source brains.",
+              "description": "v0.34: scope search to a single source. Defaults to OperationContext.sourceId (set from CLI --source / GBRAIN_SOURCE / .gbrain-source dotfile). Pass '__all__' to span every source for trusted local callers; for remote callers '__all__' spans only your granted sources.",
               "type": "string"
             },
             "symbol_kind": {
@@ -297,7 +317,7 @@
               "type": "string"
             },
             "source_id": {
-              "description": "Scope to a single source. Defaults to ctx.sourceId. '__all__' opts out.",
+              "description": "Scope to a single source. Defaults to ctx.sourceId. '__all__' spans every source for trusted local callers, your granted sources for remote callers.",
               "type": "string"
             }
           },
@@ -370,6 +390,10 @@
             "from": {
               "type": "string"
             },
+            "link_source": {
+              "description": "Provenance tag (kebab-case, e.g. 'citation-graph'). Defaults to 'manual'. Reconciliation-managed built-ins (markdown/frontmatter/mentions/wikilink-resolved) are rejected.",
+              "type": "string"
+            },
             "link_type": {
               "description": "Link type (e.g., invested_in, works_at)",
               "type": "string"
@@ -391,6 +415,14 @@
         "inputSchema": {
           "properties": {
             "from": {
+              "type": "string"
+            },
+            "link_source": {
+              "description": "Only remove edges of this provenance (e.g. citation-graph); omit = any provenance",
+              "type": "string"
+            },
+            "link_type": {
+              "description": "Only remove edges of this link type (omit = all types)",
               "type": "string"
             },
             "to": {
@@ -434,6 +466,15 @@
           "type": "object"
         },
         "name": "get_backlinks"
+      },
+      {
+        "description": "List distinct link_source provenances in the brain with edge counts (e.g. citation-graph, manual, markdown)",
+        "inputSchema": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "name": "list_link_sources"
       },
       {
         "description": "Traverse link graph from a page. With link_type/direction, returns edges (GraphPath[]) instead of nodes.",
@@ -580,6 +621,45 @@
           "type": "object"
         },
         "name": "get_brain_identity"
+      },
+      {
+        "description": "List the skills this agent's brain publishes. A skill is a named prose instruction set (NOT executable code) that teaches you how to do a task using this server's other tools. Returns a flat catalog — each entry has a name, one-line description, triggers (phrasings that should invoke it), and `usable_tools` / `unavailable_tools` (which tools the skill calls that you CAN vs CANNOT call given this server + your access). To actually use a skill, call get_skill with its name, read the returned prose, and follow it — calling the correspondingly-named tools on THIS server. The response also carries an `instructions` envelope explaining this protocol. Reflects the serving repo's skills even when the call targets a mounted brain. Read-scope; published only when the brain owner enabled mcp.publish_skills.",
+        "inputSchema": {
+          "properties": {
+            "section": {
+              "description": "Optional: only skills whose routing section matches this exactly.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "list_skills"
+      },
+      {
+        "description": "Fetch one skill's full instructions by name. Returns `{name, frontmatter (sanitized), body, usable_tools, unavailable_tools, client_guidance}`. The `body` is prose — read it as your operating instructions for this task, and when it says to search / store / look something up, call the same-named MCP tool on THIS server. There is nothing to 'execute' — the value is the instructions plus your tool calls back to this server. Tools listed in `unavailable_tools` won't work for you (not exposed here, or beyond your access) — adapt accordingly. Size-capped; read-scope; requires the owner to have enabled mcp.publish_skills.",
+        "inputSchema": {
+          "properties": {
+            "name": {
+              "description": "Skill name exactly as returned by list_skills.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        },
+        "name": "get_skill"
+      },
+      {
+        "description": "Snapshot for `gbrain status` thin-client mode: sync freshness + last cycle. Admin-scope.",
+        "inputSchema": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "name": "get_status_snapshot"
       },
       {
         "description": "Sync git repo to brain (incremental)",
@@ -1380,6 +1460,48 @@
         "name": "get_recent_transcripts"
       },
       {
+        "description": "Push-based context: volunteer brain pages relevant to a rolling conversation window WITHOUT being asked. Zero-LLM, confidence-gated (alias 0.9 / exact-title 0.8 / slug-suffix 0.6, +0.05 for multi-turn or newest-turn mentions; default gate 0.7), capped at 3 pages (max 5). Returns pointers with one-line rationales + synopses — open the page (get_page) before relying on details. Pass stats: true for the approximate volunteered-vs-used precision summary (the feedback loop).",
+        "inputSchema": {
+          "properties": {
+            "days": {
+              "description": "Stats window in days (default 30; stats mode only).",
+              "type": "number"
+            },
+            "max_pages": {
+              "description": "Max pages to volunteer (default 3, hard cap 5).",
+              "type": "number"
+            },
+            "min_confidence": {
+              "description": "Confidence gate 0..1 (default 0.7 — slug-suffix matches need an explicit lower gate).",
+              "type": "number"
+            },
+            "prior_context": {
+              "description": "Already-surfaced context (pointer blocks / opened page bodies). Pages whose slug appears here are not re-volunteered.",
+              "type": "string"
+            },
+            "session_id": {
+              "description": "Optional caller session id, logged for attribution.",
+              "type": "string"
+            },
+            "stats": {
+              "description": "Return the volunteered-vs-used precision summary instead of volunteering. APPROXIMATE: \"used\" = pages.last_retrieved_at > volunteered_at.",
+              "type": "boolean"
+            },
+            "turn": {
+              "description": "Optional caller turn number, logged for attribution.",
+              "type": "number"
+            },
+            "window": {
+              "description": "Recent conversation turns, oldest → newest, as 'user:' / 'assistant:' prefixed lines (unprefixed text = one user turn). Required unless stats: true. CLI: piped stdin fills this.",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "volunteer_context"
+      },
+      {
         "description": "v0.31: extract personal-knowledge facts (events, preferences, commitments, beliefs) from a conversation turn into the per-source hot memory. Sanitizes turn_text via INJECTION_PATTERNS, calls Haiku to extract structured claims, runs the cosine fast-path + classifier dedup pipeline, INSERTs into facts. Returns counts by status. Skips extraction when the turn is dream-generated content (anti-loop).",
         "inputSchema": {
           "properties": {
@@ -1569,7 +1691,7 @@
         "inputSchema": {
           "properties": {
             "all_sources": {
-              "description": "Force cross-source search (equivalent to source_id=__all__).",
+              "description": "Span sources (equivalent to source_id=__all__): every source locally, your grant remotely.",
               "type": "boolean"
             },
             "limit": {
@@ -1577,7 +1699,7 @@
               "type": "number"
             },
             "source_id": {
-              "description": "Scope to a single source. Defaults to ctx.sourceId; pass '__all__' to force cross-source.",
+              "description": "Scope to a single source. Defaults to ctx.sourceId; '__all__' spans every source for trusted local callers, your granted sources for remote callers.",
               "type": "string"
             },
             "symbol": {
@@ -1597,7 +1719,7 @@
         "inputSchema": {
           "properties": {
             "all_sources": {
-              "description": "Force cross-source search.",
+              "description": "Span sources: every source locally, your grant remotely.",
               "type": "boolean"
             },
             "limit": {
@@ -1605,7 +1727,7 @@
               "type": "number"
             },
             "source_id": {
-              "description": "Scope to a single source. Defaults to ctx.sourceId; pass '__all__' to force cross-source.",
+              "description": "Scope to a single source. Defaults to ctx.sourceId; '__all__' spans every source for trusted local callers, your granted sources for remote callers.",
               "type": "string"
             },
             "symbol": {
@@ -1684,6 +1806,10 @@
               "description": "Result-set cap (default 200)",
               "type": "number"
             },
+            "source_id": {
+              "description": "Source to traverse. Defaults to ctx.sourceId; federated clients with multiple granted sources must specify one.",
+              "type": "string"
+            },
             "symbol": {
               "description": "Bare or qualified symbol name (e.g. \"performSync\" or \"src/foo::performSync\")",
               "type": "string"
@@ -1715,6 +1841,10 @@
             "max_nodes": {
               "description": "Result-set cap (default 200)",
               "type": "number"
+            },
+            "source_id": {
+              "description": "Source to traverse. Defaults to ctx.sourceId; federated clients with multiple granted sources must specify one.",
+              "type": "string"
             }
           },
           "required": [
@@ -1863,6 +1993,80 @@
           "type": "object"
         },
         "name": "reload_schema_pack"
+      },
+      {
+        "description": "Probe brain health + optionally submit onboard remediations. Admin scope required. Protected handlers (LLM-bearing) require run_protected_onboard scope ADDITIONALLY.",
+        "inputSchema": {
+          "properties": {
+            "max_usd": {
+              "description": "USD cap for autopilot path (required for auto modes)",
+              "type": "number"
+            },
+            "mode": {
+              "description": "'check' (default), 'auto', or 'auto-with-prompt'",
+              "type": "string"
+            },
+            "target_score": {
+              "description": "Target brain_score (default 90)",
+              "type": "number"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "name": "run_onboard"
+      },
+      {
+        "description": "Run SkillOpt against a single skill. Admin scope; mutating; rate-limited per-skill via DB lock. See gbrain skillopt CLI for the full flag surface.",
+        "inputSchema": {
+          "properties": {
+            "allow_mutate_bundled": {
+              "description": "Required to mutate bundled skills",
+              "type": "boolean"
+            },
+            "batch_size": {
+              "description": "Default 8",
+              "type": "number"
+            },
+            "benchmark_path": {
+              "description": "Absolute path to benchmark JSONL; defaults to skills/<name>/skillopt-benchmark.jsonl",
+              "type": "string"
+            },
+            "dry_run": {
+              "description": "Cost preview, no LLM calls",
+              "type": "boolean"
+            },
+            "epochs": {
+              "description": "Default 4",
+              "type": "number"
+            },
+            "held_out_path": {
+              "description": "Path to a held-out test set (JSONL). REQUIRED (>=5 rows) to mutate a bundled skill in place — otherwise the run hard-refuses. Remote callers: must resolve within the skills directory.",
+              "type": "string"
+            },
+            "lr": {
+              "description": "Default 4",
+              "type": "number"
+            },
+            "max_cost_usd": {
+              "description": "Default 5.00",
+              "type": "number"
+            },
+            "no_mutate": {
+              "description": "Write proposed.md without replacing SKILL.md",
+              "type": "boolean"
+            },
+            "skill_name": {
+              "description": "Kebab-case skill name (resolves to skills/<name>/SKILL.md)",
+              "type": "string"
+            }
+          },
+          "required": [
+            "skill_name"
+          ],
+          "type": "object"
+        },
+        "name": "run_skillopt"
       }
     ]
   }
