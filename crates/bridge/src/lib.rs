@@ -56,6 +56,7 @@
 //! ```
 
 pub mod async_proxy;
+pub mod chunking;
 pub mod config;
 pub mod daemon_client;
 pub mod error;

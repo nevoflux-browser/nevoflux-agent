@@ -182,11 +182,7 @@ where
     // is up. Skipped (None) when a provider is already configured, leaving the
     // startup sequence unchanged.
     if let Some(setup_msg) = config.early_setup_status.clone() {
-        if stdout_tx
-            .send(StdoutMessage::Raw(setup_msg))
-            .await
-            .is_err()
-        {
+        if stdout_tx.send(StdoutMessage::Raw(setup_msg)).await.is_err() {
             return Err(BridgeError::ChannelClosed);
         }
     }
@@ -376,6 +372,10 @@ async fn stdin_task<R>(
 where
     R: AsyncRead + Unpin + Send,
 {
+    // Reassembles large messages the extension split into `__chunk` envelopes
+    // to stay under the 1 MB native-messaging frame limit. Non-chunk messages
+    // pass straight through.
+    let mut reassembler = crate::chunking::ChunkReassembler::new();
     loop {
         tokio::select! {
             biased;
@@ -388,6 +388,11 @@ where
             result = read_message::<_, serde_json::Value>(&mut reader) => {
                 match result {
                     Ok(message) => {
+                        // Buffer chunk envelopes; only proceed once a full
+                        // message is available (or for plain, unchunked ones).
+                        let Some(message) = reassembler.process(message) else {
+                            continue;
+                        };
                         debug!("stdin received: {:?}", message.get("type"));
 
                         if let Some((request_id, channel, payload)) = parse_native_message(&message) {
@@ -435,38 +440,35 @@ where
             }
 
             msg = rx.recv() => {
-                match msg {
+                // Build the outgoing value, then write it as one frame — or, if
+                // it exceeds the native-messaging frame limit, as a sequence of
+                // `__chunk` envelopes the extension's ChunkReassembler rejoins.
+                let out = match msg {
                     Some(StdoutMessage::DaemonResponse(envelope)) => {
-                        let value = serde_json::to_value(&envelope.payload)?;
-                        write_message(&mut writer, &value).await?;
+                        serde_json::to_value(&envelope.payload)?
                     }
-                    Some(StdoutMessage::Error { code, message }) => {
-                        let error = serde_json::json!({
-                            "type": "error",
-                            "payload": {
-                                "code": code,
-                                "message": message
-                            }
-                        });
-                        write_message(&mut writer, &error).await?;
-                    }
-                    Some(StdoutMessage::Connected { version, proxy_id }) => {
-                        let connected = serde_json::json!({
-                            "type": "connected",
-                            "payload": {
-                                "version": version,
-                                "proxy_id": proxy_id
-                            }
-                        });
-                        write_message(&mut writer, &connected).await?;
-                    }
-                    Some(StdoutMessage::Raw(value)) => {
-                        write_message(&mut writer, &value).await?;
-                    }
+                    Some(StdoutMessage::Error { code, message }) => serde_json::json!({
+                        "type": "error",
+                        "payload": {
+                            "code": code,
+                            "message": message
+                        }
+                    }),
+                    Some(StdoutMessage::Connected { version, proxy_id }) => serde_json::json!({
+                        "type": "connected",
+                        "payload": {
+                            "version": version,
+                            "proxy_id": proxy_id
+                        }
+                    }),
+                    Some(StdoutMessage::Raw(value)) => value,
                     Some(StdoutMessage::Shutdown) | None => {
                         debug!("stdout task: channel closed or shutdown");
                         break;
                     }
+                };
+                for frame in crate::chunking::split_for_send(&out) {
+                    write_message(&mut writer, &frame).await?;
                 }
             }
         }
@@ -739,10 +741,9 @@ mod tests {
         // stdout: the proxy writes framed messages we read back here.
         let (writer_for_proxy, mut test_reader) = tokio::io::duplex(64 * 1024);
 
-        let proxy =
-            tokio::spawn(
-                async move { run_async_proxy(stdin_for_proxy, writer_for_proxy, config).await },
-            );
+        let proxy = tokio::spawn(async move {
+            run_async_proxy(stdin_for_proxy, writer_for_proxy, config).await
+        });
 
         // First framed message must be the optimistic setup hint…
         let first: serde_json::Value = read_message(&mut test_reader).await.unwrap();
