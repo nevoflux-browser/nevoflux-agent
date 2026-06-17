@@ -476,6 +476,14 @@ async fn spawn_and_supervise(
         .env("OPENROUTER_BASE_URL", &gateway_v1)
         .env("OPENROUTER_API_KEY", &config.upstream_api_key)
         .env("GBRAIN_BRAIN_DIR", &config.brain_dir)
+        // gbrain 0.42's graceful-teardown deadline defaults to ~5s, but on
+        // shutdown this supervisor force-kills the child only 3s after
+        // closing its stdin (see the `timeout(Duration::from_secs(3), ...)`
+        // below). Cap gbrain's own teardown under that window so it closes
+        // PGLite and releases the single-writer `postmaster.pid` lock
+        // cleanly, instead of being killed mid-teardown and leaving a stale
+        // lock the next spawn has to reap.
+        .env("GBRAIN_TEARDOWN_DEADLINE_MS", "2000")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
