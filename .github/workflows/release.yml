@@ -151,21 +151,37 @@ jobs:
           curl -fsSL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-gnu.tar.gz \
             | sudo tar xz -C /usr/local/bin
 
+      # Build with bounded retries. The `ort`/`ort-sys` crate (pulled in by the
+      # `embedding` feature) downloads a prebuilt ONNX Runtime binary from a
+      # third-party CDN (parcel.pyke.io) inside its build script; that download
+      # occasionally times out and has failed a whole release (v0.3.5). A
+      # transient flake clears on retry, and cargo/cross resume incrementally,
+      # so a retry only re-attempts the failed download — not the whole build.
+      #
+      # Flags are derived from the matrix so a single retry wrapper covers all
+      # variants:
+      #   - matrix.no_embedding -> --no-default-features (skips ort entirely)
+      #   - matrix.use_cross    -> `cross` instead of `cargo`
+      # `shell: bash` makes the same loop run on the Windows runners too.
       - name: Build
-        if: ${{ !matrix.use_cross && !matrix.no_embedding }}
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (no embedding)
-        if: ${{ !matrix.use_cross && matrix.no_embedding }}
-        run: cargo build --release --target ${{ matrix.target }} --no-default-features
-
-      - name: Build (cross)
-        if: ${{ matrix.use_cross && !matrix.no_embedding }}
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Build (cross, no embedding)
-        if: ${{ matrix.use_cross && matrix.no_embedding }}
-        run: cross build --release --target ${{ matrix.target }} --no-default-features
+        shell: bash
+        run: |
+          set -u
+          flags=""
+          [ "${{ matrix.no_embedding }}" = "true" ] && flags="--no-default-features"
+          if [ "${{ matrix.use_cross }}" = "true" ]; then tool="cross"; else tool="cargo"; fi
+          for attempt in 1 2 3; do
+            echo "::group::$tool build --release --target ${{ matrix.target }} $flags (attempt $attempt/3)"
+            if "$tool" build --release --target "${{ matrix.target }}" $flags; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            echo "::warning::Build attempt $attempt/3 failed (often a transient ort-sys ONNX-Runtime CDN download timeout); retrying in 30s…"
+            sleep 30
+          done
+          echo "::error::Build failed after 3 attempts"
+          exit 1
 
       # Download pre-cached embedding model
       - name: Download embedding model
