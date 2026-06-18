@@ -6,13 +6,32 @@ use crate::error::{BridgeError, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Maximum message size (1 MB).
+/// Maximum size for a single Native Messaging frame on the Firefox stdin/stdout
+/// boundary. Firefox caps a native message at ~1 MB; larger payloads are split
+/// into `__chunk` envelopes by [`crate::chunking`] before crossing it.
 pub const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 
-/// Read a message from the native messaging input.
+/// Maximum frame size for the internal daemon<->proxy TCP socket. That leg is
+/// local and NOT bound by Firefox's native-messaging limit, so it carries a
+/// full large artifact (e.g. a >1 MB Canvas dashboard) in one frame; the proxy
+/// re-chunks it for the Firefox boundary on the way out.
+pub const MAX_SOCKET_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
+
+/// Read a message from the native messaging input (Firefox 1 MB frame limit).
 ///
 /// Message format: 4-byte little-endian length + JSON payload
 pub async fn read_message<R, T>(reader: &mut R) -> Result<T>
+where
+    R: AsyncReadExt + Unpin,
+    T: DeserializeOwned,
+{
+    read_message_capped(reader, MAX_MESSAGE_SIZE).await
+}
+
+/// Like [`read_message`] but with a caller-supplied maximum frame size. Used by
+/// the daemon<->proxy socket ([`MAX_SOCKET_MESSAGE_SIZE`]), which is not subject
+/// to Firefox's 1 MB native-messaging limit.
+pub async fn read_message_capped<R, T>(reader: &mut R, max_size: u32) -> Result<T>
 where
     R: AsyncReadExt + Unpin,
     T: DeserializeOwned,
@@ -23,10 +42,10 @@ where
     let len = u32::from_le_bytes(len_buf);
 
     // Validate length
-    if len > MAX_MESSAGE_SIZE {
+    if len > max_size {
         return Err(BridgeError::NativeMessaging(format!(
             "Message too large: {} bytes (max {})",
-            len, MAX_MESSAGE_SIZE
+            len, max_size
         )));
     }
 

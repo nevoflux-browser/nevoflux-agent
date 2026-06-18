@@ -443,8 +443,12 @@ pub async fn find_available_port(config: &ServerConfig) -> Result<u16> {
     Err(DaemonError::PortExhausted)
 }
 
-/// Maximum message size for length-prefixed TCP framing (1 MB).
-const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
+/// Maximum message size for length-prefixed TCP framing on the daemon<->proxy
+/// socket. This leg is local and NOT bound by Firefox's ~1 MB native-messaging
+/// limit, so it can carry a full large artifact (e.g. a >1 MB Canvas dashboard
+/// in a content_store.set / artifact.get) in one frame; the proxy re-chunks it
+/// for the Firefox stdout boundary. Mirrors bridge `MAX_SOCKET_MESSAGE_SIZE`.
+const MAX_MESSAGE_SIZE: u32 = 64 * 1024 * 1024;
 
 /// Handle a single proxy TCP connection.
 ///

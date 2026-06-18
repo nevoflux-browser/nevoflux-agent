@@ -5,7 +5,7 @@
 
 use crate::config::BridgeConfig;
 use crate::error::{BridgeError, Result};
-use crate::native_messaging::{read_message, write_message};
+use crate::native_messaging::{read_message_capped, write_message, MAX_SOCKET_MESSAGE_SIZE};
 use crate::port_discovery::{discover_daemon, DaemonInfo};
 use futures::stream::Stream;
 use nevoflux_protocol::{Channel, DaemonEnvelope, ProxyEnvelope};
@@ -358,7 +358,11 @@ impl DaemonClient {
     async fn try_recv(&mut self) -> Result<DaemonEnvelope> {
         let reader = self.reader.as_mut().ok_or(BridgeError::Disconnected)?;
 
-        let envelope: DaemonEnvelope = read_message(reader).await?;
+        // Daemon responses (e.g. a >1 MB artifact.get) travel the local socket,
+        // not Firefox's 1 MB native-messaging boundary, so allow the larger
+        // socket frame size here. The proxy re-chunks for stdout downstream.
+        let envelope: DaemonEnvelope =
+            read_message_capped(reader, MAX_SOCKET_MESSAGE_SIZE).await?;
         Ok(envelope)
     }
 
