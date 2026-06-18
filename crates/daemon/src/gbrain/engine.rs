@@ -322,6 +322,20 @@ impl BrainEngine for GbrainEngine {
         Ok(())
     }
 
+    async fn restore(&self, slug: &str) -> BrainResult<()> {
+        // gbrain's `put_page` upsert (ON CONFLICT DO UPDATE) overwrites content
+        // but never clears `deleted_at`, so re-putting a slug that an earlier
+        // `delete_page` soft-deleted leaves the row tombstoned and hidden from
+        // `get_page`. `restore_page` clears the tombstone. It is idempotent:
+        // gbrain returns `{status:"already_active"}` (NOT an error) when the
+        // page is not soft-deleted, so calling it after every seed `put` is a
+        // clean no-op for fresh pages.
+        let args = json!({ "slug": slug });
+        let resp = self.call_tool("restore_page", args).await?;
+        let _ = Self::extract_text_result(&resp)?;
+        Ok(())
+    }
+
     async fn sync(&self) -> BrainResult<SyncReport> {
         // gbrain's `sync_brain` accepts a handful of flags (dry_run,
         // full, no_embed, no_pull, repo); v1 dispatches with defaults
@@ -691,6 +705,35 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "delete_page");
         assert_eq!(calls[0].1.get("slug").unwrap().as_str().unwrap(), "doomed");
+    }
+
+    #[tokio::test]
+    async fn restore_calls_restore_page_with_slug() {
+        // gbrain returns {status:"restored"} for a soft-deleted page; the
+        // engine treats any non-error response as success.
+        let stub = Arc::new(StubToolCaller::new(vec![(
+            "restore_page",
+            wrap_text("{\"status\":\"restored\",\"slug\":\"revived\"}"),
+        )]));
+        let engine = GbrainEngine::new(stub.clone());
+        engine.restore("revived").await.unwrap();
+        let calls = stub.calls().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "restore_page");
+        assert_eq!(calls[0].1.get("slug").unwrap().as_str().unwrap(), "revived");
+    }
+
+    #[tokio::test]
+    async fn restore_treats_already_active_as_ok() {
+        // A page that was never soft-deleted yields {status:"already_active"}
+        // with no isError — restore must NOT fail, so seeding a fresh page is a
+        // clean no-op rather than a spurious error.
+        let stub = Arc::new(StubToolCaller::new(vec![(
+            "restore_page",
+            wrap_text("{\"status\":\"already_active\",\"slug\":\"fresh\"}"),
+        )]));
+        let engine = GbrainEngine::new(stub);
+        assert!(engine.restore("fresh").await.is_ok());
     }
 
     #[tokio::test]

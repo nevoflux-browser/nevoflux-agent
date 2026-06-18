@@ -34,6 +34,16 @@ pub trait BrainEngine: Send + Sync {
     /// Remove a page from the knowledge base.
     async fn delete(&self, slug: &str) -> BrainResult<()>;
 
+    /// Clear a soft-delete tombstone on `slug` so the page becomes visible
+    /// again. Engines without soft-delete semantics need not implement this;
+    /// the default is a no-op. The gbrain engine overrides it to call
+    /// `restore_page` — used after a pack-seed `put` to undo a prior
+    /// uninstall's soft-delete, because gbrain's `put_page` upsert overwrites
+    /// content but does NOT clear `deleted_at`.
+    async fn restore(&self, _slug: &str) -> BrainResult<()> {
+        Ok(())
+    }
+
     /// Sync any in-memory state to durable storage / rebuild indexes.
     async fn sync(&self) -> BrainResult<SyncReport>;
 

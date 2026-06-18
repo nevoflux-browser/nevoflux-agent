@@ -168,9 +168,27 @@ impl PackHost for PackHostImpl {
             .clone();
         // `BrainPage::from_markdown` takes owned String values.
         let page = nevoflux_brain::BrainPage::from_markdown(slug.to_string(), body.to_string());
-        self.handle
-            .block_on(async move { engine.put(page).await })
-            .map_err(|e| Self::io_err("put_page", e))?;
+        let slug_owned = slug.to_string();
+        self.handle.block_on(async move {
+            engine
+                .put(page)
+                .await
+                .map_err(|e| Self::io_err("put_page", e))?;
+            // Clear any soft-delete tombstone left by a prior uninstall
+            // (`--purge-data` calls `delete_page`, which soft-deletes). gbrain's
+            // `put_page` upsert overwrites content but does NOT reset
+            // `deleted_at`, so without this a re-seeded page stays hidden from
+            // `get_page`. Best-effort: a restore failure must not roll back the
+            // already-successful seed write, and it is a no-op for fresh pages.
+            if let Err(e) = engine.restore(&slug_owned).await {
+                tracing::warn!(
+                    slug = %slug_owned,
+                    error = %e,
+                    "seed: restore_page after put failed; page may stay hidden if it was soft-deleted"
+                );
+            }
+            Ok::<(), PackError>(())
+        })?;
         Ok(())
     }
 
