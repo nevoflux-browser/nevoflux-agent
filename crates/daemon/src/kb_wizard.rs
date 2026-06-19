@@ -633,13 +633,73 @@ pub async fn publish_progress(bus: &Arc<EventBus>, frame: &WizardProgress) {
     }
 }
 
+/// How [`run_with_progress_inner`] decides a child is "finished".
+enum Completion<'a> {
+    /// Wait for the process to exit cleanly (both pipes hit EOF). Correct for
+    /// commands that terminate on their own (bun installer, `bun init`,
+    /// `bun add`).
+    OnExit,
+    /// Some gbrain CLI subcommands (`init`, `apply-migrations`) finish their
+    /// work and print a result but never `process.exit()` on success — a
+    /// lingering gateway/embedding HTTP handle keeps the bun process alive, so
+    /// its stdout/stderr never EOF and an `OnExit` wait hangs forever (observed:
+    /// `gbrain init` prints "Brain ready"/the skillpack advisory, then never
+    /// returns). Treat the work as done once `marker` appears in the output
+    /// (plus a short `grace` for trailing lines), or after `idle` of silence as
+    /// a fallback, then kill the lingering process. The caller validates success
+    /// out-of-band (e.g. `brain.pglite` exists).
+    WhenDone {
+        marker: Option<&'a str>,
+        grace: std::time::Duration,
+        idle: std::time::Duration,
+    },
+}
+
 /// Run a child process and emit its stdout/stderr lines as `Running`
 /// progress frames via `emit`. Returns `Ok(())` on a successful exit
 /// status; an `Err` if the process exited non-zero or IO failed.
 async fn run_with_progress<F>(
+    cmd: Command,
+    step: WizardStep,
+    emit: &F,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: Fn(WizardProgress) + Send + Sync,
+{
+    run_with_progress_inner(cmd, step, emit, Completion::OnExit).await
+}
+
+/// Run a gbrain CLI subprocess that may not `process.exit()` on success.
+/// Stops once `marker` is seen (or output goes idle) and reclaims the
+/// lingering bun process instead of waiting forever for EOF. See
+/// [`Completion::WhenDone`].
+async fn run_gbrain_cli<F>(
+    cmd: Command,
+    step: WizardStep,
+    emit: &F,
+    marker: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: Fn(WizardProgress) + Send + Sync,
+{
+    run_with_progress_inner(
+        cmd,
+        step,
+        emit,
+        Completion::WhenDone {
+            marker,
+            grace: std::time::Duration::from_secs(5),
+            idle: std::time::Duration::from_secs(20),
+        },
+    )
+    .await
+}
+
+async fn run_with_progress_inner<F>(
     mut cmd: Command,
     step: WizardStep,
     emit: &F,
+    completion: Completion<'_>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     F: Fn(WizardProgress) + Send + Sync,
@@ -667,8 +727,24 @@ where
     let mut stderr_buf: Vec<u8> = Vec::new();
     let mut stdout_done = false;
     let mut stderr_done = false;
+    let mut any_output = false;
+    let mut marker_seen = false;
+    let mut early_stop = false;
 
     while !stdout_done || !stderr_done {
+        // For `WhenDone`, arm a quiet-timer once we've seen output: short
+        // `grace` after the marker, longer `idle` as a fallback. `OnExit` (and
+        // the pre-output window) leaves it disarmed so behavior is unchanged.
+        let quiet = match &completion {
+            Completion::OnExit => None,
+            Completion::WhenDone { grace, idle, .. } if any_output => {
+                Some(if marker_seen { *grace } else { *idle })
+            }
+            Completion::WhenDone { .. } => None,
+        };
+        let quiet_armed = quiet.is_some();
+        let quiet_dur = quiet.unwrap_or_else(|| std::time::Duration::from_secs(86_400));
+
         tokio::select! {
             n = stdout_reader.read_until(b'\n', &mut stdout_buf), if !stdout_done => {
                 match n {
@@ -678,6 +754,10 @@ where
                             .trim_end_matches(|c| c == '\n' || c == '\r')
                             .to_string();
                         stdout_buf.clear();
+                        any_output = true;
+                        if let Completion::WhenDone { marker: Some(m), .. } = &completion {
+                            if text.contains(m) { marker_seen = true; }
+                        }
                         emit(WizardProgress {
                             step,
                             status: WizardStatus::Running,
@@ -696,6 +776,10 @@ where
                             .trim_end_matches(|c| c == '\n' || c == '\r')
                             .to_string();
                         stderr_buf.clear();
+                        any_output = true;
+                        if let Completion::WhenDone { marker: Some(m), .. } = &completion {
+                            if text.contains(m) { marker_seen = true; }
+                        }
                         emit(WizardProgress {
                             step,
                             status: WizardStatus::Running,
@@ -706,7 +790,26 @@ where
                     Err(e) => return Err(format!("stderr read: {e}").into()),
                 }
             }
+            _ = tokio::time::sleep(quiet_dur), if quiet_armed => {
+                // gbrain finished its work (marker seen, or output went idle)
+                // but the process is not exiting. Stop and reclaim it below.
+                early_stop = true;
+                break;
+            }
         }
+    }
+
+    if early_stop {
+        let reason = if marker_seen { "completion marker" } else { "output idle" };
+        emit(WizardProgress {
+            step,
+            status: WizardStatus::Running,
+            progress_pct: 99,
+            log: format!("gbrain step finished ({reason}); reclaiming lingering process"),
+        });
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Ok(());
     }
 
     let status = child.wait().await?;
@@ -980,7 +1083,11 @@ where
         .env("GBRAIN_BRAIN_DIR", brain_dir)
         .current_dir(brain_dir);
 
-    run_with_progress(cmd, WizardStep::InitBrain, emit)
+    // `gbrain init` does its work, prints "Brain ready at …" + the skillpack
+    // advisory, then never `process.exit()`s on success (a lingering
+    // gateway/embedding handle keeps bun alive). Stop on that marker instead of
+    // waiting forever for the process to exit; `brain.pglite` below validates.
+    run_gbrain_cli(cmd, WizardStep::InitBrain, emit, Some("Brain ready at"))
         .await
         .map_err(|e| format!("gbrain init failed: {e}"))?;
 
@@ -1170,7 +1277,9 @@ where
         .env("GBRAIN_BRAIN_DIR", brain_dir)
         .current_dir(brain_dir);
 
-    run_with_progress(cmd, WizardStep::InitBrain, emit)
+    // Same non-exiting-on-success behavior as `gbrain init`; rely on the idle
+    // fallback in `run_gbrain_cli` so a lingering process can't hang the wizard.
+    run_gbrain_cli(cmd, WizardStep::InitBrain, emit, None)
         .await
         .map_err(|e| format!("gbrain apply-migrations failed: {e}"))?;
     Ok(())
@@ -2242,6 +2351,47 @@ mod tests {
         assert!(
             result.is_err(),
             "non-zero exit must return Err; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_gbrain_cli_reclaims_marker_process_that_never_exits() {
+        // Regression for the `gbrain init` hang: gbrain prints "Brain ready
+        // at …" then never `process.exit()`s on success, so a plain
+        // wait-for-EOF blocks forever. run_gbrain_cli must see the marker,
+        // reclaim the lingering process, and return Ok promptly — NOT wait out
+        // the (here 30s) sleep.
+        let frames: Arc<StdMutex<Vec<WizardProgress>>> = Arc::new(StdMutex::new(Vec::new()));
+        let frames_clone = frames.clone();
+        let emit = move |p: WizardProgress| {
+            frames_clone.lock().unwrap().push(p);
+        };
+
+        let cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "echo Brain ready at C:\\x & ping -n 30 127.0.0.1 > NUL"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "echo 'Brain ready at /x'; sleep 30"]);
+            c
+        };
+
+        let start = std::time::Instant::now();
+        let result =
+            run_gbrain_cli(cmd, WizardStep::InitBrain, &emit, Some("Brain ready at")).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok(), "marker-stop must return Ok; got {result:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "must reclaim shortly after the marker (~5s grace), not wait the 30s sleep; took {elapsed:?}"
+        );
+        let frames = frames.lock().unwrap();
+        assert!(
+            frames.iter().any(|f| f.log.contains("Brain ready at")),
+            "the marker line should have been emitted as a frame; got {:?}",
+            *frames
         );
     }
 
