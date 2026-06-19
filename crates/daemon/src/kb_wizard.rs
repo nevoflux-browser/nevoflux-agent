@@ -1083,6 +1083,12 @@ where
         .env("GBRAIN_BRAIN_DIR", brain_dir)
         .current_dir(brain_dir);
 
+    // Provide a `gbrain` shim on PATH in case init shells out to a bare
+    // `gbrain` (and so the brain repo is set up consistently with migrations).
+    if let Some(shim_dir) = ensure_gbrain_shim(bun_path, cli_path) {
+        prepend_to_path(&mut cmd, &shim_dir);
+    }
+
     // `gbrain init` does its work, prints "Brain ready at …" + the skillpack
     // advisory, then never `process.exit()`s on success (a lingering
     // gateway/embedding handle keeps bun alive). Stop on that marker instead of
@@ -1116,6 +1122,54 @@ where
         log: format!("brain initialized at {}", pglite.display()),
     });
     Ok(())
+}
+
+/// gbrain's schema migrations shell out to a bare `gbrain …` command via
+/// `execSync` (e.g. v0.11.0 Phase B runs `gbrain jobs smoke`; v0.12/v0.13/…
+/// likewise). nevoflux installs gbrain as a bun package and never puts a global
+/// `gbrain` on PATH, so those migrations fail with "'gbrain' is not recognized"
+/// on any machine whose browser-inherited daemon PATH happens to lack one.
+///
+/// Create a tiny `gbrain` shim that forwards to `bun run <cli>` and return its
+/// directory so callers can prepend it to the subprocess PATH. Best-effort:
+/// returns `None` on any IO failure (the migration then fails as it does today).
+fn ensure_gbrain_shim(bun_path: &Path, cli_path: &Path) -> Option<PathBuf> {
+    let dir = dirs::home_dir()?
+        .join(".nevoflux")
+        .join("brain-tool")
+        .join("bin");
+    std::fs::create_dir_all(&dir).ok()?;
+    let bun = bun_path.display();
+    let cli = cli_path.display();
+    #[cfg(windows)]
+    {
+        // `cmd.exe` resolves `gbrain` against PATH + PATHEXT (incl. .CMD), so a
+        // `gbrain.cmd` here is found by the migration's `execSync('gbrain …')`.
+        let shim = dir.join("gbrain.cmd");
+        let body = format!("@echo off\r\n\"{bun}\" run \"{cli}\" %*\r\n");
+        std::fs::write(&shim, body).ok()?;
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let shim = dir.join("gbrain");
+        let body = format!("#!/bin/sh\nexec \"{bun}\" run \"{cli}\" \"$@\"\n");
+        std::fs::write(&shim, body).ok()?;
+        let _ = std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755));
+    }
+    Some(dir)
+}
+
+/// Prepend `dir` to the `PATH` of `cmd` (over the daemon's inherited PATH) so a
+/// shim placed there resolves first for the subprocess and any grandchildren it
+/// spawns with `env: process.env`.
+fn prepend_to_path(cmd: &mut Command, dir: &Path) {
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![dir.to_path_buf()];
+    paths.extend(std::env::split_paths(&existing));
+    if let Ok(joined) = std::env::join_paths(paths) {
+        cmd.env("PATH", joined);
+    }
 }
 
 /// Run a `git` subcommand in `dir`, capturing output.
@@ -1276,6 +1330,13 @@ where
         .env("OPENROUTER_API_KEY", gateway_token)
         .env("GBRAIN_BRAIN_DIR", brain_dir)
         .current_dir(brain_dir);
+
+    // Migrations (e.g. v0.11.0 Phase B) `execSync('gbrain jobs smoke')` — a bare
+    // `gbrain` that only resolves if one is on PATH. Provide a shim so it works
+    // regardless of the daemon's browser-inherited PATH.
+    if let Some(shim_dir) = ensure_gbrain_shim(bun_path, cli_path) {
+        prepend_to_path(&mut cmd, &shim_dir);
+    }
 
     // Same non-exiting-on-success behavior as `gbrain init`; rely on the idle
     // fallback in `run_gbrain_cli` so a lingering process can't hang the wizard.
