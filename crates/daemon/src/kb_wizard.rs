@@ -727,25 +727,50 @@ where
     let mut stderr_buf: Vec<u8> = Vec::new();
     let mut stdout_done = false;
     let mut stderr_done = false;
-    let mut any_output = false;
     let mut marker_seen = false;
     let mut early_stop = false;
 
+    // Reclaim policy for `WhenDone`. gbrain CLI commands finish their work and
+    // print a result but may never `process.exit()` (a lingering
+    // gateway/embedding handle keeps bun alive) — and in some environments
+    // (e.g. the browser-launched daemon) they keep emitting output afterward,
+    // which would defeat a reset-on-output idle timer. So use ABSOLUTE deadlines
+    // that later output can't push back, plus a HARD CAP so the wizard can never
+    // block indefinitely whatever the cause.
+    const HARD_CAP: std::time::Duration = std::time::Duration::from_secs(90);
+    let start = tokio::time::Instant::now();
+    let (grace, idle, hard_deadline) = match &completion {
+        Completion::OnExit => (None, None, None),
+        Completion::WhenDone { grace, idle, .. } => {
+            (Some(*grace), Some(*idle), Some(start + HARD_CAP))
+        }
+    };
+    // Absolute, set once when the marker is first seen — NOT reset by later
+    // output, so a chatty post-marker process is still reclaimed on time.
+    let mut marker_deadline: Option<tokio::time::Instant> = None;
+    // Reset on every output line: a quiet (no-marker) command stops promptly
+    // once it actually goes silent.
+    let mut idle_deadline: Option<tokio::time::Instant> = None;
+
     while !stdout_done || !stderr_done {
-        // For `WhenDone`, arm a quiet-timer once we've seen output: short
-        // `grace` after the marker, longer `idle` as a fallback. `OnExit` (and
-        // the pre-output window) leaves it disarmed so behavior is unchanged.
-        let quiet = match &completion {
-            Completion::OnExit => None,
-            Completion::WhenDone { grace, idle, .. } if any_output => {
-                Some(if marker_seen { *grace } else { *idle })
-            }
-            Completion::WhenDone { .. } => None,
-        };
-        let quiet_armed = quiet.is_some();
-        let quiet_dur = quiet.unwrap_or_else(|| std::time::Duration::from_secs(86_400));
+        let wake = [marker_deadline, idle_deadline, hard_deadline]
+            .into_iter()
+            .flatten()
+            .min();
 
         tokio::select! {
+            biased;
+            // Timer first (and biased) so a due deadline always wins over a
+            // chatty process whose read branches stay ready.
+            _ = async {
+                match wake {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                early_stop = true;
+                break;
+            }
             n = stdout_reader.read_until(b'\n', &mut stdout_buf), if !stdout_done => {
                 match n {
                     Ok(0) => stdout_done = true,
@@ -754,9 +779,14 @@ where
                             .trim_end_matches(|c| c == '\n' || c == '\r')
                             .to_string();
                         stdout_buf.clear();
-                        any_output = true;
                         if let Completion::WhenDone { marker: Some(m), .. } = &completion {
-                            if text.contains(m) { marker_seen = true; }
+                            if marker_deadline.is_none() && text.contains(m) {
+                                marker_seen = true;
+                                marker_deadline = grace.map(|g| tokio::time::Instant::now() + g);
+                            }
+                        }
+                        if let Some(i) = idle {
+                            idle_deadline = Some(tokio::time::Instant::now() + i);
                         }
                         emit(WizardProgress {
                             step,
@@ -776,9 +806,14 @@ where
                             .trim_end_matches(|c| c == '\n' || c == '\r')
                             .to_string();
                         stderr_buf.clear();
-                        any_output = true;
                         if let Completion::WhenDone { marker: Some(m), .. } = &completion {
-                            if text.contains(m) { marker_seen = true; }
+                            if marker_deadline.is_none() && text.contains(m) {
+                                marker_seen = true;
+                                marker_deadline = grace.map(|g| tokio::time::Instant::now() + g);
+                            }
+                        }
+                        if let Some(i) = idle {
+                            idle_deadline = Some(tokio::time::Instant::now() + i);
                         }
                         emit(WizardProgress {
                             step,
@@ -790,17 +825,15 @@ where
                     Err(e) => return Err(format!("stderr read: {e}").into()),
                 }
             }
-            _ = tokio::time::sleep(quiet_dur), if quiet_armed => {
-                // gbrain finished its work (marker seen, or output went idle)
-                // but the process is not exiting. Stop and reclaim it below.
-                early_stop = true;
-                break;
-            }
         }
     }
 
     if early_stop {
-        let reason = if marker_seen { "completion marker" } else { "output idle" };
+        let reason = if marker_seen {
+            "completion marker"
+        } else {
+            "no further output / time cap"
+        };
         emit(WizardProgress {
             step,
             status: WizardStatus::Running,
@@ -2453,6 +2486,59 @@ mod tests {
             frames.iter().any(|f| f.log.contains("Brain ready at")),
             "the marker line should have been emitted as a frame; got {:?}",
             *frames
+        );
+    }
+
+    #[tokio::test]
+    async fn run_gbrain_cli_reclaims_marker_even_with_continuous_output() {
+        // The real failure on the browser-launched daemon: gbrain prints
+        // "Brain ready at …" then KEEPS emitting output (never exits), which a
+        // reset-on-output idle timer would chase forever. The absolute marker
+        // deadline must reclaim ~grace after the marker regardless of ongoing
+        // output.
+        let frames: Arc<StdMutex<Vec<WizardProgress>>> = Arc::new(StdMutex::new(Vec::new()));
+        let frames_clone = frames.clone();
+        let emit = move |p: WizardProgress| {
+            frames_clone.lock().unwrap().push(p);
+        };
+
+        let cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            // marker line, then ~1 reply/sec (well past the ~5s grace).
+            c.args(["/C", "echo Brain ready at C:\\x & ping -n 12 127.0.0.1"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args([
+                "-c",
+                "echo 'Brain ready at /x'; while :; do echo tick; sleep 1; done",
+            ]);
+            c
+        };
+
+        let start = std::time::Instant::now();
+        // Wrap so a regression hangs THIS future, not the whole test runner.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            run_gbrain_cli(cmd, WizardStep::InitBrain, &emit, Some("Brain ready at")),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            outcome.is_ok(),
+            "must reclaim ~grace after the marker despite continuous output, not hang"
+        );
+        assert!(outcome.unwrap().is_ok());
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "absolute marker deadline (~5s) must not be pushed back by ongoing output; took {elapsed:?}"
+        );
+        let frames = frames.lock().unwrap();
+        assert!(
+            frames.len() > 1,
+            "expected output to continue past the marker; got {} frame(s)",
+            frames.len()
         );
     }
 
