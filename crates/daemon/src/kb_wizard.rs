@@ -401,6 +401,20 @@ async fn shutdown_old_supervisor(old: Option<Arc<crate::gbrain::GbrainSupervisor
 /// the user still gets a working brain for this session and we'll
 /// surface the failure in logs so it can be fixed manually.
 async fn hot_reload_brain() -> Result<(), String> {
+    // Breadcrumbs onto the wizard progress stream so the hot-reload phase
+    // (which is otherwise tracing-only) is visible in the sidebar — the last
+    // one shown localizes any stall past `init_brain_repo`.
+    let emit = make_emit_for_global();
+    let crumb = |pct: u8, msg: &str| {
+        emit(WizardProgress {
+            step: WizardStep::InitBrain,
+            status: WizardStatus::Running,
+            progress_pct: pct,
+            log: format!("hot-reload: {msg}"),
+        })
+    };
+    crumb(98, "persisting config + tearing down old supervisor");
+
     // 1. Persist config.
     if let Err(e) = persist_brain_enabled().await {
         tracing::warn!(
@@ -461,7 +475,7 @@ async fn hot_reload_brain() -> Result<(), String> {
             resolve_bun_path(),
             default_gbrain_cli_path().filter(|p| p.exists()),
         ) {
-            let emit = make_emit_for_global();
+            crumb(98, "applying pending schema migrations");
             if let Err(e) = apply_brain_migrations(
                 &bun,
                 &cli,
@@ -481,6 +495,7 @@ async fn hot_reload_brain() -> Result<(), String> {
     }
 
     // 5. Spawn the new supervisor + build the engine (PGLite is now free).
+    crumb(99, "spawning gbrain supervisor (serve + MCP initialize)");
     let boot = match crate::init_brain::init_brain(&kb_config, &Some(gateway_snapshot)).await {
         Ok(Some(b)) => b,
         Ok(None) => {
@@ -502,6 +517,7 @@ async fn hot_reload_brain() -> Result<(), String> {
         engine: boot.engine,
     });
 
+    crumb(100, "supervisor running, engine installed");
     tracing::info!("brain hot-reload OK: supervisor running, engine installed");
     Ok(())
 }
@@ -666,18 +682,23 @@ async fn run_with_progress<F>(
 where
     F: Fn(WizardProgress) + Send + Sync,
 {
-    run_with_progress_inner(cmd, step, emit, Completion::OnExit).await
+    run_with_progress_inner(cmd, step, emit, Completion::OnExit, None).await
 }
 
 /// Run a gbrain CLI subprocess that may not `process.exit()` on success.
-/// Stops once `marker` is seen (or output goes idle) and reclaims the
-/// lingering bun process instead of waiting forever for EOF. See
-/// [`Completion::WhenDone`].
+/// Stops once `marker` is seen, the optional out-of-band `done_check`
+/// predicate flips true, or output goes idle — then reclaims the lingering
+/// bun process instead of waiting forever for EOF. See [`Completion::WhenDone`].
+///
+/// `done_check` is polled ~1×/sec; it lets a caller key completion off a
+/// filesystem artifact (e.g. gbrain's `config.json` appearing) rather than the
+/// process's stdout, which a non-exiting bun can leave buffered and unflushed.
 async fn run_gbrain_cli<F>(
     cmd: Command,
     step: WizardStep,
     emit: &F,
     marker: Option<&str>,
+    done_check: Option<&(dyn Fn() -> bool + Send + Sync)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     F: Fn(WizardProgress) + Send + Sync,
@@ -691,6 +712,7 @@ where
             grace: std::time::Duration::from_secs(5),
             idle: std::time::Duration::from_secs(20),
         },
+        done_check,
     )
     .await
 }
@@ -700,6 +722,7 @@ async fn run_with_progress_inner<F>(
     step: WizardStep,
     emit: &F,
     completion: Completion<'_>,
+    done_check: Option<&(dyn Fn() -> bool + Send + Sync)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     F: Fn(WizardProgress) + Send + Sync,
@@ -738,6 +761,10 @@ where
     // that later output can't push back, plus a HARD CAP so the wizard can never
     // block indefinitely whatever the cause.
     const HARD_CAP: std::time::Duration = std::time::Duration::from_secs(90);
+    // How often the out-of-band `done_check` predicate is polled (only when one
+    // was provided, for `WhenDone`). It's a cheap filesystem stat, so 1s is
+    // plenty fine-grained.
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
     let start = tokio::time::Instant::now();
     let (grace, idle, hard_deadline) = match &completion {
         Completion::OnExit => (None, None, None),
@@ -751,25 +778,66 @@ where
     // Reset on every output line: a quiet (no-marker) command stops promptly
     // once it actually goes silent.
     let mut idle_deadline: Option<tokio::time::Instant> = None;
+    // Absolute, armed once the `done_check` artifact predicate first fires.
+    // This is the out-of-band completion signal (e.g. gbrain's config.json
+    // appearing) that does not depend on the process's stdout, which a
+    // non-exiting bun can leave buffered/unflushed. Same grace as the marker.
+    let mut done_deadline: Option<tokio::time::Instant> = None;
+    let mut artifact_seen = false;
+    // Next instant to poll `done_check`; `None` disables polling entirely
+    // (no predicate, or an `OnExit` command).
+    let mut next_poll: Option<tokio::time::Instant> = match (&completion, done_check) {
+        (Completion::WhenDone { .. }, Some(_)) => Some(start + POLL_INTERVAL),
+        _ => None,
+    };
 
     while !stdout_done || !stderr_done {
-        let wake = [marker_deadline, idle_deadline, hard_deadline]
-            .into_iter()
-            .flatten()
-            .min();
+        let wake = [
+            marker_deadline,
+            idle_deadline,
+            hard_deadline,
+            done_deadline,
+            next_poll,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
 
         tokio::select! {
             biased;
             // Timer first (and biased) so a due deadline always wins over a
-            // chatty process whose read branches stay ready.
+            // chatty process whose read branches stay ready. This branch also
+            // services `done_check` poll ticks, which are NOT stop signals on
+            // their own — only the reclaim deadlines below end the loop.
             _ = async {
                 match wake {
                     Some(d) => tokio::time::sleep_until(d).await,
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                early_stop = true;
-                break;
+                let now = tokio::time::Instant::now();
+                // Poll the out-of-band predicate when a poll tick is due. On the
+                // first true result, arm `done_deadline` (a short grace lets any
+                // final work/flush land), then keep polling no further.
+                if let (Some(np), Some(dc)) = (next_poll, done_check) {
+                    if now >= np {
+                        if done_deadline.is_none() && dc() {
+                            artifact_seen = true;
+                            done_deadline = grace.map(|g| now + g);
+                        }
+                        next_poll = Some(now + POLL_INTERVAL);
+                    }
+                }
+                // Stop only if a real reclaim deadline is actually due; a bare
+                // poll tick falls through and the loop keeps reading.
+                let due = [marker_deadline, idle_deadline, hard_deadline, done_deadline]
+                    .into_iter()
+                    .flatten()
+                    .any(|d| now >= d);
+                if due {
+                    early_stop = true;
+                    break;
+                }
             }
             n = stdout_reader.read_until(b'\n', &mut stdout_buf), if !stdout_done => {
                 match n {
@@ -831,6 +899,8 @@ where
     if early_stop {
         let reason = if marker_seen {
             "completion marker"
+        } else if artifact_seen {
+            "completion artifact"
         } else {
             "no further output / time cap"
         };
@@ -841,7 +911,12 @@ where
             log: format!("gbrain step finished ({reason}); reclaiming lingering process"),
         });
         let _ = child.start_kill();
-        let _ = child.wait().await;
+        // Bound the reap: on Windows a killed bun whose `child.unref()`'d
+        // grandchild still holds the stdout/stderr pipe write handles can make
+        // `wait()` block forever. The child is already killed and success is
+        // validated out-of-band (`brain.pglite` exists), so never let the reap
+        // hang the wizard — drop the Child after the bound (kill_on_drop reaps).
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(8), child.wait()).await;
         return Ok(());
     }
 
@@ -850,6 +925,32 @@ where
         return Err(format!("process exited with status {status:?}").into());
     }
     Ok(())
+}
+
+/// Run a command to completion capturing its output, but NEVER block longer
+/// than `timeout`. Returns `None` on spawn/IO error or when the bound elapses
+/// (the child is killed via `kill_on_drop`).
+///
+/// Used for gbrain CLI subcommands the wizard captures with `.output()` (e.g.
+/// `gbrain config get/set` in [`ensure_repo_path`]). Those normally exit, but a
+/// non-exiting bun — or, on Windows, a killed bun whose `child.unref()`'d
+/// grandchild still holds the stdout/stderr pipe write handles — can make a
+/// plain `.output().await` block indefinitely and hang the whole install step.
+async fn output_bounded(
+    mut cmd: Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = cmd.spawn().ok()?;
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(out)) => Some(out),
+        // Spawn/IO error, or the bound elapsed: on timeout the future is
+        // dropped, which drops the child and (kill_on_drop) kills it.
+        Ok(Err(_)) | Err(_) => None,
+    }
 }
 
 /// Install bun via the official installer:
@@ -1103,6 +1204,14 @@ where
         .arg(cli_path)
         .arg("init")
         .arg("--pglite")
+        // `--json` makes init emit a single machine-readable
+        // `{"status":"success",...}` line and SKIP the human-prose
+        // "Brain ready at" + skillpack advisory + onboard nudge entirely
+        // (init.ts gates those on the non-json branch). That gives a stable
+        // completion marker that survives gbrain wording changes, and removes
+        // the trailing advisory chatter that previously left the wizard
+        // looking stuck on the "gbrain skillpack list" line.
+        .arg("--json")
         .arg("--embedding-dimensions")
         .arg("512")
         .arg("--embedding-model")
@@ -1122,13 +1231,41 @@ where
         prepend_to_path(&mut cmd, &shim_dir);
     }
 
-    // `gbrain init` does its work, prints "Brain ready at …" + the skillpack
-    // advisory, then never `process.exit()`s on success (a lingering
-    // gateway/embedding handle keeps bun alive). Stop on that marker instead of
-    // waiting forever for the process to exit; `brain.pglite` below validates.
-    run_gbrain_cli(cmd, WizardStep::InitBrain, emit, Some("Brain ready at"))
-        .await
-        .map_err(|e| format!("gbrain init failed: {e}"))?;
+    // `gbrain init` does its work, prints the `--json` success line, then never
+    // `process.exit()`s on success (a lingering gateway/embedding handle keeps
+    // bun alive). Two independent stop signals, because a non-exiting bun can
+    // leave its stdout buffered so the success line never reaches us:
+    //   1. marker: the `"status":"success"` substring of the `--json` payload;
+    //   2. done_check: gbrain's `config.json` APPEARING during this run.
+    //      `saveConfig` writes it AFTER `initSchema` (init.ts), so on a fresh
+    //      install its appearance means the brain is fully built — independent
+    //      of stdout. Gated on it not existing at start so a re-init (where
+    //      config.json is already present) doesn't reclaim before its own
+    //      initSchema finishes; the marker/idle path covers that case.
+    // `brain.pglite` below is the final out-of-band validation either way.
+    let config_path = brain_dir.join("config.json");
+    let config_existed = config_path.exists();
+    let done_check = move || !config_existed && config_path.exists();
+    let done_check: &(dyn Fn() -> bool + Send + Sync) = &done_check;
+    run_gbrain_cli(
+        cmd,
+        WizardStep::InitBrain,
+        emit,
+        Some("\"status\":\"success\""),
+        Some(done_check),
+    )
+    .await
+    .map_err(|e| format!("gbrain init failed: {e}"))?;
+
+    // Breadcrumb: the gbrain-init subprocess has been reclaimed and returned.
+    // If the wizard ever stalls AFTER the `--json` success line, the last
+    // breadcrumb shown pinpoints which post-init step hung.
+    emit(WizardProgress {
+        step: WizardStep::InitBrain,
+        status: WizardStatus::Running,
+        progress_pct: 90,
+        log: "init step: gbrain init returned; checking brain.pglite".into(),
+    });
 
     let pglite = brain_dir.join("brain.pglite");
     if !pglite.exists() {
@@ -1146,7 +1283,19 @@ where
     // `*` .gitignore (hides even `atlas/`) and zero commits. sync_brain needs
     // a content whitelist + a HEAD to diff against, or it fails with
     // "No commits in repo" / silently imports nothing. Make it sync-ready.
+    emit(WizardProgress {
+        step: WizardStep::InitBrain,
+        status: WizardStatus::Running,
+        progress_pct: 92,
+        log: "init step: brain.pglite present; making repo sync-ready".into(),
+    });
     make_brain_repo_sync_ready(bun_path, cli_path, brain_dir, emit).await;
+    emit(WizardProgress {
+        step: WizardStep::InitBrain,
+        status: WizardStatus::Running,
+        progress_pct: 98,
+        log: "init step: repo sync-ready done".into(),
+    });
 
     emit(WizardProgress {
         step: WizardStep::InitBrain,
@@ -1205,13 +1354,22 @@ fn prepend_to_path(cmd: &mut Command, dir: &Path) {
     }
 }
 
-/// Run a `git` subcommand in `dir`, capturing output.
-async fn git_in(dir: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .await
+/// Run a `git` subcommand in `dir`, capturing output — BOUNDED so it can never
+/// hang the install. On Windows `git` may spawn a background `fsmonitor` /
+/// credential helper that inherits the stdout/stderr pipes, so a plain
+/// `.output().await` never sees EOF and blocks forever (observed hanging
+/// `kb.wizard.init_brain` on Win10, right after `gbrain init`, inside
+/// [`make_brain_repo_sync_ready`]). We suppress interactive prompts, disable
+/// the fsmonitor daemon, and cap the wait via [`output_bounded`]. Returns
+/// `None` on spawn error or timeout (the caller treats git as best-effort).
+async fn git_in(dir: &Path, args: &[&str]) -> Option<std::process::Output> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .args(args);
+    output_bounded(cmd, std::time::Duration::from_secs(20)).await
 }
 
 /// Leave a freshly `gbrain init`-ed repo in a state `sync_brain` can run
@@ -1272,14 +1430,12 @@ where
         )
         .await
         {
-            Ok(o) if o.status.success() => log("brain git repo committed (sync-ready)".into()),
-            Ok(o) => log(format!(
+            Some(o) if o.status.success() => log("brain git repo committed (sync-ready)".into()),
+            Some(o) => log(format!(
                 "warn: brain baseline commit skipped: {}",
                 String::from_utf8_lossy(&o.stderr).trim()
             )),
-            Err(e) => log(format!(
-                "warn: brain baseline commit failed (git missing?): {e}"
-            )),
+            None => log("warn: brain baseline commit failed (git missing or timed out)".into()),
         }
     }
 
@@ -1373,7 +1529,7 @@ where
 
     // Same non-exiting-on-success behavior as `gbrain init`; rely on the idle
     // fallback in `run_gbrain_cli` so a lingering process can't hang the wizard.
-    run_gbrain_cli(cmd, WizardStep::InitBrain, emit, None)
+    run_gbrain_cli(cmd, WizardStep::InitBrain, emit, None, None)
         .await
         .map_err(|e| format!("gbrain apply-migrations failed: {e}"))?;
     Ok(())
@@ -1402,21 +1558,33 @@ where
     let cli = cli_path.to_string_lossy();
     let dir = brain_dir.to_string_lossy();
 
+    // gbrain `config` opens the PGLite engine (single-writer lock) and, like
+    // every non-`serve` command, is supposed to `flushThenExit`. But a hung
+    // bun (or a Windows grandchild holding the pipe) can make a plain
+    // `.output().await` block indefinitely — observed as the install step
+    // hanging right after `gbrain init` until the 10-minute client timeout.
+    // Bound each call so write-through setup is best-effort, never blocking.
+    const CONFIG_BOUND: std::time::Duration = std::time::Duration::from_secs(45);
+
     // GET: prints the value on stdout (exit 0) or exits 1 + stderr when unset.
-    let get_args = gbrain_config_args(&cli, "get", "sync.repo_path", None);
-    let get_out = Command::new(bun_path)
-        .args(&get_args)
+    log("config get sync.repo_path…".into());
+    let mut get_cmd = Command::new(bun_path);
+    get_cmd
+        .args(gbrain_config_args(&cli, "get", "sync.repo_path", None))
         .current_dir(brain_dir)
-        .env("GBRAIN_BRAIN_DIR", brain_dir)
-        .output()
-        .await;
+        .env("GBRAIN_BRAIN_DIR", brain_dir);
+    let get_out = output_bounded(get_cmd, CONFIG_BOUND).await;
     let already_set = match &get_out {
-        Ok(o) if o.status.success() => {
+        Some(o) if o.status.success() => {
             let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
             !v.is_empty()
         }
-        _ => false, // exit 1 (not found) / spawn error -> treat as unset
+        // exit 1 (not found) / spawn error / timed-out -> treat as unset
+        _ => false,
     };
+    if get_out.is_none() {
+        log("warn: config get sync.repo_path timed out; treating as unset".into());
+    }
     if already_set {
         log("sync.repo_path already configured; write-through active".into());
         return;
@@ -1424,24 +1592,26 @@ where
 
     // SET sync.repo_path = <brain_dir>. sync.repo_path is a KNOWN_CONFIG_KEY,
     // so no --force needed.
-    let set_args = gbrain_config_args(&cli, "set", "sync.repo_path", Some(&dir));
-    match Command::new(bun_path)
-        .args(&set_args)
+    log("config set sync.repo_path…".into());
+    let mut set_cmd = Command::new(bun_path);
+    set_cmd
+        .args(gbrain_config_args(
+            &cli,
+            "set",
+            "sync.repo_path",
+            Some(&dir),
+        ))
         .current_dir(brain_dir)
-        .env("GBRAIN_BRAIN_DIR", brain_dir)
-        .output()
-        .await
-    {
-        Ok(o) if o.status.success() => log(format!(
+        .env("GBRAIN_BRAIN_DIR", brain_dir);
+    match output_bounded(set_cmd, CONFIG_BOUND).await {
+        Some(o) if o.status.success() => log(format!(
             "set sync.repo_path = {dir} (write-through enabled)"
         )),
-        Ok(o) => log(format!(
+        Some(o) => log(format!(
             "warn: could not set sync.repo_path: {}",
             String::from_utf8_lossy(&o.stderr).trim()
         )),
-        Err(e) => log(format!(
-            "warn: gbrain config set failed (bun missing?): {e}"
-        )),
+        None => log("warn: config set sync.repo_path timed out (bounded)".into()),
     }
 }
 
@@ -2463,7 +2633,10 @@ mod tests {
 
         let cmd = if cfg!(windows) {
             let mut c = Command::new("cmd");
-            c.args(["/C", "echo Brain ready at C:\\x & ping -n 30 127.0.0.1 > NUL"]);
+            c.args([
+                "/C",
+                "echo Brain ready at C:\\x & ping -n 30 127.0.0.1 > NUL",
+            ]);
             c
         } else {
             let mut c = Command::new("sh");
@@ -2472,8 +2645,14 @@ mod tests {
         };
 
         let start = std::time::Instant::now();
-        let result =
-            run_gbrain_cli(cmd, WizardStep::InitBrain, &emit, Some("Brain ready at")).await;
+        let result = run_gbrain_cli(
+            cmd,
+            WizardStep::InitBrain,
+            &emit,
+            Some("Brain ready at"),
+            None,
+        )
+        .await;
         let elapsed = start.elapsed();
 
         assert!(result.is_ok(), "marker-stop must return Ok; got {result:?}");
@@ -2520,7 +2699,13 @@ mod tests {
         // Wrap so a regression hangs THIS future, not the whole test runner.
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(25),
-            run_gbrain_cli(cmd, WizardStep::InitBrain, &emit, Some("Brain ready at")),
+            run_gbrain_cli(
+                cmd,
+                WizardStep::InitBrain,
+                &emit,
+                Some("Brain ready at"),
+                None,
+            ),
         )
         .await;
         let elapsed = start.elapsed();
@@ -2539,6 +2724,124 @@ mod tests {
             frames.len() > 1,
             "expected output to continue past the marker; got {} frame(s)",
             frames.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_gbrain_cli_reclaims_via_done_check_when_artifact_appears() {
+        // gbrain init's stdout marker (`"status":"success"` under --json) can
+        // fail to flush on a non-exiting bun process, so the wizard also polls
+        // an out-of-band predicate (e.g. "config.json appeared during this
+        // run"). A still-running process with continuous output and NO marker
+        // must be reclaimed once that predicate flips true.
+        //
+        // The process is bounded (~12s) so a regression (poll never fires)
+        // doesn't hang to the 90s hard cap: it exits on its own, returns via
+        // the normal EOF path, and emits NO "completion artifact" frame — which
+        // the reason assertion below catches independently of timing.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let frames: Arc<StdMutex<Vec<WizardProgress>>> = Arc::new(StdMutex::new(Vec::new()));
+        let frames_clone = frames.clone();
+        let emit = move |p: WizardProgress| {
+            frames_clone.lock().unwrap().push(p);
+        };
+
+        // Predicate flips true ~2s in, simulating gbrain's saveConfig writing
+        // config.json mid-run.
+        let done = Arc::new(AtomicBool::new(false));
+        let done_setter = done.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            done_setter.store(true, Ordering::SeqCst);
+        });
+        let done_check = move || done.load(Ordering::SeqCst);
+        let done_check: &(dyn Fn() -> bool + Send + Sync) = &done_check;
+
+        // Continuous output (~1 line/sec, resets the idle timer), NO marker, and
+        // bounded to ~12s so a broken poll exits rather than hard-capping.
+        let cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "ping -n 12 127.0.0.1"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args([
+                "-c",
+                "i=0; while [ $i -lt 12 ]; do echo tick; sleep 1; i=$((i+1)); done",
+            ]);
+            c
+        };
+
+        let start = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_gbrain_cli(cmd, WizardStep::InitBrain, &emit, None, Some(done_check)),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(outcome.is_ok(), "must not hang past 30s");
+        assert!(outcome.unwrap().is_ok(), "artifact reclaim must return Ok");
+        assert!(
+            elapsed < std::time::Duration::from_secs(11),
+            "must reclaim shortly after the artifact (~2s + ~5s grace), not wait \
+             out the ~12s process; took {elapsed:?}"
+        );
+        let frames = frames.lock().unwrap();
+        assert!(
+            frames.iter().any(|f| f.log.contains("completion artifact")),
+            "reclaim must be attributed to the done_check artifact, not the \
+             marker/idle/cap path; frames: {:?}",
+            *frames
+        );
+    }
+
+    #[tokio::test]
+    async fn output_bounded_kills_slow_process_at_timeout() {
+        // The Win10 `gbrain config get/set` hang shape: a subprocess that
+        // doesn't return in time must be abandoned at the bound and yield
+        // `None`, never block the caller for the process's full lifetime.
+        let cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "ping -n 12 127.0.0.1"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "sleep 12"]);
+            c
+        };
+
+        let start = std::time::Instant::now();
+        let out = output_bounded(cmd, std::time::Duration::from_secs(2)).await;
+        let elapsed = start.elapsed();
+
+        assert!(out.is_none(), "a process past the bound must return None");
+        assert!(
+            elapsed < std::time::Duration::from_secs(7),
+            "must return at the ~2s bound, not wait out the ~12s process; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_bounded_returns_output_for_fast_command() {
+        let cmd = if cfg!(windows) {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "echo hello"]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "echo hello"]);
+            c
+        };
+
+        let out = output_bounded(cmd, std::time::Duration::from_secs(10))
+            .await
+            .expect("a fast command must return Some(output)");
+        assert!(out.status.success(), "echo should exit 0");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("hello"),
+            "captured stdout should contain 'hello'"
         );
     }
 
