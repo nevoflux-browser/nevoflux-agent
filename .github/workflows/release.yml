@@ -11,6 +11,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   BINARY_NAME: nevoflux-agent
+  # ONNX Runtime bundled alongside the (load-dynamic) binary. Keep in lockstep
+  # with EXPECTED_ORT_VERSION in crates/llm/src/embedding.rs and `ort_version`
+  # in the justfile (fastembed 5 -> ort rc.12 -> ONNX Runtime 1.24.x).
+  ORT_VERSION: "1.24.2"
 
 jobs:
   # Download embedding model once, share across all platform builds
@@ -87,17 +91,25 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            # Build on the oldest supported LTS so the binary's glibc floor stays
+            # low (2.35). load-dynamic decouples ONNX Runtime's glibc, but the
+            # Rust binary still links the build host's glibc; ubuntu-latest
+            # (24.04, glibc 2.39) would not run on Ubuntu 22.04.
+            os: ubuntu-22.04
             artifact: nevoflux-agent-linux-x86_64
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: nevoflux-agent-linux-aarch64
             use_cross: true
-            # ort (ONNX Runtime) C++ linking fails in cross Docker container
-            no_embedding: true
+            # Embedding works here now: load-dynamic links no ONNX Runtime at
+            # build time, so the old "ort C++ linking fails in cross Docker"
+            # blocker is gone; the aarch64 runtime is bundled at package time.
           - target: x86_64-apple-darwin
             os: macos-latest
             artifact: nevoflux-agent-macos-x86_64
+            # ONNX Runtime 1.24.x ships no Intel-macOS (osx-x86_64) build, so no
+            # version-matched runtime to bundle. Embedding off for Intel Macs.
+            no_embedding: true
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: nevoflux-agent-macos-aarch64
@@ -151,16 +163,17 @@ jobs:
           curl -fsSL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-gnu.tar.gz \
             | sudo tar xz -C /usr/local/bin
 
-      # Build with bounded retries. The `ort`/`ort-sys` crate (pulled in by the
-      # `embedding` feature) downloads a prebuilt ONNX Runtime binary from a
-      # third-party CDN (parcel.pyke.io) inside its build script; that download
-      # occasionally times out and has failed a whole release (v0.3.5). A
-      # transient flake clears on retry, and cargo/cross resume incrementally,
-      # so a retry only re-attempts the failed download — not the whole build.
+      # Build with bounded retries. The embedding build now uses `ort`'s
+      # load-dynamic strategy (the default), so the build script no longer
+      # downloads a prebuilt ONNX Runtime from a third-party CDN — that flaky
+      # download (which once failed a whole release, v0.3.5) is gone, and the
+      # matching runtime is bundled at package time instead (see below). The
+      # retry wrapper is kept as cheap insurance against other transient flakes;
+      # cargo/cross resume incrementally so a retry only redoes failed work.
       #
       # Flags are derived from the matrix so a single retry wrapper covers all
       # variants:
-      #   - matrix.no_embedding -> --no-default-features (skips ort entirely)
+      #   - matrix.no_embedding -> --no-default-features (skips embedding/ort)
       #   - matrix.use_cross    -> `cross` instead of `cargo`
       # `shell: bash` makes the same loop run on the Windows runners too.
       - name: Build
@@ -190,14 +203,56 @@ jobs:
           name: embedding-model
           path: staging/models
 
-      # Package: binary + embedding model
+      # Bundle the matching ONNX Runtime next to the binary (load-dynamic
+      # resolves <exe_dir>/lib/<libonnxruntime>). Official manylinux/macOS builds
+      # need only glibc >= 2.27, so one binary + this lib runs on both old-glibc
+      # (Ubuntu 22.04) and new (Arch) hosts. Skipped for `no_embedding` targets.
+      # The release .dll/.dylib/.so excludes debug symbols (.pdb/.dSYM).
+      - name: Bundle ONNX Runtime (Unix)
+        if: runner.os != 'Windows' && matrix.no_embedding != true
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${ORT_VERSION}"
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)  pkg="onnxruntime-linux-x64-$v";     src="lib/libonnxruntime.so.$v";   dst="libonnxruntime.so" ;;
+            aarch64-unknown-linux-gnu) pkg="onnxruntime-linux-aarch64-$v"; src="lib/libonnxruntime.so.$v";   dst="libonnxruntime.so" ;;
+            aarch64-apple-darwin)      pkg="onnxruntime-osx-arm64-$v";     src="lib/libonnxruntime.$v.dylib"; dst="libonnxruntime.dylib" ;;
+            *) echo "no ONNX Runtime bundle for ${{ matrix.target }}"; exit 0 ;;
+          esac
+          url="https://github.com/microsoft/onnxruntime/releases/download/v$v/$pkg.tgz"
+          for attempt in 1 2 3; do
+            curl -fsSL "$url" -o ort.tgz && break
+            echo "::warning::ONNX Runtime download attempt $attempt/3 failed; retrying in 15s…"; sleep 15
+          done
+          tar xzf ort.tgz
+          mkdir -p staging/lib
+          cp "$pkg/$src" "staging/lib/$dst"
+          ls -la staging/lib/
+
+      - name: Bundle ONNX Runtime (Windows)
+        if: runner.os == 'Windows' && matrix.no_embedding != true
+        shell: pwsh
+        run: |
+          $v = $env:ORT_VERSION
+          $pkg = "onnxruntime-win-x64-$v"
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v$v/$pkg.zip"
+          Invoke-WebRequest -Uri $url -OutFile ort.zip
+          Expand-Archive -Path ort.zip -DestinationPath ort_extract -Force
+          New-Item -ItemType Directory -Force -Path staging/lib | Out-Null
+          Copy-Item "ort_extract/$pkg/lib/onnxruntime.dll" "staging/lib/onnxruntime.dll"
+          Get-ChildItem staging/lib
+
+      # Package: binary + embedding model + (load-dynamic) ONNX Runtime lib
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
           mkdir -p staging
           cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} staging/
           cd staging
-          tar czf ../${{ matrix.artifact }}.tar.gz ${{ env.BINARY_NAME }} models/
+          extra=""
+          [ -d lib ] && extra="lib"
+          tar czf ../${{ matrix.artifact }}.tar.gz ${{ env.BINARY_NAME }} models/ $extra
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -205,7 +260,9 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path staging
           Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" staging/
-          Compress-Archive -Path "staging/${{ env.BINARY_NAME }}.exe", "staging/models" -DestinationPath "${{ matrix.artifact }}.zip"
+          $paths = @("staging/${{ env.BINARY_NAME }}.exe", "staging/models")
+          if (Test-Path "staging/lib") { $paths += "staging/lib" }
+          Compress-Archive -Path $paths -DestinationPath "${{ matrix.artifact }}.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
