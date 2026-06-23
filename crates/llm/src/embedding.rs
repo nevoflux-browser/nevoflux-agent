@@ -27,6 +27,19 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+// The `embedding` feature pulls in `fastembed`/`ort`, which needs exactly one
+// ONNX Runtime linking strategy. `ort-download-binaries` (default) links a
+// prebuilt runtime statically; `ort-load-dynamic` loads it at runtime. Building
+// `embedding` with neither leaves `ort` unable to find a runtime, so fail loudly.
+#[cfg(all(
+    feature = "embedding",
+    not(any(feature = "ort-download-binaries", feature = "ort-load-dynamic"))
+))]
+compile_error!(
+    "the `embedding` feature requires an ONNX Runtime linking strategy: enable \
+     `ort-download-binaries` (the default) or `ort-load-dynamic`"
+);
+
 /// Errors that can occur during embedding operations.
 #[derive(Error, Debug)]
 pub enum EmbeddingError {
@@ -277,6 +290,169 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
     Ok(())
 }
 
+/// Shared-library file name for the bundled ONNX Runtime, per platform.
+///
+/// Used by `load-dynamic` builds to locate the runtime next to the
+/// executable. The official ONNX Runtime release tarballs ship the library
+/// under these exact names.
+#[cfg(all(feature = "embedding", any(feature = "ort-load-dynamic", test)))]
+fn onnxruntime_lib_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        "onnxruntime.dll"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "libonnxruntime.dylib"
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        "libonnxruntime.so"
+    }
+}
+
+/// Candidate paths to search for a bundled ONNX Runtime library, relative to
+/// a base directory (typically the executable's directory), in priority order:
+/// `<base>/lib/<name>` (official tarball layout) then `<base>/<name>` (flat).
+#[cfg(all(feature = "embedding", any(feature = "ort-load-dynamic", test)))]
+fn ort_dylib_candidates(base: &std::path::Path) -> Vec<PathBuf> {
+    let name = onnxruntime_lib_name();
+    vec![base.join("lib").join(name), base.join(name)]
+}
+
+/// Best-effort extraction of an ONNX Runtime version (e.g. `1.24.2`) from a
+/// library file name. Handles the Linux (`libonnxruntime.so.1.24.2`) and macOS
+/// (`libonnxruntime.1.24.2.dylib`) naming conventions. Returns `None` when the
+/// name carries no version (e.g. a bare `libonnxruntime.so` or `onnxruntime.dll`),
+/// in which case the caller cannot validate and should skip the check.
+#[cfg(all(feature = "embedding", any(feature = "ort-load-dynamic", test)))]
+fn parse_ort_version_from_path(path: &std::path::Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    // Find the first maximal run of [0-9.] that, once trimmed of dots, looks
+    // like a dotted version (starts with a digit and contains a dot).
+    for run in name.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
+        let trimmed = run.trim_matches('.');
+        if trimmed.contains('.') && trimmed.starts_with(|c: char| c.is_ascii_digit()) {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+/// Whether a discovered ONNX Runtime version is API-compatible with the one
+/// this build's `ort` crate was compiled against. ONNX Runtime's C API version
+/// tracks the minor release, so major+minor must match; the patch may differ.
+///
+/// A mismatch is fatal under `load-dynamic`: `ort` rc's error path for a
+/// too-old runtime re-enters its own API `OnceLock` and deadlocks silently, so
+/// we must reject before initialization rather than let it hang.
+#[cfg(all(feature = "embedding", any(feature = "ort-load-dynamic", test)))]
+fn ort_version_compatible(found: &str, expected: &str) -> bool {
+    let major_minor = |v: &str| -> Option<(u32, u32)> {
+        let mut it = v.split('.');
+        let major = it.next()?.parse().ok()?;
+        let minor = it.next()?.parse().ok()?;
+        Some((major, minor))
+    };
+    match (major_minor(found), major_minor(expected)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// First existing ONNX Runtime library among the candidates under `base`.
+#[cfg(all(feature = "embedding", any(feature = "ort-load-dynamic", test)))]
+fn find_bundled_ort_dylib_in(base: &std::path::Path) -> Option<PathBuf> {
+    ort_dylib_candidates(base).into_iter().find(|p| p.exists())
+}
+
+/// ONNX Runtime version the `ort` crate in this build links against, used to
+/// validate a dynamically-loaded library before initialization.
+///
+/// MUST be kept in lockstep with the `fastembed`/`ort` versions in Cargo.toml:
+/// fastembed 4.x → ort 2.0.0-rc.9 → ONNX Runtime 1.20.x. A mismatched runtime
+/// makes `ort` deadlock silently (see [`ort_version_compatible`]).
+#[cfg(all(feature = "embedding", any(feature = "ort-load-dynamic", test)))]
+const EXPECTED_ORT_VERSION: &str = "1.20.0";
+
+/// Decide which ONNX Runtime dynamic library to load (pure; side-effect free).
+///
+/// A caller-supplied `ORT_DYLIB_PATH` always wins so operators can override the
+/// bundled library; otherwise fall back to a library bundled next to the
+/// executable (`exe_dir`). Returns `None` to let `ort` use its own default
+/// search (system paths).
+#[cfg(all(feature = "embedding", any(feature = "ort-load-dynamic", test)))]
+fn resolve_ort_dylib_path(
+    env_override: Option<PathBuf>,
+    exe_dir: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    if let Some(p) = env_override {
+        return Some(p);
+    }
+    exe_dir.and_then(find_bundled_ort_dylib_in)
+}
+
+/// Validate a resolved ONNX Runtime library against [`EXPECTED_ORT_VERSION`]
+/// before `ort` touches it. Returns `Err` only when the version is *known* to
+/// be incompatible (would deadlock); an unversioned name can't be validated and
+/// is allowed through (with the caller logging a warning).
+#[cfg(all(feature = "embedding", any(feature = "ort-load-dynamic", test)))]
+fn check_ort_dylib_version(path: &std::path::Path, expected: &str) -> Result<(), String> {
+    match parse_ort_version_from_path(path) {
+        Some(found) if !ort_version_compatible(&found, expected) => Err(format!(
+            "ONNX Runtime version mismatch: dynamic library at {} reports {found}, \
+             but this build of `ort` requires {expected} (major.minor must match). \
+             Loading a mismatched runtime makes `ort` deadlock on startup; refusing \
+             to continue. Bundle the matching ONNX Runtime or set ORT_DYLIB_PATH.",
+            path.display()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Locate, validate, and select the ONNX Runtime dynamic library for
+/// `load-dynamic` builds, then point `ort` at it via `ORT_DYLIB_PATH`.
+///
+/// A caller-supplied `ORT_DYLIB_PATH` is respected; otherwise a library
+/// bundled next to the executable is used. The resolved library is validated
+/// against [`EXPECTED_ORT_VERSION`] *before* `ort` touches it, because a
+/// version-mismatched runtime makes `ort` deadlock silently on init rather
+/// than returning a clean error.
+#[cfg(all(feature = "embedding", feature = "ort-load-dynamic"))]
+fn prepare_ort_dylib() -> Result<(), EmbeddingError> {
+    let env_override = std::env::var_os("ORT_DYLIB_PATH").map(PathBuf::from);
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+
+    match resolve_ort_dylib_path(env_override, exe_dir.as_deref()) {
+        Some(path) => {
+            check_ort_dylib_version(&path, EXPECTED_ORT_VERSION)
+                .map_err(EmbeddingError::InitError)?;
+            if parse_ort_version_from_path(&path).is_none() {
+                tracing::warn!(
+                    path = %path.display(),
+                    "ONNX Runtime library name carries no version; cannot verify it \
+                     matches the required {EXPECTED_ORT_VERSION} — proceeding anyway"
+                );
+            }
+            std::env::set_var("ORT_DYLIB_PATH", &path);
+            tracing::info!(
+                path = %path.display(),
+                "Using ONNX Runtime dynamic library (load-dynamic)"
+            );
+            Ok(())
+        }
+        None => {
+            tracing::warn!(
+                "No bundled ONNX Runtime found and ORT_DYLIB_PATH is unset; relying on \
+                 ort's default library search. Set ORT_DYLIB_PATH if initialization fails."
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Embedding provider using the fastembed crate for local CPU-based inference.
 ///
 /// Wraps `fastembed::TextEmbedding` in an `Arc` so the provider can be
@@ -317,6 +493,11 @@ impl FastEmbedProvider {
 
         let dims = config.model.dimensions();
         let cache_dir = resolve_cache_dir();
+
+        // load-dynamic builds: point `ort` at a version-matched ONNX Runtime
+        // before fastembed initializes it (a mismatch would deadlock).
+        #[cfg(feature = "ort-load-dynamic")]
+        prepare_ort_dylib()?;
 
         tracing::info!(
             cache_dir = %cache_dir.display(),
@@ -763,5 +944,170 @@ mod tests {
             "\nall {} triples ranked correctly; avg margin = {:+.4}",
             wins, avg_margin
         );
+    }
+}
+
+#[cfg(all(test, feature = "embedding"))]
+mod ort_dylib_tests {
+    use super::*;
+
+    #[test]
+    fn lib_name_matches_platform() {
+        let name = onnxruntime_lib_name();
+        #[cfg(target_os = "linux")]
+        assert_eq!(name, "libonnxruntime.so");
+        #[cfg(target_os = "macos")]
+        assert_eq!(name, "libonnxruntime.dylib");
+        #[cfg(target_os = "windows")]
+        assert_eq!(name, "onnxruntime.dll");
+    }
+
+    #[test]
+    fn candidates_prefer_lib_subdir_then_flat() {
+        let base = PathBuf::from("/opt/nevoflux");
+        let name = onnxruntime_lib_name();
+        let got = ort_dylib_candidates(&base);
+        assert_eq!(
+            got,
+            vec![base.join("lib").join(name), base.join(name)],
+            "must search <base>/lib/<name> before <base>/<name>"
+        );
+    }
+
+    #[test]
+    fn parses_version_from_linux_soname() {
+        let p = PathBuf::from("/opt/nevoflux/lib/libonnxruntime.so.1.24.2");
+        assert_eq!(parse_ort_version_from_path(&p).as_deref(), Some("1.24.2"));
+    }
+
+    #[test]
+    fn parses_version_from_macos_dylib() {
+        let p = PathBuf::from("/opt/nevoflux/lib/libonnxruntime.1.24.2.dylib");
+        assert_eq!(parse_ort_version_from_path(&p).as_deref(), Some("1.24.2"));
+    }
+
+    #[test]
+    fn no_version_in_unversioned_names() {
+        assert_eq!(
+            parse_ort_version_from_path(&PathBuf::from("/x/libonnxruntime.so")),
+            None
+        );
+        assert_eq!(
+            parse_ort_version_from_path(&PathBuf::from("/x/onnxruntime.dll")),
+            None
+        );
+    }
+
+    #[test]
+    fn version_compat_matches_major_minor_ignoring_patch() {
+        assert!(ort_version_compatible("1.24.2", "1.24.2"));
+        assert!(ort_version_compatible("1.24.5", "1.24.2")); // patch differs → ok
+        assert!(ort_version_compatible("1.24", "1.24.2")); // missing patch → ok
+    }
+
+    #[test]
+    fn version_compat_rejects_minor_or_major_mismatch() {
+        assert!(!ort_version_compatible("1.22.1", "1.24.2")); // minor differs
+        assert!(!ort_version_compatible("2.24.2", "1.24.2")); // major differs
+        assert!(!ort_version_compatible("garbage", "1.24.2")); // unparseable
+    }
+
+    fn unique_tmp_dir(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("nevoflux_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    #[test]
+    fn finds_lib_in_lib_subdir_before_flat() {
+        let base = unique_tmp_dir("ort_find_libdir");
+        let libdir = base.join("lib");
+        std::fs::create_dir_all(&libdir).unwrap();
+        let name = onnxruntime_lib_name();
+        std::fs::write(base.join(name), b"x").unwrap(); // flat also present
+        std::fs::write(libdir.join(name), b"x").unwrap();
+        assert_eq!(find_bundled_ort_dylib_in(&base), Some(libdir.join(name)));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn finds_flat_lib_when_no_lib_subdir() {
+        let base = unique_tmp_dir("ort_find_flat");
+        std::fs::create_dir_all(&base).unwrap();
+        let name = onnxruntime_lib_name();
+        std::fs::write(base.join(name), b"x").unwrap();
+        assert_eq!(find_bundled_ort_dylib_in(&base), Some(base.join(name)));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn none_when_no_lib_present() {
+        let base = unique_tmp_dir("ort_find_none");
+        std::fs::create_dir_all(&base).unwrap();
+        assert_eq!(find_bundled_ort_dylib_in(&base), None);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn env_override_wins_over_bundled() {
+        let base = unique_tmp_dir("ort_resolve_envwin");
+        let libdir = base.join("lib");
+        std::fs::create_dir_all(&libdir).unwrap();
+        std::fs::write(libdir.join(onnxruntime_lib_name()), b"x").unwrap();
+        let override_path = PathBuf::from("/custom/libonnxruntime.so.1.20.0");
+        assert_eq!(
+            resolve_ort_dylib_path(Some(override_path.clone()), Some(&base)),
+            Some(override_path),
+            "ORT_DYLIB_PATH must take precedence over the bundled library"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn falls_back_to_bundled_when_no_env() {
+        let base = unique_tmp_dir("ort_resolve_bundled");
+        let libdir = base.join("lib");
+        std::fs::create_dir_all(&libdir).unwrap();
+        let bundled = libdir.join(onnxruntime_lib_name());
+        std::fs::write(&bundled, b"x").unwrap();
+        assert_eq!(resolve_ort_dylib_path(None, Some(&base)), Some(bundled));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn none_when_no_env_and_no_bundle() {
+        let base = unique_tmp_dir("ort_resolve_none");
+        std::fs::create_dir_all(&base).unwrap();
+        assert_eq!(resolve_ort_dylib_path(None, Some(&base)), None);
+        assert_eq!(resolve_ort_dylib_path(None, None), None);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn version_check_accepts_matching_runtime() {
+        let p = PathBuf::from("/x/lib/libonnxruntime.so.1.20.0");
+        assert!(check_ort_dylib_version(&p, "1.20.0").is_ok());
+    }
+
+    #[test]
+    fn version_check_rejects_mismatched_runtime_with_clear_error() {
+        let p = PathBuf::from("/x/lib/libonnxruntime.so.1.24.2");
+        let err = check_ort_dylib_version(&p, "1.20.0").unwrap_err();
+        assert!(
+            err.contains("1.24.2"),
+            "error must name the found version: {err}"
+        );
+        assert!(
+            err.contains("1.20.0"),
+            "error must name the expected version: {err}"
+        );
+    }
+
+    #[test]
+    fn version_check_allows_unversioned_name() {
+        // A bare name carries no version → cannot validate → must not block.
+        let p = PathBuf::from("/x/lib/libonnxruntime.so");
+        assert!(check_ort_dylib_version(&p, "1.20.0").is_ok());
     }
 }

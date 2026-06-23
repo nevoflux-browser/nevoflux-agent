@@ -96,8 +96,15 @@ wasmtime = "27"
 wasmtime-wasi = "27"
 
 [features]
-default = ["embedding"]
+default = ["embedding", "ort-download-binaries"]
 embedding = ["nevoflux-daemon/embedding"]
+# ONNX Runtime linking strategy, forwarded to nevoflux-daemon. Pick one:
+#   * ort-download-binaries (default): statically link a prebuilt ONNX Runtime.
+#   * ort-load-dynamic: load libonnxruntime at startup via ORT_DYLIB_PATH.
+# Dynamic build:
+#   cargo build --no-default-features --features "embedding,ort-load-dynamic"
+ort-download-binaries = ["nevoflux-daemon/ort-download-binaries"]
+ort-load-dynamic = ["nevoflux-daemon/ort-load-dynamic"]
 
 [[bin]]
 name = "nevoflux-agent"
