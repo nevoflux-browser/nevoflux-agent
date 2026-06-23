@@ -161,6 +161,58 @@ download-model:
     print(f'Model downloaded to {cache_dir}')
     "
 
+# ONNX Runtime version for load-dynamic builds. Keep in lockstep with
+# EXPECTED_ORT_VERSION in crates/llm/src/embedding.rs (fastembed 4 -> ORT 1.20.x).
+ort_version := "1.20.0"
+
+# Copy a local ONNX Runtime shared library into target/<profile>/lib so that
+# `--features ort-load-dynamic` builds load it without setting ORT_DYLIB_PATH
+# (the build resolves <exe_dir>/lib/<libonnxruntime> at startup).
+# Usage:
+#   just ort-dylib ~/onnxruntime/lib/libonnxruntime.so.1.20.0
+#   just ort-dylib ~/onnxruntime/lib/libonnxruntime.so.1.20.0 release
+ort-dylib SRC PROFILE="debug":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    src="{{SRC}}"
+    [ -f "$src" ] || { echo "error: not a file: $src" >&2; exit 1; }
+    case "$(uname -s)" in
+      Darwin)               name="libonnxruntime.dylib" ;;
+      MINGW*|MSYS*|CYGWIN*) name="onnxruntime.dll" ;;
+      *)                    name="libonnxruntime.so" ;;
+    esac
+    dst="target/{{PROFILE}}/lib"
+    mkdir -p "$dst"
+    cp -f "$src" "$dst/$name"
+    echo "linked $src -> $dst/$name"
+
+# Download the ONNX Runtime matching {{ort_version}} for this platform and copy
+# it into target/<profile>/lib (see `ort-dylib`). On networks with a broken
+# default route, pass a proxy, e.g. socks5h://127.0.0.1:1080.
+# Usage:
+#   just ort-fetch
+#   just ort-fetch release
+#   just ort-fetch debug socks5h://127.0.0.1:1080
+ort-fetch PROFILE="debug" PROXY="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    v="{{ort_version}}"
+    case "$(uname -s)-$(uname -m)" in
+      Linux-x86_64)  pkg="onnxruntime-linux-x64-$v";     lib="lib/libonnxruntime.so.$v" ;;
+      Linux-aarch64) pkg="onnxruntime-linux-aarch64-$v"; lib="lib/libonnxruntime.so.$v" ;;
+      Darwin-arm64)  pkg="onnxruntime-osx-arm64-$v";     lib="lib/libonnxruntime.$v.dylib" ;;
+      Darwin-x86_64) pkg="onnxruntime-osx-x86_64-$v";    lib="lib/libonnxruntime.$v.dylib" ;;
+      *) echo "error: unsupported platform; fetch manually and use 'just ort-dylib'" >&2; exit 1 ;;
+    esac
+    url="https://github.com/microsoft/onnxruntime/releases/download/v$v/$pkg.tgz"
+    proxy=(); [ -n "{{PROXY}}" ] && proxy=(--proxy "{{PROXY}}")
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    echo "downloading $url"
+    curl -fsSL "${proxy[@]}" "$url" -o "$tmp/ort.tgz"
+    tar xzf "$tmp/ort.tgz" -C "$tmp"
+    just ort-dylib "$tmp/$pkg/$lib" "{{PROFILE}}"
+
 # Build and install locally
 install:
     cargo install --path .
