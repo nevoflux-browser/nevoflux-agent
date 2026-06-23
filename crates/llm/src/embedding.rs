@@ -21,7 +21,7 @@
 #[cfg(feature = "embedding")]
 use std::path::PathBuf;
 #[cfg(feature = "embedding")]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -370,10 +370,10 @@ fn find_bundled_ort_dylib_in(base: &std::path::Path) -> Option<PathBuf> {
 /// validate a dynamically-loaded library before initialization.
 ///
 /// MUST be kept in lockstep with the `fastembed`/`ort` versions in Cargo.toml:
-/// fastembed 4.x → ort 2.0.0-rc.9 → ONNX Runtime 1.20.x. A mismatched runtime
+/// fastembed 5.x → ort 2.0.0-rc.12 → ONNX Runtime 1.24.x. A mismatched runtime
 /// makes `ort` deadlock silently (see [`ort_version_compatible`]).
 #[cfg(all(feature = "embedding", any(feature = "ort-load-dynamic", test)))]
-const EXPECTED_ORT_VERSION: &str = "1.20.0";
+const EXPECTED_ORT_VERSION: &str = "1.24.2";
 
 /// Decide which ONNX Runtime dynamic library to load (pure; side-effect free).
 ///
@@ -460,7 +460,10 @@ fn prepare_ort_dylib() -> Result<(), EmbeddingError> {
 /// to a blocking thread pool via `tokio::task::spawn_blocking`.
 #[cfg(feature = "embedding")]
 pub struct FastEmbedProvider {
-    model: Arc<fastembed::TextEmbedding>,
+    // fastembed 5's `TextEmbedding::embed` takes `&mut self` (Rayon was removed
+    // in v5.0.0), so the shared model is guarded by a Mutex. Embedding runs on a
+    // blocking thread and never holds the lock across an `.await`.
+    model: Arc<Mutex<fastembed::TextEmbedding>>,
     dims: usize,
 }
 
@@ -522,7 +525,7 @@ impl FastEmbedProvider {
         })?;
 
         Ok(Self {
-            model: Arc::new(text_embedding),
+            model: Arc::new(Mutex::new(text_embedding)),
             dims,
         })
     }
@@ -565,10 +568,16 @@ impl EmbeddingProvider for FastEmbedProvider {
         let prefix = kind_prefix(kind);
         let prefixed = format!("{prefix}{text}");
 
-        let result = tokio::task::spawn_blocking(move || model.embed(vec![prefixed], None))
-            .await
-            .map_err(|e| EmbeddingError::GenerationError(format!("Task join error: {}", e)))?
-            .map_err(|e| EmbeddingError::GenerationError(e.to_string()))?;
+        let result = tokio::task::spawn_blocking(move || {
+            let mut model = model.lock().map_err(|_| {
+                EmbeddingError::GenerationError("embedding model lock poisoned".to_string())
+            })?;
+            model
+                .embed(vec![prefixed], None)
+                .map_err(|e| EmbeddingError::GenerationError(e.to_string()))
+        })
+        .await
+        .map_err(|e| EmbeddingError::GenerationError(format!("Task join error: {}", e)))??;
 
         result
             .into_iter()
@@ -585,10 +594,16 @@ impl EmbeddingProvider for FastEmbedProvider {
         let prefix = kind_prefix(kind);
         let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
 
-        tokio::task::spawn_blocking(move || model.embed(prefixed, None))
-            .await
-            .map_err(|e| EmbeddingError::GenerationError(format!("Task join error: {}", e)))?
-            .map_err(|e| EmbeddingError::GenerationError(e.to_string()))
+        tokio::task::spawn_blocking(move || {
+            let mut model = model.lock().map_err(|_| {
+                EmbeddingError::GenerationError("embedding model lock poisoned".to_string())
+            })?;
+            model
+                .embed(prefixed, None)
+                .map_err(|e| EmbeddingError::GenerationError(e.to_string()))
+        })
+        .await
+        .map_err(|e| EmbeddingError::GenerationError(format!("Task join error: {}", e)))?
     }
 
     fn dimensions(&self) -> usize {
@@ -1086,20 +1101,20 @@ mod ort_dylib_tests {
 
     #[test]
     fn version_check_accepts_matching_runtime() {
-        let p = PathBuf::from("/x/lib/libonnxruntime.so.1.20.0");
-        assert!(check_ort_dylib_version(&p, "1.20.0").is_ok());
+        let p = PathBuf::from("/x/lib/libonnxruntime.so.1.24.2");
+        assert!(check_ort_dylib_version(&p, "1.24.2").is_ok());
     }
 
     #[test]
     fn version_check_rejects_mismatched_runtime_with_clear_error() {
-        let p = PathBuf::from("/x/lib/libonnxruntime.so.1.24.2");
-        let err = check_ort_dylib_version(&p, "1.20.0").unwrap_err();
+        let p = PathBuf::from("/x/lib/libonnxruntime.so.1.20.0");
+        let err = check_ort_dylib_version(&p, "1.24.2").unwrap_err();
         assert!(
-            err.contains("1.24.2"),
+            err.contains("1.20.0"),
             "error must name the found version: {err}"
         );
         assert!(
-            err.contains("1.20.0"),
+            err.contains("1.24.2"),
             "error must name the expected version: {err}"
         );
     }
@@ -1108,6 +1123,6 @@ mod ort_dylib_tests {
     fn version_check_allows_unversioned_name() {
         // A bare name carries no version → cannot validate → must not block.
         let p = PathBuf::from("/x/lib/libonnxruntime.so");
-        assert!(check_ort_dylib_version(&p, "1.20.0").is_ok());
+        assert!(check_ort_dylib_version(&p, "1.24.2").is_ok());
     }
 }

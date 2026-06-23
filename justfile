@@ -162,8 +162,8 @@ download-model:
     "
 
 # ONNX Runtime version for load-dynamic builds. Keep in lockstep with
-# EXPECTED_ORT_VERSION in crates/llm/src/embedding.rs (fastembed 4 -> ORT 1.20.x).
-ort_version := "1.20.0"
+# EXPECTED_ORT_VERSION in crates/llm/src/embedding.rs (fastembed 5 -> ORT 1.24.x).
+ort_version := "1.24.2"
 
 # Copy a local ONNX Runtime shared library into target/<profile>/lib so that
 # `--features ort-load-dynamic` builds load it without setting ORT_DYLIB_PATH

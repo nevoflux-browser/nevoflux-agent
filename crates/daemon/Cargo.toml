@@ -10,13 +10,15 @@ repository.workspace = true
 description = "Core daemon for NevoFlux Agent"
 
 [features]
-default = ["embedding", "ort-download-binaries"]
+default = ["embedding", "ort-load-dynamic"]
 embedding = ["nevoflux-llm/embedding", "nevoflux-llm-gateway/embedding"]
 # ONNX Runtime linking strategy, forwarded to the embedding crates. Pick one:
-#   * ort-download-binaries (default): statically link a prebuilt ONNX Runtime.
-#   * ort-load-dynamic: load `libonnxruntime` at startup via ORT_DYLIB_PATH (or
-#     bundled next to the executable). Build with:
-#       cargo build --no-default-features --features "embedding,ort-load-dynamic,<…>"
+#   * ort-load-dynamic (default): load `libonnxruntime` at startup via
+#     ORT_DYLIB_PATH or bundled next to the exe. Runs on glibc >= 2.27; ship a
+#     version-matched runtime (see justfile `ort-fetch`).
+#   * ort-download-binaries: statically link a prebuilt ONNX Runtime (rc.12 needs
+#     glibc >= 2.38, so glibc >= 2.38 hosts only). Self-contained; build with:
+#       cargo build --no-default-features --features "embedding,ort-download-binaries,<…>"
 ort-download-binaries = [
     "nevoflux-llm/ort-download-binaries",
     "nevoflux-llm-gateway/ort-download-binaries",

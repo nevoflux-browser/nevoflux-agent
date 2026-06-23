@@ -52,15 +52,15 @@ uuid = { workspace = true }
 nevoflux-llm = { path = "../llm", default-features = false }
 
 [features]
-default = ["embedding", "ort-download-binaries"]
+default = ["embedding", "ort-load-dynamic"]
 # Pulls in the fastembed-backed `/v1/embeddings` handler via
 # `nevoflux-llm`'s `embedding` feature (fastembed -> ort). When off, the
 # `/v1/embeddings` route returns 503 `embedding_unavailable`. Kept optional
 # so aarch64 release builds can compile with `--no-default-features`.
 embedding = ["nevoflux-llm/embedding"]
 # ONNX Runtime linking strategy, forwarded to `nevoflux-llm`. Pick one (see
-# that crate's docs). `ort-download-binaries` is the default (static link);
-# `ort-load-dynamic` loads the runtime at startup via ORT_DYLIB_PATH.
+# that crate's docs). `ort-load-dynamic` is the default (loads libonnxruntime at
+# startup via ORT_DYLIB_PATH); `ort-download-binaries` statically links instead.
 ort-download-binaries = ["nevoflux-llm/ort-download-binaries"]
 ort-load-dynamic = ["nevoflux-llm/ort-load-dynamic"]
 # Exposes `serve_test_router` + `GatewayConfig::test_default` for in-process

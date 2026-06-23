@@ -8,14 +8,18 @@ license.workspace = true
 description = "LLM Provider abstraction layer for NevoFlux Agent"
 
 [features]
-default = ["embedding", "ort-download-binaries"]
+default = ["embedding", "ort-load-dynamic"]
 embedding = ["dep:fastembed", "dep:dirs"]
 # ONNX Runtime linking strategy for the `embedding` feature. Pick one:
-#   * ort-download-binaries (default): statically link a prebuilt ONNX Runtime.
-#     Self-contained binary, but the prebuilt lib's glibc floor applies.
-#   * ort-load-dynamic: link nothing; load `libonnxruntime` at runtime via
-#     ORT_DYLIB_PATH (or bundled next to the exe). Decouples the runtime's glibc
-#     from the build, at the cost of shipping a version-matched library.
+#   * ort-load-dynamic (default): link nothing; load `libonnxruntime` at runtime
+#     via ORT_DYLIB_PATH (or bundled next to the exe). The default because the
+#     prebuilt static runtime for ort rc.12 needs glibc >= 2.38, which excludes
+#     Ubuntu 22.04 etc.; an official manylinux runtime (glibc >= 2.27) loaded
+#     dynamically runs everywhere. Ship a version-matched library (see justfile
+#     `ort-fetch`).
+#   * ort-download-binaries: statically link a prebuilt ONNX Runtime.
+#     Self-contained, but only builds/runs on hosts whose glibc satisfies the
+#     prebuilt lib (rc.12 => glibc >= 2.38).
 # When both are enabled (e.g. `--all-features`), `ort` gives load-dynamic
 # precedence and does not statically link.
 ort-download-binaries = ["fastembed?/ort-download-binaries"]
@@ -35,7 +39,7 @@ tracing = "0.1"
 which = "7"
 sacp = "10.1.0"
 tokio-util = { version = "0.7", features = ["compat"] }
-fastembed = { version = "4", optional = true, default-features = false, features = [
+fastembed = { version = "5", optional = true, default-features = false, features = [
     "hf-hub-native-tls",
 ] }
 dirs = { version = "5.0", optional = true }
