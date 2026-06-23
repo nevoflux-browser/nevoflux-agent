@@ -28,7 +28,7 @@ AI-powered browser assistant with native computer control capabilities.
 ### Build from Source
 
 ```bash
-git clone https://github.com/dorisgyl/nevoflux-agent
+git clone https://github.com/nevoflux-browser/nevoflux-agent
 cd nevoflux-agent
 cargo build --release
 ```

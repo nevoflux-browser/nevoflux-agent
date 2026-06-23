@@ -37,7 +37,7 @@ NevoFlux browser already handles native messaging registration automatically via
 1. Explicit path (`--agent` / `-AgentPath`)
 2. `NEVOFLUX_AGENT_BIN` environment variable
 3. Local build at `../../target/release/nevoflux-agent`
-4. GitHub release download (latest from `dorisgyl/nevoflux-agent`)
+4. GitHub release download (latest from `nevoflux-browser/nevoflux-agent`)
 
 ## Browser Directory Resolution
 

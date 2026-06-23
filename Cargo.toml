@@ -30,7 +30,7 @@ members = [
 version = "0.3.5"
 edition = "2021"
 license = "AGPL-3.0"
-repository = "https://github.com/dorisgyl/nevoflux-agent"
+repository = "https://github.com/nevoflux-browser/nevoflux-agent"
 
 [workspace.dependencies]
 # LLM Framework

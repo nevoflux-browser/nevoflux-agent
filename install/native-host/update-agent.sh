@@ -11,7 +11,7 @@
 #   1. --agent argument
 #   2. NEVOFLUX_AGENT_BIN env var
 #   3. Local build: ../../target/release/nevoflux-agent
-#   4. GitHub release download (latest from dorisgyl/nevoflux-agent)
+#   4. GitHub release download (latest from nevoflux-browser/nevoflux-agent)
 #
 # Browser resolution:
 #   1. --browser argument
@@ -24,7 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 AGENT_BIN_NAME="nevoflux-agent"
-GITHUB_REPO="dorisgyl/nevoflux-agent"
+GITHUB_REPO="nevoflux-browser/nevoflux-agent"
 
 # Parse arguments
 AGENT_PATH=""

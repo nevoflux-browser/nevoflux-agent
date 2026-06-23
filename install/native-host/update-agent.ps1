@@ -18,7 +18,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = (Resolve-Path "$ScriptDir\..\..").Path
 
 $AgentBinName = "nevoflux-agent.exe"
-$GitHubRepo = "dorisgyl/nevoflux-agent"
+$GitHubRepo = "nevoflux-browser/nevoflux-agent"
 
 Write-Host "=== Update NevoFlux Agent ===" -ForegroundColor Cyan
 Write-Host ""
