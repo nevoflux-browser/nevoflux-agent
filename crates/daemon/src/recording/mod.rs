@@ -4,6 +4,9 @@
 mod normalize;
 pub use normalize::normalize_step;
 
+mod writer;
+pub use writer::RecordingWriter;
+
 pub const RECORDING_TOPIC_PREFIX: &str = "recording:";
 
 /// Extract `<recording_id>` from a `recording:<recording_id>` topic.
