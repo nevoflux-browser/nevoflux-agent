@@ -4386,11 +4386,18 @@ async fn handle_chat_message_streaming(
     }
 
     // Extract message content from payload
-    let message_content = payload
+    let message_content_raw = payload
         .get("payload")
         .and_then(|p| p.get("content"))
         .and_then(|c| c.as_str())
         .unwrap_or("");
+    // Expand {{NEVOFLUX_RECORDINGS_DIR}} sentinel so skill-creator handoff
+    // prompts can reference the recordings directory without the extension
+    // knowing the daemon's data dir. No-op for normal messages.
+    let recordings_dir = resolve_data_dir().join("recordings");
+    let message_content_owned =
+        crate::recording::expand_recordings_dir_sentinel(message_content_raw, &recordings_dir);
+    let message_content = message_content_owned.as_str();
 
     if message_content.is_empty() {
         let response_payload = serde_json::json!({

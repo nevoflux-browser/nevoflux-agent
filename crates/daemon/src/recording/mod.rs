@@ -67,6 +67,20 @@ impl RecordingCollector {
     }
 }
 
+/// Expand the `{{NEVOFLUX_RECORDINGS_DIR}}` sentinel in a chat message's user
+/// text, replacing it with the absolute path to the recordings directory.
+///
+/// This is a no-op when the sentinel is absent, so it is safe to call on
+/// every incoming message with negligible cost.
+pub fn expand_recordings_dir_sentinel(text: &str, recordings_dir: &std::path::Path) -> String {
+    const SENTINEL: &str = "{{NEVOFLUX_RECORDINGS_DIR}}";
+    if text.contains(SENTINEL) {
+        text.replace(SENTINEL, &recordings_dir.display().to_string())
+    } else {
+        text.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,6 +94,42 @@ mod tests {
     fn rejects_non_recording_and_empty() {
         assert_eq!(recording_id_from_topic("ui:tab:dom"), None);
         assert_eq!(recording_id_from_topic("recording:"), None);
+    }
+
+    #[test]
+    fn expand_sentinel_replaces_placeholder() {
+        let dir = std::path::Path::new("/home/user/.local/share/nevoflux/recordings");
+        let text = "Read the trace at {{NEVOFLUX_RECORDINGS_DIR}}/rec_123.jsonl";
+        let result = expand_recordings_dir_sentinel(text, dir);
+        assert_eq!(
+            result,
+            "Read the trace at /home/user/.local/share/nevoflux/recordings/rec_123.jsonl"
+        );
+    }
+
+    #[test]
+    fn expand_sentinel_noop_when_absent() {
+        let dir = std::path::Path::new("/some/path/recordings");
+        let text = "This is a normal chat message with no sentinel.";
+        let result = expand_recordings_dir_sentinel(text, dir);
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn expand_sentinel_replaces_all_occurrences() {
+        let dir = std::path::Path::new("/data/recordings");
+        let text = "dir1={{NEVOFLUX_RECORDINGS_DIR}} dir2={{NEVOFLUX_RECORDINGS_DIR}}";
+        let result = expand_recordings_dir_sentinel(text, dir);
+        assert_eq!(result, "dir1=/data/recordings dir2=/data/recordings");
+    }
+
+    #[test]
+    fn expand_sentinel_path_is_correct() {
+        // Verify the sentinel is replaced with the exact recordings_dir value passed in,
+        // not a re-derived path — i.e. the caller controls the path.
+        let dir = std::path::Path::new("/custom/recordings");
+        let text = "{{NEVOFLUX_RECORDINGS_DIR}}";
+        assert_eq!(expand_recordings_dir_sentinel(text, dir), "/custom/recordings");
     }
 
     #[tokio::test]
