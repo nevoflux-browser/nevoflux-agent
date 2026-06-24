@@ -1,6 +1,9 @@
 //! Lossless NDJSON recording sink (design §4.3–§4.5). Mirrors `trace/` but
 //! never routes through the EventBus.
 
+mod normalize;
+pub use normalize::normalize_step;
+
 pub const RECORDING_TOPIC_PREFIX: &str = "recording:";
 
 /// Extract `<recording_id>` from a `recording:<recording_id>` topic.
