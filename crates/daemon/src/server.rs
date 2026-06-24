@@ -24,6 +24,22 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, warn};
 
+/// Returns the NevoFlux application data-directory root.
+///
+/// Resolution order (identical at every call site — single source of truth):
+///   1. `NEVOFLUX_DATA_DIR` environment variable, if set.
+///   2. The platform data dir from `directories::ProjectDirs::from("com", "nevoflux", "nevoflux")`.
+///   3. `.` (current working directory) as a last-resort fallback.
+fn resolve_data_dir() -> std::path::PathBuf {
+    std::env::var("NEVOFLUX_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            directories::ProjectDirs::from("com", "nevoflux", "nevoflux")
+                .map(|dirs| dirs.data_dir().to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+        })
+}
+
 /// Mirror a ContentStore write for a `canvas:{id}` key into the `artifacts`
 /// table so downstream readers (canvas.share in particular) see the user's
 /// latest edits.
@@ -1970,13 +1986,7 @@ pub async fn start_server(
     let process_subscription_router = subscription_router.clone();
     let process_trace_enabled = config.trace_enabled;
     let process_recording_collector = {
-        let data_dir = std::env::var("NEVOFLUX_DATA_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| {
-                directories::ProjectDirs::from("com", "nevoflux", "nevoflux")
-                    .map(|dirs| dirs.data_dir().to_path_buf())
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-            });
+        let data_dir = resolve_data_dir();
         crate::recording::RecordingCollector::new(data_dir.join("recordings"))
     };
     let process_canvas_tool_registry = canvas_tool_registry.clone();
@@ -4685,14 +4695,7 @@ async fn handle_chat_message_streaming(
     // Create trace collector for this session
     let trace_collector = {
         let file_writer = if trace_enabled {
-            let data_dir = std::env::var("NEVOFLUX_DATA_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| {
-                    directories::ProjectDirs::from("com", "nevoflux", "nevoflux")
-                        .map(|dirs| dirs.data_dir().to_path_buf())
-                        .unwrap_or_else(|| std::path::PathBuf::from("."))
-                });
-            let traces_dir = data_dir.join("traces");
+            let traces_dir = resolve_data_dir().join("traces");
             TraceFileWriter::new(&traces_dir, &session_id).ok()
         } else {
             None
