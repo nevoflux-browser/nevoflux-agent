@@ -1969,6 +1969,16 @@ pub async fn start_server(
     let process_event_bus = event_bus.clone();
     let process_subscription_router = subscription_router.clone();
     let process_trace_enabled = config.trace_enabled;
+    let process_recording_collector = {
+        let data_dir = std::env::var("NEVOFLUX_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                directories::ProjectDirs::from("com", "nevoflux", "nevoflux")
+                    .map(|dirs| dirs.data_dir().to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+            });
+        crate::recording::RecordingCollector::new(data_dir.join("recordings"))
+    };
     let process_canvas_tool_registry = canvas_tool_registry.clone();
     let process_canvas_user_dir = dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -3620,6 +3630,7 @@ pub async fn start_server(
                             let pid = proxy_id.clone();
                             let rid = request_id.clone();
                             let ident = identity.clone();
+                            let rec_collector = process_recording_collector.clone();
 
                             tokio::spawn(async move {
                                 let response = handle_event_bus_request(
@@ -3629,6 +3640,7 @@ pub async fn start_server(
                                     &pid,
                                     &ident,
                                     resp_tx.clone(),
+                                    rec_collector,
                                 )
                                 .await;
                                 let msg = nevoflux_protocol::AgentMessage::EventsResponse(response);
@@ -3867,6 +3879,7 @@ async fn handle_event_bus_request(
     proxy_id: &str,
     identity: &[u8],
     response_tx: mpsc::Sender<(Vec<u8>, DaemonEnvelope)>,
+    recording_collector: crate::recording::RecordingCollector,
 ) -> nevoflux_protocol::EventBusResponse {
     use crate::event_bus::*;
     use nevoflux_protocol::events::*;
@@ -4018,6 +4031,17 @@ async fn handle_event_bus_request(
         }
 
         EventBusRequest::Publish(opts) => {
+            // Recording sink: intercept recording:<id> before the EventBus entirely.
+            if let Some(rec_id) = crate::recording::recording_id_from_topic(&opts.topic) {
+                tracing::info!(
+                    topic = %opts.topic,
+                    proxy = %proxy_id,
+                    "EventBus publish routed to recording sink"
+                );
+                recording_collector.ingest(rec_id.to_string(), opts.payload);
+                return EventBusResponse::Published { event_id: String::new() };
+            }
+
             let publisher = PublisherIdentity::Extension {
                 proxy_id: proxy_id.to_string(),
             };
