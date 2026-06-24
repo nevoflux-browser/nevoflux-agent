@@ -140,7 +140,10 @@ pub async fn handle_pack_validate(params: &Value) -> Value {
 
 /// pack.list — enumerate installed packs by reading {config}/packs/*/receipt.json.
 pub fn handle_pack_list(params: &Value) -> Value {
-    let request_id = params.get("request_id").and_then(|v| v.as_str()).unwrap_or("");
+    let request_id = params
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let paths = crate::paths::resolve_from_daemon();
     let mut packs = Vec::new();
     if let Ok(entries) = std::fs::read_dir(paths.packs_dir()) {
@@ -156,12 +159,19 @@ pub fn handle_pack_list(params: &Value) -> Value {
             }
         }
     }
-    ok(request_id, "pack.list", serde_json::json!({ "packs": packs }))
+    ok(
+        request_id,
+        "pack.list",
+        serde_json::json!({ "packs": packs }),
+    )
 }
 
 /// pack.status — receipt summary for one pack.
 pub fn handle_pack_status(params: &Value) -> Value {
-    let request_id = params.get("request_id").and_then(|v| v.as_str()).unwrap_or("");
+    let request_id = params
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let name = match params.get("name").and_then(|v| v.as_str()) {
         Some(n) => n,
         None => return err(request_id, "pack.status", "MISSING_PARAM", "name required"),
@@ -268,7 +278,10 @@ pub async fn handle_pack_install(
             )
         }
     };
-    let force = params.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let force = params
+        .get("force")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let wait = params.get("wait").and_then(|v| v.as_bool()).unwrap_or(true); // CLI default
 
     let op_id = new_op_id();
@@ -363,7 +376,12 @@ pub async fn handle_pack_install(
                 serde_json::json!({ "success": true, "version": receipt.version.to_string(),
                                     "files": receipt.files.len() }),
             ),
-            Ok(Err(e)) => err(&request_id, "pack.install", "INSTALL_FAILED", &e.to_string()),
+            Ok(Err(e)) => err(
+                &request_id,
+                "pack.install",
+                "INSTALL_FAILED",
+                &e.to_string(),
+            ),
             Err(e) => err(&request_id, "pack.install", "JOIN_ERROR", &e.to_string()),
         }
     } else {
@@ -408,13 +426,23 @@ pub async fn handle_pack_uninstall(
         .to_string();
     let name = match params.get("name").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
-        None => return err(&request_id, "pack.uninstall", "MISSING_PARAM", "name required"),
+        None => {
+            return err(
+                &request_id,
+                "pack.uninstall",
+                "MISSING_PARAM",
+                "name required",
+            )
+        }
     };
     let purge_data = params
         .get("purge_data")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let force = params.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let force = params
+        .get("force")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let build = build_host(services, new_op_id());
     let handle = tokio::runtime::Handle::current();
     let run = move || {
@@ -639,7 +667,10 @@ fn gather_tool_binaries(
                 if let Some(n) = t.get("name").and_then(|v| v.as_str()) {
                     name = n.to_string();
                 }
-                binary = t.get("binary").and_then(|v| v.as_str()).map(|x| x.to_string());
+                binary = t
+                    .get("binary")
+                    .and_then(|v| v.as_str())
+                    .map(|x| x.to_string());
             }
         }
         out.push((name, binary));
@@ -656,7 +687,14 @@ pub async fn handle_pack_inspect(params: &Value) -> Value {
         .to_string();
     let source = match params.get("source").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
-        None => return err(&request_id, "pack.inspect", "MISSING_PARAM", "source required"),
+        None => {
+            return err(
+                &request_id,
+                "pack.inspect",
+                "MISSING_PARAM",
+                "source required",
+            )
+        }
     };
     let data_dir = crate::paths::resolve_from_daemon().data_dir;
     let resolved = match crate::pack::fetch::resolve_source(&source, &data_dir).await {
@@ -665,7 +703,14 @@ pub async fn handle_pack_inspect(params: &Value) -> Value {
     };
     let raw = match std::fs::read_to_string(resolved.pack_dir.join("pack.toml")) {
         Ok(s) => s,
-        Err(e) => return err(&request_id, "pack.inspect", "MANIFEST_NOT_FOUND", &e.to_string()),
+        Err(e) => {
+            return err(
+                &request_id,
+                "pack.inspect",
+                "MANIFEST_NOT_FOUND",
+                &e.to_string(),
+            )
+        }
     };
     let manifest = match nevoflux_pack::manifest::Manifest::parse(&raw) {
         Ok(m) => m,
@@ -722,5 +767,53 @@ prefixes = ["demo/"]
         assert_eq!(v["components"]["canvas_tools"][0]["binary"], "weasyprint");
         assert_eq!(v["components"]["seed"][0], "demo/cv");
         assert_eq!(v["source"], "github:u/r@v1");
+    }
+}
+
+#[cfg(test)]
+mod inspect_preview_contract_tests {
+    use nevoflux_pack::manifest::Manifest;
+
+    const MINIMAL_PACK_TOML: &str = r#"
+[pack]
+name = "test-pack"
+version = "0.1.0"
+description = "A test pack"
+authors = ["Tester"]
+protocol = "pack-protocol/0.1"
+min_nevoflux = "0.3.0"
+"#;
+
+    #[test]
+    fn summarize_inspect_exposes_card_fields() {
+        let manifest = Manifest::parse(MINIMAL_PACK_TOML).expect("manifest parses");
+        let skills = vec!["skill-a".to_string()];
+        let tools: Vec<(String, Option<String>)> =
+            vec![("pdf".to_string(), Some("wkhtmltopdf".to_string()))];
+        let violations: Vec<String> = Vec::new();
+
+        let data = super::summarize_inspect(
+            &manifest,
+            &skills,
+            &tools,
+            &violations,
+            Some("github:owner/test-pack@v1"),
+            Some("deadbeef"),
+        );
+
+        // Preview-card contract: these keys must exist or the deep-link page breaks.
+        assert_eq!(data["pack"]["name"], "test-pack");
+        assert!(data["pack"]["version"].is_string());
+        assert!(data["pack"]["description"].is_string());
+        assert!(data["pack"]["authors"].is_array());
+        assert!(data["components"]["skills"].is_array());
+        assert!(data["components"]["canvas_tools"].is_array());
+        assert_eq!(
+            data["components"]["canvas_tools"][0]["binary"],
+            "wkhtmltopdf"
+        );
+        assert!(data["violations"].is_array());
+        assert_eq!(data["source"], "github:owner/test-pack@v1");
+        assert_eq!(data["tarball_sha256"], "deadbeef");
     }
 }
