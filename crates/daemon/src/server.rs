@@ -24,6 +24,22 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, warn};
 
+/// Returns the NevoFlux application data-directory root.
+///
+/// Resolution order (identical at every call site — single source of truth):
+///   1. `NEVOFLUX_DATA_DIR` environment variable, if set.
+///   2. The platform data dir from `directories::ProjectDirs::from("com", "nevoflux", "nevoflux")`.
+///   3. `.` (current working directory) as a last-resort fallback.
+fn resolve_data_dir() -> std::path::PathBuf {
+    std::env::var("NEVOFLUX_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            directories::ProjectDirs::from("com", "nevoflux", "nevoflux")
+                .map(|dirs| dirs.data_dir().to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+        })
+}
+
 /// Mirror a ContentStore write for a `canvas:{id}` key into the `artifacts`
 /// table so downstream readers (canvas.share in particular) see the user's
 /// latest edits.
@@ -1969,6 +1985,10 @@ pub async fn start_server(
     let process_event_bus = event_bus.clone();
     let process_subscription_router = subscription_router.clone();
     let process_trace_enabled = config.trace_enabled;
+    let process_recording_collector = {
+        let data_dir = resolve_data_dir();
+        crate::recording::RecordingCollector::new(data_dir.join("recordings"))
+    };
     let process_canvas_tool_registry = canvas_tool_registry.clone();
     let process_canvas_user_dir = dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -3620,6 +3640,7 @@ pub async fn start_server(
                             let pid = proxy_id.clone();
                             let rid = request_id.clone();
                             let ident = identity.clone();
+                            let rec_collector = process_recording_collector.clone();
 
                             tokio::spawn(async move {
                                 let response = handle_event_bus_request(
@@ -3629,6 +3650,7 @@ pub async fn start_server(
                                     &pid,
                                     &ident,
                                     resp_tx.clone(),
+                                    rec_collector,
                                 )
                                 .await;
                                 let msg = nevoflux_protocol::AgentMessage::EventsResponse(response);
@@ -3867,6 +3889,7 @@ async fn handle_event_bus_request(
     proxy_id: &str,
     identity: &[u8],
     response_tx: mpsc::Sender<(Vec<u8>, DaemonEnvelope)>,
+    recording_collector: crate::recording::RecordingCollector,
 ) -> nevoflux_protocol::EventBusResponse {
     use crate::event_bus::*;
     use nevoflux_protocol::events::*;
@@ -4018,6 +4041,17 @@ async fn handle_event_bus_request(
         }
 
         EventBusRequest::Publish(opts) => {
+            // Recording sink: intercept recording:<id> before the EventBus entirely.
+            if let Some(rec_id) = crate::recording::recording_id_from_topic(&opts.topic) {
+                tracing::info!(
+                    topic = %opts.topic,
+                    proxy = %proxy_id,
+                    "EventBus publish routed to recording sink"
+                );
+                recording_collector.ingest(rec_id.to_string(), opts.payload);
+                return EventBusResponse::Published { event_id: String::new() };
+            }
+
             let publisher = PublisherIdentity::Extension {
                 proxy_id: proxy_id.to_string(),
             };
@@ -4352,11 +4386,18 @@ async fn handle_chat_message_streaming(
     }
 
     // Extract message content from payload
-    let message_content = payload
+    let message_content_raw = payload
         .get("payload")
         .and_then(|p| p.get("content"))
         .and_then(|c| c.as_str())
         .unwrap_or("");
+    // Expand {{NEVOFLUX_RECORDINGS_DIR}} sentinel so skill-creator handoff
+    // prompts can reference the recordings directory without the extension
+    // knowing the daemon's data dir. No-op for normal messages.
+    let recordings_dir = resolve_data_dir().join("recordings");
+    let message_content_owned =
+        crate::recording::expand_recordings_dir_sentinel(message_content_raw, &recordings_dir);
+    let message_content = message_content_owned.as_str();
 
     if message_content.is_empty() {
         let response_payload = serde_json::json!({
@@ -4661,14 +4702,7 @@ async fn handle_chat_message_streaming(
     // Create trace collector for this session
     let trace_collector = {
         let file_writer = if trace_enabled {
-            let data_dir = std::env::var("NEVOFLUX_DATA_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| {
-                    directories::ProjectDirs::from("com", "nevoflux", "nevoflux")
-                        .map(|dirs| dirs.data_dir().to_path_buf())
-                        .unwrap_or_else(|| std::path::PathBuf::from("."))
-                });
-            let traces_dir = data_dir.join("traces");
+            let traces_dir = resolve_data_dir().join("traces");
             TraceFileWriter::new(&traces_dir, &session_id).ok()
         } else {
             None

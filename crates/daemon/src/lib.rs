@@ -50,6 +50,7 @@ pub mod openclaw_setup;
 pub mod pack;
 pub mod paths;
 pub mod permission;
+pub mod recording;
 pub mod registry;
 pub mod retry;
 pub mod router;
