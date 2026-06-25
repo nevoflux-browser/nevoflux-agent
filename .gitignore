@@ -42,3 +42,4 @@ spike/
 # Eval run reports (generated artifacts; keep eval/benchmarks tracked)
 eval/reports/
 
+.superpowers/
