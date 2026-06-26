@@ -295,6 +295,7 @@ pub enum BrowserToolAction {
     /// Returns:
     /// - `recording_id`: Echo of the recording ID
     /// - `start_url`: URL of the active tab at recording start
+    #[serde(rename = "recording_start")]
     StartRecording,
     /// Stop an in-progress browser interaction recording.
     ///
@@ -304,6 +305,7 @@ pub enum BrowserToolAction {
     /// Returns:
     /// - `status`: "stopped"
     /// - `recording_id`: Echo of the recording ID
+    #[serde(rename = "recording_stop")]
     StopRecording,
 }
 

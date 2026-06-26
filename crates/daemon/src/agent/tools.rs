@@ -1648,6 +1648,16 @@ pub struct StartRecordingTool {
 #[async_trait]
 impl ToolExecutor for StartRecordingTool {
     async fn execute(&self, _name: &str, arguments: &serde_json::Value) -> Result<String> {
+        // I2: Fail loud if the recording subsystem was never initialised (empty dir
+        // or absent collector).  Producing a relative "rec_xxx.jsonl" path would
+        // silently violate the absolute-path contract.
+        if self.ctx.recordings_dir.as_os_str().is_empty() || self.ctx.recording_collector.is_none()
+        {
+            return Err(DaemonError::InternalError(
+                "Recording subsystem not initialized (no recordings_dir or collector)".into(),
+            ));
+        }
+
         let goal_hint = arguments
             .get("goal_hint")
             .and_then(|v| v.as_str())
@@ -1655,6 +1665,8 @@ impl ToolExecutor for StartRecordingTool {
             .to_string();
 
         // Generate a short unique recording ID.
+        // Note: 48-bit prefix of a v4 UUID — negligible collision probability for
+        // typical recording counts per session.
         let recording_id = format!(
             "rec_{}",
             &uuid::Uuid::new_v4().simple().to_string()[..12]
@@ -1662,7 +1674,7 @@ impl ToolExecutor for StartRecordingTool {
 
         let trace_path = self.ctx.recordings_dir.join(format!("{recording_id}.jsonl"));
 
-        // Tell the browser extension to start recording; it returns the active tab URL.
+        // Tell the browser extension to arm recording; it returns the active tab URL.
         let params = serde_json::json!({
             "recording_id": recording_id,
             "goal_hint": goal_hint,
@@ -1670,6 +1682,19 @@ impl ToolExecutor for StartRecordingTool {
         let response =
             dispatch_browser_request(&self.ctx, BrowserToolAction::StartRecording, params, None)
                 .await?;
+
+        // I1: If the browser failed to arm (e.g. no active tab), surface the error
+        // immediately — do NOT write a header or return a path for a dead session.
+        if !response.success {
+            let msg = response
+                .error
+                .as_ref()
+                .map(|e| e.message.as_str())
+                .unwrap_or("browser failed to arm recording");
+            return Err(DaemonError::InternalError(format!(
+                "start_recording: {msg}"
+            )));
+        }
 
         let start_url = response
             .result
@@ -1679,7 +1704,7 @@ impl ToolExecutor for StartRecordingTool {
             .unwrap_or("")
             .to_string();
 
-        // Write the header line into the JSONL trace.
+        // Write the header line into the JSONL trace (only on successful arm).
         if let Some(collector) = &self.ctx.recording_collector {
             let epoch_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1727,8 +1752,22 @@ impl ToolExecutor for StopRecordingTool {
             .to_string();
 
         let params = serde_json::json!({ "recording_id": recording_id });
-        dispatch_browser_request(&self.ctx, BrowserToolAction::StopRecording, params, None)
-            .await?;
+        let response =
+            dispatch_browser_request(&self.ctx, BrowserToolAction::StopRecording, params, None)
+                .await?;
+
+        // I3: Surface disarm failures — don't report a clean stop when the
+        // browser refused or had no active session for this recording_id.
+        if !response.success {
+            let msg = response
+                .error
+                .as_ref()
+                .map(|e| e.message.as_str())
+                .unwrap_or("browser failed to stop recording");
+            return Err(DaemonError::InternalError(format!(
+                "stop_recording: {msg}"
+            )));
+        }
 
         Ok(serde_json::json!({
             "status": "stopped",
@@ -2711,5 +2750,55 @@ mod tests {
             .await
             .expect_err("must fail when AssetServer is missing");
         assert!(err.to_string().contains("AssetServer is not running"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Recording tool unit tests
+    // -------------------------------------------------------------------------
+
+    /// C1: BrowserToolAction::StartRecording/StopRecording must serialise to
+    /// the strings background.js dispatches on ("recording_start"/"recording_stop"),
+    /// NOT the snake_case derived from the variant names ("start_recording"/"stop_recording").
+    #[test]
+    fn test_recording_action_serde_rename() {
+        use nevoflux_protocol::BrowserToolAction;
+
+        let start = serde_json::to_value(BrowserToolAction::StartRecording).unwrap();
+        assert_eq!(
+            start,
+            serde_json::Value::String("recording_start".into()),
+            "StartRecording must serialise to \"recording_start\""
+        );
+
+        let stop = serde_json::to_value(BrowserToolAction::StopRecording).unwrap();
+        assert_eq!(
+            stop,
+            serde_json::Value::String("recording_stop".into()),
+            "StopRecording must serialise to \"recording_stop\""
+        );
+    }
+
+    /// I2: StartRecordingTool must return an error when recordings_dir is empty
+    /// (subsystem not initialised) rather than silently producing a relative path.
+    #[tokio::test]
+    async fn test_start_recording_fails_without_subsystem() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let ctx = Arc::new(BrowserContext {
+            sender: tx,
+            proxy_id: String::new(),
+            client_identity: vec![],
+            asset_server: None,
+            recording_collector: None,        // subsystem absent
+            recordings_dir: std::path::PathBuf::new(), // empty
+        });
+        let tool = StartRecordingTool { ctx };
+        let err = tool
+            .execute("start_recording", &serde_json::json!({}))
+            .await
+            .expect_err("must fail when recording subsystem is not initialized");
+        assert!(
+            err.to_string().contains("not initialized"),
+            "error should mention 'not initialized', got: {err}"
+        );
     }
 }
