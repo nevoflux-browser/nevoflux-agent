@@ -103,6 +103,11 @@ pub struct BrowserContext {
     /// it up here. `None` means the AssetServer didn't start — caller
     /// must report a clear error rather than silently fall back.
     pub asset_server: Option<crate::asset_server::AssetServer>,
+    /// Recording collector for writing JSONL trace lines.
+    /// `Some` when the daemon has initialised the recording subsystem.
+    pub recording_collector: Option<crate::recording::RecordingCollector>,
+    /// Directory where per-session `<recording_id>.jsonl` files are written.
+    pub recordings_dir: std::path::PathBuf,
 }
 
 /// Browser tool request for the browser sender channel.
@@ -272,6 +277,15 @@ pub struct HostServices {
     /// failed to boot or has not been initialized yet, and brain tool
     /// calls surface a clear error in that case.
     pub brain_slot: Option<crate::init_brain::SharedBrainSlot>,
+
+    /// Recording collector for the Record & Replay subsystem.
+    /// When `Some`, `start_recording` / `stop_recording` agent tools can
+    /// write JSONL trace lines through this shared sink.
+    pub recording_collector: Option<crate::recording::RecordingCollector>,
+
+    /// Directory where per-session `<recording_id>.jsonl` files live.
+    /// Defaults to `<data_dir>/recordings`.
+    pub recordings_dir: std::path::PathBuf,
 }
 
 impl HostServices {
@@ -335,6 +349,8 @@ impl HostServices {
             agent_config: None,
             runtime_handle: None,
             brain_slot: None,
+            recording_collector: None,
+            recordings_dir: std::path::PathBuf::new(),
         }
     }
 
@@ -377,7 +393,28 @@ impl HostServices {
             agent_config: None,
             runtime_handle: None,
             brain_slot: None,
+            recording_collector: None,
+            recordings_dir: std::path::PathBuf::new(),
         }
+    }
+
+    /// Attach the recording subsystem to services (builder pattern).
+    ///
+    /// Call this after constructing `HostServices` to enable the
+    /// `start_recording` / `stop_recording` agent tools.
+    ///
+    /// # Arguments
+    ///
+    /// * `collector` - Shared recording collector (wraps an unbounded channel).
+    /// * `recordings_dir` - Directory where `<recording_id>.jsonl` files are written.
+    pub fn with_recording(
+        mut self,
+        collector: crate::recording::RecordingCollector,
+        recordings_dir: std::path::PathBuf,
+    ) -> Self {
+        self.recording_collector = Some(collector);
+        self.recordings_dir = recordings_dir;
+        self
     }
 
     /// Build a `BrowserContext` from this service's browser_sender and routing info.
@@ -389,6 +426,8 @@ impl HostServices {
             proxy_id: self.proxy_id.clone(),
             client_identity: self.client_identity.clone(),
             asset_server: self.asset_server.clone(),
+            recording_collector: self.recording_collector.clone(),
+            recordings_dir: self.recordings_dir.clone(),
         })
     }
 

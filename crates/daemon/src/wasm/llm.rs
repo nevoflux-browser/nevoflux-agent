@@ -3751,6 +3751,8 @@ async fn stream_acp_completion(
                         client_identity: Vec::new(),
                         proxy_id: String::new(),
                         asset_server: services.asset_server.clone(),
+                        recording_collector: services.recording_collector.clone(),
+                        recordings_dir: services.recordings_dir.clone(),
                     };
                     tokio::spawn(crate::wasm::mcp_tool_executor::run_permission_handler(
                         perm_rx,

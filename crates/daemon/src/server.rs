@@ -1611,6 +1611,15 @@ pub async fn start_server(
     // own direct broadcast; this one covers the LLM-driven tool call path.
     services = services.with_broadcast_tx(response_tx.clone());
 
+    // Wire the recording subsystem into HostServices so start_recording /
+    // stop_recording agent tools can ingest JSONL trace lines.
+    {
+        let data_dir = resolve_data_dir();
+        let recordings_dir = data_dir.join("recordings");
+        let collector = crate::recording::RecordingCollector::new(recordings_dir.clone());
+        services = services.with_recording(collector, recordings_dir);
+    }
+
     // Boot the Asset & Stream Plane HTTP server. Reuses the same port
     // range as the bridge — bridge takes its slot first, AssetServer
     // takes the next free one (per design D4 / §5.2). On bind failure
