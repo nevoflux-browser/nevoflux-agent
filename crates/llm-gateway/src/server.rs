@@ -252,17 +252,44 @@ pub struct GatewayHandle {
     shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
+/// How long [`GatewayHandle::shutdown`] waits for the serve task to drain
+/// in-flight requests before it force-aborts the task.
+///
+/// axum's `with_graceful_shutdown` future only resolves once *every*
+/// connection has closed. An in-flight streaming (SSE) response held open
+/// by a pooled client (gbrain, the in-process brain engine) never drains
+/// on its own, so an unbounded await on the serve task would block the
+/// daemon's entire shutdown path forever — the process never reaches its
+/// `std::process::exit(0)`, and Ctrl+C appears dead. Bounding the wait
+/// keeps shutdown responsive while still giving genuine in-flight requests
+/// a brief window to finish.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
 impl GatewayHandle {
     /// Return the canonical `http://<host>:<port>` URL for this gateway.
     pub fn url(&self) -> String {
         format!("http://{}", self.bind_addr)
     }
 
-    /// Signal the server to stop, then await the task. Returns once the
-    /// background task has fully ended.
-    pub async fn shutdown(self) {
+    /// Signal the server to stop, then wait for the serve task to drain.
+    ///
+    /// Returns once the background task has fully ended, or after
+    /// [`SHUTDOWN_GRACE`] elapses — whichever comes first. On timeout the
+    /// serve task is aborted so this can never block the caller (and thus
+    /// the daemon's shutdown path) indefinitely on a connection that won't
+    /// drain.
+    pub async fn shutdown(mut self) {
         let _ = self.shutdown.send(());
-        let _ = self.join.await;
+        if tokio::time::timeout(SHUTDOWN_GRACE, &mut self.join)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "llm-gateway did not drain within {:?}; aborting serve task",
+                SHUTDOWN_GRACE
+            );
+            self.join.abort();
+        }
     }
 }
 
@@ -327,4 +354,42 @@ pub async fn serve(config: GatewayConfig) -> anyhow::Result<GatewayHandle> {
 pub async fn serve_test_router(config: GatewayConfig) -> axum::Router {
     let state = Arc::new(AppState::new(config).await.expect("AppState::new for test"));
     handlers::build_router(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`GatewayHandle::shutdown`] must return even when the underlying
+    /// serve task never finishes on its own. In production the task is
+    /// `axum::serve(...).with_graceful_shutdown(...)`, whose future only
+    /// resolves once every connection has drained — an in-flight streaming
+    /// (SSE) response held open by a client (gbrain, the in-process brain
+    /// engine) never drains, so the old unbounded `self.join.await` blocked
+    /// the daemon's whole shutdown path forever. That is the "Ctrl+C can't
+    /// exit" hang. We model the never-finishing serve future directly so
+    /// the regression doesn't depend on axum's connection semantics.
+    #[tokio::test]
+    async fn shutdown_returns_when_serve_task_never_finishes() {
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        // A serve task that ignores the shutdown signal and never ends,
+        // standing in for axum graceful-shutdown wedged on an open stream.
+        let join = tokio::spawn(std::future::pending::<()>());
+        let handle = GatewayHandle {
+            bind_addr: "127.0.0.1:0".parse().expect("loopback addr"),
+            bearer_token: "test-token".into(),
+            join,
+            shutdown: shutdown_tx,
+        };
+
+        // The bug (unbounded await on the serve task) would never return
+        // here; the outer timeout is the safety net that turns a hang into
+        // a test failure rather than a wedged test run.
+        let result =
+            tokio::time::timeout(SHUTDOWN_GRACE + Duration::from_secs(3), handle.shutdown()).await;
+        assert!(
+            result.is_ok(),
+            "shutdown must return within the grace window even if the serve task never finishes"
+        );
+    }
 }

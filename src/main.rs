@@ -484,6 +484,63 @@ fn assign_self_to_kill_on_close_job() {
     // `prctl(PR_SET_PDEATHSIG)` per child on Linux.
 }
 
+/// Terminate the current process immediately, skipping ALL in-process
+/// cleanup.
+///
+/// `std::process::exit` first runs Rust's runtime cleanup (which flushes
+/// stdout) and then, on Windows, `ExitProcess` — which runs DLL detach
+/// under the loader lock. With `--verbose` logging across many threads plus
+/// the uncancellable `spawn_blocking` LLM-call threads still running at
+/// shutdown, either step can deadlock: a thread parked mid-write holds the
+/// stdout lock the flush needs, or a force-terminated thread holds a
+/// CRT/loader lock that DLL detach then waits on. The symptom is the daemon
+/// hanging at the very end of shutdown with Ctrl+C appearing dead.
+///
+/// `TerminateProcess(GetCurrentProcess())` kills the process without
+/// flushing stdout, without DLL detach, and without taking the loader lock,
+/// so it cannot deadlock. The leaked kill-on-close Job handle is closed by
+/// the kernel as the process dies, so child processes are still reaped.
+#[cfg(windows)]
+fn force_exit(code: u32) -> ! {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+    // SAFETY: GetCurrentProcess returns a pseudo-handle to the current
+    // process; TerminateProcess on it does not return.
+    unsafe {
+        TerminateProcess(GetCurrentProcess(), code);
+    }
+    // TerminateProcess on self never returns, but its signature can't prove
+    // that. Spin so this function is `!` and we never fall through.
+    loop {
+        std::hint::spin_loop();
+    }
+}
+
+/// Unix variant: the Windows `ExitProcess`/loader-lock hang does not apply,
+/// and `std::process::exit` is the idiomatic immediate exit.
+#[cfg(not(windows))]
+fn force_exit(code: u32) -> ! {
+    std::process::exit(code as i32);
+}
+
+/// Spawn a detached OS thread that force-terminates the process after
+/// `grace`, as a last-resort backstop for shutdown.
+///
+/// Deliberately a plain `std::thread`, NOT a tokio task: if the async
+/// shutdown path wedges (an uncancellable `spawn_blocking` call, a Windows
+/// `ExitProcess` deadlock, a stdout flush blocked on a paused console),
+/// tokio can't schedule a task to rescue us — but an independent OS thread
+/// sleeping on a timer is immune to all of it. When the orderly path wins
+/// the race it calls [`force_exit`] first and this thread dies with the
+/// process, never firing.
+fn spawn_force_exit_watchdog(grace: std::time::Duration) {
+    std::thread::spawn(move || {
+        std::thread::sleep(grace);
+        // Reached only if orderly shutdown never terminated us.
+        eprintln!("shutdown watchdog: process did not exit within {grace:?}; forcing termination");
+        force_exit(0);
+    });
+}
+
 /// Run the daemon.
 async fn run_daemon(
     verbose: bool,
@@ -589,8 +646,28 @@ async fn run_daemon(
 
     logging::log_shutdown();
 
-    // Gracefully shut down the server (stops listeners and background tasks)
-    server.shutdown().await;
+    // Arm an independent OS-thread backstop FIRST: from this point the
+    // process is guaranteed to die within the grace window no matter what
+    // the async path below does. This is what makes Ctrl+C reliable — even
+    // if graceful shutdown wedges or the final force-exit deadlocks, the
+    // watchdog fires and terminates us.
+    spawn_force_exit_watchdog(std::time::Duration::from_secs(8));
+
+    // Gracefully shut down the server (stops listeners and background
+    // tasks). Best-effort, and also escapable with a second Ctrl+C, which
+    // breaks the select and drops us straight to the force-exit below.
+    // (`tokio::signal::ctrl_c()` resolves once per await, so a fresh await
+    // here is what makes a *second* Ctrl+C effective.)
+    let graceful = server.shutdown();
+    tokio::pin!(graceful);
+    tokio::select! {
+        _ = &mut graceful => {
+            tracing::info!("graceful shutdown complete");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::warn!("second Ctrl+C received during shutdown; forcing exit");
+        }
+    }
 
     // Cleanup — only remove files we actually wrote.
     // In managed+port mode no files were written, so nothing to clean up.
@@ -607,10 +684,11 @@ async fn run_daemon(
 
     // Force-exit the process. Loop iterations run Agent::run() inside
     // spawn_blocking — those threads cannot be interrupted by tokio
-    // cancellation. Without this, the tokio runtime drop waits for the
-    // blocking thread pool to drain, which hangs indefinitely if an LLM
-    // HTTP call is still in-flight.
-    std::process::exit(0);
+    // cancellation, so the tokio runtime drop would otherwise hang waiting
+    // for the blocking pool to drain. `force_exit` uses TerminateProcess on
+    // Windows (see its doc) rather than `std::process::exit`, whose stdout
+    // flush + ExitProcess loader-lock teardown can itself deadlock here.
+    force_exit(0);
 }
 
 /// Get the database path for storage.
