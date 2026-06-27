@@ -469,6 +469,39 @@ Content.
     }
 
     #[test]
+    fn test_parse_skill_allowed_tools_bare_string() {
+        // LLM-generated skills (e.g. skill-creator from a recording) commonly
+        // write a bare string instead of a YAML sequence. The loader must accept
+        // it rather than silently dropping the whole skill.
+        let content = r#"---
+name: demo-record
+description: A recorded browser skill.
+allowed_tools: browser_*
+---
+
+# Demo
+"#;
+        let skill = parse_skill(content, SkillSource::User).unwrap();
+        assert_eq!(skill.metadata.allowed_tools, vec!["browser_*"]);
+    }
+
+    #[test]
+    fn test_parse_skill_tags_bare_string() {
+        // The same string-or-sequence leniency applies to the other list-valued
+        // frontmatter fields (tags / dependencies / triggers).
+        let content = r#"---
+name: tagged
+description: A skill with a single bare-string tag.
+tags: browser
+---
+
+# Body
+"#;
+        let skill = parse_skill(content, SkillSource::User).unwrap();
+        assert_eq!(skill.metadata.tags, vec!["browser"]);
+    }
+
+    #[test]
     fn test_parse_skill_without_allowed_tools() {
         // Skills without allowed-tools should have empty vec
         let content = r#"---

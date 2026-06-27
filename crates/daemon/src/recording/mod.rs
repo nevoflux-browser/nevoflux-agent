@@ -27,7 +27,7 @@ struct IngestMsg {
 }
 
 /// Cloneable handle to the single recording writer task.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RecordingCollector {
     tx: mpsc::UnboundedSender<IngestMsg>,
 }

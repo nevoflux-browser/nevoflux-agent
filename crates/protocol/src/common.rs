@@ -286,6 +286,27 @@ pub enum BrowserToolAction {
     /// extraction; TabId mode reuses the existing tab without closing.
     #[serde(rename = "extractVisualIdentity")]
     ExtractVisualIdentity,
+    /// Begin recording browser interactions to a JSONL trace file.
+    ///
+    /// Params:
+    /// - `recording_id`: Unique ID for this recording session
+    /// - `goal_hint`: Optional natural-language description of what is being recorded
+    ///
+    /// Returns:
+    /// - `recording_id`: Echo of the recording ID
+    /// - `start_url`: URL of the active tab at recording start
+    #[serde(rename = "recording_start")]
+    StartRecording,
+    /// Stop an in-progress browser interaction recording.
+    ///
+    /// Params:
+    /// - `recording_id`: ID of the recording session to stop
+    ///
+    /// Returns:
+    /// - `status`: "stopped"
+    /// - `recording_id`: Echo of the recording ID
+    #[serde(rename = "recording_stop")]
+    StopRecording,
 }
 
 /// File attachment

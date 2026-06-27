@@ -150,6 +150,17 @@ impl ToolRegistry {
             );
         }
 
+        // Record & Replay tools — need direct collector/dir access, so they
+        // can't go through the generic BrowserTool dispatch.
+        registry.register(
+            "start_recording",
+            Box::new(StartRecordingTool { ctx: ctx.clone() }),
+        );
+        registry.register(
+            "stop_recording",
+            Box::new(StopRecordingTool { ctx: ctx.clone() }),
+        );
+
         registry
     }
 
@@ -362,6 +373,16 @@ impl ToolRegistry {
             "browser_ask_user" => (
                 "question: str, options: list = None, allow_custom: bool = True",
                 "Ask the user a question and wait for response.",
+            ),
+            "start_recording" => (
+                "goal_hint: str = None",
+                "Begin recording browser interactions to a JSONL trace file. \
+                 Returns dict with 'recording_id' and 'trace_path'.",
+            ),
+            "stop_recording" => (
+                "recording_id: str",
+                "Stop an in-progress browser interaction recording. \
+                 Returns dict with 'status' and 'recording_id'.",
             ),
             _ => ("**kwargs", "Execute this tool with keyword arguments."),
         }
@@ -1131,6 +1152,13 @@ impl BrowserTool {
                 // handles token issuance and file serving.
                 arguments.clone()
             }
+            // StartRecording / StopRecording are dispatched by their own dedicated
+            // ToolExecutor impls (StartRecordingTool / StopRecordingTool) and never
+            // reach the generic BrowserTool::execute path, so build_params is
+            // unreachable for these variants at runtime.
+            BrowserToolAction::StartRecording | BrowserToolAction::StopRecording => {
+                arguments.clone()
+            }
         };
 
         (params, tab_id)
@@ -1570,6 +1598,217 @@ impl ToolExecutor for GetCodeModeContextTool {
 }
 
 // ============================================================================
+// Recording Tools
+// ============================================================================
+
+/// Shared helper: send a `BrowserRequest` and await the response.
+///
+/// Encapsulates the mpsc send + oneshot receive + timeout logic so
+/// `StartRecordingTool` and `StopRecordingTool` don't duplicate it.
+async fn dispatch_browser_request(
+    ctx: &Arc<BrowserContext>,
+    action: BrowserToolAction,
+    params: serde_json::Value,
+    tab_id: Option<i64>,
+) -> Result<BrowserResponse> {
+    let request = BrowserRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        session_id: "agent-mode".to_string(),
+        tab_id,
+        action,
+        params,
+        timeout_ms: 30_000,
+        client_identity: ctx.client_identity.clone(),
+        proxy_id: ctx.proxy_id.clone(),
+    };
+
+    let (response_tx, response_rx) = oneshot::channel();
+
+    ctx.sender
+        .send((request, response_tx))
+        .await
+        .map_err(|_| DaemonError::InternalError("Failed to send browser request".into()))?;
+
+    tokio::time::timeout(Duration::from_secs(30), response_rx)
+        .await
+        .map_err(|_| DaemonError::InternalError("Browser request timed out".into()))?
+        .map_err(|_| DaemonError::InternalError("Response channel closed".into()))
+}
+
+/// Agent tool: begin recording browser interactions to a JSONL trace.
+///
+/// Args (JSON object):
+/// - `goal_hint` (string, optional): Natural-language description of the task.
+///
+/// Returns JSON string: `{"recording_id": "...", "trace_path": "..."}`.
+pub struct StartRecordingTool {
+    ctx: Arc<BrowserContext>,
+}
+
+#[async_trait]
+impl ToolExecutor for StartRecordingTool {
+    async fn execute(&self, _name: &str, arguments: &serde_json::Value) -> Result<String> {
+        // I2: Fail loud if the recording subsystem was never initialised (empty dir
+        // or absent collector).  Producing a relative "rec_xxx.jsonl" path would
+        // silently violate the absolute-path contract.
+        if self.ctx.recordings_dir.as_os_str().is_empty() || self.ctx.recording_collector.is_none()
+        {
+            return Err(DaemonError::InternalError(
+                "Recording subsystem not initialized (no recordings_dir or collector)".into(),
+            ));
+        }
+
+        let goal_hint = arguments
+            .get("goal_hint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Generate a short unique recording ID.
+        // Note: 48-bit prefix of a v4 UUID — negligible collision probability for
+        // typical recording counts per session.
+        let recording_id = format!(
+            "rec_{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        );
+
+        let trace_path = self.ctx.recordings_dir.join(format!("{recording_id}.jsonl"));
+
+        // Tell the browser extension to arm recording; it returns the active tab URL.
+        let params = serde_json::json!({
+            "recording_id": recording_id,
+            "goal_hint": goal_hint,
+        });
+        let response =
+            dispatch_browser_request(&self.ctx, BrowserToolAction::StartRecording, params, None)
+                .await?;
+
+        // I1: If the browser failed to arm (e.g. no active tab), surface the error
+        // immediately — do NOT write a header or return a path for a dead session.
+        if !response.success {
+            let msg = response
+                .error
+                .as_ref()
+                .map(|e| e.message.as_str())
+                .unwrap_or("browser failed to arm recording");
+            return Err(DaemonError::InternalError(format!(
+                "start_recording: {msg}"
+            )));
+        }
+
+        let start_url = response
+            .result
+            .as_ref()
+            .and_then(|r| r.get("start_url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Write the header line into the JSONL trace (only on successful arm).
+        if let Some(collector) = &self.ctx.recording_collector {
+            let epoch_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            collector.ingest(
+                recording_id.clone(),
+                serde_json::json!({
+                    "type": "header",
+                    "recording_id": recording_id,
+                    "created_at": epoch_ms,
+                    "start_url": start_url,
+                    "goal_hint": goal_hint,
+                }),
+            );
+        }
+
+        Ok(serde_json::json!({
+            "recording_id": recording_id,
+            "trace_path": trace_path.display().to_string(),
+        })
+        .to_string())
+    }
+}
+
+/// Agent tool: stop an in-progress browser interaction recording.
+///
+/// Args (JSON object):
+/// - `recording_id` (string, required): ID of the session to stop.
+///
+/// Returns JSON string: `{"status": "stopped", "recording_id": "..."}`.
+pub struct StopRecordingTool {
+    ctx: Arc<BrowserContext>,
+}
+
+#[async_trait]
+impl ToolExecutor for StopRecordingTool {
+    async fn execute(&self, _name: &str, arguments: &serde_json::Value) -> Result<String> {
+        let recording_id = arguments
+            .get("recording_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                DaemonError::InternalError("Missing required argument 'recording_id'".into())
+            })?
+            .to_string();
+
+        let params = serde_json::json!({ "recording_id": recording_id });
+        let response =
+            dispatch_browser_request(&self.ctx, BrowserToolAction::StopRecording, params, None)
+                .await?;
+
+        // I3: Surface disarm failures — don't report a clean stop when the
+        // browser refused or had no active session for this recording_id.
+        if !response.success {
+            let msg = response
+                .error
+                .as_ref()
+                .map(|e| e.message.as_str())
+                .unwrap_or("browser failed to stop recording");
+            return Err(DaemonError::InternalError(format!(
+                "stop_recording: {msg}"
+            )));
+        }
+
+        Ok(serde_json::json!({
+            "status": "stopped",
+            "recording_id": recording_id,
+        })
+        .to_string())
+    }
+}
+
+/// Dispatch a Record & Replay tool (`start_recording` / `stop_recording`) by
+/// name against a `BrowserContext`.
+///
+/// These tools are daemon-orchestrated (they mint the recording id, write the
+/// JSONL header through the [`crate::recording::RecordingCollector`] on the
+/// context, and dispatch a `recording_start`/`recording_stop` BrowserRequest),
+/// so they cannot go through the generic single-shot browser-tool path. This
+/// helper is the single entry point shared by every runtime path that needs
+/// them:
+/// - the ACP / MCP-HTTP-bridge path (`wasm::mcp_tool_executor::execute_mcp_tool`),
+///   used by `provider = "claude-code"` and other external agents;
+/// - the direct-API path (`agent_host::tool_call_dynamic`), used by the
+///   in-process WASM agent for anthropic/openai-direct providers.
+///
+/// The code-mode `ToolRegistry::with_browser` path keeps using the
+/// [`StartRecordingTool`] / [`StopRecordingTool`] executors directly.
+pub async fn dispatch_recording_tool(
+    name: &str,
+    arguments: &serde_json::Value,
+    ctx: BrowserContext,
+) -> Result<String> {
+    let ctx = Arc::new(ctx);
+    match name {
+        "start_recording" => StartRecordingTool { ctx }.execute(name, arguments).await,
+        "stop_recording" => StopRecordingTool { ctx }.execute(name, arguments).await,
+        other => Err(DaemonError::InternalError(format!(
+            "dispatch_recording_tool: unknown recording tool '{other}'"
+        ))),
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1614,6 +1853,8 @@ mod tests {
             proxy_id: String::new(),
             client_identity: vec![],
             asset_server: None,
+            recording_collector: None,
+            recordings_dir: std::path::PathBuf::new(),
         });
         let names = registry.tool_names();
 
@@ -1661,6 +1902,10 @@ mod tests {
 
         // User interaction
         assert!(names.contains(&"browser_ask_user"));
+
+        // Record & Replay tools
+        assert!(names.contains(&"start_recording"));
+        assert!(names.contains(&"stop_recording"));
     }
 
     #[tokio::test]
@@ -1671,6 +1916,8 @@ mod tests {
             proxy_id: String::new(),
             client_identity: vec![],
             asset_server: None,
+            recording_collector: None,
+            recordings_dir: std::path::PathBuf::new(),
         });
         let stubs = registry.to_python_stubs();
 
@@ -1688,6 +1935,8 @@ mod tests {
             proxy_id: String::new(),
             client_identity: vec![],
             asset_server: None,
+            recording_collector: None,
+            recordings_dir: std::path::PathBuf::new(),
         });
         let summary = registry.tool_categories_summary();
 
@@ -1784,6 +2033,8 @@ mod tests {
             proxy_id: String::new(),
             client_identity: vec![],
             asset_server: None,
+            recording_collector: None,
+            recordings_dir: std::path::PathBuf::new(),
         });
         let mappings = registry.param_mappings();
 
@@ -2425,6 +2676,8 @@ mod tests {
             proxy_id: "test-proxy".into(),
             client_identity: b"test-proxy".to_vec(),
             asset_server: Some(asset_server.clone()),
+            recording_collector: None,
+            recordings_dir: std::path::PathBuf::new(),
         });
         let tool = BrowserTool {
             ctx,
@@ -2510,6 +2763,8 @@ mod tests {
             proxy_id: "p".into(),
             client_identity: b"p".to_vec(),
             asset_server: None,
+            recording_collector: None,
+            recordings_dir: std::path::PathBuf::new(),
         });
         let tool = BrowserTool {
             ctx,
@@ -2526,5 +2781,55 @@ mod tests {
             .await
             .expect_err("must fail when AssetServer is missing");
         assert!(err.to_string().contains("AssetServer is not running"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Recording tool unit tests
+    // -------------------------------------------------------------------------
+
+    /// C1: BrowserToolAction::StartRecording/StopRecording must serialise to
+    /// the strings background.js dispatches on ("recording_start"/"recording_stop"),
+    /// NOT the snake_case derived from the variant names ("start_recording"/"stop_recording").
+    #[test]
+    fn test_recording_action_serde_rename() {
+        use nevoflux_protocol::BrowserToolAction;
+
+        let start = serde_json::to_value(BrowserToolAction::StartRecording).unwrap();
+        assert_eq!(
+            start,
+            serde_json::Value::String("recording_start".into()),
+            "StartRecording must serialise to \"recording_start\""
+        );
+
+        let stop = serde_json::to_value(BrowserToolAction::StopRecording).unwrap();
+        assert_eq!(
+            stop,
+            serde_json::Value::String("recording_stop".into()),
+            "StopRecording must serialise to \"recording_stop\""
+        );
+    }
+
+    /// I2: StartRecordingTool must return an error when recordings_dir is empty
+    /// (subsystem not initialised) rather than silently producing a relative path.
+    #[tokio::test]
+    async fn test_start_recording_fails_without_subsystem() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let ctx = Arc::new(BrowserContext {
+            sender: tx,
+            proxy_id: String::new(),
+            client_identity: vec![],
+            asset_server: None,
+            recording_collector: None,        // subsystem absent
+            recordings_dir: std::path::PathBuf::new(), // empty
+        });
+        let tool = StartRecordingTool { ctx };
+        let err = tool
+            .execute("start_recording", &serde_json::json!({}))
+            .await
+            .expect_err("must fail when recording subsystem is not initialized");
+        assert!(
+            err.to_string().contains("not initialized"),
+            "error should mention 'not initialized', got: {err}"
+        );
     }
 }

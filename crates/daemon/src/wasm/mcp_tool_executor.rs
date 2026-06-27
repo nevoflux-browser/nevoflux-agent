@@ -358,6 +358,24 @@ pub async fn execute_mcp_tool(
         return execute_browser_tool(action, arguments, &browser_ctx).await;
     }
 
+    // 1'. Record & Replay tools (start_recording / stop_recording).
+    //
+    // Daemon-orchestrated: they mint the recording_id, write the JSONL header
+    // through the RecordingCollector on the BrowserContext, and dispatch a
+    // recording_start/recording_stop BrowserRequest. They are intentionally NOT
+    // in `tool_name_to_browser_action` (which only maps single-shot browser
+    // actions), so they need their own arm. ACP-bridge providers (claude-code,
+    // gemini-cli, ...) reach this branch; the direct-API path mirrors it via
+    // `agent_host::tool_call_dynamic`. Both delegate to the same helper.
+    if name == "start_recording" || name == "stop_recording" {
+        let browser_ctx = services
+            .browser_context()
+            .ok_or_else(|| "browser not available".to_string())?;
+        return crate::agent::tools::dispatch_recording_tool(name, arguments, browser_ctx)
+            .await
+            .map_err(|e| e.to_string());
+    }
+
     // 2. Computer Use tools
     if name.starts_with("computer_") {
         return execute_computer_tool(name, arguments, services).await;
@@ -1830,6 +1848,9 @@ async fn execute_skill_load(
     let name = args["name"]
         .as_str()
         .ok_or_else(|| "missing 'name' argument".to_string())?;
+    // Lazily rescan once on a miss so a skill created this session (e.g. by
+    // skill-creator) is loadable without a daemon restart.
+    services.ensure_skill_or_reload(name).await;
     let skills = services.skills.read().await;
     match skills.get(name) {
         Some(skill) => {
