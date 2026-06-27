@@ -1777,6 +1777,37 @@ impl ToolExecutor for StopRecordingTool {
     }
 }
 
+/// Dispatch a Record & Replay tool (`start_recording` / `stop_recording`) by
+/// name against a `BrowserContext`.
+///
+/// These tools are daemon-orchestrated (they mint the recording id, write the
+/// JSONL header through the [`crate::recording::RecordingCollector`] on the
+/// context, and dispatch a `recording_start`/`recording_stop` BrowserRequest),
+/// so they cannot go through the generic single-shot browser-tool path. This
+/// helper is the single entry point shared by every runtime path that needs
+/// them:
+/// - the ACP / MCP-HTTP-bridge path (`wasm::mcp_tool_executor::execute_mcp_tool`),
+///   used by `provider = "claude-code"` and other external agents;
+/// - the direct-API path (`agent_host::tool_call_dynamic`), used by the
+///   in-process WASM agent for anthropic/openai-direct providers.
+///
+/// The code-mode `ToolRegistry::with_browser` path keeps using the
+/// [`StartRecordingTool`] / [`StopRecordingTool`] executors directly.
+pub async fn dispatch_recording_tool(
+    name: &str,
+    arguments: &serde_json::Value,
+    ctx: BrowserContext,
+) -> Result<String> {
+    let ctx = Arc::new(ctx);
+    match name {
+        "start_recording" => StartRecordingTool { ctx }.execute(name, arguments).await,
+        "stop_recording" => StopRecordingTool { ctx }.execute(name, arguments).await,
+        other => Err(DaemonError::InternalError(format!(
+            "dispatch_recording_tool: unknown recording tool '{other}'"
+        ))),
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

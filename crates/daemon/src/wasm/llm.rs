@@ -4153,7 +4153,10 @@ async fn apply_acp_skill_command(
     };
 
     // Resolve the skill + its convention dependencies, cloning owned strings so
-    // we don't hold the registry lock while mutating the request.
+    // we don't hold the registry lock while mutating the request. Lazily rescan
+    // once on a miss so a skill created this session (e.g. by skill-creator)
+    // resolves without a daemon restart.
+    services.ensure_skill_or_reload(&name).await;
     let (skill_body, conventions) = {
         let registry = services.skills.read().await;
         let Some(skill) = registry.get(&name) else {

@@ -2359,6 +2359,12 @@ The following skill instructions MUST be followed exactly. These instructions ta
             "loop_scratchpad_set" => self.host.tool_loop_scratchpad_set(
                 &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
             )?,
+            // Record & Replay (agent mode) — daemon-orchestrated via
+            // tool_call_dynamic (mirrors the browser_input dispatch pattern).
+            // The MCP/ACP path handles these in mcp_tool_executor instead.
+            "start_recording" | "stop_recording" => self
+                .host
+                .tool_call_dynamic(&tool_call.name, &tool_call.arguments)?,
             _ => {
                 format!("Unknown tool: {}", tool_call.name)
             }
@@ -4785,6 +4791,41 @@ comprehensions, f-strings, lambda, asyncio.gather\n\
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {}
+            }),
+        });
+
+        // Record & Replay tools (agent-mode only). The skill-creator agent
+        // drives a "demonstrate a workflow → skill" recording with these: arm
+        // the passive recorder on the active tab, let the user demonstrate, then
+        // disarm and read the JSONL trace. Daemon-orchestrated — see
+        // `daemon::agent::tools::dispatch_recording_tool`. Intentionally NOT in
+        // browser/chat mode so replay runs never see them.
+        tools.push(ToolDefinition {
+            name: "start_recording".into(),
+            description: "Arm the passive browser-interaction recorder on the active tab to capture a user demonstration. Use this when the user wants to *show* you a workflow (instead of describing it) so you can turn it into a recorded skill. Returns {recording_id, trace_path}: trace_path is the ABSOLUTE path to a JSONL trace you read after stop_recording. After calling, tell the user to perform the workflow in the page and to say when they are done; then call stop_recording.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "goal_hint": {
+                        "type": "string",
+                        "description": "One-line natural-language description of the task being demonstrated (stored in the trace header)."
+                    }
+                }
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "stop_recording".into(),
+            description: "Disarm the browser-interaction recorder for an in-progress recording. Call this when the user says they are done demonstrating (e.g. \"录制完成\" / \"done\" / \"stop recording\"). Pass the recording_id returned by start_recording. After it returns, read the trace_path JSONL to build the skill.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "recording_id": {
+                        "type": "string",
+                        "description": "The recording_id returned by start_recording."
+                    }
+                },
+                "required": ["recording_id"]
             }),
         });
 
