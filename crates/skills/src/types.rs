@@ -33,28 +33,57 @@ pub struct SkillMetadata {
     #[serde(default)]
     pub author: Option<String>,
     /// Tags for categorization.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_seq")]
     pub tags: Vec<String>,
     /// Whether this skill is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Skills this depends on.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_seq")]
     pub dependencies: Vec<String>,
     /// Trigger patterns (when to auto-suggest this skill).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_seq")]
     pub triggers: Vec<String>,
     /// Custom data.
     #[serde(default)]
     pub extra: serde_json::Value,
     /// Tools this skill depends on. Supports glob patterns (e.g., "stitch*:*", "Read").
     /// If specified, the skill will only be injected if these tools are available.
-    #[serde(default, alias = "allowed-tools")]
+    #[serde(
+        default,
+        alias = "allowed-tools",
+        deserialize_with = "deserialize_string_or_seq"
+    )]
     pub allowed_tools: Vec<String>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Deserialize a `Vec<String>` from either a YAML sequence (`[a, b]` or a block
+/// list) or a single bare string (`field: value`).
+///
+/// LLM-authored skill frontmatter — e.g. produced by skill-creator from a
+/// recording — frequently writes a bare string such as `allowed_tools:
+/// browser_*` instead of the sequence `allowed_tools: [browser_*]`. With a
+/// strict `Vec<String>` that fails to parse and the whole skill is silently
+/// dropped at load time. Accepting both forms makes the loader tolerant of the
+/// common mistake.
+fn deserialize_string_or_seq<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrSeq {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match StringOrSeq::deserialize(deserializer)? {
+        StringOrSeq::One(s) => vec![s],
+        StringOrSeq::Many(v) => v,
+    })
 }
 
 impl Default for SkillMetadata {
