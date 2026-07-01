@@ -60,6 +60,14 @@ pub async fn spawn_and_supervise(
     if let Some(display) = &cfg.display {
         cmd.env("DISPLAY", display);
     }
+    // The native-messaging proxy is spawned by the browser and inherits its env.
+    // NEVOFLUX_PROXY_ROLE=browser makes the proxy declare role:"browser" so the
+    // daemon registers it as the automation target (P2 T5). Propagate
+    // NEVOFLUX_DATA_DIR (if set) so the proxy discovers THIS daemon's port file.
+    cmd.env("NEVOFLUX_PROXY_ROLE", "browser");
+    if let Ok(data_dir) = std::env::var("NEVOFLUX_DATA_DIR") {
+        cmd.env("NEVOFLUX_DATA_DIR", data_dir);
+    }
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
     let child = cmd.spawn()?;
 

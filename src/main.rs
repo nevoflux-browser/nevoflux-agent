@@ -627,7 +627,7 @@ async fn run_daemon(
     let mut config = nevoflux_daemon::ServerConfig {
         trace_enabled,
         managed,
-        data_dir: Some(data_dir),
+        data_dir: Some(data_dir.clone()),
         explicit_port: port,
         ..Default::default()
     };
@@ -650,6 +650,17 @@ async fn run_daemon(
     // tasks report not-yet-wired. The daemon still routes browser_* tools to a
     // registered browser via the P2 binding once the leaf runs them.
     if headless {
+        // E2E bug #2 fix: the browser we spawn launches a native-messaging proxy
+        // that, in prod mode, discovers a daemon via `daemon-managed.port`. Write
+        // it with THIS daemon's port so the proxy connects BACK to us instead of
+        // spawning its own managed daemon (which would hold the browser in a
+        // different daemon than the one running the task).
+        let managed_port_file = data_dir.join("daemon-managed.port");
+        if let Err(e) = std::fs::write(&managed_port_file, port.to_string()) {
+            tracing::warn!("headless: failed to write daemon-managed.port: {}", e);
+        } else {
+            tracing::info!("headless: wrote daemon-managed.port={} for proxy connect-back", port);
+        }
         if let Some(addr) = http_addr {
             use std::sync::Arc;
             // Real runner: clone profile → spawn browser → bind → run agent →
