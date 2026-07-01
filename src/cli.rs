@@ -65,6 +65,15 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub managed: bool,
 
+    /// Run the daemon in headless automation mode: spawn a browser and serve the
+    /// task HTTP API. Requires --daemon. (P4)
+    #[arg(long)]
+    pub headless: bool,
+
+    /// HTTP bind address for the task API in headless mode (e.g. 0.0.0.0:8080)
+    #[arg(long)]
+    pub http_addr: Option<std::net::SocketAddr>,
+
     /// Subcommand to execute
     #[command(subcommand)]
     pub command: Option<Commands>,

@@ -683,6 +683,14 @@ impl HostServices {
         self
     }
 
+    /// Route `browser_*` tools to an explicitly-bound browser (headless model),
+    /// instead of the chat sender. Sets the same routing fields as
+    /// [`with_client_context`](Self::with_client_context) from a
+    /// [`BrowserEntry`](crate::registry::BrowserEntry).
+    pub fn with_bound_browser(self, entry: &crate::registry::BrowserEntry) -> Self {
+        self.with_client_context(entry.client_identity.clone(), entry.proxy_id.clone())
+    }
+
     /// Set session ID for session-scoped operations (e.g. artifact creation).
     pub fn with_session_id(mut self, session_id: String) -> Self {
         self.session_id = session_id;
@@ -945,6 +953,22 @@ mod tests {
         // Verify services are accessible
         assert!(Arc::strong_count(&services.database) >= 1);
         assert!(Arc::strong_count(&services.skills) >= 1);
+    }
+
+    #[test]
+    fn with_bound_browser_sets_routing_identity() {
+        use crate::registry::BrowserEntry;
+        use std::time::Instant;
+        let db = Arc::new(Database::open_in_memory().expect("in-memory db"));
+        let entry = BrowserEntry {
+            proxy_id: "proxy-b1".into(),
+            client_identity: b"proxy-b1".to_vec(),
+            registered_at: Instant::now(),
+            last_heartbeat: Instant::now(),
+        };
+        let svc = HostServices::new(db).with_bound_browser(&entry);
+        assert_eq!(svc.proxy_id, "proxy-b1");
+        assert_eq!(svc.client_identity, b"proxy-b1".to_vec());
     }
 
     #[test]

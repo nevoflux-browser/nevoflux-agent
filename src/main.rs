@@ -542,6 +542,7 @@ fn spawn_force_exit_watchdog(grace: std::time::Duration) {
 }
 
 /// Run the daemon.
+#[allow(clippy::too_many_arguments)]
 async fn run_daemon(
     verbose: bool,
     trace: bool,
@@ -549,6 +550,8 @@ async fn run_daemon(
     port_end: Option<u16>,
     port: Option<u16>,
     managed: bool,
+    headless: bool,
+    http_addr: Option<std::net::SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Ensure data directory exists first — managed daemons need it for the
     // log file, and SessionManager needs it for the database. This must
@@ -640,6 +643,51 @@ async fn run_daemon(
     let port = server.port();
 
     tracing::info!("Daemon started on port {} (managed={})", port, managed);
+
+    // Headless automation mode (P4): serve the task HTTP API. The queue/router/
+    // metrics are real (unit-tested); task *execution* (the browser-driving
+    // session-runner leaf) is the browser-gated piece — until it lands, submitted
+    // tasks report not-yet-wired. The daemon still routes browser_* tools to a
+    // registered browser via the P2 binding once the leaf runs them.
+    if headless {
+        if let Some(addr) = http_addr {
+            use std::sync::Arc;
+            // Real runner: clone profile → spawn browser → bind → run agent →
+            // drain, with taint-gated retry. Falls back to a stub if the daemon
+            // context or NEVOFLUX_BROWSER_BIN isn't available yet.
+            let runner: nevoflux_daemon::http::queue::Runner = nevoflux_daemon::automation::build_headless_runner()
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        "headless runner context not ready (set NEVOFLUX_BROWSER_BIN); serving stub"
+                    );
+                    Arc::new(|id, _req| {
+                        Box::pin(async move {
+                            nevoflux_daemon::http::types::TaskResponse {
+                                id,
+                                status: nevoflux_daemon::http::types::TaskStatus::Failed,
+                                attempts: 1,
+                                output: None,
+                                error: Some("headless runner context unavailable".into()),
+                                artifacts: Vec::new(),
+                            }
+                        })
+                    })
+                });
+            let state = nevoflux_daemon::http::router::AppState {
+                queue: Arc::new(nevoflux_daemon::http::queue::TaskQueue::new(runner)),
+                metrics: Arc::new(nevoflux_daemon::http::metrics::Metrics::default()),
+            };
+            let app = nevoflux_daemon::http::router::router(state);
+            tokio::spawn(async move {
+                tracing::info!("Headless task API listening on {}", addr);
+                if let Err(e) = nevoflux_daemon::http::router::serve(addr, app).await {
+                    tracing::error!("Headless task API server error: {}", e);
+                }
+            });
+        } else {
+            tracing::warn!("--headless without --http-addr: task API not served");
+        }
+    }
 
     // Wait for shutdown signal
     tokio::signal::ctrl_c().await?;
@@ -1099,6 +1147,8 @@ async fn main() {
             cli.port_end,
             cli.port,
             cli.managed,
+            cli.headless,
+            cli.http_addr,
         )
         .await
         {

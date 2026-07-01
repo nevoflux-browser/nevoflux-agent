@@ -146,11 +146,12 @@ impl DaemonClient {
         let reader = BufReader::new(read_half);
         let mut writer = BufWriter::new(write_half);
 
-        // Send registration frame with proxy_id
-        let registration = serde_json::json!({
-            "type": "register",
-            "proxy_id": self.proxy_id,
-        });
+        // Send registration frame with proxy_id (+ role in automation mode).
+        // The daemon sets NEVOFLUX_PROXY_ROLE=browser before launching the
+        // headless browser; the proxy then declares role:"browser" so the
+        // daemon routes browser_* tools to it (P2).
+        let role = std::env::var("NEVOFLUX_PROXY_ROLE").ok();
+        let registration = build_register_frame(&self.proxy_id, role.as_deref());
         write_message(&mut writer, &registration).await?;
 
         self.reader = Some(reader);
@@ -415,9 +416,31 @@ pub fn generate_proxy_id() -> String {
     format!("proxy-{}", &uuid_str[..8])
 }
 
+/// Build the daemon registration frame. `role` is included only when set
+/// (automation mode passes `Some("browser")`); absent ⇒ headed/control default,
+/// preserving existing behavior.
+pub(crate) fn build_register_frame(proxy_id: &str, role: Option<&str>) -> serde_json::Value {
+    let mut v = serde_json::json!({ "type": "register", "proxy_id": proxy_id });
+    if let Some(r) = role {
+        v["role"] = serde_json::Value::String(r.to_string());
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_frame_includes_role_when_set() {
+        let with = build_register_frame("p1", Some("browser"));
+        assert_eq!(with["type"], "register");
+        assert_eq!(with["proxy_id"], "p1");
+        assert_eq!(with["role"], "browser");
+        let without = build_register_frame("p2", None);
+        assert_eq!(without["proxy_id"], "p2");
+        assert!(without.get("role").is_none());
+    }
 
     #[test]
     fn test_generate_proxy_id() {

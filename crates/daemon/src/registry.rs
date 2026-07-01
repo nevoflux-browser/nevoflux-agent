@@ -119,6 +119,143 @@ impl ProxyRegistry {
     }
 }
 
+/// A registered browser connection (declared `role:"browser"` at registration),
+/// addressable for `browser_*` tool routing independently of who sent the chat.
+/// In the headless automation model there is exactly one browser per daemon.
+#[derive(Debug, Clone)]
+pub struct BrowserEntry {
+    /// Proxy ID of the browser's connection.
+    pub proxy_id: String,
+    /// Routing identity bytes (proxy_id as UTF-8).
+    pub client_identity: Vec<u8>,
+    /// When the browser registered.
+    pub registered_at: Instant,
+    /// Last heartbeat.
+    pub last_heartbeat: Instant,
+}
+
+/// Error resolving a browser binding.
+#[derive(Debug, thiserror::Error)]
+pub enum BrowserBindError {
+    /// No browser has registered.
+    #[error("no browser registered")]
+    NoBrowser,
+    /// More than one browser is registered (headless model expects exactly one).
+    #[error("ambiguous browser binding: {0} browsers registered")]
+    Ambiguous(usize),
+    /// Timed out waiting for a browser to register.
+    #[error("timed out waiting for a browser to register")]
+    Timeout,
+}
+
+/// Registry of connections that declared `role:"browser"`. Distinct from
+/// [`ProxyRegistry`] (which tracks all proxies) and [`SessionProxyTracker`]
+/// (the `/loop` borrow hack): this is the explicit routing target for
+/// `browser_*` tools in headless/automation sessions.
+pub struct BrowserRegistry {
+    browsers: RwLock<HashMap<String, BrowserEntry>>,
+}
+
+impl Default for BrowserRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BrowserRegistry {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self {
+            browsers: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Record a browser connection.
+    pub fn register(&self, proxy_id: impl Into<String>, client_identity: Vec<u8>) {
+        let proxy_id = proxy_id.into();
+        let now = Instant::now();
+        self.browsers.write().unwrap().insert(
+            proxy_id.clone(),
+            BrowserEntry {
+                proxy_id,
+                client_identity,
+                registered_at: now,
+                last_heartbeat: now,
+            },
+        );
+    }
+
+    /// Remove a browser connection (on disconnect).
+    pub fn unregister(&self, proxy_id: &str) -> Option<BrowserEntry> {
+        self.browsers.write().unwrap().remove(proxy_id)
+    }
+
+    /// Number of registered browsers.
+    pub fn count(&self) -> usize {
+        self.browsers.read().unwrap().len()
+    }
+
+    /// Resolve the single registered browser (headless model: exactly one).
+    pub fn single(&self) -> Result<BrowserEntry, BrowserBindError> {
+        let map = self.browsers.read().unwrap();
+        match map.len() {
+            0 => Err(BrowserBindError::NoBrowser),
+            1 => Ok(map.values().next().unwrap().clone()),
+            n => Err(BrowserBindError::Ambiguous(n)),
+        }
+    }
+
+    /// Wait until at least one browser is registered, then resolve it.
+    /// Returns [`BrowserBindError::Timeout`] if none registers in `timeout`.
+    pub async fn wait_for_browser(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<BrowserEntry, BrowserBindError> {
+        let start = Instant::now();
+        loop {
+            match self.single() {
+                Ok(e) => return Ok(e),
+                Err(BrowserBindError::NoBrowser) if start.elapsed() < timeout => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(BrowserBindError::NoBrowser) => return Err(BrowserBindError::Timeout),
+                Err(other) => return Err(other),
+            }
+        }
+    }
+}
+
+/// Process-global handle to the daemon's [`BrowserRegistry`], set once at
+/// startup so the automation session runner (which runs off the task path,
+/// not the connection handler) can resolve the bound browser. Mirrors
+/// `crate::loops::CURRENT_LOOP_MANAGER`.
+pub static CURRENT_BROWSER_REGISTRY: std::sync::OnceLock<std::sync::Arc<BrowserRegistry>> =
+    std::sync::OnceLock::new();
+
+/// Role a connecting proxy declares in its registration frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterRole {
+    /// The headless browser (its `browser_*` tools are the automation target).
+    Browser,
+    /// A control/sidebar client (the default when `role` is absent).
+    Control,
+}
+
+/// Parse a registration frame into `(proxy_id, role)`. Absent `role` ⇒ Control,
+/// preserving headed behavior. Returns `None` for a non-register / malformed frame.
+pub fn parse_register_frame(data: &[u8]) -> Option<(String, RegisterRole)> {
+    let val: serde_json::Value = serde_json::from_slice(data).ok()?;
+    if val.get("type").and_then(|t| t.as_str()) != Some("register") {
+        return None;
+    }
+    let proxy_id = val.get("proxy_id").and_then(|v| v.as_str())?.to_string();
+    let role = match val.get("role").and_then(|v| v.as_str()) {
+        Some("browser") => RegisterRole::Browser,
+        _ => RegisterRole::Control,
+    };
+    Some((proxy_id, role))
+}
+
 /// Tracks the most-recently-active sidebar proxy per session_id, so that
 /// `/loop` iterations can borrow a connected sidebar to fulfill `browser_*`
 /// tool calls. Iterations themselves have `proxy_id=""` (no inbound chat
@@ -457,5 +594,39 @@ mod tests {
 
         assert_eq!(removed.len(), 2);
         assert_eq!(registry.active_count(), 1);
+    }
+
+    #[test]
+    fn browser_registry_single_ok_and_ambiguous() {
+        let r = BrowserRegistry::new();
+        assert!(matches!(r.single(), Err(BrowserBindError::NoBrowser)));
+        r.register("proxy-b1", b"proxy-b1".to_vec());
+        let e = r.single().expect("one browser");
+        assert_eq!(e.proxy_id, "proxy-b1");
+        assert_eq!(e.client_identity, b"proxy-b1".to_vec());
+        r.register("proxy-b2", b"proxy-b2".to_vec());
+        assert!(matches!(r.single(), Err(BrowserBindError::Ambiguous(2))));
+        r.unregister("proxy-b2");
+        assert_eq!(r.single().unwrap().proxy_id, "proxy-b1");
+        assert_eq!(r.count(), 1);
+    }
+
+    #[test]
+    fn register_frame_role_parse() {
+        let browser = br#"{"type":"register","proxy_id":"p1","role":"browser"}"#;
+        let control = br#"{"type":"register","proxy_id":"p2"}"#;
+        assert_eq!(
+            parse_register_frame(browser),
+            Some(("p1".to_string(), RegisterRole::Browser))
+        );
+        assert_eq!(
+            parse_register_frame(control),
+            Some(("p2".to_string(), RegisterRole::Control))
+        );
+        assert_eq!(parse_register_frame(b"not json"), None);
+        assert_eq!(
+            parse_register_frame(br#"{"type":"hello","proxy_id":"p3"}"#),
+            None
+        );
     }
 }

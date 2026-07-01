@@ -475,28 +475,17 @@ async fn handle_proxy_connection(
     msg_tx: mpsc::Sender<(Vec<u8>, ProxyEnvelope)>,
     writers: Arc<Mutex<HashMap<String, BufWriter<tokio::net::tcp::OwnedWriteHalf>>>>,
     last_message_time: Arc<Mutex<std::time::Instant>>,
+    browser_registry: Arc<crate::registry::BrowserRegistry>,
 ) {
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    // Read registration frame: { "type": "register", "proxy_id": "proxy-xxx" }
-    let proxy_id = match read_length_prefixed_message(&mut reader).await {
-        Ok(data) => match serde_json::from_slice::<serde_json::Value>(&data) {
-            Ok(val) => {
-                if val.get("type").and_then(|t| t.as_str()) == Some("register") {
-                    if let Some(id) = val.get("proxy_id").and_then(|v| v.as_str()) {
-                        id.to_string()
-                    } else {
-                        error!("Registration frame missing proxy_id");
-                        return;
-                    }
-                } else {
-                    error!("First frame is not a registration frame");
-                    return;
-                }
-            }
-            Err(e) => {
-                error!("Failed to parse registration frame: {}", e);
+    // Read registration frame: { "type": "register", "proxy_id": "...", "role"?: "browser" }
+    let (proxy_id, role) = match read_length_prefixed_message(&mut reader).await {
+        Ok(data) => match crate::registry::parse_register_frame(&data) {
+            Some(pr) => pr,
+            None => {
+                error!("Invalid or non-registration first frame");
                 return;
             }
         },
@@ -517,6 +506,13 @@ async fn handle_proxy_connection(
 
     // Identity bytes (proxy_id encoded as UTF-8) for compatibility with existing pipeline
     let identity = proxy_id.as_bytes().to_vec();
+
+    // Track browsers so `browser_*` tools can be routed to an explicitly-bound
+    // browser (headless automation) rather than the chat sender (see P2/Q2-Q3).
+    if role == crate::registry::RegisterRole::Browser {
+        browser_registry.register(proxy_id.clone(), identity.clone());
+        info!("Browser registered: {}", proxy_id);
+    }
 
     // Read loop: read length-prefixed JSON frames
     loop {
@@ -551,6 +547,7 @@ async fn handle_proxy_connection(
 
     // Clean up writer
     writers.lock().await.remove(&proxy_id);
+    browser_registry.unregister(&proxy_id);
 
     // Notify the message loop about the disconnect so EventBus subscriptions
     // belonging to this proxy can be cleaned up.
@@ -1515,6 +1512,16 @@ pub async fn start_server(
     // to fulfill browser_* tool calls.
     let session_proxy_tracker = Arc::new(crate::registry::SessionProxyTracker::new());
 
+    // Registry of role="browser" connections — the explicit routing target for
+    // `browser_*` tools in headless/automation sessions (P2). Populated by
+    // `handle_proxy_connection` on connect/disconnect. (Named `available_browsers`
+    // to avoid shadowing the existing `browser_registry` request-response map.)
+    let available_browsers = Arc::new(crate::registry::BrowserRegistry::new());
+    // Expose it process-globally so the automation session runner (P3) can
+    // resolve the bound browser off the task path (see ADJ-2). Ignore if
+    // already set (e.g. a second daemon in tests).
+    let _ = crate::registry::CURRENT_BROWSER_REGISTRY.set(available_browsers.clone());
+
     let mut services = HostServices::with_skills(Arc::new(db.clone()), shared_skills)
         .with_browser_sender(browser_tx)
         .with_mcp_manager(mcp_manager)
@@ -1527,6 +1534,11 @@ pub async fn start_server(
         .with_agent_config(agent_config.read().unwrap().clone())
         .with_runtime_handle(tokio::runtime::Handle::current())
         .with_session_proxy_tracker(session_proxy_tracker.clone());
+
+    // Snapshot the services as a template for the headless automation runner
+    // (P4). It carries the leaf-relevant fields (agent_config, runtime_handle,
+    // browser_sender) set above; the runner builds per-task agent hosts from it.
+    let _ = crate::automation::CURRENT_SERVICES_TEMPLATE.set(services.clone());
 
     // Construct the /loop skill's LoopManager and inject into HostServices
     // so the loop_* tool dispatcher (mcp_tool_executor + future direct-API
@@ -1746,6 +1758,7 @@ pub async fn start_server(
 
     // TCP accept loop: accepts connections and spawns per-connection reader tasks
     let accept_writers = writers.clone();
+    let accept_browser_registry = available_browsers.clone();
     let config_managed = config.managed;
     let config_idle_timeout = config.idle_timeout;
     let accept_shutdown_tx = shutdown_tx.clone();
@@ -1786,9 +1799,17 @@ pub async fn start_server(
                             let msg_tx = msg_tx.clone();
                             let conn_writers = accept_writers.clone();
                             let last_msg = last_message_time.clone();
+                            let conn_browser_registry = accept_browser_registry.clone();
 
                             tokio::spawn(async move {
-                                handle_proxy_connection(stream, msg_tx, conn_writers, last_msg).await;
+                                handle_proxy_connection(
+                                    stream,
+                                    msg_tx,
+                                    conn_writers,
+                                    last_msg,
+                                    conn_browser_registry,
+                                )
+                                .await;
                             });
                         }
                         Err(e) => {
