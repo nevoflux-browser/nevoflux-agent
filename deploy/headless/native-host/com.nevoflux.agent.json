@@ -1,0 +1,7 @@
+{
+  "name": "com.nevoflux.agent",
+  "description": "NevoFlux agent Chat channel (native messaging host)",
+  "path": "/usr/local/bin/nevoflux-agent",
+  "type": "stdio",
+  "allowed_extensions": ["agent@nevoflux.com"]
+}

@@ -663,10 +663,11 @@ async fn run_daemon(
         }
         if let Some(addr) = http_addr {
             use std::sync::Arc;
+            let metrics = Arc::new(nevoflux_daemon::http::metrics::Metrics::default());
             // Real runner: clone profile → spawn browser → bind → run agent →
             // drain, with taint-gated retry. Falls back to a stub if the daemon
             // context or NEVOFLUX_BROWSER_BIN isn't available yet.
-            let runner: nevoflux_daemon::http::queue::Runner = nevoflux_daemon::automation::build_headless_runner()
+            let runner: nevoflux_daemon::http::queue::Runner = nevoflux_daemon::automation::build_headless_runner(metrics.clone())
                 .unwrap_or_else(|| {
                     tracing::warn!(
                         "headless runner context not ready (set NEVOFLUX_BROWSER_BIN); serving stub"
@@ -686,7 +687,7 @@ async fn run_daemon(
                 });
             let state = nevoflux_daemon::http::router::AppState {
                 queue: Arc::new(nevoflux_daemon::http::queue::TaskQueue::new(runner)),
-                metrics: Arc::new(nevoflux_daemon::http::metrics::Metrics::default()),
+                metrics: metrics.clone(),
             };
             let app = nevoflux_daemon::http::router::router(state);
             tokio::spawn(async move {

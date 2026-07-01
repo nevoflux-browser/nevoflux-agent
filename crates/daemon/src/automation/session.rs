@@ -197,6 +197,8 @@ pub struct AutomationDeps {
     pub display: Option<String>,
     /// Agent mode for the task.
     pub mode: nevoflux_builtin_wasm::AgentMode,
+    /// Per-task workspace dir (drain target for result + debug bundle, P6/Q12).
+    pub workspace: std::path::PathBuf,
 }
 
 /// Run a full task: taint-gated retry over fresh attempts, each of which clones
@@ -209,7 +211,7 @@ pub async fn execute_full_task(
     policy: &Policy,
     task: &str,
 ) -> SessionOutcome {
-    run_with_retry(policy, |attempt| async move {
+    let outcome = run_with_retry(policy, |attempt| async move {
         let clone = match deps.profile_mgr.clone_base(&deps.profile) {
             Ok(c) => c,
             Err(e) => {
@@ -266,7 +268,25 @@ pub async fn execute_full_task(
         deps.profile_mgr.cleanup(&clone);
         result
     })
-    .await
+    .await;
+
+    // P6/Q12 drain: write the task result to the workspace (best-effort, incl.
+    // on failure) so it survives sandbox teardown. Per-step screenshots require
+    // a tool-dispatch hook (follow-up); the result + a bundle manifest land here.
+    let _ = std::fs::create_dir_all(&deps.workspace);
+    let result_json = serde_json::json!({
+        "status": format!("{:?}", outcome.status),
+        "attempts": outcome.attempts,
+        "output": outcome.output,
+        "error": outcome.error,
+    });
+    let _ = std::fs::write(
+        deps.workspace.join("result.json"),
+        serde_json::to_string_pretty(&result_json).unwrap_or_default(),
+    );
+    let _ = crate::automation::bundle::DebugBundle::new().write_to(&deps.workspace);
+
+    outcome
 }
 
 #[cfg(test)]

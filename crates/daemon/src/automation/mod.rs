@@ -36,8 +36,11 @@ fn parse_agent_mode(s: &str) -> nevoflux_builtin_wasm::AgentMode {
 ///
 /// End-to-end behavior is verified against a live browser (phase gate); the
 /// wiring + the pieces it composes are unit-tested.
-pub fn build_headless_runner() -> Option<crate::http::queue::Runner> {
+pub fn build_headless_runner(
+    metrics: std::sync::Arc<crate::http::metrics::Metrics>,
+) -> Option<crate::http::queue::Runner> {
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
     let template = CURRENT_SERVICES_TEMPLATE.get()?.clone();
     let registry = crate::registry::CURRENT_BROWSER_REGISTRY.get()?.clone();
     let browser_bin = PathBuf::from(std::env::var("NEVOFLUX_BROWSER_BIN").ok()?);
@@ -57,7 +60,10 @@ pub fn build_headless_runner() -> Option<crate::http::queue::Runner> {
             let display = display.clone();
             let base_dir = base_dir.clone();
             let work_dir = work_dir.clone();
+            let metrics = metrics.clone();
             Box::pin(async move {
+                metrics.tasks_total.fetch_add(1, Ordering::Relaxed);
+                let workspace = work_dir.join(format!("ws-{}", id));
                 let deps = session::AutomationDeps {
                     profile_mgr: crate::profile::ProfileManager { base_dir, work_dir },
                     profile: req.profile.clone().unwrap_or_else(|| "default".to_string()),
@@ -66,9 +72,13 @@ pub fn build_headless_runner() -> Option<crate::http::queue::Runner> {
                     browser_bin,
                     display,
                     mode: parse_agent_mode(&req.mode),
+                    workspace,
                 };
                 let policy = req.to_policy();
                 let outcome = session::execute_full_task(&deps, &policy, &req.task).await;
+                if outcome.status == crate::http::types::TaskStatus::Failed {
+                    metrics.tasks_failed.fetch_add(1, Ordering::Relaxed);
+                }
                 crate::http::types::TaskResponse {
                     id,
                     status: outcome.status,
