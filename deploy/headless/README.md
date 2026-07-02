@@ -94,14 +94,23 @@ docker run --rm \
 ## Run — service mode (trusted) + observe
 
 ```bash
-docker run --rm -p 8080:8080 -p 5900:5900 \
+docker run --rm -p 8080:8080 -p 6080:6080 -p 5900:5900 \
   -e NEVOFLUX_VNC=1 -e NEVOFLUX_VNC_PASSWD=/etc/nevoflux/vncpasswd \
   nevoflux/headless:latest
 # submit:  curl -X POST localhost:8080/tasks -d '{"task":"...","mode":"browser"}'
-# watch:   curl -N localhost:8080/tasks/<id>/events   (live events)
-#          VNC localhost:5900                          (live browser)
+# watch:   curl -N localhost:8080/tasks/<id>/events        (live task events)
+#          http://localhost:6080/vnc.html                  (live browser in ANY web browser, via noVNC)
+#          VNC localhost:5900                               (or a native VNC client)
 # metrics: curl localhost:8080/metrics
 ```
+
+**Live browser in a web browser (noVNC):** with `NEVOFLUX_VNC=1`, the image runs
+`x11vnc` (raw VNC on `:5900`) *and* `websockify` serving noVNC on `:6080`, so you
+can watch at `http://<host>:6080/vnc.html` with no client install — it just needs
+the VNC password. Add `NEVOFLUX_VNC_VIEWONLY=1` to watch without being able to
+click (avoids interfering with the automation). Keep both ports **off in prod** or
+behind an authenticated HTTPS proxy / SSH tunnel — a raw VNC/noVNC port is a
+remote-control surface.
 
 ## Task API reference
 

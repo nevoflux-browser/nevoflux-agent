@@ -11,10 +11,16 @@ eval "$(dbus-launch --sh-syntax)"
 Xvfb "${DISPLAY}" -screen 0 1280x1024x24 -nolisten tcp &
 for _ in $(seq 1 100); do xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1 && break; sleep 0.1; done
 
-# 3) optional live VNC (default off; NEVOFLUX_VNC=1 + a password file to enable)
+# 3) optional live VNC (default off; NEVOFLUX_VNC=1 + a password file to enable).
+#    Raw VNC on :5900 (native clients) AND noVNC on :6080 (any web browser at
+#    http://<host>:6080/vnc.html). NEVOFLUX_VNC_VIEWONLY=1 to watch without input.
 if [ "${NEVOFLUX_VNC:-0}" = "1" ]; then
+  vnc_ro=""
+  [ "${NEVOFLUX_VNC_VIEWONLY:-0}" = "1" ] && vnc_ro="-viewonly"
   x11vnc -display "${DISPLAY}" -rfbauth "${NEVOFLUX_VNC_PASSWD:-/etc/nevoflux/vncpasswd}" \
-         -forever -shared -bg -rfbport 5900
+         -forever -shared -bg -rfbport 5900 ${vnc_ro}
+  # noVNC: bridge the browser's WebSocket to the VNC TCP port (5900).
+  websockify --web=/usr/share/novnc/ 6080 localhost:5900 &
 fi
 
 # Install packs cloned into the image at build time (Dockerfile ARG PACK_REPOS).

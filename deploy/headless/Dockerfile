@@ -6,7 +6,7 @@ FROM debian:bookworm-slim
 
 # --- system deps: Xvfb (Linux headless display) / x11vnc / dbus / Gecko libs ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      xvfb x11vnc dbus-x11 xauth x11-utils tini ca-certificates git curl unzip \
+      xvfb x11vnc novnc websockify dbus-x11 xauth x11-utils tini ca-certificates git curl unzip \
       libgtk-3-0 libdbus-glib-1-2 libxt6 libasound2 libx11-xcb1 libxtst6 libpci3 \
       fonts-liberation fonts-noto-color-emoji fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*

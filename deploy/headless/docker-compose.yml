@@ -34,7 +34,8 @@ services:
       # - "8081:8081"         # dedicated OpenAI  (POST /v1/chat/completions) — needs --openai-addr
       # - "8082:8082"         # dedicated MCP     (POST /mcp)                  — needs --mcp-addr
       # - "8083:8083"         # dedicated ACP     (POST /acp)                  — needs --acp-addr
-      # - "5900:5900"         # live VNC into Xvfb (only when NEVOFLUX_VNC=1; keep off in prod)
+      # - "6080:6080"         # noVNC in a browser: http://localhost:6080/vnc.html (NEVOFLUX_VNC=1)
+      # - "5900:5900"         # raw VNC for native clients (NEVOFLUX_VNC=1). Keep both off in prod.
     environment:
       # Provider API key. The daemon reads the provider-specific var (ANTHROPIC_API_KEY /
       # OPENAI_API_KEY). Default matches the image's baked [llm].provider = anthropic
@@ -45,8 +46,10 @@ services:
       # Egress boundary (hard control): allowlist LLM API + task domains, deny rest.
       HTTP_PROXY: "${EGRESS_PROXY:-}"
       HTTPS_PROXY: "${EGRESS_PROXY:-}"
-      # Observability: live VNC (default off). Set to 1 + provide a password file to enable.
+      # Observability: live VNC (default off). Set to 1 (+ a password file) to enable
+      # raw VNC on :5900 AND noVNC on :6080 (browser at http://host:6080/vnc.html).
       NEVOFLUX_VNC: "0"
+      # NEVOFLUX_VNC_VIEWONLY: "1"   # watch-only (no input) so you can't disturb the run
       # Logging level (stderr → `docker compose logs`).
       NEVOFLUX_LOG: "info"
       # Fixed-script mode (no LLM): run a deterministic Python flow instead of the
