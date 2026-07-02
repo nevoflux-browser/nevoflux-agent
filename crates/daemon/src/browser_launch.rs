@@ -40,6 +40,67 @@ pub struct BrowserHandle {
     pub child: Child,
 }
 
+impl BrowserHandle {
+    /// Reap the spawned child. On Windows the child is the short-lived *launcher*
+    /// process (it relaunches the real browser as a separate, re-parented tree
+    /// and exits), so killing it by pid is both useless and unsafe (pid reuse) —
+    /// the real teardown is done by [`kill_profile_processes`], which matches the
+    /// unique clone-profile path. Here we only start_kill + wait to close the
+    /// handle and avoid a zombie.
+    pub async fn terminate(&mut self) {
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+    }
+}
+
+/// Kill every process whose command line references `profile_dir` — the browser
+/// launched with that cloned profile plus its content processes. This is the
+/// reliable teardown: the Windows launcher process exits after relaunching the
+/// real browser under a new (soon-orphaned) pid, so pid-based kills miss it, but
+/// the relaunched process still carries `-profile <clone>` on its command line.
+/// A digit boundary keeps `default-5` from also matching `default-50`.
+pub async fn kill_profile_processes(profile_dir: &Path) {
+    let path = profile_dir.to_string_lossy();
+    #[cfg(windows)]
+    {
+        let escaped = path.replace('\'', "''");
+        // -match on an escaped literal path followed by a non-digit (or end).
+        let script = format!(
+            "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -match ([regex]::Escape('{escaped}') + '([^0-9]|$)') }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"
+        );
+        let _ = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    #[cfg(unix)]
+    {
+        // pkill -f matches the pattern (ERE) against the whole command line.
+        let pattern = format!("{}([^0-9]|$)", regex_escape(&path));
+        let _ = Command::new("pkill")
+            .args(["-9", "-f", &pattern])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+}
+
+/// Minimal ERE metacharacter escaping for the Unix `pkill -f` pattern.
+#[cfg(unix)]
+fn regex_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if "\\.^$|?*+()[]{}".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Firefox/Gecko CLI args: dedicated profile, single instance (no remote).
 pub fn browser_launch_args(profile_dir: &Path) -> Vec<String> {
     vec![

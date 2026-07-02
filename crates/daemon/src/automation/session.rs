@@ -337,11 +337,15 @@ pub async fn execute_full_task(
                         error: Some(format!("binding failed: {e}")),
                     },
                 };
-                // Tear down the browser for this attempt (fresh browser per retry).
-                let _ = handle.child.start_kill();
+                // Reap the launcher child for this attempt.
+                handle.terminate().await;
                 outcome
             }
         };
+        // Kill any browser process still holding this clone profile (the launcher
+        // relaunches the real browser under a new pid, so reaping the child isn't
+        // enough), then remove the clone dir. Prevents cross-task process leaks.
+        crate::browser_launch::kill_profile_processes(&clone).await;
         deps.profile_mgr.cleanup(&clone);
         result
     })
