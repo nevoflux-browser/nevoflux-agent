@@ -227,8 +227,10 @@ task string (POST /tasks `task`, OpenAI last user message, MCP `task` arg, ACP
 prompt). Whatever `run` **returns** (or prints) becomes the interface `output`; a
 raised exception → `status:"failed"` + the error. It uses the same browser tools as
 the agent (in the sandboxed Monty interpreter), driving the *bound* headless
-browser — but with **zero LLM calls and no API key**. Template:
-[`examples/fixed-flow.py`](examples/fixed-flow.py).
+browser — but with **zero LLM calls and no API key**. Templates:
+[`examples/fixed-flow.py`](examples/fixed-flow.py) (basic navigate→fill→click→read)
+and [`examples/fixed-flow-advanced.py`](examples/fixed-flow-advanced.py) (multi-step
+pagination + `try/except` + always returns a structured `{ok, ...}` dict).
 
 ```python
 def run(task):
