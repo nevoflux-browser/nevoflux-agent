@@ -75,6 +75,60 @@ impl TaskRequest {
             no_retry: self.no_retry,
         }
     }
+
+    /// Build a request for `task`, filling every other field from environment
+    /// variables. Used by the thin front-ends (OpenAI-compatible / MCP / ACP)
+    /// that only carry a prompt — mode / profile / policy / caps come from
+    /// `NEVOFLUX_TASK_*` and `NEVOFLUX_POLICY_*`:
+    ///
+    /// | env var | field | default |
+    /// |---|---|---|
+    /// | `NEVOFLUX_TASK_MODE` | mode | `browser` |
+    /// | `NEVOFLUX_TASK_PROFILE` | profile | none |
+    /// | `NEVOFLUX_POLICY_ALLOW_SHELL` | policy.allow_shell | false |
+    /// | `NEVOFLUX_POLICY_ALLOW_FS_WRITE` | policy.allow_fs_write | false |
+    /// | `NEVOFLUX_POLICY_ALLOW_UPLOAD` | policy.allow_upload | false |
+    /// | `NEVOFLUX_POLICY_DOMAIN_ALLOWLIST` | policy.domain_allowlist | empty (comma-sep) |
+    /// | `NEVOFLUX_WALL_CLOCK_SECS` | wall_clock_secs | none |
+    /// | `NEVOFLUX_TOKEN_BUDGET` | token_budget | none |
+    /// | `NEVOFLUX_IDEMPOTENT` | idempotent | false |
+    /// | `NEVOFLUX_NO_RETRY` | no_retry | false |
+    pub fn from_env(task: String) -> Self {
+        fn env_bool(k: &str) -> bool {
+            matches!(
+                std::env::var(k).ok().as_deref(),
+                Some("1") | Some("true") | Some("TRUE") | Some("yes")
+            )
+        }
+        fn env_u64(k: &str) -> Option<u64> {
+            std::env::var(k).ok().and_then(|v| v.parse().ok())
+        }
+        Self {
+            task,
+            mode: std::env::var("NEVOFLUX_TASK_MODE").unwrap_or_else(|_| default_mode()),
+            profile: std::env::var("NEVOFLUX_TASK_PROFILE")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            policy: PolicyRequest {
+                allow_shell: env_bool("NEVOFLUX_POLICY_ALLOW_SHELL"),
+                allow_fs_write: env_bool("NEVOFLUX_POLICY_ALLOW_FS_WRITE"),
+                allow_upload: env_bool("NEVOFLUX_POLICY_ALLOW_UPLOAD"),
+                domain_allowlist: std::env::var("NEVOFLUX_POLICY_DOMAIN_ALLOWLIST")
+                    .ok()
+                    .map(|s| {
+                        s.split(',')
+                            .map(|x| x.trim().to_string())
+                            .filter(|x| !x.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
+            wall_clock_secs: env_u64("NEVOFLUX_WALL_CLOCK_SECS"),
+            token_budget: env_u64("NEVOFLUX_TOKEN_BUDGET"),
+            idempotent: env_bool("NEVOFLUX_IDEMPOTENT"),
+            no_retry: env_bool("NEVOFLUX_NO_RETRY"),
+        }
+    }
 }
 
 /// Lifecycle status of a task.

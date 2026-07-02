@@ -552,6 +552,9 @@ async fn run_daemon(
     managed: bool,
     headless: bool,
     http_addr: Option<std::net::SocketAddr>,
+    openai_addr: Option<std::net::SocketAddr>,
+    mcp_addr: Option<std::net::SocketAddr>,
+    acp_addr: Option<std::net::SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Ensure data directory exists first — managed daemons need it for the
     // log file, and SessionManager needs it for the database. This must
@@ -661,43 +664,81 @@ async fn run_daemon(
         } else {
             tracing::info!("headless: wrote daemon-managed.port={} for proxy connect-back", port);
         }
-        if let Some(addr) = http_addr {
+        if http_addr.is_some() || openai_addr.is_some() || mcp_addr.is_some() || acp_addr.is_some()
+        {
+            use nevoflux_daemon::http;
             use std::sync::Arc;
-            let metrics = Arc::new(nevoflux_daemon::http::metrics::Metrics::default());
+            let metrics = Arc::new(http::metrics::Metrics::default());
             // Real runner: clone profile → spawn browser → bind → run agent →
             // drain, with taint-gated retry. Falls back to a stub if the daemon
             // context or NEVOFLUX_BROWSER_BIN isn't available yet.
-            let runner: nevoflux_daemon::http::queue::Runner = nevoflux_daemon::automation::build_headless_runner(metrics.clone())
-                .unwrap_or_else(|| {
-                    tracing::warn!(
-                        "headless runner context not ready (set NEVOFLUX_BROWSER_BIN); serving stub"
-                    );
-                    Arc::new(|id, _req| {
-                        Box::pin(async move {
-                            nevoflux_daemon::http::types::TaskResponse {
-                                id,
-                                status: nevoflux_daemon::http::types::TaskStatus::Failed,
-                                attempts: 1,
-                                output: None,
-                                error: Some("headless runner context unavailable".into()),
-                                artifacts: Vec::new(),
-                            }
+            let runner: http::queue::Runner =
+                nevoflux_daemon::automation::build_headless_runner(metrics.clone()).unwrap_or_else(
+                    || {
+                        tracing::warn!(
+                            "headless runner context not ready (set NEVOFLUX_BROWSER_BIN); serving stub"
+                        );
+                        Arc::new(|id, _req| {
+                            Box::pin(async move {
+                                http::types::TaskResponse {
+                                    id,
+                                    status: http::types::TaskStatus::Failed,
+                                    attempts: 1,
+                                    output: None,
+                                    error: Some("headless runner context unavailable".into()),
+                                    artifacts: Vec::new(),
+                                }
+                            })
                         })
-                    })
-                });
-            let state = nevoflux_daemon::http::router::AppState {
-                queue: Arc::new(nevoflux_daemon::http::queue::TaskQueue::new(runner)),
-                metrics: metrics.clone(),
+                    },
+                );
+            let state = http::router::AppState {
+                queue: Arc::new(http::queue::TaskQueue::new(runner)),
+                metrics,
             };
-            let app = nevoflux_daemon::http::router::router(state);
-            tokio::spawn(async move {
-                tracing::info!("Headless task API listening on {}", addr);
-                if let Err(e) = nevoflux_daemon::http::router::serve(addr, app).await {
-                    tracing::error!("Headless task API server error: {}", e);
-                }
-            });
+
+            // Task API (+ OpenAI merged) on --http-addr; dedicated OpenAI / MCP /
+            // ACP ports when their addr is set. All share the same task state.
+            if let Some(addr) = http_addr {
+                let app = http::router::router(state.clone());
+                tokio::spawn(async move {
+                    tracing::info!("Headless task API (+ OpenAI /v1) listening on {}", addr);
+                    if let Err(e) = http::router::serve(addr, app).await {
+                        tracing::error!("task API server error: {}", e);
+                    }
+                });
+            }
+            if let Some(addr) = openai_addr {
+                let app = http::router::openai_routes().with_state(state.clone());
+                tokio::spawn(async move {
+                    tracing::info!("OpenAI-compatible API listening on {} (/v1/chat/completions)", addr);
+                    if let Err(e) = http::router::serve(addr, app).await {
+                        tracing::error!("OpenAI API server error: {}", e);
+                    }
+                });
+            }
+            if let Some(addr) = mcp_addr {
+                let app = http::rpc::mcp_routes().with_state(state.clone());
+                tokio::spawn(async move {
+                    tracing::info!("MCP-over-HTTP listening on {} (POST /mcp)", addr);
+                    if let Err(e) = http::router::serve(addr, app).await {
+                        tracing::error!("MCP server error: {}", e);
+                    }
+                });
+            }
+            if let Some(addr) = acp_addr {
+                let app = http::rpc::acp_routes().with_state(state.clone());
+                tokio::spawn(async move {
+                    tracing::info!("ACP-over-HTTP listening on {} (POST /acp)", addr);
+                    if let Err(e) = http::router::serve(addr, app).await {
+                        tracing::error!("ACP server error: {}", e);
+                    }
+                });
+            }
         } else {
-            tracing::warn!("--headless without --http-addr: task API not served");
+            tracing::warn!(
+                "--headless without --http-addr/--openai-addr/--mcp-addr/--acp-addr: no API served"
+            );
         }
     }
 
@@ -1161,6 +1202,9 @@ async fn main() {
             cli.managed,
             cli.headless,
             cli.http_addr,
+            cli.openai_addr,
+            cli.mcp_addr,
+            cli.acp_addr,
         )
         .await
         {

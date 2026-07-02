@@ -69,6 +69,25 @@ impl TaskQueue {
         self.statuses.read().unwrap().get(id).cloned()
     }
 
+    /// Submit `req` and poll until it reaches a terminal status (or `timeout`).
+    /// Used by the synchronous front-ends (OpenAI-compatible / MCP). On timeout
+    /// returns the last-known snapshot (still `Running`).
+    pub async fn submit_and_wait(&self, req: TaskRequest, timeout: std::time::Duration) -> TaskResponse {
+        let id = self.submit(req);
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(r) = self.status(&id) {
+                if matches!(r.status, TaskStatus::Succeeded | TaskStatus::Failed) {
+                    return r;
+                }
+                if start.elapsed() >= timeout {
+                    return r;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
     /// Request cancellation. Marks a `Queued`/`Running` task `Failed` and returns
     /// `true` if the id exists. (Cooperative interrupt of a *running* attempt is
     /// delivered by the session runner, P3 Task 6; this is the queue-level hook.)

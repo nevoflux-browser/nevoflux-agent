@@ -8,16 +8,23 @@
 
 use crate::http::metrics::Metrics;
 use crate::http::queue::TaskQueue;
-use crate::http::types::TaskRequest;
+use crate::http::types::{TaskRequest, TaskStatus};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     routing::{get, post},
     Json, Router,
 };
+use futures::stream::Stream;
+use serde::Deserialize;
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Shared state for the HTTP handlers.
 #[derive(Clone)]
@@ -28,13 +35,22 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
 }
 
-/// Build the task-API router.
+/// Build the task-API router (task submit/status/cancel/events, metrics, and the
+/// OpenAI-compatible chat endpoint on the same port).
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/tasks", post(submit_task))
         .route("/tasks/:id", get(get_task).delete(cancel_task))
+        .route("/tasks/:id/events", get(task_events))
         .route("/metrics", get(metrics_handler))
+        .merge(openai_routes())
         .with_state(state)
+}
+
+/// OpenAI-compatible routes, unstated so the caller applies state once. For a
+/// dedicated port: `openai_routes().with_state(state)`.
+pub fn openai_routes() -> Router<AppState> {
+    Router::new().route("/v1/chat/completions", post(chat_completions))
 }
 
 /// Bind `addr` and serve `app` until the process exits.
@@ -70,6 +86,111 @@ async fn cancel_task(State(s): State<AppState>, Path(id): Path<String>) -> impl 
 
 async fn metrics_handler(State(s): State<AppState>) -> impl IntoResponse {
     s.metrics.render()
+}
+
+/// SSE: stream a task's status snapshots until it reaches a terminal state.
+/// Emits a `status` event on each change (and the terminal one), keep-alive
+/// comments in between. `GET /tasks/:id/events`.
+async fn task_events(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let queue = s.queue.clone();
+    let stream = futures::stream::unfold(
+        (queue, id, false, None::<TaskStatus>),
+        |(queue, id, done, last)| async move {
+            if done {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            match queue.status(&id) {
+                None => {
+                    let ev = Event::default().event("error").data("unknown task");
+                    Some((Ok(ev), (queue, id, true, last)))
+                }
+                Some(r) => {
+                    let terminal = matches!(r.status, TaskStatus::Succeeded | TaskStatus::Failed);
+                    if last != Some(r.status) || terminal {
+                        let data = serde_json::to_string(&r).unwrap_or_default();
+                        let ev = Event::default().event("status").data(data);
+                        Some((Ok(ev), (queue, id, terminal, Some(r.status))))
+                    } else {
+                        let ev = Event::default().comment("waiting");
+                        Some((Ok(ev), (queue, id, false, Some(r.status))))
+                    }
+                }
+            }
+        },
+    );
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+// ---- OpenAI-compatible chat completions -------------------------------------
+
+#[derive(Deserialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct ChatCompletionRequest {
+    #[serde(default)]
+    model: String,
+    messages: Vec<ChatMessage>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    stream: bool,
+}
+
+/// OpenAI-compatible `POST /v1/chat/completions`. The last `user` message becomes
+/// a browser task (mode/profile/policy from env via [`TaskRequest::from_env`]);
+/// the agent runs it and its answer is returned as the assistant message.
+/// Non-streaming.
+async fn chat_completions(
+    State(s): State<AppState>,
+    Json(req): Json<ChatCompletionRequest>,
+) -> impl IntoResponse {
+    let task = req
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+    if task.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": {"message": "no user message"}})),
+        )
+            .into_response();
+    }
+    let treq = TaskRequest::from_env(task);
+    let resp = s
+        .queue
+        .submit_and_wait(treq, Duration::from_secs(600))
+        .await;
+    let content = resp
+        .output
+        .clone()
+        .or_else(|| resp.error.clone())
+        .unwrap_or_default();
+    let finish = if resp.status == TaskStatus::Succeeded {
+        "stop"
+    } else {
+        "error"
+    };
+    let body = serde_json::json!({
+        "id": format!("chatcmpl-{}", resp.id),
+        "object": "chat.completion",
+        "model": if req.model.is_empty() { "nevoflux-headless".to_string() } else { req.model },
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": content },
+            "finish_reason": finish
+        }]
+    });
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 #[cfg(test)]

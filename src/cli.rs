@@ -70,9 +70,23 @@ pub struct Cli {
     #[arg(long)]
     pub headless: bool,
 
-    /// HTTP bind address for the task API in headless mode (e.g. 0.0.0.0:8080)
+    /// HTTP bind address for the task API in headless mode (e.g. 0.0.0.0:8080).
+    /// Also serves the OpenAI-compatible /v1/chat/completions on this port.
     #[arg(long)]
     pub http_addr: Option<std::net::SocketAddr>,
+
+    /// Serve the OpenAI-compatible API (/v1/chat/completions) on a DEDICATED port
+    /// (in addition to --http-addr). e.g. 0.0.0.0:8081
+    #[arg(long)]
+    pub openai_addr: Option<std::net::SocketAddr>,
+
+    /// Serve the MCP-over-HTTP server (POST /mcp) on this port. e.g. 0.0.0.0:8082
+    #[arg(long)]
+    pub mcp_addr: Option<std::net::SocketAddr>,
+
+    /// Serve the ACP-over-HTTP endpoint (POST /acp) on this port. e.g. 0.0.0.0:8083
+    #[arg(long)]
+    pub acp_addr: Option<std::net::SocketAddr>,
 
     /// Subcommand to execute
     #[command(subcommand)]
