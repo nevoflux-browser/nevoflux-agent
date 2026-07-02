@@ -49,6 +49,9 @@ services:
       NEVOFLUX_VNC: "0"
       # Logging level (stderr → `docker compose logs`).
       NEVOFLUX_LOG: "info"
+      # Fixed-script mode (no LLM): run a deterministic Python flow instead of the
+      # agent loop. Every task calls its run(task). Mount the script (see volumes).
+      # NEVOFLUX_HEADLESS_SCRIPT: /opt/nevoflux/fixed-flow.py
       # Defaults for the OpenAI/MCP/ACP interfaces (which carry only a prompt).
       # POST /tasks still takes these per-request; these are the interface fallbacks.
       # NEVOFLUX_TASK_MODE: "browser"
@@ -60,6 +63,7 @@ services:
     volumes:
       - ./out:/work                             # drained result.json + debug-bundle + artifacts
       - base-profiles:/base-profiles:ro         # pre-authenticated login templates (cloned per task)
+      # - ./fixed-flow.py:/opt/nevoflux/fixed-flow.py:ro   # fixed-script mode (see NEVOFLUX_HEADLESS_SCRIPT)
     tmpfs:
       - /tmp
       - /var/nevoflux/data                       # daemon.port / db — ephemeral

@@ -212,6 +212,53 @@ that can't carry them.
 > non-streaming OpenAI. Enough to drive a headless task from an OpenAI / MCP / ACP
 > client, not full protocol implementations.
 
+## Fixed-script mode (no LLM)
+
+For a **deterministic** browser-use pipeline that needs **no LLM provider**, point
+the daemon at a Python script:
+
+```bash
+NEVOFLUX_HEADLESS_SCRIPT=/opt/nevoflux/fixed-flow.py
+```
+
+When set, **every headless task runs that script instead of the LLM agent loop**.
+The script defines `def run(task): ...`; the daemon calls it with the interface's
+task string (POST /tasks `task`, OpenAI last user message, MCP `task` arg, ACP
+prompt). Whatever `run` **returns** (or prints) becomes the interface `output`; a
+raised exception → `status:"failed"` + the error. It uses the same browser tools as
+the agent (in the sandboxed Monty interpreter), driving the *bound* headless
+browser — but with **zero LLM calls and no API key**. Template:
+[`examples/fixed-flow.py`](examples/fixed-flow.py).
+
+```python
+def run(task):
+    nav = browser_navigate(url="https://example.com/search")
+    tab = nav["tab_id"]                              # navigate opens a NEW tab
+    browser_fill(selector="#q", value=task, tab_id=tab)
+    browser_click(selector="button[type=submit]", tab_id=tab)
+    browser_wait_for(selector="#results", tab_id=tab, timeout_ms=15000)
+    return browser_get_markdown(tab_id=tab)["markdown"]
+```
+
+Verified live (no LLM key set): `POST /tasks {"task":"read the page"}` ran the
+script and returned the real page markdown (`# Example Domain …`).
+
+**Two gotchas** (also in the example's comments):
+1. `browser_navigate` opens a **new, inactive** tab and returns `{"tab_id": N}` —
+   thread that `tab_id` into every later call, or tools hit "No active web tab found".
+2. Tool results are **structured** dicts, not strings:
+   `browser_get_markdown(...)` → `{"markdown","title","url","success"}` — index the field.
+
+For this mode the image needs **no `ANTHROPIC_API_KEY` and no GBrain** — pure
+deterministic pipeline. Mount your script + set the env var:
+```yaml
+# docker-compose.yml (headless service)
+environment:
+  NEVOFLUX_HEADLESS_SCRIPT: /opt/nevoflux/fixed-flow.py
+volumes:
+  - ./fixed-flow.py:/opt/nevoflux/fixed-flow.py:ro
+```
+
 ## Docker Compose (`docker-compose.yml`)
 
 The compose file packages the two `docker run` invocations above as reusable,
