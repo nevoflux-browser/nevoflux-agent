@@ -120,6 +120,17 @@ pub async fn execute_task_attempt(
     services.is_iteration = true;
     services.session_id = session_id.clone();
 
+    // Headless fixed-script mode (Q16): if NEVOFLUX_HEADLESS_SCRIPT points at a
+    // user Python file defining `def run(task): ...`, run it directly via the
+    // code-mode executor (Monty) against the bound browser — NO LLM, no agent
+    // loop. Deterministic browser-use pipeline; the interface `task` is passed in.
+    if let Some(script_path) = std::env::var("NEVOFLUX_HEADLESS_SCRIPT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return run_headless_script(&services, &script_path, task);
+    }
+
     let host = DaemonHostFunctions::new(agent_config, runtime_handle)
         .with_services(services)
         .with_session_id(session_id.clone());
@@ -178,6 +189,72 @@ pub async fn execute_task_attempt(
             output: None,
             error: Some(format!("agent task panicked: {e}")),
         },
+    }
+}
+
+/// Headless fixed-script execution (Q16): run the user's Python `run(task)` via
+/// the code-mode executor (Monty) against the bound browser, with **no LLM**.
+/// The script is expected to define `def run(task): ...`; its return value (or,
+/// failing that, its `print()` output) becomes the task output. Because it runs
+/// browser side effects, a failure is treated as tainted (not auto-retried).
+///
+/// This is headless-only — it is reached solely from [`execute_task_attempt`],
+/// which only runs inside the `--headless` task runner.
+fn run_headless_script(services: &HostServices, script_path: &str, task: &str) -> AttemptOutcome {
+    let user_code = match std::fs::read_to_string(script_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return AttemptOutcome {
+                success: false,
+                tainted: false, // couldn't even start — nothing mutated
+                output: None,
+                error: Some(format!(
+                    "headless script mode: cannot read NEVOFLUX_HEADLESS_SCRIPT '{script_path}': {e}"
+                )),
+            }
+        }
+    };
+    let Some(browser_ctx) = services.browser_context() else {
+        return AttemptOutcome {
+            success: false,
+            tainted: false,
+            output: None,
+            error: Some("headless script mode: no bound browser context".into()),
+        };
+    };
+
+    // Inject the task and call `run(task)` as the trailing expression, so its
+    // return value lands in `CodeModeResult.result`; prints land in `.output`.
+    // serde_json's string encoding is a valid Python string literal (safe against
+    // quotes/newlines in the task).
+    let task_literal = serde_json::to_string(task).unwrap_or_else(|_| "\"\"".into());
+    let wrapped = format!("{user_code}\n\nrun({task_literal})\n");
+
+    let result = crate::agent::code_mode::execute_python_simple(&wrapped, Some(browser_ctx));
+    if result.success {
+        // Prefer the returned value; fall back to printed output.
+        let output = match &result.result {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
+            Some(v) if !v.is_null() => v.to_string(),
+            _ => result.output.clone(),
+        };
+        AttemptOutcome {
+            success: true,
+            tainted: true,
+            output: Some(output),
+            error: None,
+        }
+    } else {
+        AttemptOutcome {
+            success: false,
+            tainted: true,
+            output: None,
+            error: Some(
+                result
+                    .error
+                    .unwrap_or_else(|| "headless script execution failed".into()),
+            ),
+        }
     }
 }
 
