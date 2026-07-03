@@ -406,10 +406,16 @@ async fn soft_reset_active_tab(services: &HostServices, browser: &BrowserEntry) 
         ctx.client_identity.clone(),
         ctx.proxy_id.clone(),
     );
+    let sender = ctx.sender.clone();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    if ctx.sender.send((req, tx)).await.is_ok() {
-        let _ = tokio::time::timeout(Duration::from_secs(6), rx).await;
-    }
+    // Best-effort + airtight: bound the whole send+recv so a full request channel
+    // can never block the flow.
+    let _ = tokio::time::timeout(Duration::from_secs(6), async move {
+        if sender.send((req, tx)).await.is_ok() {
+            let _ = rx.await;
+        }
+    })
+    .await;
 }
 
 /// A failed `SessionOutcome` with a message.
@@ -434,18 +440,25 @@ pub async fn execute_session_task(
     let holder = SessionHolder::global();
     let mut guard = holder.inner.lock().await;
 
-    // Ensure a live browser. Relaunch if absent or the child has died (cookies
-    // persist on disk in the clone, so login survives a relaunch).
-    let need_launch = match guard.as_mut() {
-        None => true,
-        Some(s) => !s.handle.is_running(),
-    };
+    // A REGISTERED browser is the cross-platform liveness signal. On Windows the
+    // launcher child exits after re-parenting the real browser, so the child handle
+    // is not a valid liveness check — the registry entry (connection-driven) is.
+    // Reuse when a browser is registered; otherwise (first task, or the session
+    // died) launch.
+    let need_launch = guard.is_none() || deps.registry.single().is_err();
     if need_launch {
-        // Clean up a dead session's residue first.
-        session_holder::teardown_locked(&mut guard, &deps.profile_mgr).await;
-        let clone = match deps.profile_mgr.clone_base(&deps.profile) {
-            Ok(c) => c,
-            Err(e) => return failed(format!("profile clone failed: {e}")),
+        // Crash-relaunch REUSES the existing clone dir so in-flow login/cookies on
+        // disk survive; a fresh flow clones the base profile.
+        let clone = match guard.take() {
+            Some(mut dead) => {
+                dead.handle.terminate().await;
+                crate::browser_launch::kill_profile_processes(&dead.clone_dir).await;
+                dead.clone_dir
+            }
+            None => match deps.profile_mgr.clone_base(&deps.profile) {
+                Ok(c) => c,
+                Err(e) => return failed(format!("profile clone failed: {e}")),
+            },
         };
         let _ = deps.profile_mgr.inject_automation_pref(&clone);
         let cfg = BrowserLaunchConfig {

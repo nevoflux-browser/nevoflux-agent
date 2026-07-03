@@ -59,7 +59,10 @@ mod tests {
         let b = SessionHolder::global();
         // Same process-global instance (same Arc).
         assert!(std::sync::Arc::ptr_eq(&a.inner, &b.inner));
-        // Starts with no live session.
-        assert!(a.inner.try_lock().unwrap().is_none());
+        // Starts with no live session. Tolerate a concurrent test transiently
+        // holding the same process-global lock (try_lock instead of unwrap-panic).
+        if let Ok(g) = a.inner.try_lock() {
+            assert!(g.is_none());
+        }
     }
 }

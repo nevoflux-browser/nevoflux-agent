@@ -51,13 +51,6 @@ impl BrowserHandle {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
     }
-
-    /// Best-effort liveness of the spawned child. `try_wait` is non-blocking:
-    /// `Ok(None)` = still running, `Ok(Some(_))` = exited, `Err(_)` = already
-    /// reaped/unknown → treated as not running so the caller relaunches.
-    pub fn is_running(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
-    }
 }
 
 /// Kill every process whose command line references `profile_dir` — the browser
@@ -162,23 +155,5 @@ mod tests {
             .position(|a| a == "-profile")
             .expect("-profile present");
         assert_eq!(args[i + 1], "/tmp/clone");
-    }
-
-    #[tokio::test]
-    async fn is_running_reflects_child_state() {
-        // A process that exits immediately.
-        #[cfg(not(target_os = "windows"))]
-        let mut cmd = tokio::process::Command::new("true");
-        #[cfg(target_os = "windows")]
-        let mut cmd = {
-            let mut c = tokio::process::Command::new("cmd");
-            c.args(["/C", "exit"]);
-            c
-        };
-        let child = cmd.spawn().expect("spawn");
-        let mut h = BrowserHandle { child };
-        // Give it a moment to exit, then is_running() must report false.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(!h.is_running(), "exited child should not be running");
     }
 }
