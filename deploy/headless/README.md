@@ -23,10 +23,31 @@ boundary. The product adds in-process defense-in-depth (tool allowlist, fs-sandb
 
 ## Build
 
+The image DOWNLOADS the official prebuilt releases from GitHub — **no local
+compilation**. Just:
+
 ```bash
-# stage: dist/nevoflux/ (Linux Gecko build), nevoflux-agent (Linux binary)
-docker build -t nevoflux/headless:latest deploy/headless
+docker build -t nevoflux/headless:latest deploy/headless      # amd64 or arm64
 ```
+
+- **Versions:** default to the latest release; pin for reproducible builds:
+  `--build-arg AGENT_VERSION=v0.3.9 --build-arg BROWSER_VERSION=0.3.9`
+  (agent tags carry a leading `v`, browser tags do not). `latest` builds are not
+  reproducible and may pair a newer agent with a newer browser.
+- **Multi-arch:** `TARGETARCH` selects the `x86_64`/`aarch64` assets; on arm64
+  hosts (or `docker buildx --platform linux/arm64`) it downloads the arm build.
+
+### Building from local (unreleased) binaries — `Dockerfile.local`
+
+Developers testing locally-built or unreleased daemon/browser changes (a feature
+not yet in a release) stage the four artifacts and build the COPY-based variant:
+
+```bash
+# stage into deploy/headless/: dist/nevoflux/ (./mach package tree),
+# nevoflux-agent (built daemon), libonnxruntime.so (v1.24.x), models/fastembed/
+docker build -f deploy/headless/Dockerfile.local -t nevoflux/headless:local deploy/headless
+```
+(Or in compose: `build.dockerfile: Dockerfile.local`.)
 
 ## Bundled packs (build-time clone → startup install)
 
