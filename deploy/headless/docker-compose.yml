@@ -22,6 +22,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # Image is DOWNLOADED from GitHub releases (no local compile). Pin versions:
+      #   args: { AGENT_VERSION: v0.3.9, BROWSER_VERSION: 0.3.9 }   # default: latest
+      # To build from locally-staged artifacts instead, set: dockerfile: Dockerfile.local
     image: nevoflux/headless:latest
     # `--headless` serves the task API; the daemon spawns a browser per task.
     # The task API port also serves the OpenAI-compatible /v1/chat/completions.
@@ -43,15 +46,17 @@ services:
       # For another provider: set its key here AND rebuild `--build-arg LLM_PROVIDER=openai`.
       # Prefer injecting via a front proxy so the key isn't in env for an agent to read.
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:?set ANTHROPIC_API_KEY (or your provider's key)}"
-      # Egress boundary (hard control): allowlist LLM API + task domains, deny rest.
-      HTTP_PROXY: "${EGRESS_PROXY:-}"
-      HTTPS_PROXY: "${EGRESS_PROXY:-}"
+      # Egress proxy (optional). Do NOT set these to an empty string — leave unset for
+      # direct egress. To route through a proxy, uncomment and set EGRESS_PROXY, and add
+      # NO_PROXY: "127.0.0.1,localhost" so the in-process gateway isn't proxied.
+      # HTTP_PROXY: "${EGRESS_PROXY}"
+      # HTTPS_PROXY: "${EGRESS_PROXY}"
       # Observability: live VNC (default off). Set to 1 (+ a password file) to enable
       # raw VNC on :5900 AND noVNC on :6080 (browser at http://host:6080/vnc.html).
       NEVOFLUX_VNC: "0"
       # NEVOFLUX_VNC_VIEWONLY: "1"   # watch-only (no input) so you can't disturb the run
-      # Logging level (stderr → `docker compose logs`).
-      NEVOFLUX_LOG: "info"
+      # Logging level (stderr → `docker compose logs`). The daemon reads RUST_LOG.
+      RUST_LOG: "info"
       # Fixed-script mode (no LLM): run a deterministic Python flow instead of the
       # agent loop. Every task calls its run(task). Mount the script (see volumes).
       # NEVOFLUX_HEADLESS_SCRIPT: /opt/nevoflux/fixed-flow.py
@@ -63,10 +68,10 @@ services:
       # NEVOFLUX_POLICY_DOMAIN_ALLOWLIST: "example.com,wikipedia.org"
       # NEVOFLUX_WALL_CLOCK_SECS: "300"
       # NEVOFLUX_TOKEN_BUDGET: "200000"
-      # Session/task-flow mode: reuse ONE browser + profile clone across tasks
-      # (soft-reset to about:blank between tasks) instead of a fresh browser per
-      # task. End the flow with a task carrying {"end_session": true} or
-      # POST /session/close. Trusted, sequential flows only (tasks share cookies).
+      # Session/task-flow mode: reuse ONE browser across tasks (soft-reset about:blank
+      # between tasks). End with {"end_session": true} on a task or POST /session/close.
+      # Trusted, sequential flows only (tasks share cookies). Only in daemon builds that
+      # include it — the pinned release may not yet; use Dockerfile.local to test it.
       # NEVOFLUX_SESSION_MODE: "1"
     volumes:
       - ./out:/work                             # drained result.json + debug-bundle + artifacts
@@ -75,18 +80,20 @@ services:
     tmpfs:
       - /tmp
       - /var/nevoflux/data                       # daemon.port / db — ephemeral
+      - /home/nevo/.gbrain                        # GBrain DB (HOME is on the read-only rootfs)
+      - /home/nevo/.cache                         # bun / misc caches
     # ---- hardening (the container IS the boundary) ----
     read_only: true
     cap_drop: ["ALL"]
     security_opt:
       - "no-new-privileges:true"
       # - "seccomp=./seccomp.json"               # add a profile once tuned
-    pids_limit: 512
     deploy:
       resources:
         limits:
           cpus: "2.0"
           memory: 4g
+          pids: 512          # merged from pids_limit (compose v2 rejects both set distinctly)
     restart: "no"
     # Compose can't express an egress allowlist; put `headless` on a network whose
     # egress is restricted (external firewall / NetworkPolicy in k8s / a proxy sidecar).
@@ -103,24 +110,27 @@ services:
     # entrypoint is the daemon binary; args come from `docker compose run`
     environment:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
-      HTTP_PROXY: "${EGRESS_PROXY:-}"
-      HTTPS_PROXY: "${EGRESS_PROXY:-}"
+      # Egress proxy optional — leave unset for direct egress (empty proxy can hang the client).
+      # HTTP_PROXY: "${EGRESS_PROXY}"
+      # HTTPS_PROXY: "${EGRESS_PROXY}"
     volumes:
       - ./out:/work
       - base-profiles:/base-profiles:ro
     tmpfs:
       - /tmp
       - /var/nevoflux/data
+      - /home/nevo/.gbrain
+      - /home/nevo/.cache
     read_only: true
     cap_drop: ["ALL"]
     security_opt:
       - "no-new-privileges:true"
-    pids_limit: 512
     deploy:
       resources:
         limits:
           cpus: "2.0"
           memory: 4g
+          pids: 512          # merged from pids_limit (compose v2 rejects both set distinctly)
 
 volumes:
   base-profiles:
