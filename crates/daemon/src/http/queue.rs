@@ -122,6 +122,7 @@ mod tests {
             token_budget: None,
             idempotent: false,
             no_retry: false,
+            end_session: false,
         }
     }
 

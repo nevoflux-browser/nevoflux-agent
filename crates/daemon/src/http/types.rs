@@ -57,6 +57,11 @@ pub struct TaskRequest {
     /// Disable auto-retry entirely.
     #[serde(default)]
     pub no_retry: bool,
+    /// Session mode only: tear down the shared browser + profile clone AFTER
+    /// this task completes (end of a task-flow). Ignored when
+    /// `NEVOFLUX_SESSION_MODE` is off. Default `false`.
+    #[serde(default)]
+    pub end_session: bool,
 }
 
 fn default_mode() -> String {
@@ -127,6 +132,7 @@ impl TaskRequest {
             token_budget: env_u64("NEVOFLUX_TOKEN_BUDGET"),
             idempotent: env_bool("NEVOFLUX_IDEMPOTENT"),
             no_retry: env_bool("NEVOFLUX_NO_RETRY"),
+            end_session: false,
         }
     }
 }
@@ -178,6 +184,18 @@ mod tests {
         let p = req.to_policy();
         assert!(p.allow_shell);
         assert!(!p.allow_fs_write);
+    }
+
+    #[test]
+    fn end_session_defaults_false_and_parses() {
+        // Absent → false
+        let r: TaskRequest = serde_json::from_str(r#"{"task":"x"}"#).unwrap();
+        assert!(!r.end_session);
+        // Present true → true
+        let r: TaskRequest = serde_json::from_str(r#"{"task":"x","end_session":true}"#).unwrap();
+        assert!(r.end_session);
+        // from_env leaves it false
+        assert!(!TaskRequest::from_env("x".into()).end_session);
     }
 
     #[test]
