@@ -9,6 +9,7 @@ pub mod bundle;
 pub mod capture;
 pub mod policy;
 pub mod session;
+pub mod session_holder;
 pub mod taint;
 
 use std::time::Duration;
