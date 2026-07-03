@@ -11,9 +11,13 @@ use crate::agent_host::DaemonHostFunctions;
 use crate::automation::policy::Policy;
 use crate::automation::retry_decision;
 use crate::http::types::TaskStatus;
+use crate::automation::session_holder::{self, LiveSession, SessionHolder};
+use crate::browser_launch::{spawn_and_supervise, BrowserLaunchConfig};
 use crate::registry::BrowserEntry;
-use crate::wasm::services::HostServices;
+use crate::wasm::services::{BrowserRequest, HostServices};
+use nevoflux_protocol::common::BrowserToolAction;
 use std::future::Future;
+use std::time::Duration;
 
 /// Result of one attempt at a task.
 #[derive(Debug, Clone)]
@@ -370,9 +374,150 @@ pub async fn execute_full_task(
     outcome
 }
 
+/// Build the daemon-side "soft reset" request: navigate the active tab to
+/// about:blank. Pure so the shape is unit-testable; the send is in
+/// `soft_reset_active_tab`.
+fn build_soft_reset_request(
+    session_id: &str,
+    client_identity: Vec<u8>,
+    proxy_id: String,
+) -> BrowserRequest {
+    BrowserRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        session_id: session_id.to_string(),
+        tab_id: None,
+        action: BrowserToolAction::Navigate,
+        params: serde_json::json!({ "url": "about:blank" }),
+        timeout_ms: 5000,
+        client_identity,
+        proxy_id,
+    }
+}
+
+/// Soft-reset the active tab to about:blank between tasks (best-effort: a failed
+/// or timed-out reset never fails the flow).
+async fn soft_reset_active_tab(services: &HostServices, browser: &BrowserEntry) {
+    let bound = services.clone().with_bound_browser(browser);
+    let Some(ctx) = bound.browser_context() else {
+        return;
+    };
+    let req = build_soft_reset_request(
+        "session-reset",
+        ctx.client_identity.clone(),
+        ctx.proxy_id.clone(),
+    );
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    if ctx.sender.send((req, tx)).await.is_ok() {
+        let _ = tokio::time::timeout(Duration::from_secs(6), rx).await;
+    }
+}
+
+/// A failed `SessionOutcome` with a message.
+fn failed(msg: String) -> SessionOutcome {
+    SessionOutcome {
+        status: TaskStatus::Failed,
+        attempts: 1,
+        output: None,
+        error: Some(msg),
+    }
+}
+
+/// Session-mode task runner: reuse ONE browser + profile clone across tasks.
+/// Serialized by the `SessionHolder` mutex. Launches on first use / after a
+/// crash; soft-resets between reuses; tears down only when `end_session`.
+pub async fn execute_session_task(
+    deps: &AutomationDeps,
+    policy: &Policy,
+    task: &str,
+    end_session: bool,
+) -> SessionOutcome {
+    let holder = SessionHolder::global();
+    let mut guard = holder.inner.lock().await;
+
+    // Ensure a live browser. Relaunch if absent or the child has died (cookies
+    // persist on disk in the clone, so login survives a relaunch).
+    let need_launch = match guard.as_mut() {
+        None => true,
+        Some(s) => !s.handle.is_running(),
+    };
+    if need_launch {
+        // Clean up a dead session's residue first.
+        session_holder::teardown_locked(&mut guard, &deps.profile_mgr).await;
+        let clone = match deps.profile_mgr.clone_base(&deps.profile) {
+            Ok(c) => c,
+            Err(e) => return failed(format!("profile clone failed: {e}")),
+        };
+        let _ = deps.profile_mgr.inject_automation_pref(&clone);
+        let cfg = BrowserLaunchConfig {
+            browser_bin: deps.browser_bin.clone(),
+            profile_dir: clone.clone(),
+            display: deps.display.clone(),
+            register_timeout: Duration::from_secs(60),
+        };
+        match spawn_and_supervise(cfg, deps.registry.clone()).await {
+            Ok(handle) => {
+                *guard = Some(LiveSession {
+                    handle,
+                    clone_dir: clone,
+                    base_profile: deps.profile.clone(),
+                });
+            }
+            Err(e) => {
+                deps.profile_mgr.cleanup(&clone);
+                return failed(format!("browser launch failed: {e}"));
+            }
+        }
+    } else if let Ok(browser) = deps.registry.single() {
+        // Reuse: reset the visible page before the next task runs.
+        soft_reset_active_tab(&deps.services_template, &browser).await;
+    }
+
+    // Run the task against the live browser (own retry loop; NO relaunch — each
+    // attempt just re-binds the same registered browser).
+    let outcome = run_with_retry(policy, |attempt| async move {
+        let browser = match deps.registry.single() {
+            Ok(b) => b,
+            Err(e) => {
+                return AttemptOutcome {
+                    success: false,
+                    tainted: false,
+                    output: None,
+                    error: Some(format!("binding failed: {e}")),
+                }
+            }
+        };
+        execute_task_attempt(
+            deps.services_template.clone(),
+            &browser,
+            policy,
+            task,
+            deps.mode,
+            format!("session-{attempt}"),
+        )
+        .await
+    })
+    .await;
+
+    // End of flow → tear the session down.
+    if end_session {
+        session_holder::teardown_locked(&mut guard, &deps.profile_mgr).await;
+    }
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn about_blank_reset_request_is_navigate() {
+        let req = build_soft_reset_request("sess-1", vec![9, 9], "proxy-x".into());
+        assert_eq!(req.action, BrowserToolAction::Navigate);
+        assert_eq!(req.params["url"], "about:blank");
+        assert_eq!(req.tab_id, None);
+        assert_eq!(req.proxy_id, "proxy-x");
+        assert_eq!(req.client_identity, vec![9, 9]);
+    }
 
     fn fail(tainted: bool) -> AttemptOutcome {
         AttemptOutcome {
