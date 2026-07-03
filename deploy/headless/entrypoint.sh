@@ -38,10 +38,43 @@ install_bundled_packs() {
   done
 }
 
+# Initialize the GBrain repo BEFORE the daemon starts. gbrain's dir (~/.gbrain)
+# is an ephemeral tmpfs, so it is empty on every start and `gbrain serve` (spawned
+# by the daemon at boot) would crash with "No brain configured" → the daemon's MCP
+# init times out after 120s and brain is disabled. This mirrors the daemon install
+# wizard's init (embedding via the in-process gateway, zero-padded to dim 512).
+init_gbrain_brain() {
+  local bun="$HOME/.bun/bin/bun"
+  local cli="$HOME/.nevoflux/brain-tool/node_modules/gbrain/src/cli.ts"
+  local brain_dir="${GBRAIN_BRAIN_DIR:-$HOME/.gbrain}"
+  [ -x "$bun" ] && [ -f "$cli" ] || return 0            # gbrain not installed → skip
+  [ -f "$brain_dir/config.json" ] && return 0           # already initialized → skip
+  mkdir -p "$brain_dir"
+  echo "initializing gbrain brain at $brain_dir (one-time per start; tmpfs) ..."
+  # init only PROBES the gateway (liveness); placeholder OPENAI_* is fine here — the
+  # real gateway is up once the daemon spawns `gbrain serve`. init prints its --json
+  # success line then lingers (bun does not exit), so wait for config.json then stop it.
+  ( cd "$brain_dir" && \
+    OPENAI_BASE_URL="http://127.0.0.1:1/v1" OPENAI_API_KEY="x" \
+    OPENROUTER_BASE_URL="http://127.0.0.1:1/v1" OPENROUTER_API_KEY="x" \
+    GBRAIN_BRAIN_DIR="$brain_dir" \
+    "$bun" run "$cli" init --pglite --json --embedding-dimensions 512 \
+      --embedding-model openai:text-embedding-3-small </dev/null >/tmp/gbrain-init.log 2>&1 ) &
+  local ipid=$!
+  for _ in $(seq 1 80); do [ -f "$brain_dir/config.json" ] && break; sleep 0.5; done
+  kill "$ipid" 2>/dev/null || true
+  if [ -f "$brain_dir/config.json" ]; then
+    echo "gbrain brain initialized."
+  else
+    echo "WARN: gbrain init did not complete in time; brain will be disabled (see /tmp/gbrain-init.log)"
+  fi
+}
+
 case " $* " in
   *" --daemon "*)
     # Daemon mode: start in background so we can install bundled packs once it's
     # up, then hand over. Forward SIGTERM/SIGINT for a clean shutdown.
+    init_gbrain_brain    # ready the brain before the daemon spawns `gbrain serve`
     nevoflux-agent "$@" &
     DAEMON_PID=$!
     trap 'kill -TERM "$DAEMON_PID" 2>/dev/null || true' TERM INT
