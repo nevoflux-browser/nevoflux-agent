@@ -43,6 +43,7 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks/:id", get(get_task).delete(cancel_task))
         .route("/tasks/:id/events", get(task_events))
         .route("/metrics", get(metrics_handler))
+        .route("/session/close", post(close_session))
         .merge(openai_routes())
         .with_state(state)
 }
@@ -193,6 +194,27 @@ async fn chat_completions(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+/// Tear down the reused browser session (session mode). Locks the same
+/// `SessionHolder` mutex tasks use, so it waits for any in-flight task, then
+/// tears the session down. `closed=false` means there was no live session.
+async fn close_session() -> impl IntoResponse {
+    let holder = crate::automation::session_holder::SessionHolder::global();
+    let mut guard = holder.inner.lock().await;
+    let had = guard.is_some();
+    if had {
+        // Same ProfileManager config the runner uses (env-derived).
+        let base_dir = std::env::var("NEVOFLUX_BASE_PROFILES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/base-profiles"));
+        let work_dir = std::env::var("NEVOFLUX_PROFILE_WORK")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("nevoflux-profiles"));
+        let pm = crate::profile::ProfileManager { base_dir, work_dir };
+        crate::automation::session_holder::teardown_locked(&mut guard, &pm).await;
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "closed": had }))).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +224,25 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn session_close_reports_no_active_session() {
+        let app = router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/session/close")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["closed"], false);
+    }
 
     fn test_state() -> AppState {
         let runner: Runner = Arc::new(|id, _req| {
