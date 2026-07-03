@@ -29,6 +29,11 @@ fn parse_agent_mode(s: &str) -> nevoflux_builtin_wasm::AgentMode {
     }
 }
 
+/// Session mode is on only for the exact value "1" (keeps the flag unambiguous).
+fn session_mode_enabled(val: Option<&str>) -> bool {
+    val == Some("1")
+}
+
 /// Build the headless task [`Runner`](crate::http::queue::Runner) from the
 /// process-global daemon context (services template + browser registry) and env
 /// (`NEVOFLUX_BROWSER_BIN`, `DISPLAY`, `NEVOFLUX_BASE_PROFILES`,
@@ -52,6 +57,7 @@ pub fn build_headless_runner(
     let work_dir = std::env::var("NEVOFLUX_PROFILE_WORK")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("nevoflux-profiles"));
+    let session_mode = session_mode_enabled(std::env::var("NEVOFLUX_SESSION_MODE").ok().as_deref());
 
     Some(std::sync::Arc::new(
         move |id: String, req: crate::http::types::TaskRequest| {
@@ -62,6 +68,7 @@ pub fn build_headless_runner(
             let base_dir = base_dir.clone();
             let work_dir = work_dir.clone();
             let metrics = metrics.clone();
+            let session_mode = session_mode;
             Box::pin(async move {
                 metrics.tasks_total.fetch_add(1, Ordering::Relaxed);
                 let workspace = work_dir.join(format!("ws-{}", id));
@@ -76,7 +83,11 @@ pub fn build_headless_runner(
                     workspace,
                 };
                 let policy = req.to_policy();
-                let outcome = session::execute_full_task(&deps, &policy, &req.task).await;
+                let outcome = if session_mode {
+                    session::execute_session_task(&deps, &policy, &req.task, req.end_session).await
+                } else {
+                    session::execute_full_task(&deps, &policy, &req.task).await
+                };
                 if outcome.status == crate::http::types::TaskStatus::Failed {
                     metrics.tasks_failed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -155,6 +166,14 @@ impl TaskCaps {
 mod tests {
     use super::policy::Policy;
     use super::*;
+
+    #[test]
+    fn session_mode_enabled_only_for_one() {
+        assert!(session_mode_enabled(Some("1")));
+        assert!(!session_mode_enabled(Some("0")));
+        assert!(!session_mode_enabled(Some("true")));
+        assert!(!session_mode_enabled(None));
+    }
 
     #[test]
     fn retry_only_untainted_up_to_three() {
