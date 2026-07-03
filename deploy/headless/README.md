@@ -154,6 +154,32 @@ curl -N localhost:8080/tasks/task-0/events
 Emits a `status` frame on each change (plus the terminal one); keep-alive comments
 in between. The stream ends when the task reaches `succeeded`/`failed`.
 
+## Session mode (task-flow: reuse one browser)
+
+By default every task is fully isolated: clone a fresh profile → launch a browser
+→ run → kill the browser + delete the clone. Set `NEVOFLUX_SESSION_MODE=1` to run
+a **task-flow** instead: the first task launches ONE browser + profile clone, and
+subsequent tasks **reuse** it (the active tab is soft-reset to `about:blank`
+between tasks) until you end the flow.
+
+```bash
+# enable: NEVOFLUX_SESSION_MODE=1 in the environment
+curl -X POST localhost:8080/tasks -d '{"task":"log in to example.com"}'          # launches the browser
+curl -X POST localhost:8080/tasks -d '{"task":"go to the dashboard"}'            # reuses it (shared login)
+curl -X POST localhost:8080/tasks -d '{"task":"export the report","end_session":true}'  # runs, then tears down
+# or end out-of-band at any time:
+curl -X POST localhost:8080/session/close        # → {"closed":true|false}
+```
+
+- **Drive tasks sequentially** (submit → wait for it to finish → submit the next).
+  The shared browser is serialized by a lock, but task ORDER is the caller's job.
+- **Shared state within a flow:** tasks share cookies / localStorage / login. A
+  prompt-injected task can affect later tasks in the SAME flow — use session mode
+  only for **trusted, sequential** flows. Cross-flow isolation is preserved (the
+  next flow clones a fresh base profile).
+- If the shared browser crashes mid-flow, the next task relaunches it against the
+  same clone (cookies persist on disk, so login survives).
+
 ## Alternative interfaces: OpenAI / MCP / ACP
 
 Three thin front-ends map a prompt to a task (all reduce to the same runner).

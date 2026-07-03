@@ -63,6 +63,11 @@ services:
       # NEVOFLUX_POLICY_DOMAIN_ALLOWLIST: "example.com,wikipedia.org"
       # NEVOFLUX_WALL_CLOCK_SECS: "300"
       # NEVOFLUX_TOKEN_BUDGET: "200000"
+      # Session/task-flow mode: reuse ONE browser + profile clone across tasks
+      # (soft-reset to about:blank between tasks) instead of a fresh browser per
+      # task. End the flow with a task carrying {"end_session": true} or
+      # POST /session/close. Trusted, sequential flows only (tasks share cookies).
+      # NEVOFLUX_SESSION_MODE: "1"
     volumes:
       - ./out:/work                             # drained result.json + debug-bundle + artifacts
       - base-profiles:/base-profiles:ro         # pre-authenticated login templates (cloned per task)
