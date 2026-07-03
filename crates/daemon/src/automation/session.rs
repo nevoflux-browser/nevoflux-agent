@@ -451,6 +451,10 @@ pub async fn execute_session_task(
         // disk survive; a fresh flow clones the base profile.
         let clone = match guard.take() {
             Some(mut dead) => {
+                tracing::warn!(
+                    clone_dir = %dead.clone_dir.display(),
+                    "session browser died; relaunching against the same profile clone"
+                );
                 dead.handle.terminate().await;
                 crate::browser_launch::kill_profile_processes(&dead.clone_dir).await;
                 dead.clone_dir
