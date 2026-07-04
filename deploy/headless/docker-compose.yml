@@ -25,7 +25,7 @@ services:
       # Image is DOWNLOADED from GitHub releases (no local compile). Pin versions:
       #   args: { AGENT_VERSION: v0.3.9, BROWSER_VERSION: 0.3.9 }   # default: latest
       # To build from locally-staged artifacts instead, set: dockerfile: Dockerfile.local
-    image: nevoflux/headless:latest
+    image: nevoflux/agent:latest
     # `--headless` serves the task API; the daemon spawns a browser per task.
     # The task API port also serves the OpenAI-compatible /v1/chat/completions.
     # To split OpenAI / MCP / ACP onto their own ports, add their flags + publish:
@@ -103,7 +103,7 @@ services:
   # `docker compose --profile oneshot run --rm oneshot run --task "..." ...`
   oneshot:
     profiles: ["oneshot"]
-    image: nevoflux/headless:latest
+    image: nevoflux/agent:latest
     build:
       context: .
       dockerfile: Dockerfile

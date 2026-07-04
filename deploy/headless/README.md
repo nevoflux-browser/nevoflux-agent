@@ -27,7 +27,7 @@ The image DOWNLOADS the official prebuilt releases from GitHub — **no local
 compilation**. Just:
 
 ```bash
-docker build -t nevoflux/headless:latest deploy/headless      # amd64 or arm64
+docker build -t nevoflux/agent:latest deploy/headless      # amd64 or arm64
 ```
 
 - **Versions:** default to the latest release; pin for reproducible builds:
@@ -45,7 +45,7 @@ not yet in a release) stage the four artifacts and build the COPY-based variant:
 ```bash
 # stage into deploy/headless/: dist/nevoflux/ (./mach package tree),
 # nevoflux-agent (built daemon), libonnxruntime.so (v1.24.x), models/fastembed/
-docker build -f deploy/headless/Dockerfile.local -t nevoflux/headless:local deploy/headless
+docker build -f deploy/headless/Dockerfile.local -t nevoflux/agent:local deploy/headless
 ```
 (Or in compose: `build.dockerfile: Dockerfile.local`.)
 
@@ -58,7 +58,7 @@ running a daemon during `docker build` and works even with an ephemeral (tmpfs)
 data dir — packs are re-applied each start from the baked-in clones.
 
 ```bash
-docker build -t nevoflux/headless:latest \
+docker build -t nevoflux/agent:latest \
   --build-arg PACK_REPOS="owner/pack-repo https://github.com/x/y.git" \
   deploy/headless
 # → cloned to /opt/packs/<name>; entrypoint runs `pack install /opt/packs/<name>[/pack.toml] --yes --force`
@@ -82,13 +82,13 @@ The image installs **GBrain** at build time and enables it:
 
 ```bash
 # defaults: gbrain on, provider anthropic (needs ANTHROPIC_API_KEY at runtime)
-docker build -t nevoflux/headless:latest deploy/headless
+docker build -t nevoflux/agent:latest deploy/headless
 
 # other provider / pin / disable:
 docker build --build-arg LLM_PROVIDER=openai \                # then set OPENAI_API_KEY at run
              --build-arg GBRAIN_PIN=github:garrytan/gbrain#<sha> \
              --build-arg INSTALL_GBRAIN=0 \                    # skip gbrain entirely
-             -t nevoflux/headless:latest deploy/headless
+             -t nevoflux/agent:latest deploy/headless
 ```
 
 > If you **mount your own** `config.toml`, keep `[knowledge_base.brain] enabled = true`
@@ -106,7 +106,7 @@ docker run --rm \
   -v nevoflux-base-profiles:/base-profiles:ro \
   -e ANTHROPIC_API_KEY="$SHORT_LIVED_KEY" \
   -e HTTP_PROXY="$EGRESS_PROXY" -e HTTPS_PROXY="$EGRESS_PROXY" \
-  nevoflux/headless:latest \
+  nevoflux/agent:latest \
   run --task "open example.com and report the title" --profile base1 \
       --policy browser-only --wall-clock 300s --token-budget 200k
 # result + debug bundle drained to ./out (result.json, debug-bundle/)
@@ -117,7 +117,7 @@ docker run --rm \
 ```bash
 docker run --rm -p 8080:8080 -p 6080:6080 -p 5900:5900 \
   -e NEVOFLUX_VNC=1 -e NEVOFLUX_VNC_PASSWD=/etc/nevoflux/vncpasswd \
-  nevoflux/headless:latest
+  nevoflux/agent:latest
 # submit:  curl -X POST localhost:8080/tasks -d '{"task":"...","mode":"browser"}'
 # watch:   curl -N localhost:8080/tasks/<id>/events        (live task events)
 #          http://localhost:6080/vnc.html                  (live browser in ANY web browser, via noVNC)
