@@ -62,6 +62,14 @@ pub struct TaskRequest {
     /// `NEVOFLUX_SESSION_MODE` is off. Default `false`.
     #[serde(default)]
     pub end_session: bool,
+    /// Session mode only: persist the session's profile clone back to a base
+    /// profile at teardown. Implies ending the session (a safe save needs the
+    /// browser stopped). Default `false`.
+    #[serde(default)]
+    pub save_profile: bool,
+    /// Optional base name to save-as (default: the base the session cloned from).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_profile_as: Option<String>,
 }
 
 fn default_mode() -> String {
@@ -133,6 +141,10 @@ impl TaskRequest {
             idempotent: env_bool("NEVOFLUX_IDEMPOTENT"),
             no_retry: env_bool("NEVOFLUX_NO_RETRY"),
             end_session: false,
+            save_profile: env_bool("NEVOFLUX_SAVE_PROFILE"),
+            save_profile_as: std::env::var("NEVOFLUX_SAVE_PROFILE_AS")
+                .ok()
+                .filter(|s| !s.is_empty()),
         }
     }
 }
@@ -196,6 +208,22 @@ mod tests {
         assert!(r.end_session);
         // from_env leaves it false
         assert!(!TaskRequest::from_env("x".into()).end_session);
+    }
+
+    #[test]
+    fn task_request_save_profile_defaults_absent() {
+        let r: TaskRequest = serde_json::from_str(r#"{"task":"x"}"#).unwrap();
+        assert!(!r.save_profile);
+        assert!(r.save_profile_as.is_none());
+    }
+
+    #[test]
+    fn task_request_save_profile_parses() {
+        let r: TaskRequest =
+            serde_json::from_str(r#"{"task":"x","save_profile":true,"save_profile_as":"acme2"}"#)
+                .unwrap();
+        assert!(r.save_profile);
+        assert_eq!(r.save_profile_as.as_deref(), Some("acme2"));
     }
 
     #[test]

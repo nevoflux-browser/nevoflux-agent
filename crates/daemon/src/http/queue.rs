@@ -123,6 +123,8 @@ mod tests {
             idempotent: false,
             no_retry: false,
             end_session: false,
+            save_profile: false,
+            save_profile_as: None,
         }
     }
 
