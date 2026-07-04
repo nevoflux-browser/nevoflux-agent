@@ -197,22 +197,44 @@ async fn chat_completions(
 /// Tear down the reused browser session (session mode). Locks the same
 /// `SessionHolder` mutex tasks use, so it waits for any in-flight task, then
 /// tears the session down. `closed=false` means there was no live session.
-async fn close_session() -> impl IntoResponse {
+/// Optional JSON body for `POST /session/close`. A bodyless close defaults to
+/// `save=false` (just tear down).
+#[derive(Debug, Default, serde::Deserialize)]
+struct CloseSessionRequest {
+    /// Save the profile back to base before tearing down.
+    #[serde(default)]
+    save: bool,
+    /// Optional base name to save-as (default: the base the session cloned from).
+    #[serde(default, rename = "as")]
+    save_as: Option<String>,
+}
+
+async fn close_session(body: Option<Json<CloseSessionRequest>>) -> impl IntoResponse {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
     let holder = crate::automation::session_holder::SessionHolder::global();
     let mut guard = holder.inner.lock().await;
     let had = guard.is_some();
-    if had {
-        // Same ProfileManager config the runner uses (env-derived).
-        let base_dir = std::env::var("NEVOFLUX_BASE_PROFILES")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("/base-profiles"));
-        let work_dir = std::env::var("NEVOFLUX_PROFILE_WORK")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir().join("nevoflux-profiles"));
-        let pm = crate::profile::ProfileManager { base_dir, work_dir };
-        crate::automation::session_holder::teardown_locked(&mut guard, &pm).await;
-    }
-    (StatusCode::OK, Json(serde_json::json!({ "closed": had }))).into_response()
+    // Same ProfileManager config the runner uses (env-derived).
+    let base_dir = std::env::var("NEVOFLUX_BASE_PROFILES")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/base-profiles"));
+    let work_dir = std::env::var("NEVOFLUX_PROFILE_WORK")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("nevoflux-profiles"));
+    let pm = crate::profile::ProfileManager { base_dir, work_dir };
+    let report = crate::automation::session_holder::teardown_locked(
+        &mut guard, &pm, req.save, req.save_as,
+    )
+    .await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "closed": had,
+            "saved_to": report.saved_to,
+            "save_error": report.error,
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -224,6 +246,20 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    #[test]
+    fn close_session_request_defaults_bodyless() {
+        let r = CloseSessionRequest::default();
+        assert!(!r.save);
+        assert!(r.save_as.is_none());
+    }
+
+    #[test]
+    fn close_session_request_parses() {
+        let r: CloseSessionRequest = serde_json::from_str(r#"{"save":true,"as":"acme2"}"#).unwrap();
+        assert!(r.save);
+        assert_eq!(r.save_as.as_deref(), Some("acme2"));
+    }
 
     #[tokio::test]
     async fn session_close_reports_no_active_session() {
