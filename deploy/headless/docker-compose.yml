@@ -76,6 +76,9 @@ services:
     volumes:
       - ./out:/work                             # drained result.json + debug-bundle + artifacts
       - base-profiles:/base-profiles:ro         # pre-authenticated login templates (cloned per task)
+      # NOTE: session-mode `save_profile` (task flag or POST /session/close {"save":true})
+      # writes the profile BACK here — drop the `:ro` above to allow it (default is
+      # read-only so tasks can't overwrite a base credential). See examples/ for scripts.
       # - ./fixed-flow.py:/opt/nevoflux/fixed-flow.py:ro   # fixed-script mode (see NEVOFLUX_HEADLESS_SCRIPT)
     tmpfs:
       - /tmp
