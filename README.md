@@ -9,7 +9,7 @@ AI-powered browser assistant with native computer control capabilities.
 - **MCP Integration**: Works with Claude Code via Model Context Protocol (stdio transport)
 - **MCP Manager**: Connect to external MCP servers with auto-reconnection and health monitoring
 - **Native Messaging**: Secure bridge between browser extension and daemon via ZeroMQ
-- **LLM Integration**: Supports Anthropic, OpenAI, Qwen, DeepSeek, OpenRouter via rig-core
+- **LLM Integration**: Anthropic, OpenAI, OpenRouter, DeepSeek, Qwen, Gemini, Groq, Ollama, Mistral, xAI, Cohere, Perplexity, Together — plus subprocess/ACP agents (Claude Code, Gemini CLI, OpenClaw)
 - **WASM Skills**: Extensible skill system using WebAssembly modules with host functions
 - **Session Management**: Persistent session storage with SQLite, automatic cleanup policies
 - **Hot Config Reload**: Configuration file watching with automatic updates
@@ -20,7 +20,7 @@ AI-powered browser assistant with native computer control capabilities.
 
 ### Prerequisites
 
-- Rust 1.75+ (for building from source)
+- Rust 1.91.0 (pinned via `rust-toolchain.toml`)
 - Linux: X11 display server (Wayland not yet supported)
 - macOS: Accessibility permissions required for computer control
 - Windows: Administrator privileges for native messaging host installation
@@ -33,7 +33,10 @@ cd nevoflux-agent
 cargo build --release
 ```
 
-The binary will be available at `target/release/nevoflux`.
+The binary will be available at `target/release/nevoflux-agent`.
+
+> The executable is named **`nevoflux-agent`**. The examples below use `nevoflux`
+> for brevity — either alias it (`alias nevoflux=nevoflux-agent`) or type the full name.
 
 ### Using justfile
 
@@ -41,7 +44,7 @@ Development tasks are automated via `just`:
 
 ```bash
 just build          # Build all crates
-just build-release  # Build release version
+just release        # Build release version
 just test           # Run all tests
 just ci             # Full CI (fmt check + clippy + tests)
 just daemon         # Run daemon with verbose logging
@@ -120,6 +123,16 @@ nevoflux config delete key        # Delete value
 ```bash
 nevoflux setup
 ```
+
+### Other Commands
+
+```bash
+nevoflux pack list              # Manage capability packs (validate/inspect/install/…)
+nevoflux completions bash       # Generate shell completions
+```
+
+Server/deployment flags — `--headless`, `--http-addr`, `--openai-addr`, `--mcp-addr`,
+`--acp-addr` — are covered under [Headless Deployment](#headless-deployment-docker).
 
 ## Headless Deployment (Docker)
 
@@ -206,11 +219,14 @@ and session mode live in `deploy/headless/examples/`.
 | `nevoflux-bridge` | Native messaging bridge between browser and daemon |
 | `nevoflux-protocol` | Shared message types and serialization (JSON/MessagePack) |
 | `nevoflux-storage` | SQLite-based persistent storage |
-| `nevoflux-llm` | LLM provider abstraction (Anthropic, OpenAI, Qwen, DeepSeek, OpenRouter) |
+| `nevoflux-llm` | LLM provider abstraction (Anthropic, OpenAI, Gemini, DeepSeek, Qwen, … + ACP/CLI agents) |
 | `nevoflux-computer` | Cross-platform computer control (screenshot, mouse, keyboard) |
 | `nevoflux-skills` | WASM skill loading and management |
 | `nevoflux-builtin-wasm` | Built-in WASM skill modules |
 | `nevoflux-testing` | Testing utilities, mocks, and fixtures |
+| `nevoflux-brain` | Knowledge/memory brain engine |
+| `nevoflux-llm-gateway` | In-process OpenAI-compatible LLM + embeddings gateway |
+| `nevoflux-pack` | Pack (capability bundle) install + lifecycle |
 
 ## MCP Tools
 
@@ -229,7 +245,7 @@ and session mode live in `deploy/headless/examples/`.
 | `browser_scroll` | Scroll page | `direction`, `amount?` |
 | `browser_get_element` | Get element info | `selector` |
 | `browser_query_all` | Query all matching elements | `selector` |
-| `browser_snapshot` | Accessibility tree snapshot | - |
+| `browser_get_elements` | Get info for all matching elements | `selector` |
 | `browser_click_by_id` | Click by snapshot ID | `element_id` |
 | `browser_fill_by_id` | Fill by snapshot ID | `element_id`, `value` |
 | `browser_type_by_id` | Type by snapshot ID | `element_id`, `text` |
@@ -298,7 +314,7 @@ include_current_page = true
 [llm]
 default_provider = "anthropic"
 default_model = "claude-sonnet-4-20250514"
-max_tokens = 4096
+max_tokens = 32768
 temperature = 0.7
 timeout_secs = 120
 max_retries = 3
@@ -326,7 +342,9 @@ OPENROUTER_API_KEY    # OpenRouter
 
 # NevoFlux Settings
 NEVOFLUX_DATA_DIR     # Override data directory
-NEVOFLUX_LOG_LEVEL    # Override log level (trace, debug, info, warn, error)
+RUST_LOG              # Log level / filter (e.g. info, debug, nevoflux_daemon=trace)
+NEVOFLUX_SESSION_MODE # Headless: reuse ONE browser across a task-flow (see Headless Deployment)
+ORT_DYLIB_PATH        # Path to libonnxruntime (embedding feature, load-dynamic builds)
 ```
 
 ## Development
@@ -366,7 +384,7 @@ just doc     # Generate and open docs
 ### Build for Release
 
 ```bash
-just build-release
+just release
 ```
 
 ## Platform Notes
