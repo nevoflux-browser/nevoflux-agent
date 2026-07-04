@@ -84,7 +84,15 @@ pub fn build_headless_runner(
                 };
                 let policy = req.to_policy();
                 let outcome = if session_mode {
-                    session::execute_session_task(&deps, &policy, &req.task, req.end_session).await
+                    session::execute_session_task(
+                        &deps,
+                        &policy,
+                        &req.task,
+                        req.end_session,
+                        req.save_profile,
+                        req.save_profile_as.clone(),
+                    )
+                    .await
                 } else {
                     session::execute_full_task(&deps, &policy, &req.task).await
                 };

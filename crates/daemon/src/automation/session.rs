@@ -436,6 +436,8 @@ pub async fn execute_session_task(
     policy: &Policy,
     task: &str,
     end_session: bool,
+    save_profile: bool,
+    save_profile_as: Option<String>,
 ) -> SessionOutcome {
     let holder = SessionHolder::global();
     let mut guard = holder.inner.lock().await;
@@ -491,7 +493,7 @@ pub async fn execute_session_task(
 
     // Run the task against the live browser (own retry loop; NO relaunch — each
     // attempt just re-binds the same registered browser).
-    let outcome = run_with_retry(policy, |attempt| async move {
+    let mut outcome = run_with_retry(policy, |attempt| async move {
         let browser = match deps.registry.single() {
             Ok(b) => b,
             Err(e) => {
@@ -515,11 +517,31 @@ pub async fn execute_session_task(
     })
     .await;
 
-    // End of flow → tear the session down.
-    if end_session {
-        session_holder::teardown_locked(&mut guard, &deps.profile_mgr).await;
+    // End of flow (explicit end, OR a save request — a safe save needs teardown).
+    if end_session || save_profile {
+        let report = session_holder::teardown_locked(
+            &mut guard,
+            &deps.profile_mgr,
+            save_profile,
+            save_profile_as,
+        )
+        .await;
+        outcome.output = append_save_note(outcome.output, &report);
     }
     outcome
+}
+
+/// Fold a teardown [`SaveReport`](session_holder::SaveReport) into the task output
+/// the caller already reads.
+fn append_save_note(output: Option<String>, report: &session_holder::SaveReport) -> Option<String> {
+    let note = if let Some(name) = &report.saved_to {
+        format!("\n[profile saved to base: {name}]")
+    } else if let Some(err) = &report.error {
+        format!("\n[profile save failed: {err}]")
+    } else {
+        return output;
+    };
+    Some(output.unwrap_or_default() + &note)
 }
 
 #[cfg(test)]
@@ -534,6 +556,29 @@ mod tests {
         assert_eq!(req.tab_id, None);
         assert_eq!(req.proxy_id, "proxy-x");
         assert_eq!(req.client_identity, vec![9, 9]);
+    }
+
+    #[test]
+    fn append_save_note_reports_outcome() {
+        use crate::automation::session_holder::SaveReport;
+        let saved = SaveReport {
+            saved_to: Some("acme".into()),
+            error: None,
+        };
+        assert!(append_save_note(Some("done".into()), &saved)
+            .unwrap()
+            .contains("saved to base: acme"));
+
+        let empty = SaveReport::default();
+        assert_eq!(append_save_note(Some("done".into()), &empty), Some("done".into()));
+
+        let failed = SaveReport {
+            saved_to: None,
+            error: Some("boom".into()),
+        };
+        assert!(append_save_note(None, &failed)
+            .unwrap()
+            .contains("save failed: boom"));
     }
 
     fn fail(tainted: bool) -> AttemptOutcome {
