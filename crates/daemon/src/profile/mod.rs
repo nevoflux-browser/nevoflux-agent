@@ -63,6 +63,25 @@ impl ProfileManager {
     pub fn cleanup(&self, clone: &Path) {
         let _ = std::fs::remove_dir_all(clone);
     }
+
+    /// Persist a live clone dir back to `base_dir/<base_name>`, replacing it.
+    /// Reverse of `clone_base`. The caller MUST have stopped the browser first
+    /// (files flushed) — this is a plain filesystem copy.
+    pub fn save_to_base(&self, clone: &Path, base_name: &str) -> Result<(), ProfileError> {
+        std::fs::create_dir_all(&self.base_dir)?;
+        let seq = CLONE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dest = self.base_dir.join(base_name);
+        let tmp = self.base_dir.join(format!("{base_name}.saving-{seq}"));
+        // Copy into a temp sibling first so a mid-copy failure can't destroy the
+        // existing base; only swap once the copy fully succeeds.
+        let _ = std::fs::remove_dir_all(&tmp);
+        copy_dir_filtered(clone, &tmp)?;
+        if dest.exists() {
+            std::fs::remove_dir_all(&dest)?;
+        }
+        std::fs::rename(&tmp, &dest)?;
+        Ok(())
+    }
 }
 
 /// Recursively copy `src` into `dst` (dirs + files).
@@ -74,6 +93,41 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         let target = dst.join(entry.file_name());
         if ty.is_dir() {
             copy_dir_all(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Like `copy_dir_all`, but at the profile ROOT it (a) skips Firefox lock files
+/// (`lock`, `.parentlock`) so a stale lock never poisons the base, and (b) strips
+/// the injected `nevoflux.headless.automation` pref from `user.js` so the base
+/// stays a clean human-login profile (it is re-injected per clone). Subdirectories
+/// are copied verbatim.
+fn copy_dir_filtered(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str == "lock" || name_str == ".parentlock" {
+            continue;
+        }
+        let ty = entry.file_type()?;
+        let target = dst.join(&name);
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else if name_str == "user.js" {
+            let contents = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            let mut filtered = String::new();
+            for line in contents.lines() {
+                if !line.contains("nevoflux.headless.automation") {
+                    filtered.push_str(line);
+                    filtered.push('\n');
+                }
+            }
+            std::fs::write(&target, filtered)?;
         } else {
             std::fs::copy(entry.path(), target)?;
         }
@@ -123,5 +177,57 @@ mod tests {
         };
         let clone = pm.clone_base("does-not-exist").unwrap();
         assert!(clone.is_dir());
+    }
+
+    #[test]
+    fn save_to_base_replaces_and_filters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pm = ProfileManager {
+            base_dir: tmp.path().join("base"),
+            work_dir: tmp.path().join("work"),
+        };
+        let base = pm.base_dir.join("acme");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("old.txt"), b"old").unwrap(); // must be gone after replace
+        let clone = tmp.path().join("clone");
+        std::fs::create_dir_all(clone.join("storage")).unwrap();
+        std::fs::write(clone.join("cookies.sqlite"), b"c").unwrap();
+        std::fs::write(clone.join("storage/s"), b"s").unwrap();
+        std::fs::write(
+            clone.join("user.js"),
+            "user_pref(\"a.b\", 1);\nuser_pref(\"nevoflux.headless.automation\", true);\n",
+        )
+        .unwrap();
+        std::fs::write(clone.join("lock"), b"x").unwrap();
+
+        pm.save_to_base(&clone, "acme").unwrap();
+
+        assert!(base.join("cookies.sqlite").exists()); // new content persisted
+        assert!(base.join("storage/s").exists()); // subdirs copied
+        assert!(!base.join("old.txt").exists()); // base fully REPLACED
+        assert!(!base.join("lock").exists()); // lock file skipped
+        let uj = std::fs::read_to_string(base.join("user.js")).unwrap();
+        assert!(uj.contains("a.b")); // other prefs kept
+        assert!(!uj.contains("nevoflux.headless.automation")); // injected pref stripped
+    }
+
+    #[test]
+    fn save_to_base_as_new_name_leaves_original() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pm = ProfileManager {
+            base_dir: tmp.path().join("base"),
+            work_dir: tmp.path().join("work"),
+        };
+        let orig = pm.base_dir.join("acme");
+        std::fs::create_dir_all(&orig).unwrap();
+        std::fs::write(orig.join("keep.txt"), b"k").unwrap();
+        let clone = tmp.path().join("clone");
+        std::fs::create_dir_all(&clone).unwrap();
+        std::fs::write(clone.join("new.txt"), b"n").unwrap();
+
+        pm.save_to_base(&clone, "acme-loggedin").unwrap();
+
+        assert!(pm.base_dir.join("acme-loggedin/new.txt").exists());
+        assert!(orig.join("keep.txt").exists()); // original untouched
     }
 }
