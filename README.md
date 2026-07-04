@@ -121,6 +121,44 @@ nevoflux config delete key        # Delete value
 nevoflux setup
 ```
 
+## Headless Deployment (Docker)
+
+Run NevoFlux Agent as a **containerized service** — no GUI needed. The
+`nevoflux/agent` image packages the daemon plus a headless browser and serves an
+HTTP **task API**, an **OpenAI-compatible** `/v1/chat/completions` endpoint, and
+optional **MCP** / **ACP** interfaces. Each task drives a real browser
+(automation + computer use + shell/fs tools) with the built-in knowledge base —
+so "headless" is only the deployment mode, not the extent of what it does.
+
+The image is built from `deploy/headless/` and **downloads prebuilt releases from
+GitHub — no local compilation**:
+
+```bash
+docker build -t nevoflux/agent:latest deploy/headless      # amd64 or arm64
+cd deploy/headless && docker compose up -d                 # long-running service
+
+# submit a browser task
+curl -s localhost:8080/tasks -H 'Content-Type: application/json' \
+  -d '{"task":"open example.com and report the title","mode":"browser"}'
+# OpenAI-compatible endpoint: POST localhost:8080/v1/chat/completions
+```
+
+Notable modes (full guide in [`deploy/headless/README.md`](deploy/headless/README.md)):
+
+- **Session mode** (`NEVOFLUX_SESSION_MODE=1`): reuse ONE warm browser + profile
+  clone across a task-flow (soft-reset between tasks); end with `{"end_session":true}`
+  on a task or `POST /session/close`. Persist the profile back to a base profile
+  with the `save_profile` flag / `POST /session/close {"save":true}`.
+- **Fixed-script mode** (`NEVOFLUX_HEADLESS_SCRIPT=…`): run a deterministic Python
+  flow instead of the LLM agent loop (see `deploy/headless/examples/`).
+- **One task per container** (untrusted workloads): `docker compose --profile oneshot run …`.
+- **Live view**: noVNC at `http://localhost:6080/vnc.html` with `NEVOFLUX_VNC=1`.
+
+Versions default to the latest release; pin with `--build-arg AGENT_VERSION=vX.Y.Z
+--build-arg BROWSER_VERSION=X.Y.Z`. To build from local/unreleased binaries, use
+`deploy/headless/Dockerfile.local` (COPY-based). Helper scripts for the task API
+and session mode live in `deploy/headless/examples/`.
+
 ## Architecture
 
 ```
