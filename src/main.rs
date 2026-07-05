@@ -742,8 +742,17 @@ async fn run_daemon(
         }
     }
 
-    // Wait for shutdown signal
-    tokio::signal::ctrl_c().await?;
+    // Wait for a shutdown signal: Ctrl+C, or the server terminating on its
+    // own (managed-mode idle timeout). Waiting only on Ctrl+C left idle
+    // managed daemons alive forever: the idle check stopped the accept loop
+    // but nothing ever ended the process, so each browser session leaked an
+    // orphan daemon holding a port from the 19501-19600 range.
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        _ = server.wait_terminated() => {
+            tracing::info!("server terminated on its own (idle timeout); exiting");
+        }
+    }
 
     logging::log_shutdown();
 

@@ -284,6 +284,11 @@ pub struct ServerConfig {
     /// Explicit port to bind to (set by proxy in managed mode).
     /// When set, skips port scanning and port/pid file writes.
     pub explicit_port: Option<u16>,
+    /// Boot with this agent config instead of loading the user's
+    /// `config.toml` from disk. Tests use it to isolate from the real
+    /// config (which may enable gbrain/embedding and contend on shared
+    /// resources like the `~/.gbrain` PGLite lock). `None` = load from disk.
+    pub agent_config: Option<AgentConfig>,
 }
 
 impl Default for ServerConfig {
@@ -297,6 +302,7 @@ impl Default for ServerConfig {
             idle_timeout: std::time::Duration::from_secs(30),
             data_dir: None,
             explicit_port: None,
+            agent_config: None,
         }
     }
 }
@@ -317,6 +323,10 @@ pub struct Server {
     port: u16,
     /// Shutdown signal sender.
     shutdown_tx: Option<mpsc::Sender<()>>,
+    /// Notified when the accept loop has shut down (e.g. managed-mode idle
+    /// self-termination). `main` waits on this so the process actually
+    /// exits instead of blocking on Ctrl+C forever.
+    terminated: Arc<tokio::sync::Notify>,
     /// In-process llm-gateway handle, if `knowledge_base.enabled` was
     /// true at boot (M1 #010). Stored here so [`Self::shutdown`] can
     /// gracefully stop the gateway task before the daemon exits.
@@ -402,6 +412,15 @@ impl Server {
     pub fn reindex_progress(&self) -> Option<crate::memory_reindex::ReindexProgress> {
         let guard = self.reindex_progress.read().ok()?;
         guard.as_ref().map(|rx| rx.borrow().clone())
+    }
+
+    /// Wait until the server has terminated on its own (the accept loop
+    /// exited, e.g. after the managed-mode idle timeout fired).
+    ///
+    /// Backed by a [`tokio::sync::Notify`] whose permit is stored, so this
+    /// resolves even when termination happened before the call.
+    pub async fn wait_terminated(&self) {
+        self.terminated.notified().await;
     }
 
     /// Signal the server to shutdown.
@@ -645,8 +664,13 @@ pub async fn start_server(
 
     info!("Starting daemon server on {}", bind_addr);
 
-    // Load agent config for LLM settings
-    let agent_config = match AgentConfig::load() {
+    // Load agent config for LLM settings (or take the injected one).
+    let agent_config = match config
+        .agent_config
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(AgentConfig::load)
+    {
         Ok(cfg) => {
             info!(
                 "Loaded agent config: llm.provider={:?}",
@@ -1763,6 +1787,8 @@ pub async fn start_server(
     let config_idle_timeout = config.idle_timeout;
     let accept_shutdown_tx = shutdown_tx.clone();
     let shutdown_loop_manager = loop_manager.clone();
+    let terminated = Arc::new(tokio::sync::Notify::new());
+    let accept_terminated = terminated.clone();
     tokio::spawn(async move {
         let last_message_time = Arc::new(Mutex::new(std::time::Instant::now()));
 
@@ -1825,6 +1851,11 @@ pub async fn start_server(
                 }
             }
         }
+        // Make the shutdown observable to `Server::wait_terminated()`.
+        // Without this, a managed daemon's idle self-termination only
+        // stopped this accept loop while `main` kept awaiting Ctrl+C,
+        // leaking an orphan process per browser session.
+        accept_terminated.notify_one();
     });
 
     // Spawn browser request handler task
@@ -3814,6 +3845,7 @@ pub async fn start_server(
     Ok(Server {
         port,
         shutdown_tx: Some(shutdown_tx),
+        terminated,
         gateway: gateway_handle,
         gateway_snapshot,
         brain_slot,
@@ -10152,7 +10184,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_start_and_shutdown() {
-        let config = ServerConfig::default();
+        // Inject an isolated agent config instead of loading the developer's
+        // real config.toml: a real config may enable gbrain (whose spawn
+        // contends on the shared ~/.gbrain PGLite lock with any live daemon
+        // and hangs this test waiting for it) or embedding (whose model
+        // load runs on an un-cancellable spawn_blocking thread and can hit
+        // the network).
+        let mut agent_config = AgentConfig::default();
+        agent_config.embedding.enabled = false;
+        agent_config.knowledge_base.enabled = false;
+        agent_config.knowledge_base.brain.enabled = false;
+
+        let config = ServerConfig {
+            // Stay out of the production daemon's 19500-19600 range.
+            port_start: 38500,
+            port_end: 38600,
+            agent_config: Some(agent_config),
+            ..Default::default()
+        };
         let router = Arc::new(Router::new());
         let session_manager = Arc::new(SessionManager::in_memory().unwrap());
 
@@ -10160,7 +10209,7 @@ mod tests {
         assert!(server.is_ok());
 
         let mut server = server.unwrap();
-        assert!(server.port() >= 19500);
+        assert!(server.port() >= 38500);
 
         // Shutdown
         server.shutdown().await;

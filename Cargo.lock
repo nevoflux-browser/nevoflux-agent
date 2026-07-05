@@ -3417,6 +3417,7 @@ dependencies = [
  "toml_edit 0.22.27",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "wasmtime",
  "wasmtime-wasi",
