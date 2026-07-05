@@ -398,15 +398,38 @@ mod tests {
     }
 
     #[test]
-    fn subscribe_wildcard_denied_for_non_daemon() {
+    fn subscribe_prefixed_wildcard_follows_prefix_permissions() {
+        // Prefixed wildcards follow the same rules as exact topics under
+        // that prefix: whoever may subscribe `task:foo` may subscribe
+        // `task:*` (and the Extension sidebar may subscribe `ui:*`).
         let pat = TopicPattern::wildcard("task:*");
+        assert!(PermissionChecker::check_subscribe(&pat, &sub_agent()).is_allowed());
+        assert!(PermissionChecker::check_subscribe(&pat, &sub_extension()).is_denied());
+
+        let pat = TopicPattern::wildcard("ui:*");
+        assert!(PermissionChecker::check_subscribe(&pat, &sub_extension()).is_allowed());
+        assert!(PermissionChecker::check_subscribe(&pat, &sub_agent()).is_denied());
+    }
+
+    #[test]
+    fn subscribe_bare_wildcard_denied_for_non_daemon() {
+        // A bare `*` crosses permission boundaries and stays Internal-only.
+        let pat = TopicPattern::wildcard("*");
         assert!(PermissionChecker::check_subscribe(&pat, &sub_agent()).is_denied());
         assert!(PermissionChecker::check_subscribe(&pat, &sub_extension()).is_denied());
     }
 
     #[test]
-    fn subscribe_double_wildcard_denied_for_non_daemon() {
+    fn subscribe_prefixed_double_wildcard_follows_prefix_permissions() {
         let pat = TopicPattern::double_wildcard("task");
+        assert!(PermissionChecker::check_subscribe(&pat, &sub_agent()).is_allowed());
+        assert!(PermissionChecker::check_subscribe(&pat, &sub_extension()).is_denied());
+    }
+
+    #[test]
+    fn subscribe_bare_double_wildcard_denied_for_non_daemon() {
+        // A bare `**` crosses permission boundaries and stays Internal-only.
+        let pat = TopicPattern::double_wildcard("");
         assert!(PermissionChecker::check_subscribe(&pat, &sub_agent()).is_denied());
         assert!(PermissionChecker::check_subscribe(&pat, &sub_extension()).is_denied());
     }

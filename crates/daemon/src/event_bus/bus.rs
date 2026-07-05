@@ -656,9 +656,22 @@ mod tests {
         assert_eq!(handle.rx.try_recv().unwrap().payload, json!("b"));
         assert!(handle.rx.try_recv().is_err());
 
-        // Non-internal subscriber should be denied double-wildcard.
+        // A prefixed double-wildcard follows that prefix's permissions,
+        // so an Agent may subscribe `task:**`...
         let result = bus.subscribe(
             TopicPattern::double_wildcard("task"),
+            SubscriberIdentity::Agent {
+                session_id: "s1".into(),
+            },
+            BackpressurePolicy::DropNewest,
+            16,
+        );
+        assert!(result.is_ok());
+
+        // ...but a bare `**` crosses permission boundaries and stays
+        // Internal-only.
+        let result = bus.subscribe(
+            TopicPattern::double_wildcard(""),
             SubscriberIdentity::Agent {
                 session_id: "s1".into(),
             },
