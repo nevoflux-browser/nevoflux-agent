@@ -167,6 +167,196 @@ pub fn append_repair(flow: &FlowPackage, entry: &serde_json::Value) -> std::io::
     writeln!(f, "{entry}")
 }
 
+use crate::agent::code_mode::CodeModeResult;
+use crate::error::{DaemonError, Result as DaemonResult};
+use crate::wasm::services::BrowserContext;
+
+/// Instruction appended to every failure handoff so the calling LLM knows how
+/// to take over and how to file the repair suggestion afterwards.
+const HANDOFF_INSTRUCTION: &str = "The recorded flow script failed partway. The browser is still \
+at the failure state (see handoff.url / handoff.tab_id when present). Take over now: use the \
+browser tools to relocate the failed element (durable selectors first, then role+name) and finish \
+the remaining steps of the workflow yourself. After the task is complete, call \
+report_flow_repair with this flow's name, the failed step, and the selector or approach that \
+worked, so the script can be fixed with user approval later.";
+
+/// Wrap a flow script for execution: prepend `import json`, append a trailing
+/// `run(json.loads("<params-json>"))` expression so the script's return value
+/// lands in `CodeModeResult.result`. Params are double-JSON-encoded because a
+/// raw JSON object is not a valid Python literal (`true` / `null`), while a
+/// JSON *string* is a valid Python string literal (same trick as the headless
+/// runner's task injection, one level up).
+fn wrap_script(user_code: &str, params: &serde_json::Value) -> String {
+    let params_json = serde_json::to_string(params).unwrap_or_else(|_| "{}".into());
+    let params_literal = serde_json::to_string(&params_json).unwrap_or_else(|_| "\"{}\"".into());
+    format!("import json\n{user_code}\n\nrun(json.loads({params_literal}))\n")
+}
+
+/// Convert a `CodeModeResult` into the tool-result string for the calling LLM.
+///
+/// - script returned a dict without `"ok": false` -> plain JSON passthrough
+/// - script returned a handoff (`"ok": false`)    -> `status: script_failed` envelope
+/// - Monty runtime error                          -> `status: script_error` envelope
+fn format_flow_result(flow_name: &str, result: &CodeModeResult) -> String {
+    if result.success {
+        let value = match &result.result {
+            Some(v) if !v.is_null() => v.clone(),
+            _ => serde_json::json!({"ok": true, "output": result.output}),
+        };
+        let script_failed = value
+            .get("ok")
+            .map(|ok| ok == &serde_json::json!(false))
+            .unwrap_or(false);
+        if script_failed {
+            serde_json::json!({
+                "flow": flow_name,
+                "status": "script_failed",
+                "handoff": value,
+                "instruction": HANDOFF_INSTRUCTION,
+            })
+            .to_string()
+        } else {
+            value.to_string()
+        }
+    } else {
+        serde_json::json!({
+            "flow": flow_name,
+            "status": "script_error",
+            "handoff": {
+                "error": result.error.clone().unwrap_or_else(|| "flow script failed".into()),
+                "output": result.output,
+            },
+            "instruction": HANDOFF_INSTRUCTION,
+        })
+        .to_string()
+    }
+}
+
+/// Execute a flow's `replay.py` with already-validated params against the
+/// bound browser. Synchronous by design — `execute_python_simple` does its own
+/// `block_in_place + block_on`, exactly like the headless script runner.
+pub fn execute_flow(
+    flow: &FlowPackage,
+    params: &serde_json::Value,
+    browser_ctx: BrowserContext,
+) -> DaemonResult<String> {
+    let script_path = flow.script_path();
+    let user_code = std::fs::read_to_string(&script_path).map_err(|e| {
+        DaemonError::InternalError(format!(
+            "run_flow: cannot read flow script {}: {e}",
+            script_path.display()
+        ))
+    })?;
+    let wrapped = wrap_script(&user_code, params);
+    let result = crate::agent::code_mode::execute_python_simple(&wrapped, Some(browser_ctx));
+    Ok(format_flow_result(&flow.manifest.name, &result))
+}
+
+/// Daemon-orchestrated dispatch for the recorded-flow tools, mirroring
+/// `agent::tools::dispatch_recording_tool`. Called from both the direct-API
+/// path (`agent_host::tool_call_dynamic`) and the ACP/MCP-bridge path
+/// (`mcp_tool_executor::execute_mcp_tool`).
+pub async fn dispatch_flow_tool(
+    name: &str,
+    arguments: &serde_json::Value,
+    browser_ctx: Option<BrowserContext>,
+) -> DaemonResult<String> {
+    match name {
+        "list_flows" => {
+            let flows: Vec<serde_json::Value> =
+                discover_flows(&nevoflux_skills::default_user_skills_dirs())
+                    .into_iter()
+                    .map(|f| {
+                        serde_json::json!({
+                            "name": f.manifest.name,
+                            "description": f.manifest.description,
+                            "params_schema": f.manifest.params_schema,
+                        })
+                    })
+                    .collect();
+            Ok(serde_json::json!({ "flows": flows }).to_string())
+        }
+        "run_flow" => {
+            let flow_name = arguments
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    DaemonError::InternalError("run_flow: missing 'name' argument".into())
+                })?;
+            let params = arguments
+                .get("params")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let Some(flow) = find_flow(flow_name) else {
+                let available: Vec<String> =
+                    discover_flows(&nevoflux_skills::default_user_skills_dirs())
+                        .into_iter()
+                        .map(|f| f.manifest.name)
+                        .collect();
+                return Ok(serde_json::json!({
+                    "status": "unknown_flow",
+                    "error": format!("no recorded flow named '{flow_name}'"),
+                    "available_flows": available,
+                })
+                .to_string());
+            };
+            if let Err(e) = validate_params(&flow.manifest.params_schema, &params) {
+                return Ok(serde_json::json!({
+                    "status": "invalid_params",
+                    "flow": flow.manifest.name,
+                    "error": e,
+                    "params_schema": flow.manifest.params_schema,
+                })
+                .to_string());
+            }
+            let ctx = browser_ctx.ok_or_else(|| {
+                DaemonError::InternalError("run_flow: browser not available".into())
+            })?;
+            execute_flow(&flow, &params, ctx)
+        }
+        "report_flow_repair" => {
+            let flow_name = arguments
+                .get("flow")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    DaemonError::InternalError(
+                        "report_flow_repair: missing 'flow' argument".into(),
+                    )
+                })?;
+            let Some(flow) = find_flow(flow_name) else {
+                return Ok(serde_json::json!({
+                    "status": "unknown_flow",
+                    "error": format!("no recorded flow named '{flow_name}'"),
+                })
+                .to_string());
+            };
+            let entry = serde_json::json!({
+                "failed_step": arguments.get("failed_step").cloned().unwrap_or(serde_json::Value::Null),
+                "suggestion": arguments.get("suggestion").cloned().unwrap_or(serde_json::Value::Null),
+                "reported_at_ms": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            });
+            append_repair(&flow, &entry).map_err(|e| {
+                DaemonError::InternalError(format!(
+                    "report_flow_repair: cannot write {}: {e}",
+                    flow.repairs_path().display()
+                ))
+            })?;
+            Ok(serde_json::json!({
+                "status": "recorded",
+                "flow": flow.manifest.name,
+                "note": "Repair suggestion saved. skill-creator will ask the user to confirm the script update on its next session.",
+            })
+            .to_string())
+        }
+        other => Err(DaemonError::InternalError(format!(
+            "dispatch_flow_tool: unknown flow tool '{other}'"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +447,119 @@ mod tests {
     fn test_validate_params_not_object() {
         let m: FlowManifest = serde_json::from_str(MANIFEST).unwrap();
         assert!(validate_params(&m.params_schema, &serde_json::json!("str")).is_err());
+    }
+
+    #[test]
+    fn test_wrap_script_injects_params_via_json() {
+        let wrapped = wrap_script(
+            "def run(params):\n    return params[\"q\"]\n",
+            &serde_json::json!({"q": "hello \"world\"", "flag": true, "n": null}),
+        );
+        assert!(wrapped.starts_with("import json\n"), "wrapped: {wrapped}");
+        assert!(wrapped.contains("def run(params):"));
+        assert!(wrapped.contains("run(json.loads("), "wrapped: {wrapped}");
+        // The JSON payload must be double-encoded (a Python string literal).
+        assert!(
+            wrapped.contains("\\\"flag\\\": true") || wrapped.contains("\\\"flag\\\":true"),
+            "wrapped: {wrapped}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_execute_flow_returns_script_value() {
+        // No browser tools needed by this script, so browser_ctx = None works
+        // through execute_python_simple; exercise wrap + execute + format.
+        let tmp = TempDir::new().unwrap();
+        let dir = write_flow(
+            tmp.path(),
+            "my-skill",
+            "echo",
+            r#"{"name": "echo", "description": "", "version": 1,
+                "params_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}"#,
+        );
+        std::fs::write(
+            dir.join("replay.py"),
+            "def run(params):\n    return {\"ok\": True, \"echo\": params[\"q\"]}\n",
+        )
+        .unwrap();
+        let flow = FlowPackage {
+            manifest: serde_json::from_str(
+                &std::fs::read_to_string(dir.join("flow.json")).unwrap(),
+            )
+            .unwrap(),
+            dir,
+        };
+        let code = std::fs::read_to_string(flow.script_path()).unwrap();
+        let wrapped = wrap_script(&code, &serde_json::json!({"q": "hi"}));
+        let result = tokio::task::spawn_blocking(move || {
+            crate::agent::code_mode::execute_python_simple(&wrapped, None)
+        })
+        .await
+        .unwrap();
+        let formatted = format_flow_result("echo", &result);
+        let v: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+        assert_eq!(v["ok"], serde_json::json!(true), "formatted: {formatted}");
+        assert_eq!(v["echo"], serde_json::json!("hi"));
+    }
+
+    #[test]
+    fn test_format_flow_result_wraps_script_handoff() {
+        let result = crate::agent::code_mode::CodeModeResult::success(String::new())
+            .with_result(serde_json::json!({
+                "ok": false, "failed_step": 3, "step_label": "click submit",
+                "url": "https://x/y", "tab_id": 2, "error": "no selector matched"
+            }));
+        let formatted = format_flow_result("jira_ticket", &result);
+        let v: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+        assert_eq!(v["status"], serde_json::json!("script_failed"));
+        assert_eq!(v["flow"], serde_json::json!("jira_ticket"));
+        assert_eq!(v["handoff"]["failed_step"], serde_json::json!(3));
+        let instruction = v["instruction"].as_str().unwrap();
+        assert!(instruction.contains("browser"), "instruction: {instruction}");
+        assert!(
+            instruction.contains("report_flow_repair"),
+            "instruction: {instruction}"
+        );
+    }
+
+    #[test]
+    fn test_format_flow_result_wraps_runtime_error() {
+        let result = crate::agent::code_mode::CodeModeResult::fail("NameError: nope");
+        let formatted = format_flow_result("jira_ticket", &result);
+        let v: serde_json::Value = serde_json::from_str(&formatted).unwrap();
+        assert_eq!(v["status"], serde_json::json!("script_error"));
+        assert!(v["handoff"]["error"].as_str().unwrap().contains("NameError"));
+        assert!(v["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("report_flow_repair"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_list_flows_and_errors() {
+        // list_flows scans the real user skills dirs — just assert it returns
+        // valid JSON with a "flows" array (machine may or may not have flows).
+        let out = dispatch_flow_tool("list_flows", &serde_json::json!({}), None)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["flows"].is_array());
+
+        // run_flow with a name that cannot exist -> Ok(json) with unknown_flow status
+        let out = dispatch_flow_tool(
+            "run_flow",
+            &serde_json::json!({"name": "__no_such_flow__", "params": {}}),
+            None,
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["status"], serde_json::json!("unknown_flow"));
+
+        // unknown dispatch name -> Err
+        assert!(dispatch_flow_tool("bogus_tool", &serde_json::json!({}), None)
+            .await
+            .is_err());
     }
 
     #[test]
