@@ -1106,8 +1106,8 @@ mod tests {
             serde_json::json!("hello")
         );
         assert_eq!(
-            monty_object_to_json(&MontyObject::Float(3.14)),
-            serde_json::json!(3.14)
+            monty_object_to_json(&MontyObject::Float(2.5)),
+            serde_json::json!(2.5)
         );
         assert_eq!(
             monty_object_to_json(&MontyObject::List(vec![
@@ -1136,8 +1136,8 @@ mod tests {
             MontyObject::String(s) => assert_eq!(s, "hello"),
             other => panic!("Expected String, got {:?}", other),
         }
-        match json_to_monty_object(&serde_json::json!(3.14)) {
-            MontyObject::Float(f) => assert!((f - 3.14).abs() < f64::EPSILON),
+        match json_to_monty_object(&serde_json::json!(2.5)) {
+            MontyObject::Float(f) => assert!((f - 2.5).abs() < f64::EPSILON),
             other => panic!("Expected Float, got {:?}", other),
         }
     }
