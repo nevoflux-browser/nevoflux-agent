@@ -3,11 +3,11 @@
 //! Spec §5.2 / §7.2: an iteration running under a `time:dynamic` trigger
 //! is expected to end its output with a fenced JSON block of the form
 //!
-//! ```text
+//! ````text
 //! ```loop-meta
 //! { "next_delay_seconds": 240 }
 //! ```
-//! ```
+//! ````
 //!
 //! The scheduler reads `next_delay_seconds`, clamps to [60, 3600], and
 //! reschedules the next fire after that duration. If the block is missing

@@ -131,13 +131,22 @@ async fn recording_session_trace_contract() {
         }),
     );
 
-    // Allow the spawn_blocking writer task to drain all messages.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Poll until the spawn_blocking writer task has drained all 6 lines.
+    // A fixed sleep flakes under full-suite load when the writer is starved.
+    let path = dir.join(format!("{recording_id}.jsonl"));
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if std::fs::read_to_string(&path)
+            .map(|c| c.lines().count() >= 6)
+            .unwrap_or(false)
+        {
+            break;
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Read the file and parse every line
     // -----------------------------------------------------------------------
-    let path = dir.join(format!("{recording_id}.jsonl"));
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("could not read {path:?}: {e}"));
 

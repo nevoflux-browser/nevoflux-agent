@@ -32,6 +32,9 @@ test brand
 #[tokio::test]
 async fn test_create_composition_returns_artifact_id() {
     let svc = fresh_service();
+    // Empty creates (neither `html` nor `template`) are rejected since
+    // b419c20, and without a wired skill registry `design_md` must be
+    // supplied inline — same as the other tests in this file.
     let req = CreateCompositionRequest {
         title: "demo".into(),
         width: 1920,
@@ -39,9 +42,9 @@ async fn test_create_composition_returns_artifact_id() {
         duration_sec: 5.0,
         fps: 30,
         bg: None,
-        html: None,
+        html: Some("<!doctype html><body></body>".into()),
         template: None,
-        design_md: None,
+        design_md: Some(SAMPLE_DESIGN_MD.to_string()),
         session_id: None,
     };
     let resp: CreateCompositionResponse = svc.create_composition(req).await.unwrap();
@@ -387,8 +390,21 @@ async fn test_render_loop_reassembles_and_encodes() {
         return;
     }
 
-    // Production service (no stub short-circuit) so the full render loop runs.
-    let svc = Arc::new(CanvasVideoService::new());
+    use nevoflux_daemon::event_bus::{
+        BackpressurePolicy, EventBus, SubscriberIdentity, TopicPattern,
+    };
+
+    // Production service (no stub short-circuit) so the full render loop
+    // runs, with in-memory storage wired in (create_composition persists
+    // via ArtifactRepository since b7e8c15) and an event bus so we can
+    // learn the output path from the `succeeded` event.
+    let storage = Arc::new(nevoflux_storage::Storage::open_in_memory().expect("in-memory Storage"));
+    let bus = Arc::new(EventBus::new());
+    let svc = Arc::new(
+        CanvasVideoService::new()
+            .with_storage(storage)
+            .with_event_bus(bus.clone()),
+    );
 
     // Keep the render tiny so the test finishes in well under a second:
     // 12 frames at 24 fps = 0.5 s composition (the configured minimum).
@@ -406,7 +422,8 @@ async fn test_render_loop_reassembles_and_encodes() {
             bg: None,
             html: Some("<!doctype html><body></body>".into()),
             template: None,
-            design_md: None,
+            // Without a wired skill registry, design_md must be inline.
+            design_md: Some(SAMPLE_DESIGN_MD.to_string()),
             session_id: None,
         })
         .await
@@ -419,6 +436,18 @@ async fn test_render_loop_reassembles_and_encodes() {
         .await
         .unwrap();
     let job_id = start_resp.job_id.clone();
+
+    // Subscribe before pushing frames so the `succeeded` event (which
+    // carries the output path — the path is user-facing and built from
+    // title + timestamp, so it can't be predicted here) can't be missed.
+    let mut job_events = bus
+        .subscribe(
+            TopicPattern::exact(format!("jobs:render:{job_id}")),
+            SubscriberIdentity::Internal,
+            BackpressurePolicy::DropNewest,
+            16,
+        )
+        .expect("subscribe to job events");
 
     // Build a 16x16 PNG with varying color per frame to avoid degenerate encoder paths.
     let make_png = |frame: u32| -> Vec<u8> {
@@ -477,13 +506,25 @@ async fn test_render_loop_reassembles_and_encodes() {
         final_state
     );
 
+    // The `succeeded` event carries the output path; wait for it (the
+    // state flips to Succeeded just before the event is published).
+    let output_path = loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), job_events.rx.recv())
+            .await
+            .expect("timed out waiting for job events")
+            .expect("job event channel closed before `succeeded`");
+        if event.payload.get("event").and_then(|v| v.as_str()) == Some("succeeded") {
+            break std::path::PathBuf::from(
+                event
+                    .payload
+                    .get("output_path")
+                    .and_then(|v| v.as_str())
+                    .expect("succeeded event missing output_path"),
+            );
+        }
+    };
+
     // Verify the MP4 was written and is non-trivially sized.
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let output_path = std::path::PathBuf::from(home)
-        .join(".cache")
-        .join("nevoflux")
-        .join("render")
-        .join(format!("{}.mp4", job_id));
     let metadata = std::fs::metadata(&output_path)
         .unwrap_or_else(|e| panic!("output not found at {:?}: {}", output_path, e));
     assert!(

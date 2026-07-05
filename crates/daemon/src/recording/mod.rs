@@ -135,18 +135,26 @@ mod tests {
     #[tokio::test]
     async fn collector_appends_lines_for_a_recording() {
         use serde_json::json;
-        let mut dir = std::env::temp_dir();
-        dir.push("rec_collector_test");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = tempfile::tempdir().unwrap();
 
-        let collector = RecordingCollector::new(dir.clone());
+        let collector = RecordingCollector::new(dir.path().to_path_buf());
         collector.ingest("rec_z".into(), json!({"type":"header","recording_id":"rec_z"}));
         collector.ingest("rec_z".into(), json!({"type":"step","action":"click"}));
 
-        // allow the writer task to drain
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Poll until the async writer task has drained both lines. A fixed
+        // sleep flakes under full-suite load when the writer is starved.
+        let file = dir.path().join("rec_z.jsonl");
+        let mut content = String::new();
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if let Ok(c) = std::fs::read_to_string(&file) {
+                if c.lines().count() >= 2 {
+                    content = c;
+                    break;
+                }
+            }
+        }
 
-        let content = std::fs::read_to_string(dir.join("rec_z.jsonl")).unwrap();
         let lines: Vec<_> = content.lines().collect();
         assert_eq!(lines.len(), 2);
         let s: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
