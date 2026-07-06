@@ -319,9 +319,7 @@ pub async fn dispatch_flow_tool(
                 .get("flow")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    DaemonError::InternalError(
-                        "report_flow_repair: missing 'flow' argument".into(),
-                    )
+                    DaemonError::InternalError("report_flow_repair: missing 'flow' argument".into())
                 })?;
             let Some(flow) = find_flow(flow_name) else {
                 return Ok(serde_json::json!({
@@ -426,8 +424,8 @@ mod tests {
     #[test]
     fn test_validate_params_missing_required() {
         let m: FlowManifest = serde_json::from_str(MANIFEST).unwrap();
-        let err = validate_params(&m.params_schema, &serde_json::json!({"project": "NEVO"}))
-            .unwrap_err();
+        let err =
+            validate_params(&m.params_schema, &serde_json::json!({"project": "NEVO"})).unwrap_err();
         assert!(err.contains("title"), "err was: {err}");
     }
 
@@ -504,18 +502,22 @@ mod tests {
 
     #[test]
     fn test_format_flow_result_wraps_script_handoff() {
-        let result = crate::agent::code_mode::CodeModeResult::success(String::new())
-            .with_result(serde_json::json!({
+        let result = crate::agent::code_mode::CodeModeResult::success(String::new()).with_result(
+            serde_json::json!({
                 "ok": false, "failed_step": 3, "step_label": "click submit",
                 "url": "https://x/y", "tab_id": 2, "error": "no selector matched"
-            }));
+            }),
+        );
         let formatted = format_flow_result("jira_ticket", &result);
         let v: serde_json::Value = serde_json::from_str(&formatted).unwrap();
         assert_eq!(v["status"], serde_json::json!("script_failed"));
         assert_eq!(v["flow"], serde_json::json!("jira_ticket"));
         assert_eq!(v["handoff"]["failed_step"], serde_json::json!(3));
         let instruction = v["instruction"].as_str().unwrap();
-        assert!(instruction.contains("browser"), "instruction: {instruction}");
+        assert!(
+            instruction.contains("browser"),
+            "instruction: {instruction}"
+        );
         assert!(
             instruction.contains("report_flow_repair"),
             "instruction: {instruction}"
@@ -528,7 +530,10 @@ mod tests {
         let formatted = format_flow_result("jira_ticket", &result);
         let v: serde_json::Value = serde_json::from_str(&formatted).unwrap();
         assert_eq!(v["status"], serde_json::json!("script_error"));
-        assert!(v["handoff"]["error"].as_str().unwrap().contains("NameError"));
+        assert!(v["handoff"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("NameError"));
         assert!(v["instruction"]
             .as_str()
             .unwrap()
@@ -557,9 +562,11 @@ mod tests {
         assert_eq!(v["status"], serde_json::json!("unknown_flow"));
 
         // unknown dispatch name -> Err
-        assert!(dispatch_flow_tool("bogus_tool", &serde_json::json!({}), None)
-            .await
-            .is_err());
+        assert!(
+            dispatch_flow_tool("bogus_tool", &serde_json::json!({}), None)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -570,8 +577,16 @@ mod tests {
             manifest: serde_json::from_str(MANIFEST).unwrap(),
             dir,
         };
-        append_repair(&flow, &serde_json::json!({"failed_step": 3, "suggestion": "s1"})).unwrap();
-        append_repair(&flow, &serde_json::json!({"failed_step": 3, "suggestion": "s2"})).unwrap();
+        append_repair(
+            &flow,
+            &serde_json::json!({"failed_step": 3, "suggestion": "s1"}),
+        )
+        .unwrap();
+        append_repair(
+            &flow,
+            &serde_json::json!({"failed_step": 3, "suggestion": "s2"}),
+        )
+        .unwrap();
         let content = std::fs::read_to_string(flow.repairs_path()).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2);

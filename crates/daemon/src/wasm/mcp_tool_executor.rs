@@ -11,8 +11,8 @@ use nevoflux_computer::{
 use nevoflux_llm::providers::acp::mcp_bridge::{
     McpToolBridge, PendingArtifact, PermissionRequest, PermissionResponse, ToolCallRequest,
 };
-use nevoflux_protocol::BrowserToolAction;
 use nevoflux_llm::EmbedKind;
+use nevoflux_protocol::BrowserToolAction;
 use nevoflux_storage::{CreateKnowledgeParams, KnowledgeRepository};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -307,17 +307,14 @@ pub async fn execute_mcp_tool(
     // so the gate has to live here too.
     if services.is_iteration {
         if matches!(name, "browser_ask_user" | "ask_user") {
-            return Err(
-                "ask_user is forbidden inside /loop iterations \
+            return Err("ask_user is forbidden inside /loop iterations \
                  (sidebar may be closed; nobody to answer). \
                  Use loop_scratchpad_set to persist state instead."
-                    .to_string(),
-            );
+                .to_string());
         }
         if name == "loop_create" {
             return Err(
-                "loop_create is forbidden inside /loop iterations (no nested loops)"
-                    .to_string(),
+                "loop_create is forbidden inside /loop iterations (no nested loops)".to_string(),
             );
         }
     }
@@ -346,8 +343,12 @@ pub async fn execute_mcp_tool(
                  are installed)"
             )
         })?;
-        return crate::brain_tools::invoke_brain_tool(&supervisor, &def.gbrain_name, arguments.clone())
-            .await;
+        return crate::brain_tools::invoke_brain_tool(
+            &supervisor,
+            &def.gbrain_name,
+            arguments.clone(),
+        )
+        .await;
     }
 
     // 1. Browser tools
@@ -372,6 +373,19 @@ pub async fn execute_mcp_tool(
             .browser_context()
             .ok_or_else(|| "browser not available".to_string())?;
         return crate::agent::tools::dispatch_recording_tool(name, arguments, browser_ctx)
+            .await
+            .map_err(|e| e.to_string());
+    }
+
+    // 1''. Recorded-flow tools (run_flow / list_flows / report_flow_repair).
+    //
+    // Daemon-orchestrated: flow packages live in the user skills dirs and
+    // run_flow executes the flow script via the code-mode executor. Browser
+    // context is optional (list_flows / report_flow_repair need none); the
+    // direct-API path mirrors this in `agent_host::tool_call_dynamic`.
+    if name == "run_flow" || name == "list_flows" || name == "report_flow_repair" {
+        let browser_ctx = services.browser_context();
+        return crate::agent::flows::dispatch_flow_tool(name, arguments, browser_ctx)
             .await
             .map_err(|e| e.to_string());
     }
@@ -469,9 +483,8 @@ pub async fn execute_mcp_tool(
         // already-parsed object (some bridges pass objects) and an empty value.
         let inner_args: serde_json::Value = match arguments.get("arguments") {
             Some(serde_json::Value::String(s)) if !s.trim().is_empty() => {
-                serde_json::from_str(s).map_err(|e| {
-                    format!("tool_call_dynamic: 'arguments' is not valid JSON: {e}")
-                })?
+                serde_json::from_str(s)
+                    .map_err(|e| format!("tool_call_dynamic: 'arguments' is not valid JSON: {e}"))?
             }
             Some(serde_json::Value::String(_)) | None => serde_json::json!({}),
             Some(other) => other.clone(),
@@ -841,10 +854,9 @@ async fn execute_browser_upload_orchestrated(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string());
 
-    let asset_server = browser_ctx
-        .asset_server
-        .as_ref()
-        .ok_or_else(|| "browser_upload_file: AssetServer is not running on this daemon".to_string())?;
+    let asset_server = browser_ctx.asset_server.as_ref().ok_or_else(|| {
+        "browser_upload_file: AssetServer is not running on this daemon".to_string()
+    })?;
     let file_url =
         asset_server.register_download(canonical, mime_type.clone(), file_name.clone(), TOKEN_TTL);
 
@@ -1583,8 +1595,11 @@ fn find_similar_hot_knowledge(services: &HostServices, content: &str) -> Option<
     // hot knowledge passage embeddings; both sides of the cosine comparison
     // should use the indexing prefix.
     let query_emb = match tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current()
-            .block_on(async { provider.embed_kind(EmbedKind::Passage, &content_owned).await })
+        tokio::runtime::Handle::current().block_on(async {
+            provider
+                .embed_kind(EmbedKind::Passage, &content_owned)
+                .await
+        })
     }) {
         Ok(emb) => emb,
         Err(_) => return None,
@@ -2225,9 +2240,7 @@ async fn resolve_attach_asset_payload(
             .unwrap_or_else(|| infer_mime_from_name(path_str));
         let size = bytes.len() as u64;
         let payload_b64 = encode_base64(&bytes);
-        let name_from_path = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string());
+        let name_from_path = path.file_name().map(|n| n.to_string_lossy().to_string());
         let name = pick_name(
             req.name.as_deref().or(name_from_path.as_deref()),
             &mime,
@@ -2367,7 +2380,9 @@ mod tests {
             role: None,
         };
 
-        let resolved = resolve_attach_asset_payload(&req).await.expect("resolve ok");
+        let resolved = resolve_attach_asset_payload(&req)
+            .await
+            .expect("resolve ok");
         assert_eq!(resolved.size_bytes, bytes.len() as u64);
         assert_eq!(resolved.mime_type, "image/png");
         assert_eq!(resolved.name, "hero.png");
@@ -2637,7 +2652,10 @@ mod tests {
             &services,
             &bridge,
         ));
-        assert_eq!(result, Err("tool_call_dynamic cannot call itself".to_string()));
+        assert_eq!(
+            result,
+            Err("tool_call_dynamic cannot call itself".to_string())
+        );
     }
 
     #[test]
