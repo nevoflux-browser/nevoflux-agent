@@ -321,7 +321,11 @@ impl DaemonHostFunctions {
         // of the cosine comparison should use the indexing prefix so the
         // similarity score is meaningful.
         let query_emb = match tokio::task::block_in_place(|| {
-            runtime.block_on(async { provider.embed_kind(EmbedKind::Passage, &content_owned).await })
+            runtime.block_on(async {
+                provider
+                    .embed_kind(EmbedKind::Passage, &content_owned)
+                    .await
+            })
         }) {
             Ok(emb) => emb,
             Err(_) => return None,
@@ -1765,32 +1769,33 @@ impl HostFunctions for DaemonHostFunctions {
             })?;
 
         // Path 2: Vector semantic search (if embedding provider is available)
-        let semantic_results =
-            if let Some(provider) = crate::wasm::services::get_embedding(&services.embedding) {
-                let runtime = self.runtime.clone();
-                let query_owned = query.to_string();
-                // Query: this is the user-search side of memory_search hybrid
-                // retrieval (FTS + vector); chunks were indexed as passages.
-                let embed_result = tokio::task::block_in_place(|| {
-                    runtime
-                        .block_on(async { provider.embed_kind(EmbedKind::Query, &query_owned).await })
-                });
-                match embed_result {
-                    Ok(query_emb) => {
-                        if let Ok(idx) = services.vector_index.read() {
-                            idx.search(&query_emb, fetch_limit)
-                        } else {
-                            vec![]
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to generate query embedding: {}", e);
+        let semantic_results = if let Some(provider) =
+            crate::wasm::services::get_embedding(&services.embedding)
+        {
+            let runtime = self.runtime.clone();
+            let query_owned = query.to_string();
+            // Query: this is the user-search side of memory_search hybrid
+            // retrieval (FTS + vector); chunks were indexed as passages.
+            let embed_result = tokio::task::block_in_place(|| {
+                runtime
+                    .block_on(async { provider.embed_kind(EmbedKind::Query, &query_owned).await })
+            });
+            match embed_result {
+                Ok(query_emb) => {
+                    if let Ok(idx) = services.vector_index.read() {
+                        idx.search(&query_emb, fetch_limit)
+                    } else {
                         vec![]
                     }
                 }
-            } else {
-                vec![]
-            };
+                Err(e) => {
+                    warn!("Failed to generate query embedding: {}", e);
+                    vec![]
+                }
+            }
+        } else {
+            vec![]
+        };
 
         // If no semantic results, return FTS results directly (existing behavior)
         if semantic_results.is_empty() {
@@ -3187,6 +3192,68 @@ impl HostFunctions for DaemonHostFunctions {
             let result = tokio::task::block_in_place(|| {
                 runtime.block_on(async move {
                     crate::agent::tools::dispatch_recording_tool(&name, &args, browser_ctx).await
+                })
+            });
+
+            let duration_ms = start.elapsed().as_millis() as u64;
+            let traced_name = format!("dynamic:{}", tool_name);
+            match result {
+                Ok(json) => {
+                    self.record_tool(
+                        &traced_name,
+                        Some(arguments.to_string()),
+                        true,
+                        None,
+                        None,
+                        duration_ms,
+                        Some(arguments.clone()),
+                        None,
+                    );
+                    return Ok(json);
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    self.record_tool(
+                        &traced_name,
+                        Some(arguments.to_string()),
+                        false,
+                        Some("100".into()),
+                        Some(msg.clone()),
+                        duration_ms,
+                        Some(arguments.clone()),
+                        None,
+                    );
+                    return Err(HostError {
+                        code: 100,
+                        message: msg,
+                    });
+                }
+            }
+        }
+
+        // Intercept recorded-flow tools (run_flow / list_flows / report_flow_repair).
+        //
+        // Daemon-orchestrated like the recording tools above: they read flow
+        // packages from the user skills dirs and (for run_flow) execute the
+        // flow script via the code-mode executor against the bound browser,
+        // so the MCP fallthrough would fail with "No server provides tool".
+        // The ACP/MCP-bridge path mirrors this in
+        // `mcp_tool_executor::execute_mcp_tool`; both delegate to
+        // `agent::flows::dispatch_flow_tool`. Browser context is optional:
+        // list_flows / report_flow_repair work without a browser.
+        if tool_name == "run_flow" || tool_name == "list_flows" || tool_name == "report_flow_repair"
+        {
+            let browser_ctx = self
+                .services
+                .as_ref()
+                .and_then(|services| services.browser_context());
+
+            let runtime = self.runtime.clone();
+            let name = tool_name.to_string();
+            let args = arguments.clone();
+            let result = tokio::task::block_in_place(|| {
+                runtime.block_on(async move {
+                    crate::agent::flows::dispatch_flow_tool(&name, &args, browser_ctx).await
                 })
             });
 

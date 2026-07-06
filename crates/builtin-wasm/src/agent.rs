@@ -2365,6 +2365,11 @@ The following skill instructions MUST be followed exactly. These instructions ta
             "start_recording" | "stop_recording" => self
                 .host
                 .tool_call_dynamic(&tool_call.name, &tool_call.arguments)?,
+            // Recorded flows — daemon-orchestrated via tool_call_dynamic,
+            // same dispatch pattern as the recording tools above.
+            "run_flow" | "list_flows" | "report_flow_repair" => self
+                .host
+                .tool_call_dynamic(&tool_call.name, &tool_call.arguments)?,
             _ => {
                 format!("Unknown tool: {}", tool_call.name)
             }
@@ -4121,6 +4126,8 @@ Set workspace_dir to the directory containing the file to allow uploads from any
         // tool_search + tool_call_dynamic are inherited from get_chat_tools()
         // (every mode now exposes dynamic tool discovery, including Chat).
 
+        tools.extend(Self::recorded_flow_tools());
+
         tools
     }
 
@@ -4829,7 +4836,68 @@ comprehensions, f-strings, lambda, asyncio.gather\n\
             }),
         });
 
+        tools.extend(Self::recorded_flow_tools());
+
         tools
+    }
+
+    /// Recorded-flow tools (browser + agent modes). A flow is a browser
+    /// workflow the user demonstrated once and skill-creator compiled into a
+    /// deterministic script; at call time the LLM only extracts parameters.
+    /// Daemon-orchestrated via tool_call_dynamic (same pattern as
+    /// start_recording / stop_recording); the MCP/ACP path handles them in
+    /// mcp_tool_executor.
+    fn recorded_flow_tools() -> Vec<ToolDefinition> {
+        vec![
+            ToolDefinition {
+                name: "run_flow".into(),
+                description: "Execute a recorded browser flow (a deterministic script compiled from a user demonstration) by name. Use this when a skill tells you to run a recorded flow: extract the parameters from the user's request and pass them as `params` matching the flow's params_schema. Params are validated first — on `status: invalid_params`, fix the params and retry. On `status: script_failed` / `script_error`, the browser is left at the failure state: follow the returned instruction, finish the remaining steps with browser tools yourself, then call report_flow_repair.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Flow name, as given by the skill or by list_flows."
+                        },
+                        "params": {
+                            "type": "object",
+                            "description": "Flow parameters matching the flow's params_schema (see the skill or list_flows)."
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            },
+            ToolDefinition {
+                name: "list_flows".into(),
+                description: "List all available recorded flows with their descriptions and parameter schemas. Use when you are unsure which recorded flows exist or what parameters a flow takes.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+            ToolDefinition {
+                name: "report_flow_repair".into(),
+                description: "File a repair suggestion after a recorded flow script failed and you completed the task manually. Records which step broke and what selector/approach worked, so skill-creator can update the script with user approval. Call this once, after the user's task is done.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "flow": {
+                            "type": "string",
+                            "description": "Name of the flow that failed."
+                        },
+                        "failed_step": {
+                            "type": "integer",
+                            "description": "The failed_step index from the run_flow handoff."
+                        },
+                        "suggestion": {
+                            "type": "string",
+                            "description": "What worked instead: the selector you used, the changed page structure, etc."
+                        }
+                    },
+                    "required": ["flow", "suggestion"]
+                }),
+            },
+        ]
     }
 
     /// Get available tools for agent mode (includes dynamically-generated orchestrate tool).
@@ -5290,6 +5358,30 @@ mod tests {
     fn test_format_tab_context_empty() {
         let ctx = Agent::<MockHostFunctions>::format_tab_context(None, &[]);
         assert!(ctx.is_empty());
+    }
+
+    #[test]
+    fn test_recorded_flow_tools_in_modes() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        let names = |mode: AgentMode| -> Vec<String> {
+            agent
+                .get_tools_for_mode(mode)
+                .into_iter()
+                .map(|t| t.name)
+                .collect()
+        };
+        for mode in [AgentMode::Browser, AgentMode::Agent] {
+            let n = names(mode);
+            assert!(n.contains(&"run_flow".to_string()), "{mode:?}: {n:?}");
+            assert!(n.contains(&"list_flows".to_string()), "{mode:?}: {n:?}");
+            assert!(
+                n.contains(&"report_flow_repair".to_string()),
+                "{mode:?}: {n:?}"
+            );
+        }
+        let chat = names(AgentMode::Chat);
+        assert!(!chat.contains(&"run_flow".to_string()));
     }
 
     #[test]
@@ -6246,7 +6338,9 @@ mod tests {
         // get_chat_tools() so chat mode can reach the knowledge base. They are
         // now part of the chat baseline (inherited by browser/agent), no longer
         // counted among browser-specific tools — hence +21, was +23.
-        assert_eq!(browser_tools.len(), chat_tools.len() + 21);
+        // Recorded-flow tools (run_flow / list_flows / report_flow_repair)
+        // are browser+agent only, not in chat — hence +24, was +21.
+        assert_eq!(browser_tools.len(), chat_tools.len() + 24);
     }
 
     #[test]

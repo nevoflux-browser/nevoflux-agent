@@ -5,6 +5,7 @@ pub mod auth;
 pub mod browser_input;
 pub mod code_mode;
 pub mod computer_tools;
+pub mod flows;
 pub mod roles;
 pub mod runner;
 pub mod streaming;
