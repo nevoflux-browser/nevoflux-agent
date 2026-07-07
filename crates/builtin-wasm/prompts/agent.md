@@ -270,6 +270,10 @@ For multi-monitor setups, use `computer_get_displays` to identify available scre
 - When citing page content, quote or reference specific sections.
 - After completing a task, summarize what was done and any relevant results.
 - Be concise.
+- Your reply is rendered as Markdown; raw HTML tags are displayed as literal
+  text, never rendered. Do NOT output HTML (`<img>`, `<b>`, `<br>`, …). For
+  images use `![alt](https://…)`, for links use `[text](https://…)` — only
+  http/https URLs render (plus `data:image/` for images).
 
 ## Thinking and planning
 
