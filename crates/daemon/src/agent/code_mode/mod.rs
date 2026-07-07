@@ -14,6 +14,6 @@ pub mod repair_prompt;
 pub mod signature;
 
 pub use executor::{
-    execute_python_simple, execute_python_with_llm, CodeModeExecutor, CodeModeResult,
-    ToolCallResult,
+    execute_python_simple, execute_python_simple_with_timeout, execute_python_with_llm,
+    CodeModeExecutor, CodeModeResult, ToolCallResult, DEFAULT_MAX_DURATION,
 };

@@ -686,7 +686,7 @@ To read files listed above, use the `read` tool with just the filename (e.g., `r
 
                 format!(
                     r#"<CRITICAL_INSTRUCTIONS priority="highest">
-The following skill instructions MUST be followed exactly. These instructions take absolute priority over all other guidance.
+The user EXPLICITLY invoked the "{}" skill by name — you are running that skill NOW. Carry out its instructions as an ACTION: if the skill says to call a tool (e.g. `run_flow`), you MUST call that tool. Do NOT answer from your own knowledge and do NOT treat the user's message as a general question to research — the user's message is the INPUT to this skill. These instructions MUST be followed exactly and take absolute priority over all other guidance.
 
 <skill name="{}" base_path="{}">
 {}
@@ -694,7 +694,7 @@ The following skill instructions MUST be followed exactly. These instructions ta
 </CRITICAL_INSTRUCTIONS>
 
 {}"#,
-                    skill.name, skill.base_path, skill.content, files_section, base_prompt
+                    skill.name, skill.name, skill.base_path, skill.content, files_section, base_prompt
                 )
             }
             None => base_prompt,

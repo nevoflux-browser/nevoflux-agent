@@ -17,6 +17,7 @@
 //! ```
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -32,6 +33,13 @@ pub struct FlowManifest {
     pub recording_id: Option<String>,
     #[serde(default = "default_params_schema")]
     pub params_schema: serde_json::Value,
+    /// Optional wall-clock budget for the whole flow, in milliseconds. Threaded
+    /// into the Code Mode executor's time limit so flows that legitimately wait
+    /// on a slow remote response (e.g. an LLM streaming its reply) aren't
+    /// aborted mid-flow. `None` uses the executor default
+    /// (`code_mode::DEFAULT_MAX_DURATION`).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 fn default_params_schema() -> serde_json::Value {
@@ -233,8 +241,13 @@ fn format_flow_result(flow_name: &str, result: &CodeModeResult) -> String {
 }
 
 /// Execute a flow's `replay.py` with already-validated params against the
-/// bound browser. Synchronous by design — `execute_python_simple` does its own
-/// `block_in_place + block_on`, exactly like the headless script runner.
+/// bound browser. Synchronous by design — `execute_python_simple_with_timeout`
+/// does its own `block_in_place + block_on`, exactly like the headless script
+/// runner.
+///
+/// The flow's `flow.json` `timeout_ms` (when present) overrides the Code Mode
+/// executor's default wall-clock budget, so a flow that waits on a slow remote
+/// response isn't killed mid-run by the shared default.
 pub fn execute_flow(
     flow: &FlowPackage,
     params: &serde_json::Value,
@@ -248,7 +261,12 @@ pub fn execute_flow(
         ))
     })?;
     let wrapped = wrap_script(&user_code, params);
-    let result = crate::agent::code_mode::execute_python_simple(&wrapped, Some(browser_ctx));
+    let max_duration = flow.manifest.timeout_ms.map(Duration::from_millis);
+    let result = crate::agent::code_mode::execute_python_simple_with_timeout(
+        &wrapped,
+        Some(browser_ctx),
+        max_duration,
+    );
     Ok(format_flow_result(&flow.manifest.name, &result))
 }
 
@@ -398,6 +416,28 @@ mod tests {
         assert_eq!(flows[0].manifest.name, "jira_ticket");
         assert_eq!(flows[0].manifest.description, "Create a Jira ticket");
         assert!(flows[0].script_path().ends_with("replay.py"));
+    }
+
+    #[test]
+    fn test_manifest_timeout_ms_defaults_to_none() {
+        // A manifest without `timeout_ms` must parse cleanly and leave the flow
+        // on the executor default budget.
+        let m: FlowManifest = serde_json::from_str(MANIFEST).unwrap();
+        assert_eq!(m.timeout_ms, None);
+    }
+
+    #[test]
+    fn test_manifest_parses_timeout_ms() {
+        // A recorded flow that waits on a slow LLM reply declares a larger
+        // budget; it must survive round-trip so `execute_flow` can override the
+        // executor default with it.
+        let json = r#"{
+            "name": "gemini-chat",
+            "params_schema": {"type": "object", "properties": {}},
+            "timeout_ms": 600000
+        }"#;
+        let m: FlowManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.timeout_ms, Some(600_000));
     }
 
     #[test]

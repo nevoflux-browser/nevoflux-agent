@@ -4085,14 +4085,37 @@ fn build_acp_content_mcp(
 // deterministically regardless of provider.
 // ---------------------------------------------------------------------------
 
+/// Full-width solidus `／` (U+FF0F). CJK input methods routinely emit this in
+/// place of the ASCII `/` (U+002F) when a Chinese/Japanese layout is active, so
+/// a user typing `/skillname` while writing Chinese frequently produces `／`.
+const FULLWIDTH_SLASH: char = '／';
+
+/// Strip a leading skill-command slash, tolerating CJK input quirks.
+///
+/// Trims leading whitespace, then removes a single leading slash — either the
+/// ASCII `/` (U+002F) or the full-width `／` (U+FF0F). Returns the remainder
+/// after the slash, or `None` when the (trimmed) message begins with neither.
+///
+/// Centralizing this keeps the native `/skill` routers in `server.rs` and the
+/// ACP router below in agreement about what counts as a slash command, so a
+/// message typed with a full-width slash or a leading space is not silently
+/// forwarded to the model as ordinary text.
+pub(crate) fn strip_skill_slash(message: &str) -> Option<&str> {
+    let trimmed = message.trim_start();
+    trimmed
+        .strip_prefix('/')
+        .or_else(|| trimmed.strip_prefix(FULLWIDTH_SLASH))
+}
+
 /// Parse a leading `/skillname args` slash command from a user message.
 ///
-/// Returns `(skill_name, args)` when the message begins with `/` followed by a
-/// non-empty name; `args` is the trimmed remainder after the first whitespace
-/// (possibly empty). Returns `None` for messages that don't start with `/`, or
-/// for a bare `/`.
+/// Returns `(skill_name, args)` when the message begins with a slash (ASCII or
+/// full-width, per [`strip_skill_slash`]) followed by a non-empty name; `args`
+/// is the trimmed remainder after the first whitespace (possibly empty).
+/// Returns `None` for messages that don't start with a slash, or for a bare
+/// slash.
 fn parse_slash_command(message: &str) -> Option<(&str, &str)> {
-    let rest = message.trim_start().strip_prefix('/')?;
+    let rest = strip_skill_slash(message)?;
     let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     let name = &rest[..name_end];
     if name.is_empty() {
@@ -4114,8 +4137,12 @@ fn build_skill_injection(
 ) -> (String, String) {
     let mut prefix = format!(
         "<CRITICAL_INSTRUCTIONS priority=\"highest\">\n\
-         The user invoked the \"{name}\" skill. These instructions MUST be followed exactly and \
-         take priority over all other guidance.\n\n<skill name=\"{name}\">\n{body}\n</skill>\n",
+         The user EXPLICITLY invoked the \"{name}\" skill by name — you are running that skill NOW. \
+         Carry out its instructions as an ACTION: if the skill says to call a tool (e.g. `run_flow`), \
+         you MUST call that tool. Do NOT answer from your own knowledge and do NOT treat the user's \
+         message as a general question to research — the user's message is the INPUT to this skill. \
+         These instructions MUST be followed exactly and take priority over all other guidance.\n\n\
+         <skill name=\"{name}\">\n{body}\n</skill>\n",
         name = skill_name,
         body = skill_body,
     );
@@ -4126,12 +4153,24 @@ fn build_skill_injection(
     }
     prefix.push_str("</CRITICAL_INSTRUCTIONS>");
 
-    let cleaned = if args.is_empty() {
-        format!("(Invoked the {skill_name} skill — follow its instructions.)")
+    (prefix, skill_invocation_message(skill_name, args))
+}
+
+/// The LLM-facing user message for an explicit `/skill` invocation.
+///
+/// The native `/skill` router strips the `/skillname` prefix, which would
+/// otherwise leave the model with a bare question (e.g. "什么是loop工程") and
+/// no signal that the user invoked a skill — so the model answers it directly
+/// instead of running the skill. This restores that signal: it marks the text
+/// as the skill's INPUT, not a general question. Shared by the native router
+/// (`server.rs`) and the ACP fallback router (`build_skill_injection`) so both
+/// speak to the model identically.
+pub(crate) fn skill_invocation_message(skill_name: &str, args: &str) -> String {
+    if args.trim().is_empty() {
+        format!("Run the \"{skill_name}\" skill — follow its instructions.")
     } else {
-        args.to_string()
-    };
-    (prefix, cleaned)
+        format!("Run the \"{skill_name}\" skill. Input from the user:\n\n{args}")
+    }
 }
 
 /// When the last user message is an explicit `/skillname` invocation, fold the
@@ -4208,7 +4247,7 @@ async fn apply_acp_skill_command(
 
 #[cfg(test)]
 mod acp_skill_router_tests {
-    use super::{build_skill_injection, parse_slash_command};
+    use super::{build_skill_injection, parse_slash_command, strip_skill_slash};
 
     #[test]
     fn parses_basic_slash_command() {
@@ -4224,11 +4263,41 @@ mod acp_skill_router_tests {
     }
 
     #[test]
+    fn parses_fullwidth_slash_command() {
+        // CJK IMEs emit `／` (U+FF0F) instead of ASCII `/`; the router must
+        // treat it identically so a Chinese-typed invocation isn't forwarded to
+        // the model as plain text.
+        assert_eq!(
+            parse_slash_command("／gemini-llm 什么是harness"),
+            Some(("gemini-llm", "什么是harness"))
+        );
+        assert_eq!(parse_slash_command("／gemini-llm"), Some(("gemini-llm", "")));
+        // Leading whitespace + full-width slash together.
+        assert_eq!(
+            parse_slash_command("  ／brain-recall   hi  "),
+            Some(("brain-recall", "hi"))
+        );
+    }
+
+    #[test]
+    fn strip_skill_slash_handles_both_slashes() {
+        assert_eq!(strip_skill_slash("/foo bar"), Some("foo bar"));
+        assert_eq!(strip_skill_slash("／foo bar"), Some("foo bar"));
+        assert_eq!(strip_skill_slash("   /foo"), Some("foo"));
+        assert_eq!(strip_skill_slash("   ／foo"), Some("foo"));
+        assert_eq!(strip_skill_slash("no slash"), None);
+        assert_eq!(strip_skill_slash(""), None);
+    }
+
+    #[test]
     fn rejects_non_commands() {
         assert_eq!(parse_slash_command("what do I know about X"), None);
         assert_eq!(parse_slash_command("/"), None);
         assert_eq!(parse_slash_command("/   "), None);
         assert_eq!(parse_slash_command("https://example.com"), None);
+        // A bare full-width slash is likewise not a command.
+        assert_eq!(parse_slash_command("／"), None);
+        assert_eq!(parse_slash_command("／   "), None);
     }
 
     #[test]
@@ -4238,7 +4307,26 @@ mod acp_skill_router_tests {
         assert!(prefix.contains("CRITICAL_INSTRUCTIONS"));
         assert!(prefix.contains("<skill name=\"brain-recall\">"));
         assert!(prefix.contains("SKILL BODY"));
-        assert_eq!(cleaned, "感冒刮哪里");
+        // The directive must tell the model to EXECUTE the skill (call its
+        // tools) rather than answer the message as a general question.
+        assert!(prefix.contains("EXPLICITLY invoked"));
+        assert!(prefix.contains("MUST call"));
+        assert!(prefix.contains("INPUT to this skill"));
+        // The cleaned user message carries the invocation intent + the args.
+        assert!(cleaned.contains("感冒刮哪里"));
+        assert!(cleaned.contains("brain-recall"));
+    }
+
+    #[test]
+    fn skill_invocation_message_marks_input_and_empty() {
+        use super::skill_invocation_message;
+        let with_args = skill_invocation_message("gemini-llm", "什么是loop工程");
+        assert!(with_args.contains("gemini-llm"));
+        assert!(with_args.contains("什么是loop工程"));
+        assert!(!with_args.starts_with('/'));
+        let empty = skill_invocation_message("gemini-llm", "   ");
+        assert!(empty.contains("gemini-llm"));
+        assert!(empty.contains("follow its instructions"));
     }
 
     #[test]

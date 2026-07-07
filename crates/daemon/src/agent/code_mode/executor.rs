@@ -103,11 +103,20 @@ impl CodeModeResult {
     }
 }
 
+/// Default wall-clock budget for a single Code Mode execution.
+///
+/// Recorded flows frequently wait on a slow remote response (e.g. an LLM
+/// streaming its reply), so this must comfortably exceed a typical
+/// navigate-fill-send-wait round trip. Individual flows can still raise it
+/// further via their `flow.json` `timeout_ms`; see
+/// [`execute_python_simple_with_timeout`].
+pub const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(180);
+
 /// Default resource limits for Monty execution.
 fn default_resource_limits() -> ResourceLimits {
     ResourceLimits {
         max_allocations: Some(100_000),
-        max_duration: Some(Duration::from_secs(30)),
+        max_duration: Some(DEFAULT_MAX_DURATION),
         max_memory: Some(64 * 1024 * 1024), // 64MB
         gc_interval: Some(10_000),
         max_recursion_depth: Some(100),
@@ -220,11 +229,33 @@ fn collect_output(print_writer: PrintWriter<'_>) -> String {
 /// On lint violations or runtime errors, the executor can request the LLM
 /// to rewrite the code, up to `MAX_RETRIES` times.
 #[derive(Default)]
-pub struct CodeModeExecutor;
+pub struct CodeModeExecutor {
+    /// Optional override for the wall-clock execution budget. `None` uses
+    /// [`DEFAULT_MAX_DURATION`]. Recorded flows thread their `flow.json`
+    /// `timeout_ms` here so a legitimately long browser wait isn't aborted by
+    /// the default budget.
+    max_duration: Option<Duration>,
+}
 
 impl CodeModeExecutor {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Override the wall-clock execution budget (default [`DEFAULT_MAX_DURATION`]).
+    pub fn with_max_duration(mut self, max_duration: Duration) -> Self {
+        self.max_duration = Some(max_duration);
+        self
+    }
+
+    /// Resolve the resource limits for this execution, applying the
+    /// `max_duration` override (if any) on top of the module defaults.
+    fn resource_limits(&self) -> ResourceLimits {
+        let mut limits = default_resource_limits();
+        if let Some(max_duration) = self.max_duration {
+            limits.max_duration = Some(max_duration);
+        }
+        limits
     }
 
     /// Execute Python code through the full pipeline.
@@ -380,7 +411,7 @@ impl CodeModeExecutor {
                 }
             };
 
-            let resource_tracker = LimitedTracker::new(default_resource_limits());
+            let resource_tracker = LimitedTracker::new(self.resource_limits());
             let mut print_writer = PrintWriter::Collect(String::new());
             let mut tool_results: Vec<ToolCallResult> = Vec::new();
             // Track resolved external call results keyed by call_id for ResolveFutures.
@@ -925,13 +956,30 @@ fn build_registry_and_executor(
 ///
 /// Delegates to `CodeModeExecutor::execute()` with a no-op LLM rewrite callback.
 pub fn execute_python_simple(code: &str, browser_ctx: Option<BrowserContext>) -> CodeModeResult {
+    execute_python_simple_with_timeout(code, browser_ctx, None)
+}
+
+/// Like [`execute_python_simple`], but with an explicit wall-clock budget.
+///
+/// `max_duration` overrides [`DEFAULT_MAX_DURATION`]; pass `None` to use the
+/// default. Recorded flows pass their `flow.json` `timeout_ms` here so a step
+/// that legitimately waits on a slow remote response (e.g. an LLM streaming a
+/// reply) isn't aborted mid-flow.
+pub fn execute_python_simple_with_timeout(
+    code: &str,
+    browser_ctx: Option<BrowserContext>,
+    max_duration: Option<Duration>,
+) -> CodeModeResult {
     let runtime = tokio::runtime::Handle::current();
     // Build param mappings from registry tool definitions.
     // Empty mappings = positional args use generic names (arg0, arg1, ...).
     // When SignatureCache is wired in from the caller, real mappings will be provided.
     let (external_names, tool_executor) =
         build_registry_and_executor(browser_ctx, HashMap::new(), None);
-    let executor = CodeModeExecutor::new();
+    let mut executor = CodeModeExecutor::new();
+    if let Some(max_duration) = max_duration {
+        executor = executor.with_max_duration(max_duration);
+    }
 
     let llm_rewrite =
         |_prompt: &str| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
@@ -1086,6 +1134,34 @@ fn uuid_simple() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_default_max_duration_is_180s() {
+        assert_eq!(DEFAULT_MAX_DURATION, Duration::from_secs(180));
+        // The default limits must carry the module default.
+        let limits = default_resource_limits();
+        assert_eq!(limits.max_duration, Some(DEFAULT_MAX_DURATION));
+    }
+
+    #[test]
+    fn test_executor_uses_default_duration_without_override() {
+        let limits = CodeModeExecutor::new().resource_limits();
+        assert_eq!(limits.max_duration, Some(DEFAULT_MAX_DURATION));
+    }
+
+    #[test]
+    fn test_with_max_duration_overrides_default() {
+        // A flow declaring a 10-minute budget must win over the default, so a
+        // long wait-for-reply step isn't aborted mid-flow.
+        let limits = CodeModeExecutor::new()
+            .with_max_duration(Duration::from_secs(600))
+            .resource_limits();
+        assert_eq!(limits.max_duration, Some(Duration::from_secs(600)));
+        // Other limits stay at their defaults.
+        let defaults = default_resource_limits();
+        assert_eq!(limits.max_memory, defaults.max_memory);
+        assert_eq!(limits.max_allocations, defaults.max_allocations);
+    }
 
     #[test]
     fn test_monty_object_to_json() {

@@ -4585,9 +4585,11 @@ async fn handle_chat_message_streaming(
         })
         .unwrap_or_default();
 
-    // Detect and process /skillname commands (same logic as non-streaming path)
+    // Detect and process /skillname commands (same logic as non-streaming path).
+    // Tolerates a leading full-width `／` and leading whitespace via the shared
+    // helper, so CJK-typed invocations aren't silently treated as plain text.
     let (effective_message, skill_context) = if let Some(trimmed) =
-        message_content.strip_prefix('/')
+        crate::wasm::llm::strip_skill_slash(message_content)
     {
         let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
         let skill_name = parts[0].trim();
@@ -4675,7 +4677,12 @@ async fn handle_chat_message_streaming(
                     content: skill.content.clone(),
                     available_files,
                 };
-                (args, Some(ctx))
+                // Mark the LLM-facing message as this skill's INPUT (not a bare
+                // question) so the model runs the skill instead of answering
+                // directly. History still stores the original `message_content`.
+                let invocation =
+                    crate::wasm::llm::skill_invocation_message(skill_name, &args);
+                (invocation, Some(ctx))
             } else {
                 warn!("Skill '{}' not found in streaming path", skill_name);
                 let response_payload = serde_json::json!({
@@ -6001,9 +6008,12 @@ async fn handle_chat_message(
             }
 
             // Detect and process /skillname commands
-            // Returns (user_message, skill_context)
+            // Returns (user_message, skill_context).
+            // Tolerates a leading full-width `／` and leading whitespace via the
+            // shared helper, so CJK-typed invocations aren't silently treated as
+            // plain text.
             let (user_message, skill_context) = if let Some(trimmed) =
-                message_content.strip_prefix('/')
+                crate::wasm::llm::strip_skill_slash(message_content)
             {
                 // Parse: "/skillname args" -> ("skillname", "args")
                 let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
