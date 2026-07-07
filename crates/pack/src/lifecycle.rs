@@ -425,17 +425,29 @@ pub fn update(
     }
 }
 
-/// Read a directory one level deep, returning (relative-name, bytes). Skills
-/// and canvas-app bundles are flattened to a single level by the loader.
+/// Read a directory tree recursively, returning (relative-path, bytes) for
+/// every regular file. Relative names are `/`-joined so receipts and
+/// destination paths stay identical across platforms. Skills bundle their own
+/// resource subdirectories (`references/`, `scripts/`, …), so the walk must
+/// reach arbitrary depth — a shallow (two-level) walk silently drops a skill's
+/// nested files, installing only its top-level SKILL.md.
 ///
-/// Symlinks are NEVER followed: a bundled symlink (e.g. `evil -> /etc/passwd`)
-/// would otherwise let a pack exfiltrate files outside its own directory. We
-/// use `entry.file_type()` (which does NOT traverse symlinks, unlike `is_file`/
-/// `is_dir`) and skip any entry that is itself a symlink at every level.
+/// Symlinks are NEVER followed at ANY level: a bundled symlink (e.g. `evil ->
+/// /etc/passwd`) would otherwise let a pack exfiltrate files outside its own
+/// directory. We use `entry.file_type()` (which does NOT traverse symlinks,
+/// unlike `is_file`/`is_dir`) and skip any entry that is itself a symlink.
 fn read_dir_flat(root: &Path) -> PackResult<Vec<(String, Vec<u8>)>> {
     let mut out = Vec::new();
-    let entries = std::fs::read_dir(root)
-        .map_err(|e| PackError::Host(format!("read_dir {}: {e}", root.display())))?;
+    read_dir_recursive(root, root, &mut out)?;
+    out.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic order
+    Ok(out)
+}
+
+/// Recursive worker for [`read_dir_flat`]. `root` is the walk origin (used to
+/// compute relative names); `dir` is the directory currently being scanned.
+fn read_dir_recursive(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> PackResult<()> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| PackError::Host(format!("read_dir {}: {e}", dir.display())))?;
     for entry in entries.flatten() {
         let path = entry.path();
         let ft = entry
@@ -445,30 +457,59 @@ fn read_dir_flat(root: &Path) -> PackResult<Vec<(String, Vec<u8>)>> {
             continue; // never follow symlinks: a pack could point outside its dir
         }
         if ft.is_file() {
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| PackError::Host(format!("strip_prefix {}: {e}", path.display())))?;
+            // Join components with `/` so Windows (`\`) and Unix agree on the
+            // relative name — receipts and destinations must be identical.
+            let name = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
             let bytes = std::fs::read(&path)
                 .map_err(|e| PackError::Host(format!("read {}: {e}", path.display())))?;
             out.push((name, bytes));
         } else if ft.is_dir() {
-            // One nested level (e.g. skills/<name>/SKILL.md, conventions/*).
-            let sub = path.file_name().unwrap().to_string_lossy().into_owned();
-            for inner in std::fs::read_dir(&path).map_err(|e| PackError::Host(e.to_string()))?.flatten() {
-                let ift = match inner.file_type() {
-                    Ok(t) => t,
-                    Err(e) => return Err(PackError::Host(e.to_string())),
-                };
-                if ift.is_symlink() {
-                    continue; // skip nested symlinks too
-                }
-                if ift.is_file() {
-                    let ip = inner.path();
-                    let name = format!("{sub}/{}", ip.file_name().unwrap().to_string_lossy());
-                    let bytes = std::fs::read(&ip).map_err(|e| PackError::Host(e.to_string()))?;
-                    out.push((name, bytes));
-                }
-            }
+            read_dir_recursive(root, &path, out)?;
         }
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic order
-    Ok(out)
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A skill bundles its own resource subdirectories (`references/`,
+    /// `scripts/`), placing files three or more levels below the component
+    /// root. `read_dir_flat` must reach files at ANY depth — a shallow walk
+    /// silently drops a skill's nested resources, installing only SKILL.md.
+    #[test]
+    fn read_dir_flat_recurses_into_nested_skill_resource_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("learn/references")).unwrap();
+        std::fs::create_dir_all(root.join("learn/scripts")).unwrap();
+        std::fs::write(root.join("learn/SKILL.md"), b"# learn").unwrap();
+        std::fs::write(
+            root.join("learn/references/pack-authoring.md"),
+            b"# authoring",
+        )
+        .unwrap();
+        std::fs::write(root.join("learn/scripts/validate-pack.sh"), b"#!/bin/sh\n").unwrap();
+
+        let got = read_dir_flat(root).unwrap();
+        let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "learn/SKILL.md",
+                "learn/references/pack-authoring.md",
+                "learn/scripts/validate-pack.sh",
+            ],
+            "nested resource files must be included, in deterministic `/`-joined order"
+        );
+    }
 }
