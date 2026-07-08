@@ -58,6 +58,7 @@ pub mod recording;
 pub mod registry;
 pub mod retry;
 pub mod router;
+pub mod schedules;
 pub mod secrets;
 pub mod server;
 pub mod session;
