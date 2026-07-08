@@ -304,6 +304,22 @@ pub enum PlanResponse {
     Cancelled,
 }
 
+/// Agent → Sidebar: the bundled default skills changed since they were last
+/// applied; offer to replace the user's skills or keep them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillsUpdateRequest {
+    /// Number of skill entries in the bundled defaults (for the prompt copy).
+    pub bundled_count: usize,
+}
+
+/// Sidebar → Agent: the user's choice for a pending skills update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillsUpdateResponse {
+    /// True = replace the user's skills with the bundled defaults (backing up
+    /// the existing ones first); false = keep the user's skills as-is.
+    pub replace: bool,
+}
+
 // ============================================================================
 // Artifact Types
 // ============================================================================
@@ -481,6 +497,8 @@ pub enum SidebarMessage {
     BrowserToolResponse(BrowserToolResponse),
     PlanResponse(PlanResponse),
     ToolAuthResponse(ToolAuthResponse),
+    /// Response to a skills-update prompt (replace / keep)
+    SkillsUpdateResponse(SkillsUpdateResponse),
     /// EventBus request (subscribe/unsubscribe/publish/history)
     EventsRequest(EventBusRequest),
     /// Canvas tool invocation request
@@ -503,6 +521,8 @@ pub enum AgentMessage {
     SystemResponse(SystemResponse),
     BrowserToolRequest(BrowserToolRequest),
     PlanProposal(PlanProposal),
+    /// Bundled default skills changed; prompt the user to replace or keep.
+    SkillsUpdateRequest(SkillsUpdateRequest),
     ArtifactStart(ArtifactStart),
     ArtifactDelta(ArtifactDelta),
     ArtifactComplete(ArtifactComplete),
@@ -525,6 +545,26 @@ pub enum AgentMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skills_update_request_serializes_with_expected_type() {
+        // The daemon emits this via a raw json!{} with a hardcoded "type" string,
+        // and the sidebar parses by that string — lock the contract here.
+        let msg = AgentMessage::SkillsUpdateRequest(SkillsUpdateRequest { bundled_count: 3 });
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "skills_update_request");
+        assert_eq!(v["payload"]["bundled_count"], 3);
+    }
+
+    #[test]
+    fn skills_update_response_roundtrips_with_expected_type() {
+        let msg = SidebarMessage::SkillsUpdateResponse(SkillsUpdateResponse { replace: true });
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["type"], "skills_update_response");
+        assert_eq!(v["payload"]["replace"], true);
+        let back: SidebarMessage = serde_json::from_value(v).unwrap();
+        assert_eq!(back, msg);
+    }
 
     #[test]
     fn test_chat_message_serialization() {

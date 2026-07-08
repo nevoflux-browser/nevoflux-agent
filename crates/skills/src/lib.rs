@@ -68,8 +68,10 @@ pub use error::{Result, SkillsError};
 #[allow(deprecated)]
 pub use loader::default_user_skills_dir;
 pub use loader::{
-    default_user_skills_dirs, install_default_skills, nevoflux_user_skills_dir, AsyncSkillLoader,
-    LoaderConfig, SkillLoader,
+    bundled_skills_count, bundled_skills_fingerprint, default_user_skills_dirs,
+    install_default_skills, nevoflux_user_skills_dir, record_skills_bundle_applied,
+    replace_user_skills_with_bundled, skills_update_available, AsyncSkillLoader, LoaderConfig,
+    SkillLoader,
 };
 pub use parser::{parse_skill, parse_skill_file, serialize_skill};
 pub use registry::{AsyncSkillRegistry, SkillRegistry};

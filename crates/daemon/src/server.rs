@@ -2135,6 +2135,12 @@ pub async fn start_server(
     let process_canvas_persist_service = canvas_persist_service.clone();
     let process_canvas_video_service = canvas_video_service.clone();
     tokio::spawn(async move {
+        // One-shot skills-update prompt (Stage 2): on a version bump the bundled
+        // default skills may differ from the user's installed ones; when a chat
+        // sidebar is connected (its first Chat message arrives) push a
+        // replace/keep prompt exactly once for this daemon lifetime.
+        let skills_update_pending = nevoflux_skills::skills_update_available();
+        let mut skills_prompt_sent = false;
         while let Some((identity, envelope)) = msg_rx.recv().await {
             let proxy_id = envelope.proxy_id.clone();
             let request_id = envelope.request_id.clone();
@@ -2153,6 +2159,23 @@ pub async fn start_server(
                 channel,
                 identity.len()
             );
+
+            // One-shot: when a chat sidebar is connected and the bundled default
+            // skills changed, push the replace/keep prompt (Stage 2). The
+            // response arrives below as `skills_update_response`.
+            if skills_update_pending && !skills_prompt_sent && channel == Channel::Chat {
+                skills_prompt_sent = true;
+                let payload = serde_json::json!({
+                    "type": "skills_update_request",
+                    "payload": { "bundled_count": nevoflux_skills::bundled_skills_count() }
+                });
+                let env = DaemonEnvelope::new(&proxy_id, channel, payload);
+                if let Err(e) = process_response_tx.send((identity.clone(), env)).await {
+                    warn!("Failed to push skills_update_request: {}", e);
+                } else {
+                    info!("Pushed skills_update_request to sidebar");
+                }
+            }
 
             // Check for stop_generation messages - handle cancellation
             if msg_type == "stop_generation" {
@@ -2271,6 +2294,34 @@ pub async fn start_server(
                         warn!("Failed to parse plan response from payload: {:?}", payload);
                     }
                 }
+                continue;
+            }
+
+            // Skills-update prompt response (Stage 2): replace the user's skills
+            // with the bundled defaults, or keep them. Either way the applied
+            // fingerprint is recorded so the same bundle isn't offered again.
+            if msg_type == "skills_update_response" {
+                let replace = envelope
+                    .payload
+                    .get("payload")
+                    .and_then(|p| p.get("replace"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                info!("Processing skills_update_response: replace={}", replace);
+                // Run the filesystem work off the message loop.
+                tokio::task::spawn_blocking(move || {
+                    if replace {
+                        match nevoflux_skills::replace_user_skills_with_bundled() {
+                            Ok(n) => {
+                                info!("skills_update: replaced user skills ({} entries)", n)
+                            }
+                            Err(e) => warn!("skills_update: replace failed: {}", e),
+                        }
+                    } else {
+                        nevoflux_skills::record_skills_bundle_applied();
+                        info!("skills_update: user kept existing skills");
+                    }
+                });
                 continue;
             }
 
