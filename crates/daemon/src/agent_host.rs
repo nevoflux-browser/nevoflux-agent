@@ -189,6 +189,10 @@ pub struct DaemonHostFunctions {
     /// (e.g., unit tests). Callers that invoke the canvas_video_* methods
     /// without wiring the service will receive a host error.
     canvas_video_service: Option<Arc<crate::canvas_video::CanvasVideoService>>,
+    /// Shared per-run spend cap for unattended surfaces (loops/schedules/goals).
+    /// `None` for interactive hosts — zero behavior change when unset. See
+    /// [`crate::agent_exec::TokenBudget`].
+    token_budget: Option<Arc<crate::agent_exec::TokenBudget>>,
     // Note: always_allowed_tools is on HostServices (shared across requests),
     // not here (per-request DaemonHostFunctions).
 }
@@ -229,6 +233,7 @@ impl DaemonHostFunctions {
             session_extractor,
             last_response_at: Mutex::new(None),
             canvas_video_service: None,
+            token_budget: None,
         }
     }
 
@@ -292,6 +297,16 @@ impl DaemonHostFunctions {
         svc: Arc<crate::canvas_video::CanvasVideoService>,
     ) -> Self {
         self.canvas_video_service = Some(svc);
+        self
+    }
+
+    /// Wire a per-run [`crate::agent_exec::TokenBudget`]. Once set, `llm_chat`
+    /// and `llm_stream_start` refuse to dispatch once the budget is exceeded,
+    /// and `llm_chat` accrues usage from each successful response. Leave unset
+    /// for interactive hosts — behavior is unchanged when `token_budget` is
+    /// `None`.
+    pub fn with_token_budget(mut self, budget: Arc<crate::agent_exec::TokenBudget>) -> Self {
+        self.token_budget = Some(budget);
         self
     }
 
@@ -1086,6 +1101,19 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 
 impl HostFunctions for DaemonHostFunctions {
     fn llm_chat(&self, request: &LlmRequest) -> HostResult<LlmResponse> {
+        // Per-run spend cap (unattended surfaces only — `token_budget` is
+        // `None` for interactive hosts). Checked before any provider
+        // resolution or dispatch so an exhausted budget never reaches the
+        // network.
+        if let Some(budget) = &self.token_budget {
+            if budget.exceeded() {
+                return Err(HostError {
+                    code: 429,
+                    message: "token budget for this run exhausted".into(),
+                });
+            }
+        }
+
         // Resolve provider (uses override if set, otherwise config)
         let (provider_name, api_key, model, base_url) = self.resolve_provider_and_model()?;
 
@@ -1291,6 +1319,11 @@ impl HostFunctions for DaemonHostFunctions {
                     *t = Some(std::time::Instant::now());
                 }
 
+                // Accrue usage against the per-run budget, when both are present.
+                if let (Some(budget), Some(usage)) = (&self.token_budget, &response.usage) {
+                    budget.add(usage.total_tokens as u64);
+                }
+
                 // Convert tool calls, preserving call_id for OpenAI Responses API compatibility
                 let tool_calls = response
                     .tool_calls
@@ -1337,6 +1370,26 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn llm_stream_start(&self, request: &LlmRequest) -> HostResult<u64> {
+        // Per-run spend cap, mirroring the `llm_chat` gate above. Streamed
+        // responses do not currently surface per-call usage back to this
+        // host function (see `llm_stream_next`/`LlmStreamChunk` — no `usage`
+        // field is threaded through the mpsc channel), so streaming cannot
+        // *accrue* against the budget yet. Gating the call itself is still
+        // load-bearing: `Agent::run`'s default `AgentConfig` has
+        // `use_streaming: true`, so unattended runs (loops/schedules/goals
+        // via `agent_exec::run_agent_once`, which builds `Agent::new(host)`
+        // with default config) go through this path, not `llm_chat`. Without
+        // this check an exhausted budget would only stop the (rarely taken)
+        // non-streaming branch.
+        if let Some(budget) = &self.token_budget {
+            if budget.exceeded() {
+                return Err(HostError {
+                    code: 429,
+                    message: "token budget for this run exhausted".into(),
+                });
+            }
+        }
+
         // Resolve provider (uses override if set, otherwise config)
         let (provider_name, api_key, model, base_url) = self.resolve_provider_and_model()?;
 
@@ -5772,6 +5825,10 @@ impl DaemonHostFunctions {
             session_extractor: self.session_extractor.clone(),
             last_response_at: Mutex::new(self.last_response_at.lock().unwrap().clone()),
             canvas_video_service: self.canvas_video_service.clone(),
+            // Same run, same spend cap: nested builtin_chat/browser/agent
+            // dispatches must accrue against (and be gated by) the parent's
+            // budget, not run unmetered.
+            token_budget: self.token_budget.clone(),
         }
     }
 
@@ -6629,6 +6686,86 @@ mod tests {
         let config = Arc::new(AgentConfig::default());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _host = DaemonHostFunctions::new(config, rt.handle().clone());
+    }
+
+    // ==================== Token Budget Tests ====================
+    //
+    // These exercise only the pre-dispatch gate: the budget check happens
+    // before `resolve_provider_and_model`, so it fires deterministically
+    // even with an unconfigured `AgentConfig::default()` (no provider/API
+    // key) and never touches the network. Usage *accrual* (`budget.add`)
+    // needs a real provider response and is covered by the runner-level
+    // test in task 3.2, not here.
+
+    fn minimal_llm_request() -> LlmRequest {
+        use nevoflux_builtin_wasm::Message;
+        LlmRequest {
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            stream: false,
+        }
+    }
+
+    #[test]
+    fn llm_chat_rejects_with_429_when_budget_exhausted_before_any_dispatch() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let budget = crate::agent_exec::TokenBudget::new(10);
+        budget.add(10); // spent == limit ⇒ exceeded()
+        let host = DaemonHostFunctions::new(config, rt.handle().clone()).with_token_budget(budget);
+
+        let err = host
+            .llm_chat(&minimal_llm_request())
+            .expect_err("exhausted budget must reject before provider resolution");
+        assert_eq!(err.code, 429);
+        assert!(err.message.contains("token budget"));
+    }
+
+    #[test]
+    fn llm_stream_start_rejects_with_429_when_budget_exhausted_before_any_dispatch() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let budget = crate::agent_exec::TokenBudget::new(0); // zero limit ⇒ immediately exceeded
+        let host = DaemonHostFunctions::new(config, rt.handle().clone()).with_token_budget(budget);
+
+        let err = host
+            .llm_stream_start(&minimal_llm_request())
+            .expect_err("exhausted budget must reject before provider resolution");
+        assert_eq!(err.code, 429);
+        assert!(err.message.contains("token budget"));
+    }
+
+    #[test]
+    fn llm_chat_without_budget_is_unaffected_by_the_gate() {
+        // `token_budget: None` (the default, and the only state interactive
+        // hosts ever have) must not short-circuit with 429. Without a
+        // provider configured, `AgentConfig::default()` fails later in
+        // `resolve_provider_and_model` instead — proving the gate was
+        // skipped, not that the call succeeded.
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        let err = host
+            .llm_chat(&minimal_llm_request())
+            .expect_err("no provider configured");
+        assert_ne!(err.code, 429);
+    }
+
+    #[test]
+    fn llm_chat_with_budget_under_limit_reaches_provider_resolution() {
+        // A budget that is *not* exceeded must let the call proceed past the
+        // gate — it should fail for the same "no provider configured"
+        // reason as the no-budget case, not with 429.
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let budget = crate::agent_exec::TokenBudget::new(1000);
+        let host = DaemonHostFunctions::new(config, rt.handle().clone()).with_token_budget(budget);
+
+        let err = host
+            .llm_chat(&minimal_llm_request())
+            .expect_err("no provider configured");
+        assert_ne!(err.code, 429);
     }
 
     // ==================== Memory Tests ====================

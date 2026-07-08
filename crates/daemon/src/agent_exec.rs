@@ -19,14 +19,14 @@ use nevoflux_builtin_wasm::{AgentInput, Message, MessageRole};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Forward-compatibility token budget shared across an unattended run.
+/// Shared spend counter for one unattended run (turns + evaluator calls).
 ///
-/// **Not yet wired** into [`crate::agent_host::DaemonHostFunctions`]: a later
-/// task threads it into the host so per-call usage accrues here and the agent
-/// loop can stop when [`Self::exceeded`] flips. For now [`run_agent_once`]
-/// only *holds* the handle (via [`AgentExecRequest::token_budget`]) so callers
-/// can begin constructing budgets without a second refactor — the value is
-/// intentionally not read during execution.
+/// Wired into [`crate::agent_host::DaemonHostFunctions`] via
+/// `with_token_budget`: `llm_chat` and `llm_stream_start` refuse to dispatch
+/// once [`Self::exceeded`] is true, and `llm_chat` accrues usage from each
+/// successful response via [`Self::add`]. See the doc comment on
+/// `DaemonHostFunctions::llm_stream_start` for why streamed calls are gated
+/// but not (yet) metered.
 #[derive(Debug)]
 pub struct TokenBudget {
     /// Hard ceiling in tokens.
@@ -86,8 +86,9 @@ pub struct AgentExecRequest {
     /// Prior conversation as `(role, text)` pairs; converted into
     /// [`AgentInput::history`]. Loops pass empty.
     pub history: Vec<(String, String)>,
-    /// Forward-compat token budget; held but **not** yet wired into the host.
-    /// See [`TokenBudget`].
+    /// Per-run spend cap. When `Some`, installed on the host via
+    /// `with_token_budget` so the LLM boundary enforces it. See
+    /// [`TokenBudget`].
     pub token_budget: Option<Arc<TokenBudget>>,
 }
 
@@ -145,11 +146,6 @@ pub async fn run_agent_once(
     services: &HostServices,
     req: AgentExecRequest,
 ) -> Result<AgentExecOutcome, String> {
-    // `token_budget` is intentionally *not* read yet: a later task wires it
-    // into `DaemonHostFunctions` so per-call usage accrues against it. Holding
-    // it in the request keeps callers forward-compatible without a re-plumb.
-    let _ = &req.token_budget;
-
     let agent_config = services
         .agent_config
         .as_ref()
@@ -211,9 +207,12 @@ pub async fn run_agent_once(
     // Reset interrupt flag so a stray prior cancel doesn't poison this run.
     services_for_run.reset_interrupt();
 
-    let host = crate::agent_host::DaemonHostFunctions::new(agent_config, runtime_handle)
+    let mut host = crate::agent_host::DaemonHostFunctions::new(agent_config, runtime_handle)
         .with_services(services_for_run)
         .with_session_id(req.session_id.clone());
+    if let Some(budget) = req.token_budget.clone() {
+        host = host.with_token_budget(budget);
+    }
 
     let agent = nevoflux_builtin_wasm::Agent::new(host);
     // Build the run allowlist from the mode's canonical tool catalog, then
