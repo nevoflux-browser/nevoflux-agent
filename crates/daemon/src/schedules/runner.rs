@@ -22,14 +22,35 @@
 //!   defer/skip semantics land in P4).
 //! - `headless` → the run ends immediately as `Error("headless policy lands in
 //!   P4")`; a bound headless browser is a P4 concern.
+//!
+//! ## Token budget + goal loop (P3)
+//!
+//! A `max_tokens_per_run` builds a shared [`TokenBudget`] threaded through the
+//! LLM boundary for *every* run (plain or goal-wrapped); the spent total lands
+//! in the run row's `tokens_used`.
+//!
+//! When `goal_condition` is set, the run becomes a **goal loop**: each turn
+//! runs the kernel, the accumulated `(user, assistant)` transcript is judged by
+//! the evaluator (reusing `goals::evaluator`), and the pure decision core
+//! [`next_goal_step`] decides met → `Ok`, exhausted turns / budget → `Error`,
+//! else a `<GOAL-CONTINUATION>` message for the next turn. The loop's control
+//! flow is isolated behind the [`GoalTurnDriver`] seam so it is unit-testable
+//! without a network (see the tests).
 
-use crate::agent_exec::{run_agent_once, AgentExecRequest};
+use crate::agent_exec::{run_agent_once, AgentExecRequest, TokenBudget};
+use crate::goals::evaluator::{evaluate, resolve_evaluator, EvaluatorChoice, Verdict};
 use crate::schedules::events::ScheduleEvents;
 use crate::wasm::services::HostServices;
 use nevoflux_storage::models::current_timestamp;
 use nevoflux_storage::models::schedule::{ScheduleRecord, ScheduleRunStatus};
 use nevoflux_storage::repositories::ScheduleRepository;
 use nevoflux_storage::Database;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+/// Default per-run turn budget for a goal-wrapped schedule when
+/// `goal_max_turns` is unset (or non-positive). Mirrors the goals engine.
+const DEFAULT_GOAL_MAX_TURNS: i64 = 20;
 
 /// Outcome of a single schedule run, consumed by
 /// `manager::ScheduleManager::finish_fire` to apply next-fire/status
@@ -105,6 +126,8 @@ pub async fn execute_run(
             ScheduleRunStatus::Error,
             Some("headless policy lands in P4".to_string()),
             None,
+            None,
+            None,
         )
         .await;
     }
@@ -123,6 +146,8 @@ pub async fn execute_run(
                 ScheduleRunStatus::Ok,
                 None,
                 None,
+                None,
+                None,
             )
             .await;
         }
@@ -139,6 +164,33 @@ pub async fn execute_run(
     let borrow_proxy = rec.browser_policy == "live";
     let mode = crate::loops::manager::db_str_to_agent_mode(&rec.mode);
 
+    // Per-run token budget: applies to plain AND goal-wrapped runs. A
+    // non-positive limit is treated as unbounded (no budget installed).
+    let budget = rec
+        .max_tokens_per_run
+        .filter(|l| *l > 0)
+        .map(|limit| TokenBudget::new(limit as u64));
+
+    // Goal-wrapped run: drive the goal turn loop.
+    if let Some(condition) = rec.goal_condition.clone() {
+        return run_goal_wrapped(
+            &repo,
+            events,
+            rec,
+            run_id,
+            services,
+            session_id,
+            mode,
+            borrow_proxy,
+            budget,
+            condition,
+            user_message,
+        )
+        .await;
+    }
+
+    // Plain run: a single kernel call, with the budget threaded through so the
+    // LLM boundary enforces it and the spend is recorded.
     let req = AgentExecRequest {
         session_id,
         mode,
@@ -150,8 +202,7 @@ pub async fn execute_run(
         borrow_proxy,
         bound_browser: None,
         history: Vec::new(),
-        // Token budgeting is a P3 concern (`max_tokens_per_run`).
-        token_budget: None,
+        token_budget: budget.clone(),
     };
 
     match run_agent_once(services, req).await {
@@ -164,6 +215,8 @@ pub async fn execute_run(
                 ScheduleRunStatus::Ok,
                 None,
                 Some(outcome.text),
+                budget_spent(&budget),
+                None,
             )
             .await
         }
@@ -176,15 +229,303 @@ pub async fn execute_run(
                 ScheduleRunStatus::Error,
                 Some(e),
                 None,
+                budget_spent(&budget),
+                None,
             )
             .await
         }
     }
 }
 
+/// Snapshot the tokens spent so far on a budget (for `record_run_end`). `None`
+/// when the run has no budget installed.
+fn budget_spent(budget: &Option<Arc<TokenBudget>>) -> Option<i64> {
+    budget
+        .as_ref()
+        .map(|b| b.spent.load(Ordering::Relaxed) as i64)
+}
+
+// ---------------------------------------------------------------------------
+// Goal turn loop
+// ---------------------------------------------------------------------------
+
+/// The pure decision core of the goal loop. Given the just-completed `turn`
+/// (1-based), the `max_turns` budget, the evaluator `verdict`, and whether the
+/// token budget is now exhausted, decide the next step. Total and side-effect
+/// free, so it is unit-tested exhaustively.
+///
+/// Precedence (matches the plan): a `met` verdict wins even at/over budget;
+/// otherwise turns exhaustion wins over budget exhaustion; otherwise the
+/// budget stops the loop; otherwise continue.
+fn next_goal_step(turn: i64, max_turns: i64, verdict: &Verdict, budget_exceeded: bool) -> GoalStep {
+    if verdict.met {
+        GoalStep::Met
+    } else if turn >= max_turns {
+        GoalStep::Failed(format!(
+            "goal not met after {turn} turns: {}",
+            verdict.reason
+        ))
+    } else if budget_exceeded {
+        GoalStep::Failed("token budget exhausted before goal met".to_string())
+    } else {
+        GoalStep::Continue(format!(
+            "<GOAL-CONTINUATION>\n{}\nContinue. Turn {}/{}.\n</GOAL-CONTINUATION>",
+            verdict.reason, turn, max_turns
+        ))
+    }
+}
+
+/// Outcome of the pure decision core.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GoalStep {
+    /// Goal met at this turn — the loop succeeds with its captured final text.
+    Met,
+    /// Loop ends without meeting the goal (turns/budget exhausted).
+    Failed(String),
+    /// Run another turn with this `<GOAL-CONTINUATION>` user message.
+    Continue(String),
+}
+
+/// Seam over the two network operations the goal loop performs, so the loop's
+/// control flow (history pairing, continuation threading, budget accounting,
+/// break conditions) is testable without a network. Production wires
+/// [`run_agent_once`] + [`evaluate`]; tests supply canned replies.
+#[allow(async_fn_in_trait)]
+trait GoalTurnDriver {
+    /// Run one unattended agent turn and return its final assistant text.
+    async fn run_turn(
+        &mut self,
+        user_message: String,
+        history: Vec<(String, String)>,
+    ) -> Result<String, String>;
+
+    /// Judge the goal condition against the accumulated `(role, text)`
+    /// transcript. `Err` is a transport failure (handled as its own break).
+    async fn evaluate_goal(&mut self, transcript: &[(String, String)]) -> Result<Verdict, String>;
+}
+
+/// The terminal outcome of [`drive_goal_loop`], mapped 1:1 onto a run row.
+struct GoalLoopResult {
+    ok: bool,
+    error: Option<String>,
+    final_text: Option<String>,
+    tokens_used: Option<i64>,
+    goal_turns: i64,
+}
+
+impl GoalLoopResult {
+    fn spent(budget: Option<&TokenBudget>) -> Option<i64> {
+        budget.map(|b| b.spent.load(Ordering::Relaxed) as i64)
+    }
+    fn met(text: String, turns: i64, budget: Option<&TokenBudget>) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            final_text: Some(text),
+            tokens_used: Self::spent(budget),
+            goal_turns: turns,
+        }
+    }
+    fn failed(msg: String, turns: i64, budget: Option<&TokenBudget>) -> Self {
+        Self {
+            ok: false,
+            error: Some(msg),
+            final_text: None,
+            tokens_used: Self::spent(budget),
+            goal_turns: turns,
+        }
+    }
+}
+
+/// Drive the goal turn loop over a [`GoalTurnDriver`]. Accumulates the
+/// `(user, assistant)` transcript across turns, threads the token budget
+/// (evaluator spend is added here; kernel spend is added at the LLM boundary),
+/// and breaks per [`next_goal_step`] plus the two error breaks (kernel error,
+/// evaluator transport error). Budget spend is recorded on ALL outcomes.
+async fn drive_goal_loop<D: GoalTurnDriver>(
+    mut driver: D,
+    first_message: String,
+    max_turns: i64,
+    budget: Option<Arc<TokenBudget>>,
+) -> GoalLoopResult {
+    let mut history: Vec<(String, String)> = Vec::new();
+    let mut turn = 0i64;
+    let mut user_message = first_message;
+
+    loop {
+        turn += 1;
+        let text = match driver.run_turn(user_message.clone(), history.clone()).await {
+            Ok(t) => t,
+            // Kernel error: budget spend so far is still recorded.
+            Err(e) => return GoalLoopResult::failed(e, turn, budget.as_deref()),
+        };
+        // Pair this turn's (user, assistant) into the transcript BEFORE eval.
+        history.push(("user".to_string(), user_message.clone()));
+        history.push(("assistant".to_string(), text.clone()));
+
+        let verdict = match driver.evaluate_goal(&history).await {
+            Ok(v) => v,
+            // Evaluator transport error is its own break (no verdict, so no
+            // evaluator tokens are added).
+            Err(e) => {
+                return GoalLoopResult::failed(
+                    format!("evaluator error: {e}"),
+                    turn,
+                    budget.as_deref(),
+                )
+            }
+        };
+        // Evaluator tokens count against the budget.
+        if let Some(b) = budget.as_deref() {
+            b.add(verdict.tokens_used);
+        }
+        let budget_exceeded = budget.as_deref().map(|b| b.exceeded()).unwrap_or(false);
+
+        match next_goal_step(turn, max_turns, &verdict, budget_exceeded) {
+            GoalStep::Met => return GoalLoopResult::met(text, turn, budget.as_deref()),
+            GoalStep::Failed(msg) => return GoalLoopResult::failed(msg, turn, budget.as_deref()),
+            GoalStep::Continue(next) => user_message = next,
+        }
+    }
+}
+
+/// Production [`GoalTurnDriver`]: each turn calls the shared unattended kernel
+/// (threading the budget) and each evaluation calls the resolved evaluator.
+struct ProductionGoalDriver<'a> {
+    services: &'a HostServices,
+    session_id: String,
+    mode: nevoflux_builtin_wasm::AgentMode,
+    borrow_proxy: bool,
+    budget: Option<Arc<TokenBudget>>,
+    choice: EvaluatorChoice,
+    condition: String,
+}
+
+impl GoalTurnDriver for ProductionGoalDriver<'_> {
+    async fn run_turn(
+        &mut self,
+        user_message: String,
+        history: Vec<(String, String)>,
+    ) -> Result<String, String> {
+        let req = AgentExecRequest {
+            session_id: self.session_id.clone(),
+            mode: self.mode,
+            user_message,
+            forbidden_tools: forbidden_tools(),
+            forbidden_prefixes: Vec::new(),
+            unattended: true,
+            iteration_loop_id: None,
+            borrow_proxy: self.borrow_proxy,
+            bound_browser: None,
+            history,
+            token_budget: self.budget.clone(),
+        };
+        run_agent_once(self.services, req).await.map(|o| o.text)
+    }
+
+    async fn evaluate_goal(&mut self, transcript: &[(String, String)]) -> Result<Verdict, String> {
+        evaluate(&self.choice, &self.condition, transcript).await
+    }
+}
+
+/// Resolve the evaluator against the live config, drive the goal loop, and
+/// record the run. The persisted row already carries the resolved
+/// provider/model (set at create time); resolution here re-derives the API key
+/// (kept in config, never persisted). A resolution failure or a missing config
+/// ends the run as an error (with the budget spend, if any, recorded).
+#[allow(clippy::too_many_arguments)]
+async fn run_goal_wrapped(
+    repo: &ScheduleRepository<'_>,
+    events: &ScheduleEvents,
+    rec: &ScheduleRecord,
+    run_id: i64,
+    services: &HostServices,
+    session_id: String,
+    mode: nevoflux_builtin_wasm::AgentMode,
+    borrow_proxy: bool,
+    budget: Option<Arc<TokenBudget>>,
+    condition: String,
+    first_message: String,
+) -> RunResult {
+    let config = match services.agent_config.as_ref() {
+        Some(c) => c.clone(),
+        None => {
+            return end_run(
+                repo,
+                events,
+                rec,
+                run_id,
+                ScheduleRunStatus::Error,
+                Some("goal evaluation unavailable (no agent config)".to_string()),
+                None,
+                budget_spent(&budget),
+                Some(0),
+            )
+            .await;
+        }
+    };
+    let choice = match resolve_evaluator(
+        &config,
+        rec.evaluator_provider.as_deref(),
+        rec.evaluator_model.as_deref(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            return end_run(
+                repo,
+                events,
+                rec,
+                run_id,
+                ScheduleRunStatus::Error,
+                Some(format!("evaluator error: {e}")),
+                None,
+                budget_spent(&budget),
+                Some(0),
+            )
+            .await;
+        }
+    };
+    let max_turns = rec
+        .goal_max_turns
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_GOAL_MAX_TURNS);
+
+    let driver = ProductionGoalDriver {
+        services,
+        session_id,
+        mode,
+        borrow_proxy,
+        budget: budget.clone(),
+        choice,
+        condition,
+    };
+    let result = drive_goal_loop(driver, first_message, max_turns, budget).await;
+
+    let status = if result.ok {
+        ScheduleRunStatus::Ok
+    } else {
+        ScheduleRunStatus::Error
+    };
+    end_run(
+        repo,
+        events,
+        rec,
+        run_id,
+        status,
+        result.error,
+        result.final_text,
+        result.tokens_used,
+        Some(result.goal_turns),
+    )
+    .await
+}
+
 /// Persist `run_end`, emit the `run_end` event, and build the [`RunResult`].
-/// Centralizes the exit paths (headless refusal, stub ok, production ok/error)
-/// so the persisted row and the emitted event never diverge.
+/// Centralizes the exit paths (headless refusal, stub ok, plain ok/error,
+/// goal-loop outcomes) so the persisted row and the emitted event never
+/// diverge. `tokens_used` is the budget spend (when a budget was installed);
+/// `goal_turns` is the number of goal turns taken (goal-wrapped runs only).
+#[allow(clippy::too_many_arguments)]
 async fn end_run(
     repo: &ScheduleRepository<'_>,
     events: &ScheduleEvents,
@@ -193,6 +534,8 @@ async fn end_run(
     status: ScheduleRunStatus,
     error: Option<String>,
     final_text: Option<String>,
+    tokens_used: Option<i64>,
+    goal_turns: Option<i64>,
 ) -> RunResult {
     let end = current_timestamp();
     let _ = repo.record_run_end(
@@ -201,8 +544,8 @@ async fn end_run(
         status,
         error.as_deref(),
         final_text.as_deref(),
-        None,
-        None,
+        tokens_used,
+        goal_turns,
     );
     events
         .run_end(
@@ -276,6 +619,7 @@ mod tests {
             goal_max_turns: None,
             max_tokens_per_run: None,
             evaluator_model: None,
+            evaluator_provider: None,
             status: nevoflux_storage::models::schedule::ScheduleStatus::Active,
             next_fire_at: Some(1_800_000_000),
             last_run_status: None,
@@ -361,5 +705,290 @@ mod tests {
 
         let runs = repo.list_runs("sch00002", 10).unwrap();
         assert_eq!(runs[0].status, ScheduleRunStatus::Error);
+    }
+
+    // ---- next_goal_step (pure decision core) -------------------------------
+
+    fn verdict(met: bool, reason: &str, tokens: u64) -> Verdict {
+        Verdict {
+            met,
+            reason: reason.to_string(),
+            tokens_used: tokens,
+        }
+    }
+
+    #[test]
+    fn step_met_is_met_regardless_of_turns_or_budget() {
+        assert_eq!(
+            next_goal_step(1, 20, &verdict(true, "confirmed", 0), false),
+            GoalStep::Met
+        );
+        // met wins even at the turn boundary AND with the budget exhausted.
+        assert_eq!(
+            next_goal_step(20, 20, &verdict(true, "confirmed", 0), true),
+            GoalStep::Met
+        );
+    }
+
+    #[test]
+    fn step_unmet_under_budget_continues_with_directive() {
+        let step = next_goal_step(3, 20, &verdict(false, "still installing", 0), false);
+        assert_eq!(
+            step,
+            GoalStep::Continue(
+                "<GOAL-CONTINUATION>\nstill installing\nContinue. Turn 3/20.\n</GOAL-CONTINUATION>"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn step_unmet_at_and_over_max_turns_fails() {
+        assert_eq!(
+            next_goal_step(2, 2, &verdict(false, "nope", 0), false),
+            GoalStep::Failed("goal not met after 2 turns: nope".to_string())
+        );
+        // turn > max (defensive) still fails as turns-exhausted.
+        assert_eq!(
+            next_goal_step(3, 2, &verdict(false, "nope", 0), false),
+            GoalStep::Failed("goal not met after 3 turns: nope".to_string())
+        );
+    }
+
+    #[test]
+    fn step_budget_exceeded_after_eval_fails() {
+        assert_eq!(
+            next_goal_step(1, 20, &verdict(false, "working", 0), true),
+            GoalStep::Failed("token budget exhausted before goal met".to_string())
+        );
+    }
+
+    #[test]
+    fn step_turns_exhaustion_wins_over_budget() {
+        // At the turn boundary AND over budget: the turns message wins (matches
+        // the plan's precedence — the budget check is last).
+        assert_eq!(
+            next_goal_step(2, 2, &verdict(false, "nope", 0), true),
+            GoalStep::Failed("goal not met after 2 turns: nope".to_string())
+        );
+    }
+
+    // ---- drive_goal_loop (full control flow, no network) -------------------
+
+    #[derive(Default)]
+    struct Recorder {
+        seen_messages: Vec<String>,
+        seen_histories: Vec<Vec<(String, String)>>,
+    }
+
+    /// A [`GoalTurnDriver`] with canned per-turn replies, so the loop's control
+    /// flow is exercised without any network. `kernel_tokens[i]` simulates the
+    /// spend the LLM boundary would accrue on turn `i` (added to `budget`).
+    struct StubDriver {
+        turn_replies: Vec<Result<String, String>>,
+        eval_replies: Vec<Result<Verdict, String>>,
+        kernel_tokens: Vec<u64>,
+        budget: Option<Arc<TokenBudget>>,
+        run_calls: usize,
+        eval_calls: usize,
+        rec: std::rc::Rc<std::cell::RefCell<Recorder>>,
+    }
+
+    impl StubDriver {
+        fn new(
+            turn_replies: Vec<Result<String, String>>,
+            eval_replies: Vec<Result<Verdict, String>>,
+        ) -> Self {
+            Self {
+                turn_replies,
+                eval_replies,
+                kernel_tokens: Vec::new(),
+                budget: None,
+                run_calls: 0,
+                eval_calls: 0,
+                rec: std::rc::Rc::new(std::cell::RefCell::new(Recorder::default())),
+            }
+        }
+        fn with_budget(mut self, budget: Arc<TokenBudget>, kernel_tokens: Vec<u64>) -> Self {
+            self.budget = Some(budget);
+            self.kernel_tokens = kernel_tokens;
+            self
+        }
+    }
+
+    impl GoalTurnDriver for StubDriver {
+        async fn run_turn(
+            &mut self,
+            user_message: String,
+            history: Vec<(String, String)>,
+        ) -> Result<String, String> {
+            self.rec.borrow_mut().seen_messages.push(user_message);
+            self.rec.borrow_mut().seen_histories.push(history);
+            let i = self.run_calls;
+            self.run_calls += 1;
+            // Simulate the LLM boundary accruing this turn's kernel spend.
+            if let (Some(b), Some(t)) = (self.budget.as_deref(), self.kernel_tokens.get(i)) {
+                b.add(*t);
+            }
+            self.turn_replies[i].clone()
+        }
+
+        async fn evaluate_goal(
+            &mut self,
+            _transcript: &[(String, String)],
+        ) -> Result<Verdict, String> {
+            let i = self.eval_calls;
+            self.eval_calls += 1;
+            self.eval_replies[i].clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_met_on_first_turn_is_ok() {
+        let driver = StubDriver::new(
+            vec![Ok("did the thing".into())],
+            vec![Ok(verdict(true, "confirmed", 12))],
+        );
+        let r = drive_goal_loop(driver, "start".into(), 20, None).await;
+        assert!(r.ok);
+        assert!(r.error.is_none());
+        assert_eq!(r.final_text.as_deref(), Some("did the thing"));
+        assert_eq!(r.goal_turns, 1);
+        // No budget installed → nothing recorded.
+        assert_eq!(r.tokens_used, None);
+    }
+
+    #[tokio::test]
+    async fn loop_met_on_third_turn_pairs_history_and_threads_continuation() {
+        let driver = StubDriver::new(
+            vec![Ok("t1".into()), Ok("t2".into()), Ok("t3".into())],
+            vec![
+                Ok(verdict(false, "not yet", 0)),
+                Ok(verdict(false, "closer", 0)),
+                Ok(verdict(true, "done", 0)),
+            ],
+        );
+        let rec = driver.rec.clone();
+        let r = drive_goal_loop(driver, "start".into(), 20, None).await;
+        assert!(r.ok);
+        assert_eq!(r.final_text.as_deref(), Some("t3"));
+        assert_eq!(r.goal_turns, 3);
+
+        let rec = rec.borrow();
+        // Continuation threading: first message is the original; turns 2 and 3
+        // receive the `<GOAL-CONTINUATION>` built from the prior verdict.
+        assert_eq!(rec.seen_messages[0], "start");
+        assert_eq!(
+            rec.seen_messages[1],
+            "<GOAL-CONTINUATION>\nnot yet\nContinue. Turn 1/20.\n</GOAL-CONTINUATION>"
+        );
+        assert_eq!(
+            rec.seen_messages[2],
+            "<GOAL-CONTINUATION>\ncloser\nContinue. Turn 2/20.\n</GOAL-CONTINUATION>"
+        );
+        // History pairing: each turn sees the accumulated (user, assistant) pairs.
+        assert!(rec.seen_histories[0].is_empty());
+        assert_eq!(
+            rec.seen_histories[1],
+            vec![
+                ("user".to_string(), "start".to_string()),
+                ("assistant".to_string(), "t1".to_string()),
+            ]
+        );
+        assert_eq!(
+            rec.seen_histories[2],
+            vec![
+                ("user".to_string(), "start".to_string()),
+                ("assistant".to_string(), "t1".to_string()),
+                (
+                    "user".to_string(),
+                    "<GOAL-CONTINUATION>\nnot yet\nContinue. Turn 1/20.\n</GOAL-CONTINUATION>"
+                        .to_string()
+                ),
+                ("assistant".to_string(), "t2".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_unmet_until_max_turns_fails() {
+        let driver = StubDriver::new(
+            vec![Ok("t1".into()), Ok("t2".into())],
+            vec![
+                Ok(verdict(false, "nope1", 0)),
+                Ok(verdict(false, "nope2", 0)),
+            ],
+        );
+        let r = drive_goal_loop(driver, "start".into(), 2, None).await;
+        assert!(!r.ok);
+        assert_eq!(
+            r.error.as_deref(),
+            Some("goal not met after 2 turns: nope2")
+        );
+        assert_eq!(r.goal_turns, 2);
+        assert!(r.final_text.is_none());
+    }
+
+    #[tokio::test]
+    async fn loop_evaluator_error_breaks_and_records_spend() {
+        let budget = TokenBudget::new(1000);
+        let driver = StubDriver::new(vec![Ok("t1".into())], vec![Err("network down".into())])
+            .with_budget(budget.clone(), vec![40]);
+        let r = drive_goal_loop(driver, "start".into(), 20, Some(budget)).await;
+        assert!(!r.ok);
+        assert_eq!(r.error.as_deref(), Some("evaluator error: network down"));
+        assert_eq!(r.goal_turns, 1);
+        // Kernel spend accrued before the evaluator failed is still recorded;
+        // no evaluator tokens are added on the transport-error path.
+        assert_eq!(r.tokens_used, Some(40));
+    }
+
+    #[tokio::test]
+    async fn loop_kernel_error_breaks_and_records_spend() {
+        let budget = TokenBudget::new(1000);
+        // The kernel accrues 25 tokens, then returns an error.
+        let driver = StubDriver::new(vec![Err("kernel boom".into())], vec![])
+            .with_budget(budget.clone(), vec![25]);
+        let r = drive_goal_loop(driver, "start".into(), 20, Some(budget)).await;
+        assert!(!r.ok);
+        assert_eq!(r.error.as_deref(), Some("kernel boom"));
+        assert_eq!(r.goal_turns, 1);
+        assert_eq!(r.tokens_used, Some(25));
+    }
+
+    #[tokio::test]
+    async fn loop_budget_exhausted_after_eval_breaks() {
+        let budget = TokenBudget::new(100);
+        // Kernel spends 30; the evaluator returns unmet + 90 tokens → 120 ≥ 100.
+        let driver = StubDriver::new(
+            vec![Ok("t1".into())],
+            vec![Ok(verdict(false, "still working", 90))],
+        )
+        .with_budget(budget.clone(), vec![30]);
+        let r = drive_goal_loop(driver, "start".into(), 20, Some(budget)).await;
+        assert!(!r.ok);
+        assert_eq!(
+            r.error.as_deref(),
+            Some("token budget exhausted before goal met")
+        );
+        assert_eq!(r.goal_turns, 1);
+        // Both kernel (30) and evaluator (90) spend are counted.
+        assert_eq!(r.tokens_used, Some(120));
+    }
+
+    #[tokio::test]
+    async fn loop_met_wins_even_when_budget_exhausted() {
+        let budget = TokenBudget::new(10);
+        // The met verdict itself pushes the budget over, but met still wins.
+        let driver = StubDriver::new(
+            vec![Ok("finished".into())],
+            vec![Ok(verdict(true, "done", 50))],
+        )
+        .with_budget(budget.clone(), vec![]);
+        let r = drive_goal_loop(driver, "start".into(), 20, Some(budget)).await;
+        assert!(r.ok);
+        assert_eq!(r.final_text.as_deref(), Some("finished"));
+        assert_eq!(r.goal_turns, 1);
+        assert_eq!(r.tokens_used, Some(50));
     }
 }

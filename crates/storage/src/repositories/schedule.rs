@@ -10,12 +10,15 @@ use crate::connection::Database;
 use crate::error::{Result, StorageError};
 use crate::models::schedule::{ScheduleRecord, ScheduleRun, ScheduleRunStatus, ScheduleStatus};
 
+// `evaluator_provider` is appended last (migration 023 added it after
+// `updated_at` physically); keeping it at the tail of this explicit list means
+// every prior column index in `row_to_schedule` is unchanged.
 const SCHEDULE_COLUMNS: &str =
     "id, creator_session_id, name, cron_expr, at_ts, prompt_text, wrapped_skill,
      mode, browser_policy, on_unavailable, headless_profile, catch_up,
      goal_condition, goal_max_turns, max_tokens_per_run, evaluator_model,
      status, next_fire_at, last_run_status, last_run_at,
-     consecutive_failures, run_count, created_at, updated_at";
+     consecutive_failures, run_count, created_at, updated_at, evaluator_provider";
 
 /// Cap `final_text` at 4096 chars before insert — same cap `daemon::loops::events`
 /// applies to loop iteration output, so a long run response doesn't bloat the
@@ -43,7 +46,7 @@ impl<'a> ScheduleRepository<'a> {
                 &format!(
                     "INSERT INTO schedules ({SCHEDULE_COLUMNS})
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                             ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)"
+                             ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
                 ),
                 params![
                     rec.id,
@@ -70,6 +73,7 @@ impl<'a> ScheduleRepository<'a> {
                     rec.run_count,
                     rec.created_at,
                     rec.updated_at,
+                    rec.evaluator_provider,
                 ],
             )?;
             Ok(rec.id.clone())
@@ -356,6 +360,7 @@ fn row_to_schedule(row: &Row<'_>) -> rusqlite::Result<Result<ScheduleRecord>> {
     let run_count: i64 = row.get(21)?;
     let created_at: i64 = row.get(22)?;
     let updated_at: i64 = row.get(23)?;
+    let evaluator_provider: Option<String> = row.get(24)?;
 
     Ok((|| -> Result<ScheduleRecord> {
         let status = ScheduleStatus::from_db_str(&status_str).ok_or_else(|| {
@@ -378,6 +383,7 @@ fn row_to_schedule(row: &Row<'_>) -> rusqlite::Result<Result<ScheduleRecord>> {
             goal_max_turns,
             max_tokens_per_run,
             evaluator_model,
+            evaluator_provider,
             status,
             next_fire_at,
             last_run_status,
@@ -448,6 +454,7 @@ mod tests {
             goal_max_turns: None,
             max_tokens_per_run: None,
             evaluator_model: None,
+            evaluator_provider: None,
             status: ScheduleStatus::Active,
             next_fire_at: Some(1_800_000_000),
             last_run_status: None,
@@ -468,6 +475,24 @@ mod tests {
         assert_eq!(got.name, "daily-report");
         assert_eq!(got.cron_expr.as_deref(), Some("0 9 * * *"));
         assert_eq!(got.status, ScheduleStatus::Active);
+    }
+
+    #[test]
+    fn evaluator_provider_and_model_roundtrip() {
+        // Migration 023: the resolved evaluator (provider, model) pair persists
+        // and reads back through the appended column.
+        let db = test_db();
+        let repo = ScheduleRepository::new(&db);
+        let mut rec = sample("sch00006");
+        rec.goal_condition = Some("the report is posted".into());
+        rec.evaluator_provider = Some("anthropic".into());
+        rec.evaluator_model = Some("claude-haiku-4-5".into());
+        repo.create(&rec).unwrap();
+
+        let got = repo.get("sch00006").unwrap().expect("exists");
+        assert_eq!(got.evaluator_provider.as_deref(), Some("anthropic"));
+        assert_eq!(got.evaluator_model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(got.goal_condition.as_deref(), Some("the report is posted"));
     }
 
     #[test]

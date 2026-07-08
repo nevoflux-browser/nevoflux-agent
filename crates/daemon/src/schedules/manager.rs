@@ -50,6 +50,10 @@ use tokio::task::JoinHandle;
 /// Poll cadence for the due-tick engine.
 const TICK_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Maximum length of a `goal_condition` (characters) — mirrors the goals table
+/// bound and the `schedules` DB CHECK, enforced eagerly for a clean error.
+const GOAL_CONDITION_MAX_CHARS: usize = 4000;
+
 /// Validated argument bundle for [`ScheduleManager::create`]. Field names and
 /// types are binding — the `/schedule` tool + server layers construct this
 /// verbatim.
@@ -76,7 +80,12 @@ pub struct CreateScheduleArgs {
     pub goal_condition: Option<String>,
     pub goal_max_turns: Option<i64>,
     pub max_tokens_per_run: Option<i64>,
+    /// Explicit evaluator model (else the active model). Resolved at create
+    /// time when `goal_condition` is present.
     pub evaluator_model: Option<String>,
+    /// Explicit direct-API evaluator provider (else the active provider).
+    /// Resolved at create time when `goal_condition` is present.
+    pub evaluator_provider: Option<String>,
 }
 
 /// A dispatch request funneled through the mpsc channel into the tick task
@@ -332,6 +341,47 @@ impl ScheduleManager {
             }
         }
 
+        // Goal validation + eager evaluator resolution. When a goal condition is
+        // present we (a) enforce the same non-empty / ≤4000-char bound the DB
+        // CHECK holds (so a bad condition fails with a clean message rather than
+        // a constraint error), and (b) resolve the evaluator NOW against the
+        // live agent config — an ACP provider or a missing key fails creation
+        // fast, and the resolved (provider, model) strings are persisted so the
+        // run-time evaluator call needs no re-resolution. `services` (production)
+        // carries the config; without it, goal evaluation is unavailable.
+        let (goal_condition, resolved_provider, resolved_model) = match &args.goal_condition {
+            Some(condition) => {
+                let trimmed = condition.trim();
+                if trimmed.is_empty() {
+                    return Err("goal_condition must not be empty".into());
+                }
+                let char_count = trimmed.chars().count();
+                if char_count > GOAL_CONDITION_MAX_CHARS {
+                    return Err(format!(
+                        "goal_condition too long: {char_count} characters (max {GOAL_CONDITION_MAX_CHARS})"
+                    ));
+                }
+                let config = self
+                    .inner
+                    .services
+                    .as_ref()
+                    .and_then(|s| s.agent_config.as_ref())
+                    .ok_or("goal evaluation unavailable (no agent config)")?;
+                let choice = crate::goals::evaluator::resolve_evaluator(
+                    config,
+                    args.evaluator_provider.as_deref(),
+                    args.evaluator_model.as_deref(),
+                )?;
+                (
+                    Some(trimmed.to_string()),
+                    Some(choice.provider),
+                    Some(choice.model),
+                )
+            }
+            // No goal: carry any evaluator hints verbatim (inert without a goal).
+            None => (None, args.evaluator_provider, args.evaluator_model),
+        };
+
         let now = current_timestamp();
         // Compute the first fire; cron validation surfaces `TooFrequent` (with
         // the "use /loop" redirect) as a plain error string.
@@ -360,10 +410,11 @@ impl ScheduleManager {
             on_unavailable: args.on_unavailable,
             headless_profile: args.headless_profile,
             catch_up: args.catch_up,
-            goal_condition: args.goal_condition,
+            goal_condition,
             goal_max_turns: args.goal_max_turns,
             max_tokens_per_run: args.max_tokens_per_run,
-            evaluator_model: args.evaluator_model,
+            evaluator_model: resolved_model,
+            evaluator_provider: resolved_provider,
             status: ScheduleStatus::Active,
             next_fire_at: Some(next_fire_at),
             last_run_status: None,
@@ -759,6 +810,7 @@ mod tests {
             goal_max_turns: None,
             max_tokens_per_run: None,
             evaluator_model: None,
+            evaluator_provider: None,
         }
     }
 
@@ -787,6 +839,7 @@ mod tests {
             goal_max_turns: None,
             max_tokens_per_run: None,
             evaluator_model: None,
+            evaluator_provider: None,
             status: ScheduleStatus::Active,
             next_fire_at: next_fire,
             last_run_status: None,
@@ -1258,6 +1311,163 @@ mod tests {
             .unwrap();
         assert_eq!(rec.status, ScheduleStatus::Ran, "Ran must not be clobbered");
         assert_eq!(mgr.pending_work_handle().load(Ordering::SeqCst), 0);
+        mgr.shutdown().await;
+    }
+
+    // ---- goal validation + evaluator resolution at create time -------------
+
+    /// A direct-API config fixture (mirrors the goals-manager test fixture) so
+    /// goal-bearing schedules can resolve an evaluator.
+    fn config_anthropic() -> Arc<crate::config::AgentConfig> {
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.llm.provider = Some("anthropic".to_string());
+        cfg.llm.anthropic.api_key = Some("sk-ant-test".to_string());
+        cfg.llm.anthropic.model = Some("claude-haiku-4-5".to_string());
+        Arc::new(cfg)
+    }
+
+    /// `HostServices` carrying `agent_config` — the create-side goal path reads
+    /// the evaluator config from here (production always has it).
+    fn services_with_config(
+        db: &Database,
+        config: Arc<crate::config::AgentConfig>,
+    ) -> HostServices {
+        HostServices::new(Arc::new(db.clone())).with_agent_config(config)
+    }
+
+    fn goal_args(condition: &str) -> CreateScheduleArgs {
+        let mut args = base_args();
+        args.goal_condition = Some(condition.to_string());
+        args
+    }
+
+    #[tokio::test]
+    async fn create_goal_requires_agent_config() {
+        // No services ⇒ no agent config ⇒ goal evaluation is unavailable.
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+
+        let err = mgr
+            .create(goal_args("the report is posted"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("goal evaluation unavailable"),
+            "unexpected error: {err}"
+        );
+        // Nothing persisted, nothing counted.
+        assert!(mgr.list().await.unwrap().is_empty());
+        assert!(!mgr.has_pending_work());
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn create_goal_rejects_acp_evaluator() {
+        // An ACP active provider cannot act as an evaluator — fail fast.
+        let db = Database::open_in_memory().unwrap();
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.llm.provider = Some("claude-code".to_string());
+        let services = services_with_config(&db, Arc::new(cfg));
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, Some(services));
+
+        let err = mgr.create(goal_args("done")).await.unwrap_err();
+        assert!(
+            err.contains("ACP") && err.to_lowercase().contains("direct-api"),
+            "unexpected error: {err}"
+        );
+        assert!(mgr.list().await.unwrap().is_empty());
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn create_goal_rejects_empty_and_over_length_condition() {
+        let db = Database::open_in_memory().unwrap();
+        let services = services_with_config(&db, config_anthropic());
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, Some(services));
+
+        let err = mgr.create(goal_args("   \n\t ")).await.unwrap_err();
+        assert!(err.contains("empty"), "unexpected error: {err}");
+
+        let too_long = "x".repeat(GOAL_CONDITION_MAX_CHARS + 1);
+        let err = mgr.create(goal_args(&too_long)).await.unwrap_err();
+        assert!(err.contains("too long"), "unexpected error: {err}");
+
+        // Exactly at the limit is allowed and resolves.
+        let at_limit = "y".repeat(GOAL_CONDITION_MAX_CHARS);
+        assert!(mgr.create(goal_args(&at_limit)).await.is_ok());
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn create_goal_resolves_and_persists_evaluator() {
+        let db = Database::open_in_memory().unwrap();
+        let services = services_with_config(&db, config_anthropic());
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, Some(services));
+
+        let id = mgr
+            .create(goal_args("  the PR is merged  "))
+            .await
+            .expect("goal schedule created");
+
+        let rec = mgr
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id.0)
+            .unwrap();
+        // Condition is trimmed; the resolved (provider, model) are persisted.
+        assert_eq!(rec.goal_condition.as_deref(), Some("the PR is merged"));
+        assert_eq!(rec.evaluator_provider.as_deref(), Some("anthropic"));
+        assert_eq!(rec.evaluator_model.as_deref(), Some("claude-haiku-4-5"));
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn create_goal_honors_explicit_evaluator_provider_and_model() {
+        // Explicit (provider, model) override the active provider and persist.
+        let db = Database::open_in_memory().unwrap();
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.llm.provider = Some("anthropic".to_string());
+        cfg.llm.anthropic.api_key = Some("sk-ant".to_string());
+        cfg.llm.anthropic.model = Some("claude-haiku-4-5".to_string());
+        cfg.llm.openrouter.api_key = Some("sk-or".to_string());
+        cfg.llm.openrouter.model = Some("config/model".to_string());
+        let services = services_with_config(&db, Arc::new(cfg));
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, Some(services));
+
+        let mut args = goal_args("done");
+        args.evaluator_provider = Some("openrouter".to_string());
+        args.evaluator_model = Some("explicit/model".to_string());
+        let id = mgr.create(args).await.expect("created");
+
+        let rec = mgr
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id.0)
+            .unwrap();
+        assert_eq!(rec.evaluator_provider.as_deref(), Some("openrouter"));
+        assert_eq!(rec.evaluator_model.as_deref(), Some("explicit/model"));
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn create_without_goal_ignores_config_absence() {
+        // A goal-less create still works with no services (zero behavior change).
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let id = mgr.create(base_args()).await.expect("created");
+        let rec = mgr
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id.0)
+            .unwrap();
+        assert!(rec.goal_condition.is_none());
+        assert!(rec.evaluator_provider.is_none());
         mgr.shutdown().await;
     }
 }

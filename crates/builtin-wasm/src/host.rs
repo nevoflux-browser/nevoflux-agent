@@ -716,7 +716,8 @@ pub trait HostFunctions {
     /// Create a `/schedule`. JSON args: {name, cron?, at?, prompt_text?,
     /// wrapped_skill?, mode?, browser?, on_unavailable?, headless_profile?,
     /// catch_up?, goal_condition?, goal_max_turns?, max_tokens_per_run?,
-    /// evaluator_model?}. Returns JSON {"schedule_id":"…","next_fire_at":N}.
+    /// evaluator_model?, evaluator_provider?}. Returns JSON
+    /// {"schedule_id":"…","next_fire_at":N}.
     /// Default impl returns Unsupported so non-daemon hosts (mocks, tests)
     /// don't need stub code.
     fn tool_schedule_create(&self, _args_json: &str) -> HostResult<String> {

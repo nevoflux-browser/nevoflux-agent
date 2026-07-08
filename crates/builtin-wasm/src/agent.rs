@@ -3656,10 +3656,11 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                         },
                         "headless_profile": { "type": "string", "description": "named headless browser profile to use" },
                         "catch_up": { "type": "boolean", "description": "fire once on next boot if the daemon was offline at the scheduled time. Default false." },
-                        "goal_condition": { "type": "string", "description": "natural-language success condition; takes effect in goal-enabled runs (inert until the goal engine ships)" },
-                        "goal_max_turns": { "type": "integer", "description": "max turns for goal-enabled runs (inert until the goal engine ships)" },
-                        "max_tokens_per_run": { "type": "integer", "description": "token budget per run" },
-                        "evaluator_model": { "type": "string", "description": "model id used to evaluate goal_condition (inert until the goal engine ships)" }
+                        "goal_condition": { "type": "string", "description": "natural-language success condition; when set, each fire runs a goal loop that re-evaluates after every turn until met or budget/turns run out (max 4000 chars)" },
+                        "goal_max_turns": { "type": "integer", "description": "max turns for a goal-enabled run. Default 20." },
+                        "max_tokens_per_run": { "type": "integer", "description": "token budget per run (applies to plain and goal-enabled runs; goal turns + evaluator calls both count against it)" },
+                        "evaluator_model": { "type": "string", "description": "model id used to evaluate goal_condition. Default: the current model." },
+                        "evaluator_provider": { "type": "string", "description": "direct-API provider id used to evaluate goal_condition (ACP providers rejected). Default: the current provider." }
                     },
                     "required": ["name"]
                 }),

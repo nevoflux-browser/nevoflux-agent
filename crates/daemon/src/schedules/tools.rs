@@ -119,6 +119,10 @@ async fn schedule_create(
         .get("evaluator_model")
         .and_then(|v| v.as_str())
         .map(String::from);
+    let evaluator_provider = args
+        .get("evaluator_provider")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     let creator_session_id = if ctx.session_id.is_empty() {
         None
@@ -143,6 +147,7 @@ async fn schedule_create(
             goal_max_turns,
             max_tokens_per_run,
             evaluator_model,
+            evaluator_provider,
         })
         .await?;
 

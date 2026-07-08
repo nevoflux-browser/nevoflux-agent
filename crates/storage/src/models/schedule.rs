@@ -94,6 +94,9 @@ pub struct ScheduleRecord {
     pub goal_max_turns: Option<i64>,
     pub max_tokens_per_run: Option<i64>,
     pub evaluator_model: Option<String>,
+    /// Direct-API provider id used to evaluate `goal_condition`. Resolved and
+    /// persisted alongside `evaluator_model` at create time (migration 023).
+    pub evaluator_provider: Option<String>,
     pub status: ScheduleStatus,
     pub next_fire_at: Option<i64>,
     pub last_run_status: Option<String>,

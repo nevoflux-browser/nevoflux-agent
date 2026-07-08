@@ -231,6 +231,7 @@ mod tests {
             goal_max_turns: None,
             max_tokens_per_run: None,
             evaluator_model: None,
+            evaluator_provider: None,
             status: ScheduleStatus::Active,
             next_fire_at: Some(1_700_000_000),
             last_run_status: None,
