@@ -50,14 +50,17 @@ pub struct RunResult {
 }
 
 /// Tools a scheduled run must never call: interactive prompts (there is no
-/// user to answer) and recursive job creation (a scheduled job spawning more
-/// jobs/loops is out of P1 scope).
+/// user to answer), recursive job creation (a scheduled job spawning more
+/// jobs/loops is out of P1 scope), and `goal_set` — a scheduled (unattended)
+/// run must not hijack the creator session's active goal, since goals are
+/// session-scoped and single-active.
 fn forbidden_tools() -> Vec<String> {
     vec![
         "ask_user".to_string(),
         "browser_ask_user".to_string(),
         "loop_create".to_string(),
         "schedule_create".to_string(),
+        "goal_set".to_string(),
     ]
 }
 
@@ -282,6 +285,28 @@ mod tests {
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,
         }
+    }
+
+    #[test]
+    fn forbidden_tools_block_self_replication_and_goal_hijack() {
+        let list = forbidden_tools();
+        // Interactive prompts, recursive job creation, and goal hijack are all
+        // barred from unattended scheduled runs.
+        for expected in [
+            "ask_user",
+            "browser_ask_user",
+            "loop_create",
+            "schedule_create",
+            "goal_set",
+        ] {
+            assert!(
+                list.iter().any(|t| t == expected),
+                "scheduled runs must forbid {expected}"
+            );
+        }
+        // Read-only goal/schedule tools stay available to scheduled runs.
+        assert!(!list.iter().any(|t| t == "goal_status"));
+        assert!(!list.iter().any(|t| t == "schedule_list"));
     }
 
     #[tokio::test]
