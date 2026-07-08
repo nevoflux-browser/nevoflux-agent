@@ -6929,6 +6929,48 @@ async fn handle_chat_message(
                 "brain.share_list" => crate::brain_share_rpc::handle_share_list(&params).await,
                 "brain.share_renew" => crate::brain_share_rpc::handle_share_renew(&params).await,
                 "brain.share_revoke" => crate::brain_share_rpc::handle_share_revoke(&params).await,
+                // Schedule & Goal management commands (Task 5.0) — thin
+                // ScheduleManager / GoalManager wrappers so the sidebar Jobs
+                // UI (P5) can manage schedules without going through the LLM
+                // tool-call loop. DRY: the mutation-y ones marshal through
+                // `crate::schedules::execute_schedule_tool` /
+                // `crate::goals::execute_goal_tool` — the same dispatcher the
+                // `schedule_*`/`goal_*` LLM tools use — rather than
+                // re-implementing the ScheduleManager/GoalManager calls here.
+                "schedule.list" => handle_schedule_list(services, &params).await,
+                "schedule.runs" => handle_schedule_runs(services, &params).await,
+                "schedule.pause" => {
+                    handle_schedule_mutation(services, &params, "schedule.pause", "schedule_pause")
+                        .await
+                }
+                "schedule.resume" => {
+                    handle_schedule_mutation(
+                        services,
+                        &params,
+                        "schedule.resume",
+                        "schedule_resume",
+                    )
+                    .await
+                }
+                "schedule.cancel" => {
+                    handle_schedule_mutation(
+                        services,
+                        &params,
+                        "schedule.cancel",
+                        "schedule_cancel",
+                    )
+                    .await
+                }
+                "schedule.run_now" => {
+                    handle_schedule_mutation(
+                        services,
+                        &params,
+                        "schedule.run_now",
+                        "schedule_run_now",
+                    )
+                    .await
+                }
+                "goal.status" => handle_goal_status(services, &params).await,
                 // Artifact persistence commands
                 "artifact.get" => handle_artifact_get(session_manager, &params).await,
                 "artifact.list" => handle_artifact_list(session_manager, &params).await,
@@ -7692,6 +7734,332 @@ async fn handle_session_pin(
                 }
             })
         }
+    }
+}
+
+/// Handle schedule.list command.
+///
+/// `{}` -> `{ schedules: [...schedule_list-tool-shaped rows], has_pending_work }`.
+/// Marshals through `execute_schedule_tool("schedule_list", ...)` (the same
+/// dispatcher the `schedule_list` LLM tool uses) rather than re-deriving the
+/// row shape here, then adds `has_pending_work` from the manager directly —
+/// the tool result doesn't carry it since no LLM tool needs it.
+async fn handle_schedule_list(
+    services: &HostServices,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let Some(mgr) = services.schedule_manager.as_ref() else {
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "schedule.list",
+                "success": false,
+                "error": {
+                    "code": "SCHEDULE_MANAGER_UNAVAILABLE",
+                    "message": "ScheduleManager not configured"
+                }
+            }
+        });
+    };
+
+    let ctx = crate::schedules::ScheduleToolContext {
+        session_id: params
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        is_unattended: false,
+    };
+
+    match crate::schedules::execute_schedule_tool(
+        "schedule_list",
+        &serde_json::json!({}),
+        &ctx,
+        mgr,
+    )
+    .await
+    {
+        Ok(schedules) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "schedule.list",
+                "success": true,
+                "data": {
+                    "schedules": schedules,
+                    "has_pending_work": mgr.has_pending_work()
+                }
+            }
+        }),
+        Err(e) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "schedule.list",
+                "success": false,
+                "error": {
+                    "code": "SCHEDULE_ERROR",
+                    "message": e
+                }
+            }
+        }),
+    }
+}
+
+/// Handle schedule.runs command.
+///
+/// `{ schedule_id, limit? = 20 }` -> `{ runs: [...] }`. `final_text` is
+/// deliberately excluded (same as the `schedule_runs` LLM tool) — history is
+/// for browsing, not for re-consuming the last run's full output.
+async fn handle_schedule_runs(
+    services: &HostServices,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let schedule_id = match params.get("schedule_id").and_then(|s| s.as_str()) {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "schedule.runs",
+                    "success": false,
+                    "error": {
+                        "code": "MISSING_PARAM",
+                        "message": "Missing or empty schedule_id parameter"
+                    }
+                }
+            });
+        }
+    };
+
+    let Some(mgr) = services.schedule_manager.as_ref() else {
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "schedule.runs",
+                "success": false,
+                "error": {
+                    "code": "SCHEDULE_MANAGER_UNAVAILABLE",
+                    "message": "ScheduleManager not configured"
+                }
+            }
+        });
+    };
+
+    let ctx = crate::schedules::ScheduleToolContext {
+        session_id: params
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        is_unattended: false,
+    };
+    let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
+    let args = serde_json::json!({ "schedule_id": schedule_id, "limit": limit });
+
+    match crate::schedules::execute_schedule_tool("schedule_runs", &args, &ctx, mgr).await {
+        Ok(runs) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "schedule.runs",
+                "success": true,
+                "data": { "runs": runs }
+            }
+        }),
+        Err(e) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "schedule.runs",
+                "success": false,
+                "error": {
+                    "code": "SCHEDULE_ERROR",
+                    "message": e
+                }
+            }
+        }),
+    }
+}
+
+/// Handle schedule.pause / schedule.resume / schedule.cancel /
+/// schedule.run_now commands.
+///
+/// All four take a single `{ schedule_id }` param and are thin wrappers over
+/// `execute_schedule_tool`; only the system_command name (`command`, used for
+/// the envelope's `command` field) and the underlying tool name
+/// (`tool_name`, one of `schedule_pause`/`schedule_resume`/`schedule_cancel`/
+/// `schedule_run_now`) differ, so they share this implementation.
+async fn handle_schedule_mutation(
+    services: &HostServices,
+    params: &serde_json::Value,
+    command: &str,
+    tool_name: &str,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let schedule_id = match params.get("schedule_id").and_then(|s| s.as_str()) {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": command,
+                    "success": false,
+                    "error": {
+                        "code": "MISSING_PARAM",
+                        "message": "Missing or empty schedule_id parameter"
+                    }
+                }
+            });
+        }
+    };
+
+    let Some(mgr) = services.schedule_manager.as_ref() else {
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": command,
+                "success": false,
+                "error": {
+                    "code": "SCHEDULE_MANAGER_UNAVAILABLE",
+                    "message": "ScheduleManager not configured"
+                }
+            }
+        });
+    };
+
+    let ctx = crate::schedules::ScheduleToolContext {
+        session_id: params
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        is_unattended: false,
+    };
+    let args = serde_json::json!({ "schedule_id": schedule_id });
+
+    match crate::schedules::execute_schedule_tool(tool_name, &args, &ctx, mgr).await {
+        Ok(data) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": command,
+                "success": true,
+                "data": data
+            }
+        }),
+        Err(e) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": command,
+                "success": false,
+                "error": {
+                    "code": "SCHEDULE_ERROR",
+                    "message": e
+                }
+            }
+        }),
+    }
+}
+
+/// Handle goal.status command.
+///
+/// `{ session_id }` -> the `goal_status` LLM tool's status JSON
+/// (`{"status":"none"}` when the session has never had a goal, else the full
+/// goal record). `session_id` is required — unlike the `goal_status` LLM
+/// tool (which reads it from the calling session's `HostFunctions`), this is
+/// a session-scoped UI query with no implicit session context, so it must be
+/// supplied explicitly, mirroring `session.resolve`/`session.pin`.
+async fn handle_goal_status(
+    services: &HostServices,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let session_id = match params.get("session_id").and_then(|s| s.as_str()) {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "goal.status",
+                    "success": false,
+                    "error": {
+                        "code": "MISSING_PARAM",
+                        "message": "Missing or empty session_id parameter"
+                    }
+                }
+            });
+        }
+    };
+
+    let Some(mgr) = services.goal_manager.as_ref() else {
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "goal.status",
+                "success": false,
+                "error": {
+                    "code": "GOAL_MANAGER_UNAVAILABLE",
+                    "message": "GoalManager not configured"
+                }
+            }
+        });
+    };
+
+    match crate::goals::execute_goal_tool("goal_status", &serde_json::json!({}), session_id, mgr)
+        .await
+    {
+        Ok(status) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "goal.status",
+                "success": true,
+                "data": status
+            }
+        }),
+        Err(e) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "goal.status",
+                "success": false,
+                "error": {
+                    "code": "GOAL_ERROR",
+                    "message": e
+                }
+            }
+        }),
     }
 }
 
@@ -11025,6 +11393,211 @@ mod tests {
             !section.contains("verify before acting"),
             "Should not have freshness warning, got: {}",
             section
+        );
+    }
+
+    // ---- Task 5.0: schedule.*/goal.status system_command handlers --------
+    //
+    // `handle_chat_message` (the fn housing the `system_command` dispatch
+    // match) has no existing test harness — building one needs a full
+    // `SessionManager` + wired proxy plumbing unrelated to this task. These
+    // tests instead exercise the new arm handlers directly (same approach
+    // `brain_rpc`'s tests use for its arms), covering both the
+    // manager-absent error path and — with real `ScheduleManager` /
+    // `GoalManager` instances, mirroring `schedules::tools` /
+    // `goals::tools`'s own test fixtures — the happy path end to end.
+
+    fn schedule_test_db() -> nevoflux_storage::Database {
+        nevoflux_storage::Database::open_in_memory().unwrap()
+    }
+
+    fn base_schedule_args() -> crate::schedules::manager::CreateScheduleArgs {
+        crate::schedules::manager::CreateScheduleArgs {
+            creator_session_id: None,
+            name: "nightly report".into(),
+            cron_expr: Some("0 9 * * *".into()),
+            at_ts: None,
+            prompt_text: Some("generate the nightly report".into()),
+            wrapped_skill: None,
+            mode: AgentMode::Chat,
+            browser_policy: "none".into(),
+            on_unavailable: None,
+            headless_profile: None,
+            catch_up: false,
+            goal_condition: None,
+            goal_max_turns: None,
+            max_tokens_per_run: None,
+            evaluator_model: None,
+            evaluator_provider: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_list_errors_when_manager_unavailable() {
+        let services = HostServices::new(Arc::new(schedule_test_db()));
+        let resp =
+            handle_schedule_list(&services, &serde_json::json!({ "request_id": "r1" })).await;
+        assert_eq!(resp["type"], "system_response");
+        assert_eq!(resp["payload"]["request_id"], "r1");
+        assert_eq!(resp["payload"]["command"], "schedule.list");
+        assert_eq!(resp["payload"]["success"], false);
+        assert_eq!(
+            resp["payload"]["error"]["code"],
+            "SCHEDULE_MANAGER_UNAVAILABLE"
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_runs_missing_schedule_id_is_missing_param() {
+        let services = HostServices::new(Arc::new(schedule_test_db()));
+        let resp =
+            handle_schedule_runs(&services, &serde_json::json!({ "request_id": "r2" })).await;
+        assert_eq!(resp["payload"]["success"], false);
+        assert_eq!(resp["payload"]["command"], "schedule.runs");
+        assert_eq!(resp["payload"]["error"]["code"], "MISSING_PARAM");
+    }
+
+    #[tokio::test]
+    async fn schedule_mutation_missing_schedule_id_is_missing_param() {
+        let services = HostServices::new(Arc::new(schedule_test_db()));
+        let resp = handle_schedule_mutation(
+            &services,
+            &serde_json::json!({ "request_id": "r3" }),
+            "schedule.pause",
+            "schedule_pause",
+        )
+        .await;
+        assert_eq!(resp["payload"]["success"], false);
+        assert_eq!(resp["payload"]["command"], "schedule.pause");
+        assert_eq!(resp["payload"]["error"]["code"], "MISSING_PARAM");
+    }
+
+    #[tokio::test]
+    async fn schedule_mutation_errors_when_manager_unavailable() {
+        let services = HostServices::new(Arc::new(schedule_test_db()));
+        let resp = handle_schedule_mutation(
+            &services,
+            &serde_json::json!({ "request_id": "r4", "schedule_id": "sched-1" }),
+            "schedule.cancel",
+            "schedule_cancel",
+        )
+        .await;
+        assert_eq!(resp["payload"]["success"], false);
+        assert_eq!(resp["payload"]["command"], "schedule.cancel");
+        assert_eq!(
+            resp["payload"]["error"]["code"],
+            "SCHEDULE_MANAGER_UNAVAILABLE"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_status_missing_session_id_is_missing_param() {
+        let services = HostServices::new(Arc::new(schedule_test_db()));
+        let resp = handle_goal_status(&services, &serde_json::json!({ "request_id": "r5" })).await;
+        assert_eq!(resp["payload"]["success"], false);
+        assert_eq!(resp["payload"]["command"], "goal.status");
+        assert_eq!(resp["payload"]["error"]["code"], "MISSING_PARAM");
+    }
+
+    #[tokio::test]
+    async fn goal_status_errors_when_manager_unavailable() {
+        let services = HostServices::new(Arc::new(schedule_test_db()));
+        let resp = handle_goal_status(
+            &services,
+            &serde_json::json!({ "request_id": "r6", "session_id": "s1" }),
+        )
+        .await;
+        assert_eq!(resp["payload"]["success"], false);
+        assert_eq!(resp["payload"]["command"], "goal.status");
+        assert_eq!(resp["payload"]["error"]["code"], "GOAL_MANAGER_UNAVAILABLE");
+    }
+
+    #[tokio::test]
+    async fn schedule_list_and_pause_resume_roundtrip_via_system_command_handlers() {
+        let db = schedule_test_db();
+        let mgr = crate::schedules::ScheduleManager::start_with_bus(db.clone(), None, None);
+        let services = HostServices::new(Arc::new(db.clone())).with_schedule_manager(mgr.clone());
+
+        let id = mgr.create(base_schedule_args()).await.unwrap().0;
+
+        let listed =
+            handle_schedule_list(&services, &serde_json::json!({ "request_id": "r7" })).await;
+        assert_eq!(listed["payload"]["success"], true);
+        let schedules = listed["payload"]["data"]["schedules"].as_array().unwrap();
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0]["schedule_id"], id);
+        // A freshly-created cron schedule is immediately pending (armed for
+        // its next fire), so has_pending_work must reflect that.
+        assert_eq!(listed["payload"]["data"]["has_pending_work"], true);
+
+        let paused = handle_schedule_mutation(
+            &services,
+            &serde_json::json!({ "request_id": "r8", "schedule_id": id }),
+            "schedule.pause",
+            "schedule_pause",
+        )
+        .await;
+        assert_eq!(paused["payload"]["success"], true);
+        assert_eq!(paused["payload"]["data"]["status"], "paused");
+
+        let resumed = handle_schedule_mutation(
+            &services,
+            &serde_json::json!({ "request_id": "r9", "schedule_id": id }),
+            "schedule.resume",
+            "schedule_resume",
+        )
+        .await;
+        assert_eq!(resumed["payload"]["success"], true);
+        assert_eq!(resumed["payload"]["data"]["status"], "active");
+
+        let runs = handle_schedule_runs(
+            &services,
+            &serde_json::json!({ "request_id": "r10", "schedule_id": id }),
+        )
+        .await;
+        assert_eq!(runs["payload"]["success"], true);
+        assert_eq!(runs["payload"]["data"]["runs"], serde_json::json!([]));
+
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn goal_status_none_then_active_via_system_command_handler() {
+        let db = schedule_test_db();
+        nevoflux_storage::repositories::SessionRepository::new(&db)
+            .create(nevoflux_storage::CreateSessionParams::new().with_id("s1"))
+            .unwrap();
+
+        let mut cfg = AgentConfig::default();
+        cfg.llm.provider = Some("anthropic".to_string());
+        cfg.llm.anthropic.api_key = Some("sk-ant-test".to_string());
+        cfg.llm.anthropic.model = Some("claude-haiku-4-5".to_string());
+
+        let mgr = crate::goals::GoalManager::new(db.clone(), None, Arc::new(cfg));
+        let services = HostServices::new(Arc::new(db.clone())).with_goal_manager(mgr.clone());
+
+        let none_status = handle_goal_status(
+            &services,
+            &serde_json::json!({ "request_id": "r11", "session_id": "s1" }),
+        )
+        .await;
+        assert_eq!(none_status["payload"]["success"], true);
+        assert_eq!(none_status["payload"]["data"]["status"], "none");
+
+        mgr.set("s1", "the task is done", None, None, None)
+            .await
+            .unwrap();
+
+        let active_status = handle_goal_status(
+            &services,
+            &serde_json::json!({ "request_id": "r12", "session_id": "s1" }),
+        )
+        .await;
+        assert_eq!(active_status["payload"]["success"], true);
+        assert_eq!(active_status["payload"]["data"]["status"], "active");
+        assert_eq!(
+            active_status["payload"]["data"]["condition"],
+            "the task is done"
         );
     }
 }
