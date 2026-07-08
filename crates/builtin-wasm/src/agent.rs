@@ -694,7 +694,12 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
 </CRITICAL_INSTRUCTIONS>
 
 {}"#,
-                    skill.name, skill.name, skill.base_path, skill.content, files_section, base_prompt
+                    skill.name,
+                    skill.name,
+                    skill.base_path,
+                    skill.content,
+                    files_section,
+                    base_prompt
                 )
             }
             None => base_prompt,
@@ -2359,6 +2364,32 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             "loop_scratchpad_set" => self.host.tool_loop_scratchpad_set(
                 &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
             )?,
+            // /schedule skill tools — direct-API dispatch (Anthropic / OpenAI
+            // direct providers). The MCP/ACP path goes through
+            // `mcp_tool_executor::execute_mcp_tool::schedule_*`.
+            "schedule_create" => self.host.tool_schedule_create(
+                &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
+            )?,
+            "schedule_list" => self.host.tool_schedule_list()?,
+            "schedule_cancel" => {
+                let schedule_id = tool_call.arguments["schedule_id"].as_str().unwrap_or("");
+                self.host.tool_schedule_cancel(schedule_id)?
+            }
+            "schedule_pause" => {
+                let schedule_id = tool_call.arguments["schedule_id"].as_str().unwrap_or("");
+                self.host.tool_schedule_pause(schedule_id)?
+            }
+            "schedule_resume" => {
+                let schedule_id = tool_call.arguments["schedule_id"].as_str().unwrap_or("");
+                self.host.tool_schedule_resume(schedule_id)?
+            }
+            "schedule_run_now" => {
+                let schedule_id = tool_call.arguments["schedule_id"].as_str().unwrap_or("");
+                self.host.tool_schedule_run_now(schedule_id)?
+            }
+            "schedule_runs" => self.host.tool_schedule_runs(
+                &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
+            )?,
             // Record & Replay (agent mode) — daemon-orchestrated via
             // tool_call_dynamic (mirrors the browser_input dispatch pattern).
             // The MCP/ACP path handles these in mcp_tool_executor instead.
@@ -2446,6 +2477,13 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 | "loop_cancel"
                 | "loop_scratchpad_get"
                 | "loop_scratchpad_set"
+                | "schedule_create"
+                | "schedule_list"
+                | "schedule_cancel"
+                | "schedule_pause"
+                | "schedule_resume"
+                | "schedule_run_now"
+                | "schedule_runs"
         ) || name.starts_with("computer_")
             || name.starts_with("browser_")
     }
@@ -3573,6 +3611,99 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     "type": "object",
                     "properties": { "content": { "type": "string" } },
                     "required": ["content"]
+                }),
+            },
+            // /schedule skill tools (Task 1.6).
+            ToolDefinition {
+                name: "schedule_create".into(),
+                description: "Create a recurring or one-off background job (routines-style). Minimum cadence is 1 hour — for anything sub-hourly use the loop_* tools instead. Browser policy: 'none' (default, no browser needed) / 'headless' (background web or login tasks) / 'live' (only when the run needs the user's CURRENT window/tab state — it borrows their visible browser). Always confirm the schedule's name and a human-readable cadence (e.g. 'every day at 9am') with the user before calling this.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "short human-readable name for the schedule" },
+                        "cron": { "type": "string", "description": "5-field cron expression, e.g. '0 9 * * *' — XOR with at. Minimum 1h between fires." },
+                        "at": { "type": "string", "description": "one-off fire time: RFC3339 with offset, or unix seconds — XOR with cron" },
+                        "prompt_text": { "type": "string", "description": "raw prompt re-issued each fire — XOR with wrapped_skill" },
+                        "wrapped_skill": {
+                            "type": "string",
+                            "description": "JSON-stringified `{name, args}` blob — XOR with prompt_text. Call JSON.stringify before passing."
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["chat", "browser", "agent"],
+                            "description": "Agent mode for the run. Default 'chat'."
+                        },
+                        "browser": {
+                            "type": "string",
+                            "enum": ["none", "live", "headless"],
+                            "description": "Browser policy for the run. Default 'none'."
+                        },
+                        "on_unavailable": {
+                            "type": "string",
+                            "enum": ["defer", "skip"],
+                            "description": "What to do if the required browser isn't available at fire time."
+                        },
+                        "headless_profile": { "type": "string", "description": "named headless browser profile to use" },
+                        "catch_up": { "type": "boolean", "description": "fire once on next boot if the daemon was offline at the scheduled time. Default false." },
+                        "goal_condition": { "type": "string", "description": "natural-language success condition; takes effect in goal-enabled runs (inert until the goal engine ships)" },
+                        "goal_max_turns": { "type": "integer", "description": "max turns for goal-enabled runs (inert until the goal engine ships)" },
+                        "max_tokens_per_run": { "type": "integer", "description": "token budget per run" },
+                        "evaluator_model": { "type": "string", "description": "model id used to evaluate goal_condition (inert until the goal engine ships)" }
+                    },
+                    "required": ["name"]
+                }),
+            },
+            ToolDefinition {
+                name: "schedule_list".into(),
+                description: "List all schedules (any status: active, paused, ran, cancelled).".into(),
+                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            },
+            ToolDefinition {
+                name: "schedule_cancel".into(),
+                description: "Cancel a schedule permanently (terminal state).".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "schedule_id": { "type": "string" } },
+                    "required": ["schedule_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "schedule_pause".into(),
+                description: "Pause an active schedule so it stops firing until resumed.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "schedule_id": { "type": "string" } },
+                    "required": ["schedule_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "schedule_resume".into(),
+                description: "Resume a paused schedule, recomputing its next fire time from now.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "schedule_id": { "type": "string" } },
+                    "required": ["schedule_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "schedule_run_now".into(),
+                description: "Fire a schedule immediately, out of band, without disturbing its normal cadence.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "schedule_id": { "type": "string" } },
+                    "required": ["schedule_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "schedule_runs".into(),
+                description: "List recent run history for a schedule (status, timing, errors — not the full output text).".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "schedule_id": { "type": "string" },
+                        "limit": { "type": "integer", "description": "max rows to return, default 20, max 100" }
+                    },
+                    "required": ["schedule_id"]
                 }),
             },
         ];

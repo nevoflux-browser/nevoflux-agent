@@ -317,6 +317,9 @@ pub async fn execute_mcp_tool(
                 "loop_create is forbidden inside /loop iterations (no nested loops)".to_string(),
             );
         }
+        if name == "schedule_create" {
+            return Err("schedule_create is not available inside unattended runs".to_string());
+        }
     }
 
     // 0'. gbrain knowledge-base tools (M3-4).
@@ -558,6 +561,48 @@ pub async fn execute_mcp_tool(
             services.database.as_ref(),
         )
         .await;
+        return match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(e),
+        };
+    }
+
+    // 6''. /schedule skill tools (Task 1.6).
+    //
+    // Dispatched via `crate::schedules::execute_schedule_tool`. ACP-bridge
+    // providers (claude-code, gemini-cli, kimi, openclaw) reach this branch
+    // through the MCP HTTP bridge; direct-API providers reach the same
+    // dispatcher through `agent_host.rs`'s `tool_schedule_*` methods, which
+    // call the identical `execute_schedule_tool` dispatcher — only the
+    // surface differs, mirroring the /loop wiring above.
+    //
+    // Requires `services.schedule_manager` to be set at daemon startup;
+    // until then tool calls surface a clear error.
+    if matches!(
+        name,
+        "schedule_create"
+            | "schedule_list"
+            | "schedule_cancel"
+            | "schedule_pause"
+            | "schedule_resume"
+            | "schedule_run_now"
+            | "schedule_runs"
+    ) {
+        let mgr = match services.schedule_manager.as_ref() {
+            Some(m) => m,
+            None => {
+                return Err(
+                    "/schedule tools are not available — daemon was started without a ScheduleManager"
+                        .to_string(),
+                );
+            }
+        };
+        let ctx = crate::schedules::ScheduleToolContext {
+            session_id: services.session_id.clone(),
+            is_unattended: services.is_iteration,
+        };
+        let result =
+            crate::schedules::execute_schedule_tool(name, arguments, &ctx, mgr.as_ref()).await;
         return match result {
             Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
             Err(e) => Err(e),

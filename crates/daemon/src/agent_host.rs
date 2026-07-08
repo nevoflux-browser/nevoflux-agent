@@ -5298,6 +5298,266 @@ impl HostFunctions for DaemonHostFunctions {
             }),
         }
     }
+
+    // =========================================================================
+    // /schedule skill tool functions (Task 1.6) — direct-API surface.
+    //
+    // Mirrors the /loop wiring immediately above: direct-API providers
+    // (Anthropic / OpenAI) reach the `schedule_*` family through
+    // `Agent::execute_tool` in builtin-wasm, which calls these host
+    // functions. ACP-bridge providers take the parallel path through
+    // `mcp_tool_executor::execute_mcp_tool` and call
+    // `crate::schedules::execute_schedule_tool` directly. Both paths share
+    // the same dispatcher; only the surface differs.
+    //
+    // All seven methods are sync (HostFunctions is sync) but
+    // `execute_schedule_tool` is async, so we use the same
+    // `tokio::task::block_in_place(|| runtime.block_on(...))` pattern as
+    // `tool_loop_*` / `llm_chat` to avoid panicking when called from inside
+    // a Tokio runtime.
+    //
+    // `is_unattended: false` here: direct-API HostFunctions never runs
+    // inside an unattended run (schedule fire / loop iteration) — those go
+    // through `agent_exec::run_agent_once` with a dedicated HostServices
+    // clone in a separate context, not through this main-session host.
+    // =========================================================================
+
+    fn tool_schedule_create(&self, args_json: &str) -> HostResult<String> {
+        let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| HostError {
+            code: 4,
+            message: format!("invalid args JSON: {e}"),
+        })?;
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services
+            .schedule_manager
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "ScheduleManager not configured".into(),
+            })?;
+        let ctx = crate::schedules::ScheduleToolContext {
+            session_id: self.session_id.clone().unwrap_or_default(),
+            is_unattended: false,
+        };
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::schedules::execute_schedule_tool("schedule_create", &args, &ctx, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_schedule_list(&self) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services
+            .schedule_manager
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "ScheduleManager not configured".into(),
+            })?;
+        let ctx = crate::schedules::ScheduleToolContext {
+            session_id: self.session_id.clone().unwrap_or_default(),
+            is_unattended: false,
+        };
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let args = serde_json::json!({});
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::schedules::execute_schedule_tool("schedule_list", &args, &ctx, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_schedule_cancel(&self, schedule_id: &str) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services
+            .schedule_manager
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "ScheduleManager not configured".into(),
+            })?;
+        let ctx = crate::schedules::ScheduleToolContext {
+            session_id: self.session_id.clone().unwrap_or_default(),
+            is_unattended: false,
+        };
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let args = serde_json::json!({ "schedule_id": schedule_id });
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::schedules::execute_schedule_tool("schedule_cancel", &args, &ctx, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_schedule_pause(&self, schedule_id: &str) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services
+            .schedule_manager
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "ScheduleManager not configured".into(),
+            })?;
+        let ctx = crate::schedules::ScheduleToolContext {
+            session_id: self.session_id.clone().unwrap_or_default(),
+            is_unattended: false,
+        };
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let args = serde_json::json!({ "schedule_id": schedule_id });
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::schedules::execute_schedule_tool("schedule_pause", &args, &ctx, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_schedule_resume(&self, schedule_id: &str) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services
+            .schedule_manager
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "ScheduleManager not configured".into(),
+            })?;
+        let ctx = crate::schedules::ScheduleToolContext {
+            session_id: self.session_id.clone().unwrap_or_default(),
+            is_unattended: false,
+        };
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let args = serde_json::json!({ "schedule_id": schedule_id });
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::schedules::execute_schedule_tool("schedule_resume", &args, &ctx, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_schedule_run_now(&self, schedule_id: &str) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services
+            .schedule_manager
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "ScheduleManager not configured".into(),
+            })?;
+        let ctx = crate::schedules::ScheduleToolContext {
+            session_id: self.session_id.clone().unwrap_or_default(),
+            is_unattended: false,
+        };
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let args = serde_json::json!({ "schedule_id": schedule_id });
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::schedules::execute_schedule_tool("schedule_run_now", &args, &ctx, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_schedule_runs(&self, args_json: &str) -> HostResult<String> {
+        let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| HostError {
+            code: 4,
+            message: format!("invalid args JSON: {e}"),
+        })?;
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services
+            .schedule_manager
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "ScheduleManager not configured".into(),
+            })?;
+        let ctx = crate::schedules::ScheduleToolContext {
+            session_id: self.session_id.clone().unwrap_or_default(),
+            is_unattended: false,
+        };
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::schedules::execute_schedule_tool("schedule_runs", &args, &ctx, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
 }
 
 impl DaemonHostFunctions {

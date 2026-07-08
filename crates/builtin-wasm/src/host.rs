@@ -708,6 +708,72 @@ pub trait HostFunctions {
             message: "tool_loop_scratchpad_set not supported by this host".into(),
         })
     }
+
+    // =========================================================================
+    // /schedule skill tool functions (Task 1.6)
+    // =========================================================================
+
+    /// Create a `/schedule`. JSON args: {name, cron?, at?, prompt_text?,
+    /// wrapped_skill?, mode?, browser?, on_unavailable?, headless_profile?,
+    /// catch_up?, goal_condition?, goal_max_turns?, max_tokens_per_run?,
+    /// evaluator_model?}. Returns JSON {"schedule_id":"…","next_fire_at":N}.
+    /// Default impl returns Unsupported so non-daemon hosts (mocks, tests)
+    /// don't need stub code.
+    fn tool_schedule_create(&self, _args_json: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_schedule_create not supported by this host".into(),
+        })
+    }
+
+    /// List all schedules (any status). Returns JSON array.
+    fn tool_schedule_list(&self) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_schedule_list not supported by this host".into(),
+        })
+    }
+
+    /// Cancel a schedule by id. Returns JSON {"cancelled":true}.
+    fn tool_schedule_cancel(&self, _schedule_id: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_schedule_cancel not supported by this host".into(),
+        })
+    }
+
+    /// Pause an active schedule. Returns JSON {"status":"paused"}.
+    fn tool_schedule_pause(&self, _schedule_id: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_schedule_pause not supported by this host".into(),
+        })
+    }
+
+    /// Resume a paused schedule. Returns JSON {"status":"active","next_fire_at":N}.
+    fn tool_schedule_resume(&self, _schedule_id: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_schedule_resume not supported by this host".into(),
+        })
+    }
+
+    /// Fire a schedule immediately (out of band). Returns JSON {"started":true}.
+    fn tool_schedule_run_now(&self, _schedule_id: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_schedule_run_now not supported by this host".into(),
+        })
+    }
+
+    /// List recent runs for a schedule. JSON args: {schedule_id, limit?}.
+    /// Returns JSON array of run rows (final_text excluded).
+    fn tool_schedule_runs(&self, _args_json: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_schedule_runs not supported by this host".into(),
+        })
+    }
 }
 
 /// Mock host functions for testing.
