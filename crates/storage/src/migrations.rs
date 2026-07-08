@@ -67,6 +67,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "020_brain_shares",
         include_str!("migrations/020_brain_shares.sql"),
     ),
+    (
+        "021_schedules",
+        include_str!("migrations/021_schedules.sql"),
+    ),
 ];
 
 /// Run all pending migrations on the given connection.
@@ -135,9 +139,9 @@ mod tests {
         let count: i32 = conn
             .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        // 18 SQL migrations (001-012, 014, 015, 016, 017, 018, 019, 020) + 1 Rust
-        // post-migration marker (016b_composition_assets_data) = 20.
-        assert_eq!(count, 20);
+        // 19 SQL migrations (001-012, 014, 015, 016, 017, 018, 019, 020, 021) + 1 Rust
+        // post-migration marker (016b_composition_assets_data) = 21.
+        assert_eq!(count, 21);
     }
 
     #[test]
