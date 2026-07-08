@@ -1691,6 +1691,25 @@ pub async fn start_server(
     );
     services = services.with_schedule_manager(schedule_manager.clone());
 
+    // Construct the /goal skill's GoalManager and inject it into HostServices
+    // (Task 2.4). Unlike loop/schedule managers it runs NO background task —
+    // it is a thin facade over GoalRepository + the evaluator — so there is no
+    // `start_*` handle to shut down and no chicken-and-egg with `services`.
+    // The `Arc<AgentConfig>` it needs for evaluator resolution is the same one
+    // handed to `with_agent_config` above (the current live snapshot). Wiring
+    // it here (a) makes `services.goal_manager` resolve on both the direct-API
+    // (`agent_host`) and ACP (`mcp_tool_executor`) goal_* dispatch surfaces,
+    // and (b) activates the post-turn continuation hook in
+    // `handle_chat_message_streaming`.
+    let goal_manager = crate::goals::GoalManager::new(
+        db.clone(),
+        Some(event_bus.clone()),
+        agent_config.read().unwrap().clone(),
+    );
+    // No shutdown handle is retained (GoalManager owns no background task), so
+    // move the sole `Arc` straight onto services.
+    services = services.with_goal_manager(goal_manager);
+
     if let Some(retriever) = knowledge_retriever {
         services = services.with_knowledge_retriever(retriever);
     }
@@ -4559,6 +4578,97 @@ async fn load_session_history(
     }
 }
 
+/// Build the synthetic `chat_message` payload that re-enters
+/// [`handle_chat_message_streaming`] for a goal-continuation turn.
+///
+/// Pure (no I/O, no randomness) so the wire shape can be unit-tested. The
+/// `directive` is the `GoalManager::after_turn` continuation string, injected as
+/// the turn's user `content`; `mode_str` mirrors the originating turn's mode so
+/// the continuation runs in the same mode. No attachments — a continuation is a
+/// text-only nudge back into the same session.
+fn build_goal_continuation_payload(
+    directive: &str,
+    session_id: &str,
+    mode_str: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "chat_message",
+        "payload": {
+            "content": directive,
+            "session_id": session_id,
+            "mode": mode_str,
+            "attachments": [],
+        }
+    })
+}
+
+/// Fresh `request_id` for a goal-continuation turn, `goal-<uuid-simple>`.
+///
+/// The `goal-` prefix distinguishes continuation turns from user-initiated ones
+/// in logs and request tracing; the uuid keeps each continuation's streaming
+/// envelopes independently addressable.
+fn goal_continuation_request_id() -> String {
+    format!("goal-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Spawn a goal-continuation turn: re-enter [`handle_chat_message_streaming`]
+/// with `synthetic` as a fresh, detached task.
+///
+/// Deliberately a standalone **sync** fn taking owned args rather than an inline
+/// `tokio::spawn` inside `handle_chat_message_streaming`. Re-spawning in-body
+/// would make that fn's future recursively contain itself, which (a) has no
+/// finite size and (b) creates a `Send` auto-trait inference cycle — a
+/// `Box::pin` at the in-body recursion site fails to resolve `Send` (E0283)
+/// because the coercion is proven *while* the enclosing future's `Send`-ness is
+/// still being computed. Routing the re-entry through this separate fn crosses a
+/// function boundary: the caller's future only sees a synchronous `()`-returning
+/// call, so its type and `Send`-ness resolve independently, and no boxing is
+/// needed. The spawned task owning `synthetic` while its `handle_...` future
+/// borrows it is a normal self-referential async block (pinned by the runtime).
+#[allow(clippy::too_many_arguments)]
+fn spawn_goal_continuation(
+    synthetic: serde_json::Value,
+    config: Arc<AgentConfig>,
+    shared_config: SharedAgentConfig,
+    session_manager: Arc<SessionManager>,
+    services: HostServices,
+    runtime: tokio::runtime::Handle,
+    identity: Vec<u8>,
+    proxy_id: String,
+    request_id: String,
+    channel: Channel,
+    response_tx: mpsc::Sender<(Vec<u8>, DaemonEnvelope)>,
+    cancellation_registry: CancellationRegistry,
+    interrupt_registry: InterruptRegistry,
+    plan_registry: PlanRequestRegistry,
+    trace_enabled: bool,
+    extraction_registry: ExtractionRegistry,
+    canvas_video_service: Arc<crate::canvas_video::CanvasVideoService>,
+) {
+    tokio::spawn(async move {
+        handle_chat_message_streaming(
+            &synthetic,
+            &config,
+            &shared_config,
+            &session_manager,
+            &services,
+            runtime,
+            identity,
+            proxy_id,
+            request_id,
+            channel,
+            response_tx,
+            cancellation_registry,
+            interrupt_registry,
+            plan_registry,
+            trace_enabled,
+            extraction_registry,
+            canvas_video_service,
+        )
+        .await;
+    });
+}
+
 /// Handle chat channel messages with streaming support.
 ///
 /// This function processes chat messages and streams the response back to the sidebar
@@ -4676,6 +4786,15 @@ async fn handle_chat_message_streaming(
         .and_then(|m| m.as_str())
         .map(parse_agent_mode)
         .unwrap_or(AgentMode::Chat);
+    // Raw mode string, mirrored verbatim into any goal-continuation turn this
+    // turn spawns so the continuation runs in the same mode. Absent ⇒ "chat"
+    // (round-trips through `parse_agent_mode` back to `AgentMode::Chat`).
+    let mode_str = payload
+        .get("payload")
+        .and_then(|p| p.get("mode"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("chat")
+        .to_string();
 
     // Extract attachments (multimodal: images, files)
     let mut attachments: Vec<Attachment> = payload
@@ -5935,10 +6054,54 @@ async fn handle_chat_message_streaming(
                     .and_then(|p| p.get("session_title"))
                     .is_some()
             );
-            if let Err(e) = response_tx.send((identity, response)).await {
+            if let Err(e) = response_tx.send((identity.clone(), response)).await {
                 error!("Failed to send final response: {}", e);
             } else {
                 info!("Final stream_chunk queued for writer");
+            }
+
+            // ── Goal loop hook ────────────────────────────────────────────
+            // If this session has an active goal, evaluate it against the turn
+            // that just finished and, when the evaluator wants more work,
+            // re-enter this same pipeline as a fresh spawned turn carrying the
+            // continuation directive as a synthetic user message.
+            //
+            // Reached ONLY on the normal success path: the plan-proposal branch
+            // `return`s above, the non-`chat_message` branch `return`s at the
+            // top, and a cancelled turn `return`s before the `match`. So the
+            // guard chain (`msg_type == "chat_message"` && not cancelled) is
+            // already satisfied by position; the only remaining guard is that a
+            // GoalManager was wired at boot. `after_turn` increments the goal's
+            // turn count BEFORE deciding, so `max_turns` bounds total
+            // continuations even if a continuation turn later errors mid-stream;
+            // a broken evaluator fails safe to `None` and never continues.
+            if let Some(gm) = services.goal_manager.as_ref() {
+                if let Some(directive) = gm.after_turn(&session_id).await {
+                    // Re-enter the pipeline through a standalone sync fn so the
+                    // continuation crosses a function boundary — this detaches
+                    // the continuation as its own task and breaks the async
+                    // self-recursion (no `Box::pin` needed; see the fn's docs).
+                    // Every arg is a cheap Arc/Clone or Copy.
+                    spawn_goal_continuation(
+                        build_goal_continuation_payload(&directive, &session_id, &mode_str),
+                        config.clone(),
+                        shared_config.clone(),
+                        session_manager.clone(),
+                        services.clone(),
+                        runtime.clone(),
+                        identity.clone(),
+                        proxy_id.clone(),
+                        goal_continuation_request_id(),
+                        channel,
+                        response_tx.clone(),
+                        cancellation_registry.clone(),
+                        interrupt_registry.clone(),
+                        plan_registry.clone(),
+                        trace_enabled,
+                        extraction_registry.clone(),
+                        canvas_video_service.clone(),
+                    );
+                }
             }
         }
         Ok(Err(e)) => {
@@ -10108,6 +10271,53 @@ mod tests {
         assert_eq!(config.port_start, 19500);
         assert_eq!(config.port_end, 19600);
         assert_eq!(config.bind_address, "127.0.0.1");
+    }
+
+    #[test]
+    fn goal_continuation_payload_has_chat_message_shape() {
+        let v = build_goal_continuation_payload(
+            "<GOAL-CONTINUATION>\nGoal not yet met\n</GOAL-CONTINUATION>",
+            "sess-42",
+            "agent",
+        );
+        assert_eq!(v["type"], serde_json::json!("chat_message"));
+        assert_eq!(
+            v["payload"]["content"],
+            serde_json::json!("<GOAL-CONTINUATION>\nGoal not yet met\n</GOAL-CONTINUATION>")
+        );
+        assert_eq!(v["payload"]["session_id"], serde_json::json!("sess-42"));
+        // Mode is mirrored verbatim so the continuation runs in the same mode,
+        // and round-trips through parse_agent_mode.
+        assert_eq!(v["payload"]["mode"], serde_json::json!("agent"));
+        assert_eq!(
+            parse_agent_mode(v["payload"]["mode"].as_str().unwrap()),
+            AgentMode::Agent
+        );
+        // Continuations carry no attachments (text-only nudge).
+        assert_eq!(v["payload"]["attachments"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn goal_continuation_payload_mirrors_chat_mode() {
+        let v = build_goal_continuation_payload("keep going", "s1", "chat");
+        assert_eq!(v["payload"]["mode"], serde_json::json!("chat"));
+        assert_eq!(
+            parse_agent_mode(v["payload"]["mode"].as_str().unwrap()),
+            AgentMode::Chat
+        );
+    }
+
+    #[test]
+    fn goal_continuation_request_id_is_prefixed_and_fresh() {
+        let a = goal_continuation_request_id();
+        let b = goal_continuation_request_id();
+        assert!(a.starts_with("goal-"), "unexpected id: {a}");
+        assert!(b.starts_with("goal-"), "unexpected id: {b}");
+        // Fresh uuid each call so continuation turns are independently
+        // addressable.
+        assert_ne!(a, b);
+        // uuid simple form is 32 hex chars after the "goal-" prefix.
+        assert_eq!(a.len(), "goal-".len() + 32);
     }
 
     #[test]
