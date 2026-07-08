@@ -2,6 +2,7 @@
 
 pub(crate) mod artifact;
 mod config;
+pub mod goal;
 pub(crate) mod knowledge;
 pub(crate) mod learning_metrics;
 pub mod loop_record;
@@ -15,6 +16,7 @@ pub(crate) mod tool_stat;
 
 pub use artifact::{ArtifactRecord, CreateArtifactParams};
 pub use config::ConfigEntry;
+pub use goal::{GoalRecord, GoalStatus};
 pub use knowledge::{CreateKnowledgeParams, Knowledge};
 pub use learning_metrics::{CreateLearningMetricParams, LearningMetric};
 pub use loop_record::{IterationStatus, LoopIteration, LoopRecord, LoopState};

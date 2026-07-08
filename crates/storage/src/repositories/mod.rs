@@ -3,6 +3,7 @@
 mod artifact;
 pub mod composition_asset;
 mod config;
+mod goal;
 mod knowledge;
 mod learning_metrics;
 mod loop_record;
@@ -18,6 +19,7 @@ pub mod traces;
 pub use artifact::ArtifactRepository;
 pub use composition_asset::{CompositionAsset, CompositionAssetRepository};
 pub use config::ConfigRepository;
+pub use goal::GoalRepository;
 pub use knowledge::KnowledgeRepository;
 pub use learning_metrics::LearningMetricsRepository;
 pub use loop_record::LoopRepository;
