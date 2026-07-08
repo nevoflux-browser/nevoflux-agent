@@ -94,12 +94,16 @@ impl<'a> GoalRepository<'a> {
     /// The most recently created goal for a session, regardless of status —
     /// used to report `goal_status` after a goal has already resolved
     /// (achieved/expired/cleared) and is no longer "active".
+    ///
+    /// `rowid DESC` breaks ties: `created_at` has whole-second granularity,
+    /// so a same-second create-replace would otherwise be free to return
+    /// the older (cleared) goal.
     pub fn latest(&self, session_id: &str) -> Result<Option<GoalRecord>> {
         self.db.with_connection(|conn| {
             conn.query_row(
                 &format!(
                     "SELECT {GOAL_COLUMNS} FROM goals WHERE session_id = ?1
-                     ORDER BY created_at DESC LIMIT 1"
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1"
                 ),
                 params![session_id],
                 row_to_goal,
@@ -353,6 +357,30 @@ mod tests {
 
         let latest = repo.latest("sess-1").unwrap().expect("latest exists");
         assert_eq!(latest.id, "goal00002");
+    }
+
+    #[test]
+    fn latest_breaks_created_at_ties_by_insertion_order() {
+        // created_at has whole-second granularity, so a create-replace
+        // within the same second produces two rows with IDENTICAL
+        // created_at. latest() must still return the newer (active) goal,
+        // not the cleared one — the rowid DESC tiebreaker guarantees it.
+        let db = test_db();
+        seed_session(&db, "sess-1");
+        let repo = GoalRepository::new(&db);
+
+        let first = sample("goal00001", "sess-1");
+        repo.create(&first).unwrap();
+
+        let mut second = sample("goal00002", "sess-1");
+        second.condition = "the PR has been merged".to_string();
+        // Same created_at/updated_at as `first` (sample() defaults).
+        assert_eq!(second.created_at, first.created_at);
+        repo.create(&second).unwrap();
+
+        let latest = repo.latest("sess-1").unwrap().expect("latest exists");
+        assert_eq!(latest.id, "goal00002");
+        assert_eq!(latest.status, GoalStatus::Active);
     }
 
     #[test]
