@@ -34,7 +34,9 @@ use crate::schedules::runner::{self, RunResult};
 use crate::schedules::types::ScheduleId;
 use crate::wasm::services::HostServices;
 use nevoflux_storage::models::current_timestamp;
-use nevoflux_storage::models::schedule::{ScheduleRecord, ScheduleRun, ScheduleStatus};
+use nevoflux_storage::models::schedule::{
+    ScheduleRecord, ScheduleRun, ScheduleRunStatus, ScheduleStatus,
+};
 use nevoflux_storage::repositories::ScheduleRepository;
 use nevoflux_storage::Database;
 use serde_json::json;
@@ -170,14 +172,25 @@ impl Inner {
         let _ = repo.set_last_run_status(&rec.id, result.status.as_str(), now);
 
         if rec.cron_expr.is_some() {
-            // Recurring: advance to the next occurrence after `now`. If the cron
-            // can no longer produce a fire (degenerate), stop it by clearing
-            // next_fire rather than leaving a past time that would busy-loop.
-            let next = rec
-                .cron_expr
-                .as_deref()
-                .and_then(|e| cron::next_after(e, now).ok());
-            if next.is_none() {
+            // Recurring: advance to the next occurrence after `now`. Re-read the
+            // LIVE status first — `rec` is a snapshot taken at fire time, and a
+            // cancel/pause that landed mid-run must not get a future fire time
+            // written onto its (now non-active) row. `list_due` filters on
+            // status so a stale next_fire_at could never fire anyway, but we
+            // keep the row consistent. If the cron can no longer produce a fire
+            // (degenerate), clear next_fire rather than leaving a past time.
+            let still_active = matches!(
+                repo.get(&rec.id).ok().flatten().map(|r| r.status),
+                Some(ScheduleStatus::Active)
+            );
+            let next = if still_active {
+                rec.cron_expr
+                    .as_deref()
+                    .and_then(|e| cron::next_after(e, now).ok())
+            } else {
+                None
+            };
+            if still_active && next.is_none() {
                 tracing::warn!(
                     schedule_id = %rec.id,
                     "cron produced no next fire after run; clearing next_fire_at"
@@ -185,14 +198,21 @@ impl Inner {
             }
             let _ = repo.update_after_fire(&rec.id, next, now);
         } else {
-            // One-off: consumed. Clear next_fire and disable via `Ran`.
+            // One-off: consumed. run_count/last_run_at always advance (the run
+            // DID happen), but the Active → Ran transition is atomic against the
+            // LIVE database status — never the `rec` snapshot captured at fire
+            // time. A cancel/pause that landed while this run was in flight has
+            // already taken the schedule's pending_work decrement; deciding on
+            // the stale snapshot would clobber its terminal status back to Ran
+            // AND double-decrement, underflowing the counter and pinning
+            // has_pending_work() true forever. `retire_one_off` flips the row
+            // only if still active and reports whether it did, so exactly one
+            // party ever decrements for the schedule.
             let _ = repo.update_after_fire(&rec.id, None, now);
-            if rec.status == ScheduleStatus::Active {
-                let _ = repo.update_status(&rec.id, ScheduleStatus::Ran, now);
-                // Active → Ran: the schedule stops counting toward pending_work.
+            if repo.retire_one_off(&rec.id, now).unwrap_or(false) {
                 self.pending_work.fetch_sub(1, Ordering::SeqCst);
                 self.events
-                    .state_changed(&rec.id, &rec.name, "ran", rec.status.as_str(), None)
+                    .state_changed(&rec.id, &rec.name, "ran", "active", None)
                     .await;
             }
         }
@@ -518,10 +538,12 @@ impl ScheduleManager {
     }
 }
 
-/// Synchronous boot recovery (DB writes only). Sweeps orphaned run rows, loads
-/// active schedules into the pending-work counter, and detects + rearms missed
-/// fires. Returns the async work (events + catchups) to run at the tick task's
-/// head so [`ScheduleManager::start_with_bus`] can stay non-async.
+/// Synchronous boot recovery (DB writes only). Sweeps orphaned run rows,
+/// detects + rearms missed fires, retires spent/stranded one-offs, and only
+/// THEN counts the surviving active schedules into pending_work — retire
+/// decisions never touch the counter, so there is no boot-path decrement to
+/// keep balanced. Returns the async work (events + catchups) to run at the
+/// tick task's head so [`ScheduleManager::start_with_bus`] can stay non-async.
 fn boot_recover(inner: &Arc<Inner>) -> BootPlan {
     let now = current_timestamp();
     let repo = ScheduleRepository::new(&inner.db);
@@ -529,19 +551,42 @@ fn boot_recover(inner: &Arc<Inner>) -> BootPlan {
     // (1) Crash-recovery: any run row left `running` was orphaned by a restart.
     let _ = repo.sweep_orphaned_runs(now, "orphaned by daemon restart");
 
-    // (2) Load active schedules — each contributes +1 to pending_work up front;
-    // a one-off that we retire to `Ran` below subtracts its +1 again.
-    let active = repo.list_active().unwrap_or_default();
-    inner.pending_work.fetch_add(active.len(), Ordering::SeqCst);
-
     let mut plan = BootPlan {
         missed: Vec::new(),
         state_changes: Vec::new(),
         catchups: Vec::new(),
     };
 
+    // (2) Rearm/retire pass over the active set (counter untouched here).
+    let active = repo.list_active().unwrap_or_default();
     for rec in &active {
         let Some(nf) = rec.next_fire_at else {
+            // Active with no armed fire. For a one-off this means a prior daemon
+            // died between a boot catchup's next_fire clear and the catchup
+            // run's finish_fire: without intervention it would never fire again
+            // yet keep counting as pending work forever. Retire it, with a
+            // cancelled run row for operator visibility. (A cron row can only
+            // get here in a degenerate way — next_after failed at finish_fire —
+            // and is deliberately left alone.)
+            if rec.cron_expr.is_none() && repo.retire_one_off(&rec.id, now).unwrap_or(false) {
+                if let Ok(run_id) = repo.record_run_start(&rec.id, now, "catchup") {
+                    let _ = repo.record_run_end(
+                        run_id,
+                        now,
+                        ScheduleRunStatus::Cancelled,
+                        Some("stranded by prior shutdown"),
+                        None,
+                        None,
+                        None,
+                    );
+                }
+                plan.state_changes.push((
+                    rec.id.clone(),
+                    rec.name.clone(),
+                    "active".to_string(),
+                    "ran".to_string(),
+                ));
+            }
             continue;
         };
         if nf >= now {
@@ -562,23 +607,30 @@ fn boot_recover(inner: &Arc<Inner>) -> BootPlan {
             }
         } else if rec.catch_up {
             // One-off with catch_up: clear next_fire so the tick can't also fire
-            // it, keep it Active, and run it once as a catchup. The catchup run's
-            // finish_fire retires it to `Ran` (and does the pending_work -1).
+            // it, keep it Active (so it IS counted below), and run it once as a
+            // catchup. The catchup run's finish_fire retires it via
+            // retire_one_off (which pairs the pending_work -1 with the flip).
             let _ = repo.update_next_fire(&rec.id, None, now);
             plan.catchups.push(rec.id.clone());
         } else {
             // One-off, no catch_up: the moment is gone — retire to `Ran`.
             let _ = repo.update_next_fire(&rec.id, None, now);
-            let _ = repo.update_status(&rec.id, ScheduleStatus::Ran, now);
-            inner.pending_work.fetch_sub(1, Ordering::SeqCst);
-            plan.state_changes.push((
-                rec.id.clone(),
-                rec.name.clone(),
-                "active".to_string(),
-                "ran".to_string(),
-            ));
+            if repo.retire_one_off(&rec.id, now).unwrap_or(false) {
+                plan.state_changes.push((
+                    rec.id.clone(),
+                    rec.name.clone(),
+                    "active".to_string(),
+                    "ran".to_string(),
+                ));
+            }
         }
     }
+
+    // (4) Count pending work AFTER the pass: schedules retired above never
+    // enter the counter at all. Nothing can interleave — the tick task is not
+    // spawned yet and the manager handle has not been returned to callers.
+    let still_active = repo.list_active().map(|v| v.len()).unwrap_or(0);
+    inner.pending_work.fetch_add(still_active, Ordering::SeqCst);
 
     plan
 }
@@ -630,7 +682,6 @@ async fn tick_loop(inner: Arc<Inner>, mut run_rx: mpsc::Receiver<DispatchRequest
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nevoflux_storage::models::schedule::ScheduleRunStatus;
 
     fn base_args() -> CreateScheduleArgs {
         CreateScheduleArgs {
@@ -813,7 +864,7 @@ mod tests {
             .find(|r| r.id == "sch00009")
             .unwrap();
         assert_eq!(rec.status, ScheduleStatus::Ran);
-        // Loaded active (+1) then retired to Ran (-1) → no pending work.
+        // Retired during the boot pass, so it was never counted at all.
         assert!(!mgr.has_pending_work());
         let runs = mgr.runs("sch00009", 10).await.unwrap();
         assert!(runs.iter().any(|r| r.status == ScheduleRunStatus::Missed));
@@ -917,6 +968,100 @@ mod tests {
         // run_count reflects completed fires; the gate prevents a runaway count.
         let rec = mgr.list().await.unwrap().into_iter().next().unwrap();
         assert!(rec.run_count >= 1, "at least one manual fire completed");
+        mgr.shutdown().await;
+    }
+
+    /// Regression (review CRITICAL 1): a one-off cancelled while its run is in
+    /// flight must NOT be clobbered back to `Ran` by `finish_fire`'s stale
+    /// record snapshot, and pending_work must NOT be double-decremented (which
+    /// underflowed to usize::MAX and pinned has_pending_work() true forever).
+    /// The stub runner is instant, so the race window is reproduced by driving
+    /// the internals directly: snapshot the record, simulate run-start
+    /// bookkeeping, cancel, then apply finish_fire with the stale snapshot.
+    #[tokio::test]
+    async fn cancel_mid_run_does_not_double_decrement_one_off() {
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let counter = mgr.pending_work_handle();
+
+        let mut args = base_args();
+        args.cron_expr = None;
+        args.at_ts = Some(current_timestamp() + 100_000);
+        let id = mgr.create(args).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "active one-off → 1");
+
+        // Fire time: run_one snapshots the record...
+        let stale_rec = ScheduleRepository::new(&db).get(&id.0).unwrap().unwrap();
+        assert_eq!(stale_rec.status, ScheduleStatus::Active);
+        // ...takes the concurrency slot and counts the in-flight run.
+        mgr.inner.running.lock().await.insert(id.0.clone());
+        mgr.inner.pending_work.fetch_add(1, Ordering::SeqCst);
+        let run_id = ScheduleRepository::new(&db)
+            .record_run_start(&id.0, current_timestamp(), "manual")
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "active + in-flight");
+
+        // User cancels mid-run: sees Active, takes the schedule's decrement.
+        mgr.cancel(&id.0).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "in-flight run only");
+
+        // Run completes with the STALE snapshot (status still Active in it).
+        let result = RunResult {
+            run_id,
+            ok: true,
+            status: ScheduleRunStatus::Ok,
+            error: None,
+            final_text: None,
+        };
+        mgr.inner.finish_fire(&stale_rec, &result).await;
+        mgr.inner.cleanup_run(&id.0).await;
+
+        // Exactly zero — no double decrement, no underflow.
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "balanced at 0");
+        assert!(!mgr.has_pending_work());
+        // Terminal status not clobbered back to Ran.
+        let after = ScheduleRepository::new(&db).get(&id.0).unwrap().unwrap();
+        assert_eq!(after.status, ScheduleStatus::Cancelled);
+        mgr.shutdown().await;
+    }
+
+    /// Regression (review IMPORTANT 2): a daemon that died between a boot
+    /// catchup's next_fire clear and the catchup run's finish_fire leaves an
+    /// Active one-off with next_fire_at=NULL. The next boot must retire it
+    /// (it can never fire again) instead of counting it as pending work
+    /// forever, and record a visible cancelled run row.
+    #[tokio::test]
+    async fn boot_retires_stranded_active_one_off() {
+        let db = Database::open_in_memory().unwrap();
+        let now = current_timestamp();
+        {
+            let repo = ScheduleRepository::new(&db);
+            let mut rec = seed("sch00077", None, Some(now - 500), None);
+            rec.catch_up = true;
+            repo.create(&rec).unwrap();
+        }
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+
+        let rec = mgr
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == "sch00077")
+            .unwrap();
+        assert_eq!(rec.status, ScheduleStatus::Ran, "stranded one-off retired");
+        assert!(!mgr.has_pending_work(), "retired before counting");
+        assert_eq!(mgr.pending_work_handle().load(Ordering::SeqCst), 0);
+
+        let runs = mgr.runs("sch00077", 10).await.unwrap();
+        let stranded = runs
+            .iter()
+            .find(|r| r.status == ScheduleRunStatus::Cancelled)
+            .expect("visibility run row");
+        assert_eq!(
+            stranded.error_message.as_deref(),
+            Some("stranded by prior shutdown")
+        );
         mgr.shutdown().await;
     }
 }

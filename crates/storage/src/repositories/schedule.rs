@@ -268,6 +268,22 @@ impl<'a> ScheduleRepository<'a> {
         })
     }
 
+    /// Atomically retire a one-off schedule: `active` → `ran`, but only if it
+    /// is *still* active in the database. Returns whether a row actually
+    /// flipped, so callers can pair pending-work accounting with the real
+    /// transition: a cancel/pause that landed while the run was in flight wins
+    /// (this returns `false` and the terminal status is not clobbered).
+    pub fn retire_one_off(&self, id: &str, now: i64) -> Result<bool> {
+        self.db.with_connection(|conn| {
+            let n = conn.execute(
+                "UPDATE schedules SET status = 'ran', updated_at = ?2
+                 WHERE id = ?1 AND status = 'active'",
+                params![id, now],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
     /// Mark every still-`running` run row as cancelled. Called at daemon boot
     /// (rows left `running` by a crash are orphaned) and at shutdown (in-flight
     /// runs are torn down). `reason` is stored in `error_message`. Returns the
@@ -474,6 +490,38 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, ScheduleRunStatus::Ok);
         assert_eq!(runs[0].tokens_used, Some(1234));
+    }
+
+    #[test]
+    fn retire_one_off_only_flips_active_rows() {
+        let db = test_db();
+        let repo = ScheduleRepository::new(&db);
+        let mut rec = sample("sch00003");
+        rec.cron_expr = None;
+        rec.at_ts = Some(1_800_000_000);
+        repo.create(&rec).unwrap();
+
+        // Active → ran flips exactly once.
+        assert!(repo.retire_one_off("sch00003", 1_800_000_001).unwrap());
+        assert_eq!(
+            repo.get("sch00003").unwrap().unwrap().status,
+            ScheduleStatus::Ran
+        );
+        // Second retire is a no-op (already ran).
+        assert!(!repo.retire_one_off("sch00003", 1_800_000_002).unwrap());
+
+        // A cancelled row is never clobbered back to ran.
+        let mut rec2 = sample("sch00004");
+        rec2.cron_expr = None;
+        rec2.at_ts = Some(1_800_000_000);
+        repo.create(&rec2).unwrap();
+        repo.update_status("sch00004", ScheduleStatus::Cancelled, 1_800_000_001)
+            .unwrap();
+        assert!(!repo.retire_one_off("sch00004", 1_800_000_002).unwrap());
+        assert_eq!(
+            repo.get("sch00004").unwrap().unwrap().status,
+            ScheduleStatus::Cancelled
+        );
     }
 
     #[test]
