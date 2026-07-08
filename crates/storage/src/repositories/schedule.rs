@@ -268,6 +268,22 @@ impl<'a> ScheduleRepository<'a> {
         })
     }
 
+    /// Mark every still-`running` run row as cancelled. Called at daemon boot
+    /// (rows left `running` by a crash are orphaned) and at shutdown (in-flight
+    /// runs are torn down). `reason` is stored in `error_message`. Returns the
+    /// number of rows swept.
+    pub fn sweep_orphaned_runs(&self, now: i64, reason: &str) -> Result<usize> {
+        self.db.with_connection(|conn| {
+            let n = conn.execute(
+                "UPDATE schedule_runs
+                 SET status = 'cancelled', ended_at = ?1, error_message = ?2
+                 WHERE status = 'running'",
+                params![now, reason],
+            )?;
+            Ok(n)
+        })
+    }
+
     pub fn list_runs(&self, schedule_id: &str, limit: i64) -> Result<Vec<ScheduleRun>> {
         self.db.with_connection(|conn| {
             let mut stmt = conn.prepare(

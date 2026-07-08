@@ -355,7 +355,7 @@ pub(crate) async fn build_user_message(
 /// skill registry, missing skill, parse failure). Loops should not fail
 /// outright on a bad wrapped_skill — they should surface the problem in the
 /// iteration log so the operator can fix the loop record.
-async fn materialize_wrapped_skill(
+pub(crate) async fn materialize_wrapped_skill(
     skill_json: &str,
     services: Option<&HostServices>,
 ) -> String {

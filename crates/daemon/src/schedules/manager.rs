@@ -1,0 +1,922 @@
+//! ScheduleManager — the `/schedule` (routines-style) engine.
+//!
+//! ## Engine shape (deliberately unlike `/loop`)
+//!
+//! `/loop` spawns one sleeping timer task per loop. Schedules instead run a
+//! **single** tick task on a 30s [`tokio::time::interval`] with
+//! [`MissedTickBehavior::Delay`]. Every tick calls
+//! [`ScheduleRepository::list_due`] and dispatches each due schedule. This is
+//! robust to system sleep and wall-clock jumps (a laptop that slept through a
+//! fire wakes up, sees `next_fire_at <= now`, and fires once) and, at a 1h
+//! minimum cadence, a 30s poll is negligible load. `run_now` funnels a manual
+//! fire through the same dispatch via an mpsc channel.
+//!
+//! ## Idle inhibitor
+//!
+//! [`ScheduleManager::pending_work`] counts **active schedules + in-flight
+//! runs**. The managed-mode idle-suicide guard consults
+//! [`ScheduleManager::has_pending_work`] so the daemon does not terminate while
+//! a schedule could still fire (active) or is mid-run. Paused / ran / cancelled
+//! schedules do *not* count — a paused schedule will never fire, so it does not
+//! need to keep the daemon alive; resuming re-arms the counter.
+//!
+//! ## Divergence from `/loop`: no 3-strike auto-cancel
+//!
+//! Loops self-cancel after 3 consecutive failures. Schedules do **not**: a
+//! recurring job (e.g. a nightly report) should keep trying on transient
+//! failures; failure visibility comes from the UI badge
+//! (`last_run_status` / `consecutive_failures`), not teardown.
+
+use crate::event_bus::EventBus;
+use crate::schedules::cron;
+use crate::schedules::events::ScheduleEvents;
+use crate::schedules::runner::{self, RunResult};
+use crate::schedules::types::ScheduleId;
+use crate::wasm::services::HostServices;
+use nevoflux_storage::models::current_timestamp;
+use nevoflux_storage::models::schedule::{ScheduleRecord, ScheduleRun, ScheduleStatus};
+use nevoflux_storage::repositories::ScheduleRepository;
+use nevoflux_storage::Database;
+use serde_json::json;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
+use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
+
+/// Poll cadence for the due-tick engine.
+const TICK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Validated argument bundle for [`ScheduleManager::create`]. Field names and
+/// types are binding — the `/schedule` tool + server layers construct this
+/// verbatim.
+#[derive(Debug, Clone)]
+pub struct CreateScheduleArgs {
+    pub creator_session_id: Option<String>,
+    pub name: String,
+    /// Cron expression (XOR with `at_ts`).
+    pub cron_expr: Option<String>,
+    /// One-off fire time as unix seconds (XOR with `cron_expr`).
+    pub at_ts: Option<i64>,
+    /// Prompt body (XOR with `wrapped_skill`).
+    pub prompt_text: Option<String>,
+    /// Wrapped-skill JSON `{name, args}` (XOR with `prompt_text`).
+    pub wrapped_skill: Option<String>,
+    pub mode: nevoflux_builtin_wasm::AgentMode,
+    /// `"none" | "live" | "headless"` (validated).
+    pub browser_policy: String,
+    /// `"defer" | "skip"` when set (validated). Acted on in P4.
+    pub on_unavailable: Option<String>,
+    pub headless_profile: Option<String>,
+    pub catch_up: bool,
+    /// Stored in P1, evaluated in P3.
+    pub goal_condition: Option<String>,
+    pub goal_max_turns: Option<i64>,
+    pub max_tokens_per_run: Option<i64>,
+    pub evaluator_model: Option<String>,
+}
+
+/// A dispatch request funneled through the mpsc channel into the tick task
+/// (used by `run_now`; the tick branch dispatches `scheduled` fires directly).
+struct DispatchRequest {
+    id: String,
+    fire_kind: String,
+}
+
+/// Shared state cloned into the tick task and every spawned run.
+struct Inner {
+    db: Database,
+    events: ScheduleEvents,
+    /// Live host services for production runs; `None` ⇒ stub run path.
+    services: Option<HostServices>,
+    /// Schedule ids with a run in flight — the concurrency gate (one run per
+    /// schedule at a time; tick and `run_now` both consult it).
+    running: Mutex<HashSet<String>>,
+    /// Active schedules + in-flight runs. See the module-level idle-inhibitor
+    /// note for the exact transitions.
+    pending_work: Arc<AtomicUsize>,
+}
+
+impl Inner {
+    /// Spawn a detached task to run schedule `id` once. The running-set gate is
+    /// re-checked inside the task, so a duplicate dispatch (tick racing a
+    /// `run_now`) is a no-op rather than a double fire.
+    fn spawn_run(self: &Arc<Self>, id: String, fire_kind: String) {
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            inner.run_one(id, fire_kind).await;
+        });
+    }
+
+    async fn run_one(self: Arc<Self>, id: String, fire_kind: String) {
+        // Concurrency gate: skip if a run for this schedule is already in
+        // flight. A manual `run_now` that lands here mid-run is a silent no-op
+        // (documented: `run_now` still returns `Ok`).
+        {
+            let mut running = self.running.lock().await;
+            if running.contains(&id) {
+                return;
+            }
+            running.insert(id.clone());
+        }
+        // Run start: +1 in-flight.
+        self.pending_work.fetch_add(1, Ordering::SeqCst);
+        self.emit_snapshot().await;
+
+        let rec = match ScheduleRepository::new(&self.db).get(&id) {
+            Ok(Some(r)) => r,
+            _ => {
+                self.cleanup_run(&id).await;
+                return;
+            }
+        };
+        // Only fire active schedules. `list_due` already filters to active, but
+        // a manual/catchup fire could target a schedule paused/cancelled in the
+        // meantime; skip those without touching the active-schedule counter.
+        if rec.status != ScheduleStatus::Active {
+            self.cleanup_run(&id).await;
+            return;
+        }
+
+        let result =
+            runner::execute_run(&self.services, &self.events, &self.db, &rec, &fire_kind).await;
+        self.finish_fire(&rec, &result).await;
+        self.cleanup_run(&id).await;
+    }
+
+    /// Release the concurrency slot and account the run's end (-1 in-flight).
+    /// Paired with the `+1` in [`Self::run_one`]; the early "already running"
+    /// return happens *before* that `+1`, so it must not reach here.
+    async fn cleanup_run(self: &Arc<Self>, id: &str) {
+        self.running.lock().await.remove(id);
+        self.pending_work.fetch_sub(1, Ordering::SeqCst);
+        self.emit_snapshot().await;
+    }
+
+    /// Apply post-fire bookkeeping: failure counting, `last_run_status`, the
+    /// next-fire recomputation, and the one-off `Active → Ran` transition.
+    async fn finish_fire(&self, rec: &ScheduleRecord, result: &RunResult) {
+        let now = current_timestamp();
+        let repo = ScheduleRepository::new(&self.db);
+
+        // Failure bookkeeping mirrors loops (reset on ok, bump on error) but
+        // there is NO 3-strike auto-cancel — see the module-level note.
+        if result.ok {
+            let _ = repo.set_consecutive_failures(&rec.id, 0, now);
+        } else {
+            let _ = repo.set_consecutive_failures(&rec.id, rec.consecutive_failures + 1, now);
+        }
+        let _ = repo.set_last_run_status(&rec.id, result.status.as_str(), now);
+
+        if rec.cron_expr.is_some() {
+            // Recurring: advance to the next occurrence after `now`. If the cron
+            // can no longer produce a fire (degenerate), stop it by clearing
+            // next_fire rather than leaving a past time that would busy-loop.
+            let next = rec
+                .cron_expr
+                .as_deref()
+                .and_then(|e| cron::next_after(e, now).ok());
+            if next.is_none() {
+                tracing::warn!(
+                    schedule_id = %rec.id,
+                    "cron produced no next fire after run; clearing next_fire_at"
+                );
+            }
+            let _ = repo.update_after_fire(&rec.id, next, now);
+        } else {
+            // One-off: consumed. Clear next_fire and disable via `Ran`.
+            let _ = repo.update_after_fire(&rec.id, None, now);
+            if rec.status == ScheduleStatus::Active {
+                let _ = repo.update_status(&rec.id, ScheduleStatus::Ran, now);
+                // Active → Ran: the schedule stops counting toward pending_work.
+                self.pending_work.fetch_sub(1, Ordering::SeqCst);
+                self.events
+                    .state_changed(&rec.id, &rec.name, "ran", rec.status.as_str(), None)
+                    .await;
+            }
+        }
+    }
+
+    /// Publish the sticky aggregate snapshot the sidebar's `/schedule` icon
+    /// consumes: `{active, running, failed_recent, next_fire_at}`.
+    async fn emit_snapshot(&self) {
+        let running = { self.running.lock().await.len() };
+        let all = match ScheduleRepository::new(&self.db).list_all() {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let mut active = 0usize;
+        let mut failed_recent = 0usize;
+        let mut next_fire_at: Option<i64> = None;
+        for rec in &all {
+            if rec.status == ScheduleStatus::Active {
+                active += 1;
+                if let Some(nf) = rec.next_fire_at {
+                    next_fire_at = Some(next_fire_at.map_or(nf, |cur| cur.min(nf)));
+                }
+            }
+            if matches!(
+                rec.last_run_status.as_deref(),
+                Some("error") | Some("missed")
+            ) {
+                failed_recent += 1;
+            }
+        }
+        self.events
+            .snapshot(json!({
+                "active": active,
+                "running": running,
+                "failed_recent": failed_recent,
+                "next_fire_at": next_fire_at,
+            }))
+            .await;
+    }
+}
+
+/// Boot-time work computed synchronously (DB writes) and the async emissions /
+/// catchups deferred into the tick task's startup.
+struct BootPlan {
+    /// `(id, name, fire_was_at)` for each missed schedule.
+    missed: Vec<(String, String, i64)>,
+    /// `(id, name, prev_status, new_status)` state transitions (one-off → ran).
+    state_changes: Vec<(String, String, String, String)>,
+    /// Schedule ids to fire once as `catchup` after the tick task starts.
+    catchups: Vec<String>,
+}
+
+pub struct ScheduleManager {
+    inner: Arc<Inner>,
+    /// Manual-fire channel into the tick task.
+    run_tx: mpsc::Sender<DispatchRequest>,
+    /// The single tick task; aborted on [`ScheduleManager::shutdown`].
+    tick_handle: StdMutex<Option<JoinHandle<()>>>,
+}
+
+impl ScheduleManager {
+    /// Boot the schedules engine: crash-sweep orphaned runs, detect and rearm
+    /// missed fires, spawn the due-tick task, then return the handle.
+    ///
+    /// `bus = None` silences all events; `services = None` selects the stub run
+    /// path (no LLM) — both used by unit tests.
+    pub fn start_with_bus(
+        db: Database,
+        bus: Option<Arc<EventBus>>,
+        services: Option<HostServices>,
+    ) -> Arc<Self> {
+        let (run_tx, run_rx) = mpsc::channel::<DispatchRequest>(64);
+        let inner = Arc::new(Inner {
+            db: db.clone(),
+            events: ScheduleEvents::new(bus),
+            services,
+            running: Mutex::new(HashSet::new()),
+            pending_work: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let boot = boot_recover(&inner);
+
+        // Spawn the single due-tick task. Boot emissions + catchups run once at
+        // its head (deferred out of this synchronous fn), then it polls.
+        let inner_task = Arc::clone(&inner);
+        let handle = tokio::spawn(tick_loop(inner_task, run_rx, boot));
+
+        Arc::new(Self {
+            inner,
+            run_tx,
+            tick_handle: StdMutex::new(Some(handle)),
+        })
+    }
+
+    /// Validate + persist a new schedule (state `Active`), arm its first fire,
+    /// and emit `created` + `snapshot`. Returns the new [`ScheduleId`].
+    pub async fn create(&self, args: CreateScheduleArgs) -> Result<ScheduleId, String> {
+        if args.name.trim().is_empty() {
+            return Err("schedule name must not be empty".into());
+        }
+        // XOR trigger + XOR body (also CHECK-enforced in sqlite; checked here
+        // for a clean error message).
+        if args.cron_expr.is_some() == args.at_ts.is_some() {
+            return Err("exactly one of cron_expr or at_ts is required".into());
+        }
+        if args.prompt_text.is_some() == args.wrapped_skill.is_some() {
+            return Err("exactly one of prompt_text or wrapped_skill is required".into());
+        }
+        if !matches!(args.browser_policy.as_str(), "none" | "live" | "headless") {
+            return Err(format!("invalid browser_policy: {}", args.browser_policy));
+        }
+        if let Some(ou) = &args.on_unavailable {
+            if !matches!(ou.as_str(), "defer" | "skip") {
+                return Err(format!("invalid on_unavailable: {ou}"));
+            }
+        }
+
+        let now = current_timestamp();
+        // Compute the first fire; cron validation surfaces `TooFrequent` (with
+        // the "use /loop" redirect) as a plain error string.
+        let next_fire_at = if let Some(expr) = &args.cron_expr {
+            cron::validate_and_next(expr, now).map_err(|e| e.to_string())?
+        } else {
+            // XOR above guarantees at_ts is Some here.
+            let at = args.at_ts.unwrap_or(0);
+            if at <= now {
+                return Err("one-off schedule time must be in the future".into());
+            }
+            at
+        };
+
+        let id = ScheduleId::generate();
+        let rec = ScheduleRecord {
+            id: id.0.clone(),
+            creator_session_id: args.creator_session_id,
+            name: args.name,
+            cron_expr: args.cron_expr,
+            at_ts: args.at_ts,
+            prompt_text: args.prompt_text,
+            wrapped_skill: args.wrapped_skill,
+            mode: crate::loops::manager::agent_mode_to_db_str(args.mode).to_string(),
+            browser_policy: args.browser_policy,
+            on_unavailable: args.on_unavailable,
+            headless_profile: args.headless_profile,
+            catch_up: args.catch_up,
+            goal_condition: args.goal_condition,
+            goal_max_turns: args.goal_max_turns,
+            max_tokens_per_run: args.max_tokens_per_run,
+            evaluator_model: args.evaluator_model,
+            status: ScheduleStatus::Active,
+            next_fire_at: Some(next_fire_at),
+            last_run_status: None,
+            last_run_at: None,
+            consecutive_failures: 0,
+            run_count: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        ScheduleRepository::new(&self.inner.db)
+            .create(&rec)
+            .map_err(|e| e.to_string())?;
+        // Created active: +1.
+        self.inner.pending_work.fetch_add(1, Ordering::SeqCst);
+        self.inner.events.created(&rec).await;
+        self.inner.emit_snapshot().await;
+        Ok(id)
+    }
+
+    /// Cancel a schedule (terminal). Idempotent if already cancelled.
+    pub async fn cancel(&self, id: &str) -> Result<(), String> {
+        let repo = ScheduleRepository::new(&self.inner.db);
+        let rec = repo
+            .get(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("schedule not found: {id}"))?;
+        if rec.status == ScheduleStatus::Cancelled {
+            return Ok(());
+        }
+        let now = current_timestamp();
+        let was_active = rec.status == ScheduleStatus::Active;
+        repo.update_status(id, ScheduleStatus::Cancelled, now)
+            .map_err(|e| e.to_string())?;
+        if was_active {
+            self.inner.pending_work.fetch_sub(1, Ordering::SeqCst);
+        }
+        self.inner
+            .events
+            .state_changed(id, &rec.name, "cancelled", rec.status.as_str(), None)
+            .await;
+        self.inner.emit_snapshot().await;
+        Ok(())
+    }
+
+    /// Pause an active schedule (stops firing; `list_due` filters on status).
+    /// Idempotent if already paused; errors on ran/cancelled.
+    pub async fn pause(&self, id: &str) -> Result<(), String> {
+        let repo = ScheduleRepository::new(&self.inner.db);
+        let rec = repo
+            .get(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("schedule not found: {id}"))?;
+        match rec.status {
+            ScheduleStatus::Active => {}
+            ScheduleStatus::Paused => return Ok(()),
+            other => return Err(format!("cannot pause a {} schedule", other.as_str())),
+        }
+        let now = current_timestamp();
+        // next_fire_at is left untouched; the status filter in `list_due`
+        // keeps a paused schedule from firing.
+        repo.update_status(id, ScheduleStatus::Paused, now)
+            .map_err(|e| e.to_string())?;
+        // Active → Paused: -1.
+        self.inner.pending_work.fetch_sub(1, Ordering::SeqCst);
+        self.inner
+            .events
+            .state_changed(id, &rec.name, "paused", "active", rec.next_fire_at)
+            .await;
+        self.inner.emit_snapshot().await;
+        Ok(())
+    }
+
+    /// Resume a paused schedule, recomputing `next_fire_at` from *now*. A
+    /// one-off whose `at_ts` has already passed cannot be resumed (its moment
+    /// is gone) — returns an error rather than firing immediately.
+    pub async fn resume(&self, id: &str) -> Result<(), String> {
+        let repo = ScheduleRepository::new(&self.inner.db);
+        let rec = repo
+            .get(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("schedule not found: {id}"))?;
+        match rec.status {
+            ScheduleStatus::Paused => {}
+            ScheduleStatus::Active => return Ok(()),
+            other => return Err(format!("cannot resume a {} schedule", other.as_str())),
+        }
+        let now = current_timestamp();
+        let next = if let Some(expr) = &rec.cron_expr {
+            cron::next_after(expr, now).map_err(|e| e.to_string())?
+        } else if let Some(at) = rec.at_ts {
+            if at <= now {
+                return Err("one-off time already passed".into());
+            }
+            at
+        } else {
+            return Err("schedule has neither cron_expr nor at_ts".into());
+        };
+        repo.update_next_fire(id, Some(next), now)
+            .map_err(|e| e.to_string())?;
+        repo.update_status(id, ScheduleStatus::Active, now)
+            .map_err(|e| e.to_string())?;
+        // Paused → Active: +1.
+        self.inner.pending_work.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .events
+            .state_changed(id, &rec.name, "active", "paused", Some(next))
+            .await;
+        self.inner.emit_snapshot().await;
+        Ok(())
+    }
+
+    /// Enqueue a manual fire (`fire_kind = "manual"`). Respects the concurrency
+    /// gate — if a run is already in flight for this schedule the fire is a
+    /// silent no-op and this still returns `Ok`.
+    pub async fn run_now(&self, id: &str) -> Result<(), String> {
+        let repo = ScheduleRepository::new(&self.inner.db);
+        let rec = repo
+            .get(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("schedule not found: {id}"))?;
+        if rec.status != ScheduleStatus::Active {
+            return Err(format!("cannot run a {} schedule", rec.status.as_str()));
+        }
+        self.run_tx
+            .send(DispatchRequest {
+                id: id.to_string(),
+                fire_kind: "manual".to_string(),
+            })
+            .await
+            .map_err(|_| "schedule dispatcher is not running".to_string())
+    }
+
+    /// All schedules (any status), oldest first.
+    pub async fn list(&self) -> Result<Vec<ScheduleRecord>, String> {
+        ScheduleRepository::new(&self.inner.db)
+            .list_all()
+            .map_err(|e| e.to_string())
+    }
+
+    /// Recent runs for a schedule, newest first.
+    pub async fn runs(&self, id: &str, limit: i64) -> Result<Vec<ScheduleRun>, String> {
+        ScheduleRepository::new(&self.inner.db)
+            .list_runs(id, limit)
+            .map_err(|e| e.to_string())
+    }
+
+    /// True while any schedule is active or a run is in flight. Consulted by the
+    /// managed-mode idle-suicide inhibitor. Paused schedules do not count.
+    pub fn has_pending_work(&self) -> bool {
+        self.inner.pending_work.load(Ordering::SeqCst) > 0
+    }
+
+    /// Shared handle to the pending-work counter, for the idle guard to observe
+    /// without holding the manager.
+    pub fn pending_work_handle(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.inner.pending_work)
+    }
+
+    /// Abort the tick task, mark any still-running run rows cancelled, and clear
+    /// the concurrency gate. Already-spawned run tasks finish naturally (they
+    /// are not aborted), so their `+1/-1` pending_work pairing stays balanced.
+    pub async fn shutdown(&self) {
+        if let Some(handle) = self.tick_handle.lock().unwrap().take() {
+            handle.abort();
+        }
+        let now = current_timestamp();
+        let _ = ScheduleRepository::new(&self.inner.db)
+            .sweep_orphaned_runs(now, "cancelled by daemon shutdown");
+        self.inner.running.lock().await.clear();
+    }
+
+    pub fn events(&self) -> &ScheduleEvents {
+        &self.inner.events
+    }
+}
+
+/// Synchronous boot recovery (DB writes only). Sweeps orphaned run rows, loads
+/// active schedules into the pending-work counter, and detects + rearms missed
+/// fires. Returns the async work (events + catchups) to run at the tick task's
+/// head so [`ScheduleManager::start_with_bus`] can stay non-async.
+fn boot_recover(inner: &Arc<Inner>) -> BootPlan {
+    let now = current_timestamp();
+    let repo = ScheduleRepository::new(&inner.db);
+
+    // (1) Crash-recovery: any run row left `running` was orphaned by a restart.
+    let _ = repo.sweep_orphaned_runs(now, "orphaned by daemon restart");
+
+    // (2) Load active schedules — each contributes +1 to pending_work up front;
+    // a one-off that we retire to `Ran` below subtracts its +1 again.
+    let active = repo.list_active().unwrap_or_default();
+    inner.pending_work.fetch_add(active.len(), Ordering::SeqCst);
+
+    let mut plan = BootPlan {
+        missed: Vec::new(),
+        state_changes: Vec::new(),
+        catchups: Vec::new(),
+    };
+
+    for rec in &active {
+        let Some(nf) = rec.next_fire_at else {
+            continue;
+        };
+        if nf >= now {
+            continue; // future fire — nothing to recover.
+        }
+
+        // (3) Missed fire: record it and set the badge status.
+        let _ = repo.record_missed(&rec.id, nf, now);
+        let _ = repo.set_last_run_status(&rec.id, "missed", now);
+        plan.missed.push((rec.id.clone(), rec.name.clone(), nf));
+
+        if let Some(expr) = &rec.cron_expr {
+            // Recurring: rearm to the next occurrence after now.
+            let next = cron::next_after(expr, now).ok();
+            let _ = repo.update_next_fire(&rec.id, next, now);
+            if rec.catch_up {
+                plan.catchups.push(rec.id.clone());
+            }
+        } else if rec.catch_up {
+            // One-off with catch_up: clear next_fire so the tick can't also fire
+            // it, keep it Active, and run it once as a catchup. The catchup run's
+            // finish_fire retires it to `Ran` (and does the pending_work -1).
+            let _ = repo.update_next_fire(&rec.id, None, now);
+            plan.catchups.push(rec.id.clone());
+        } else {
+            // One-off, no catch_up: the moment is gone — retire to `Ran`.
+            let _ = repo.update_next_fire(&rec.id, None, now);
+            let _ = repo.update_status(&rec.id, ScheduleStatus::Ran, now);
+            inner.pending_work.fetch_sub(1, Ordering::SeqCst);
+            plan.state_changes.push((
+                rec.id.clone(),
+                rec.name.clone(),
+                "active".to_string(),
+                "ran".to_string(),
+            ));
+        }
+    }
+
+    plan
+}
+
+/// The single due-tick task body. Runs the deferred boot emissions + catchups
+/// once, then polls `list_due` every [`TICK_INTERVAL`] and services manual
+/// fires arriving on `run_rx`.
+async fn tick_loop(inner: Arc<Inner>, mut run_rx: mpsc::Receiver<DispatchRequest>, boot: BootPlan) {
+    // Deferred boot emissions (start_with_bus is synchronous).
+    for (id, name, fire_was_at) in boot.missed {
+        inner.events.missed(&id, &name, fire_was_at).await;
+    }
+    for (id, name, prev, new) in boot.state_changes {
+        inner
+            .events
+            .state_changed(&id, &name, &new, &prev, None)
+            .await;
+    }
+    // Boot catchups: fire once each. next_fire was cleared/rearmed above so the
+    // first `list_due` poll below will not double-fire them.
+    for id in boot.catchups {
+        inner.spawn_run(id, "catchup".to_string());
+    }
+    inner.emit_snapshot().await;
+
+    let mut ticker = tokio::time::interval(TICK_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let now = current_timestamp();
+                if let Ok(due) = ScheduleRepository::new(&inner.db).list_due(now) {
+                    for rec in due {
+                        inner.spawn_run(rec.id, "scheduled".to_string());
+                    }
+                }
+            }
+            maybe = run_rx.recv() => {
+                match maybe {
+                    Some(req) => inner.spawn_run(req.id, req.fire_kind),
+                    // All senders dropped (manager gone) — stop the task.
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nevoflux_storage::models::schedule::ScheduleRunStatus;
+
+    fn base_args() -> CreateScheduleArgs {
+        CreateScheduleArgs {
+            creator_session_id: None,
+            name: "t".into(),
+            cron_expr: Some("0 9 * * *".into()),
+            at_ts: None,
+            prompt_text: Some("p".into()),
+            wrapped_skill: None,
+            mode: nevoflux_builtin_wasm::AgentMode::Chat,
+            browser_policy: "none".into(),
+            on_unavailable: None,
+            headless_profile: None,
+            catch_up: false,
+            goal_condition: None,
+            goal_max_turns: None,
+            max_tokens_per_run: None,
+            evaluator_model: None,
+        }
+    }
+
+    /// Seed a schedule row directly (bypassing `create`) so tests can plant a
+    /// past `next_fire_at` for boot-recovery assertions.
+    fn seed(
+        id: &str,
+        cron: Option<&str>,
+        at: Option<i64>,
+        next_fire: Option<i64>,
+    ) -> ScheduleRecord {
+        ScheduleRecord {
+            id: id.into(),
+            creator_session_id: None,
+            name: "seed".into(),
+            cron_expr: cron.map(|s| s.to_string()),
+            at_ts: at,
+            prompt_text: Some("p".into()),
+            wrapped_skill: None,
+            mode: "chat".into(),
+            browser_policy: "none".into(),
+            on_unavailable: None,
+            headless_profile: None,
+            catch_up: false,
+            goal_condition: None,
+            goal_max_turns: None,
+            max_tokens_per_run: None,
+            evaluator_model: None,
+            status: ScheduleStatus::Active,
+            next_fire_at: next_fire,
+            last_run_status: None,
+            last_run_at: None,
+            consecutive_failures: 0,
+            run_count: 0,
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_validates_and_persists() {
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let id = mgr.create(base_args()).await.expect("created");
+
+        let all = mgr.list().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].next_fire_at.is_some());
+        assert_eq!(all[0].status, ScheduleStatus::Active);
+        assert!(mgr.has_pending_work());
+
+        mgr.cancel(&id.0).await.unwrap();
+        assert!(!mgr.has_pending_work());
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sub_hourly_cron_rejected() {
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let mut args = base_args();
+        args.cron_expr = Some("*/30 * * * *".into());
+        let err = mgr.create(args).await.unwrap_err();
+        // TooFrequent surfaced as a String, carrying the /loop redirect.
+        assert!(
+            err.contains("more often") || err.to_lowercase().contains("loop"),
+            "unexpected error: {err}"
+        );
+        // Nothing persisted, nothing counted.
+        assert_eq!(mgr.list().await.unwrap().len(), 0);
+        assert!(!mgr.has_pending_work());
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn create_rejects_xor_violations() {
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+
+        // Both cron and at → error.
+        let mut a = base_args();
+        a.at_ts = Some(current_timestamp() + 100_000);
+        assert!(mgr
+            .create(a)
+            .await
+            .unwrap_err()
+            .contains("cron_expr or at_ts"));
+
+        // Neither prompt nor skill → error.
+        let mut b = base_args();
+        b.prompt_text = None;
+        b.wrapped_skill = None;
+        assert!(mgr
+            .create(b)
+            .await
+            .unwrap_err()
+            .contains("prompt_text or wrapped_skill"));
+
+        // Past one-off → error.
+        let mut c = base_args();
+        c.cron_expr = None;
+        c.at_ts = Some(current_timestamp() - 10);
+        assert!(mgr.create(c).await.unwrap_err().contains("future"));
+
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn missed_detection_at_boot() {
+        let db = Database::open_in_memory().unwrap();
+        let now = current_timestamp();
+        // Seed a cron schedule whose next_fire_at is well in the past.
+        {
+            let repo = ScheduleRepository::new(&db);
+            repo.create(&seed(
+                "sch00001",
+                Some("0 9 * * *"),
+                None,
+                Some(now - 100_000),
+            ))
+            .unwrap();
+        }
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+
+        // Boot recovery is synchronous, so the DB reflects it immediately.
+        let runs = mgr.runs("sch00001", 10).await.unwrap();
+        assert!(
+            runs.iter().any(|r| r.status == ScheduleRunStatus::Missed),
+            "expected a missed run row"
+        );
+        let rec = mgr
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == "sch00001")
+            .unwrap();
+        assert_eq!(rec.status, ScheduleStatus::Active, "cron stays active");
+        assert!(
+            rec.next_fire_at.unwrap() > now,
+            "next_fire_at must be rearmed into the future, got {:?}",
+            rec.next_fire_at
+        );
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn one_off_missed_no_catchup_marks_ran() {
+        let db = Database::open_in_memory().unwrap();
+        let now = current_timestamp();
+        {
+            let repo = ScheduleRepository::new(&db);
+            repo.create(&seed("sch00009", None, Some(now - 100), Some(now - 100)))
+                .unwrap();
+        }
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let rec = mgr
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == "sch00009")
+            .unwrap();
+        assert_eq!(rec.status, ScheduleStatus::Ran);
+        // Loaded active (+1) then retired to Ran (-1) → no pending work.
+        assert!(!mgr.has_pending_work());
+        let runs = mgr.runs("sch00009", 10).await.unwrap();
+        assert!(runs.iter().any(|r| r.status == ScheduleRunStatus::Missed));
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pause_resume_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let id = mgr.create(base_args()).await.unwrap();
+
+        mgr.pause(&id.0).await.unwrap();
+        let paused = mgr.list().await.unwrap();
+        assert_eq!(paused[0].status, ScheduleStatus::Paused);
+        // Paused schedule is not due.
+        let due = ScheduleRepository::new(&db)
+            .list_due(current_timestamp() + 10_000_000)
+            .unwrap();
+        assert!(due.is_empty(), "paused schedule must not be due");
+        assert!(!mgr.has_pending_work());
+
+        mgr.resume(&id.0).await.unwrap();
+        let resumed = mgr.list().await.unwrap();
+        assert_eq!(resumed[0].status, ScheduleStatus::Active);
+        assert!(resumed[0].next_fire_at.is_some());
+        assert!(mgr.has_pending_work());
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pending_work_counter_balances_across_lifecycle() {
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let counter = mgr.pending_work_handle();
+
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        let id = mgr.create(base_args()).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "create active → 1");
+        mgr.pause(&id.0).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "pause → 0");
+        mgr.resume(&id.0).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "resume → 1");
+        mgr.cancel(&id.0).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "cancel → 0");
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn run_now_stub_records_ok_run() {
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let id = mgr.create(base_args()).await.unwrap();
+
+        mgr.run_now(&id.0).await.unwrap();
+
+        // Wait for the spawned stub run to persist its ok row.
+        let mut ok = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let runs = mgr.runs(&id.0, 10).await.unwrap();
+            if runs.iter().any(|r| r.status == ScheduleRunStatus::Ok) {
+                ok = true;
+                break;
+            }
+        }
+        assert!(ok, "manual run should record an ok run");
+
+        let runs = mgr.runs(&id.0, 10).await.unwrap();
+        assert_eq!(runs[0].fire_kind, "manual");
+        // Cron schedule still active after a manual fire; run advanced count.
+        let rec = mgr.list().await.unwrap().into_iter().next().unwrap();
+        assert_eq!(rec.status, ScheduleStatus::Active);
+        assert_eq!(rec.run_count, 1);
+        assert_eq!(rec.last_run_status.as_deref(), Some("ok"));
+        // Back to just the active schedule (in-flight run ended).
+        assert!(mgr.has_pending_work());
+        assert_eq!(mgr.pending_work_handle().load(Ordering::SeqCst), 1);
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn run_now_skips_when_already_running_returns_ok() {
+        // Two back-to-back manual fires: the concurrency gate makes at most one
+        // run per schedule at a time, and run_now still returns Ok either way.
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let id = mgr.create(base_args()).await.unwrap();
+
+        mgr.run_now(&id.0).await.unwrap();
+        mgr.run_now(&id.0).await.unwrap();
+
+        // Let the dispatcher settle.
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if !mgr.runs(&id.0, 10).await.unwrap().is_empty() {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // run_count reflects completed fires; the gate prevents a runaway count.
+        let rec = mgr.list().await.unwrap().into_iter().next().unwrap();
+        assert!(rec.run_count >= 1, "at least one manual fire completed");
+        mgr.shutdown().await;
+    }
+}
