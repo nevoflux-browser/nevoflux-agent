@@ -41,6 +41,7 @@ pub mod error;
 pub mod event_bus;
 pub mod file_picker;
 pub mod gbrain;
+pub mod goals;
 pub mod health;
 pub mod http;
 pub mod init_brain;
