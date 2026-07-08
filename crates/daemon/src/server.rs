@@ -495,7 +495,9 @@ async fn handle_proxy_connection(
     writers: Arc<Mutex<HashMap<String, BufWriter<tokio::net::tcp::OwnedWriteHalf>>>>,
     last_message_time: Arc<Mutex<std::time::Instant>>,
     browser_registry: Arc<crate::registry::BrowserRegistry>,
+    connection_count: Arc<std::sync::atomic::AtomicUsize>,
 ) {
+    use std::sync::atomic::Ordering;
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
@@ -522,6 +524,9 @@ async fn handle_proxy_connection(
         let writer = BufWriter::new(write_half);
         writers.lock().await.insert(proxy_id.clone(), writer);
     }
+    // Count this connection as live (paired with the decrement in cleanup
+    // below). The idle watchdog treats a non-zero count as "browser present".
+    connection_count.fetch_add(1, Ordering::SeqCst);
 
     // Identity bytes (proxy_id encoded as UTF-8) for compatibility with existing pipeline
     let identity = proxy_id.as_bytes().to_vec();
@@ -566,6 +571,7 @@ async fn handle_proxy_connection(
 
     // Clean up writer
     writers.lock().await.remove(&proxy_id);
+    connection_count.fetch_sub(1, Ordering::SeqCst);
     browser_registry.unregister(&proxy_id);
 
     // Notify the message loop about the disconnect so EventBus subscriptions
@@ -612,6 +618,69 @@ async fn read_length_prefixed_message(
     let mut buf = vec![0u8; len as usize];
     reader.read_exact(&mut buf).await?;
     Ok(buf)
+}
+
+/// Decide whether a managed daemon should self-terminate on an idle tick.
+///
+/// A managed (proxy-spawned) daemon self-terminates so it doesn't linger after
+/// the browser goes away — but its lifetime must track *whether the browser is
+/// still connected*, NOT "did a chat message arrive recently". A sidebar can
+/// stay open (or be minimized to the floating avatar) and connected for a long
+/// time while the user reads a reply or adjusts the appearance/boost panel (a
+/// pure chrome+CSS feature that sends no daemon traffic); killing the daemon out
+/// from under a live browser surfaces a spurious `DAEMON_DISCONNECTED`.
+///
+/// So we self-terminate only when the browser has been *continuously
+/// disconnected* for the whole idle window AND the message path is also idle:
+/// - `since_last_connection > idle_timeout`: no proxy has been connected at any
+///   point in the window. Tracking *continuous* absence (not "no connection
+///   right this instant") makes this immune to a brief native-messaging
+///   reconnect blip, which would otherwise race the poll tick and kill the
+///   daemon mid-session.
+/// - `since_last_message > idle_timeout`: also idle on the message path, which
+///   keeps background `/loop`/agent work (streams frames, may run without a
+///   sidebar connection) alive.
+fn managed_should_self_terminate(
+    since_last_connection: std::time::Duration,
+    since_last_message: std::time::Duration,
+    idle_timeout: std::time::Duration,
+) -> bool {
+    since_last_connection > idle_timeout && since_last_message > idle_timeout
+}
+
+/// Idle watchdog loop for a managed daemon. Every `poll_interval` it samples the
+/// live connection count and the last-message time, and fires `shutdown_tx` once
+/// the daemon has been continuously disconnected AND idle for `idle_timeout`
+/// (see [`managed_should_self_terminate`]). Extracted from `start_server` so its
+/// timing behavior is testable without standing up the full TCP server.
+async fn managed_idle_watchdog(
+    connection_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    last_message_time: std::sync::Arc<Mutex<std::time::Instant>>,
+    idle_timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+    shutdown_tx: mpsc::Sender<()>,
+) {
+    use std::sync::atomic::Ordering;
+    // Last instant at which >=1 proxy was connected. Seeded to "now" so a daemon
+    // that never receives a connection still reclaims after the idle window
+    // rather than lingering forever.
+    let mut last_connected = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(poll_interval).await;
+        if connection_count.load(Ordering::SeqCst) > 0 {
+            last_connected = std::time::Instant::now();
+        }
+        let since_last_connection = last_connected.elapsed();
+        let since_last_message = last_message_time.lock().await.elapsed();
+        if managed_should_self_terminate(since_last_connection, since_last_message, idle_timeout) {
+            info!(
+                "Managed daemon: no browser connected and idle for {:?}, self-terminating",
+                idle_timeout
+            );
+            let _ = shutdown_tx.send(()).await;
+            break;
+        }
+    }
 }
 
 /// Start the TCP server.
@@ -1791,25 +1860,28 @@ pub async fn start_server(
     let accept_terminated = terminated.clone();
     tokio::spawn(async move {
         let last_message_time = Arc::new(Mutex::new(std::time::Instant::now()));
+        // Live count of connected proxies (a proxy = the browser's background
+        // native-messaging channel, or a one-shot query connection). Kept in
+        // lockstep with the `writers` map by `handle_proxy_connection`. The idle
+        // watchdog uses this to keep the daemon alive as long as the browser is
+        // connected — see `managed_idle_watchdog`.
+        let connection_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        // Idle check task for managed daemon
+        // Idle watchdog for managed daemon: self-terminate only once the browser
+        // has been continuously disconnected AND idle for `idle_timeout`. This
+        // keeps a connected-but-quiet browser (e.g. sidebar open on the
+        // appearance/boost panel, which sends no daemon traffic) from having its
+        // daemon killed after `idle_timeout` — the spurious DAEMON_DISCONNECTED
+        // bug — while still reclaiming the daemon ~idle_timeout after the browser
+        // closes.
         if config_managed {
-            let idle_last_message = last_message_time.clone();
-            let idle_shutdown = accept_shutdown_tx.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    let elapsed = idle_last_message.lock().await.elapsed();
-                    if elapsed > config_idle_timeout {
-                        info!(
-                            "Managed daemon: idle for {:?}, self-terminating",
-                            config_idle_timeout
-                        );
-                        let _ = idle_shutdown.send(()).await;
-                        break;
-                    }
-                }
-            });
+            tokio::spawn(managed_idle_watchdog(
+                connection_count.clone(),
+                last_message_time.clone(),
+                config_idle_timeout,
+                std::time::Duration::from_secs(1),
+                accept_shutdown_tx.clone(),
+            ));
         }
 
         loop {
@@ -1826,6 +1898,7 @@ pub async fn start_server(
                             let conn_writers = accept_writers.clone();
                             let last_msg = last_message_time.clone();
                             let conn_browser_registry = accept_browser_registry.clone();
+                            let conn_count = connection_count.clone();
 
                             tokio::spawn(async move {
                                 handle_proxy_connection(
@@ -1834,6 +1907,7 @@ pub async fn start_server(
                                     conn_writers,
                                     last_msg,
                                     conn_browser_registry,
+                                    conn_count,
                                 )
                                 .await;
                             });
@@ -9931,6 +10005,123 @@ mod tests {
         assert_eq!(config.port_start, 19500);
         assert_eq!(config.port_end, 19600);
         assert_eq!(config.bind_address, "127.0.0.1");
+    }
+
+    #[test]
+    fn managed_terminate_decision_requires_both_no_connection_and_no_message() {
+        use std::time::Duration;
+        let timeout = Duration::from_secs(30);
+        let past = Duration::from_secs(31);
+        let recent = Duration::from_secs(5);
+
+        // Browser connected within the window (e.g. sidebar open on the boost
+        // panel, sending no chat) -> never terminate, no matter how stale the
+        // message path is. This is the spurious-DAEMON_DISCONNECTED regression.
+        assert!(!managed_should_self_terminate(recent, past, timeout));
+        assert!(!managed_should_self_terminate(
+            Duration::ZERO,
+            Duration::from_secs(3600),
+            timeout
+        ));
+
+        // Recent message but connection gone briefly -> keep running (covers a
+        // background /loop that streams frames without a sidebar connection).
+        assert!(!managed_should_self_terminate(past, recent, timeout));
+
+        // Both continuously idle past the window -> terminate (browser gone;
+        // reclaim the daemon rather than orphan it).
+        assert!(managed_should_self_terminate(past, past, timeout));
+
+        // Boundary: exactly at the timeout is not yet past it.
+        assert!(!managed_should_self_terminate(timeout, timeout, timeout));
+    }
+
+    // The watchdog uses real `std::time::Instant`, so these drive it with real
+    // (short) durations rather than tokio's virtual clock. timeout=120ms with a
+    // 10ms poll keeps them fast while leaving margin against scheduler jitter.
+    #[tokio::test]
+    async fn watchdog_keeps_daemon_alive_while_a_proxy_stays_connected() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+        // A single persistently-connected proxy (the browser's background
+        // channel), silent the whole time — must NOT be terminated even though
+        // the message path goes stale. This is the boost/idle regression.
+        let count = Arc::new(AtomicUsize::new(1));
+        let last_msg = Arc::new(Mutex::new(std::time::Instant::now()));
+        let (tx, mut rx) = mpsc::channel::<()>(1);
+
+        let handle = tokio::spawn(managed_idle_watchdog(
+            count,
+            last_msg,
+            Duration::from_millis(120),
+            Duration::from_millis(10),
+            tx,
+        ));
+
+        // Well past several idle windows with the proxy still connected.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "watchdog must not self-terminate while a proxy is connected"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn watchdog_terminates_after_browser_disconnects() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+        // No proxy connected (browser gone) -> terminate after the idle window.
+        let count = Arc::new(AtomicUsize::new(0));
+        let last_msg = Arc::new(Mutex::new(std::time::Instant::now()));
+        let (tx, mut rx) = mpsc::channel::<()>(1);
+
+        tokio::spawn(managed_idle_watchdog(
+            count,
+            last_msg,
+            Duration::from_millis(120),
+            Duration::from_millis(10),
+            tx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "watchdog must self-terminate once the browser has been gone past the idle window"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_survives_a_brief_reconnect_gap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        // Connected, then a short blip to 0 (native-messaging reconnect), then
+        // back to 1 — must NOT terminate even though the message path is stale.
+        let count = Arc::new(AtomicUsize::new(1));
+        let last_msg = Arc::new(Mutex::new(std::time::Instant::now()));
+        let (tx, mut rx) = mpsc::channel::<()>(1);
+
+        let gap_count = count.clone();
+        let handle = tokio::spawn(managed_idle_watchdog(
+            count,
+            last_msg,
+            Duration::from_millis(120),
+            Duration::from_millis(10),
+            tx,
+        ));
+
+        // Connected for a while, drop for ~2 polls (a blip well under the
+        // window), reconnect, then run past another full window.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        gap_count.store(0, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        gap_count.store(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a brief reconnect gap must not trip self-termination"
+        );
+        handle.abort();
     }
 
     #[test]
