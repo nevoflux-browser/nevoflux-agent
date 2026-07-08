@@ -2390,6 +2390,14 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             "schedule_runs" => self.host.tool_schedule_runs(
                 &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
             )?,
+            // /goal skill tools — direct-API dispatch (Anthropic / OpenAI
+            // direct providers). The MCP/ACP path goes through
+            // `mcp_tool_executor::execute_mcp_tool::goal_*`.
+            "goal_set" => self
+                .host
+                .tool_goal_set(&serde_json::to_string(&tool_call.arguments).unwrap_or_default())?,
+            "goal_status" => self.host.tool_goal_status()?,
+            "goal_clear" => self.host.tool_goal_clear()?,
             // Record & Replay (agent mode) — daemon-orchestrated via
             // tool_call_dynamic (mirrors the browser_input dispatch pattern).
             // The MCP/ACP path handles these in mcp_tool_executor instead.
@@ -2484,6 +2492,9 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 | "schedule_resume"
                 | "schedule_run_now"
                 | "schedule_runs"
+                | "goal_set"
+                | "goal_status"
+                | "goal_clear"
         ) || name.starts_with("computer_")
             || name.starts_with("browser_")
     }
@@ -3705,6 +3716,31 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     },
                     "required": ["schedule_id"]
                 }),
+            },
+            // /goal skill tools (Task 2.3).
+            ToolDefinition {
+                name: "goal_set".into(),
+                description: "Set a completion condition for this session. After every turn an independent zero-tool evaluator model judges the condition against the conversation; if unmet the agent is automatically told to continue. Before calling: ask the user which model should evaluate (default: the current provider/model). The condition must be self-provable from conversation output (state the check, e.g. 'cargo test exits 0'). Max 4000 chars. Optional max_turns (default 20).".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "condition": { "type": "string", "description": "natural-language, self-provable completion condition (max 4000 chars)" },
+                        "evaluator_provider": { "type": "string", "description": "direct-API provider id to use as the evaluator. Default: the current provider." },
+                        "evaluator_model": { "type": "string", "description": "model id to use as the evaluator. Default: the current model." },
+                        "max_turns": { "type": "integer", "description": "turn budget before the goal expires unmet. Default 20." }
+                    },
+                    "required": ["condition"]
+                }),
+            },
+            ToolDefinition {
+                name: "goal_status".into(),
+                description: "Report the current session goal's status (active/achieved/expired/cleared/none), turns used, and the evaluator's last reason.".into(),
+                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            },
+            ToolDefinition {
+                name: "goal_clear".into(),
+                description: "Clear the active session goal, if any, stopping post-turn evaluation.".into(),
+                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
             },
         ];
 

@@ -5558,6 +5558,113 @@ impl HostFunctions for DaemonHostFunctions {
             }),
         }
     }
+
+    // =========================================================================
+    // /goal skill tool functions (Task 2.3) — direct-API surface.
+    //
+    // Mirrors the /schedule wiring immediately above: direct-API providers
+    // reach the `goal_*` family through `Agent::execute_tool` in
+    // builtin-wasm, which calls these host functions. ACP-bridge providers
+    // take the parallel path through `mcp_tool_executor::execute_mcp_tool`
+    // and call `crate::goals::execute_goal_tool` directly. Both paths share
+    // the same dispatcher; only the surface differs.
+    //
+    // All three methods are sync (HostFunctions is sync) but
+    // `execute_goal_tool` is async, so we use the same
+    // `tokio::task::block_in_place(|| runtime.block_on(...))` pattern as
+    // `tool_schedule_*` to avoid panicking when called from inside a Tokio
+    // runtime.
+    //
+    // Unlike `tool_schedule_create`, `goal_set` needs no `is_unattended`
+    // flag here: direct-API `HostFunctions` never runs inside an unattended
+    // run (that gate lives solely at the `mcp_tool_executor` iteration
+    // check, since ACP-bridge providers are the only surface that can be
+    // invoked from inside a `/loop` iteration or a schedule's own fire).
+    // =========================================================================
+
+    fn tool_goal_set(&self, args_json: &str) -> HostResult<String> {
+        let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| HostError {
+            code: 4,
+            message: format!("invalid args JSON: {e}"),
+        })?;
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services.goal_manager.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "GoalManager not configured".into(),
+        })?;
+        let session_id = self.session_id.clone().unwrap_or_default();
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::goals::execute_goal_tool("goal_set", &args, &session_id, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_goal_status(&self) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services.goal_manager.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "GoalManager not configured".into(),
+        })?;
+        let session_id = self.session_id.clone().unwrap_or_default();
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let args = serde_json::json!({});
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::goals::execute_goal_tool("goal_status", &args, &session_id, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_goal_clear(&self) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services.goal_manager.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "GoalManager not configured".into(),
+        })?;
+        let session_id = self.session_id.clone().unwrap_or_default();
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let args = serde_json::json!({});
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::goals::execute_goal_tool("goal_clear", &args, &session_id, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
 }
 
 impl DaemonHostFunctions {

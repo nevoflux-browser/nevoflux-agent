@@ -320,6 +320,9 @@ pub async fn execute_mcp_tool(
         if name == "schedule_create" {
             return Err("schedule_create is not available inside unattended runs".to_string());
         }
+        if name == "goal_set" {
+            return Err("goal_set is not available inside unattended runs".to_string());
+        }
     }
 
     // 0'. gbrain knowledge-base tools (M3-4).
@@ -603,6 +606,39 @@ pub async fn execute_mcp_tool(
         };
         let result =
             crate::schedules::execute_schedule_tool(name, arguments, &ctx, mgr.as_ref()).await;
+        return match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(e),
+        };
+    }
+
+    // 6'''. /goal skill tools (Task 2.3).
+    //
+    // Dispatched via `crate::goals::execute_goal_tool`. ACP-bridge providers
+    // (claude-code, gemini-cli, kimi, openclaw) reach this branch through
+    // the MCP HTTP bridge; direct-API providers reach the same dispatcher
+    // through `agent_host.rs`'s `tool_goal_*` methods, which call the
+    // identical `execute_goal_tool` dispatcher — only the surface differs,
+    // mirroring the /schedule wiring above. `goal_set` is additionally
+    // rejected earlier by the /loop iteration gate when
+    // `services.is_iteration` is true (unattended runs must not hijack the
+    // session goal — P3 composition passes goal config explicitly instead).
+    //
+    // Requires `services.goal_manager` to be set at daemon startup (Task
+    // 2.4 wires boot); until then tool calls surface a clear error.
+    if matches!(name, "goal_set" | "goal_status" | "goal_clear") {
+        let mgr = match services.goal_manager.as_ref() {
+            Some(m) => m,
+            None => {
+                return Err(
+                    "/goal tools are not available — daemon was started without a GoalManager"
+                        .to_string(),
+                );
+            }
+        };
+        let result =
+            crate::goals::execute_goal_tool(name, arguments, &services.session_id, mgr.as_ref())
+                .await;
         return match result {
             Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
             Err(e) => Err(e),

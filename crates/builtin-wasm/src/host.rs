@@ -774,6 +774,39 @@ pub trait HostFunctions {
             message: "tool_schedule_runs not supported by this host".into(),
         })
     }
+
+    // =========================================================================
+    // /goal skill tool functions (Task 2.3)
+    // =========================================================================
+
+    /// Set (replace) the completion condition for this session. JSON args:
+    /// {condition, evaluator_provider?, evaluator_model?, max_turns?}.
+    /// Returns the goal status JSON (same shape as `tool_goal_status`).
+    /// Default impl returns Unsupported so non-daemon hosts (mocks, tests)
+    /// don't need stub code.
+    fn tool_goal_set(&self, _args_json: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_goal_set not supported by this host".into(),
+        })
+    }
+
+    /// Report the current session goal's status. Returns JSON
+    /// `{"status":"none"}` when there is none, else the full status object.
+    fn tool_goal_status(&self) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_goal_status not supported by this host".into(),
+        })
+    }
+
+    /// Clear the active session goal, if any. Returns JSON {"cleared":bool}.
+    fn tool_goal_clear(&self) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_goal_clear not supported by this host".into(),
+        })
+    }
 }
 
 /// Mock host functions for testing.

@@ -10,7 +10,7 @@
 //! returns `None` and the loop stops.
 //!
 //! Task 2.1 landed the storage layer (`GoalRepository`, `GoalRecord`). Task 2.2
-//! (this module) adds:
+//! added:
 //! - [`evaluator`]: `resolve_evaluator` (pick a direct-API provider/model/key,
 //!   rejecting ACP providers), the verbatim evaluator system prompt, the pure
 //!   `parse_verdict` / `clip_transcript` cores, and the async `evaluate` call.
@@ -18,11 +18,15 @@
 //!   `schedules::events`).
 //! - [`manager`]: `GoalManager` (`set` / `status` / `clear` / `after_turn`) and
 //!   the pure `apply_verdict` decision core.
+//!
+//! Task 2.3 adds [`tools`] (the `goal_*` LLM-callable tool dispatcher).
 
 pub mod evaluator;
 pub mod events;
 pub mod manager;
+pub mod tools;
 
 pub use evaluator::{evaluate, resolve_evaluator, EvaluatorChoice, Verdict};
 pub use events::GoalEvents;
 pub use manager::GoalManager;
+pub use tools::execute_goal_tool;
