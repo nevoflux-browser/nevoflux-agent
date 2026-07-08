@@ -23,10 +23,12 @@ use std::sync::Arc;
 ///
 /// Wired into [`crate::agent_host::DaemonHostFunctions`] via
 /// `with_token_budget`: `llm_chat` and `llm_stream_start` refuse to dispatch
-/// once [`Self::exceeded`] is true, and `llm_chat` accrues usage from each
-/// successful response via [`Self::add`]. See the doc comment on
-/// `DaemonHostFunctions::llm_stream_start` for why streamed calls are gated
-/// but not (yet) metered.
+/// once [`Self::exceeded`] is true, and every call accrues spend via
+/// [`Self::add`] — real provider-reported usage where available (rig
+/// streaming and non-streaming paths), a chars/4 estimate otherwise (raw
+/// HTTP and ACP paths). Streams settle when their terminal chunk is
+/// observed in `llm_stream_next`, or on `llm_stream_close` for
+/// aborted/early-closed streams — whichever comes first, exactly once.
 #[derive(Debug)]
 pub struct TokenBudget {
     /// Hard ceiling in tokens.

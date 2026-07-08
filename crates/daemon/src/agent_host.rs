@@ -121,6 +121,33 @@ struct StreamTraceData {
     accumulated_tool_calls: Vec<crate::wasm::llm::LlmToolCall>,
 }
 
+/// Per-stream spend accounting for a run [`crate::agent_exec::TokenBudget`].
+///
+/// Created in `llm_stream_start` only when the host carries a budget; updated
+/// as chunks pass through `llm_stream_next`; settled exactly once — either
+/// when the `done` chunk is observed or, for aborted/early-closed streams, in
+/// `llm_stream_close` (settling removes the entry, so whichever runs first
+/// wins and the other is a no-op).
+struct StreamBudgetData {
+    /// Total chars across the request messages (prompt side of the estimate).
+    prompt_chars: usize,
+    /// Chars streamed back so far: text + reasoning + tool-call argument JSON.
+    streamed_chars: usize,
+    /// Real usage total reported by the provider (final chunk), if any.
+    /// Preferred over the chars/4 estimate at settle time.
+    usage_total_tokens: Option<u64>,
+}
+
+/// Approximate token count from character counts, used only when the provider
+/// reported no usage for a call. Heuristic: ~4 chars per token, which is the
+/// common rule of thumb for English text; CJK-heavy content will be
+/// underestimated (closer to 1-2 chars/token) and dense code slightly
+/// overestimated. Deliberately crude — the budget is a spend *cap*, not a
+/// billing meter, and a consistent floor beats no accrual at all.
+fn estimate_tokens_from_chars(prompt_chars: usize, streamed_chars: usize) -> u64 {
+    ((prompt_chars + streamed_chars) / 4) as u64
+}
+
 /// A streaming chunk to send to the sidebar.
 #[derive(Debug, Clone)]
 pub struct SidebarStreamChunk {
@@ -158,6 +185,9 @@ pub struct DaemonHostFunctions {
     current_iteration: AtomicU32,
     /// Trace metadata for in-flight streaming LLM calls, keyed by stream_id.
     stream_trace_data: Arc<Mutex<HashMap<u64, StreamTraceData>>>,
+    /// Token-budget accounting for in-flight streams, keyed by stream_id.
+    /// Only populated when [`Self::token_budget`] is `Some`.
+    stream_budget_data: Arc<Mutex<HashMap<u64, StreamBudgetData>>>,
     /// Override for the active LLM provider (set via switch_model tool).
     model_override_provider: Arc<Mutex<Option<String>>>,
     /// Override for the active LLM model (set via switch_model tool).
@@ -220,6 +250,7 @@ impl DaemonHostFunctions {
             trace_collector: None,
             current_iteration: AtomicU32::new(0),
             stream_trace_data: Arc::new(Mutex::new(HashMap::new())),
+            stream_budget_data: Arc::new(Mutex::new(HashMap::new())),
             model_override_provider: Arc::new(Mutex::new(None)),
             model_override_model: Arc::new(Mutex::new(None)),
             skill_base_path: None,
@@ -302,9 +333,10 @@ impl DaemonHostFunctions {
 
     /// Wire a per-run [`crate::agent_exec::TokenBudget`]. Once set, `llm_chat`
     /// and `llm_stream_start` refuse to dispatch once the budget is exceeded,
-    /// and `llm_chat` accrues usage from each successful response. Leave unset
-    /// for interactive hosts — behavior is unchanged when `token_budget` is
-    /// `None`.
+    /// and every call accrues spend: real provider-reported usage where
+    /// available, a chars/4 estimate otherwise (see
+    /// [`estimate_tokens_from_chars`]). Leave unset for interactive hosts —
+    /// behavior is unchanged when `token_budget` is `None`.
     pub fn with_token_budget(mut self, budget: Arc<crate::agent_exec::TokenBudget>) -> Self {
         self.token_budget = Some(budget);
         self
@@ -1319,9 +1351,31 @@ impl HostFunctions for DaemonHostFunctions {
                     *t = Some(std::time::Instant::now());
                 }
 
-                // Accrue usage against the per-run budget, when both are present.
-                if let (Some(budget), Some(usage)) = (&self.token_budget, &response.usage) {
-                    budget.add(usage.total_tokens as u64);
+                // Accrue spend against the per-run budget: real
+                // provider-reported usage when present, chars/4 estimate
+                // otherwise (raw HTTP paths — DeepSeek/MiMo raw, OpenRouter
+                // image models, Kimi — don't parse usage today).
+                if let Some(budget) = &self.token_budget {
+                    match &response.usage {
+                        Some(usage) => budget.add(usage.total_tokens as u64),
+                        None => {
+                            let prompt_chars: usize =
+                                request.messages.iter().map(|m| m.content.len()).sum();
+                            let mut completion_chars = response.content.len();
+                            if let Some(tool_calls) = &response.tool_calls {
+                                for tc in tool_calls {
+                                    completion_chars += tc.arguments.to_string().len();
+                                }
+                            }
+                            let estimated =
+                                estimate_tokens_from_chars(prompt_chars, completion_chars);
+                            debug!(
+                                estimated_tokens = estimated,
+                                "provider reported no usage for llm_chat; accruing chars/4 estimate against run token budget"
+                            );
+                            budget.add(estimated);
+                        }
+                    }
                 }
 
                 // Convert tool calls, preserving call_id for OpenAI Responses API compatibility
@@ -1370,17 +1424,13 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn llm_stream_start(&self, request: &LlmRequest) -> HostResult<u64> {
-        // Per-run spend cap, mirroring the `llm_chat` gate above. Streamed
-        // responses do not currently surface per-call usage back to this
-        // host function (see `llm_stream_next`/`LlmStreamChunk` — no `usage`
-        // field is threaded through the mpsc channel), so streaming cannot
-        // *accrue* against the budget yet. Gating the call itself is still
-        // load-bearing: `Agent::run`'s default `AgentConfig` has
+        // Per-run spend cap, mirroring the `llm_chat` gate above. This is the
+        // load-bearing gate: `Agent::run`'s default `AgentConfig` has
         // `use_streaming: true`, so unattended runs (loops/schedules/goals
         // via `agent_exec::run_agent_once`, which builds `Agent::new(host)`
-        // with default config) go through this path, not `llm_chat`. Without
-        // this check an exhausted budget would only stop the (rarely taken)
-        // non-streaming branch.
+        // with default config) go through this path, not `llm_chat`. Spend
+        // *accrual* for the stream happens at stream end — see the
+        // `stream_budget_data` bookkeeping below and `settle_stream_budget`.
         if let Some(budget) = &self.token_budget {
             if budget.exceeded() {
                 return Err(HostError {
@@ -1611,6 +1661,7 @@ impl HostFunctions for DaemonHostFunctions {
             // Send text chunk if present
             if !response.content.is_empty() {
                 let _ = tx.try_send(LlmStreamChunk {
+                    usage: None,
                     text: Some(response.content),
                     tool_calls: vec![],
                     done: false,
@@ -1621,6 +1672,7 @@ impl HostFunctions for DaemonHostFunctions {
             // Send images if present
             if !response.images.is_empty() {
                 let _ = tx.try_send(LlmStreamChunk {
+                    usage: None,
                     text: None,
                     tool_calls: vec![],
                     done: false,
@@ -1632,6 +1684,7 @@ impl HostFunctions for DaemonHostFunctions {
             if let Some(tool_calls) = response.tool_calls {
                 if !tool_calls.is_empty() {
                     let _ = tx.try_send(LlmStreamChunk {
+                        usage: None,
                         text: None,
                         tool_calls,
                         done: false,
@@ -1640,8 +1693,11 @@ impl HostFunctions for DaemonHostFunctions {
                     });
                 }
             }
-            // Send done chunk
+            // Send done chunk, carrying any real usage from the underlying
+            // non-streaming call so budget accounting prefers it over the
+            // chars/4 estimate.
             let _ = tx.try_send(LlmStreamChunk {
+                usage: response.usage,
                 text: None,
                 tool_calls: vec![],
                 done: true,
@@ -1666,6 +1722,22 @@ impl HostFunctions for DaemonHostFunctions {
             );
         }
 
+        // Open budget accounting for this stream: chars accumulate in
+        // `llm_stream_next`, and the spend settles (real usage if the final
+        // chunk carried it, chars/4 estimate otherwise) when the stream ends
+        // or closes. Only bookkept when this host carries a budget.
+        if self.token_budget.is_some() {
+            let prompt_chars = request.messages.iter().map(|m| m.content.len()).sum();
+            self.stream_budget_data.lock().unwrap().insert(
+                stream_id,
+                StreamBudgetData {
+                    prompt_chars,
+                    streamed_chars: 0,
+                    usage_total_tokens: None,
+                },
+            );
+        }
+
         debug!("llm_stream_start: stream_id={}", stream_id);
         Ok(stream_id)
     }
@@ -1685,6 +1757,36 @@ impl HostFunctions for DaemonHostFunctions {
                             }
                             data.accumulated_tool_calls.extend(chunk.tool_calls.clone());
                         }
+                    }
+                }
+
+                // Accumulate for run token-budget accounting; settle when the
+                // stream's terminal chunk arrives. Removing the entry before
+                // settling makes accrual exactly-once even if the guest also
+                // calls llm_stream_close afterwards (it always does).
+                if self.token_budget.is_some() {
+                    let mut settle: Option<StreamBudgetData> = None;
+                    if let Ok(mut budget_map) = self.stream_budget_data.lock() {
+                        if let Some(data) = budget_map.get_mut(&stream_id) {
+                            if let Some(ref text) = chunk.text {
+                                data.streamed_chars += text.len();
+                            }
+                            if let Some(ref reasoning) = chunk.reasoning {
+                                data.streamed_chars += reasoning.len();
+                            }
+                            for tc in &chunk.tool_calls {
+                                data.streamed_chars += tc.arguments.to_string().len();
+                            }
+                            if let Some(ref usage) = chunk.usage {
+                                data.usage_total_tokens = Some(usage.total_tokens as u64);
+                            }
+                        }
+                        if chunk.done {
+                            settle = budget_map.remove(&stream_id);
+                        }
+                    }
+                    if let Some(data) = settle {
+                        self.settle_stream_budget(stream_id, data);
                     }
                 }
 
@@ -1758,6 +1860,17 @@ impl HostFunctions for DaemonHostFunctions {
 
     fn llm_stream_close(&self, stream_id: u64) -> HostResult<()> {
         debug!("llm_stream_close: stream_id={}", stream_id);
+
+        // Settle budget accounting for streams that never delivered a `done`
+        // chunk (interrupt/abort/early close). If the stream already settled
+        // on its `done` chunk in llm_stream_next, the entry is gone and this
+        // is a no-op — accrual stays exactly-once.
+        if self.token_budget.is_some() {
+            let leftover = self.stream_budget_data.lock().unwrap().remove(&stream_id);
+            if let Some(data) = leftover {
+                self.settle_stream_budget(stream_id, data);
+            }
+        }
 
         // End any open thinking block before closing the stream
         let ended_id = self.current_thinking_id.lock().unwrap().take();
@@ -5794,6 +5907,35 @@ impl DaemonHostFunctions {
         Ok(())
     }
 
+    /// Settle a finished stream's spend against the run token budget.
+    ///
+    /// Called with the [`StreamBudgetData`] already *removed* from
+    /// `stream_budget_data`, which is what guarantees exactly-once accrual
+    /// across the two finalization sites (`done` chunk in `llm_stream_next`,
+    /// and `llm_stream_close` for aborted/early-closed streams). Prefers real
+    /// provider-reported usage; falls back to the chars/4 estimate.
+    fn settle_stream_budget(&self, stream_id: u64, data: StreamBudgetData) {
+        let Some(budget) = &self.token_budget else {
+            return;
+        };
+        match data.usage_total_tokens {
+            Some(total) => {
+                budget.add(total);
+            }
+            None => {
+                let estimated = estimate_tokens_from_chars(data.prompt_chars, data.streamed_chars);
+                debug!(
+                    stream_id,
+                    estimated_tokens = estimated,
+                    prompt_chars = data.prompt_chars,
+                    streamed_chars = data.streamed_chars,
+                    "provider reported no usage for stream; accruing chars/4 estimate against run token budget"
+                );
+                budget.add(estimated);
+            }
+        }
+    }
+
     /// Create a clone for builtin proxy calls to avoid infinite recursion.
     fn clone_for_builtin(&self) -> Self {
         Self {
@@ -5807,6 +5949,9 @@ impl DaemonHostFunctions {
             trace_collector: self.trace_collector.clone(),
             current_iteration: AtomicU32::new(self.current_iteration.load(Ordering::Relaxed)),
             stream_trace_data: self.stream_trace_data.clone(),
+            // Shared with the parent (like stream_trace_data): stream ids come
+            // from the shared registry, so accounting must live in one map.
+            stream_budget_data: self.stream_budget_data.clone(),
             model_override_provider: self.model_override_provider.clone(),
             model_override_model: self.model_override_model.clone(),
             skill_base_path: self.skill_base_path.clone(),
@@ -6690,12 +6835,13 @@ mod tests {
 
     // ==================== Token Budget Tests ====================
     //
-    // These exercise only the pre-dispatch gate: the budget check happens
-    // before `resolve_provider_and_model`, so it fires deterministically
-    // even with an unconfigured `AgentConfig::default()` (no provider/API
-    // key) and never touches the network. Usage *accrual* (`budget.add`)
-    // needs a real provider response and is covered by the runner-level
-    // test in task 3.2, not here.
+    // Gate tests exercise only the pre-dispatch check: it happens before
+    // `resolve_provider_and_model`, so it fires deterministically even with
+    // an unconfigured `AgentConfig::default()` (no provider/API key) and
+    // never touches the network. Streaming *accrual* is testable without a
+    // network too: the registry accepts hand-registered chunk channels, so
+    // tests drive `llm_stream_next`/`llm_stream_close` against pre-queued
+    // chunks and assert the budget's `spent` counter.
 
     fn minimal_llm_request() -> LlmRequest {
         use nevoflux_builtin_wasm::Message;
@@ -6766,6 +6912,159 @@ mod tests {
             .llm_chat(&minimal_llm_request())
             .expect_err("no provider configured");
         assert_ne!(err.code, 429);
+    }
+
+    // ---- streaming accrual ----------------------------------------------
+
+    #[test]
+    fn estimate_tokens_from_chars_is_floor_of_quarter_sum() {
+        assert_eq!(estimate_tokens_from_chars(0, 0), 0);
+        assert_eq!(estimate_tokens_from_chars(3, 0), 0); // floors below one token
+        assert_eq!(estimate_tokens_from_chars(4, 4), 2);
+        assert_eq!(estimate_tokens_from_chars(10, 9), 4); // 19 / 4 = 4 (floor)
+        assert_eq!(estimate_tokens_from_chars(100, 100), 50);
+    }
+
+    /// Build a budgeted host plus a hand-registered stream: pre-queued chunks
+    /// flow through the real `llm_stream_next`/`llm_stream_close` machinery
+    /// with no network involved. Returns (host, budget, stream_id, runtime).
+    fn setup_budgeted_stream(
+        prompt_chars: usize,
+        chunks: Vec<crate::wasm::llm::LlmStreamChunk>,
+    ) -> (
+        DaemonHostFunctions,
+        Arc<crate::agent_exec::TokenBudget>,
+        u64,
+        tokio::runtime::Runtime,
+    ) {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let budget = crate::agent_exec::TokenBudget::new(1_000_000);
+        let host =
+            DaemonHostFunctions::new(config, rt.handle().clone()).with_token_budget(budget.clone());
+
+        let stream_id = host.stream_registry.allocate_id();
+        let (tx, rx) = tokio::sync::mpsc::channel(chunks.len().max(1));
+        for chunk in chunks {
+            tx.try_send(chunk).expect("pre-queue chunk");
+        }
+        host.stream_registry.register(stream_id, rx);
+        // Mirror what llm_stream_start does when a budget is present.
+        host.stream_budget_data.lock().unwrap().insert(
+            stream_id,
+            StreamBudgetData {
+                prompt_chars,
+                streamed_chars: 0,
+                usage_total_tokens: None,
+            },
+        );
+        (host, budget, stream_id, rt)
+    }
+
+    fn text_chunk(text: &str) -> crate::wasm::llm::LlmStreamChunk {
+        crate::wasm::llm::LlmStreamChunk {
+            text: Some(text.to_string()),
+            tool_calls: vec![],
+            done: false,
+            reasoning: None,
+            images: vec![],
+            usage: None,
+        }
+    }
+
+    fn done_chunk(usage: Option<crate::wasm::llm::LlmUsage>) -> crate::wasm::llm::LlmStreamChunk {
+        crate::wasm::llm::LlmStreamChunk {
+            text: None,
+            tool_calls: vec![],
+            done: true,
+            reasoning: None,
+            images: vec![],
+            usage,
+        }
+    }
+
+    /// Drain the stream via llm_stream_next until the done chunk is seen.
+    fn drain_stream(host: &DaemonHostFunctions, stream_id: u64) {
+        for _ in 0..32 {
+            match host.llm_stream_next(stream_id).expect("stream next") {
+                Some(chunk) if chunk.done => return,
+                _ => {}
+            }
+        }
+        panic!("stream never delivered a done chunk");
+    }
+
+    #[test]
+    fn stream_with_real_usage_accrues_provider_total() {
+        let usage = crate::wasm::llm::LlmUsage {
+            prompt_tokens: 100,
+            completion_tokens: 23,
+            total_tokens: 123,
+        };
+        let (host, budget, stream_id, _rt) = setup_budgeted_stream(
+            400, // would estimate to >=100 — must NOT be used when real usage exists
+            vec![text_chunk("hello world"), done_chunk(Some(usage))],
+        );
+
+        drain_stream(&host, stream_id);
+        assert_eq!(budget.spent.load(Ordering::Relaxed), 123);
+
+        // Close after done must not double-accrue (entry already settled).
+        host.llm_stream_close(stream_id).unwrap();
+        assert_eq!(budget.spent.load(Ordering::Relaxed), 123);
+    }
+
+    #[test]
+    fn stream_without_usage_accrues_chars_estimate_on_done() {
+        // prompt 20 chars + streamed 12 chars => 32 / 4 = 8 tokens.
+        let (host, budget, stream_id, _rt) =
+            setup_budgeted_stream(20, vec![text_chunk("abcdefghijkl"), done_chunk(None)]);
+
+        drain_stream(&host, stream_id);
+        assert_eq!(budget.spent.load(Ordering::Relaxed), 8);
+
+        host.llm_stream_close(stream_id).unwrap();
+        assert_eq!(budget.spent.load(Ordering::Relaxed), 8);
+    }
+
+    #[test]
+    fn stream_closed_before_done_settles_estimate_on_close() {
+        // Abort path: consume one text chunk, never see done, then close.
+        // prompt 40 + streamed 8 => 48 / 4 = 12 tokens.
+        let (host, budget, stream_id, _rt) =
+            setup_budgeted_stream(40, vec![text_chunk("12345678")]);
+
+        let chunk = host
+            .llm_stream_next(stream_id)
+            .expect("stream next")
+            .expect("first chunk");
+        assert!(!chunk.done);
+        assert_eq!(budget.spent.load(Ordering::Relaxed), 0); // nothing settled yet
+
+        host.llm_stream_close(stream_id).unwrap();
+        assert_eq!(budget.spent.load(Ordering::Relaxed), 12);
+
+        // Double-close stays settled-once.
+        host.llm_stream_close(stream_id).unwrap();
+        assert_eq!(budget.spent.load(Ordering::Relaxed), 12);
+    }
+
+    #[test]
+    fn stream_accounting_untracked_without_budget() {
+        // A host without a budget must not create accounting entries in
+        // llm_stream_start's bookkeeping map, and next/close must not panic.
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        let stream_id = host.stream_registry.allocate_id();
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.try_send(done_chunk(None)).unwrap();
+        host.stream_registry.register(stream_id, rx);
+
+        drain_stream(&host, stream_id);
+        host.llm_stream_close(stream_id).unwrap();
+        assert!(host.stream_budget_data.lock().unwrap().is_empty());
     }
 
     // ==================== Memory Tests ====================

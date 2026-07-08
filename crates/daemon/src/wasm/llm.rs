@@ -607,12 +607,7 @@ fn sanitize_schema_for_openai_strict(schema: &mut serde_json::Value) {
         // `required` now lists every property key.
         obj.insert(
             "required".to_string(),
-            Value::Array(
-                prop_keys
-                    .iter()
-                    .map(|k| Value::String(k.clone()))
-                    .collect(),
-            ),
+            Value::Array(prop_keys.iter().map(|k| Value::String(k.clone())).collect()),
         );
 
         // Required by strict mode on every object.
@@ -1136,9 +1131,7 @@ fn build_anthropic_messages_request_body(
                     // message entirely if there's truly nothing on it.
                     continue;
                 }
-                messages.push(
-                    serde_json::json!({"role": "assistant", "content": parts}),
-                );
+                messages.push(serde_json::json!({"role": "assistant", "content": parts}));
             }
             _ => {
                 messages.push(serde_json::json!({
@@ -1428,15 +1421,16 @@ async fn execute_anthropic_chat_raw(
         }
     }
 
-    let finish_reason = raw["stop_reason"]
-        .as_str()
-        .unwrap_or("stop")
-        .to_string();
+    let finish_reason = raw["stop_reason"].as_str().unwrap_or("stop").to_string();
 
     Ok(LlmChatResponse {
         content: content_text,
         finish_reason,
-        tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+        tool_calls: if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        },
         usage: None,
         images: vec![],
     })
@@ -1999,8 +1993,15 @@ where
         .await
         .map_err(|e| DaemonError::InternalError(format!("LLM chat failed: {}", e)))?;
 
-    // Extract the response content and handle tool calls
-    process_completion_response(completion_response.choice)
+    // Extract the response content and handle tool calls. Usage was
+    // previously discarded here; it now rides along so callers (run
+    // token-budget accounting in `agent_host::llm_chat`) can accrue real
+    // provider-reported spend.
+    let usage = rig_usage_to_llm(&completion_response.usage);
+    process_completion_response(completion_response.choice).map(|mut response| {
+        response.usage = usage;
+        response
+    })
 }
 
 /// Build a rig `Message::Assistant` from a host-side `LlmMessage`.
@@ -2171,7 +2172,26 @@ fn clean_base64_data(data: &str) -> String {
     stripped.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-/// Extract text content from a rig Message.
+/// Convert rig's non-optional [`rig::completion::Usage`] into our optional
+/// [`LlmUsage`]. rig fills the struct with zeros when a provider reports
+/// nothing, so an all-zero usage maps to `None` (letting callers fall back to
+/// estimation instead of trusting a bogus zero). Providers that report only
+/// input/output get `total` summed for them.
+fn rig_usage_to_llm(usage: &rig::completion::Usage) -> Option<LlmUsage> {
+    if usage.input_tokens == 0 && usage.output_tokens == 0 && usage.total_tokens == 0 {
+        return None;
+    }
+    let total = if usage.total_tokens > 0 {
+        usage.total_tokens
+    } else {
+        usage.input_tokens + usage.output_tokens
+    };
+    Some(LlmUsage {
+        prompt_tokens: usage.input_tokens as u32,
+        completion_tokens: usage.output_tokens as u32,
+        total_tokens: total as u32,
+    })
+}
 
 /// Process the completion response and convert to LlmChatResponse.
 fn process_completion_response(choice: OneOrMany<AssistantContent>) -> Result<LlmChatResponse> {
@@ -2252,6 +2272,13 @@ pub struct LlmStreamChunk {
     /// Generated images in this chunk.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<LlmGeneratedImage>,
+    /// Usage totals for the whole call, reported by the provider. Only ever
+    /// set on the final (`done: true`) chunk, and only on paths that surface
+    /// real usage (rig streaming via `GetTokenUsage`, emulated streaming via
+    /// `execute_llm_chat`). Consumed by the run token-budget accounting in
+    /// `agent_host::llm_stream_next`; not forwarded to WASM guests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<LlmUsage>,
 }
 
 /// Stream entry for tracking active LLM streams.
@@ -2380,6 +2407,7 @@ pub async fn start_llm_stream(
             // Send error as final chunk
             let _ = tx
                 .send(LlmStreamChunk {
+                    usage: None,
                     text: Some(format!("[Error: {}]", e)),
                     tool_calls: vec![],
                     done: true,
@@ -2556,6 +2584,7 @@ async fn stream_openrouter(
         if !response.content.is_empty() {
             let _ = tx
                 .send(LlmStreamChunk {
+                    usage: None,
                     text: Some(response.content),
                     tool_calls: vec![],
                     done: false,
@@ -2569,6 +2598,7 @@ async fn stream_openrouter(
         if !response.images.is_empty() {
             let _ = tx
                 .send(LlmStreamChunk {
+                    usage: None,
                     text: None,
                     tool_calls: vec![],
                     done: false,
@@ -2581,6 +2611,7 @@ async fn stream_openrouter(
         // Done
         let _ = tx
             .send(LlmStreamChunk {
+                usage: None,
                 text: None,
                 tool_calls: vec![],
                 done: true,
@@ -2744,6 +2775,7 @@ async fn stream_qwen(
                         if !content.is_empty() {
                             let _ = tx
                                 .send(LlmStreamChunk {
+                                    usage: None,
                                     text: Some(content.to_string()),
                                     tool_calls: vec![],
                                     done: false,
@@ -2785,6 +2817,7 @@ async fn stream_qwen(
                         if !reasoning.is_empty() {
                             let _ = tx
                                 .send(LlmStreamChunk {
+                                    usage: None,
                                     text: None,
                                     tool_calls: vec![],
                                     done: false,
@@ -2819,6 +2852,7 @@ async fn stream_qwen(
         tool_calls.sort_by_key(|tc| tc.id.clone());
         let _ = tx
             .send(LlmStreamChunk {
+                usage: None,
                 text: None,
                 tool_calls,
                 done: false,
@@ -2831,6 +2865,7 @@ async fn stream_qwen(
     // Send final done chunk
     let _ = tx
         .send(LlmStreamChunk {
+            usage: None,
             text: None,
             tool_calls: vec![],
             done: true,
@@ -2937,6 +2972,7 @@ async fn stream_deepseek_raw(
                         if !content.is_empty() {
                             let _ = tx
                                 .send(LlmStreamChunk {
+                                    usage: None,
                                     text: Some(content.to_string()),
                                     tool_calls: vec![],
                                     done: false,
@@ -2952,6 +2988,7 @@ async fn stream_deepseek_raw(
                         if !r.is_empty() {
                             let _ = tx
                                 .send(LlmStreamChunk {
+                                    usage: None,
                                     text: None,
                                     tool_calls: vec![],
                                     done: false,
@@ -3011,6 +3048,7 @@ async fn stream_deepseek_raw(
         tool_calls.sort_by_key(|tc| tc.id.clone());
         let _ = tx
             .send(LlmStreamChunk {
+                usage: None,
                 text: None,
                 tool_calls,
                 done: false,
@@ -3022,6 +3060,7 @@ async fn stream_deepseek_raw(
 
     let _ = tx
         .send(LlmStreamChunk {
+            usage: None,
             text: None,
             tool_calls: vec![],
             done: true,
@@ -3164,6 +3203,7 @@ async fn stream_anthropic_raw(
                                         if !text.is_empty() {
                                             let _ = tx
                                                 .send(LlmStreamChunk {
+                                                    usage: None,
                                                     text: Some(text.to_string()),
                                                     tool_calls: vec![],
                                                     done: false,
@@ -3179,6 +3219,7 @@ async fn stream_anthropic_raw(
                                         if !thinking.is_empty() {
                                             let _ = tx
                                                 .send(LlmStreamChunk {
+                                                    usage: None,
                                                     text: None,
                                                     tool_calls: vec![],
                                                     done: false,
@@ -3243,6 +3284,7 @@ async fn stream_anthropic_raw(
         tool_calls.sort_by_key(|tc| tc.id.clone());
         let _ = tx
             .send(LlmStreamChunk {
+                usage: None,
                 text: None,
                 tool_calls,
                 done: false,
@@ -3254,6 +3296,7 @@ async fn stream_anthropic_raw(
 
     let _ = tx
         .send(LlmStreamChunk {
+            usage: None,
             text: None,
             tool_calls: vec![],
             done: true,
@@ -3535,6 +3578,7 @@ async fn stream_kimi_agent(
             WireEvent::ContentPart { text } => {
                 let _ = tx
                     .send(LlmStreamChunk {
+                        usage: None,
                         text: Some(text),
                         tool_calls: vec![],
                         done: false,
@@ -3560,6 +3604,7 @@ async fn stream_kimi_agent(
             WireEvent::ThinkingPart { text } => {
                 let _ = tx
                     .send(LlmStreamChunk {
+                        usage: None,
                         text: None,
                         tool_calls: vec![],
                         done: false,
@@ -3572,6 +3617,7 @@ async fn stream_kimi_agent(
                 tracing::warn!("stream_kimi_agent: error event: {}", msg);
                 let _ = tx
                     .send(LlmStreamChunk {
+                        usage: None,
                         text: Some(format!("\n\n[kimi-agent error] {}", msg)),
                         tool_calls: vec![],
                         done: false,
@@ -3591,6 +3637,7 @@ async fn stream_kimi_agent(
     // Send final done chunk with any tool calls
     let _ = tx
         .send(LlmStreamChunk {
+            usage: None,
             text: None,
             tool_calls,
             done: true,
@@ -3755,9 +3802,7 @@ async fn stream_acp_completion(
                         recordings_dir: services.recordings_dir.clone(),
                     };
                     tokio::spawn(crate::wasm::mcp_tool_executor::run_permission_handler(
-                        perm_rx,
-                        dummy_ctx,
-                        true,
+                        perm_rx, dummy_ctx, true,
                     ));
                 }
                 // If browser_sender is None too, the bridge won't work in
@@ -3839,6 +3884,7 @@ async fn stream_acp_completion(
                     // Tool call extraction happens at Complete.
                     let _ = tx
                         .send(LlmStreamChunk {
+                            usage: None,
                             text: Some(text),
                             tool_calls: vec![],
                             done: false,
@@ -3850,6 +3896,7 @@ async fn stream_acp_completion(
                 AcpUpdate::Thought(thought) => {
                     let _ = tx
                         .send(LlmStreamChunk {
+                            usage: None,
                             text: None,
                             tool_calls: vec![],
                             done: false,
@@ -3867,6 +3914,7 @@ async fn stream_acp_completion(
                         // messages independently of the streaming done signal.
                         let _ = tx
                             .send(LlmStreamChunk {
+                                usage: None,
                                 text: None,
                                 tool_calls: vec![],
                                 done: true,
@@ -3898,6 +3946,7 @@ async fn stream_acp_completion(
                             // Send cleaned text (without <tool_call> XML) + tool calls
                             let _ = tx
                                 .send(LlmStreamChunk {
+                                    usage: None,
                                     text: if cleaned_text.is_empty() {
                                         None
                                     } else {
@@ -3912,6 +3961,7 @@ async fn stream_acp_completion(
                         } else {
                             let _ = tx
                                 .send(LlmStreamChunk {
+                                    usage: None,
                                     text: None,
                                     tool_calls: vec![],
                                     done: true,
@@ -4255,7 +4305,10 @@ mod acp_skill_router_tests {
             parse_slash_command("/brain-recall 感冒刮哪里"),
             Some(("brain-recall", "感冒刮哪里"))
         );
-        assert_eq!(parse_slash_command("/brain-recall"), Some(("brain-recall", "")));
+        assert_eq!(
+            parse_slash_command("/brain-recall"),
+            Some(("brain-recall", ""))
+        );
         assert_eq!(
             parse_slash_command("  /brain-recall   hi  "),
             Some(("brain-recall", "hi"))
@@ -4271,7 +4324,10 @@ mod acp_skill_router_tests {
             parse_slash_command("／gemini-llm 什么是harness"),
             Some(("gemini-llm", "什么是harness"))
         );
-        assert_eq!(parse_slash_command("／gemini-llm"), Some(("gemini-llm", "")));
+        assert_eq!(
+            parse_slash_command("／gemini-llm"),
+            Some(("gemini-llm", ""))
+        );
         // Leading whitespace + full-width slash together.
         assert_eq!(
             parse_slash_command("  ／brain-recall   hi  "),
@@ -4894,6 +4950,9 @@ where
     let mut total_text_bytes: usize = 0;
     let mut total_text_chunks: usize = 0;
     let mut receiver_dropped = false;
+    // Provider-reported usage from the stream's Final summary chunk, if any.
+    // Attached to the terminal `done: true` chunk for budget accounting.
+    let mut final_usage: Option<LlmUsage> = None;
 
     // First chunk timeout: 5 minutes (provider queue delays, cold starts).
     // Inter-chunk timeout: 2 minutes (healthy streams shouldn't gap longer).
@@ -4918,6 +4977,7 @@ where
                 );
                 let _ = tx
                     .send(LlmStreamChunk {
+                        usage: None,
                         text: Some(format!(
                             "\n\n[error] LLM provider timed out after {} seconds with no {}.",
                             timeout_dur.as_secs(),
@@ -4952,6 +5012,7 @@ where
                             );
                         }
                         LlmStreamChunk {
+                            usage: None,
                             text: Some(text.text),
                             tool_calls: vec![],
                             done: false,
@@ -5042,6 +5103,7 @@ where
                     StreamedAssistantContent::Reasoning(reasoning) => {
                         tracing::debug!("Stream chunk: Reasoning");
                         LlmStreamChunk {
+                            usage: None,
                             text: None,
                             tool_calls: vec![],
                             done: false,
@@ -5052,6 +5114,7 @@ where
                     StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
                         tracing::debug!("Stream chunk: ReasoningDelta({})", reasoning);
                         LlmStreamChunk {
+                            usage: None,
                             text: None,
                             tool_calls: vec![],
                             done: false,
@@ -5059,11 +5122,22 @@ where
                             images: vec![],
                         }
                     }
-                    StreamedAssistantContent::Final(_) => {
+                    StreamedAssistantContent::Final(final_response) => {
+                        // Capture provider-reported token usage from the
+                        // stream summary (the `GetTokenUsage` bound on
+                        // `M::StreamingResponse`); it rides out on the
+                        // terminal `done: true` chunk below so the host can
+                        // accrue real spend against a run token budget.
+                        use rig::completion::GetTokenUsage;
+                        final_usage = final_response
+                            .token_usage()
+                            .as_ref()
+                            .and_then(rig_usage_to_llm);
                         tracing::info!(
-                            "Stream chunk: Final (text_so_far={} bytes, {} chunks)",
+                            "Stream chunk: Final (text_so_far={} bytes, {} chunks, usage={:?})",
                             total_text_bytes,
-                            total_text_chunks
+                            total_text_chunks,
+                            final_usage
                         );
                         continue; // Final is a summary; content was already streamed as Text/ToolCall chunks
                     }
@@ -5086,6 +5160,7 @@ where
                 let error_text = format!("\n[Error: {}]", e);
                 let _ = tx
                     .send(LlmStreamChunk {
+                        usage: None,
                         text: Some(error_text),
                         tool_calls: vec![],
                         done: false,
@@ -5133,6 +5208,7 @@ where
 
     let _ = tx
         .send(LlmStreamChunk {
+            usage: final_usage,
             text: None,
             tool_calls: final_tool_calls,
             done: true,
@@ -5240,6 +5316,40 @@ mod tests {
         let parsed: LlmChatResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.content, "Hello!");
         assert!(parsed.usage.is_none());
+    }
+
+    #[test]
+    fn rig_usage_all_zero_maps_to_none() {
+        let usage = rig::completion::Usage {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+        };
+        assert!(rig_usage_to_llm(&usage).is_none());
+    }
+
+    #[test]
+    fn rig_usage_missing_total_is_summed() {
+        let usage = rig::completion::Usage {
+            input_tokens: 70,
+            output_tokens: 30,
+            total_tokens: 0,
+        };
+        let out = rig_usage_to_llm(&usage).expect("usage present");
+        assert_eq!(out.prompt_tokens, 70);
+        assert_eq!(out.completion_tokens, 30);
+        assert_eq!(out.total_tokens, 100);
+    }
+
+    #[test]
+    fn rig_usage_reported_total_wins() {
+        let usage = rig::completion::Usage {
+            input_tokens: 70,
+            output_tokens: 30,
+            total_tokens: 110, // e.g. provider counts cached/system tokens too
+        };
+        let out = rig_usage_to_llm(&usage).expect("usage present");
+        assert_eq!(out.total_tokens, 110);
     }
 
     #[test]
@@ -5594,9 +5704,7 @@ mod tests {
     #[test]
     fn test_is_mimo_base_url() {
         assert!(is_mimo_base_url(Some("https://platform.xiaomimimo.com/v1")));
-        assert!(is_mimo_base_url(Some(
-            "HTTPS://PLATFORM.XIAOMIMIMO.COM/v1"
-        )));
+        assert!(is_mimo_base_url(Some("HTTPS://PLATFORM.XIAOMIMIMO.COM/v1")));
         assert!(is_mimo_base_url(Some("https://xiaomimimo.com")));
         assert!(!is_mimo_base_url(Some("https://api.deepseek.com/v1")));
         assert!(!is_mimo_base_url(Some("https://api.openai.com/v1")));
@@ -5660,6 +5768,7 @@ mod tests {
     #[test]
     fn test_stream_chunk_serialization() {
         let chunk = LlmStreamChunk {
+            usage: None,
             text: Some("Hello".into()),
             tool_calls: vec![],
             done: false,
@@ -5679,6 +5788,7 @@ mod tests {
     #[test]
     fn test_stream_chunk_with_tool_calls() {
         let chunk = LlmStreamChunk {
+            usage: None,
             text: None,
             tool_calls: vec![LlmToolCall {
                 id: "call_123".into(),
@@ -5700,6 +5810,7 @@ mod tests {
     #[test]
     fn test_stream_chunk_done() {
         let chunk = LlmStreamChunk {
+            usage: None,
             text: None,
             tool_calls: vec![],
             done: true,
@@ -5738,6 +5849,7 @@ mod tests {
 
         // Send a chunk
         tx.send(LlmStreamChunk {
+            usage: None,
             text: Some("Hello".into()),
             tool_calls: vec![],
             done: false,
@@ -5770,6 +5882,7 @@ mod tests {
 
         // Send done chunk
         tx.send(LlmStreamChunk {
+            usage: None,
             text: None,
             tool_calls: vec![],
             done: true,
