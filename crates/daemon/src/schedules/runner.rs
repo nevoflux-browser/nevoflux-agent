@@ -14,14 +14,28 @@
 //! `final_text = None` — mirroring `loops::executor`'s stub — so the manager's
 //! due-tick, boot-rearm and counter logic are testable without an LLM.
 //!
-//! ## Browser policy (P1)
+//! ## Browser policy (P4)
 //!
-//! - `none`  → `borrow_proxy = false` (no browser routing).
-//! - `live`  → `borrow_proxy = true` (borrow the creator session's most recent
-//!   sidebar proxy; if none exists `browser_*` tools fail per-call — full
-//!   defer/skip semantics land in P4).
-//! - `headless` → the run ends immediately as `Error("headless policy lands in
-//!   P4")`; a bound headless browser is a P4 concern.
+//! The pure decision core [`plan_browser`] maps `(policy, on_unavailable,
+//! browser_available, env_bin_set)` onto a [`BrowserPlan`]; `execute_run`
+//! dispatches on it BEFORE the stub short-circuit (so defer/skip verdicts are
+//! recorded even without an LLM):
+//!
+//! - `none`  → `borrow_proxy = false` AND the `browser_*` / `computer_*` tools
+//!   are stripped from the run's allowlist via `forbidden_prefixes` (the stored
+//!   mode's non-browser tools stay available).
+//! - `live`  → at fire time, `CURRENT_BROWSER_REGISTRY.any()`. Present ⇒
+//!   `borrow_proxy = true` (borrow the creator session's most recent sidebar
+//!   proxy — the P1 path, unchanged). Absent ⇒ `on_unavailable`: `skip` records
+//!   the run `Skipped`; `defer` (the default) records it `Deferred` and parks
+//!   the schedule id in the manager's deferred set for a coalesced re-fire once
+//!   a browser returns. Neither bumps `consecutive_failures`.
+//! - `headless` → guarded by `NEVOFLUX_BROWSER_BIN` (unset ⇒ run `Error`). Per
+//!   run: clone a base profile, inject the automation pref, hold the global
+//!   [`headless_launch_lock`] across `proxy_ids()` snapshot → spawn →
+//!   `wait_for_new_browser`, bind the new instance, run the kernel with
+//!   `bound_browser: Some(entry)`, and ALWAYS tear the browser + clone down on
+//!   every exit path.
 //!
 //! ## Token budget + goal loop (P3)
 //!
@@ -38,19 +52,145 @@
 //! without a network (see the tests).
 
 use crate::agent_exec::{run_agent_once, AgentExecRequest, TokenBudget};
+use crate::browser_launch::{
+    kill_profile_processes, spawn_and_supervise_excluding, BrowserLaunchConfig,
+};
 use crate::goals::evaluator::{evaluate, resolve_evaluator, EvaluatorChoice, Verdict};
+use crate::profile::ProfileManager;
+use crate::registry::{BrowserEntry, BrowserRegistry};
 use crate::schedules::events::ScheduleEvents;
 use crate::wasm::services::HostServices;
 use nevoflux_storage::models::current_timestamp;
 use nevoflux_storage::models::schedule::{ScheduleRecord, ScheduleRunStatus};
 use nevoflux_storage::repositories::ScheduleRepository;
 use nevoflux_storage::Database;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Default per-run turn budget for a goal-wrapped schedule when
 /// `goal_max_turns` is unset (or non-positive). Mirrors the goals engine.
 const DEFAULT_GOAL_MAX_TURNS: i64 = 20;
+
+/// Env var naming the nevoflux (Gecko fork) binary a headless-policy run
+/// launches. Required for the `headless` policy — unset ⇒ the run errors.
+const HEADLESS_BROWSER_BIN_ENV: &str = "NEVOFLUX_BROWSER_BIN";
+
+/// Readiness barrier for a spawned headless browser: how long to wait for its
+/// extension to auto-connect + register before the run fails.
+const HEADLESS_REGISTER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Tool-name prefixes stripped from a `none`-policy run's allowlist: a run with
+/// no browser must not see `browser_*` / `computer_*` tools (they would hang on
+/// a routing target that does not exist). The stored mode's other tools stay.
+fn none_policy_forbidden_prefixes() -> Vec<String> {
+    vec!["browser_".to_string(), "computer_".to_string()]
+}
+
+/// Process-global serialization lock for headless launches. Two schedules
+/// launching a headless browser concurrently would each snapshot the other's
+/// registration as part of its `exclude` set — or, worse, cross-bind the
+/// other's just-registered instance as "new". Holding this from the
+/// `proxy_ids()` snapshot through `wait_for_new_browser` completion makes each
+/// launch see a stable before/after picture. At the ≥1h schedule cadence
+/// contention is negligible.
+fn headless_launch_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Resolve the base-profiles directory: `NEVOFLUX_BASE_PROFILES` if set, else
+/// `<config_dir>/base-profiles` (config_dir resolved the same way the daemon
+/// loads config — see `crate::paths`). A missing base yields an empty clone
+/// (documented `ProfileManager` behavior — the run proceeds without login state).
+fn resolve_base_profiles_dir() -> PathBuf {
+    if let Some(v) = std::env::var_os("NEVOFLUX_BASE_PROFILES") {
+        return PathBuf::from(v);
+    }
+    crate::config::AgentConfig::default_config_path()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("base-profiles")
+}
+
+/// Resolve the ephemeral clone work directory: `NEVOFLUX_PROFILE_WORK` if set,
+/// else `$TMPDIR/nevoflux-profiles`.
+fn resolve_profile_work_dir() -> PathBuf {
+    std::env::var_os("NEVOFLUX_PROFILE_WORK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("nevoflux-profiles"))
+}
+
+/// Browser routing for one run: whether to borrow the session's sidebar proxy
+/// (`live`) and/or route to an explicitly-bound headless browser. Threaded
+/// through both the plain and goal-wrapped execution paths.
+#[derive(Clone, Default)]
+struct BrowserRouting {
+    /// Borrow the session's most-recent sidebar proxy (the `live` P1 path).
+    borrow_proxy: bool,
+    /// Route `browser_*` tools to this explicitly-bound browser (headless).
+    bound_browser: Option<BrowserEntry>,
+}
+
+/// The pure browser-policy decision core. Maps a schedule's `(policy,
+/// on_unavailable)` plus the fire-time facts (`browser_available` from the
+/// registry, `env_bin_set` for headless) onto the plan `execute_run` dispatches
+/// on. Total + side-effect free, so it is unit-tested exhaustively.
+///
+/// `browser_available` is only consulted for `live`; `env_bin_set` only for
+/// `headless`. An unrecognized policy is a defensive `Error` (create-time
+/// validation should already have rejected it).
+pub(crate) fn plan_browser(
+    policy: &str,
+    on_unavailable: Option<&str>,
+    browser_available: bool,
+    env_bin_set: bool,
+) -> BrowserPlan {
+    match policy {
+        "none" => BrowserPlan::UseNone,
+        "live" => {
+            if browser_available {
+                BrowserPlan::UseLive
+            } else if matches!(on_unavailable, Some("skip")) {
+                BrowserPlan::Skip
+            } else {
+                // Default (None) and explicit "defer" both defer.
+                BrowserPlan::Defer
+            }
+        }
+        "headless" => {
+            if env_bin_set {
+                BrowserPlan::LaunchHeadless
+            } else {
+                BrowserPlan::Error(format!(
+                    "headless browser policy requires the {HEADLESS_BROWSER_BIN_ENV} env var to be set"
+                ))
+            }
+        }
+        other => BrowserPlan::Error(format!("invalid browser_policy: {other}")),
+    }
+}
+
+/// Outcome of [`plan_browser`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BrowserPlan {
+    /// Run with no browser; strip `browser_*` / `computer_*` from the allowlist.
+    UseNone,
+    /// Run with the live sidebar-proxy borrow (a browser is available).
+    UseLive,
+    /// No live browser + `on_unavailable=defer`: record `Deferred`, park for
+    /// a coalesced re-fire when a browser returns.
+    Defer,
+    /// No live browser + `on_unavailable=skip`: record `Skipped`.
+    Skip,
+    /// Launch + bind a headless browser for the duration of the run.
+    LaunchHeadless,
+    /// The policy cannot run as configured (headless without the env var, or an
+    /// invalid policy string) — record `Error` with this message.
+    Error(String),
+}
 
 /// Outcome of a single schedule run, consumed by
 /// `manager::ScheduleManager::finish_fire` to apply next-fire/status
@@ -62,7 +202,7 @@ pub struct RunResult {
     pub run_id: i64,
     /// True on a successful agent turn (or the stub path).
     pub ok: bool,
-    /// The persisted run status (`Ok` or `Error` in P1).
+    /// The persisted run status (`Ok` / `Error` / `Skipped` / `Deferred`).
     pub status: ScheduleRunStatus,
     /// Short error string when `ok == false`.
     pub error: Option<String>,
@@ -86,13 +226,17 @@ fn forbidden_tools() -> Vec<String> {
 }
 
 /// Execute one run of `rec` with the given `fire_kind` (`scheduled` | `manual`
-/// | `catchup`). See the module docs for the stub/production split.
+/// | `catchup`). `registry` is the browser registry the fire-time policy
+/// decision consults (the manager threads its injected-or-global registry
+/// here); `None` means no registry is available (live ⇒ unavailable, headless
+/// ⇒ error). See the module docs for the policy dispatch and the stub split.
 pub async fn execute_run(
     services: &Option<HostServices>,
     events: &ScheduleEvents,
     db: &Database,
     rec: &ScheduleRecord,
     fire_kind: &str,
+    registry: Option<Arc<BrowserRegistry>>,
 ) -> RunResult {
     let repo = ScheduleRepository::new(db);
     let start = current_timestamp();
@@ -116,30 +260,184 @@ pub async fn execute_run(
         .run_start(&rec.id, &rec.name, run_id, fire_kind, start)
         .await;
 
-    // Headless browser policy is a P4 concern; refuse the run cleanly for now.
-    if rec.browser_policy == "headless" {
-        return end_run(
-            &repo,
-            events,
-            rec,
-            run_id,
-            ScheduleRunStatus::Error,
-            Some("headless policy lands in P4".to_string()),
-            None,
-            None,
-            None,
-        )
-        .await;
+    // Browser policy decision — BEFORE the stub short-circuit, so a defer/skip
+    // verdict is recorded even on the (LLM-less) stub path used by the
+    // manager's coalesce tests.
+    let browser_available = registry.as_ref().and_then(|r| r.any()).is_some();
+    let env_bin_set = std::env::var_os(HEADLESS_BROWSER_BIN_ENV)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let plan = plan_browser(
+        &rec.browser_policy,
+        rec.on_unavailable.as_deref(),
+        browser_available,
+        env_bin_set,
+    );
+
+    // Non-executing verdicts: record the terminal status + return. None of
+    // these bump `consecutive_failures` in the manager (skip/defer are waiting
+    // states, not failures; the manager keys on `result.status`).
+    match &plan {
+        BrowserPlan::Error(msg) => {
+            return end_run(
+                &repo,
+                events,
+                rec,
+                run_id,
+                ScheduleRunStatus::Error,
+                Some(msg.clone()),
+                None,
+                None,
+                None,
+            )
+            .await;
+        }
+        BrowserPlan::Skip => {
+            return end_run(
+                &repo,
+                events,
+                rec,
+                run_id,
+                ScheduleRunStatus::Skipped,
+                Some("live browser unavailable; on_unavailable=skip".to_string()),
+                None,
+                None,
+                None,
+            )
+            .await;
+        }
+        BrowserPlan::Defer => {
+            return end_run(
+                &repo,
+                events,
+                rec,
+                run_id,
+                ScheduleRunStatus::Deferred,
+                Some("live browser unavailable; deferred until one returns".to_string()),
+                None,
+                None,
+                None,
+            )
+            .await;
+        }
+        // Executing plans fall through.
+        BrowserPlan::UseNone | BrowserPlan::UseLive | BrowserPlan::LaunchHeadless => {}
     }
 
     let user_message = build_user_message(rec, fire_kind, services.as_ref()).await;
 
+    // Session scoping: reuse the creator's session so artifacts and (for `live`)
+    // the borrowed sidebar proxy resolve; fall back to a per-schedule synthetic
+    // session id when the schedule was created without a creator session.
+    let session_id = rec
+        .creator_session_id
+        .clone()
+        .unwrap_or_else(|| format!("schedule:{}", rec.id));
+    let mode = crate::loops::manager::db_str_to_agent_mode(&rec.mode);
+
+    // Per-run token budget: applies to plain AND goal-wrapped runs. A
+    // non-positive limit is treated as unbounded (no budget installed).
+    let budget = rec
+        .max_tokens_per_run
+        .filter(|l| *l > 0)
+        .map(|limit| TokenBudget::new(limit as u64));
+
+    match plan {
+        BrowserPlan::UseNone => {
+            run_executing(
+                &repo,
+                events,
+                rec,
+                run_id,
+                services,
+                session_id,
+                mode,
+                budget,
+                BrowserRouting::default(),
+                none_policy_forbidden_prefixes(),
+                user_message,
+            )
+            .await
+        }
+        BrowserPlan::UseLive => {
+            run_executing(
+                &repo,
+                events,
+                rec,
+                run_id,
+                services,
+                session_id,
+                mode,
+                budget,
+                BrowserRouting {
+                    borrow_proxy: true,
+                    bound_browser: None,
+                },
+                Vec::new(),
+                user_message,
+            )
+            .await
+        }
+        BrowserPlan::LaunchHeadless => {
+            // Headless is a production-only path — it spawns a real browser
+            // process. Guard the stub path so tests never launch a browser.
+            let Some(services) = services.as_ref() else {
+                return end_run(
+                    &repo,
+                    events,
+                    rec,
+                    run_id,
+                    ScheduleRunStatus::Error,
+                    Some("headless run requires host services".to_string()),
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+            };
+            run_headless(
+                &repo,
+                events,
+                rec,
+                run_id,
+                services,
+                registry,
+                session_id,
+                mode,
+                budget,
+                user_message,
+            )
+            .await
+        }
+        // Non-executing verdicts already returned above.
+        BrowserPlan::Error(_) | BrowserPlan::Skip | BrowserPlan::Defer => unreachable!(),
+    }
+}
+
+/// Run an executing plan (`UseNone` / `UseLive` / headless-bound) to a persisted
+/// run row. Handles the stub short-circuit (no services ⇒ immediate `Ok`), then
+/// dispatches to the goal loop or a single plain kernel call. `routing` +
+/// `forbidden_prefixes` carry the browser policy into the kernel request(s).
+#[allow(clippy::too_many_arguments)]
+async fn run_executing(
+    repo: &ScheduleRepository<'_>,
+    events: &ScheduleEvents,
+    rec: &ScheduleRecord,
+    run_id: i64,
+    services: &Option<HostServices>,
+    session_id: String,
+    mode: nevoflux_builtin_wasm::AgentMode,
+    budget: Option<Arc<TokenBudget>>,
+    routing: BrowserRouting,
+    forbidden_prefixes: Vec<String>,
+    user_message: String,
+) -> RunResult {
     // Stub path: no services wired (unit tests) → immediate ok, no text.
     let services = match services.as_ref() {
         Some(s) => s,
         None => {
             return end_run(
-                &repo,
+                repo,
                 events,
                 rec,
                 run_id,
@@ -153,35 +451,18 @@ pub async fn execute_run(
         }
     };
 
-    // Production path. Session scoping: reuse the creator's session so artifacts
-    // and (for `live`) the borrowed sidebar proxy resolve; fall back to a
-    // per-schedule synthetic session id when the schedule was created without a
-    // creator session.
-    let session_id = rec
-        .creator_session_id
-        .clone()
-        .unwrap_or_else(|| format!("schedule:{}", rec.id));
-    let borrow_proxy = rec.browser_policy == "live";
-    let mode = crate::loops::manager::db_str_to_agent_mode(&rec.mode);
-
-    // Per-run token budget: applies to plain AND goal-wrapped runs. A
-    // non-positive limit is treated as unbounded (no budget installed).
-    let budget = rec
-        .max_tokens_per_run
-        .filter(|l| *l > 0)
-        .map(|limit| TokenBudget::new(limit as u64));
-
     // Goal-wrapped run: drive the goal turn loop.
     if let Some(condition) = rec.goal_condition.clone() {
         return run_goal_wrapped(
-            &repo,
+            repo,
             events,
             rec,
             run_id,
             services,
             session_id,
             mode,
-            borrow_proxy,
+            routing,
+            forbidden_prefixes,
             budget,
             condition,
             user_message,
@@ -196,11 +477,11 @@ pub async fn execute_run(
         mode,
         user_message,
         forbidden_tools: forbidden_tools(),
-        forbidden_prefixes: Vec::new(),
+        forbidden_prefixes,
         unattended: true,
         iteration_loop_id: None,
-        borrow_proxy,
-        bound_browser: None,
+        borrow_proxy: routing.borrow_proxy,
+        bound_browser: routing.bound_browser,
         history: Vec::new(),
         token_budget: budget.clone(),
     };
@@ -208,7 +489,7 @@ pub async fn execute_run(
     match run_agent_once(services, req).await {
         Ok(outcome) => {
             end_run(
-                &repo,
+                repo,
                 events,
                 rec,
                 run_id,
@@ -222,7 +503,7 @@ pub async fn execute_run(
         }
         Err(e) => {
             end_run(
-                &repo,
+                repo,
                 events,
                 rec,
                 run_id,
@@ -235,6 +516,173 @@ pub async fn execute_run(
             .await
         }
     }
+}
+
+/// The headless-policy run: clone + prep a profile, launch and bind a dedicated
+/// browser, run the kernel against it, and ALWAYS tear the browser + clone down
+/// on every exit path.
+///
+/// Teardown discipline: before a browser handle exists (clone/inject/launch
+/// failures) we still `kill_profile_processes` + `cleanup` the clone (the launch
+/// may have spawned a process that never registered). Once the handle exists,
+/// every subsequent exit runs the full `handle.terminate()` +
+/// `kill_profile_processes` + `cleanup`. `run_executing` always returns a
+/// `RunResult` (kernel error included), so the teardown after it is unconditional.
+#[allow(clippy::too_many_arguments)]
+async fn run_headless(
+    repo: &ScheduleRepository<'_>,
+    events: &ScheduleEvents,
+    rec: &ScheduleRecord,
+    run_id: i64,
+    services: &HostServices,
+    registry: Option<Arc<BrowserRegistry>>,
+    session_id: String,
+    mode: nevoflux_builtin_wasm::AgentMode,
+    budget: Option<Arc<TokenBudget>>,
+    user_message: String,
+) -> RunResult {
+    // env guard already passed via `plan_browser`; re-read the concrete path.
+    let browser_bin = match std::env::var_os(HEADLESS_BROWSER_BIN_ENV) {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => {
+            return headless_error(
+                repo,
+                events,
+                rec,
+                run_id,
+                format!(
+                "headless browser policy requires the {HEADLESS_BROWSER_BIN_ENV} env var to be set"
+            ),
+            )
+            .await;
+        }
+    };
+    let Some(registry) = registry else {
+        return headless_error(
+            repo,
+            events,
+            rec,
+            run_id,
+            "browser registry unavailable".to_string(),
+        )
+        .await;
+    };
+
+    let profile_mgr = ProfileManager {
+        base_dir: resolve_base_profiles_dir(),
+        work_dir: resolve_profile_work_dir(),
+    };
+    let base_name = rec.headless_profile.as_deref().unwrap_or("default");
+    let clone = match profile_mgr.clone_base(base_name) {
+        Ok(c) => c,
+        Err(e) => {
+            return headless_error(
+                repo,
+                events,
+                rec,
+                run_id,
+                format!("profile clone failed: {e}"),
+            )
+            .await;
+        }
+    };
+    if let Err(e) = profile_mgr.inject_automation_pref(&clone) {
+        // Clone dir exists; no browser spawned yet — clean up the clone.
+        teardown_clone(&profile_mgr, &clone).await;
+        return headless_error(
+            repo,
+            events,
+            rec,
+            run_id,
+            format!("profile pref injection failed: {e}"),
+        )
+        .await;
+    }
+
+    let cfg = BrowserLaunchConfig {
+        browser_bin,
+        profile_dir: clone.clone(),
+        display: std::env::var("DISPLAY").ok(),
+        register_timeout: HEADLESS_REGISTER_TIMEOUT,
+    };
+
+    // Serialize the snapshot→spawn→bind window against other headless launches.
+    let spawn_result = {
+        let _guard = headless_launch_lock().lock().await;
+        let snapshot = registry.proxy_ids();
+        spawn_and_supervise_excluding(cfg, registry.clone(), &snapshot).await
+    };
+    let (mut handle, entry) = match spawn_result {
+        Ok(pair) => pair,
+        Err(e) => {
+            // Spawn error OR register timeout: a process may be running under the
+            // clone profile — kill it and clean the clone.
+            teardown_clone(&profile_mgr, &clone).await;
+            return headless_error(
+                repo,
+                events,
+                rec,
+                run_id,
+                format!("headless browser launch failed: {e}"),
+            )
+            .await;
+        }
+    };
+
+    // Run the kernel bound to the spawned browser. `run_executing` always
+    // returns (kernel error included) so teardown below is unconditional.
+    let result = run_executing(
+        repo,
+        events,
+        rec,
+        run_id,
+        &Some(services.clone()),
+        session_id,
+        mode,
+        budget,
+        BrowserRouting {
+            borrow_proxy: false,
+            bound_browser: Some(entry),
+        },
+        Vec::new(),
+        user_message,
+    )
+    .await;
+
+    // Unconditional teardown (kernel ok AND kernel error reach here).
+    handle.terminate().await;
+    teardown_clone(&profile_mgr, &clone).await;
+
+    result
+}
+
+/// Kill any process still holding the clone profile and remove the clone dir.
+/// Best-effort; used on every headless exit path.
+async fn teardown_clone(profile_mgr: &ProfileManager, clone: &Path) {
+    kill_profile_processes(clone).await;
+    profile_mgr.cleanup(clone);
+}
+
+/// Record a headless failure as an `Error` run row + event.
+async fn headless_error(
+    repo: &ScheduleRepository<'_>,
+    events: &ScheduleEvents,
+    rec: &ScheduleRecord,
+    run_id: i64,
+    msg: String,
+) -> RunResult {
+    end_run(
+        repo,
+        events,
+        rec,
+        run_id,
+        ScheduleRunStatus::Error,
+        Some(msg),
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 /// Snapshot the tokens spent so far on a budget (for `record_run_end`). `None`
@@ -390,12 +838,14 @@ async fn drive_goal_loop<D: GoalTurnDriver>(
 }
 
 /// Production [`GoalTurnDriver`]: each turn calls the shared unattended kernel
-/// (threading the budget) and each evaluation calls the resolved evaluator.
+/// (threading the budget + browser routing) and each evaluation calls the
+/// resolved evaluator.
 struct ProductionGoalDriver<'a> {
     services: &'a HostServices,
     session_id: String,
     mode: nevoflux_builtin_wasm::AgentMode,
-    borrow_proxy: bool,
+    routing: BrowserRouting,
+    forbidden_prefixes: Vec<String>,
     budget: Option<Arc<TokenBudget>>,
     choice: EvaluatorChoice,
     condition: String,
@@ -412,11 +862,11 @@ impl GoalTurnDriver for ProductionGoalDriver<'_> {
             mode: self.mode,
             user_message,
             forbidden_tools: forbidden_tools(),
-            forbidden_prefixes: Vec::new(),
+            forbidden_prefixes: self.forbidden_prefixes.clone(),
             unattended: true,
             iteration_loop_id: None,
-            borrow_proxy: self.borrow_proxy,
-            bound_browser: None,
+            borrow_proxy: self.routing.borrow_proxy,
+            bound_browser: self.routing.bound_browser.clone(),
             history,
             token_budget: self.budget.clone(),
         };
@@ -442,7 +892,8 @@ async fn run_goal_wrapped(
     services: &HostServices,
     session_id: String,
     mode: nevoflux_builtin_wasm::AgentMode,
-    borrow_proxy: bool,
+    routing: BrowserRouting,
+    forbidden_prefixes: Vec<String>,
     budget: Option<Arc<TokenBudget>>,
     condition: String,
     first_message: String,
@@ -494,7 +945,8 @@ async fn run_goal_wrapped(
         services,
         session_id,
         mode,
-        borrow_proxy,
+        routing,
+        forbidden_prefixes,
         budget: budget.clone(),
         choice,
         condition,
@@ -676,7 +1128,7 @@ mod tests {
         repo.create(&rec).unwrap();
 
         let events = ScheduleEvents::new(None);
-        let res = execute_run(&None, &events, &db, &rec, "scheduled").await;
+        let res = execute_run(&None, &events, &db, &rec, "scheduled", None).await;
 
         assert!(res.ok);
         assert_eq!(res.status, ScheduleRunStatus::Ok);
@@ -689,7 +1141,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn headless_policy_run_errors_immediately() {
+    async fn headless_policy_stub_run_errors_without_env_or_services() {
+        // Stub path (no services) + no `NEVOFLUX_BROWSER_BIN`: a headless run
+        // errors before spawning anything. (If the env var happens to be set in
+        // CI, the missing services guard yields an equally-`headless` error — no
+        // browser process is ever launched on the stub path either way.)
         let db = Database::open_in_memory().unwrap();
         let repo = ScheduleRepository::new(&db);
         let mut rec = sample("sch00002");
@@ -697,7 +1153,7 @@ mod tests {
         repo.create(&rec).unwrap();
 
         let events = ScheduleEvents::new(None);
-        let res = execute_run(&None, &events, &db, &rec, "manual").await;
+        let res = execute_run(&None, &events, &db, &rec, "manual", None).await;
 
         assert!(!res.ok);
         assert_eq!(res.status, ScheduleRunStatus::Error);
@@ -705,6 +1161,170 @@ mod tests {
 
         let runs = repo.list_runs("sch00002", 10).unwrap();
         assert_eq!(runs[0].status, ScheduleRunStatus::Error);
+    }
+
+    // ---- plan_browser (pure decision core) ---------------------------------
+
+    #[test]
+    fn plan_none_is_use_none_regardless_of_availability_or_env() {
+        // `none` never consults the registry or the headless env var.
+        for available in [false, true] {
+            for env in [false, true] {
+                assert_eq!(
+                    plan_browser("none", None, available, env),
+                    BrowserPlan::UseNone
+                );
+                assert_eq!(
+                    plan_browser("none", Some("skip"), available, env),
+                    BrowserPlan::UseNone
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plan_live_available_is_use_live() {
+        // Availability wins over on_unavailable, and env is irrelevant to live.
+        for ou in [None, Some("defer"), Some("skip")] {
+            for env in [false, true] {
+                assert_eq!(
+                    plan_browser("live", ou, true, env),
+                    BrowserPlan::UseLive,
+                    "ou={ou:?} env={env}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plan_live_unavailable_defers_by_default_and_on_defer() {
+        // None (default) and explicit "defer" both defer.
+        assert_eq!(plan_browser("live", None, false, false), BrowserPlan::Defer);
+        assert_eq!(
+            plan_browser("live", Some("defer"), false, false),
+            BrowserPlan::Defer
+        );
+        // Env has no bearing on the live path.
+        assert_eq!(plan_browser("live", None, false, true), BrowserPlan::Defer);
+    }
+
+    #[test]
+    fn plan_live_unavailable_skips_on_skip() {
+        assert_eq!(
+            plan_browser("live", Some("skip"), false, false),
+            BrowserPlan::Skip
+        );
+        assert_eq!(
+            plan_browser("live", Some("skip"), false, true),
+            BrowserPlan::Skip
+        );
+    }
+
+    #[test]
+    fn plan_headless_launches_only_when_env_set() {
+        // Env set ⇒ launch, regardless of availability or on_unavailable.
+        for available in [false, true] {
+            for ou in [None, Some("defer"), Some("skip")] {
+                assert_eq!(
+                    plan_browser("headless", ou, available, true),
+                    BrowserPlan::LaunchHeadless,
+                    "available={available} ou={ou:?}"
+                );
+            }
+        }
+        // Env unset ⇒ error naming the env var.
+        match plan_browser("headless", None, true, false) {
+            BrowserPlan::Error(msg) => {
+                assert!(msg.contains(HEADLESS_BROWSER_BIN_ENV), "msg={msg}");
+                assert!(msg.contains("headless"), "msg={msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_unknown_policy_is_error() {
+        match plan_browser("bogus", None, true, true) {
+            BrowserPlan::Error(msg) => assert!(msg.contains("bogus"), "msg={msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    // ---- execute_run policy dispatch (stub path) ---------------------------
+
+    fn live_rec(id: &str, on_unavailable: Option<&str>) -> ScheduleRecord {
+        let mut rec = sample(id);
+        rec.browser_policy = "live".into();
+        rec.on_unavailable = on_unavailable.map(|s| s.to_string());
+        rec
+    }
+
+    #[tokio::test]
+    async fn live_defer_records_deferred_without_browser() {
+        let db = Database::open_in_memory().unwrap();
+        let repo = ScheduleRepository::new(&db);
+        let rec = live_rec("schlive1", None); // default defer
+        repo.create(&rec).unwrap();
+
+        let events = ScheduleEvents::new(None);
+        // Empty registry ⇒ no browser available ⇒ defer.
+        let registry = Arc::new(BrowserRegistry::new());
+        let res = execute_run(&None, &events, &db, &rec, "scheduled", Some(registry)).await;
+
+        assert!(!res.ok);
+        assert_eq!(res.status, ScheduleRunStatus::Deferred);
+        let runs = repo.list_runs("schlive1", 10).unwrap();
+        assert_eq!(runs[0].status, ScheduleRunStatus::Deferred);
+    }
+
+    #[tokio::test]
+    async fn live_skip_records_skipped_without_browser() {
+        let db = Database::open_in_memory().unwrap();
+        let repo = ScheduleRepository::new(&db);
+        let rec = live_rec("schlive2", Some("skip"));
+        repo.create(&rec).unwrap();
+
+        let events = ScheduleEvents::new(None);
+        let registry = Arc::new(BrowserRegistry::new());
+        let res = execute_run(&None, &events, &db, &rec, "scheduled", Some(registry)).await;
+
+        assert!(!res.ok);
+        assert_eq!(res.status, ScheduleRunStatus::Skipped);
+        let runs = repo.list_runs("schlive2", 10).unwrap();
+        assert_eq!(runs[0].status, ScheduleRunStatus::Skipped);
+    }
+
+    #[tokio::test]
+    async fn live_with_browser_runs_via_stub() {
+        let db = Database::open_in_memory().unwrap();
+        let repo = ScheduleRepository::new(&db);
+        let rec = live_rec("schlive3", None);
+        repo.create(&rec).unwrap();
+
+        let events = ScheduleEvents::new(None);
+        // A registered browser ⇒ available ⇒ UseLive ⇒ stub Ok.
+        let registry = Arc::new(BrowserRegistry::new());
+        registry.register("proxy-b1", b"proxy-b1".to_vec());
+        let res = execute_run(&None, &events, &db, &rec, "scheduled", Some(registry)).await;
+
+        assert!(res.ok);
+        assert_eq!(res.status, ScheduleRunStatus::Ok);
+        let runs = repo.list_runs("schlive3", 10).unwrap();
+        assert_eq!(runs[0].status, ScheduleRunStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn none_policy_runs_via_stub_ignoring_registry() {
+        // `none` never blocks on browser availability.
+        let db = Database::open_in_memory().unwrap();
+        let repo = ScheduleRepository::new(&db);
+        let rec = sample("schnone1"); // browser_policy "none"
+        repo.create(&rec).unwrap();
+
+        let events = ScheduleEvents::new(None);
+        let res = execute_run(&None, &events, &db, &rec, "scheduled", None).await;
+        assert!(res.ok);
+        assert_eq!(res.status, ScheduleRunStatus::Ok);
     }
 
     // ---- next_goal_step (pure decision core) -------------------------------

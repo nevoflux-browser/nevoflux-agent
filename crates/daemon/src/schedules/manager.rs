@@ -28,6 +28,7 @@
 //! (`last_run_status` / `consecutive_failures`), not teardown.
 
 use crate::event_bus::EventBus;
+use crate::registry::BrowserRegistry;
 use crate::schedules::cron;
 use crate::schedules::events::ScheduleEvents;
 use crate::schedules::runner::{self, RunResult};
@@ -107,9 +108,55 @@ struct Inner {
     /// Active schedules + in-flight runs. See the module-level idle-inhibitor
     /// note for the exact transitions.
     pending_work: Arc<AtomicUsize>,
+    /// Schedule ids parked by a `live`-policy `defer` (browser unavailable at
+    /// fire time). Drained + coalesced-refired on the first tick a browser is
+    /// available (one fire per schedule — a HashSet dedupes repeat deferrals).
+    /// `cancel`/`pause` evict ids so the set can't grow across lifecycle churn;
+    /// `run_one` re-reads live status as the final guard. Held only briefly
+    /// (no await under the lock), so a std Mutex is fine.
+    deferred: StdMutex<HashSet<String>>,
+    /// Browser registry the runner's fire-time policy consults. `None` in
+    /// production (falls back to the process-global
+    /// [`crate::registry::CURRENT_BROWSER_REGISTRY`]); tests inject a fake here
+    /// via [`Inner::inject_browser_registry_for_test`] to drive live/defer
+    /// paths deterministically.
+    browser_registry: std::sync::OnceLock<Arc<BrowserRegistry>>,
 }
 
 impl Inner {
+    /// Resolve the browser registry the fire-time policy consults: the injected
+    /// one (tests) if present, else the process-global set at daemon boot.
+    fn resolve_registry(&self) -> Option<Arc<BrowserRegistry>> {
+        self.browser_registry
+            .get()
+            .cloned()
+            .or_else(|| crate::registry::CURRENT_BROWSER_REGISTRY.get().cloned())
+    }
+
+    /// If a browser is available AND deferred schedules are parked, drain and
+    /// return them for a coalesced re-fire; otherwise leave the set intact and
+    /// return empty. Pure decision half of the tick's defer-coalesce (the tick
+    /// spawns the returned ids); testable without spawning.
+    fn take_deferred_if_available(&self) -> Vec<String> {
+        if self.resolve_registry().and_then(|r| r.any()).is_none() {
+            return Vec::new();
+        }
+        let mut set = self.deferred.lock().unwrap();
+        set.drain().collect()
+    }
+
+    /// Evict a schedule id from the deferred set (on cancel/pause) so a
+    /// terminated/paused schedule never lingers as parked work.
+    fn drop_deferred(&self, id: &str) {
+        self.deferred.lock().unwrap().remove(id);
+    }
+
+    /// Test seam: inject a fake browser registry (see [`Inner::browser_registry`]).
+    #[cfg(test)]
+    fn inject_browser_registry_for_test(&self, registry: Arc<BrowserRegistry>) {
+        let _ = self.browser_registry.set(registry);
+    }
+
     /// Spawn a detached task to run schedule `id` once. The running-set gate is
     /// re-checked inside the task, so a duplicate dispatch (tick racing a
     /// `run_now`) is a no-op rather than a double fire.
@@ -150,8 +197,16 @@ impl Inner {
             return;
         }
 
-        let result =
-            runner::execute_run(&self.services, &self.events, &self.db, &rec, &fire_kind).await;
+        let registry = self.resolve_registry();
+        let result = runner::execute_run(
+            &self.services,
+            &self.events,
+            &self.db,
+            &rec,
+            &fire_kind,
+            registry,
+        )
+        .await;
         self.finish_fire(&rec, &result).await;
         self.cleanup_run(&id).await;
     }
@@ -173,12 +228,26 @@ impl Inner {
 
         // Failure bookkeeping mirrors loops (reset on ok, bump on error) but
         // there is NO 3-strike auto-cancel — see the module-level note.
-        if result.ok {
-            let _ = repo.set_consecutive_failures(&rec.id, 0, now);
-        } else {
-            let _ = repo.set_consecutive_failures(&rec.id, rec.consecutive_failures + 1, now);
+        // `Skipped`/`Deferred` are browser-availability waiting states, not
+        // failures: they leave `consecutive_failures` untouched (neither reset
+        // nor bumped), so they don't inflate the failure badge nor mask a real
+        // failure streak.
+        match result.status {
+            ScheduleRunStatus::Ok => {
+                let _ = repo.set_consecutive_failures(&rec.id, 0, now);
+            }
+            ScheduleRunStatus::Skipped | ScheduleRunStatus::Deferred => {}
+            _ => {
+                let _ = repo.set_consecutive_failures(&rec.id, rec.consecutive_failures + 1, now);
+            }
         }
         let _ = repo.set_last_run_status(&rec.id, result.status.as_str(), now);
+
+        // A `live`+`defer` run parks the schedule for a coalesced re-fire once a
+        // browser returns (see [`Inner::take_deferred_if_available`]).
+        if result.status == ScheduleRunStatus::Deferred {
+            self.deferred.lock().unwrap().insert(rec.id.clone());
+        }
 
         if rec.cron_expr.is_some() {
             // Recurring: advance to the next occurrence after `now`. Re-read the
@@ -220,7 +289,13 @@ impl Inner {
             // only if still active and reports whether it did, so exactly one
             // party ever decrements for the schedule.
             let _ = repo.update_after_fire(&rec.id, None, now);
-            if repo.retire_one_off(&rec.id, now).unwrap_or(false) {
+            // A deferred one-off is NOT consumed — it must still run once a
+            // browser returns (via the coalesced re-fire), so it stays Active
+            // (with next_fire_at=NULL; only the deferred drain re-fires it).
+            // Every other outcome (ok/error/skipped) consumes the one-off.
+            if result.status != ScheduleRunStatus::Deferred
+                && repo.retire_one_off(&rec.id, now).unwrap_or(false)
+            {
                 self.pending_work.fetch_sub(1, Ordering::SeqCst);
                 self.events
                     .state_changed(&rec.id, &rec.name, "ran", "active", None)
@@ -302,6 +377,8 @@ impl ScheduleManager {
             services,
             running: Mutex::new(HashSet::new()),
             pending_work: Arc::new(AtomicUsize::new(0)),
+            deferred: StdMutex::new(HashSet::new()),
+            browser_registry: std::sync::OnceLock::new(),
         });
 
         let boot = boot_recover(&inner);
@@ -448,6 +525,9 @@ impl ScheduleManager {
             .get(id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("schedule not found: {id}"))?;
+        // Evict from the deferred set: a cancelled schedule must never be
+        // re-fired by the defer-coalesce drain.
+        self.inner.drop_deferred(id);
         let now = current_timestamp();
         if repo
             .transition_status(id, ScheduleStatus::Active, ScheduleStatus::Cancelled, now)
@@ -495,6 +575,9 @@ impl ScheduleManager {
             .get(id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("schedule not found: {id}"))?;
+        // Evict from the deferred set: a paused schedule must not be re-fired by
+        // the defer-coalesce drain until it is resumed (and re-defers if needed).
+        self.inner.drop_deferred(id);
         let now = current_timestamp();
         if repo
             .transition_status(id, ScheduleStatus::Active, ScheduleStatus::Paused, now)
@@ -771,6 +854,13 @@ async fn tick_loop(inner: Arc<Inner>, mut run_rx: mpsc::Receiver<DispatchRequest
     loop {
         tokio::select! {
             _ = ticker.tick() => {
+                // Defer coalesce: if a browser is now available, re-fire the
+                // parked (live+defer) schedules once each. Runs BEFORE the due
+                // sweep; `run_one`'s concurrency gate + live-status recheck make
+                // a schedule that also lands in `list_due` a single fire.
+                for id in inner.take_deferred_if_available() {
+                    inner.spawn_run(id, "scheduled".to_string());
+                }
                 let now = current_timestamp();
                 if let Ok(due) = ScheduleRepository::new(&inner.db).list_due(now) {
                     for rec in due {
@@ -1468,6 +1558,121 @@ mod tests {
             .unwrap();
         assert!(rec.goal_condition.is_none());
         assert!(rec.evaluator_provider.is_none());
+        mgr.shutdown().await;
+    }
+
+    // ---- P4: browser policy / defer coalesce -------------------------------
+
+    fn live_args(on_unavailable: Option<&str>) -> CreateScheduleArgs {
+        let mut args = base_args();
+        args.browser_policy = "live".into();
+        args.on_unavailable = on_unavailable.map(|s| s.to_string());
+        args
+    }
+
+    /// A live+defer schedule with no browser records `Deferred`, parks in the
+    /// deferred set (no failure bump), and is coalesced-refired exactly once when
+    /// a browser returns — the drain clears the set. Exercised through the stub
+    /// path via a fake injected registry.
+    #[tokio::test]
+    async fn deferred_live_schedule_coalesces_when_browser_returns() {
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let registry = Arc::new(BrowserRegistry::new()); // empty: no browser
+        mgr.inner.inject_browser_registry_for_test(registry.clone());
+
+        let id = mgr.create(live_args(None)).await.unwrap(); // default defer
+
+        // Fire once with no browser → deferred + parked, failures untouched.
+        Arc::clone(&mgr.inner)
+            .run_one(id.0.clone(), "manual".to_string())
+            .await;
+        let runs = mgr.runs(&id.0, 10).await.unwrap();
+        assert_eq!(runs[0].status, ScheduleRunStatus::Deferred);
+        assert!(mgr.inner.deferred.lock().unwrap().contains(&id.0));
+        let rec = ScheduleRepository::new(&db).get(&id.0).unwrap().unwrap();
+        assert_eq!(rec.consecutive_failures, 0, "defer must not bump failures");
+
+        // Still no browser: drain is a no-op, set intact.
+        assert!(mgr.inner.take_deferred_if_available().is_empty());
+        assert!(mgr.inner.deferred.lock().unwrap().contains(&id.0));
+
+        // Browser returns: the drain yields the parked id exactly once + clears.
+        registry.register("proxy-b1", b"proxy-b1".to_vec());
+        let fire = mgr.inner.take_deferred_if_available();
+        assert_eq!(fire, vec![id.0.clone()]);
+        assert!(mgr.inner.deferred.lock().unwrap().is_empty(), "set cleared");
+
+        // The coalesced re-fire now runs (browser available → UseLive → stub Ok).
+        Arc::clone(&mgr.inner)
+            .run_one(id.0.clone(), "scheduled".to_string())
+            .await;
+        // Newest run by id (both share a 1s `started_at`, so `runs[0]` order is
+        // a tie): the re-fire recorded Ok.
+        let runs = mgr.runs(&id.0, 10).await.unwrap();
+        let newest = runs.iter().max_by_key(|r| r.id).unwrap();
+        assert_eq!(newest.status, ScheduleRunStatus::Ok);
+        mgr.shutdown().await;
+    }
+
+    /// Both `Skipped` and `Deferred` leave `consecutive_failures` untouched —
+    /// neither bumped nor reset — so a real failure streak is preserved across a
+    /// browser-availability waiting state.
+    #[tokio::test]
+    async fn skipped_and_deferred_do_not_bump_consecutive_failures() {
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let registry = Arc::new(BrowserRegistry::new()); // empty: no browser
+        mgr.inner.inject_browser_registry_for_test(registry);
+        let repo = ScheduleRepository::new(&db);
+        let now = current_timestamp();
+
+        // Skip schedule with a pre-existing failure streak of 2.
+        let skip_id = mgr.create(live_args(Some("skip"))).await.unwrap();
+        repo.set_consecutive_failures(&skip_id.0, 2, now).unwrap();
+        Arc::clone(&mgr.inner)
+            .run_one(skip_id.0.clone(), "scheduled".to_string())
+            .await;
+        let rec = repo.get(&skip_id.0).unwrap().unwrap();
+        assert_eq!(rec.last_run_status.as_deref(), Some("skipped"));
+        assert_eq!(rec.consecutive_failures, 2, "skip preserves the streak");
+
+        // Defer schedule with a pre-existing failure streak of 2.
+        let defer_id = mgr.create(live_args(None)).await.unwrap();
+        repo.set_consecutive_failures(&defer_id.0, 2, now).unwrap();
+        Arc::clone(&mgr.inner)
+            .run_one(defer_id.0.clone(), "scheduled".to_string())
+            .await;
+        let rec = repo.get(&defer_id.0).unwrap().unwrap();
+        assert_eq!(rec.last_run_status.as_deref(), Some("deferred"));
+        assert_eq!(rec.consecutive_failures, 2, "defer preserves the streak");
+        mgr.shutdown().await;
+    }
+
+    /// Cancelling a deferred schedule evicts it from the deferred set, so the
+    /// coalesce drain can never re-fire a cancelled schedule.
+    #[tokio::test]
+    async fn cancel_evicts_from_deferred_set() {
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let registry = Arc::new(BrowserRegistry::new());
+        mgr.inner.inject_browser_registry_for_test(registry.clone());
+
+        let id = mgr.create(live_args(None)).await.unwrap();
+        Arc::clone(&mgr.inner)
+            .run_one(id.0.clone(), "manual".to_string())
+            .await;
+        assert!(mgr.inner.deferred.lock().unwrap().contains(&id.0));
+
+        mgr.cancel(&id.0).await.unwrap();
+        assert!(
+            mgr.inner.deferred.lock().unwrap().is_empty(),
+            "cancel must evict the parked id"
+        );
+
+        // Even with a browser now available, the drain finds nothing to fire.
+        registry.register("proxy-b1", b"proxy-b1".to_vec());
+        assert!(mgr.inner.take_deferred_if_available().is_empty());
         mgr.shutdown().await;
     }
 }

@@ -245,8 +245,10 @@ impl BrowserRegistry {
     /// either bind the wrong (already-registered) browser instantly or return
     /// `Ambiguous` once both are present. Polls every 50ms like
     /// [`Self::wait_for_browser`]. If multiple non-excluded browsers are
-    /// registered, returns the one with the earliest `registered_at`
-    /// (deterministic tie-break) rather than erroring.
+    /// registered, returns the one with the earliest `registered_at`, breaking
+    /// exact `Instant` ties on `proxy_id` so the pick is fully deterministic
+    /// (two browsers registered in the same instant would otherwise resolve
+    /// non-deterministically) rather than erroring.
     pub async fn wait_for_new_browser(
         &self,
         exclude: &std::collections::HashSet<String>,
@@ -258,7 +260,7 @@ impl BrowserRegistry {
                 let map = self.browsers.read().unwrap();
                 map.values()
                     .filter(|e| !exclude.contains(&e.proxy_id))
-                    .min_by_key(|e| e.registered_at)
+                    .min_by_key(|e| (e.registered_at, e.proxy_id.clone()))
                     .cloned()
             };
             if let Some(entry) = candidate {
