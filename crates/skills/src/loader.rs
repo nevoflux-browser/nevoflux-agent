@@ -212,6 +212,9 @@ pub fn install_default_skills() -> std::result::Result<usize, String> {
 
     let mut installed = 0;
     copy_dir_recursive(&source, &target, &mut installed)?;
+    // Record the applied bundle fingerprint so a freshly-seeded install is not
+    // then prompted to "update" to the very skills it just received.
+    record_skills_bundle_applied();
 
     tracing::info!(
         "Installed {} default skill entries to {}",
@@ -257,6 +260,146 @@ fn copy_dir_recursive(
         }
     }
     Ok(())
+}
+
+/// Marker file (next to the user skills dir) recording the fingerprint of the
+/// bundled skills that were last applied or acknowledged, so a refresh is only
+/// offered when the bundled defaults actually change.
+fn skills_bundle_marker() -> Option<PathBuf> {
+    nevoflux_user_skills_dir().and_then(|d| d.parent().map(|p| p.join(".skills-bundle")))
+}
+
+/// Collect all files under `dir` (recursively) into `out`.
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                collect_files(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+}
+
+/// Stable (FNV-1a) fingerprint of the bundled default skills directory: hashes
+/// every file's relative path and bytes in sorted order. `None` when no bundled
+/// skills ship with this build. FNV-1a is used (not `DefaultHasher`) so the
+/// value stays comparable across binary versions/platforms — the marker written
+/// by one install is read by the next.
+pub fn bundled_skills_fingerprint() -> Option<String> {
+    bundled_skills_dir().map(|root| fingerprint_dir(&root))
+}
+
+/// Count the top-level skill entries in the bundled defaults (for prompt copy).
+pub fn bundled_skills_count() -> usize {
+    bundled_skills_dir()
+        .and_then(|d| std::fs::read_dir(d).ok())
+        .map(|rd| rd.flatten().count())
+        .unwrap_or(0)
+}
+
+/// FNV-1a fingerprint of every file under `root` (relative path + bytes), sorted
+/// so it is independent of filesystem iteration order.
+fn fingerprint_dir(root: &Path) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(PRIME);
+        }
+        h
+    }
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_files(root, &mut files);
+    files.sort();
+
+    let mut hash = OFFSET;
+    for f in &files {
+        if let Ok(rel) = f.strip_prefix(root) {
+            hash = fnv(hash, rel.to_string_lossy().as_bytes());
+            hash = fnv(hash, &[0]);
+            if let Ok(bytes) = std::fs::read(f) {
+                hash = fnv(hash, &bytes);
+            }
+            hash = fnv(hash, &[0]);
+        }
+    }
+    format!("{hash:016x}")
+}
+
+/// Record that the current bundled skills fingerprint has been applied or
+/// acknowledged, so the same bundle is not offered again.
+pub fn record_skills_bundle_applied() {
+    if let (Some(marker), Some(fp)) = (skills_bundle_marker(), bundled_skills_fingerprint()) {
+        if let Some(parent) = marker.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&marker, fp);
+    }
+}
+
+/// True when the bundled default skills differ from what was last applied AND
+/// the user already has skills installed — i.e. there is a refresh worth
+/// offering. Returns false on an empty/missing user skills dir (that case is
+/// seeded silently by [`install_default_skills`]).
+pub fn skills_update_available() -> bool {
+    let Some(fp) = bundled_skills_fingerprint() else {
+        return false;
+    };
+    let Some(user_dir) = nevoflux_user_skills_dir() else {
+        return false;
+    };
+    let has_user = std::fs::read_dir(&user_dir)
+        .map(|mut r| r.next().is_some())
+        .unwrap_or(false);
+    if !has_user {
+        return false;
+    }
+    match skills_bundle_marker().and_then(|m| std::fs::read_to_string(m).ok()) {
+        Some(applied) => applied.trim() != fp,
+        None => true, // never recorded -> offer once
+    }
+}
+
+/// Pick a non-clobbering `<dir>.bak[-N]` path for backing up existing skills.
+fn unique_backup_path(dir: &Path) -> PathBuf {
+    let base = format!("{}.bak", dir.display());
+    let mut candidate = PathBuf::from(&base);
+    let mut n = 1;
+    while candidate.exists() {
+        candidate = PathBuf::from(format!("{base}-{n}"));
+        n += 1;
+    }
+    candidate
+}
+
+/// Replace the user's skills directory with the bundled defaults, backing up the
+/// existing skills to `skills.bak[-N]` first, then recording the applied
+/// fingerprint. Returns the number of files installed.
+pub fn replace_user_skills_with_bundled() -> std::result::Result<usize, String> {
+    let source =
+        bundled_skills_dir().ok_or_else(|| "No bundled skills to apply".to_string())?;
+    let target = nevoflux_user_skills_dir()
+        .ok_or_else(|| "Cannot determine user skills directory".to_string())?;
+
+    if target.is_dir() {
+        let backup = unique_backup_path(&target);
+        std::fs::rename(&target, &backup)
+            .map_err(|e| format!("Failed to back up skills to {}: {}", backup.display(), e))?;
+        tracing::info!("Backed up existing skills to {}", backup.display());
+    }
+    std::fs::create_dir_all(&target)
+        .map_err(|e| format!("Failed to create skills directory {}: {}", target.display(), e))?;
+
+    let mut installed = 0;
+    copy_dir_recursive(&source, &target, &mut installed)?;
+    record_skills_bundle_applied();
+    tracing::info!("Replaced skills with {} bundled entries", installed);
+    Ok(installed)
 }
 
 /// Get the default user skills directory (legacy, returns first directory).
@@ -593,6 +736,51 @@ Content for {}.
 "#,
             name, description, name, name
         )
+    }
+
+    #[test]
+    fn fingerprint_dir_detects_content_and_file_changes() {
+        let d = TempDir::new().unwrap();
+        let root = d.path();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        create_skill_file(&root.join("a"), "s1", "hello");
+        create_skill_file(root, "top", "world");
+        let fp1 = fingerprint_dir(root);
+
+        // Stable when recomputed over the same tree.
+        assert_eq!(fp1, fingerprint_dir(root));
+
+        // Editing a file changes the fingerprint.
+        create_skill_file(&root.join("a"), "s1", "hello!!!");
+        let fp2 = fingerprint_dir(root);
+        assert_ne!(fp1, fp2, "content edit must change the fingerprint");
+
+        // Adding a file changes the fingerprint.
+        create_skill_file(root, "extra", "x");
+        assert_ne!(fp2, fingerprint_dir(root), "new file must change fingerprint");
+    }
+
+    #[test]
+    fn fingerprint_dir_is_order_independent() {
+        let d1 = TempDir::new().unwrap();
+        create_skill_file(d1.path(), "a", "1");
+        create_skill_file(d1.path(), "b", "2");
+        let d2 = TempDir::new().unwrap();
+        create_skill_file(d2.path(), "b", "2");
+        create_skill_file(d2.path(), "a", "1");
+        assert_eq!(fingerprint_dir(d1.path()), fingerprint_dir(d2.path()));
+    }
+
+    #[test]
+    fn unique_backup_path_avoids_clobber() {
+        let d = TempDir::new().unwrap();
+        let skills = d.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let b1 = unique_backup_path(&skills);
+        assert_eq!(b1, PathBuf::from(format!("{}.bak", skills.display())));
+        std::fs::create_dir_all(&b1).unwrap();
+        let b2 = unique_backup_path(&skills);
+        assert_eq!(b2, PathBuf::from(format!("{}.bak-1", skills.display())));
     }
 
     #[test]
