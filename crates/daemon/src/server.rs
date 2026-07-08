@@ -640,12 +640,22 @@ async fn read_length_prefixed_message(
 /// - `since_last_message > idle_timeout`: also idle on the message path, which
 ///   keeps background `/loop`/agent work (streams frames, may run without a
 ///   sidebar connection) alive.
+/// - `background_jobs == 0`: no active schedule and no in-flight scheduled run.
+///   A managed daemon must outlive its browser while any schedule is armed (or
+///   a run is executing), otherwise a cron that fires while the sidebar is
+///   closed would never run. This is an *inhibitor only*: it does NOT reset the
+///   disconnect/idle clocks, so once `background_jobs` drops back to 0 the idle
+///   countdown resumes from the real elapsed times and the daemon reclaims
+///   itself on the next tick.
 fn managed_should_self_terminate(
     since_last_connection: std::time::Duration,
     since_last_message: std::time::Duration,
     idle_timeout: std::time::Duration,
+    background_jobs: usize,
 ) -> bool {
-    since_last_connection > idle_timeout && since_last_message > idle_timeout
+    background_jobs == 0
+        && since_last_connection > idle_timeout
+        && since_last_message > idle_timeout
 }
 
 /// Idle watchdog loop for a managed daemon. Every `poll_interval` it samples the
@@ -658,6 +668,7 @@ async fn managed_idle_watchdog(
     last_message_time: std::sync::Arc<Mutex<std::time::Instant>>,
     idle_timeout: std::time::Duration,
     poll_interval: std::time::Duration,
+    background_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     shutdown_tx: mpsc::Sender<()>,
 ) {
     use std::sync::atomic::Ordering;
@@ -672,7 +683,17 @@ async fn managed_idle_watchdog(
         }
         let since_last_connection = last_connected.elapsed();
         let since_last_message = last_message_time.lock().await.elapsed();
-        if managed_should_self_terminate(since_last_connection, since_last_message, idle_timeout) {
+        // Pending schedule work (active schedules + in-flight runs) inhibits
+        // termination without touching `last_connected`, so a real disconnect
+        // is not masked: the moment the counter hits 0 the countdown resumes
+        // from the already-elapsed disconnect time.
+        let background_jobs = background_jobs.load(Ordering::SeqCst);
+        if managed_should_self_terminate(
+            since_last_connection,
+            since_last_message,
+            idle_timeout,
+            background_jobs,
+        ) {
             info!(
                 "Managed daemon: no browser connected and idle for {:?}, self-terminating",
                 idle_timeout
@@ -1647,6 +1668,29 @@ pub async fn start_server(
     // services.loop_manager when claude-code (ACP) calls loop_* via MCP.
     let _ = crate::loops::CURRENT_LOOP_MANAGER.set(loop_manager.clone());
     services = services.with_loop_manager(loop_manager.clone());
+
+    // Construct the /schedule skill's ScheduleManager and inject it into
+    // HostServices so the `schedule_*` tool dispatchers (both the direct-API
+    // `agent_host` surface and the ACP `mcp_tool_executor` surface) resolve
+    // `services.schedule_manager` to a live manager. Wired AFTER loop_manager
+    // on purpose: the `Some(services.clone())` snapshot the ScheduleManager
+    // captures for its runner therefore already carries `loop_manager`, so a
+    // scheduled run can call the loop_* read tools (loop_list/loop_scratchpad_*)
+    // without a "loop not configured" error. (`schedule_create`/`loop_create`
+    // are in the runner's forbidden set, so the runner never needs
+    // `schedule_manager` in its own snapshot — no chicken-and-egg, hence no
+    // process-global back-fill is required here, unlike CURRENT_LOOP_MANAGER.
+    // For the ACP path, agent_exec.rs also back-fills loop_manager from
+    // CURRENT_LOOP_MANAGER as belt-and-suspenders.) The automation template
+    // snapshot (CURRENT_SERVICES_TEMPLATE, taken above before either manager)
+    // is intentionally left pre-manager, matching loop_manager's treatment.
+    let schedule_manager = crate::schedules::ScheduleManager::start_with_bus(
+        db.clone(),
+        Some(event_bus.clone()),
+        Some(services.clone()),
+    );
+    services = services.with_schedule_manager(schedule_manager.clone());
+
     if let Some(retriever) = knowledge_retriever {
         services = services.with_knowledge_retriever(retriever);
     }
@@ -1856,6 +1900,11 @@ pub async fn start_server(
     let config_idle_timeout = config.idle_timeout;
     let accept_shutdown_tx = shutdown_tx.clone();
     let shutdown_loop_manager = loop_manager.clone();
+    let shutdown_schedule_manager = schedule_manager.clone();
+    // Handle to the schedule pending-work counter for the idle watchdog spawned
+    // inside the accept loop below (a managed daemon must not self-terminate
+    // while a schedule is armed or a run is in flight).
+    let watchdog_schedule_jobs = schedule_manager.pending_work_handle();
     let terminated = Arc::new(tokio::sync::Notify::new());
     let accept_terminated = terminated.clone();
     tokio::spawn(async move {
@@ -1880,6 +1929,7 @@ pub async fn start_server(
                 last_message_time.clone(),
                 config_idle_timeout,
                 std::time::Duration::from_secs(1),
+                watchdog_schedule_jobs.clone(),
                 accept_shutdown_tx.clone(),
             ));
         }
@@ -1921,6 +1971,8 @@ pub async fn start_server(
                     info!("Server shutdown signal received");
                     info!("Tearing down /loop skill subscriptions and pending iterations…");
                     shutdown_loop_manager.shutdown().await;
+                    info!("Tearing down /schedule tick task and sweeping orphaned runs…");
+                    shutdown_schedule_manager.shutdown().await;
                     break;
                 }
             }
@@ -10068,23 +10120,36 @@ mod tests {
         // Browser connected within the window (e.g. sidebar open on the boost
         // panel, sending no chat) -> never terminate, no matter how stale the
         // message path is. This is the spurious-DAEMON_DISCONNECTED regression.
-        assert!(!managed_should_self_terminate(recent, past, timeout));
+        assert!(!managed_should_self_terminate(recent, past, timeout, 0));
         assert!(!managed_should_self_terminate(
             Duration::ZERO,
             Duration::from_secs(3600),
-            timeout
+            timeout,
+            0
         ));
 
         // Recent message but connection gone briefly -> keep running (covers a
         // background /loop that streams frames without a sidebar connection).
-        assert!(!managed_should_self_terminate(past, recent, timeout));
+        assert!(!managed_should_self_terminate(past, recent, timeout, 0));
 
         // Both continuously idle past the window -> terminate (browser gone;
         // reclaim the daemon rather than orphan it).
-        assert!(managed_should_self_terminate(past, past, timeout));
+        assert!(managed_should_self_terminate(past, past, timeout, 0));
 
         // Boundary: exactly at the timeout is not yet past it.
-        assert!(!managed_should_self_terminate(timeout, timeout, timeout));
+        assert!(!managed_should_self_terminate(timeout, timeout, timeout, 0));
+
+        // Pending schedule work inhibits termination even when fully idle and
+        // continuously disconnected past the window — a managed daemon must
+        // outlive its browser while a schedule is armed or a run is in flight.
+        assert!(!managed_should_self_terminate(past, past, timeout, 1));
+        assert!(!managed_should_self_terminate(past, past, timeout, 5));
+
+        // ...and the countdown resumes from the *same* real elapsed times once
+        // the counter hits 0: the identical (past, past) that were being
+        // ignored now trip termination on the very next evaluation. The
+        // inhibitor never reset the clocks, so a real disconnect isn't masked.
+        assert!(managed_should_self_terminate(past, past, timeout, 0));
     }
 
     // The watchdog uses real `std::time::Instant`, so these drive it with real
@@ -10106,6 +10171,7 @@ mod tests {
             last_msg,
             Duration::from_millis(120),
             Duration::from_millis(10),
+            Arc::new(AtomicUsize::new(0)),
             tx,
         ));
 
@@ -10132,6 +10198,7 @@ mod tests {
             last_msg,
             Duration::from_millis(120),
             Duration::from_millis(10),
+            Arc::new(AtomicUsize::new(0)),
             tx,
         ));
 
@@ -10158,6 +10225,7 @@ mod tests {
             last_msg,
             Duration::from_millis(120),
             Duration::from_millis(10),
+            Arc::new(AtomicUsize::new(0)),
             tx,
         ));
 
@@ -10171,6 +10239,49 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a brief reconnect gap must not trip self-termination"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn watchdog_stays_alive_while_schedules_pending_then_resumes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        // Browser gone for the whole run (count stays 0) and the message path
+        // idle, but a schedule is armed (background_jobs = 1): the managed
+        // daemon must NOT self-terminate — otherwise a cron that fires while the
+        // sidebar is closed would never run.
+        let count = Arc::new(AtomicUsize::new(0));
+        let last_msg = Arc::new(Mutex::new(std::time::Instant::now()));
+        let jobs = Arc::new(AtomicUsize::new(1));
+        let (tx, mut rx) = mpsc::channel::<()>(1);
+
+        let jobs_ctl = jobs.clone();
+        let handle = tokio::spawn(managed_idle_watchdog(
+            count,
+            last_msg,
+            Duration::from_millis(120),
+            Duration::from_millis(10),
+            jobs,
+            tx,
+        ));
+
+        // Past several idle windows with a job pending -> must stay alive.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "watchdog must not self-terminate while a schedule is armed / a run is in flight"
+        );
+
+        // The last schedule completes (counter -> 0). The idle countdown resumes
+        // from the real elapsed disconnect time — which is already well past the
+        // window — so termination fires on the next poll. The inhibitor never
+        // reset `last_connected`, so the elapsed disconnect isn't masked.
+        jobs_ctl.store(0, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "watchdog must resume the idle countdown from real elapsed times once jobs hit 0"
         );
         handle.abort();
     }
