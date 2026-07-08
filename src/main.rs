@@ -541,6 +541,93 @@ fn spawn_force_exit_watchdog(grace: std::time::Duration) {
     });
 }
 
+/// Run the bundled post-update cleanup script once per version.
+///
+/// On the first daemon start after a version change, spawn the platform cleanup
+/// script from `<exe_dir>/cleanup/` to clear stale add-on caches so an update
+/// never keeps serving an old cached sidebar. Passes `--no-kill` (the browser is
+/// running — never kill the live session) and `--keep-skills` (the skills
+/// refresh is handled separately, with consent). Fully best-effort: any failure
+/// is logged and ignored, and the version marker advances so it runs at most
+/// once per version. Locked cache files (held by the running browser) are simply
+/// skipped and take effect on the next launch; Firefox also self-invalidates its
+/// startup caches on a build-id change.
+fn run_post_update_cleanup(data_dir: &std::path::Path) {
+    let current = env!("CARGO_PKG_VERSION");
+    let marker = data_dir.join(".last-cleanup-version");
+    if std::fs::read_to_string(&marker)
+        .map(|s| s.trim() == current)
+        .unwrap_or(false)
+    {
+        return; // already ran for this version
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("post-update cleanup: cannot resolve exe path: {}", e);
+            return;
+        }
+    };
+    let Some(cleanup_dir) = exe.parent().map(|d| d.join("cleanup")) else {
+        return;
+    };
+
+    #[cfg(windows)]
+    let script = cleanup_dir.join("nevoflux-cleanup.ps1");
+    #[cfg(target_os = "macos")]
+    let script = cleanup_dir.join("nevoflux-cleanup.command");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let script = cleanup_dir.join("nevoflux-cleanup.sh");
+
+    if script.exists() {
+        #[cfg(windows)]
+        let mut cmd = {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let mut c = std::process::Command::new("powershell.exe");
+            c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]);
+            c.arg(&script);
+            c.args(["-NoKill", "-KeepSkills"]);
+            c.creation_flags(CREATE_NO_WINDOW);
+            c
+        };
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = std::process::Command::new("bash");
+            c.arg(&script);
+            c.args(["--no-kill", "--keep-skills"]);
+            c
+        };
+        // Detach from the native-messaging stdio channel; the cleanup output
+        // must never reach the protocol wire.
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+
+        match cmd.spawn() {
+            Ok(_child) => tracing::info!(
+                "post-update cleanup: launched {} (version -> {})",
+                script.display(),
+                current
+            ),
+            Err(e) => tracing::warn!("post-update cleanup: failed to spawn: {}", e),
+        }
+    } else {
+        tracing::debug!(
+            "post-update cleanup: no bundled script at {}",
+            script.display()
+        );
+    }
+
+    // Advance the marker regardless of outcome: this is a best-effort, once-per
+    // version belt-and-suspenders step (Firefox self-invalidates its caches on a
+    // build-id change), so we do not want to re-spawn on every daemon start.
+    if let Err(e) = std::fs::write(&marker, current) {
+        tracing::warn!("post-update cleanup: failed to write version marker: {}", e);
+    }
+}
+
 /// Run the daemon.
 #[allow(clippy::too_many_arguments)]
 async fn run_daemon(
@@ -599,6 +686,11 @@ async fn run_daemon(
         Ok(n) => tracing::info!("Installed {} default skill files", n),
         Err(e) => tracing::warn!("Failed to install default skills: {}", e),
     }
+
+    // On a version bump, run the bundled post-update cleanup once so an update
+    // never keeps serving a stale cached sidebar. Best-effort; never blocks or
+    // fails startup, and never kills the running browser or touches skills.
+    run_post_update_cleanup(&data_dir);
 
     // In managed+port mode the proxy is the lifecycle manager — skip file lock.
     let _lock = if managed && port.is_some() {
