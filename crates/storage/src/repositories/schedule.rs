@@ -268,20 +268,37 @@ impl<'a> ScheduleRepository<'a> {
         })
     }
 
+    /// Atomically transition a schedule's status, but only if it currently
+    /// holds the expected `from` status. Returns whether a row actually
+    /// flipped. This is the concurrency primitive for every manager-side
+    /// status change: two racing writers (double cancel, cancel vs.
+    /// run-completion retirement, double resume) are serialized by SQLite and
+    /// exactly one observes `true`, so pending-work accounting can be paired
+    /// 1:1 with the real transition instead of a read-then-write snapshot.
+    pub fn transition_status(
+        &self,
+        id: &str,
+        from: ScheduleStatus,
+        to: ScheduleStatus,
+        now: i64,
+    ) -> Result<bool> {
+        self.db.with_connection(|conn| {
+            let n = conn.execute(
+                "UPDATE schedules SET status = ?1, updated_at = ?2
+                 WHERE id = ?3 AND status = ?4",
+                params![to.as_str(), now, id, from.as_str()],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
     /// Atomically retire a one-off schedule: `active` → `ran`, but only if it
     /// is *still* active in the database. Returns whether a row actually
     /// flipped, so callers can pair pending-work accounting with the real
     /// transition: a cancel/pause that landed while the run was in flight wins
     /// (this returns `false` and the terminal status is not clobbered).
     pub fn retire_one_off(&self, id: &str, now: i64) -> Result<bool> {
-        self.db.with_connection(|conn| {
-            let n = conn.execute(
-                "UPDATE schedules SET status = 'ran', updated_at = ?2
-                 WHERE id = ?1 AND status = 'active'",
-                params![id, now],
-            )?;
-            Ok(n > 0)
-        })
+        self.transition_status(id, ScheduleStatus::Active, ScheduleStatus::Ran, now)
     }
 
     /// Mark every still-`running` run row as cancelled. Called at daemon boot
@@ -490,6 +507,55 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, ScheduleRunStatus::Ok);
         assert_eq!(runs[0].tokens_used, Some(1234));
+    }
+
+    #[test]
+    fn transition_status_requires_expected_from() {
+        let db = test_db();
+        let repo = ScheduleRepository::new(&db);
+        repo.create(&sample("sch00005")).unwrap();
+
+        // Wrong `from` → no flip, row untouched.
+        assert!(!repo
+            .transition_status(
+                "sch00005",
+                ScheduleStatus::Paused,
+                ScheduleStatus::Active,
+                1
+            )
+            .unwrap());
+        assert_eq!(
+            repo.get("sch00005").unwrap().unwrap().status,
+            ScheduleStatus::Active
+        );
+
+        // Correct `from` → flips exactly once; a second identical call (the
+        // double-cancel race shape) reports false.
+        assert!(repo
+            .transition_status(
+                "sch00005",
+                ScheduleStatus::Active,
+                ScheduleStatus::Cancelled,
+                2
+            )
+            .unwrap());
+        assert!(!repo
+            .transition_status(
+                "sch00005",
+                ScheduleStatus::Active,
+                ScheduleStatus::Cancelled,
+                3
+            )
+            .unwrap());
+        assert_eq!(
+            repo.get("sch00005").unwrap().unwrap().status,
+            ScheduleStatus::Cancelled
+        );
+
+        // Missing row → false, not an error.
+        assert!(!repo
+            .transition_status("nope", ScheduleStatus::Active, ScheduleStatus::Paused, 4)
+            .unwrap());
     }
 
     #[test]

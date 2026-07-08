@@ -175,10 +175,12 @@ impl Inner {
             // Recurring: advance to the next occurrence after `now`. Re-read the
             // LIVE status first — `rec` is a snapshot taken at fire time, and a
             // cancel/pause that landed mid-run must not get a future fire time
-            // written onto its (now non-active) row. `list_due` filters on
-            // status so a stale next_fire_at could never fire anyway, but we
-            // keep the row consistent. If the cron can no longer produce a fire
-            // (degenerate), clear next_fire rather than leaving a past time.
+            // written onto its (now non-active) row. In that case this writes
+            // next_fire_at = NULL (run_count/last_run_at still advance — the
+            // run did happen); `resume` recomputes the fire time from scratch,
+            // and `list_due` filters on status either way. If the cron can no
+            // longer produce a fire (degenerate), clear next_fire rather than
+            // leaving a past time.
             let still_active = matches!(
                 repo.get(&rec.id).ok().flatten().map(|r| r.status),
                 Some(ScheduleStatus::Active)
@@ -381,62 +383,102 @@ impl ScheduleManager {
         Ok(id)
     }
 
-    /// Cancel a schedule (terminal). Idempotent if already cancelled.
+    /// Cancel a schedule (terminal). The Active→Cancelled / Paused→Cancelled
+    /// flips are atomic against the live DB status (never a `get` snapshot),
+    /// so racing writers — a second concurrent cancel, or a one-off run
+    /// completing via `retire_one_off` in the same instant — can never pair
+    /// two pending_work decrements with one logical transition. A schedule
+    /// already in a terminal state (`ran`/`cancelled`, possibly flipped by
+    /// the racing writer) is an idempotent no-op `Ok`: there is nothing left
+    /// to stop, and the winner already did the accounting.
     pub async fn cancel(&self, id: &str) -> Result<(), String> {
         let repo = ScheduleRepository::new(&self.inner.db);
         let rec = repo
             .get(id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("schedule not found: {id}"))?;
-        if rec.status == ScheduleStatus::Cancelled {
+        let now = current_timestamp();
+        if repo
+            .transition_status(id, ScheduleStatus::Active, ScheduleStatus::Cancelled, now)
+            .map_err(|e| e.to_string())?
+        {
+            // We won the Active→Cancelled flip: exactly one decrement.
+            self.inner.pending_work.fetch_sub(1, Ordering::SeqCst);
+            self.inner
+                .events
+                .state_changed(id, &rec.name, "cancelled", "active", None)
+                .await;
+            self.inner.emit_snapshot().await;
             return Ok(());
         }
-        let now = current_timestamp();
-        let was_active = rec.status == ScheduleStatus::Active;
-        repo.update_status(id, ScheduleStatus::Cancelled, now)
-            .map_err(|e| e.to_string())?;
-        if was_active {
-            self.inner.pending_work.fetch_sub(1, Ordering::SeqCst);
+        if repo
+            .transition_status(id, ScheduleStatus::Paused, ScheduleStatus::Cancelled, now)
+            .map_err(|e| e.to_string())?
+        {
+            // Paused schedules are not counted — no counter change.
+            self.inner
+                .events
+                .state_changed(id, &rec.name, "cancelled", "paused", None)
+                .await;
+            self.inner.emit_snapshot().await;
+            return Ok(());
         }
-        self.inner
-            .events
-            .state_changed(id, &rec.name, "cancelled", rec.status.as_str(), None)
-            .await;
-        self.inner.emit_snapshot().await;
+        // Already ran/cancelled: idempotent no-op (no event, no counter).
         Ok(())
     }
 
     /// Pause an active schedule (stops firing; `list_due` filters on status).
-    /// Idempotent if already paused; errors on ran/cancelled.
+    /// The Active→Paused flip is atomic against the live DB status, so pause
+    /// can never clobber a schedule that concurrently ran to completion
+    /// (`Ran`) or was cancelled, and the counter decrement pairs 1:1 with the
+    /// flip. Pausing an already-paused schedule is an idempotent `Ok` with no
+    /// event re-emitted; pausing a ran/cancelled schedule is an error.
+    ///
+    /// Pause itself does not modify `next_fire_at` (`list_due`'s status
+    /// filter is what stops the firing). Note that a run already in flight
+    /// when the pause lands will still clear/advance `next_fire_at` in its
+    /// `finish_fire` — harmless, since `resume` recomputes it from scratch.
     pub async fn pause(&self, id: &str) -> Result<(), String> {
         let repo = ScheduleRepository::new(&self.inner.db);
         let rec = repo
             .get(id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("schedule not found: {id}"))?;
-        match rec.status {
-            ScheduleStatus::Active => {}
-            ScheduleStatus::Paused => return Ok(()),
-            other => return Err(format!("cannot pause a {} schedule", other.as_str())),
-        }
         let now = current_timestamp();
-        // next_fire_at is left untouched; the status filter in `list_due`
-        // keeps a paused schedule from firing.
-        repo.update_status(id, ScheduleStatus::Paused, now)
-            .map_err(|e| e.to_string())?;
-        // Active → Paused: -1.
-        self.inner.pending_work.fetch_sub(1, Ordering::SeqCst);
-        self.inner
-            .events
-            .state_changed(id, &rec.name, "paused", "active", rec.next_fire_at)
-            .await;
-        self.inner.emit_snapshot().await;
-        Ok(())
+        if repo
+            .transition_status(id, ScheduleStatus::Active, ScheduleStatus::Paused, now)
+            .map_err(|e| e.to_string())?
+        {
+            // Active → Paused: -1, paired with the flip we won.
+            self.inner.pending_work.fetch_sub(1, Ordering::SeqCst);
+            self.inner
+                .events
+                .state_changed(id, &rec.name, "paused", "active", rec.next_fire_at)
+                .await;
+            self.inner.emit_snapshot().await;
+            return Ok(());
+        }
+        // No flip — re-read the live status for an accurate verdict.
+        match repo.get(id).map_err(|e| e.to_string())?.map(|r| r.status) {
+            Some(ScheduleStatus::Paused) => Ok(()),
+            Some(other) => Err(format!("cannot pause a {} schedule", other.as_str())),
+            None => Err(format!("schedule not found: {id}")),
+        }
     }
 
     /// Resume a paused schedule, recomputing `next_fire_at` from *now*. A
     /// one-off whose `at_ts` has already passed cannot be resumed (its moment
     /// is gone) — returns an error rather than firing immediately.
+    ///
+    /// Ordering: the new fire time is computed and persisted BEFORE the
+    /// atomic Paused→Active flip. Recompute failures therefore error out with
+    /// the row still paused and the counter untouched, and the schedule only
+    /// becomes visible to the due-tick once it already carries the fresh fire
+    /// time (a paused row's `next_fire_at` is invisible to `list_due`). The
+    /// +1 is applied only when this call wins the flip, so a concurrent
+    /// double resume increments exactly once. If a concurrent cancel wins
+    /// instead, the pre-written `next_fire_at` remains on the cancelled row —
+    /// harmless (status-filtered) but noted for consistency audits.
     pub async fn resume(&self, id: &str) -> Result<(), String> {
         let repo = ScheduleRepository::new(&self.inner.db);
         let rec = repo
@@ -445,10 +487,13 @@ impl ScheduleManager {
             .ok_or_else(|| format!("schedule not found: {id}"))?;
         match rec.status {
             ScheduleStatus::Paused => {}
+            // Already active (e.g. a concurrent resume won): idempotent.
             ScheduleStatus::Active => return Ok(()),
             other => return Err(format!("cannot resume a {} schedule", other.as_str())),
         }
         let now = current_timestamp();
+        // cron_expr / at_ts are immutable after create, so the snapshot is
+        // authoritative for the recompute even under status races.
         let next = if let Some(expr) = &rec.cron_expr {
             cron::next_after(expr, now).map_err(|e| e.to_string())?
         } else if let Some(at) = rec.at_ts {
@@ -461,16 +506,26 @@ impl ScheduleManager {
         };
         repo.update_next_fire(id, Some(next), now)
             .map_err(|e| e.to_string())?;
-        repo.update_status(id, ScheduleStatus::Active, now)
-            .map_err(|e| e.to_string())?;
-        // Paused → Active: +1.
-        self.inner.pending_work.fetch_add(1, Ordering::SeqCst);
-        self.inner
-            .events
-            .state_changed(id, &rec.name, "active", "paused", Some(next))
-            .await;
-        self.inner.emit_snapshot().await;
-        Ok(())
+        if repo
+            .transition_status(id, ScheduleStatus::Paused, ScheduleStatus::Active, now)
+            .map_err(|e| e.to_string())?
+        {
+            // Paused → Active: +1, paired with the flip we won.
+            self.inner.pending_work.fetch_add(1, Ordering::SeqCst);
+            self.inner
+                .events
+                .state_changed(id, &rec.name, "active", "paused", Some(next))
+                .await;
+            self.inner.emit_snapshot().await;
+            return Ok(());
+        }
+        // No flip — a racing writer changed the status since our snapshot.
+        match repo.get(id).map_err(|e| e.to_string())?.map(|r| r.status) {
+            // A concurrent resume won and did the accounting: idempotent.
+            Some(ScheduleStatus::Active) => Ok(()),
+            Some(other) => Err(format!("cannot resume a {} schedule", other.as_str())),
+            None => Err(format!("schedule not found: {id}")),
+        }
     }
 
     /// Enqueue a manual fire (`fire_kind = "manual"`). Respects the concurrency
@@ -569,7 +624,11 @@ fn boot_recover(inner: &Arc<Inner>) -> BootPlan {
             // get here in a degenerate way — next_after failed at finish_fire —
             // and is deliberately left alone.)
             if rec.cron_expr.is_none() && repo.retire_one_off(&rec.id, now).unwrap_or(false) {
-                if let Ok(run_id) = repo.record_run_start(&rec.id, now, "catchup") {
+                // Visibility row: fire_kind "scheduled" (the fire that never
+                // happened was the schedule's own), status `cancelled` with an
+                // explanatory error — mirroring the sweep's "orphaned by
+                // daemon restart" shape rather than claiming a catchup ran.
+                if let Ok(run_id) = repo.record_run_start(&rec.id, now, "scheduled") {
                     let _ = repo.record_run_end(
                         run_id,
                         now,
@@ -1062,6 +1121,143 @@ mod tests {
             stranded.error_message.as_deref(),
             Some("stranded by prior shutdown")
         );
+        assert_eq!(stranded.fire_kind, "scheduled");
+        mgr.shutdown().await;
+    }
+
+    /// Regression (re-review): cancel arriving after a racing writer already
+    /// took the Active→Cancelled flip (and its decrement) must be an
+    /// idempotent no-op — the old read-then-write shape let both cancels
+    /// snapshot Active and double-decrement. The winner is emulated exactly
+    /// as the new cancel path behaves: atomic flip + one decrement.
+    #[tokio::test]
+    async fn cancel_race_decrements_once() {
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let counter = mgr.pending_work_handle();
+        let id = mgr.create(base_args()).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Racing cancel wins the flip and does its accounting.
+        let repo = ScheduleRepository::new(&db);
+        let now = current_timestamp();
+        assert!(repo
+            .transition_status(
+                &id.0,
+                ScheduleStatus::Active,
+                ScheduleStatus::Cancelled,
+                now
+            )
+            .unwrap());
+        mgr.inner.pending_work.fetch_sub(1, Ordering::SeqCst);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        // Our cancel arrives second: Ok, but NO second decrement (pre-fix this
+        // shape underflowed to usize::MAX) and no status churn.
+        mgr.cancel(&id.0).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "no double decrement");
+        assert!(!mgr.has_pending_work());
+        assert_eq!(
+            repo.get(&id.0).unwrap().unwrap().status,
+            ScheduleStatus::Cancelled
+        );
+        // Sequential third cancel is equally idempotent.
+        mgr.cancel(&id.0).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        mgr.shutdown().await;
+    }
+
+    /// Regression (re-review): cancel landing after a one-off's run completed
+    /// (finish_fire won the Active→Ran flip and decremented) must not clobber
+    /// `Ran` back to `Cancelled` — the old code overwrote any non-cancelled
+    /// status — and must not decrement again.
+    #[tokio::test]
+    async fn cancel_after_retire_is_noop() {
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let counter = mgr.pending_work_handle();
+        let mut args = base_args();
+        args.cron_expr = None;
+        args.at_ts = Some(current_timestamp() + 100_000);
+        let id = mgr.create(args).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // finish_fire wins: retires the one-off and takes the decrement.
+        let repo = ScheduleRepository::new(&db);
+        assert!(repo.retire_one_off(&id.0, current_timestamp()).unwrap());
+        mgr.inner.pending_work.fetch_sub(1, Ordering::SeqCst);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        // Late cancel: idempotent Ok, Ran preserved, counter untouched.
+        mgr.cancel(&id.0).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            repo.get(&id.0).unwrap().unwrap().status,
+            ScheduleStatus::Ran,
+            "terminal Ran must not be clobbered by a late cancel"
+        );
+        mgr.shutdown().await;
+    }
+
+    /// Regression (re-review): a resume arriving after a racing resume already
+    /// won the Paused→Active flip (and its increment) must not increment a
+    /// second time — the old read-then-write shape let both snapshot Paused
+    /// and leak the counter upward so the daemon never idles.
+    #[tokio::test]
+    async fn resume_race_increments_once() {
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let counter = mgr.pending_work_handle();
+        let id = mgr.create(base_args()).await.unwrap();
+        mgr.pause(&id.0).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        // Racing resume wins: arms the fire time, flips, increments — exactly
+        // what the new resume path does.
+        let repo = ScheduleRepository::new(&db);
+        let now = current_timestamp();
+        repo.update_next_fire(&id.0, Some(now + 3_600), now)
+            .unwrap();
+        assert!(repo
+            .transition_status(&id.0, ScheduleStatus::Paused, ScheduleStatus::Active, now)
+            .unwrap());
+        mgr.inner.pending_work.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Our resume arrives second: idempotent Ok, counter stays exactly 1.
+        mgr.resume(&id.0).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "no double increment");
+        // The losing flip reports false, so no caller can pair a +1 with it.
+        assert!(!repo
+            .transition_status(&id.0, ScheduleStatus::Paused, ScheduleStatus::Active, now)
+            .unwrap());
+        mgr.shutdown().await;
+    }
+
+    /// Regression (re-review): pause must never clobber a terminal `Ran`
+    /// status (old shape: snapshot Active → blind UPDATE could overwrite a
+    /// concurrent run-completion's Ran with Paused and double-decrement).
+    #[tokio::test]
+    async fn pause_on_ran_does_not_clobber() {
+        let db = Database::open_in_memory().unwrap();
+        let now = current_timestamp();
+        {
+            let repo = ScheduleRepository::new(&db);
+            let mut rec = seed("sch00088", None, Some(now + 500), Some(now + 500));
+            rec.status = ScheduleStatus::Ran;
+            repo.create(&rec).unwrap();
+        }
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        assert_eq!(mgr.pending_work_handle().load(Ordering::SeqCst), 0);
+
+        let err = mgr.pause("sch00088").await.unwrap_err();
+        assert!(err.contains("ran"), "unexpected error: {err}");
+        let rec = ScheduleRepository::new(&db)
+            .get("sch00088")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.status, ScheduleStatus::Ran, "Ran must not be clobbered");
+        assert_eq!(mgr.pending_work_handle().load(Ordering::SeqCst), 0);
         mgr.shutdown().await;
     }
 }
