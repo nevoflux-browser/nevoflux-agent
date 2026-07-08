@@ -53,7 +53,7 @@
 
 use crate::loops::events::LoopEvents;
 use crate::loops::manager::db_str_to_agent_mode;
-use crate::loops::tool_classes::is_forbidden_in_iteration;
+use crate::loops::tool_classes::iteration_forbidden_tools;
 use crate::loops::types::LoopId;
 use crate::wasm::services::HostServices;
 use nevoflux_storage::models::{current_timestamp, IterationStatus, LoopRecord};
@@ -192,154 +192,32 @@ impl IterationExecutor {
             }
         };
 
-        // Production path: spawn a real agent host and run one turn.
-        // Skip sidebar streaming (sticky card + iteration_end events
-        // suffice), session extraction (would pollute memories), and
-        // trace collection (we have our own tool_calls_summary).
-        let agent_config = match services.agent_config.as_ref() {
-            Some(c) => c.clone(),
-            None => {
-                return self
-                    .finalize_iteration_error(
-                        iter_id,
-                        "HostServices has no agent_config — bug at server boot".into(),
-                        &session_id,
-                        &loop_id,
-                        seq,
-                        &rec,
-                    )
-                    .await;
-            }
-        };
-        let runtime_handle = match services.runtime_handle.as_ref() {
-            Some(h) => h.clone(),
-            None => {
-                return self
-                    .finalize_iteration_error(
-                        iter_id,
-                        "HostServices has no runtime_handle — bug at server boot".into(),
-                        &session_id,
-                        &loop_id,
-                        seq,
-                        &rec,
-                    )
-                    .await;
-            }
-        };
-
-        let mut services_for_iter = services.clone();
-        services_for_iter.session_id = session_id.clone();
-        // Mark this clone as iteration-mode so permission handlers in
-        // `wasm::mcp_tool_executor` and `agent_host` short-circuit dialogs
-        // (the loop's `mode` is the gating layer; permission dialogs would
-        // anyway be sent to the borrowed sidebar, which the user did not
-        // explicitly authorize — auto-approve keeps the interaction silent).
-        services_for_iter.is_iteration = true;
-        services_for_iter.iteration_loop_id = Some(loop_id.0.clone());
-        // Borrow the session's most recently active sidebar so browser_*
-        // tools issued from inside this iteration can actually reach a
-        // content script for execution. Without this, the daemon's writer
-        // lookup at `server.rs::browser request handler` warns "No writer
-        // for proxy" and drops the request (the iteration has proxy_id="").
-        if let Some(tracker) = services_for_iter.session_proxy_tracker.as_ref() {
-            if let Some(entry) = tracker.latest(&session_id) {
-                tracing::info!(
-                    loop_id = %loop_id.as_ref(),
-                    session_id = %session_id,
-                    borrowed_proxy = %entry.proxy_id,
-                    "loop iteration borrowed sidebar proxy"
-                );
-                services_for_iter.proxy_id = entry.proxy_id;
-                services_for_iter.client_identity = entry.client_identity;
-            } else {
-                tracing::warn!(
-                    loop_id = %loop_id.as_ref(),
-                    session_id = %session_id,
-                    "loop iteration could not borrow a sidebar proxy — browser_* tools will fail"
-                );
-            }
-        }
-        // Back-fill loop_manager handle: the LoopManager's stored services
-        // snapshot has `loop_manager: None` (chicken-and-egg at construction
-        // time), but the iteration's LLM may call loop_scratchpad_{set,get}
-        // via the MCP tool surface, which dispatches through `mcp_tool_executor`
-        // and needs `services.loop_manager`. Resolve via the process-global
-        // OnceLock set by server.rs at daemon startup.
-        if services_for_iter.loop_manager.is_none() {
-            if let Some(mgr) = crate::loops::CURRENT_LOOP_MANAGER.get() {
-                services_for_iter.loop_manager = Some(mgr.clone());
-            }
-        }
-        // Reset interrupt flag so a stray prior cancel doesn't poison
-        // this iteration. Note: the loop's own cancel_token is checked
-        // by `manager.rs::cancel_loop_inner`, not here.
-        services_for_iter.reset_interrupt();
-
-        let host = crate::agent_host::DaemonHostFunctions::new(agent_config, runtime_handle)
-            .with_services(services_for_iter)
-            .with_session_id(session_id.clone());
-
-        let agent = nevoflux_builtin_wasm::Agent::new(host);
-        // Build the iteration's tool allowlist from the mode's canonical
-        // tool catalog, then strip iteration-forbidden tools (ask_user,
-        // loop_create). Passing as `ToolsConfig::Allow(...)` ensures the
-        // filter is enforced even if `Agent::run`'s mode-default would
-        // otherwise have included them.
-        let allowlist: Vec<String> = agent
-            .get_tools_for_mode(iter_mode)
-            .into_iter()
-            .map(|t| t.name)
-            .filter(|n| !is_forbidden_in_iteration(n))
-            .collect();
-        let input = nevoflux_builtin_wasm::AgentInput {
+        // Production path: run one unattended agent turn via the shared
+        // `agent_exec` kernel. The kernel owns host construction, the sidebar
+        // proxy borrow, the `CURRENT_LOOP_MANAGER` back-fill, interrupt reset,
+        // allowlist filtering, and agent-panic mapping — extracted verbatim so
+        // schedules/goals can reuse the exact same wiring. Iterations skip
+        // sidebar streaming, session extraction, and the per-chat trace
+        // collector (we persist our own `tool_calls_summary`).
+        let req = crate::agent_exec::AgentExecRequest {
             session_id: session_id.clone(),
             mode: iter_mode,
             user_message,
-            history: vec![],
-            attachments: vec![],
-            local_files: vec![],
-            custom_system_prompt: None,
-            tab_id: None,
-            tab_ids: vec![],
-            skill_context: None,
-            available_models: vec![],
-            mcp_servers: vec![],
-            soul_context: None,
-            tools_config: Some(nevoflux_protocol::subagent::ToolsConfig::Allow(allowlist)),
-            os_platform: Some(std::env::consts::OS.to_string()),
+            forbidden_tools: iteration_forbidden_tools(),
+            forbidden_prefixes: Vec::new(),
+            unattended: true,
+            iteration_loop_id: Some(loop_id.0.clone()),
+            borrow_proxy: true,
+            bound_browser: None,
+            history: Vec::new(),
+            token_budget: None,
         };
-
-        // `Agent::run` is synchronous; the host functions block on the
-        // runtime handle stashed at construction time for any async LLM
-        // calls. Wrapping in `spawn_blocking` keeps us from hogging the
-        // dispatcher's executor thread.
-        let outcome: Result<nevoflux_builtin_wasm::AgentOutput, nevoflux_builtin_wasm::HostError> =
-            tokio::task::spawn_blocking(move || agent.run(&input))
-                .await
-                .unwrap_or_else(|e| {
-                    Err(nevoflux_builtin_wasm::HostError {
-                        code: 500,
-                        message: format!("agent task panicked: {e}"),
-                    })
-                });
-
-        match outcome {
-            Ok(out) => {
-                let trace = serde_json::Value::Array(
-                    out.tool_calls
-                        .iter()
-                        .map(|tc| {
-                            serde_json::json!({
-                                "name": tc.name,
-                                "ok": true,
-                            })
-                        })
-                        .collect(),
-                );
+        match crate::agent_exec::run_agent_once(&services, req).await {
+            Ok(outcome) => {
                 self.finalize_iteration_ok(
                     iter_id,
-                    Some(out.text),
-                    trace,
+                    Some(outcome.text),
+                    outcome.trace,
                     &session_id,
                     &loop_id,
                     seq,
@@ -348,15 +226,8 @@ impl IterationExecutor {
                 .await
             }
             Err(e) => {
-                self.finalize_iteration_error(
-                    iter_id,
-                    e.message,
-                    &session_id,
-                    &loop_id,
-                    seq,
-                    &rec,
-                )
-                .await
+                self.finalize_iteration_error(iter_id, e, &session_id, &loop_id, seq, &rec)
+                    .await
             }
         }
     }

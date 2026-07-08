@@ -12,11 +12,23 @@
 //! `Agent::get_tools_for_mode(mode)`. The only iteration-specific filter
 //! left is [`is_forbidden_in_iteration`].
 
-/// Tools that are forbidden inside loop iterations regardless of mode.
+/// Single source of truth for the iteration-forbidden tool names.
 /// `loop_create` would let an iteration spawn nested loops; `ask_user` blocks
 /// on a sidebar that may be closed.
+const ITERATION_FORBIDDEN: &[&str] = &["loop_create", "ask_user"];
+
+/// Tools that are forbidden inside loop iterations regardless of mode.
 pub fn is_forbidden_in_iteration(tool_name: &str) -> bool {
-    matches!(tool_name, "loop_create" | "ask_user")
+    ITERATION_FORBIDDEN.contains(&tool_name)
+}
+
+/// The iteration-forbidden tool names as an owned list.
+///
+/// Behaviourally equivalent to filtering a catalog with
+/// [`is_forbidden_in_iteration`], but materialised so it can be handed to the
+/// shared `agent_exec` kernel as `AgentExecRequest::forbidden_tools`.
+pub fn iteration_forbidden_tools() -> Vec<String> {
+    ITERATION_FORBIDDEN.iter().map(|s| s.to_string()).collect()
 }
 
 #[cfg(test)]
@@ -30,5 +42,19 @@ mod tests {
         assert!(!is_forbidden_in_iteration("read"));
         assert!(!is_forbidden_in_iteration("loop_scratchpad_set"));
         assert!(!is_forbidden_in_iteration("browser_get_content"));
+    }
+
+    #[test]
+    fn forbidden_list_matches_predicate() {
+        let list = iteration_forbidden_tools();
+        // Every listed name is forbidden by the predicate, and both entries
+        // are present — the kernel filter and the predicate stay in lockstep.
+        assert_eq!(
+            list,
+            vec!["loop_create".to_string(), "ask_user".to_string()]
+        );
+        for name in &list {
+            assert!(is_forbidden_in_iteration(name));
+        }
     }
 }

@@ -22,6 +22,7 @@
 //! ```
 
 pub mod agent;
+pub mod agent_exec;
 pub mod agent_host;
 pub mod asset_server;
 pub mod automation;
