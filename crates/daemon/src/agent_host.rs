@@ -1132,6 +1132,42 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 }
 
 impl HostFunctions for DaemonHostFunctions {
+    /// Persist a completed tool's result as a `tool_result` message so the goal
+    /// evaluator reads the raw observation (not the model's paraphrase) and the
+    /// continuation anchor can name what already happened (spec §4.1). Best
+    /// effort: skips when no services/session, empty content, or the meta
+    /// `think` tool (reasoning, not an observation).
+    fn record_tool_result(&self, tool_name: &str, tool_id: &str, content: &str, _success: bool) {
+        if content.trim().is_empty() || tool_name == "think" {
+            return;
+        }
+        let Some(services) = self.services.as_ref() else {
+            return;
+        };
+        let session_id = self
+            .session_id
+            .as_deref()
+            .unwrap_or(services.session_id.as_str());
+        if session_id.is_empty() {
+            return;
+        }
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("tool_name".to_string(), serde_json::json!(tool_name));
+        metadata.insert("tool_id".to_string(), serde_json::json!(tool_id));
+        let params = nevoflux_storage::CreateMessageParams::new(
+            session_id,
+            nevoflux_storage::models::MessageRole::Assistant,
+            content,
+        )
+        .with_content_type(nevoflux_storage::models::ContentType::ToolResult)
+        .with_metadata(metadata);
+        if let Err(e) = nevoflux_storage::repositories::MessageRepository::new(&services.database)
+            .create(params)
+        {
+            tracing::warn!(tool = tool_name, error = %e, "record_tool_result: persist failed");
+        }
+    }
+
     fn llm_chat(&self, request: &LlmRequest) -> HostResult<LlmResponse> {
         // Per-run spend cap (unattended surfaces only — `token_budget` is
         // `None` for interactive hosts). Checked before any provider

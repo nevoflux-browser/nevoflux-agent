@@ -709,6 +709,13 @@ pub trait HostFunctions {
         })
     }
 
+    /// Record a completed tool's result so it can be surfaced as durable
+    /// evidence (e.g. the goal evaluator's transcript and the continuation
+    /// progress anchor). Default: no-op. Called once per tool execution in the
+    /// agent loop with the full (untruncated) result content. See spec §4.1.
+    fn record_tool_result(&self, _tool_name: &str, _tool_id: &str, _content: &str, _success: bool) {
+    }
+
     // =========================================================================
     // /schedule skill tool functions (Task 1.6)
     // =========================================================================

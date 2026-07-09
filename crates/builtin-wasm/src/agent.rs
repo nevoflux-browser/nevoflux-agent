@@ -1216,6 +1216,16 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     preview
                 );
 
+                // Surface the full (untruncated) result as durable evidence for
+                // the goal evaluator + continuation anchor (spec §4.1). No-op on
+                // hosts that don't override it.
+                self.host.record_tool_result(
+                    &tool_call.name,
+                    &result.tool_call_id,
+                    &result.content,
+                    result.success,
+                );
+
                 // Dynamic truncation based on current message size
                 let content = truncate_tool_result_if_needed(&messages, &result.content);
 
