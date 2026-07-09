@@ -1084,8 +1084,22 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         });
         let tab_context_prefix = Self::format_tab_context(active_tab_info.as_ref(), &input.tab_ids);
 
-        // For browser/agent mode: extract keywords from user message and take initial viewport snapshot
-        let initial_snapshot = if matches!(input.mode, AgentMode::Browser | AgentMode::Agent) {
+        // For browser/agent mode: extract keywords from user message and take
+        // initial viewport snapshot.
+        //
+        // Skip it when the active tab is a Canvas page (`nevoflux://canvas/...`):
+        // a viewport snapshot of an internal page is meaningless, and the
+        // extension redirects it to a regular web tab — activating a discarded
+        // web tab to snapshot it STEALS focus from the Canvas tab (the user then
+        // has to click back). Suppressing the snapshot here keeps focus on the
+        // Canvas tab so canvas_eval works without manual intervention.
+        let active_tab_is_canvas = active_tab_info
+            .as_ref()
+            .map(|t| t.url.starts_with("nevoflux://canvas"))
+            .unwrap_or(false);
+        let initial_snapshot = if matches!(input.mode, AgentMode::Browser | AgentMode::Agent)
+            && !active_tab_is_canvas
+        {
             let keywords = Self::extract_keywords_from_text(&input.user_message);
             if !keywords.is_empty() {
                 eprintln!("[AGENT] Initial keywords from user message: {:?}", keywords);
