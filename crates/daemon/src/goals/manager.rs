@@ -71,6 +71,27 @@ pub fn apply_verdict(
     }
 }
 
+/// Render a compact "Recent actions" anchor from the newest-first tool results,
+/// one line per action (up to `k`). Each summary is single-lined and clipped so
+/// the anchor stays small. Injected into the continuation so a resumed turn
+/// knows what already happened and does not repeat completed steps (spec §4.2).
+pub fn derive_progress_anchor(recent: &[(String, String)], k: usize) -> String {
+    if recent.is_empty() {
+        return "(no tool actions last turn)".to_string();
+    }
+    let mut out = String::new();
+    for (name, summary) in recent.iter().take(k) {
+        let one_line = summary.replace('\n', " ");
+        let clipped: String = one_line.chars().take(120).collect();
+        out.push_str("- ");
+        out.push_str(name);
+        out.push_str(" → ");
+        out.push_str(&clipped);
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
 pub struct GoalManager {
     db: Database,
     events: GoalEvents,
@@ -397,6 +418,42 @@ mod tests {
     fn apply_verdict_unmet_under_budget_continues() {
         assert_eq!(apply_verdict(1, 20, false), AfterTurnAction::Continue);
         assert_eq!(apply_verdict(19, 20, false), AfterTurnAction::Continue);
+    }
+
+    // ---- derive_progress_anchor (pure) ------------------------------------
+
+    #[test]
+    fn progress_anchor_lists_recent_actions_newest_first() {
+        let recent = vec![
+            (
+                "create_artifact".to_string(),
+                "Artifact created and sent to canvas: art-123".to_string(),
+            ),
+            ("skill_load".to_string(), "ok".to_string()),
+        ];
+        let s = derive_progress_anchor(&recent, 5);
+        assert!(s.contains("create_artifact"));
+        assert!(s.contains("art-123"));
+        assert!(s.contains("skill_load"));
+        // newest first
+        assert!(s.find("create_artifact").unwrap() < s.find("skill_load").unwrap());
+    }
+
+    #[test]
+    fn progress_anchor_caps_at_k() {
+        let recent: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("tool{i}"), "r".to_string()))
+            .collect();
+        let s = derive_progress_anchor(&recent, 3);
+        assert_eq!(s.matches("- ").count(), 3);
+    }
+
+    #[test]
+    fn progress_anchor_empty_is_explicit() {
+        assert_eq!(
+            derive_progress_anchor(&[], 5),
+            "(no tool actions last turn)"
+        );
     }
 
     #[test]
