@@ -28,7 +28,8 @@
 use crate::config::AgentConfig;
 use crate::event_bus::EventBus;
 use crate::goals::evaluator::{
-    clip_transcript, evaluate, resolve_evaluator, TRANSCRIPT_MAX_BYTES, TRANSCRIPT_MAX_MESSAGES,
+    clip_transcript, evaluate, resolve_evaluator, Verdict, TRANSCRIPT_MAX_BYTES,
+    TRANSCRIPT_MAX_MESSAGES,
 };
 use crate::goals::events::GoalEvents;
 use nevoflux_storage::models::current_timestamp;
@@ -42,6 +43,14 @@ use std::sync::Arc;
 const CONDITION_MAX_CHARS: usize = 4000;
 /// Default turn budget when the caller doesn't specify one (or specifies ≤0).
 const DEFAULT_MAX_TURNS: i64 = 20;
+/// How many recent tool results feed the programmatic check and the
+/// continuation progress anchor (spec §4.1-4.3).
+const TOOL_RESULTS_WINDOW: u32 = 6;
+/// How many recent actions to list in the continuation progress anchor.
+const PROGRESS_ANCHOR_K: usize = 5;
+/// Per-message clamp (bytes) for a tool result folded into the evaluator
+/// transcript, so one giant output can't evict all other context.
+const TOOL_RESULT_MAX_BYTES: usize = 2048;
 
 /// The pure post-turn decision, computed from the turn count *after* the
 /// increment and whether the evaluator judged the condition met.
@@ -244,25 +253,66 @@ impl GoalManager {
             }
         };
 
-        // (2) Transcript tail (last N, clipped to the byte budget).
-        let transcript = self.load_transcript(session_id);
+        // (2) Recent tool results — shared by the programmatic check and the
+        // continuation progress anchor.
+        let tool_results = MessageRepository::new(&self.db)
+            .list_recent_tool_results(session_id, TOOL_RESULTS_WINDOW)
+            .unwrap_or_default();
+        let check = rec
+            .check_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<crate::goals::check::GoalCheck>(s).ok());
 
-        // (3) Resolve the evaluator. A failure here (key vanished, stored
-        // provider is ACP) is an evaluator error → fail-safe.
-        let choice = match resolve_evaluator(
+        // (2b) Programmatic check short-circuit (spec §4.3 route A): a machine
+        // check that holds against recent tool results achieves the goal with
+        // NO model call at all — works with no API key / ACP-only.
+        if let Some(c) = &check {
+            if crate::goals::check::eval_check(c, &tool_results) {
+                let now = current_timestamp();
+                let turns_used = repo
+                    .increment_turns(&rec.id, "programmatic check matched", now)
+                    .unwrap_or(rec.turns_used + 1);
+                let _ = repo.set_status(&rec.id, GoalStatus::Achieved, now);
+                self.emit_both(
+                    session_id,
+                    &rec,
+                    GoalStatus::Achieved.as_str(),
+                    true,
+                    "programmatic check matched",
+                    turns_used,
+                )
+                .await;
+                return None;
+            }
+        }
+
+        // (3-4) Model verdict. A check-only goal whose model is unusable simply
+        // continues (met=false) instead of fail-safe stopping — the check is
+        // its completion criterion, so keep working until it matches or the
+        // budget is exhausted.
+        let verdict = match resolve_evaluator(
             &self.config,
             rec.evaluator_provider.as_deref(),
             rec.evaluator_model.as_deref(),
         ) {
-            Ok(c) => c,
-            Err(e) => return self.record_evaluator_error(&repo, &rec, &e).await,
-        };
-
-        // (4) Evaluate. A transport `Err` (never unparseable — that's an Ok
-        // verdict) is an evaluator error → fail-safe.
-        let verdict = match evaluate(&choice, &rec.condition, &transcript).await {
-            Ok(v) => v,
-            Err(e) => return self.record_evaluator_error(&repo, &rec, &e).await,
+            Ok(choice) => {
+                let transcript = self.load_transcript(session_id);
+                match evaluate(&choice, &rec.condition, &transcript).await {
+                    Ok(v) => v,
+                    Err(e) => return self.record_evaluator_error(&repo, &rec, &e).await,
+                }
+            }
+            Err(e) => {
+                if check.is_some() {
+                    Verdict {
+                        met: false,
+                        reason: "awaiting programmatic check".to_string(),
+                        tokens_used: 0,
+                    }
+                } else {
+                    return self.record_evaluator_error(&repo, &rec, &e).await;
+                }
+            }
         };
 
         // (5) Count the turn with the verdict's reason.
@@ -313,10 +363,12 @@ impl GoalManager {
                     turns_used,
                 )
                 .await;
+                let anchor = derive_progress_anchor(&tool_results, PROGRESS_ANCHOR_K);
                 Some(format!(
-                    "<GOAL-CONTINUATION>\nGoal not yet met: {condition}\nEvaluator: {reason}\nContinue working toward the goal. Turn {used}/{max}.\n</GOAL-CONTINUATION>",
+                    "<GOAL-CONTINUATION>\nGoal not yet met: {condition}\nEvaluator: {reason}\nRecent actions (do NOT repeat completed steps):\n{anchor}\nContinue working toward the goal. Turn {used}/{max}.\n</GOAL-CONTINUATION>",
                     condition = rec.condition,
                     reason = verdict.reason,
+                    anchor = anchor,
                     used = turns_used,
                     max = rec.max_turns,
                 ))
@@ -328,12 +380,28 @@ impl GoalManager {
     /// [`TRANSCRIPT_MAX_MESSAGES`] messages (fetched efficiently), then clipped
     /// to [`TRANSCRIPT_MAX_BYTES`] (oldest dropped first).
     fn load_transcript(&self, session_id: &str) -> Vec<(String, String)> {
+        use nevoflux_storage::models::ContentType;
         let msgs = MessageRepository::new(&self.db)
             .list_recent(session_id, TRANSCRIPT_MAX_MESSAGES as u32)
             .unwrap_or_default();
         let pairs: Vec<(String, String)> = msgs
             .into_iter()
-            .map(|m| (m.role.as_str().to_string(), m.content))
+            .map(|m| {
+                // Label tool results distinctly so the evaluator reads them as
+                // observed output, not the model's own claim; clamp huge ones.
+                if m.content_type == ContentType::ToolResult {
+                    let content = if m.content.len() > TOOL_RESULT_MAX_BYTES {
+                        let mut c: String = m.content.chars().take(TOOL_RESULT_MAX_BYTES).collect();
+                        c.push_str("…[truncated]");
+                        c
+                    } else {
+                        m.content
+                    };
+                    ("tool".to_string(), content)
+                } else {
+                    (m.role.as_str().to_string(), m.content)
+                }
+            })
             .collect();
         clip_transcript(pairs, TRANSCRIPT_MAX_MESSAGES, TRANSCRIPT_MAX_BYTES)
     }
@@ -698,6 +766,98 @@ mod tests {
         seed_session(&db, "sess-1");
         let mgr = GoalManager::new(db.clone(), None, config_anthropic());
         assert!(mgr.after_turn("sess-1").await.is_none());
+    }
+
+    fn seed_tool_result(db: &Database, session_id: &str, tool: &str, content: &str) {
+        use nevoflux_storage::models::{ContentType, CreateMessageParams, MessageRole};
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("tool_name".to_string(), serde_json::json!(tool));
+        MessageRepository::new(db)
+            .create(
+                CreateMessageParams::new(session_id, MessageRole::Assistant, content)
+                    .with_content_type(ContentType::ToolResult)
+                    .with_metadata(meta),
+            )
+            .unwrap();
+    }
+
+    fn seed_goal_with_check(
+        db: &Database,
+        id: &str,
+        session_id: &str,
+        check: crate::goals::check::GoalCheck,
+    ) {
+        let now = current_timestamp();
+        let rec = GoalRecord {
+            id: id.to_string(),
+            session_id: session_id.to_string(),
+            condition: "condition text".to_string(),
+            // ACP provider: resolve_evaluator would ERROR if the model path ran.
+            evaluator_provider: Some("claude-code".to_string()),
+            evaluator_model: Some("sonnet".to_string()),
+            max_turns: 20,
+            turns_used: 0,
+            status: GoalStatus::Active,
+            last_reason: None,
+            created_at: now,
+            updated_at: now,
+            achieved_at: None,
+            check_json: Some(serde_json::to_string(&check).unwrap()),
+        };
+        GoalRepository::new(db).create(&rec).unwrap();
+    }
+
+    /// A matching programmatic check achieves the goal WITHOUT ever calling the
+    /// (deliberately broken/ACP) evaluator model. Spec §4.3 route A.
+    #[tokio::test]
+    async fn after_turn_check_hit_achieves_without_model() {
+        let db = Database::open_in_memory().unwrap();
+        seed_session(&db, "sess-1");
+        let mgr = GoalManager::new(db.clone(), None, config_anthropic());
+        seed_goal_with_check(
+            &db,
+            "goal-check",
+            "sess-1",
+            crate::goals::check::GoalCheck {
+                tool: Some("canvas_eval".into()),
+                matches: "15".into(),
+                negate: false,
+            },
+        );
+        seed_tool_result(&db, "sess-1", "canvas_eval", "display=15");
+
+        let out = mgr.after_turn("sess-1").await;
+        assert!(out.is_none(), "check matched → achieved, no continuation");
+        let status = mgr.status("sess-1").await.unwrap();
+        assert_eq!(status["status"], "achieved");
+    }
+
+    /// A check-only goal whose check is unmet and whose model is unusable must
+    /// CONTINUE (keep working) rather than fail-safe stop, and the continuation
+    /// carries the progress anchor. Spec §4.2/§4.3.
+    #[tokio::test]
+    async fn after_turn_check_only_unmet_continues_with_anchor() {
+        let db = Database::open_in_memory().unwrap();
+        seed_session(&db, "sess-1");
+        let mgr = GoalManager::new(db.clone(), None, config_anthropic());
+        seed_goal_with_check(
+            &db,
+            "goal-check",
+            "sess-1",
+            crate::goals::check::GoalCheck {
+                tool: Some("canvas_eval".into()),
+                matches: "15".into(),
+                negate: false,
+            },
+        );
+        // Non-matching result → check unmet, but it should appear in the anchor.
+        seed_tool_result(&db, "sess-1", "canvas_eval", "display=20");
+
+        let out = mgr.after_turn("sess-1").await;
+        let cont = out.expect("check-only unmet → continuation, not fail-safe stop");
+        assert!(cont.contains("GOAL-CONTINUATION"));
+        assert!(cont.contains("Recent actions"));
+        assert!(cont.contains("canvas_eval"));
     }
 
     /// Fail-safe: a goal whose stored evaluator is an ACP provider (seeded
