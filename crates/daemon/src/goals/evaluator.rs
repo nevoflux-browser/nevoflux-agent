@@ -77,6 +77,10 @@ pub struct EvaluatorChoice {
     pub model: String,
     pub api_key: String,
     pub base_url: Option<String>,
+    /// True when `provider` is an ACP agent — evaluated via
+    /// [`evaluate_via_acp`] (a one-shot over an already-connected ACP session)
+    /// instead of [`evaluate`]. Spec §4.3 route B.
+    pub is_acp: bool,
 }
 
 /// A parsed evaluator judgment. `tokens_used` sums `usage.total_tokens` across
@@ -179,7 +183,36 @@ pub fn resolve_evaluator(
         model,
         api_key,
         base_url: pc.base_url.clone(),
+        is_acp: false,
     })
+}
+
+/// Goal-specific evaluator resolution that ALSO permits ACP providers (spec
+/// §4.3 route B). If the resolved provider is an ACP agent, return an
+/// `is_acp` choice (evaluated later via [`evaluate_via_acp`] over an
+/// already-connected session — no direct-API key needed). Otherwise delegate
+/// to [`resolve_evaluator`] (direct-API only). Used only by the `/goal` paths;
+/// `/schedule` and other callers keep the strict direct-API `resolve_evaluator`.
+pub fn resolve_evaluator_for_goal(
+    config: &AgentConfig,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<EvaluatorChoice, String> {
+    let provider_str = provider
+        .map(|p| p.to_string())
+        .or_else(|| config.llm.active_provider().map(|s| s.to_string()));
+    if let Some(p) = &provider_str {
+        if ACP_PROVIDERS.contains(&p.to_lowercase().as_str()) {
+            return Ok(EvaluatorChoice {
+                provider: p.to_lowercase(),
+                model: model.unwrap_or_default().to_string(),
+                api_key: String::new(),
+                base_url: None,
+                is_acp: true,
+            });
+        }
+    }
+    resolve_evaluator(config, provider, model)
 }
 
 /// Strip a single leading/trailing markdown code fence (```json … ``` or
@@ -327,6 +360,48 @@ pub async fn evaluate(
         met: false,
         reason: "evaluator output unparseable".to_string(),
         tokens_used,
+    })
+}
+
+/// One-shot ACP judgment (spec §4.3 route B). Reuses an ALREADY-CONNECTED ACP
+/// provider from the registry (a fresh session per call — never spawns a
+/// process), sends the judge prompt, accumulates the streamed text (ignoring
+/// tool activity), then parses the strict-JSON verdict with one retry. Degraded
+/// vs direct-API: no temperature control. Returns `Err` (→ fail-safe) when no
+/// connected ACP provider exists (e.g. in unit tests), so it never blocks on a
+/// subprocess. Same unparseable contract as [`evaluate`].
+pub async fn evaluate_via_acp(
+    choice: &EvaluatorChoice,
+    condition: &str,
+    transcript: &[(String, String)],
+) -> Result<Verdict, String> {
+    let provider = ProviderType::from_str(&choice.provider)
+        .map_err(|e| format!("invalid evaluator provider '{}': {e}", choice.provider))?;
+    let system_base = format!("{EVALUATOR_SYSTEM_PROMPT}\n\nCONDITION:\n{condition}");
+    let user_content = render_transcript(transcript);
+
+    for attempt in 0..2 {
+        let system = if attempt == 0 {
+            system_base.clone()
+        } else {
+            format!("{system_base}\n\nRespond with STRICT JSON only.")
+        };
+        let prompt = format!("{system}\n\n---\n{user_content}");
+        let text = crate::wasm::llm::acp_oneshot(provider, &choice.model, &prompt)
+            .await
+            .map_err(|e| format!("ACP evaluator call failed: {e}"))?;
+        if let Some((met, reason)) = parse_verdict(&text) {
+            return Ok(Verdict {
+                met,
+                reason,
+                tokens_used: 0,
+            });
+        }
+    }
+    Ok(Verdict {
+        met: false,
+        reason: "evaluator output unparseable".to_string(),
+        tokens_used: 0,
     })
 }
 

@@ -28,8 +28,8 @@
 use crate::config::AgentConfig;
 use crate::event_bus::EventBus;
 use crate::goals::evaluator::{
-    clip_transcript, evaluate, resolve_evaluator, Verdict, TRANSCRIPT_MAX_BYTES,
-    TRANSCRIPT_MAX_MESSAGES,
+    clip_transcript, evaluate, evaluate_via_acp, resolve_evaluator_for_goal, Verdict,
+    TRANSCRIPT_MAX_BYTES, TRANSCRIPT_MAX_MESSAGES,
 };
 use crate::goals::events::GoalEvents;
 use nevoflux_storage::models::current_timestamp;
@@ -161,16 +161,17 @@ impl GoalManager {
         // time. A check-only goal (`check` present) tolerates an unresolvable
         // evaluator — the programmatic check is its completion criterion, so it
         // needs no model at all (spec §4.3 route A: works with no API key).
-        let choice = match resolve_evaluator(&self.config, provider.as_deref(), model.as_deref()) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                if check.is_some() {
-                    None
-                } else {
-                    return Err(e);
+        let choice =
+            match resolve_evaluator_for_goal(&self.config, provider.as_deref(), model.as_deref()) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    if check.is_some() {
+                        None
+                    } else {
+                        return Err(e);
+                    }
                 }
-            }
-        };
+            };
         let (evaluator_provider, evaluator_model) = match &choice {
             Some(c) => (Some(c.provider.clone()), Some(c.model.clone())),
             None => (provider.clone(), model.clone()),
@@ -321,16 +322,36 @@ impl GoalManager {
         // continues (met=false) instead of fail-safe stopping — the check is
         // its completion criterion, so keep working until it matches or the
         // budget is exhausted.
-        let verdict = match resolve_evaluator(
+        let verdict = match resolve_evaluator_for_goal(
             &self.config,
             rec.evaluator_provider.as_deref(),
             rec.evaluator_model.as_deref(),
         ) {
             Ok(choice) => {
                 let transcript = self.load_transcript(session_id);
-                match evaluate(&choice, &rec.condition, &transcript).await {
+                // ACP evaluator (route B) goes through the one-shot ACP adapter;
+                // direct-API evaluators through the standard path.
+                let result = if choice.is_acp {
+                    evaluate_via_acp(&choice, &rec.condition, &transcript).await
+                } else {
+                    evaluate(&choice, &rec.condition, &transcript).await
+                };
+                match result {
                     Ok(v) => v,
-                    Err(e) => return self.record_evaluator_error(&repo, &rec, &e).await,
+                    Err(e) => {
+                        // A model error with a check present is not fatal — the
+                        // check is the real completion criterion, so keep working
+                        // rather than fail-safe stopping.
+                        if check.is_some() {
+                            Verdict {
+                                met: false,
+                                reason: "awaiting programmatic check".to_string(),
+                                tokens_used: 0,
+                            }
+                        } else {
+                            return self.record_evaluator_error(&repo, &rec, &e).await;
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -689,27 +710,26 @@ mod tests {
         assert!(mgr.set("sess-1", &at_limit, None, None, None).await.is_ok());
     }
 
+    /// With ACP-evaluator support (spec §4.3 route B) an ACP active provider is
+    /// now ACCEPTED as the evaluator (judged one-shot over a connected ACP
+    /// session), no longer rejected at set time.
     #[tokio::test]
-    async fn set_rejects_acp_active_provider_with_direct_api_hint() {
+    async fn set_accepts_acp_active_provider_as_evaluator() {
         let db = Database::open_in_memory().unwrap();
         seed_session(&db, "sess-1");
         let mut cfg = AgentConfig::default();
         cfg.llm.provider = Some("claude-code".to_string());
         let mgr = GoalManager::new(db.clone(), None, Arc::new(cfg));
 
-        let err = mgr
+        let rec = mgr
             .set("sess-1", "done", None, None, None)
             .await
-            .unwrap_err();
-        assert!(
-            err.contains("ACP") && err.to_lowercase().contains("direct-api"),
-            "unexpected: {err}"
-        );
-        // Nothing persisted.
+            .expect("ACP provider is now an accepted evaluator");
+        assert_eq!(rec.evaluator_provider.as_deref(), Some("claude-code"));
         assert!(GoalRepository::new(&db)
             .get_active("sess-1")
             .unwrap()
-            .is_none());
+            .is_some());
     }
 
     #[tokio::test]

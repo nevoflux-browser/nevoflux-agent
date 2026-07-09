@@ -39,6 +39,52 @@ pub fn acp_providers() -> &'static Arc<TokioMutex<HashMap<String, AcpProvider>>>
     ACP_PROVIDERS.get_or_init(|| Arc::new(TokioMutex::new(HashMap::new())))
 }
 
+/// One-shot ACP completion for the goal evaluator (spec §4.3 route B).
+///
+/// Reuses an ALREADY-CONNECTED ACP provider from the registry (a fresh session
+/// per call — it never spawns a subprocess), sends `prompt` as a single text
+/// block, and accumulates the streamed reply text until the turn completes.
+/// Errors when the provider is not already connected (e.g. in unit tests), so
+/// the goal evaluator fails safe rather than blocking on process startup.
+pub async fn acp_oneshot(provider: ProviderType, _model: &str, prompt: &str) -> Result<String> {
+    let provider_key = format!("{:?}", provider);
+    let providers = acp_providers().lock().await;
+    let acp = providers
+        .get(&provider_key)
+        .filter(|p| p.is_alive())
+        .ok_or_else(|| {
+            DaemonError::InternalError(format!(
+                "ACP provider '{provider_key}' is not connected; cannot evaluate"
+            ))
+        })?;
+    let session_id = acp
+        .new_session()
+        .await
+        .map_err(|e| DaemonError::InternalError(format!("ACP new_session failed: {e}")))?;
+    let content = vec![ContentBlock::Text(TextContent::new(prompt.to_string()))];
+    let mut rx = acp
+        .prompt(session_id, content)
+        .await
+        .map_err(|e| DaemonError::InternalError(format!("ACP prompt failed: {e}")))?;
+    // Release the registry lock before doing I/O on the receiver.
+    drop(providers);
+
+    let mut text = String::new();
+    while let Some(update) = rx.recv().await {
+        match update {
+            AcpUpdate::Text(t) => text.push_str(&t),
+            AcpUpdate::Thought(_) => {}
+            AcpUpdate::Complete(_) => break,
+            AcpUpdate::Error(e) => {
+                return Err(DaemonError::InternalError(format!(
+                    "ACP evaluator error: {e}"
+                )));
+            }
+        }
+    }
+    Ok(text)
+}
+
 /// Tool definition for LLM function calling.
 ///
 /// Defines a tool that the LLM can invoke during the conversation.
