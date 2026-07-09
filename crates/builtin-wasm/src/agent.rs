@@ -5056,7 +5056,11 @@ comprehensions, f-strings, lambda, asyncio.gather\n\
             }),
         });
 
-        tools.extend(Self::recorded_flow_tools());
+        // NOTE: recorded_flow_tools (run_flow/list_flows/report_flow_repair) are
+        // already added by get_browser_tools_without_orchestrate (which this
+        // builder starts from). Re-adding them here duplicated the names and
+        // made direct-API providers reject the request ("Tool names must be
+        // unique"). Do NOT extend them again.
 
         tools
     }
@@ -5699,6 +5703,33 @@ mod tests {
             orchestrate_count, 1,
             "Agent mode should have exactly 1 orchestrate tool (not duplicated from browser)"
         );
+    }
+
+    /// Every mode's tool list MUST have unique tool names — direct-API providers
+    /// (e.g. DeepSeek) reject a request whose `tools` array has any duplicate
+    /// name ("Tool names must be unique.").
+    #[test]
+    fn test_no_duplicate_tool_names_in_any_mode() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        for mode in [
+            AgentMode::Chat,
+            AgentMode::Browser,
+            AgentMode::Agent,
+            AgentMode::Code,
+        ] {
+            let tools = agent.get_tools_for_mode(mode);
+            let mut seen = std::collections::HashSet::new();
+            let dups: Vec<String> = tools
+                .iter()
+                .filter(|t| !seen.insert(t.name.clone()))
+                .map(|t| t.name.clone())
+                .collect();
+            assert!(
+                dups.is_empty(),
+                "{mode:?} mode has duplicate tool names: {dups:?}"
+            );
+        }
     }
 
     #[test]
