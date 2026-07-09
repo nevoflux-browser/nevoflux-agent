@@ -312,23 +312,7 @@ impl Inner {
             Ok(v) => v,
             Err(_) => return,
         };
-        let mut active = 0usize;
-        let mut failed_recent = 0usize;
-        let mut next_fire_at: Option<i64> = None;
-        for rec in &all {
-            if rec.status == ScheduleStatus::Active {
-                active += 1;
-                if let Some(nf) = rec.next_fire_at {
-                    next_fire_at = Some(next_fire_at.map_or(nf, |cur| cur.min(nf)));
-                }
-            }
-            if matches!(
-                rec.last_run_status.as_deref(),
-                Some("error") | Some("missed")
-            ) {
-                failed_recent += 1;
-            }
-        }
+        let (active, failed_recent, next_fire_at) = snapshot_counts(&all);
         self.events
             .snapshot(json!({
                 "active": active,
@@ -338,6 +322,40 @@ impl Inner {
             }))
             .await;
     }
+}
+
+/// Pure aggregation core of [`Inner::emit_snapshot`]: `(active, failed_recent,
+/// next_fire_at)` over all schedule rows. Split out so the counting rules are
+/// unit-testable without an EventBus.
+///
+/// `failed_recent` only counts LIVE schedules (Active/Paused) whose
+/// `last_run_status` is `error`/`missed`. Terminal rows (Cancelled/Ran) are
+/// excluded: they keep their last_run_status forever, so counting them would
+/// pin the sidebar's red badge permanently with no heal path — e.g. an
+/// error'd-then-cancelled schedule, or a missed one-off that boot retired to
+/// `Ran`. Cancelling (or the one-off completing) IS the resolution; the badge
+/// must clear with it.
+fn snapshot_counts(all: &[ScheduleRecord]) -> (usize, usize, Option<i64>) {
+    let mut active = 0usize;
+    let mut failed_recent = 0usize;
+    let mut next_fire_at: Option<i64> = None;
+    for rec in all {
+        if rec.status == ScheduleStatus::Active {
+            active += 1;
+            if let Some(nf) = rec.next_fire_at {
+                next_fire_at = Some(next_fire_at.map_or(nf, |cur| cur.min(nf)));
+            }
+        }
+        if matches!(rec.status, ScheduleStatus::Active | ScheduleStatus::Paused)
+            && matches!(
+                rec.last_run_status.as_deref(),
+                Some("error") | Some("missed")
+            )
+        {
+            failed_recent += 1;
+        }
+    }
+    (active, failed_recent, next_fire_at)
 }
 
 /// Boot-time work computed synchronously (DB writes) and the async emissions /
@@ -1339,6 +1357,49 @@ mod tests {
         );
 
         mgr.shutdown().await;
+    }
+
+    /// Regression (final review F6): `failed_recent` must only count LIVE
+    /// (Active/Paused) schedules. Terminal rows keep their last_run_status
+    /// forever, so counting them pinned the sidebar's red avatar/header badge
+    /// permanently — an error'd-then-cancelled schedule or a missed-then-retired
+    /// one-off had no heal path.
+    #[test]
+    fn snapshot_counts_failed_recent_excludes_terminal_schedules() {
+        let mk = |id: &str, status: ScheduleStatus, last_run: Option<&str>| {
+            let mut rec = seed(id, Some("0 9 * * *"), None, Some(1_800_000_000));
+            rec.status = status;
+            rec.last_run_status = last_run.map(|s| s.to_string());
+            rec
+        };
+
+        // Error'd-then-cancelled + missed-then-retired: both contribute 0.
+        let cancelled_err = mk("s1", ScheduleStatus::Cancelled, Some("error"));
+        let ran_missed = mk("s2", ScheduleStatus::Ran, Some("missed"));
+        // Live failures still count: active/error and paused/missed.
+        let active_err = mk("s3", ScheduleStatus::Active, Some("error"));
+        let paused_missed = mk("s4", ScheduleStatus::Paused, Some("missed"));
+        // Healthy active row: counts as active, not as failed.
+        let active_ok = mk("s5", ScheduleStatus::Active, Some("ok"));
+
+        let (active, failed_recent, next_fire_at) = snapshot_counts(&[
+            cancelled_err.clone(),
+            ran_missed,
+            active_err,
+            paused_missed,
+            active_ok,
+        ]);
+        // `active` semantics unchanged: only Active rows (s3, s5).
+        assert_eq!(active, 2);
+        // Only the live failures (s3 active/error, s4 paused/missed).
+        assert_eq!(failed_recent, 2);
+        assert_eq!(next_fire_at, Some(1_800_000_000));
+
+        // A lone error'd-then-cancelled schedule yields a fully healed badge.
+        let (active, failed_recent, next_fire_at) = snapshot_counts(&[cancelled_err]);
+        assert_eq!(active, 0);
+        assert_eq!(failed_recent, 0, "terminal failure must not pin the badge");
+        assert_eq!(next_fire_at, None);
     }
 
     /// Regression (re-review): cancel arriving after a racing writer already
