@@ -21,6 +21,7 @@
 //!
 //! Task 2.3 adds [`tools`] (the `goal_*` LLM-callable tool dispatcher).
 
+pub mod check;
 pub mod evaluator;
 pub mod events;
 pub mod manager;
