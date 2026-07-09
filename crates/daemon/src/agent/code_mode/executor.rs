@@ -112,6 +112,13 @@ impl CodeModeResult {
 /// [`execute_python_simple_with_timeout`].
 pub const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(180);
 
+/// Wall-clock budget for the `orchestrate` tool's Code Mode scripts. These are
+/// long-running agent-authored orchestrations that legitimately wait on many
+/// slow tool calls (browser automation in headless, remote fetches, LLM
+/// sub-calls), so they get a very generous 24-hour cap rather than the 180s
+/// default. The timeout is a runaway backstop, not a normal completion bound.
+pub const ORCHESTRATE_MAX_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Whether a Monty runtime error is the wall-clock timeout (`TimeoutError` /
 /// "time limit exceeded"). A timeout is NOT a code defect — rewriting the code
 /// (mechanical fix or LLM rewrite) cannot fix it, and a rewritten version would
@@ -1062,7 +1069,8 @@ pub fn execute_python_with_llm(
     let runtime = tokio::runtime::Handle::current();
     let (external_names, tool_executor) =
         build_registry_and_executor(browser_ctx, HashMap::new(), None);
-    let executor = CodeModeExecutor::new();
+    // orchestrate scripts are long-running by design — give them the 24h budget.
+    let executor = CodeModeExecutor::new().with_max_duration(ORCHESTRATE_MAX_DURATION);
 
     let llm_rewrite =
         move |prompt: &str| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
@@ -1191,6 +1199,17 @@ mod tests {
         assert!(!is_timeout_error("TypeError", "unsupported operand type"));
         assert!(!is_timeout_error("NameError", "name 'x' is not defined"));
         assert!(!is_timeout_error("KeyError", "__tool_error"));
+    }
+
+    #[test]
+    fn test_orchestrate_max_duration_is_24h() {
+        assert_eq!(ORCHESTRATE_MAX_DURATION, Duration::from_secs(86_400));
+        // execute_python_with_llm applies this budget, not the 180s default.
+        let executor = CodeModeExecutor::new().with_max_duration(ORCHESTRATE_MAX_DURATION);
+        assert_eq!(
+            executor.resource_limits().max_duration,
+            Some(ORCHESTRATE_MAX_DURATION)
+        );
     }
 
     #[test]

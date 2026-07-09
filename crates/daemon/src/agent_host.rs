@@ -3554,13 +3554,21 @@ impl HostFunctions for DaemonHostFunctions {
                                 "orchestrate: invalid provider '{}', falling back to no-op rewrite",
                                 provider_name
                             );
-                            crate::agent::code_mode::execute_python_simple(code, browser_ctx)
+                            crate::agent::code_mode::execute_python_simple_with_timeout(
+                                code,
+                                browser_ctx,
+                                Some(crate::agent::code_mode::ORCHESTRATE_MAX_DURATION),
+                            )
                         }
                     }
                 }
                 Err(_) => {
                     debug!("orchestrate: no LLM provider available, using no-op rewrite");
-                    crate::agent::code_mode::execute_python_simple(code, browser_ctx)
+                    crate::agent::code_mode::execute_python_simple_with_timeout(
+                        code,
+                        browser_ctx,
+                        Some(crate::agent::code_mode::ORCHESTRATE_MAX_DURATION),
+                    )
                 }
             };
 
