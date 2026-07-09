@@ -691,6 +691,9 @@ fn tool_name_to_browser_action(name: &str) -> Option<BrowserToolAction> {
         "screenshot" => Some(BrowserToolAction::Screenshot),
         "snapshot" => Some(BrowserToolAction::Snapshot),
         "eval_js" => Some(BrowserToolAction::EvalJs),
+        // `canvas_eval` strips the `canvas_` prefix to bare `eval` (distinct
+        // from `eval_js`); run JS inside a canvas artifact's iframe (spec §6).
+        "eval" => Some(BrowserToolAction::CanvasEval),
         "wait_for" => Some(BrowserToolAction::WaitFor),
         "wait_for_stable" => Some(BrowserToolAction::WaitForStable),
         "scroll" => Some(BrowserToolAction::Scroll),
