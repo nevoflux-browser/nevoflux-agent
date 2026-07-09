@@ -112,6 +112,17 @@ impl CodeModeResult {
 /// [`execute_python_simple_with_timeout`].
 pub const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(180);
 
+/// Whether a Monty runtime error is the wall-clock timeout (`TimeoutError` /
+/// "time limit exceeded"). A timeout is NOT a code defect — rewriting the code
+/// (mechanical fix or LLM rewrite) cannot fix it, and a rewritten version would
+/// just time out again. It also produces a misleading "LLM rewrite failed: No
+/// LLM retry in orchestrate tool mode" error on the orchestrate path (where
+/// `llm_rewrite` is a stub). So a timeout must be returned directly, not routed
+/// through the repair path.
+fn is_timeout_error(error_type: &str, error_msg: &str) -> bool {
+    error_type == "TimeoutError" || error_msg.contains("time limit exceeded")
+}
+
 /// Default resource limits for Monty execution.
 fn default_resource_limits() -> ResourceLimits {
     ResourceLimits {
@@ -436,6 +447,16 @@ impl CodeModeExecutor {
                         &auto_fixed[..auto_fixed.floor_char_boundary(200)]
                     );
 
+                    // A timeout is not fixable by rewriting — return it directly.
+                    if is_timeout_error(&error_type, &error_msg) {
+                        return CodeModeResult::fail_with_output(
+                            collect_output(print_writer),
+                            format!("{error_type}: {error_msg}"),
+                        )
+                        .with_tool_results(tool_results)
+                        .with_retries(retries);
+                    }
+
                     if retries < MAX_RETRIES {
                         let line = exc.traceback().last().map(|f| f.start.line as usize);
 
@@ -617,6 +638,18 @@ impl CodeModeExecutor {
                                     &auto_fixed[..auto_fixed.floor_char_boundary(200)]
                                 );
 
+                                // A timeout is not fixable by rewriting — return
+                                // it directly (also avoids the misleading
+                                // "No LLM retry in orchestrate tool mode" error).
+                                if is_timeout_error(&error_type, &error_msg) {
+                                    return CodeModeResult::fail_with_output(
+                                        collect_output(print_writer),
+                                        format!("{error_type}: {error_msg}"),
+                                    )
+                                    .with_tool_results(tool_results)
+                                    .with_retries(retries);
+                                }
+
                                 if retries < MAX_RETRIES {
                                     let line =
                                         exc.traceback().last().map(|f| f.start.line as usize);
@@ -748,6 +781,17 @@ impl CodeModeExecutor {
                                     error_msg,
                                     &auto_fixed[..auto_fixed.floor_char_boundary(200)]
                                 );
+
+                                // A timeout is not fixable by rewriting — return
+                                // it directly.
+                                if is_timeout_error(&error_type, &error_msg) {
+                                    return CodeModeResult::fail_with_output(
+                                        collect_output(print_writer),
+                                        format!("{error_type}: {error_msg}"),
+                                    )
+                                    .with_tool_results(tool_results)
+                                    .with_retries(retries);
+                                }
 
                                 if retries < MAX_RETRIES {
                                     let line =
@@ -1134,6 +1178,20 @@ fn uuid_simple() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_timeout_error() {
+        // The Monty wall-clock timeout, by type and by message.
+        assert!(is_timeout_error(
+            "TimeoutError",
+            "time limit exceeded: 32.1s > 30s"
+        ));
+        assert!(is_timeout_error("SomeType", "time limit exceeded: ..."));
+        // Ordinary code defects must still route through the repair path.
+        assert!(!is_timeout_error("TypeError", "unsupported operand type"));
+        assert!(!is_timeout_error("NameError", "name 'x' is not defined"));
+        assert!(!is_timeout_error("KeyError", "__tool_error"));
+    }
 
     #[test]
     fn test_default_max_duration_is_180s() {
