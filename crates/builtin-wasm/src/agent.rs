@@ -3731,11 +3731,21 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             // /goal skill tools (Task 2.3).
             ToolDefinition {
                 name: "goal_set".into(),
-                description: "Set a completion condition for this session. After every turn an independent zero-tool evaluator model judges the condition against the conversation; if unmet the agent is automatically told to continue. Before calling: ask the user which model should evaluate (default: the current provider/model). The condition must be self-provable from conversation output (state the check, e.g. 'cargo test exits 0'). Max 4000 chars. Optional max_turns (default 20).".into(),
+                description: "Set a completion condition for this session. After every turn completion is decided by (a) an OPTIONAL programmatic `check` over recent tool results — if it holds the goal is met with NO model call (works with no API key / ACP-only), else (b) an independent zero-tool evaluator model. Prefer `check` whenever the condition is machine-verifiable (exit code, a read-back value like a calculator display, a knowledge-base query returning results). The condition must be self-provable from conversation output (state the check, e.g. 'cargo test exits 0'). Max 4000 chars. Optional max_turns (default 20).".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "condition": { "type": "string", "description": "natural-language, self-provable completion condition (max 4000 chars)" },
+                        "check": {
+                            "type": "object",
+                            "description": "OPTIONAL machine check over recent tool results; if it holds the goal is met WITHOUT any evaluator model. Prefer this for machine-verifiable goals.",
+                            "properties": {
+                                "tool": { "type": "string", "description": "only inspect this tool's recent result; omit = any tool" },
+                                "matches": { "type": "string", "description": "substring, or /regex/ when slash-wrapped" },
+                                "negate": { "type": "boolean", "description": "require the pattern ABSENT instead of present" }
+                            },
+                            "required": ["matches"]
+                        },
                         "evaluator_provider": { "type": "string", "description": "direct-API provider id to use as the evaluator. Default: the current provider." },
                         "evaluator_model": { "type": "string", "description": "model id to use as the evaluator. Default: the current model." },
                         "max_turns": { "type": "integer", "description": "turn budget before the goal expires unmet. Default 20." }

@@ -129,6 +129,23 @@ impl GoalManager {
         model: Option<String>,
         max_turns: Option<i64>,
     ) -> Result<GoalRecord, String> {
+        self.set_checked(session_id, condition, provider, model, max_turns, None)
+            .await
+    }
+
+    /// Like [`set`], plus an optional programmatic `check` (spec §4.3 route A).
+    /// When a `check` is present the goal can complete with NO evaluator model,
+    /// so evaluator resolution is best-effort rather than fail-fast.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_checked(
+        &self,
+        session_id: &str,
+        condition: &str,
+        provider: Option<String>,
+        model: Option<String>,
+        max_turns: Option<i64>,
+        check: Option<crate::goals::check::GoalCheck>,
+    ) -> Result<GoalRecord, String> {
         let trimmed = condition.trim();
         if trimmed.is_empty() {
             return Err("goal condition must not be empty".to_string());
@@ -140,9 +157,24 @@ impl GoalManager {
             ));
         }
 
-        // Fail fast: resolve the evaluator now so a bad provider/key surfaces
-        // at set time rather than silently on the first post-turn evaluation.
-        let choice = resolve_evaluator(&self.config, provider.as_deref(), model.as_deref())?;
+        // Resolve the evaluator eagerly so a bad provider/key surfaces at set
+        // time. A check-only goal (`check` present) tolerates an unresolvable
+        // evaluator — the programmatic check is its completion criterion, so it
+        // needs no model at all (spec §4.3 route A: works with no API key).
+        let choice = match resolve_evaluator(&self.config, provider.as_deref(), model.as_deref()) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                if check.is_some() {
+                    None
+                } else {
+                    return Err(e);
+                }
+            }
+        };
+        let (evaluator_provider, evaluator_model) = match &choice {
+            Some(c) => (Some(c.provider.clone()), Some(c.model.clone())),
+            None => (provider.clone(), model.clone()),
+        };
 
         let now = current_timestamp();
         let max_turns = max_turns.filter(|n| *n > 0).unwrap_or(DEFAULT_MAX_TURNS);
@@ -153,8 +185,8 @@ impl GoalManager {
             id,
             session_id: session_id.to_string(),
             condition: trimmed.to_string(),
-            evaluator_provider: Some(choice.provider),
-            evaluator_model: Some(choice.model),
+            evaluator_provider,
+            evaluator_model,
             max_turns,
             turns_used: 0,
             status: GoalStatus::Active,
@@ -162,8 +194,7 @@ impl GoalManager {
             created_at: now,
             updated_at: now,
             achieved_at: None,
-            // Wired to a real value in Task A6 (goal_set `check` param).
-            check_json: None,
+            check_json: check.as_ref().and_then(|c| serde_json::to_string(c).ok()),
         };
         GoalRepository::new(&self.db)
             .create(&rec)
@@ -553,7 +584,35 @@ mod tests {
         Arc::new(cfg)
     }
 
+    fn config_no_provider() -> Arc<AgentConfig> {
+        Arc::new(AgentConfig::default())
+    }
+
     // ---- set ---------------------------------------------------------------
+
+    /// A check-only goal can be set with NO usable evaluator provider — the
+    /// programmatic check is its completion criterion (spec §4.3 route A).
+    #[tokio::test]
+    async fn set_checked_check_only_succeeds_without_evaluator() {
+        let db = Database::open_in_memory().unwrap();
+        seed_session(&db, "sess-1");
+        let mgr = GoalManager::new(db.clone(), None, config_no_provider());
+
+        // No provider → a plain goal cannot be set.
+        assert!(mgr.set("sess-1", "done", None, None, None).await.is_err());
+
+        // But a check-only goal can (no model needed).
+        let check = crate::goals::check::GoalCheck {
+            tool: None,
+            matches: "PASS".into(),
+            negate: false,
+        };
+        let rec = mgr
+            .set_checked("sess-1", "tests pass", None, None, None, Some(check))
+            .await
+            .expect("check-only goal sets without an evaluator");
+        assert!(rec.check_json.is_some());
+    }
 
     #[tokio::test]
     async fn set_persists_and_stores_resolved_evaluator() {

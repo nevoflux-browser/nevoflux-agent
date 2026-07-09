@@ -59,13 +59,15 @@ async fn goal_set(args: &Value, session_id: &str, mgr: &GoalManager) -> Result<V
         .and_then(|v| v.as_str())
         .map(String::from);
     let max_turns = args.get("max_turns").and_then(|v| v.as_i64());
+    let check = crate::goals::check::parse_check(args)?;
 
-    mgr.set(
+    mgr.set_checked(
         session_id,
         &condition,
         evaluator_provider,
         evaluator_model,
         max_turns,
+        check,
     )
     .await?;
 
