@@ -4336,6 +4336,15 @@ impl HostFunctions for DaemonHostFunctions {
         self.execute_browser_action(BrowserToolAction::EditArtifact, params.clone(), tab_id)
     }
 
+    fn canvas_eval(
+        &self,
+        params: &serde_json::Value,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        debug!("canvas_eval: running JS inside artifact iframe");
+        self.execute_browser_action(BrowserToolAction::CanvasEval, params.clone(), tab_id)
+    }
+
     fn browser_extract_visual_identity(
         &self,
         params: &serde_json::Value,

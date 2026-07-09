@@ -386,6 +386,19 @@ pub trait HostFunctions {
         tab_id: Option<i64>,
     ) -> HostResult<BrowserToolResult>;
 
+    /// Run a JS snippet inside a canvas artifact's iframe and return the last
+    /// expression's value. Default: not supported. See spec §6.
+    fn canvas_eval(
+        &self,
+        _params: &serde_json::Value,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        Err(HostError {
+            code: 5,
+            message: "canvas_eval not supported by this host".into(),
+        })
+    }
+
     /// Extract a brand's visual identity (colors / fonts / logo / hero
     /// screenshot / name / tagline) from a URL or existing tab. Backs the
     /// `canvas_extract_visual_identity` tool — used by Mode 3 (website-to-

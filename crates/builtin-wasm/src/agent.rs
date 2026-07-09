@@ -2200,6 +2200,16 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 let result = self.host.browser_edit_artifact(&params, tab_id)?;
                 serde_json::to_string(&result).unwrap_or_default()
             }
+            "canvas_eval" => {
+                let tab_id = tool_call.arguments["tab_id"].as_i64();
+                let params = serde_json::json!({
+                    "artifact_id": tool_call.arguments.get("artifact_id").and_then(|v| v.as_str()).unwrap_or(""),
+                    "script": tool_call.arguments.get("script").and_then(|v| v.as_str()).unwrap_or(""),
+                    "timeout_ms": tool_call.arguments.get("timeout_ms"),
+                });
+                let result = self.host.canvas_eval(&params, tab_id)?;
+                serde_json::to_string(&result).unwrap_or_default()
+            }
             // Subagent tools
             "subagent_spawn" => {
                 // If args contain role-system fields, use new JSON config path
@@ -3174,6 +3184,28 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                         }
                     },
                     "required": ["id", "old_str", "new_str"]
+                }),
+            },
+            ToolDefinition {
+                name: "canvas_eval".into(),
+                description: "Run a JS snippet INSIDE a running canvas artifact's iframe and return the last expression's value. Use this to operate and VERIFY a live Canvas app (e.g. click its buttons and read its display) — the normal browser_* tools cannot reach the canvas page. Inside the iframe `document.querySelector('[data-testid=\"btn-3\"]').click()` is a REAL click and reading the DOM returns the REAL runtime value. Only use when an [Active Canvas] hint is present. Pair with goal_set's `check` for a build→run→verify→fix loop.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "artifact_id": {
+                            "type": "string",
+                            "description": "Artifact ID (from the [Active Canvas] context hint)"
+                        },
+                        "script": {
+                            "type": "string",
+                            "description": "JS to evaluate inside the iframe; the last expression is returned (JSON-serialized). e.g. \"document.getElementById('display').textContent\""
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "description": "Optional eval timeout in ms (default 5000)"
+                        }
+                    },
+                    "required": ["artifact_id", "script"]
                 }),
             },
             ToolDefinition {

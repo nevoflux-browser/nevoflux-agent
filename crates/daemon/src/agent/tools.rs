@@ -1085,6 +1085,16 @@ impl BrowserTool {
                 }
                 p
             }
+            BrowserToolAction::CanvasEval => {
+                let mut p = serde_json::json!({
+                    "artifact_id": arguments.get("artifact_id").and_then(|v| v.as_str()).unwrap_or(""),
+                    "script": arguments.get("script").and_then(|v| v.as_str()).unwrap_or(""),
+                });
+                if let Some(t) = arguments.get("timeout_ms") {
+                    p["timeout_ms"] = t.clone();
+                }
+                p
+            }
             BrowserToolAction::ExtractVisualIdentity => {
                 // Forward the full ExtractVisualIdentityRequest shape (target,
                 // timeout_sec, viewport) through to the extension. The
@@ -1358,14 +1368,17 @@ impl BrowserTool {
         // daemon-lifetime; absence here means the daemon couldn't bind
         // its loopback HTTP port at boot, in which case browser_upload
         // is genuinely unavailable.
-        let asset_server =
-            self.ctx.asset_server.as_ref().ok_or_else(|| {
-                DaemonError::InternalError(
-                    "browser_upload_file: AssetServer is not running on this daemon".into(),
-                )
-            })?;
-        let file_url =
-            asset_server.register_download(canonical, mime_type.clone(), file_name.clone(), TOKEN_TTL);
+        let asset_server = self.ctx.asset_server.as_ref().ok_or_else(|| {
+            DaemonError::InternalError(
+                "browser_upload_file: AssetServer is not running on this daemon".into(),
+            )
+        })?;
+        let file_url = asset_server.register_download(
+            canonical,
+            mime_type.clone(),
+            file_name.clone(),
+            TOKEN_TTL,
+        );
 
         // Build and dispatch the browser request.
         let params = serde_json::json!({
@@ -1667,12 +1680,12 @@ impl ToolExecutor for StartRecordingTool {
         // Generate a short unique recording ID.
         // Note: 48-bit prefix of a v4 UUID — negligible collision probability for
         // typical recording counts per session.
-        let recording_id = format!(
-            "rec_{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        );
+        let recording_id = format!("rec_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
 
-        let trace_path = self.ctx.recordings_dir.join(format!("{recording_id}.jsonl"));
+        let trace_path = self
+            .ctx
+            .recordings_dir
+            .join(format!("{recording_id}.jsonl"));
 
         // Tell the browser extension to arm recording; it returns the active tab URL.
         let params = serde_json::json!({
@@ -1764,9 +1777,7 @@ impl ToolExecutor for StopRecordingTool {
                 .as_ref()
                 .map(|e| e.message.as_str())
                 .unwrap_or("browser failed to stop recording");
-            return Err(DaemonError::InternalError(format!(
-                "stop_recording: {msg}"
-            )));
+            return Err(DaemonError::InternalError(format!("stop_recording: {msg}")));
         }
 
         Ok(serde_json::json!({
@@ -2819,7 +2830,7 @@ mod tests {
             proxy_id: String::new(),
             client_identity: vec![],
             asset_server: None,
-            recording_collector: None,        // subsystem absent
+            recording_collector: None,                 // subsystem absent
             recordings_dir: std::path::PathBuf::new(), // empty
         });
         let tool = StartRecordingTool { ctx };
