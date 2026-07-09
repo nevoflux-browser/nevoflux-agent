@@ -728,11 +728,13 @@ impl ScheduleManager {
 }
 
 /// Synchronous boot recovery (DB writes only). Sweeps orphaned run rows,
-/// detects + rearms missed fires, retires spent/stranded one-offs, and only
-/// THEN counts the surviving active schedules into pending_work — retire
-/// decisions never touch the counter, so there is no boot-path decrement to
-/// keep balanced. Returns the async work (events + catchups) to run at the
-/// tick task's head so [`ScheduleManager::start_with_bus`] can stay non-async.
+/// detects + rearms missed fires, retires spent/stranded one-offs (but
+/// re-parks a `deferred` one-off into the deferred set instead of retiring it,
+/// so a live+defer job survives a restart), and only THEN counts the surviving
+/// active schedules into pending_work — retire decisions never touch the
+/// counter, so there is no boot-path decrement to keep balanced. Returns the
+/// async work (events + catchups) to run at the tick task's head so
+/// [`ScheduleManager::start_with_bus`] can stay non-async.
 fn boot_recover(inner: &Arc<Inner>) -> BootPlan {
     let now = current_timestamp();
     let repo = ScheduleRepository::new(&inner.db);
@@ -750,13 +752,26 @@ fn boot_recover(inner: &Arc<Inner>) -> BootPlan {
     let active = repo.list_active().unwrap_or_default();
     for rec in &active {
         let Some(nf) = rec.next_fire_at else {
-            // Active with no armed fire. For a one-off this means a prior daemon
-            // died between a boot catchup's next_fire clear and the catchup
-            // run's finish_fire: without intervention it would never fire again
-            // yet keep counting as pending work forever. Retire it, with a
-            // cancelled run row for operator visibility. (A cron row can only
-            // get here in a degenerate way — next_after failed at finish_fire —
-            // and is deliberately left alone.)
+            // A parked `live`+`defer` ONE-OFF: `finish_fire` left it Active with
+            // next_fire_at=NULL and last_run_status="deferred", plus an
+            // in-memory deferred-set entry that did NOT survive the restart.
+            // Re-park it — re-insert into the deferred set and leave it Active
+            // (so the post-pass counter below counts it and the next
+            // browser-available tick coalesce-refires it). Retiring here would
+            // break the defer promise ("runs once a browser returns"). Only
+            // one-offs reach here with NULL next_fire; a cron+defer keeps its
+            // recomputed next_fire, so it never lands in this branch.
+            if rec.cron_expr.is_none() && rec.last_run_status.as_deref() == Some("deferred") {
+                inner.deferred.lock().unwrap().insert(rec.id.clone());
+                continue;
+            }
+            // Otherwise a one-off with no armed fire means a prior daemon died
+            // between a boot catchup's next_fire clear and the catchup run's
+            // finish_fire: without intervention it would never fire again yet
+            // keep counting as pending work forever. Retire it, with a cancelled
+            // run row for operator visibility. (A cron row can only get here in
+            // a degenerate way — next_after failed at finish_fire — and is
+            // deliberately left alone.)
             if rec.cron_expr.is_none() && repo.retire_one_off(&rec.id, now).unwrap_or(false) {
                 // Visibility row: fire_kind "scheduled" (the fire that never
                 // happened was the schedule's own), status `cancelled` with an
@@ -1265,6 +1280,64 @@ mod tests {
             Some("stranded by prior shutdown")
         );
         assert_eq!(stranded.fire_kind, "scheduled");
+        mgr.shutdown().await;
+    }
+
+    /// Regression (final review F4): a parked `live`+`defer` ONE-OFF is left by
+    /// `finish_fire` as Active with next_fire_at=NULL and
+    /// last_run_status="deferred", plus an in-memory deferred-set entry that
+    /// does NOT survive a restart. Boot must RE-PARK it (stay Active, re-enter
+    /// the deferred set, keep counting as pending work) rather than retire it —
+    /// otherwise the defer promise "runs once a browser returns" becomes "never
+    /// runs".
+    #[tokio::test]
+    async fn boot_reparks_deferred_one_off_instead_of_retiring() {
+        let db = Database::open_in_memory().unwrap();
+        let now = current_timestamp();
+        {
+            let repo = ScheduleRepository::new(&db);
+            // One-off (cron None), next_fire_at NULL, browser live, and the
+            // telltale last_run_status="deferred" from the pre-restart defer.
+            let mut rec = seed("schdef1", None, Some(now), None);
+            rec.browser_policy = "live".into();
+            rec.last_run_status = Some("deferred".into());
+            repo.create(&rec).unwrap();
+        }
+
+        // No injected/global browser registry ⇒ the tick's coalesce never
+        // drains the set, so the parked entry is stable to observe. All reads
+        // below are synchronous (no await) and thus run before the current-
+        // thread runtime can drive the just-spawned tick task.
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+
+        let rec = ScheduleRepository::new(&db)
+            .get("schdef1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rec.status,
+            ScheduleStatus::Active,
+            "deferred one-off must NOT be retired"
+        );
+        assert!(
+            mgr.inner.deferred.lock().unwrap().contains("schdef1"),
+            "deferred one-off must be re-parked in the deferred set"
+        );
+        assert_eq!(
+            mgr.pending_work_handle().load(Ordering::SeqCst),
+            1,
+            "re-parked deferred one-off still counts as pending work"
+        );
+        // No cancelled "stranded" visibility row was recorded (it was re-parked,
+        // not retired).
+        let runs = mgr.runs("schdef1", 10).await.unwrap();
+        assert!(
+            !runs
+                .iter()
+                .any(|r| r.status == ScheduleRunStatus::Cancelled),
+            "re-parked one-off must not get a stranded/cancelled run row"
+        );
+
         mgr.shutdown().await;
     }
 

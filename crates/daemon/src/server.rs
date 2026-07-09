@@ -1689,6 +1689,12 @@ pub async fn start_server(
         Some(event_bus.clone()),
         Some(services.clone()),
     );
+    // Publish the process-global handle so `agent_exec::run_agent_once` can
+    // back-fill `services.schedule_manager` into an unattended run's services
+    // clone. The runner/automation snapshots above are pre-`with_schedule_manager`
+    // (chicken-and-egg), so without this the read-only `schedule_*` tools that
+    // the unattended allowlists deliberately keep available would 500.
+    let _ = crate::schedules::CURRENT_SCHEDULE_MANAGER.set(schedule_manager.clone());
     services = services.with_schedule_manager(schedule_manager.clone());
 
     // Construct the /goal skill's GoalManager and inject it into HostServices
@@ -1706,6 +1712,10 @@ pub async fn start_server(
         Some(event_bus.clone()),
         agent_config.read().unwrap().clone(),
     );
+    // Publish the process-global handle (mirrors CURRENT_SCHEDULE_MANAGER) so an
+    // unattended run can back-fill `services.goal_manager` and answer
+    // `goal_status` instead of erroring; the snapshots above are pre-manager.
+    let _ = crate::goals::CURRENT_GOAL_MANAGER.set(goal_manager.clone());
     // No shutdown handle is retained (GoalManager owns no background task), so
     // move the sole `Arc` straight onto services.
     services = services.with_goal_manager(goal_manager);
@@ -4307,7 +4317,9 @@ async fn handle_event_bus_request(
                     "EventBus publish routed to recording sink"
                 );
                 recording_collector.ingest(rec_id.to_string(), opts.payload);
-                return EventBusResponse::Published { event_id: String::new() };
+                return EventBusResponse::Published {
+                    event_id: String::new(),
+                };
             }
 
             let publisher = PublisherIdentity::Extension {
@@ -4976,8 +4988,7 @@ async fn handle_chat_message_streaming(
                 // Mark the LLM-facing message as this skill's INPUT (not a bare
                 // question) so the model runs the skill instead of answering
                 // directly. History still stores the original `message_content`.
-                let invocation =
-                    crate::wasm::llm::skill_invocation_message(skill_name, &args);
+                let invocation = crate::wasm::llm::skill_invocation_message(skill_name, &args);
                 (invocation, Some(ctx))
             } else {
                 warn!("Skill '{}' not found in streaming path", skill_name);
@@ -8036,8 +8047,14 @@ async fn handle_goal_status(
         });
     };
 
-    match crate::goals::execute_goal_tool("goal_status", &serde_json::json!({}), session_id, mgr)
-        .await
+    match crate::goals::execute_goal_tool(
+        "goal_status",
+        &serde_json::json!({}),
+        session_id,
+        false,
+        mgr,
+    )
+    .await
     {
         Ok(status) => serde_json::json!({
             "type": "system_response",

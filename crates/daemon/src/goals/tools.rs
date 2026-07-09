@@ -5,28 +5,39 @@
 //! `HostFunctions` for direct-API providers, `mcp_tool_executor` for
 //! ACP-bridge providers) is a single name-list per call site.
 //!
-//! Unlike `execute_schedule_tool`, this dispatcher takes a bare
-//! `session_id: &str` rather than a context struct — goals have no
-//! "unattended run" branch inside the tool itself. The one unattended-run
-//! restriction (`goal_set` must not hijack a session's goal from inside a
-//! `/loop` iteration or a schedule's own fire) is enforced entirely at the
-//! `mcp_tool_executor` iteration gate, the same call site that rejects
-//! `loop_create` / `schedule_create`.
+//! The one unattended-run restriction (`goal_set` must not hijack a session's
+//! goal from inside a `/loop` iteration or a schedule's own fire) is enforced
+//! HERE in the shared dispatcher via the `is_unattended` flag, so BOTH dispatch
+//! surfaces are covered: the direct-API `agent_host` path (whose run loop
+//! executes whatever tool the model emits, regardless of the advertised
+//! allowlist) and the ACP `mcp_tool_executor` path. The `mcp_tool_executor`
+//! iteration gate ALSO rejects `goal_set` earlier — that stays as
+//! belt-and-braces, but the dispatcher gate is the one that closes the
+//! direct-API hole. Callers pass `services.is_iteration` for the flag.
 
 use crate::goals::manager::GoalManager;
 use serde_json::{json, Value};
 
 /// Dispatch one of the three `goal_*` tools. `args` is the tool call's JSON
 /// arguments (already parsed — callers on the direct-API surface parse the
-/// args string once before calling this).
+/// args string once before calling this). `is_unattended` is
+/// `services.is_iteration`: when true (a `/loop` iteration or a schedule's own
+/// fire) `goal_set` is rejected — an unattended run must not hijack the
+/// session's single active goal. `goal_status` / `goal_clear` stay available.
 pub async fn execute_goal_tool(
     name: &str,
     args: &Value,
     session_id: &str,
+    is_unattended: bool,
     mgr: &GoalManager,
 ) -> Result<Value, String> {
     match name {
-        "goal_set" => goal_set(args, session_id, mgr).await,
+        "goal_set" => {
+            if is_unattended {
+                return Err("goal_set is not available inside unattended runs".into());
+            }
+            goal_set(args, session_id, mgr).await
+        }
         "goal_status" => mgr.status(session_id).await,
         "goal_clear" => goal_clear(session_id, mgr).await,
         _ => Err(format!("unknown goal tool: {name}")),
@@ -107,6 +118,7 @@ mod tests {
             "goal_set",
             &json!({ "condition": "the PR is merged", "max_turns": 15 }),
             "sess-1",
+            false,
             &mgr,
         )
         .await
@@ -129,9 +141,15 @@ mod tests {
     async fn goal_set_defaults_max_turns_when_absent() {
         let (_db, mgr) = mgr_with_session("sess-1");
 
-        let result = execute_goal_tool("goal_set", &json!({ "condition": "done" }), "sess-1", &mgr)
-            .await
-            .unwrap();
+        let result = execute_goal_tool(
+            "goal_set",
+            &json!({ "condition": "done" }),
+            "sess-1",
+            false,
+            &mgr,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(result["max_turns"], json!(20));
     }
@@ -140,7 +158,7 @@ mod tests {
     async fn goal_set_missing_condition_key_is_actionable_error() {
         let (_db, mgr) = mgr_with_session("sess-1");
 
-        let err = execute_goal_tool("goal_set", &json!({}), "sess-1", &mgr)
+        let err = execute_goal_tool("goal_set", &json!({}), "sess-1", false, &mgr)
             .await
             .unwrap_err();
         assert!(err.contains("condition"), "unexpected error: {err}");
@@ -150,9 +168,15 @@ mod tests {
     async fn goal_set_empty_condition_surfaces_manager_validation_error() {
         let (_db, mgr) = mgr_with_session("sess-1");
 
-        let err = execute_goal_tool("goal_set", &json!({ "condition": "   " }), "sess-1", &mgr)
-            .await
-            .unwrap_err();
+        let err = execute_goal_tool(
+            "goal_set",
+            &json!({ "condition": "   " }),
+            "sess-1",
+            false,
+            &mgr,
+        )
+        .await
+        .unwrap_err();
         assert!(err.contains("empty"), "unexpected error: {err}");
     }
 
@@ -165,6 +189,7 @@ mod tests {
             "goal_set",
             &json!({ "condition": too_long }),
             "sess-1",
+            false,
             &mgr,
         )
         .await
@@ -176,7 +201,7 @@ mod tests {
     async fn goal_status_none_shape_when_no_goal() {
         let (_db, mgr) = mgr_with_session("sess-1");
 
-        let result = execute_goal_tool("goal_status", &json!({}), "sess-1", &mgr)
+        let result = execute_goal_tool("goal_status", &json!({}), "sess-1", false, &mgr)
             .await
             .unwrap();
         assert_eq!(result, json!({ "status": "none" }));
@@ -185,11 +210,17 @@ mod tests {
     #[tokio::test]
     async fn goal_status_reflects_active_goal() {
         let (_db, mgr) = mgr_with_session("sess-1");
-        execute_goal_tool("goal_set", &json!({ "condition": "done" }), "sess-1", &mgr)
-            .await
-            .unwrap();
+        execute_goal_tool(
+            "goal_set",
+            &json!({ "condition": "done" }),
+            "sess-1",
+            false,
+            &mgr,
+        )
+        .await
+        .unwrap();
 
-        let result = execute_goal_tool("goal_status", &json!({}), "sess-1", &mgr)
+        let result = execute_goal_tool("goal_status", &json!({}), "sess-1", false, &mgr)
             .await
             .unwrap();
         assert_eq!(result["status"], json!("active"));
@@ -201,23 +232,29 @@ mod tests {
         let (_db, mgr) = mgr_with_session("sess-1");
 
         // No active goal yet — clear reports false.
-        let result = execute_goal_tool("goal_clear", &json!({}), "sess-1", &mgr)
+        let result = execute_goal_tool("goal_clear", &json!({}), "sess-1", false, &mgr)
             .await
             .unwrap();
         assert_eq!(result, json!({ "cleared": false }));
 
-        execute_goal_tool("goal_set", &json!({ "condition": "done" }), "sess-1", &mgr)
-            .await
-            .unwrap();
+        execute_goal_tool(
+            "goal_set",
+            &json!({ "condition": "done" }),
+            "sess-1",
+            false,
+            &mgr,
+        )
+        .await
+        .unwrap();
 
         // Now there is one — clear reports true.
-        let result = execute_goal_tool("goal_clear", &json!({}), "sess-1", &mgr)
+        let result = execute_goal_tool("goal_clear", &json!({}), "sess-1", false, &mgr)
             .await
             .unwrap();
         assert_eq!(result, json!({ "cleared": true }));
 
         // Idempotent-ish: a second clear finds nothing active.
-        let result = execute_goal_tool("goal_clear", &json!({}), "sess-1", &mgr)
+        let result = execute_goal_tool("goal_clear", &json!({}), "sess-1", false, &mgr)
             .await
             .unwrap();
         assert_eq!(result, json!({ "cleared": false }));
@@ -227,9 +264,34 @@ mod tests {
     async fn unknown_tool_name_errors() {
         let (_db, mgr) = mgr_with_session("sess-1");
 
-        let err = execute_goal_tool("goal_bogus", &json!({}), "sess-1", &mgr)
+        let err = execute_goal_tool("goal_bogus", &json!({}), "sess-1", false, &mgr)
             .await
             .unwrap_err();
         assert!(err.contains("unknown goal tool"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn goal_set_blocked_when_unattended() {
+        // The dispatcher gate is what closes the direct-API hole: even if the
+        // model emits `goal_set` inside an unattended run, it is rejected before
+        // it can hijack the session's single active goal.
+        let (_db, mgr) = mgr_with_session("sess-1");
+
+        let err = execute_goal_tool(
+            "goal_set",
+            &json!({ "condition": "the PR is merged" }),
+            "sess-1",
+            true,
+            &mgr,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("unattended"), "unexpected error: {err}");
+
+        // No goal was created — the gate short-circuits before `mgr.set`.
+        let status = execute_goal_tool("goal_status", &json!({}), "sess-1", true, &mgr)
+            .await
+            .unwrap();
+        assert_eq!(status, json!({ "status": "none" }));
     }
 }

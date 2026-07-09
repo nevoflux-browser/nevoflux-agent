@@ -4450,6 +4450,7 @@ impl HostFunctions for DaemonHostFunctions {
             None,
             None,
             self.sidebar_stream_tx.clone(),
+            self.token_budget.clone(),
         )
     }
 
@@ -5482,10 +5483,16 @@ impl HostFunctions for DaemonHostFunctions {
     // `tool_loop_*` / `llm_chat` to avoid panicking when called from inside
     // a Tokio runtime.
     //
-    // `is_unattended: false` here: direct-API HostFunctions never runs
-    // inside an unattended run (schedule fire / loop iteration) — those go
-    // through `agent_exec::run_agent_once` with a dedicated HostServices
-    // clone in a separate context, not through this main-session host.
+    // `is_unattended` is read from `services.is_iteration`, NOT hardcoded:
+    // `agent_exec::run_agent_once` builds a direct-API `DaemonHostFunctions`
+    // for EVERY schedule fire / loop iteration and sets `is_iteration = true`
+    // on the HostServices clone it installs. The run loop executes whatever
+    // tool_call the model returns (the allowlist only filters what is
+    // ADVERTISED), so this gate must reflect the real unattended state or a
+    // model that emits `schedule_create` inside an unattended run would create
+    // a schedule with nobody present to confirm its name/cadence. When the host
+    // is the interactive main session, `is_iteration` is false and this stays
+    // permissive.
     // =========================================================================
 
     fn tool_schedule_create(&self, args_json: &str) -> HostResult<String> {
@@ -5506,7 +5513,7 @@ impl HostFunctions for DaemonHostFunctions {
             })?;
         let ctx = crate::schedules::ScheduleToolContext {
             session_id: self.session_id.clone().unwrap_or_default(),
-            is_unattended: false,
+            is_unattended: services.is_iteration,
         };
         let mgr = mgr.clone();
         let runtime = self.runtime.clone();
@@ -5538,7 +5545,7 @@ impl HostFunctions for DaemonHostFunctions {
             })?;
         let ctx = crate::schedules::ScheduleToolContext {
             session_id: self.session_id.clone().unwrap_or_default(),
-            is_unattended: false,
+            is_unattended: services.is_iteration,
         };
         let mgr = mgr.clone();
         let runtime = self.runtime.clone();
@@ -5571,7 +5578,7 @@ impl HostFunctions for DaemonHostFunctions {
             })?;
         let ctx = crate::schedules::ScheduleToolContext {
             session_id: self.session_id.clone().unwrap_or_default(),
-            is_unattended: false,
+            is_unattended: services.is_iteration,
         };
         let mgr = mgr.clone();
         let runtime = self.runtime.clone();
@@ -5604,7 +5611,7 @@ impl HostFunctions for DaemonHostFunctions {
             })?;
         let ctx = crate::schedules::ScheduleToolContext {
             session_id: self.session_id.clone().unwrap_or_default(),
-            is_unattended: false,
+            is_unattended: services.is_iteration,
         };
         let mgr = mgr.clone();
         let runtime = self.runtime.clone();
@@ -5637,7 +5644,7 @@ impl HostFunctions for DaemonHostFunctions {
             })?;
         let ctx = crate::schedules::ScheduleToolContext {
             session_id: self.session_id.clone().unwrap_or_default(),
-            is_unattended: false,
+            is_unattended: services.is_iteration,
         };
         let mgr = mgr.clone();
         let runtime = self.runtime.clone();
@@ -5670,7 +5677,7 @@ impl HostFunctions for DaemonHostFunctions {
             })?;
         let ctx = crate::schedules::ScheduleToolContext {
             session_id: self.session_id.clone().unwrap_or_default(),
-            is_unattended: false,
+            is_unattended: services.is_iteration,
         };
         let mgr = mgr.clone();
         let runtime = self.runtime.clone();
@@ -5707,7 +5714,7 @@ impl HostFunctions for DaemonHostFunctions {
             })?;
         let ctx = crate::schedules::ScheduleToolContext {
             session_id: self.session_id.clone().unwrap_or_default(),
-            is_unattended: false,
+            is_unattended: services.is_iteration,
         };
         let mgr = mgr.clone();
         let runtime = self.runtime.clone();
@@ -5741,11 +5748,14 @@ impl HostFunctions for DaemonHostFunctions {
     // `tool_schedule_*` to avoid panicking when called from inside a Tokio
     // runtime.
     //
-    // Unlike `tool_schedule_create`, `goal_set` needs no `is_unattended`
-    // flag here: direct-API `HostFunctions` never runs inside an unattended
-    // run (that gate lives solely at the `mcp_tool_executor` iteration
-    // check, since ACP-bridge providers are the only surface that can be
-    // invoked from inside a `/loop` iteration or a schedule's own fire).
+    // Like `tool_schedule_create`, these pass `services.is_iteration` as the
+    // dispatcher's `is_unattended` flag: `run_agent_once` builds this direct-API
+    // host for schedule fires / loop iterations with `is_iteration = true`, and
+    // the run loop executes whatever tool the model emits (the allowlist only
+    // filters advertising), so `goal_set` MUST be gated here too — the shared
+    // `execute_goal_tool` dispatcher rejects it when unattended. The
+    // `mcp_tool_executor` iteration gate rejects it earlier on the ACP path as
+    // belt-and-braces.
     // =========================================================================
 
     fn tool_goal_set(&self, args_json: &str) -> HostResult<String> {
@@ -5762,11 +5772,18 @@ impl HostFunctions for DaemonHostFunctions {
             message: "GoalManager not configured".into(),
         })?;
         let session_id = self.session_id.clone().unwrap_or_default();
+        // `is_iteration` reflects the real unattended state: `run_agent_once`
+        // sets it on the HostServices clone it installs for schedule fires /
+        // loop iterations. The gate lives in the shared `execute_goal_tool`
+        // dispatcher, so this direct-API surface is covered too (its run loop
+        // executes whatever tool the model emits, not just the advertised set).
+        let is_unattended = services.is_iteration;
         let mgr = mgr.clone();
         let runtime = self.runtime.clone();
         let result = tokio::task::block_in_place(|| {
             runtime.block_on(async move {
-                crate::goals::execute_goal_tool("goal_set", &args, &session_id, &mgr).await
+                crate::goals::execute_goal_tool("goal_set", &args, &session_id, is_unattended, &mgr)
+                    .await
             })
         });
         match result {
@@ -5788,12 +5805,20 @@ impl HostFunctions for DaemonHostFunctions {
             message: "GoalManager not configured".into(),
         })?;
         let session_id = self.session_id.clone().unwrap_or_default();
+        let is_unattended = services.is_iteration;
         let mgr = mgr.clone();
         let runtime = self.runtime.clone();
         let args = serde_json::json!({});
         let result = tokio::task::block_in_place(|| {
             runtime.block_on(async move {
-                crate::goals::execute_goal_tool("goal_status", &args, &session_id, &mgr).await
+                crate::goals::execute_goal_tool(
+                    "goal_status",
+                    &args,
+                    &session_id,
+                    is_unattended,
+                    &mgr,
+                )
+                .await
             })
         });
         match result {
@@ -5815,12 +5840,20 @@ impl HostFunctions for DaemonHostFunctions {
             message: "GoalManager not configured".into(),
         })?;
         let session_id = self.session_id.clone().unwrap_or_default();
+        let is_unattended = services.is_iteration;
         let mgr = mgr.clone();
         let runtime = self.runtime.clone();
         let args = serde_json::json!({});
         let result = tokio::task::block_in_place(|| {
             runtime.block_on(async move {
-                crate::goals::execute_goal_tool("goal_clear", &args, &session_id, &mgr).await
+                crate::goals::execute_goal_tool(
+                    "goal_clear",
+                    &args,
+                    &session_id,
+                    is_unattended,
+                    &mgr,
+                )
+                .await
             })
         });
         match result {
@@ -6394,6 +6427,7 @@ impl DaemonHostFunctions {
             final_provider,
             final_model,
             self.sidebar_stream_tx.clone(),
+            self.token_budget.clone(),
         )
     }
 
@@ -6416,6 +6450,7 @@ impl DaemonHostFunctions {
         provider_override: Option<String>,
         model_override: Option<String>,
         sidebar_stream_tx: Option<tokio::sync::mpsc::UnboundedSender<SidebarStreamChunk>>,
+        token_budget: Option<Arc<crate::agent_exec::TokenBudget>>,
     ) -> HostResult<u64> {
         let id = subagent_registry.allocate_id();
         let task_str = task.to_string();
@@ -6458,6 +6493,13 @@ impl DaemonHostFunctions {
                 // Create a new host functions instance for the subagent
                 let mut host = DaemonHostFunctions::new(config, runtime_clone.clone());
                 host = host.with_is_subagent(true);
+                // Inherit the parent's per-run token budget so a subagent
+                // spawned from an unattended run (schedule fire / loop
+                // iteration) cannot escape `max_tokens_per_run` — its LLM
+                // boundary enforces the same shared ceiling.
+                if let Some(budget) = token_budget {
+                    host = host.with_token_budget(budget);
+                }
                 if let Some(svc) = services {
                     host = host.with_services(svc);
                 }
@@ -6912,6 +6954,66 @@ mod tests {
             .llm_chat(&minimal_llm_request())
             .expect_err("no provider configured");
         assert_ne!(err.code, 429);
+    }
+
+    #[test]
+    fn spawn_legacy_subagent_installs_parent_token_budget() {
+        // A subagent spawned from an unattended run must inherit the parent's
+        // per-run token budget. With an ALREADY-exhausted budget the child's
+        // first LLM call short-circuits at the 429 gate (before any provider
+        // resolution), so the failure text is "token budget" — NOT the
+        // "no provider"/"Invalid provider" error a budget-less spawn would hit
+        // with `AgentConfig::default()`. That difference proves the budget was
+        // installed on the spawned host, not merely accepted as a parameter.
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let registry = Arc::new(SubagentRegistry::new());
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let services = Some(HostServices::new(db));
+        let budget = crate::agent_exec::TokenBudget::new(0); // exceeded() == true
+
+        let id = DaemonHostFunctions::spawn_legacy_subagent_impl(
+            &registry,
+            &config,
+            rt.handle(),
+            &services,
+            "do the thing",
+            "chat",
+            AgentMode::Chat,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(budget),
+        )
+        .expect("spawn registers the subagent");
+
+        let result_text = rt.block_on(async {
+            for _ in 0..600 {
+                let done = {
+                    let entries = registry.entries.read().unwrap();
+                    entries.get(&id).and_then(|e| {
+                        if e.status == SubagentStatus::Running {
+                            None
+                        } else {
+                            Some(e.result.clone().unwrap_or_default())
+                        }
+                    })
+                };
+                if let Some(text) = done {
+                    return text;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("subagent did not finish in time");
+        });
+
+        assert!(
+            result_text.contains("token budget"),
+            "child's LLM call must be gated by the inherited budget; got: {result_text}"
+        );
     }
 
     // ---- streaming accrual ----------------------------------------------

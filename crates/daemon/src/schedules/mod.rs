@@ -16,3 +16,16 @@ pub mod types;
 pub use manager::{CreateScheduleArgs, ScheduleManager};
 pub use tools::{execute_schedule_tool, ScheduleToolContext};
 pub use types::ScheduleId;
+
+/// Process-global handle to the daemon's `ScheduleManager`, set once at daemon
+/// startup (see `server.rs` right after the manager is constructed).
+///
+/// Mirrors [`crate::loops::CURRENT_LOOP_MANAGER`]. Used by
+/// `agent_exec::run_agent_once` to back-fill `HostServices.schedule_manager`
+/// into the per-run services clone: the automation/schedule-runner services
+/// snapshots are captured BEFORE `with_schedule_manager` runs (chicken-and-egg
+/// at boot), so an unattended run's read-only `schedule_*` tools
+/// (`schedule_list` / `schedule_runs`) would otherwise fail with a misleading
+/// "daemon was started without a ScheduleManager" error.
+pub static CURRENT_SCHEDULE_MANAGER: std::sync::OnceLock<std::sync::Arc<ScheduleManager>> =
+    std::sync::OnceLock::new();

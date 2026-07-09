@@ -636,9 +636,14 @@ pub async fn execute_mcp_tool(
                 );
             }
         };
-        let result =
-            crate::goals::execute_goal_tool(name, arguments, &services.session_id, mgr.as_ref())
-                .await;
+        let result = crate::goals::execute_goal_tool(
+            name,
+            arguments,
+            &services.session_id,
+            services.is_iteration,
+            mgr.as_ref(),
+        )
+        .await;
         return match result {
             Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
             Err(e) => Err(e),

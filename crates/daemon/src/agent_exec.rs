@@ -65,8 +65,12 @@ pub struct AgentExecRequest {
     pub mode: nevoflux_builtin_wasm::AgentMode,
     /// Fully-formed user message (callers do any templating themselves).
     pub user_message: String,
-    /// Exact tool names to strip from the mode catalog. Loops pass their
-    /// `is_forbidden_in_iteration` set (`loop_create`, `ask_user`).
+    /// Exact tool names to strip from the mode catalog. Loops pass the
+    /// `loops::tool_classes::ITERATION_FORBIDDEN` set (materialised via
+    /// `loops::tool_classes::iteration_forbidden_tools()`); schedules pass
+    /// `schedules::runner::forbidden_tools()`. Deliberately NOT enumerated here
+    /// — the members change over time, so see those definitions for the current
+    /// list rather than a copy that silently drifts.
     pub forbidden_tools: Vec<String>,
     /// Tool-name prefixes to strip from the mode catalog (e.g. `browser_`).
     /// Empty for loops today; a later task uses it to drop `browser_*` /
@@ -137,6 +141,32 @@ fn history_to_messages(history: Vec<(String, String)>) -> Vec<Message> {
         .collect()
 }
 
+/// Back-fill the three subsystem manager handles into an unattended run's
+/// services clone from the process-global `OnceLock`s server.rs publishes at
+/// boot. The snapshot the run inherits was captured BEFORE the managers were
+/// wired (chicken-and-egg), so read-only tools the run's allowlist keeps
+/// available (`loop_scratchpad_*`, `schedule_list` / `schedule_runs`,
+/// `goal_status`) would otherwise fail with misleading "daemon was started
+/// without a …Manager" errors. Only fills a slot that is currently `None`, so
+/// an explicitly-set manager (e.g. a test injecting its own) is never clobbered.
+pub(crate) fn backfill_managers(services: &mut HostServices) {
+    if services.loop_manager.is_none() {
+        if let Some(mgr) = crate::loops::CURRENT_LOOP_MANAGER.get() {
+            services.loop_manager = Some(mgr.clone());
+        }
+    }
+    if services.schedule_manager.is_none() {
+        if let Some(mgr) = crate::schedules::CURRENT_SCHEDULE_MANAGER.get() {
+            services.schedule_manager = Some(mgr.clone());
+        }
+    }
+    if services.goal_manager.is_none() {
+        if let Some(mgr) = crate::goals::CURRENT_GOAL_MANAGER.get() {
+            services.goal_manager = Some(mgr.clone());
+        }
+    }
+}
+
 /// Run a single unattended agent turn.
 ///
 /// Requires `services.agent_config` and `services.runtime_handle` (both set at
@@ -196,16 +226,14 @@ pub async fn run_agent_once(
         }
     }
 
-    // Back-fill loop_manager handle: the stored services snapshot may have
-    // `loop_manager: None` (chicken-and-egg at construction time), but the run
-    // may call `loop_scratchpad_{set,get}` via the MCP tool surface, which
-    // dispatches through `mcp_tool_executor` and needs `services.loop_manager`.
-    // Resolve via the process-global OnceLock set by server.rs at startup.
-    if services_for_run.loop_manager.is_none() {
-        if let Some(mgr) = crate::loops::CURRENT_LOOP_MANAGER.get() {
-            services_for_run.loop_manager = Some(mgr.clone());
-        }
-    }
+    // Back-fill the subsystem manager handles: the stored services snapshot may
+    // have `{loop,schedule,goal}_manager: None` (chicken-and-egg at construction
+    // — server.rs wires each manager AFTER the snapshot this run inherits was
+    // captured), but the run may call `loop_scratchpad_*` / `schedule_list` /
+    // `schedule_runs` / `goal_status` via the tool surface, which needs the live
+    // manager. Resolve each from the process-global OnceLock server.rs sets at
+    // startup.
+    backfill_managers(&mut services_for_run);
     // Reset interrupt flag so a stray prior cancel doesn't poison this run.
     services_for_run.reset_interrupt();
 
@@ -441,5 +469,73 @@ mod tests {
     #[test]
     fn history_empty_yields_empty() {
         assert!(history_to_messages(vec![]).is_empty());
+    }
+
+    // ---- backfill_managers ---------------------------------------------
+
+    /// A services snapshot with no managers wired (the boot chicken-and-egg
+    /// state an unattended run inherits) must have all three manager handles
+    /// filled from the process-global OnceLocks. This is the only unit-testable
+    /// seam of `run_agent_once`'s per-run wiring (the full kernel needs an LLM).
+    #[tokio::test]
+    async fn backfill_managers_fills_all_three_from_globals() {
+        use nevoflux_storage::Database;
+
+        let db = Database::open_in_memory().unwrap();
+        // Publish the process-global handles (this is the only setter in the
+        // lib test binary — server::start is never run here). `.set()` is a
+        // no-op if a prior test in this process already published one; either
+        // way the globals end up populated, which is all the back-fill needs.
+        let _ = crate::loops::CURRENT_LOOP_MANAGER.set(Arc::new(
+            crate::loops::LoopManager::start_with_bus(db.clone(), None, None),
+        ));
+        let _ = crate::schedules::CURRENT_SCHEDULE_MANAGER.set(
+            crate::schedules::ScheduleManager::start_with_bus(db.clone(), None, None),
+        );
+        let _ = crate::goals::CURRENT_GOAL_MANAGER.set(crate::goals::GoalManager::new(
+            db.clone(),
+            None,
+            Arc::new(crate::config::AgentConfig::default()),
+        ));
+
+        // A snapshot with none of the three managers wired.
+        let mut services = HostServices::new(Arc::new(db));
+        assert!(services.loop_manager.is_none());
+        assert!(services.schedule_manager.is_none());
+        assert!(services.goal_manager.is_none());
+
+        backfill_managers(&mut services);
+
+        assert!(
+            services.loop_manager.is_some(),
+            "loop_manager back-filled from CURRENT_LOOP_MANAGER"
+        );
+        assert!(
+            services.schedule_manager.is_some(),
+            "schedule_manager back-filled from CURRENT_SCHEDULE_MANAGER"
+        );
+        assert!(
+            services.goal_manager.is_some(),
+            "goal_manager back-filled from CURRENT_GOAL_MANAGER"
+        );
+    }
+
+    /// An already-wired manager slot is never clobbered by the back-fill.
+    #[tokio::test]
+    async fn backfill_managers_preserves_already_set_manager() {
+        use nevoflux_storage::Database;
+
+        let db = Database::open_in_memory().unwrap();
+        let own = crate::schedules::ScheduleManager::start_with_bus(db.clone(), None, None);
+        let mut services = HostServices::new(Arc::new(db)).with_schedule_manager(own.clone());
+
+        backfill_managers(&mut services);
+
+        // Same Arc the test installed — not replaced by the global.
+        assert!(services.schedule_manager.is_some());
+        assert!(Arc::ptr_eq(
+            services.schedule_manager.as_ref().unwrap(),
+            &own
+        ));
     }
 }

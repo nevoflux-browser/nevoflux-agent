@@ -212,9 +212,13 @@ pub struct RunResult {
 
 /// Tools a scheduled run must never call: interactive prompts (there is no
 /// user to answer), recursive job creation (a scheduled job spawning more
-/// jobs/loops is out of P1 scope), and `goal_set` — a scheduled (unattended)
-/// run must not hijack the creator session's active goal, since goals are
-/// session-scoped and single-active.
+/// jobs/loops is out of P1 scope), `goal_set` — a scheduled (unattended) run
+/// must not hijack the creator session's active goal, since goals are
+/// session-scoped and single-active — and `subagent_spawn` / `orchestrate`,
+/// which fan out uncapped child agents. Stripping the latter two from the
+/// allowlist is defense-in-depth: even though a spawned subagent now inherits
+/// the parent's `max_tokens_per_run` budget (see `spawn_legacy_subagent_impl`),
+/// an unattended run should not silently fan out at all.
 fn forbidden_tools() -> Vec<String> {
     vec![
         "ask_user".to_string(),
@@ -222,6 +226,8 @@ fn forbidden_tools() -> Vec<String> {
         "loop_create".to_string(),
         "schedule_create".to_string(),
         "goal_set".to_string(),
+        "subagent_spawn".to_string(),
+        "orchestrate".to_string(),
     ]
 }
 
@@ -1086,14 +1092,17 @@ mod tests {
     #[test]
     fn forbidden_tools_block_self_replication_and_goal_hijack() {
         let list = forbidden_tools();
-        // Interactive prompts, recursive job creation, and goal hijack are all
-        // barred from unattended scheduled runs.
+        // Interactive prompts, recursive job creation, goal hijack, and
+        // uncapped subagent fan-out are all barred from unattended scheduled
+        // runs.
         for expected in [
             "ask_user",
             "browser_ask_user",
             "loop_create",
             "schedule_create",
             "goal_set",
+            "subagent_spawn",
+            "orchestrate",
         ] {
             assert!(
                 list.iter().any(|t| t == expected),

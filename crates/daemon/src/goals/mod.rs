@@ -30,3 +30,15 @@ pub use evaluator::{evaluate, resolve_evaluator, EvaluatorChoice, Verdict};
 pub use events::GoalEvents;
 pub use manager::GoalManager;
 pub use tools::execute_goal_tool;
+
+/// Process-global handle to the daemon's `GoalManager`, set once at daemon
+/// startup (see `server.rs` right after the manager is constructed).
+///
+/// Mirrors [`crate::loops::CURRENT_LOOP_MANAGER`]. Used by
+/// `agent_exec::run_agent_once` to back-fill `HostServices.goal_manager` into
+/// the per-run services clone: the automation/schedule-runner services
+/// snapshots are captured BEFORE `with_goal_manager` runs (chicken-and-egg at
+/// boot), so an unattended run's read-only `goal_status` tool would otherwise
+/// fail with a misleading "daemon was started without a GoalManager" error.
+pub static CURRENT_GOAL_MANAGER: std::sync::OnceLock<std::sync::Arc<GoalManager>> =
+    std::sync::OnceLock::new();
