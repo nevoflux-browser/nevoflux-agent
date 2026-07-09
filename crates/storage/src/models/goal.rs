@@ -49,4 +49,8 @@ pub struct GoalRecord {
     pub created_at: i64,
     pub updated_at: i64,
     pub achieved_at: Option<i64>,
+    /// Optional programmatic check (spec §4.3 route A), serialized `GoalCheck`
+    /// JSON. `None` = judged by an evaluator model only.
+    #[serde(default)]
+    pub check_json: Option<String>,
 }

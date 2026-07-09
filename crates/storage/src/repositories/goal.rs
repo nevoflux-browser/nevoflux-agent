@@ -13,7 +13,7 @@ use crate::error::{Result, StorageError};
 use crate::models::goal::{GoalRecord, GoalStatus};
 
 const GOAL_COLUMNS: &str = "id, session_id, condition, evaluator_provider, evaluator_model,
-     max_turns, turns_used, status, last_reason, created_at, updated_at, achieved_at";
+     max_turns, turns_used, status, last_reason, created_at, updated_at, achieved_at, check_json";
 
 pub struct GoalRepository<'a> {
     db: &'a Database,
@@ -39,7 +39,7 @@ impl<'a> GoalRepository<'a> {
             tx.execute(
                 &format!(
                     "INSERT INTO goals ({GOAL_COLUMNS})
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
                 ),
                 params![
                     rec.id,
@@ -54,6 +54,7 @@ impl<'a> GoalRepository<'a> {
                     rec.created_at,
                     rec.updated_at,
                     rec.achieved_at,
+                    rec.check_json,
                 ],
             )?;
             tx.commit()?;
@@ -167,6 +168,7 @@ fn row_to_goal(row: &Row<'_>) -> rusqlite::Result<Result<GoalRecord>> {
     let created_at: i64 = row.get(9)?;
     let updated_at: i64 = row.get(10)?;
     let achieved_at: Option<i64> = row.get(11)?;
+    let check_json: Option<String> = row.get(12)?;
 
     Ok((|| -> Result<GoalRecord> {
         let status = GoalStatus::from_db_str(&status_str).ok_or_else(|| {
@@ -185,6 +187,7 @@ fn row_to_goal(row: &Row<'_>) -> rusqlite::Result<Result<GoalRecord>> {
             created_at,
             updated_at,
             achieved_at,
+            check_json,
         })
     })())
 }
@@ -224,6 +227,7 @@ mod tests {
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,
             achieved_at: None,
+            check_json: None,
         }
     }
 

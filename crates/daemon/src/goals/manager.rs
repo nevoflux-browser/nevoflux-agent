@@ -153,6 +153,8 @@ impl GoalManager {
             created_at: now,
             updated_at: now,
             achieved_at: None,
+            // Wired to a real value in Task A6 (goal_set `check` param).
+            check_json: None,
         };
         GoalRepository::new(&self.db)
             .create(&rec)
@@ -732,6 +734,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             achieved_at: None,
+            check_json: None,
         };
         GoalRepository::new(&db).create(&rec).unwrap();
 
