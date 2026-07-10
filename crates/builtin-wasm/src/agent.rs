@@ -3716,7 +3716,7 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                         "goal_max_turns": { "type": "integer", "description": "max turns for a goal-enabled run. Default 20." },
                         "max_tokens_per_run": { "type": "integer", "description": "token budget per run (applies to plain and goal-enabled runs; goal turns + evaluator calls both count against it)" },
                         "evaluator_model": { "type": "string", "description": "model id used to evaluate goal_condition. Default: the current model." },
-                        "evaluator_provider": { "type": "string", "description": "direct-API provider id used to evaluate goal_condition (ACP providers rejected). Default: the current provider." }
+                        "evaluator_provider": { "type": "string", "description": "provider id used to evaluate goal_condition. Default: the current provider (ACP providers judge in degraded one-shot mode)." }
                     },
                     "required": ["name"]
                 }),
@@ -3792,7 +3792,7 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                             },
                             "required": ["matches"]
                         },
-                        "evaluator_provider": { "type": "string", "description": "direct-API provider id to use as the evaluator. Default: the current provider." },
+                        "evaluator_provider": { "type": "string", "description": "provider id to use as the evaluator. Default: the current provider (ACP providers judge in degraded one-shot mode)." },
                         "evaluator_model": { "type": "string", "description": "model id to use as the evaluator. Default: the current model." },
                         "max_turns": { "type": "integer", "description": "turn budget before the goal expires unmet. Default 20." }
                     },
