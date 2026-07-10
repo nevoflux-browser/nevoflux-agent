@@ -55,7 +55,9 @@ use crate::agent_exec::{run_agent_once, AgentExecRequest, TokenBudget};
 use crate::browser_launch::{
     kill_profile_processes, spawn_and_supervise_excluding, BrowserLaunchConfig,
 };
-use crate::goals::evaluator::{evaluate, resolve_evaluator, EvaluatorChoice, Verdict};
+use crate::goals::evaluator::{
+    evaluate_with_choice, resolve_evaluator_for_goal, EvaluatorChoice, Verdict,
+};
 use crate::profile::ProfileManager;
 use crate::registry::{BrowserEntry, BrowserRegistry};
 use crate::schedules::events::ScheduleEvents;
@@ -880,7 +882,7 @@ impl GoalTurnDriver for ProductionGoalDriver<'_> {
     }
 
     async fn evaluate_goal(&mut self, transcript: &[(String, String)]) -> Result<Verdict, String> {
-        evaluate(&self.choice, &self.condition, transcript).await
+        evaluate_with_choice(&self.choice, &self.condition, transcript).await
     }
 }
 
@@ -921,7 +923,7 @@ async fn run_goal_wrapped(
             .await;
         }
     };
-    let choice = match resolve_evaluator(
+    let choice = match resolve_evaluator_for_goal(
         &config,
         rec.evaluator_provider.as_deref(),
         rec.evaluator_model.as_deref(),

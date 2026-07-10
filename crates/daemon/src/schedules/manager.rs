@@ -462,7 +462,7 @@ impl ScheduleManager {
                     .as_ref()
                     .and_then(|s| s.agent_config.as_ref())
                     .ok_or("goal evaluation unavailable (no agent config)")?;
-                let choice = crate::goals::evaluator::resolve_evaluator(
+                let choice = crate::goals::evaluator::resolve_evaluator_for_goal(
                     config,
                     args.evaluator_provider.as_deref(),
                     args.evaluator_model.as_deref(),
@@ -1586,20 +1586,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_goal_rejects_acp_evaluator() {
-        // An ACP active provider cannot act as an evaluator — fail fast.
+    async fn create_goal_accepts_acp_evaluator() {
+        // An ACP active provider is now a valid evaluator (degraded one-shot
+        // judging). Creating a goal schedule with the evaluator unset defaults
+        // to it and persists it — no longer rejected at create time.
         let db = Database::open_in_memory().unwrap();
         let mut cfg = crate::config::AgentConfig::default();
         cfg.llm.provider = Some("claude-code".to_string());
         let services = services_with_config(&db, Arc::new(cfg));
         let mgr = ScheduleManager::start_with_bus(db.clone(), None, Some(services));
 
-        let err = mgr.create(goal_args("done")).await.unwrap_err();
-        assert!(
-            err.contains("ACP") && err.to_lowercase().contains("direct-api"),
-            "unexpected error: {err}"
-        );
-        assert!(mgr.list().await.unwrap().is_empty());
+        let id = mgr.create(goal_args("done")).await.expect("created");
+        let rec = mgr
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id.0)
+            .unwrap();
+        assert_eq!(rec.evaluator_provider.as_deref(), Some("claude-code"));
         mgr.shutdown().await;
     }
 
