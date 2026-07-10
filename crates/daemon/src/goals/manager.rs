@@ -28,7 +28,7 @@
 use crate::config::AgentConfig;
 use crate::event_bus::EventBus;
 use crate::goals::evaluator::{
-    clip_transcript, evaluate, evaluate_via_acp, resolve_evaluator_for_goal, Verdict,
+    clip_transcript, evaluate_with_choice, resolve_evaluator_for_goal, Verdict,
     TRANSCRIPT_MAX_BYTES, TRANSCRIPT_MAX_MESSAGES,
 };
 use crate::goals::events::GoalEvents;
@@ -331,11 +331,8 @@ impl GoalManager {
                 let transcript = self.load_transcript(session_id);
                 // ACP evaluator (route B) goes through the one-shot ACP adapter;
                 // direct-API evaluators through the standard path.
-                let result = if choice.is_acp {
-                    evaluate_via_acp(&choice, &rec.condition, &transcript).await
-                } else {
-                    evaluate(&choice, &rec.condition, &transcript).await
-                };
+                let result =
+                    evaluate_with_choice(&choice, &rec.condition, &transcript).await;
                 match result {
                     Ok(v) => v,
                     Err(e) => {
