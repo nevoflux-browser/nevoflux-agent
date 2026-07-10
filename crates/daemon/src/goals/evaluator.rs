@@ -52,14 +52,16 @@ condition asks for. Respond with STRICT JSON only, no prose, no code fences:
 
 /// Provider names (all aliases) that cannot act as an evaluator: ACP agents
 /// only support streaming, so `execute_llm_chat` rejects them.
+// Providers that ONLY support streaming via the ACP registry (stream_acp_completion
+// + acp_providers()), so they cannot use the direct-API `evaluate` path and must
+// judge via `evaluate_via_acp`. NOTE: kimi-agent is deliberately NOT here — it is
+// an ACP worker but supports non-streaming chat (execute_kimi_agent_chat), so it
+// judges through the normal direct-API `evaluate` path.
 const ACP_PROVIDERS: &[&str] = &[
     "claude-code",
     "claude_code",
     "gemini-cli",
     "gemini_cli",
-    "kimi-agent",
-    "kimi_agent",
-    "kimi",
     "openclaw",
     "open_claw",
     "open-claw",
@@ -109,6 +111,10 @@ fn direct_provider_cfg<'a>(llm: &'a LlmConfig, provider: &str) -> Option<&'a Pro
         "cohere" => &llm.cohere,
         "perplexity" => &llm.perplexity,
         "together" => &llm.together,
+        // kimi-agent is an ACP *worker* but supports non-streaming chat via
+        // execute_kimi_agent_chat, so it acts as a direct-API evaluator (unlike
+        // claude-code/gemini-cli/openclaw, which only stream).
+        "kimi-agent" | "kimi_agent" | "kimi" => &llm.kimi_agent,
         _ => return None,
     })
 }
@@ -155,6 +161,11 @@ pub fn resolve_evaluator(
     let api_key = match pc.api_key.as_deref().filter(|k| !k.is_empty()) {
         Some(k) => k.to_string(),
         None if provider_norm == "ollama" => "ollama-local".to_string(),
+        // kimi-agent can run keyless in CLI mode; the wire client treats the
+        // "kimi-agent-cli" sentinel as "spawn the CLI without an API key".
+        None if matches!(provider_norm.as_str(), "kimi-agent" | "kimi_agent" | "kimi") => {
+            "kimi-agent-cli".to_string()
+        }
         None => {
             return Err(format!(
                 "no API key configured for evaluator provider '{provider_str}'. \
@@ -473,8 +484,9 @@ mod tests {
 
     #[test]
     fn resolve_rejects_all_acp_providers() {
-        // Every ACP provider (as active) must be rejected with a direct-API hint.
-        for acp in ["claude-code", "gemini-cli", "kimi-agent", "openclaw"] {
+        // Every streaming-only ACP provider (as active) must be rejected with a
+        // direct-API hint. kimi-agent is excluded: it resolves as direct-API.
+        for acp in ["claude-code", "gemini-cli", "openclaw"] {
             let cfg = config_active(acp);
             let err = resolve_evaluator(&cfg, None, None).unwrap_err();
             assert!(
@@ -655,32 +667,36 @@ mod tests {
         assert_eq!(out.first().unwrap().1, format!("{:0>100}", 10));
     }
 
-    // ---- resolve_evaluator_for_goal (ACP-lenient) --------------------------
+    // ---- kimi-agent evaluator + resolve_evaluator_for_goal -----------------
 
     #[test]
-    fn for_goal_defaults_to_active_acp_provider() {
-        // Default (no explicit evaluator) with an ACP active provider must NOT
-        // be rejected — it returns an is_acp choice for degraded judging.
-        let choice = resolve_evaluator_for_goal(&config_active("kimi-agent"), None, None)
-            .expect("resolves");
-        assert!(choice.is_acp);
+    fn kimi_resolves_as_direct_evaluator() {
+        // kimi-agent is NOT is_acp: it resolves as a direct-API evaluator
+        // (execute_kimi_agent_chat), keyless via the "kimi-agent-cli" sentinel.
+        let mut cfg = config_active("kimi-agent");
+        cfg.llm.kimi_agent.model = Some("kimi-for-coding".to_string());
+        let choice = resolve_evaluator_for_goal(&cfg, None, None).expect("resolves");
+        assert!(!choice.is_acp, "kimi-agent must resolve as direct, not ACP");
         assert_eq!(choice.provider, "kimi-agent");
+        assert_eq!(choice.model, "kimi-for-coding");
+        assert_eq!(choice.api_key, "kimi-agent-cli");
     }
 
     #[test]
     fn for_goal_explicit_acp_provider_is_acp() {
-        let choice = resolve_evaluator_for_goal(&config_active("openai"), Some("kimi-agent"), None)
+        // A streaming-only ACP provider (claude-code) is is_acp for degraded judging.
+        let choice = resolve_evaluator_for_goal(&config_active("openai"), Some("claude-code"), None)
             .expect("resolves");
         assert!(choice.is_acp);
-        assert_eq!(choice.provider, "kimi-agent");
+        assert_eq!(choice.provider, "claude-code");
     }
 
     #[tokio::test]
     async fn evaluate_with_choice_routes_acp() {
-        // No ACP provider is registered in unit tests, so the ACP route errors
-        // with "not connected" — proving it did NOT fall through to the direct
-        // `evaluate` path (which would fail differently).
-        let choice = resolve_evaluator_for_goal(&config_active("kimi-agent"), None, None)
+        // A streaming-only ACP provider (claude-code) has no registered connection
+        // in unit tests, so the ACP route errors with "not connected" — proving
+        // evaluate_with_choice routed it to evaluate_via_acp, not direct `evaluate`.
+        let choice = resolve_evaluator_for_goal(&config_active("openai"), Some("claude-code"), None)
             .expect("resolves");
         let err = evaluate_with_choice(&choice, "some condition", &[])
             .await
