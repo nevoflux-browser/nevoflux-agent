@@ -405,6 +405,20 @@ pub async fn evaluate_via_acp(
     })
 }
 
+/// Route a resolved evaluator choice to the right judge: ACP providers use the
+/// degraded one-shot ACP adapter, direct-API providers the standard path.
+pub async fn evaluate_with_choice(
+    choice: &EvaluatorChoice,
+    condition: &str,
+    transcript: &[(String, String)],
+) -> Result<Verdict, String> {
+    if choice.is_acp {
+        evaluate_via_acp(choice, condition, transcript).await
+    } else {
+        evaluate(choice, condition, transcript).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,5 +653,41 @@ mod tests {
         let out = clip_transcript(input, 30, 10_000);
         assert_eq!(out.len(), 30);
         assert_eq!(out.first().unwrap().1, format!("{:0>100}", 10));
+    }
+
+    // ---- resolve_evaluator_for_goal (ACP-lenient) --------------------------
+
+    #[test]
+    fn for_goal_defaults_to_active_acp_provider() {
+        // Default (no explicit evaluator) with an ACP active provider must NOT
+        // be rejected — it returns an is_acp choice for degraded judging.
+        let choice = resolve_evaluator_for_goal(&config_active("kimi-agent"), None, None)
+            .expect("resolves");
+        assert!(choice.is_acp);
+        assert_eq!(choice.provider, "kimi-agent");
+    }
+
+    #[test]
+    fn for_goal_explicit_acp_provider_is_acp() {
+        let choice = resolve_evaluator_for_goal(&config_active("openai"), Some("kimi-agent"), None)
+            .expect("resolves");
+        assert!(choice.is_acp);
+        assert_eq!(choice.provider, "kimi-agent");
+    }
+
+    #[tokio::test]
+    async fn evaluate_with_choice_routes_acp() {
+        // No ACP provider is registered in unit tests, so the ACP route errors
+        // with "not connected" — proving it did NOT fall through to the direct
+        // `evaluate` path (which would fail differently).
+        let choice = resolve_evaluator_for_goal(&config_active("kimi-agent"), None, None)
+            .expect("resolves");
+        let err = evaluate_with_choice(&choice, "some condition", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("not connected") || err.to_lowercase().contains("acp"),
+            "expected ACP-route error, got: {err}"
+        );
     }
 }
