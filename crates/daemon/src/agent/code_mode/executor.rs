@@ -3,6 +3,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use monty::{
@@ -253,6 +254,11 @@ pub struct CodeModeExecutor {
     /// `timeout_ms` here so a legitimately long browser wait isn't aborted by
     /// the default budget.
     max_duration: Option<Duration>,
+    /// Optional cooperative cancellation flag. When set to `true` (e.g. the
+    /// user interrupts the session), the executor aborts at the next tool-call
+    /// boundary instead of running to the (possibly 24h) wall-clock cap.
+    /// Wired from `HostServices::interrupt_flag` on the orchestrate path.
+    cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 impl CodeModeExecutor {
@@ -264,6 +270,21 @@ impl CodeModeExecutor {
     pub fn with_max_duration(mut self, max_duration: Duration) -> Self {
         self.max_duration = Some(max_duration);
         self
+    }
+
+    /// Attach a cooperative cancellation flag (e.g. the session's interrupt
+    /// flag). Checked at each tool-call boundary during execution.
+    pub fn with_cancel_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.cancel_flag = Some(flag);
+        self
+    }
+
+    /// Whether cancellation has been requested.
+    fn is_cancelled(&self) -> bool {
+        self.cancel_flag
+            .as_ref()
+            .map(|f| f.load(Ordering::Relaxed))
+            .unwrap_or(false)
     }
 
     /// Resolve the resource limits for this execution, applying the
@@ -532,6 +553,19 @@ impl CodeModeExecutor {
 
             // Execution loop: handle function calls until completion
             loop {
+                // Cooperative cancellation: if the session was interrupted (user
+                // hit stop), abort at this tool-call boundary rather than running
+                // to the wall-clock cap (which may be 24h for orchestrate).
+                if self.is_cancelled() {
+                    tracing::info!("Code Mode: cancelled by interrupt");
+                    return CodeModeResult::fail_with_output(
+                        collect_output(print_writer),
+                        "Cancelled by user interrupt",
+                    )
+                    .with_tool_results(tool_results)
+                    .with_retries(retries);
+                }
+
                 match progress {
                     RunProgress::FunctionCall {
                         function_name,
@@ -1007,19 +1041,22 @@ fn build_registry_and_executor(
 ///
 /// Delegates to `CodeModeExecutor::execute()` with a no-op LLM rewrite callback.
 pub fn execute_python_simple(code: &str, browser_ctx: Option<BrowserContext>) -> CodeModeResult {
-    execute_python_simple_with_timeout(code, browser_ctx, None)
+    execute_python_simple_with_timeout(code, browser_ctx, None, None)
 }
 
-/// Like [`execute_python_simple`], but with an explicit wall-clock budget.
+/// Like [`execute_python_simple`], but with an explicit wall-clock budget and
+/// optional cooperative cancellation flag.
 ///
 /// `max_duration` overrides [`DEFAULT_MAX_DURATION`]; pass `None` to use the
 /// default. Recorded flows pass their `flow.json` `timeout_ms` here so a step
 /// that legitimately waits on a slow remote response (e.g. an LLM streaming a
-/// reply) isn't aborted mid-flow.
+/// reply) isn't aborted mid-flow. `cancel_flag` (e.g. the session interrupt
+/// flag) aborts execution at the next tool-call boundary when set.
 pub fn execute_python_simple_with_timeout(
     code: &str,
     browser_ctx: Option<BrowserContext>,
     max_duration: Option<Duration>,
+    cancel_flag: Option<Arc<AtomicBool>>,
 ) -> CodeModeResult {
     let runtime = tokio::runtime::Handle::current();
     // Build param mappings from registry tool definitions.
@@ -1030,6 +1067,9 @@ pub fn execute_python_simple_with_timeout(
     let mut executor = CodeModeExecutor::new();
     if let Some(max_duration) = max_duration {
         executor = executor.with_max_duration(max_duration);
+    }
+    if let Some(flag) = cancel_flag {
+        executor = executor.with_cancel_flag(flag);
     }
 
     let llm_rewrite =
@@ -1065,12 +1105,16 @@ pub fn execute_python_with_llm(
     api_key: String,
     model: String,
     base_url: Option<String>,
+    cancel_flag: Option<Arc<AtomicBool>>,
 ) -> CodeModeResult {
     let runtime = tokio::runtime::Handle::current();
     let (external_names, tool_executor) =
         build_registry_and_executor(browser_ctx, HashMap::new(), None);
     // orchestrate scripts are long-running by design — give them the 24h budget.
-    let executor = CodeModeExecutor::new().with_max_duration(ORCHESTRATE_MAX_DURATION);
+    let mut executor = CodeModeExecutor::new().with_max_duration(ORCHESTRATE_MAX_DURATION);
+    if let Some(flag) = cancel_flag {
+        executor = executor.with_cancel_flag(flag);
+    }
 
     let llm_rewrite =
         move |prompt: &str| -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>> {
@@ -1670,6 +1714,44 @@ mod tests {
     }
 
     // ---- End-to-end integration tests ----
+
+    #[tokio::test]
+    async fn test_cancel_flag_aborts_execution() {
+        // Interrupt already requested before the (long-running) script runs.
+        let flag = Arc::new(AtomicBool::new(true));
+        let executor = CodeModeExecutor::new().with_cancel_flag(flag);
+        let result = executor
+            .execute(
+                "a = fetch(\"https://a.com\")\nprint(a)\na",
+                &["fetch".to_string()],
+                |_name, _args| Box::pin(async { Ok(serde_json::json!("x")) }),
+                |_prompt| Box::pin(async { Err("no rewrite".to_string()) }),
+            )
+            .await;
+        assert!(!result.success, "cancelled run must not succeed");
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("Cancelled"),
+            "expected a cancellation error, got: {:?}",
+            result.error
+        );
+        // Aborted at the tool-call boundary — the tool never ran.
+        assert!(result.tool_results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_no_cancel_flag_runs_normally() {
+        // Without a flag (or with it false), execution proceeds as usual.
+        let executor = CodeModeExecutor::new().with_cancel_flag(Arc::new(AtomicBool::new(false)));
+        let result = executor
+            .execute(
+                "x = 1 + 1\nprint(x)\nx",
+                &[],
+                |_name, _args| Box::pin(async { Ok(serde_json::json!(null)) }),
+                |_prompt| Box::pin(async { Err("no rewrite".to_string()) }),
+            )
+            .await;
+        assert!(result.success, "got: {:?}", result.error);
+    }
 
     #[tokio::test]
     async fn test_orchestrate_full_pipeline() {

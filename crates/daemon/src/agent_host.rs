@@ -3529,6 +3529,10 @@ impl HostFunctions for DaemonHostFunctions {
                 code.len()
             );
             let browser_ctx = self.services.as_ref().and_then(|s| s.browser_context());
+            // Session interrupt flag → cooperative cancellation: a long-running
+            // orchestrate aborts at the next tool-call boundary when the user
+            // hits stop, instead of holding the turn up to the 24h cap.
+            let cancel_flag = self.services.as_ref().map(|s| s.interrupt_flag.clone());
 
             // Try to resolve LLM provider for error recovery rewrites.
             // Falls back to no-op rewrite if LLM is not available.
@@ -3547,6 +3551,7 @@ impl HostFunctions for DaemonHostFunctions {
                                 api_key,
                                 model,
                                 base_url,
+                                cancel_flag,
                             )
                         }
                         Err(_) => {
@@ -3558,6 +3563,7 @@ impl HostFunctions for DaemonHostFunctions {
                                 code,
                                 browser_ctx,
                                 Some(crate::agent::code_mode::ORCHESTRATE_MAX_DURATION),
+                                cancel_flag,
                             )
                         }
                     }
@@ -3568,6 +3574,7 @@ impl HostFunctions for DaemonHostFunctions {
                         code,
                         browser_ctx,
                         Some(crate::agent::code_mode::ORCHESTRATE_MAX_DURATION),
+                        cancel_flag,
                     )
                 }
             };

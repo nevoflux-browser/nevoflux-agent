@@ -266,6 +266,7 @@ pub fn execute_flow(
         &wrapped,
         Some(browser_ctx),
         max_duration,
+        None,
     );
     Ok(format_flow_result(&flow.manifest.name, &result))
 }
