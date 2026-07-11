@@ -33,6 +33,7 @@ use crate::schedules::cron;
 use crate::schedules::events::ScheduleEvents;
 use crate::schedules::runner::{self, RunResult};
 use crate::schedules::types::ScheduleId;
+use crate::server::SharedAgentConfig;
 use crate::wasm::services::HostServices;
 use nevoflux_storage::models::current_timestamp;
 use nevoflux_storage::models::schedule::{
@@ -102,6 +103,11 @@ struct Inner {
     events: ScheduleEvents,
     /// Live host services for production runs; `None` ⇒ stub run path.
     services: Option<HostServices>,
+    /// Live shared config (the `config.llm.set` / config-watcher target). When
+    /// set, each fire refreshes `services.agent_config` from it so scheduled
+    /// runs pick up provider/model changes without a daemon restart — matching
+    /// the interactive path. Unset in unit tests (falls back to the snapshot).
+    shared_agent_config: std::sync::OnceLock<SharedAgentConfig>,
     /// Schedule ids with a run in flight — the concurrency gate (one run per
     /// schedule at a time; tick and `run_now` both consult it).
     running: Mutex<HashSet<String>>,
@@ -131,6 +137,21 @@ impl Inner {
             .get()
             .cloned()
             .or_else(|| crate::registry::CURRENT_BROWSER_REGISTRY.get().cloned())
+    }
+
+    /// Services for a fire, with `agent_config` refreshed from the live shared
+    /// config (if wired) so a run picks up provider/model changes made after
+    /// daemon boot — both the main turn (`run_agent_once`) and the goal
+    /// evaluator read `services.agent_config`. Falls back to the frozen
+    /// boot-time snapshot when no shared config is set (tests / stub path).
+    fn effective_services(&self) -> Option<HostServices> {
+        let mut svc = self.services.clone();
+        if let (Some(s), Some(shared)) = (svc.as_mut(), self.shared_agent_config.get()) {
+            if let Ok(guard) = shared.read() {
+                s.agent_config = Some(guard.clone());
+            }
+        }
+        svc
     }
 
     /// If a browser is available AND deferred schedules are parked, drain and
@@ -198,8 +219,9 @@ impl Inner {
         }
 
         let registry = self.resolve_registry();
+        let services = self.effective_services();
         let result = runner::execute_run(
-            &self.services,
+            &services,
             &self.events,
             &self.db,
             &rec,
@@ -378,6 +400,13 @@ pub struct ScheduleManager {
 }
 
 impl ScheduleManager {
+    /// Wire the live shared config so scheduled runs read provider/model
+    /// changes (e.g. `config.llm.set`) without a daemon restart. Called once at
+    /// server boot, right after construction. Idempotent (no-op if already set).
+    pub fn set_shared_config(&self, shared: SharedAgentConfig) {
+        let _ = self.inner.shared_agent_config.set(shared);
+    }
+
     /// Boot the schedules engine: crash-sweep orphaned runs, detect and rearm
     /// missed fires, spawn the due-tick task, then return the handle.
     ///
@@ -397,6 +426,7 @@ impl ScheduleManager {
             pending_work: Arc::new(AtomicUsize::new(0)),
             deferred: StdMutex::new(HashSet::new()),
             browser_registry: std::sync::OnceLock::new(),
+            shared_agent_config: std::sync::OnceLock::new(),
         });
 
         let boot = boot_recover(&inner);
@@ -1548,6 +1578,53 @@ mod tests {
         cfg.llm.anthropic.api_key = Some("sk-ant-test".to_string());
         cfg.llm.anthropic.model = Some("claude-haiku-4-5".to_string());
         Arc::new(cfg)
+    }
+
+    /// Scheduled runs read the LIVE shared config at fire time, not the frozen
+    /// boot snapshot — so provider/model changes apply without a daemon restart.
+    #[tokio::test]
+    async fn effective_services_reads_live_shared_config() {
+        fn cfg_with(provider: &str) -> Arc<crate::config::AgentConfig> {
+            let mut c = crate::config::AgentConfig::default();
+            c.llm.provider = Some(provider.to_string());
+            Arc::new(c)
+        }
+        fn provider_of(svc: &HostServices) -> Option<String> {
+            svc.agent_config
+                .as_ref()
+                .and_then(|c| c.llm.provider.clone())
+        }
+
+        let db = Database::open_in_memory().unwrap();
+        // Boot snapshot baked into services = kimi-agent.
+        let services = services_with_config(&db, cfg_with("kimi-agent"));
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, Some(services));
+
+        // No shared config wired yet → falls back to the frozen snapshot.
+        assert_eq!(
+            provider_of(&mgr.inner.effective_services().unwrap()).as_deref(),
+            Some("kimi-agent")
+        );
+
+        // Wire a live shared config; the fire path now reads it, not the snapshot.
+        let shared: crate::server::SharedAgentConfig =
+            Arc::new(std::sync::RwLock::new(cfg_with("deepseek")));
+        mgr.set_shared_config(shared.clone());
+        assert_eq!(
+            provider_of(&mgr.inner.effective_services().unwrap()).as_deref(),
+            Some("deepseek"),
+            "must read the live shared config, not the boot snapshot"
+        );
+
+        // A later change (as config.llm.set does) is visible with NO restart.
+        *shared.write().unwrap() = cfg_with("claude-code");
+        assert_eq!(
+            provider_of(&mgr.inner.effective_services().unwrap()).as_deref(),
+            Some("claude-code"),
+            "a live config change must apply to scheduled runs without a restart"
+        );
+
+        mgr.shutdown().await;
     }
 
     /// `HostServices` carrying `agent_config` — the create-side goal path reads

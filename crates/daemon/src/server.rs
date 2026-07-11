@@ -260,7 +260,7 @@ struct SubscriptionEntry {
 type SubscriptionRouter = Arc<Mutex<HashMap<String, SubscriptionEntry>>>;
 
 /// Shared mutable agent config that can be updated at runtime (e.g. when changing active LLM provider).
-type SharedAgentConfig = Arc<RwLock<Arc<AgentConfig>>>;
+pub(crate) type SharedAgentConfig = Arc<RwLock<Arc<AgentConfig>>>;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -1695,6 +1695,10 @@ pub async fn start_server(
     // (chicken-and-egg), so without this the read-only `schedule_*` tools that
     // the unattended allowlists deliberately keep available would 500.
     let _ = crate::schedules::CURRENT_SCHEDULE_MANAGER.set(schedule_manager.clone());
+    // Scheduled runs read the LIVE config (config.llm.set / config-watcher) at
+    // fire time instead of the boot-time snapshot, so provider/model changes
+    // apply to schedules without a daemon restart — matching interactive chat.
+    schedule_manager.set_shared_config(agent_config.clone());
     services = services.with_schedule_manager(schedule_manager.clone());
 
     // Construct the /goal skill's GoalManager and inject it into HostServices
