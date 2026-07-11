@@ -3773,7 +3773,8 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     "type": "object",
                     "properties": {
                         "schedule_id": { "type": "string" },
-                        "limit": { "type": "integer", "description": "max rows to return, default 20, max 100" }
+                        "limit": { "type": "integer", "description": "max rows to return, default 20, max 100" },
+                        "include_final_text": { "type": "boolean", "description": "UI-only: include each run's output text; leave unset (false) for normal history browsing" }
                     },
                     "required": ["schedule_id"]
                 }),

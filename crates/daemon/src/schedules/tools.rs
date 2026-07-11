@@ -229,13 +229,19 @@ async fn schedule_runs(args: &Value, mgr: &ScheduleManager) -> Result<Value, Str
         .and_then(|v| v.as_i64())
         .unwrap_or(20)
         .clamp(1, 100);
+    // `final_text` is deliberately excluded by default — too big for an LLM
+    // tool result (history is for browsing, not re-consuming the last output).
+    // The Jobs panel opts in via `include_final_text: true` so completed cards
+    // and run-history rows can render the run's output; the LLM never sets it.
+    let include_final_text = args
+        .get("include_final_text")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let rows = mgr.runs(id, limit).await?;
-    // final_text deliberately excluded — too big for a tool result (spec:
-    // history is for LLM/UI browsing, not for re-consuming the last output).
     let out: Vec<Value> = rows
         .iter()
         .map(|r| {
-            json!({
+            let mut obj = json!({
                 "run_id": r.id,
                 "started_at": r.started_at,
                 "ended_at": r.ended_at,
@@ -244,7 +250,11 @@ async fn schedule_runs(args: &Value, mgr: &ScheduleManager) -> Result<Value, Str
                 "error": r.error_message,
                 "tokens_used": r.tokens_used,
                 "goal_turns": r.goal_turns,
-            })
+            });
+            if include_final_text {
+                obj["final_text"] = json!(r.final_text);
+            }
+            obj
         })
         .collect();
     Ok(json!(out))
@@ -456,6 +466,49 @@ mod tests {
         assert!(
             arr[0].get("final_text").is_none(),
             "final_text must not be included in the tool result"
+        );
+
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn schedule_runs_includes_final_text_when_flagged() {
+        let db = db_with_session("s1");
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let c = ctx("s1", false);
+
+        let created = execute_schedule_tool("schedule_create", &base_create_args(), &c, &mgr)
+            .await
+            .unwrap();
+        let id = created["schedule_id"].as_str().unwrap().to_string();
+
+        execute_schedule_tool("schedule_run_now", &json!({ "schedule_id": id }), &c, &mgr)
+            .await
+            .unwrap();
+
+        let mut runs = Value::Null;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let r = execute_schedule_tool(
+                "schedule_runs",
+                &json!({ "schedule_id": id, "include_final_text": true }),
+                &c,
+                &mgr,
+            )
+            .await
+            .unwrap();
+            if r.as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                runs = r;
+                break;
+            }
+        }
+        let arr = runs.as_array().expect("runs should have been recorded");
+        assert_eq!(arr.len(), 1);
+        // With the flag set, the panel-facing result carries the `final_text`
+        // key (value may be null for a stub run, but the key is present).
+        assert!(
+            arr[0].get("final_text").is_some(),
+            "final_text must be included when include_final_text is true"
         );
 
         mgr.shutdown().await;
