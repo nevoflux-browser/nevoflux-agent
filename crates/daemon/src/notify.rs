@@ -44,10 +44,13 @@ pub async fn publish_user_notification(
     source: &str,
     schedule_id: Option<&str>,
 ) {
+    // `body` is the canonical toast text field consumed by the sidebar's
+    // `ui:notification:*` renderer (see chat-sidebar handler). `source` gates
+    // the background OS notification.
     let payload = json!({
         "event_id": uuid::Uuid::new_v4().to_string(),
         "title": title,
-        "message": cap_bytes(message, NOTIFY_MESSAGE_MAX_BYTES),
+        "body": cap_bytes(message, NOTIFY_MESSAGE_MAX_BYTES),
         "source": source,
         "schedule_id": schedule_id,
     });
@@ -86,7 +89,7 @@ mod tests {
         assert_eq!(ev.topic, "ui:notification:agent");
         assert_eq!(ev.delivery, Delivery::Ephemeral);
         assert_eq!(ev.payload["source"], json!("notify_user"));
-        assert_eq!(ev.payload["message"], json!("drink water"));
+        assert_eq!(ev.payload["body"], json!("drink water"));
         assert_eq!(ev.payload["title"], json!("Reminder"));
         assert!(ev.payload["event_id"].is_string());
     }
@@ -106,6 +109,6 @@ mod tests {
         publish_user_notification(&bus, None, &"z".repeat(5000), "notify_user", None).await;
 
         let ev = handle.rx.try_recv().expect("expected a buffered event");
-        assert_eq!(ev.payload["message"].as_str().unwrap().len(), 4096);
+        assert_eq!(ev.payload["body"].as_str().unwrap().len(), 4096);
     }
 }
