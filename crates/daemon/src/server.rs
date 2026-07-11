@@ -1668,6 +1668,9 @@ pub async fn start_server(
     // services.loop_manager when claude-code (ACP) calls loop_* via MCP.
     let _ = crate::loops::CURRENT_LOOP_MANAGER.set(loop_manager.clone());
     services = services.with_loop_manager(loop_manager.clone());
+    // Attach the shared EventBus so `notify_user` can publish
+    // `ui:notification:agent` events (toast + OS notification bridge).
+    services = services.with_event_bus(event_bus.clone());
 
     // Construct the /schedule skill's ScheduleManager and inject it into
     // HostServices so the `schedule_*` tool dispatchers (both the direct-API
@@ -7885,7 +7888,17 @@ async fn handle_schedule_runs(
         is_unattended: false,
     };
     let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
-    let args = serde_json::json!({ "schedule_id": schedule_id, "limit": limit });
+    // Panel-only: forward the opt-in so completed cards / run-history rows can
+    // show the run's output text. Defaults to false (LLM history browsing).
+    let include_final_text = params
+        .get("include_final_text")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let args = serde_json::json!({
+        "schedule_id": schedule_id,
+        "limit": limit,
+        "include_final_text": include_final_text,
+    });
 
     match crate::schedules::execute_schedule_tool("schedule_runs", &args, &ctx, mgr).await {
         Ok(runs) => serde_json::json!({

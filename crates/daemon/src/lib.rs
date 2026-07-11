@@ -51,6 +51,7 @@ pub mod llm_gateway;
 pub mod loops;
 pub mod mcp_config;
 pub mod memory_reindex;
+pub mod notify;
 pub mod openclaw_setup;
 pub mod pack;
 pub mod paths;

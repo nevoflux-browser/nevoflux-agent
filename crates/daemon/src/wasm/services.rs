@@ -300,6 +300,11 @@ pub struct HostServices {
     /// Directory where per-session `<recording_id>.jsonl` files live.
     /// Defaults to `<data_dir>/recordings`.
     pub recordings_dir: std::path::PathBuf,
+
+    /// Shared EventBus handle for tools that publish user-facing events
+    /// (e.g. `notify_user` → `ui:notification:agent`). `None` in tests /
+    /// standalone contexts; wired at daemon startup via `with_event_bus`.
+    pub event_bus: Option<Arc<crate::event_bus::EventBus>>,
 }
 
 impl HostServices {
@@ -367,6 +372,7 @@ impl HostServices {
             brain_slot: None,
             recording_collector: None,
             recordings_dir: std::path::PathBuf::new(),
+            event_bus: None,
         }
     }
 
@@ -413,6 +419,7 @@ impl HostServices {
             brain_slot: None,
             recording_collector: None,
             recordings_dir: std::path::PathBuf::new(),
+            event_bus: None,
         }
     }
 
@@ -582,6 +589,16 @@ impl HostServices {
         manager: Arc<crate::schedules::ScheduleManager>,
     ) -> Self {
         self.schedule_manager = Some(manager);
+        self
+    }
+
+    /// Attach the shared EventBus (builder pattern).
+    ///
+    /// Once set, tools that publish user-facing events — currently
+    /// `notify_user` (`ui:notification:agent`) — can reach the bus. Without
+    /// it, `notify_user` returns a clear ConfigMissing error.
+    pub fn with_event_bus(mut self, bus: Arc<crate::event_bus::EventBus>) -> Self {
+        self.event_bus = Some(bus);
         self
     }
 

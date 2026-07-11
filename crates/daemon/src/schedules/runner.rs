@@ -1015,6 +1015,7 @@ async fn end_run(
             status.as_str(),
             end,
             error.as_deref(),
+            final_text.as_deref(),
         )
         .await;
     RunResult {

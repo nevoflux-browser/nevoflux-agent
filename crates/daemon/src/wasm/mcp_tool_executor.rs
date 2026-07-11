@@ -201,6 +201,7 @@ pub fn describe_tool_action(tool_name: &str, args_summary: &str) -> String {
         },
 
         // Memory write
+        "notify_user" => "Send you a notification".to_string(),
         "memory_create" => "Save new information to memory".to_string(),
         "memory_update" => "Update existing memory entry".to_string(),
         "memory_delete" => "Delete a memory entry".to_string(),
@@ -581,6 +582,30 @@ pub async fn execute_mcp_tool(
     //
     // Requires `services.schedule_manager` to be set at daemon startup;
     // until then tool calls surface a clear error.
+    // notify_user — publish a user-facing notification on the EventBus.
+    // ACP-bridge providers reach this here; direct-API providers reach the
+    // identical `crate::notify::publish_user_notification` via
+    // `agent_host::tool_notify_user`. Only the surface differs.
+    if name == "notify_user" {
+        let bus = match services.event_bus.as_ref() {
+            Some(b) => b,
+            None => {
+                return Err(
+                    "notify_user is not available — daemon was started without an EventBus"
+                        .to_string(),
+                );
+            }
+        };
+        let message = arguments
+            .get("message")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "notify_user requires a non-empty `message`".to_string())?;
+        let title = arguments.get("title").and_then(|v| v.as_str());
+        crate::notify::publish_user_notification(bus, title, message, "notify_user", None).await;
+        return Ok(serde_json::json!({ "notified": true }).to_string());
+    }
+
     if matches!(
         name,
         "schedule_create"
