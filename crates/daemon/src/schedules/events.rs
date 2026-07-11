@@ -24,6 +24,24 @@ use std::sync::Arc;
 /// bloating event payloads when a run fails with a long error/backtrace.
 const RUN_END_ERROR_MAX_CHARS: usize = 1024;
 
+/// Cap applied to `run_end`'s `final_text` before publishing (4 KB, mirroring
+/// `/loop`'s `LoopIterationEndPayload`). Keeps reminder/output text small
+/// enough for the event bus while still readable in the Jobs panel.
+const RUN_END_FINAL_TEXT_MAX_BYTES: usize = 4096;
+
+/// Truncate `s` to at most `max_bytes`, snapping down to the nearest UTF-8
+/// char boundary so we never split a multi-byte character.
+fn cap_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
 /// Helper around an EventBus handle. If `bus` is `None`, every method is a no-op.
 /// ScheduleManager holds an `Option<Arc<EventBus>>` so unit tests that don't
 /// wire a bus still work.
@@ -130,6 +148,7 @@ impl ScheduleEvents {
         status: &str,
         ended_at: i64,
         error: Option<&str>,
+        final_text: Option<&str>,
     ) {
         let Some(bus) = &self.bus else {
             return;
@@ -141,6 +160,8 @@ impl ScheduleEvents {
                 s.to_string()
             }
         });
+        let final_text_capped: Option<String> =
+            final_text.map(|s| cap_bytes(s, RUN_END_FINAL_TEXT_MAX_BYTES));
         let _ = bus
             .publish(BusEvent::ephemeral(
                 "system:schedule:run_end",
@@ -152,6 +173,7 @@ impl ScheduleEvents {
                     "status": status,
                     "ended_at": ended_at,
                     "error": error_capped,
+                    "final_text": final_text_capped,
                 }),
                 PublisherIdentity::Internal,
             ))
@@ -253,7 +275,7 @@ mod tests {
             .await;
         evts.run_start("sch-1", "nightly-digest", 1, "cron", 100)
             .await;
-        evts.run_end("sch-1", "nightly-digest", 1, "ok", 110, None)
+        evts.run_end("sch-1", "nightly-digest", 1, "ok", 110, None, None)
             .await;
         evts.missed("sch-1", "nightly-digest", 90).await;
         evts.snapshot(json!({"active": 1, "running": 0, "failed_recent": 0, "next_fire_at": null}))
@@ -290,6 +312,7 @@ mod tests {
             "error",
             110,
             Some(&"x".repeat(2000)),
+            Some(&"y".repeat(5000)),
         )
         .await;
         evts.missed("sch-1", "nightly-digest", 90).await;
@@ -327,6 +350,9 @@ mod tests {
         assert!(run_end.payload["event_id"].is_string());
         let error_str = run_end.payload["error"].as_str().unwrap();
         assert_eq!(error_str.len(), 1024);
+        // final_text capped at 4 KB.
+        let final_text_str = run_end.payload["final_text"].as_str().unwrap();
+        assert_eq!(final_text_str.len(), 4096);
 
         let missed = &received[4];
         assert_eq!(missed.topic, "system:schedule:missed");
