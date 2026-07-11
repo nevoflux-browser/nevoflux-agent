@@ -2039,6 +2039,10 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     serde_json::to_string(&result).unwrap_or_default()
                 }
             }
+            "browser_get_tabs" => {
+                let result = self.host.browser_list_tabs(None)?;
+                serde_json::to_string(&result).unwrap_or_default()
+            }
             "browser_eval_js" => {
                 let script = tool_call.arguments["script"].as_str().unwrap_or("");
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
@@ -3902,6 +3906,18 @@ For going back, use browser_go_back. NEVER use navigate to 'go back'.".into(),
         });
 
         tools.push(ToolDefinition {
+            name: "browser_get_tabs".into(),
+            description: "List all open browser tabs with their tab_id, title, and URL. \
+Use this to find or verify a tab by its title — e.g. before browser_activate_tab, \
+or to confirm the page you just opened is loaded (check a tab's title)."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        });
+
+        tools.push(ToolDefinition {
             name: "browser_activate_tab".into(),
             description: "Switch to (activate) an already-open browser tab. \
 When the user says 'activate', 'switch to', 'go to [site]' and that site is already open, \
@@ -5617,6 +5633,12 @@ mod tests {
                 n.contains(&"report_flow_repair".to_string()),
                 "{mode:?}: {n:?}"
             );
+            // browser_get_tabs must be exposed so the agent can list/verify tabs
+            // by title (previously referenced in prompts but never a callable tool).
+            assert!(
+                n.contains(&"browser_get_tabs".to_string()),
+                "{mode:?}: {n:?}"
+            );
         }
         let chat = names(AgentMode::Chat);
         assert!(!chat.contains(&"run_flow".to_string()));
@@ -6605,7 +6627,8 @@ mod tests {
         // counted among browser-specific tools — hence +21, was +23.
         // Recorded-flow tools (run_flow / list_flows / report_flow_repair)
         // are browser+agent only, not in chat — hence +24, was +21.
-        assert_eq!(browser_tools.len(), chat_tools.len() + 24);
+        // browser_get_tabs added (list tabs by title) — hence +25, was +24.
+        assert_eq!(browser_tools.len(), chat_tools.len() + 25);
     }
 
     #[test]

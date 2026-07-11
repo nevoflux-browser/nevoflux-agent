@@ -2603,6 +2603,7 @@ mod tests {
             ("browser_get_element", BrowserToolAction::GetElement),
             ("browser_get_elements", BrowserToolAction::GetElements),
             ("browser_query_all", BrowserToolAction::QueryAll),
+            ("browser_get_tabs", BrowserToolAction::ListTabs),
             ("browser_query_tabs", BrowserToolAction::QueryTabs),
             ("browser_activate_tab", BrowserToolAction::ActivateTab),
             ("browser_key_press", BrowserToolAction::KeyPress),
