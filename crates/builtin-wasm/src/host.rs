@@ -796,6 +796,16 @@ pub trait HostFunctions {
         })
     }
 
+    /// Send the user a notification (toast + OS notification when unfocused).
+    /// JSON args: {message, title?}. Returns a small JSON ack.
+    /// Default impl returns Unsupported so non-daemon hosts don't need stubs.
+    fn tool_notify_user(&self, _args_json: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_notify_user not supported by this host".into(),
+        })
+    }
+
     // =========================================================================
     // /goal skill tool functions (Task 2.3)
     // =========================================================================

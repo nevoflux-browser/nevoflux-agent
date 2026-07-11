@@ -5792,6 +5792,47 @@ impl HostFunctions for DaemonHostFunctions {
         }
     }
 
+    fn tool_notify_user(&self, args_json: &str) -> HostResult<String> {
+        let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| HostError {
+            code: 4,
+            message: format!("invalid args JSON: {e}"),
+        })?;
+        let message = args
+            .get("message")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| HostError {
+                code: 4,
+                message: "notify_user requires a non-empty `message`".into(),
+            })?;
+        let title = args.get("title").and_then(|v| v.as_str());
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let bus = services.event_bus.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "EventBus not configured".into(),
+        })?;
+        let bus = bus.clone();
+        let message = message.to_string();
+        let title = title.map(|s| s.to_string());
+        let runtime = self.runtime.clone();
+        tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::notify::publish_user_notification(
+                    &bus,
+                    title.as_deref(),
+                    &message,
+                    "notify_user",
+                    None,
+                )
+                .await;
+            })
+        });
+        Ok(serde_json::json!({ "notified": true }).to_string())
+    }
+
     // =========================================================================
     // /goal skill tool functions (Task 2.3) — direct-API surface.
     //

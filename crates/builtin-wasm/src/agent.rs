@@ -2428,6 +2428,9 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             "schedule_runs" => self.host.tool_schedule_runs(
                 &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
             )?,
+            "notify_user" => self.host.tool_notify_user(
+                &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
+            )?,
             // /goal skill tools — direct-API dispatch (Anthropic / OpenAI
             // direct providers). The MCP/ACP path goes through
             // `mcp_tool_executor::execute_mcp_tool::goal_*`.
@@ -3777,6 +3780,18 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                         "include_final_text": { "type": "boolean", "description": "UI-only: include each run's output text; leave unset (false) for normal history browsing" }
                     },
                     "required": ["schedule_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "notify_user".into(),
+                description: "Send the user a notification that reaches them even when the sidebar is closed (a desktop notification plus an in-app toast). Use for reminders and anything the user explicitly asked to be told — e.g. a scheduled 'remind me' task. Do NOT use it to narrate ordinary progress.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "message": { "type": "string", "description": "the notification body the user should see" },
+                        "title": { "type": "string", "description": "optional short heading; defaults to 'NevoFlux'" }
+                    },
+                    "required": ["message"]
                 }),
             },
             // /goal skill tools (Task 2.3).

@@ -1668,6 +1668,9 @@ pub async fn start_server(
     // services.loop_manager when claude-code (ACP) calls loop_* via MCP.
     let _ = crate::loops::CURRENT_LOOP_MANAGER.set(loop_manager.clone());
     services = services.with_loop_manager(loop_manager.clone());
+    // Attach the shared EventBus so `notify_user` can publish
+    // `ui:notification:agent` events (toast + OS notification bridge).
+    services = services.with_event_bus(event_bus.clone());
 
     // Construct the /schedule skill's ScheduleManager and inject it into
     // HostServices so the `schedule_*` tool dispatchers (both the direct-API
