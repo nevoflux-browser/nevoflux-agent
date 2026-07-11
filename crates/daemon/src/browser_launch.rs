@@ -3,7 +3,8 @@
 //! build with a dedicated cloned profile, then waits for the extension to
 //! auto-connect + register (readiness barrier) before the task starts.
 
-use crate::registry::BrowserRegistry;
+use crate::registry::{BrowserEntry, BrowserRegistry};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -110,12 +111,9 @@ pub fn browser_launch_args(profile_dir: &Path) -> Vec<String> {
     ]
 }
 
-/// Spawn the browser and wait until it registers (its extension auto-connects,
-/// P1). Returns once a browser is in the registry, or times out.
-pub async fn spawn_and_supervise(
-    cfg: BrowserLaunchConfig,
-    registry: Arc<BrowserRegistry>,
-) -> Result<BrowserHandle, BrowserLaunchError> {
+/// Build and spawn the browser process (shared by [`spawn_and_supervise`] and
+/// [`spawn_and_supervise_excluding`]) — env/arg setup lives here exactly once.
+fn spawn_browser_process(cfg: &BrowserLaunchConfig) -> Result<Child, BrowserLaunchError> {
     let mut cmd = Command::new(&cfg.browser_bin);
     cmd.args(browser_launch_args(&cfg.profile_dir));
     if let Some(display) = &cfg.display {
@@ -130,7 +128,16 @@ pub async fn spawn_and_supervise(
         cmd.env("NEVOFLUX_DATA_DIR", data_dir);
     }
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
-    let child = cmd.spawn()?;
+    Ok(cmd.spawn()?)
+}
+
+/// Spawn the browser and wait until it registers (its extension auto-connects,
+/// P1). Returns once a browser is in the registry, or times out.
+pub async fn spawn_and_supervise(
+    cfg: BrowserLaunchConfig,
+    registry: Arc<BrowserRegistry>,
+) -> Result<BrowserHandle, BrowserLaunchError> {
+    let child = spawn_browser_process(&cfg)?;
 
     if registry
         .wait_for_browser(cfg.register_timeout)
@@ -140,6 +147,27 @@ pub async fn spawn_and_supervise(
         return Err(BrowserLaunchError::RegisterTimeout(cfg.register_timeout));
     }
     Ok(BrowserHandle { child })
+}
+
+/// Spawn the browser and wait until a browser *not already in* `exclude`
+/// registers, returning the bound [`BrowserEntry`] alongside the handle.
+/// Used by headless scheduled launches so the newly-spawned instance is the
+/// one that gets bound, even while the user's already-registered live browser
+/// (in `exclude`) is still connected — see [`BrowserRegistry::wait_for_new_browser`].
+pub async fn spawn_and_supervise_excluding(
+    cfg: BrowserLaunchConfig,
+    registry: Arc<BrowserRegistry>,
+    exclude: &HashSet<String>,
+) -> Result<(BrowserHandle, BrowserEntry), BrowserLaunchError> {
+    let child = spawn_browser_process(&cfg)?;
+
+    match registry
+        .wait_for_new_browser(exclude, cfg.register_timeout)
+        .await
+    {
+        Ok(entry) => Ok((BrowserHandle { child }, entry)),
+        Err(_) => Err(BrowserLaunchError::RegisterTimeout(cfg.register_timeout)),
+    }
 }
 
 #[cfg(test)]

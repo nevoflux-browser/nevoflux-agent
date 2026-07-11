@@ -121,6 +121,33 @@ struct StreamTraceData {
     accumulated_tool_calls: Vec<crate::wasm::llm::LlmToolCall>,
 }
 
+/// Per-stream spend accounting for a run [`crate::agent_exec::TokenBudget`].
+///
+/// Created in `llm_stream_start` only when the host carries a budget; updated
+/// as chunks pass through `llm_stream_next`; settled exactly once — either
+/// when the `done` chunk is observed or, for aborted/early-closed streams, in
+/// `llm_stream_close` (settling removes the entry, so whichever runs first
+/// wins and the other is a no-op).
+struct StreamBudgetData {
+    /// Total chars across the request messages (prompt side of the estimate).
+    prompt_chars: usize,
+    /// Chars streamed back so far: text + reasoning + tool-call argument JSON.
+    streamed_chars: usize,
+    /// Real usage total reported by the provider (final chunk), if any.
+    /// Preferred over the chars/4 estimate at settle time.
+    usage_total_tokens: Option<u64>,
+}
+
+/// Approximate token count from character counts, used only when the provider
+/// reported no usage for a call. Heuristic: ~4 chars per token, which is the
+/// common rule of thumb for English text; CJK-heavy content will be
+/// underestimated (closer to 1-2 chars/token) and dense code slightly
+/// overestimated. Deliberately crude — the budget is a spend *cap*, not a
+/// billing meter, and a consistent floor beats no accrual at all.
+fn estimate_tokens_from_chars(prompt_chars: usize, streamed_chars: usize) -> u64 {
+    ((prompt_chars + streamed_chars) / 4) as u64
+}
+
 /// A streaming chunk to send to the sidebar.
 #[derive(Debug, Clone)]
 pub struct SidebarStreamChunk {
@@ -158,6 +185,9 @@ pub struct DaemonHostFunctions {
     current_iteration: AtomicU32,
     /// Trace metadata for in-flight streaming LLM calls, keyed by stream_id.
     stream_trace_data: Arc<Mutex<HashMap<u64, StreamTraceData>>>,
+    /// Token-budget accounting for in-flight streams, keyed by stream_id.
+    /// Only populated when [`Self::token_budget`] is `Some`.
+    stream_budget_data: Arc<Mutex<HashMap<u64, StreamBudgetData>>>,
     /// Override for the active LLM provider (set via switch_model tool).
     model_override_provider: Arc<Mutex<Option<String>>>,
     /// Override for the active LLM model (set via switch_model tool).
@@ -189,6 +219,10 @@ pub struct DaemonHostFunctions {
     /// (e.g., unit tests). Callers that invoke the canvas_video_* methods
     /// without wiring the service will receive a host error.
     canvas_video_service: Option<Arc<crate::canvas_video::CanvasVideoService>>,
+    /// Shared per-run spend cap for unattended surfaces (loops/schedules/goals).
+    /// `None` for interactive hosts — zero behavior change when unset. See
+    /// [`crate::agent_exec::TokenBudget`].
+    token_budget: Option<Arc<crate::agent_exec::TokenBudget>>,
     // Note: always_allowed_tools is on HostServices (shared across requests),
     // not here (per-request DaemonHostFunctions).
 }
@@ -216,6 +250,7 @@ impl DaemonHostFunctions {
             trace_collector: None,
             current_iteration: AtomicU32::new(0),
             stream_trace_data: Arc::new(Mutex::new(HashMap::new())),
+            stream_budget_data: Arc::new(Mutex::new(HashMap::new())),
             model_override_provider: Arc::new(Mutex::new(None)),
             model_override_model: Arc::new(Mutex::new(None)),
             skill_base_path: None,
@@ -229,6 +264,7 @@ impl DaemonHostFunctions {
             session_extractor,
             last_response_at: Mutex::new(None),
             canvas_video_service: None,
+            token_budget: None,
         }
     }
 
@@ -292,6 +328,17 @@ impl DaemonHostFunctions {
         svc: Arc<crate::canvas_video::CanvasVideoService>,
     ) -> Self {
         self.canvas_video_service = Some(svc);
+        self
+    }
+
+    /// Wire a per-run [`crate::agent_exec::TokenBudget`]. Once set, `llm_chat`
+    /// and `llm_stream_start` refuse to dispatch once the budget is exceeded,
+    /// and every call accrues spend: real provider-reported usage where
+    /// available, a chars/4 estimate otherwise (see
+    /// [`estimate_tokens_from_chars`]). Leave unset for interactive hosts —
+    /// behavior is unchanged when `token_budget` is `None`.
+    pub fn with_token_budget(mut self, budget: Arc<crate::agent_exec::TokenBudget>) -> Self {
+        self.token_budget = Some(budget);
         self
     }
 
@@ -1085,7 +1132,56 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 }
 
 impl HostFunctions for DaemonHostFunctions {
+    /// Persist a completed tool's result as a `tool_result` message so the goal
+    /// evaluator reads the raw observation (not the model's paraphrase) and the
+    /// continuation anchor can name what already happened (spec §4.1). Best
+    /// effort: skips when no services/session, empty content, or the meta
+    /// `think` tool (reasoning, not an observation).
+    fn record_tool_result(&self, tool_name: &str, tool_id: &str, content: &str, _success: bool) {
+        if content.trim().is_empty() || tool_name == "think" {
+            return;
+        }
+        let Some(services) = self.services.as_ref() else {
+            return;
+        };
+        let session_id = self
+            .session_id
+            .as_deref()
+            .unwrap_or(services.session_id.as_str());
+        if session_id.is_empty() {
+            return;
+        }
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("tool_name".to_string(), serde_json::json!(tool_name));
+        metadata.insert("tool_id".to_string(), serde_json::json!(tool_id));
+        let params = nevoflux_storage::CreateMessageParams::new(
+            session_id,
+            nevoflux_storage::models::MessageRole::Assistant,
+            content,
+        )
+        .with_content_type(nevoflux_storage::models::ContentType::ToolResult)
+        .with_metadata(metadata);
+        if let Err(e) = nevoflux_storage::repositories::MessageRepository::new(&services.database)
+            .create(params)
+        {
+            tracing::warn!(tool = tool_name, error = %e, "record_tool_result: persist failed");
+        }
+    }
+
     fn llm_chat(&self, request: &LlmRequest) -> HostResult<LlmResponse> {
+        // Per-run spend cap (unattended surfaces only — `token_budget` is
+        // `None` for interactive hosts). Checked before any provider
+        // resolution or dispatch so an exhausted budget never reaches the
+        // network.
+        if let Some(budget) = &self.token_budget {
+            if budget.exceeded() {
+                return Err(HostError {
+                    code: 429,
+                    message: "token budget for this run exhausted".into(),
+                });
+            }
+        }
+
         // Resolve provider (uses override if set, otherwise config)
         let (provider_name, api_key, model, base_url) = self.resolve_provider_and_model()?;
 
@@ -1291,6 +1387,33 @@ impl HostFunctions for DaemonHostFunctions {
                     *t = Some(std::time::Instant::now());
                 }
 
+                // Accrue spend against the per-run budget: real
+                // provider-reported usage when present, chars/4 estimate
+                // otherwise (raw HTTP paths — DeepSeek/MiMo raw, OpenRouter
+                // image models, Kimi — don't parse usage today).
+                if let Some(budget) = &self.token_budget {
+                    match &response.usage {
+                        Some(usage) => budget.add(usage.total_tokens as u64),
+                        None => {
+                            let prompt_chars: usize =
+                                request.messages.iter().map(|m| m.content.len()).sum();
+                            let mut completion_chars = response.content.len();
+                            if let Some(tool_calls) = &response.tool_calls {
+                                for tc in tool_calls {
+                                    completion_chars += tc.arguments.to_string().len();
+                                }
+                            }
+                            let estimated =
+                                estimate_tokens_from_chars(prompt_chars, completion_chars);
+                            debug!(
+                                estimated_tokens = estimated,
+                                "provider reported no usage for llm_chat; accruing chars/4 estimate against run token budget"
+                            );
+                            budget.add(estimated);
+                        }
+                    }
+                }
+
                 // Convert tool calls, preserving call_id for OpenAI Responses API compatibility
                 let tool_calls = response
                     .tool_calls
@@ -1337,6 +1460,22 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn llm_stream_start(&self, request: &LlmRequest) -> HostResult<u64> {
+        // Per-run spend cap, mirroring the `llm_chat` gate above. This is the
+        // load-bearing gate: `Agent::run`'s default `AgentConfig` has
+        // `use_streaming: true`, so unattended runs (loops/schedules/goals
+        // via `agent_exec::run_agent_once`, which builds `Agent::new(host)`
+        // with default config) go through this path, not `llm_chat`. Spend
+        // *accrual* for the stream happens at stream end — see the
+        // `stream_budget_data` bookkeeping below and `settle_stream_budget`.
+        if let Some(budget) = &self.token_budget {
+            if budget.exceeded() {
+                return Err(HostError {
+                    code: 429,
+                    message: "token budget for this run exhausted".into(),
+                });
+            }
+        }
+
         // Resolve provider (uses override if set, otherwise config)
         let (provider_name, api_key, model, base_url) = self.resolve_provider_and_model()?;
 
@@ -1558,6 +1697,7 @@ impl HostFunctions for DaemonHostFunctions {
             // Send text chunk if present
             if !response.content.is_empty() {
                 let _ = tx.try_send(LlmStreamChunk {
+                    usage: None,
                     text: Some(response.content),
                     tool_calls: vec![],
                     done: false,
@@ -1568,6 +1708,7 @@ impl HostFunctions for DaemonHostFunctions {
             // Send images if present
             if !response.images.is_empty() {
                 let _ = tx.try_send(LlmStreamChunk {
+                    usage: None,
                     text: None,
                     tool_calls: vec![],
                     done: false,
@@ -1579,6 +1720,7 @@ impl HostFunctions for DaemonHostFunctions {
             if let Some(tool_calls) = response.tool_calls {
                 if !tool_calls.is_empty() {
                     let _ = tx.try_send(LlmStreamChunk {
+                        usage: None,
                         text: None,
                         tool_calls,
                         done: false,
@@ -1587,8 +1729,11 @@ impl HostFunctions for DaemonHostFunctions {
                     });
                 }
             }
-            // Send done chunk
+            // Send done chunk, carrying any real usage from the underlying
+            // non-streaming call so budget accounting prefers it over the
+            // chars/4 estimate.
             let _ = tx.try_send(LlmStreamChunk {
+                usage: response.usage,
                 text: None,
                 tool_calls: vec![],
                 done: true,
@@ -1613,6 +1758,22 @@ impl HostFunctions for DaemonHostFunctions {
             );
         }
 
+        // Open budget accounting for this stream: chars accumulate in
+        // `llm_stream_next`, and the spend settles (real usage if the final
+        // chunk carried it, chars/4 estimate otherwise) when the stream ends
+        // or closes. Only bookkept when this host carries a budget.
+        if self.token_budget.is_some() {
+            let prompt_chars = request.messages.iter().map(|m| m.content.len()).sum();
+            self.stream_budget_data.lock().unwrap().insert(
+                stream_id,
+                StreamBudgetData {
+                    prompt_chars,
+                    streamed_chars: 0,
+                    usage_total_tokens: None,
+                },
+            );
+        }
+
         debug!("llm_stream_start: stream_id={}", stream_id);
         Ok(stream_id)
     }
@@ -1632,6 +1793,36 @@ impl HostFunctions for DaemonHostFunctions {
                             }
                             data.accumulated_tool_calls.extend(chunk.tool_calls.clone());
                         }
+                    }
+                }
+
+                // Accumulate for run token-budget accounting; settle when the
+                // stream's terminal chunk arrives. Removing the entry before
+                // settling makes accrual exactly-once even if the guest also
+                // calls llm_stream_close afterwards (it always does).
+                if self.token_budget.is_some() {
+                    let mut settle: Option<StreamBudgetData> = None;
+                    if let Ok(mut budget_map) = self.stream_budget_data.lock() {
+                        if let Some(data) = budget_map.get_mut(&stream_id) {
+                            if let Some(ref text) = chunk.text {
+                                data.streamed_chars += text.len();
+                            }
+                            if let Some(ref reasoning) = chunk.reasoning {
+                                data.streamed_chars += reasoning.len();
+                            }
+                            for tc in &chunk.tool_calls {
+                                data.streamed_chars += tc.arguments.to_string().len();
+                            }
+                            if let Some(ref usage) = chunk.usage {
+                                data.usage_total_tokens = Some(usage.total_tokens as u64);
+                            }
+                        }
+                        if chunk.done {
+                            settle = budget_map.remove(&stream_id);
+                        }
+                    }
+                    if let Some(data) = settle {
+                        self.settle_stream_budget(stream_id, data);
                     }
                 }
 
@@ -1705,6 +1896,17 @@ impl HostFunctions for DaemonHostFunctions {
 
     fn llm_stream_close(&self, stream_id: u64) -> HostResult<()> {
         debug!("llm_stream_close: stream_id={}", stream_id);
+
+        // Settle budget accounting for streams that never delivered a `done`
+        // chunk (interrupt/abort/early close). If the stream already settled
+        // on its `done` chunk in llm_stream_next, the entry is gone and this
+        // is a no-op — accrual stays exactly-once.
+        if self.token_budget.is_some() {
+            let leftover = self.stream_budget_data.lock().unwrap().remove(&stream_id);
+            if let Some(data) = leftover {
+                self.settle_stream_budget(stream_id, data);
+            }
+        }
 
         // End any open thinking block before closing the stream
         let ended_id = self.current_thinking_id.lock().unwrap().take();
@@ -3327,6 +3529,10 @@ impl HostFunctions for DaemonHostFunctions {
                 code.len()
             );
             let browser_ctx = self.services.as_ref().and_then(|s| s.browser_context());
+            // Session interrupt flag → cooperative cancellation: a long-running
+            // orchestrate aborts at the next tool-call boundary when the user
+            // hits stop, instead of holding the turn up to the 24h cap.
+            let cancel_flag = self.services.as_ref().map(|s| s.interrupt_flag.clone());
 
             // Try to resolve LLM provider for error recovery rewrites.
             // Falls back to no-op rewrite if LLM is not available.
@@ -3345,6 +3551,7 @@ impl HostFunctions for DaemonHostFunctions {
                                 api_key,
                                 model,
                                 base_url,
+                                cancel_flag,
                             )
                         }
                         Err(_) => {
@@ -3352,13 +3559,23 @@ impl HostFunctions for DaemonHostFunctions {
                                 "orchestrate: invalid provider '{}', falling back to no-op rewrite",
                                 provider_name
                             );
-                            crate::agent::code_mode::execute_python_simple(code, browser_ctx)
+                            crate::agent::code_mode::execute_python_simple_with_timeout(
+                                code,
+                                browser_ctx,
+                                Some(crate::agent::code_mode::ORCHESTRATE_MAX_DURATION),
+                                cancel_flag,
+                            )
                         }
                     }
                 }
                 Err(_) => {
                     debug!("orchestrate: no LLM provider available, using no-op rewrite");
-                    crate::agent::code_mode::execute_python_simple(code, browser_ctx)
+                    crate::agent::code_mode::execute_python_simple_with_timeout(
+                        code,
+                        browser_ctx,
+                        Some(crate::agent::code_mode::ORCHESTRATE_MAX_DURATION),
+                        cancel_flag,
+                    )
                 }
             };
 
@@ -4134,6 +4351,15 @@ impl HostFunctions for DaemonHostFunctions {
         self.execute_browser_action(BrowserToolAction::EditArtifact, params.clone(), tab_id)
     }
 
+    fn canvas_eval(
+        &self,
+        params: &serde_json::Value,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        debug!("canvas_eval: running JS inside artifact iframe");
+        self.execute_browser_action(BrowserToolAction::CanvasEval, params.clone(), tab_id)
+    }
+
     fn browser_extract_visual_identity(
         &self,
         params: &serde_json::Value,
@@ -4284,6 +4510,7 @@ impl HostFunctions for DaemonHostFunctions {
             None,
             None,
             self.sidebar_stream_tx.clone(),
+            self.token_budget.clone(),
         )
     }
 
@@ -5298,6 +5525,405 @@ impl HostFunctions for DaemonHostFunctions {
             }),
         }
     }
+
+    // =========================================================================
+    // /schedule skill tool functions (Task 1.6) — direct-API surface.
+    //
+    // Mirrors the /loop wiring immediately above: direct-API providers
+    // (Anthropic / OpenAI) reach the `schedule_*` family through
+    // `Agent::execute_tool` in builtin-wasm, which calls these host
+    // functions. ACP-bridge providers take the parallel path through
+    // `mcp_tool_executor::execute_mcp_tool` and call
+    // `crate::schedules::execute_schedule_tool` directly. Both paths share
+    // the same dispatcher; only the surface differs.
+    //
+    // All seven methods are sync (HostFunctions is sync) but
+    // `execute_schedule_tool` is async, so we use the same
+    // `tokio::task::block_in_place(|| runtime.block_on(...))` pattern as
+    // `tool_loop_*` / `llm_chat` to avoid panicking when called from inside
+    // a Tokio runtime.
+    //
+    // `is_unattended` is read from `services.is_iteration`, NOT hardcoded:
+    // `agent_exec::run_agent_once` builds a direct-API `DaemonHostFunctions`
+    // for EVERY schedule fire / loop iteration and sets `is_iteration = true`
+    // on the HostServices clone it installs. The run loop executes whatever
+    // tool_call the model returns (the allowlist only filters what is
+    // ADVERTISED), so this gate must reflect the real unattended state or a
+    // model that emits `schedule_create` inside an unattended run would create
+    // a schedule with nobody present to confirm its name/cadence. When the host
+    // is the interactive main session, `is_iteration` is false and this stays
+    // permissive.
+    // =========================================================================
+
+    fn tool_schedule_create(&self, args_json: &str) -> HostResult<String> {
+        let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| HostError {
+            code: 4,
+            message: format!("invalid args JSON: {e}"),
+        })?;
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services
+            .schedule_manager
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "ScheduleManager not configured".into(),
+            })?;
+        let ctx = crate::schedules::ScheduleToolContext {
+            session_id: self.session_id.clone().unwrap_or_default(),
+            is_unattended: services.is_iteration,
+        };
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::schedules::execute_schedule_tool("schedule_create", &args, &ctx, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_schedule_list(&self) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services
+            .schedule_manager
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "ScheduleManager not configured".into(),
+            })?;
+        let ctx = crate::schedules::ScheduleToolContext {
+            session_id: self.session_id.clone().unwrap_or_default(),
+            is_unattended: services.is_iteration,
+        };
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let args = serde_json::json!({});
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::schedules::execute_schedule_tool("schedule_list", &args, &ctx, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_schedule_cancel(&self, schedule_id: &str) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services
+            .schedule_manager
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "ScheduleManager not configured".into(),
+            })?;
+        let ctx = crate::schedules::ScheduleToolContext {
+            session_id: self.session_id.clone().unwrap_or_default(),
+            is_unattended: services.is_iteration,
+        };
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let args = serde_json::json!({ "schedule_id": schedule_id });
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::schedules::execute_schedule_tool("schedule_cancel", &args, &ctx, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_schedule_pause(&self, schedule_id: &str) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services
+            .schedule_manager
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "ScheduleManager not configured".into(),
+            })?;
+        let ctx = crate::schedules::ScheduleToolContext {
+            session_id: self.session_id.clone().unwrap_or_default(),
+            is_unattended: services.is_iteration,
+        };
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let args = serde_json::json!({ "schedule_id": schedule_id });
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::schedules::execute_schedule_tool("schedule_pause", &args, &ctx, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_schedule_resume(&self, schedule_id: &str) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services
+            .schedule_manager
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "ScheduleManager not configured".into(),
+            })?;
+        let ctx = crate::schedules::ScheduleToolContext {
+            session_id: self.session_id.clone().unwrap_or_default(),
+            is_unattended: services.is_iteration,
+        };
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let args = serde_json::json!({ "schedule_id": schedule_id });
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::schedules::execute_schedule_tool("schedule_resume", &args, &ctx, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_schedule_run_now(&self, schedule_id: &str) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services
+            .schedule_manager
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "ScheduleManager not configured".into(),
+            })?;
+        let ctx = crate::schedules::ScheduleToolContext {
+            session_id: self.session_id.clone().unwrap_or_default(),
+            is_unattended: services.is_iteration,
+        };
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let args = serde_json::json!({ "schedule_id": schedule_id });
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::schedules::execute_schedule_tool("schedule_run_now", &args, &ctx, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_schedule_runs(&self, args_json: &str) -> HostResult<String> {
+        let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| HostError {
+            code: 4,
+            message: format!("invalid args JSON: {e}"),
+        })?;
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services
+            .schedule_manager
+            .as_ref()
+            .ok_or_else(|| HostError {
+                code: 3,
+                message: "ScheduleManager not configured".into(),
+            })?;
+        let ctx = crate::schedules::ScheduleToolContext {
+            session_id: self.session_id.clone().unwrap_or_default(),
+            is_unattended: services.is_iteration,
+        };
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::schedules::execute_schedule_tool("schedule_runs", &args, &ctx, &mgr).await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    // =========================================================================
+    // /goal skill tool functions (Task 2.3) — direct-API surface.
+    //
+    // Mirrors the /schedule wiring immediately above: direct-API providers
+    // reach the `goal_*` family through `Agent::execute_tool` in
+    // builtin-wasm, which calls these host functions. ACP-bridge providers
+    // take the parallel path through `mcp_tool_executor::execute_mcp_tool`
+    // and call `crate::goals::execute_goal_tool` directly. Both paths share
+    // the same dispatcher; only the surface differs.
+    //
+    // All three methods are sync (HostFunctions is sync) but
+    // `execute_goal_tool` is async, so we use the same
+    // `tokio::task::block_in_place(|| runtime.block_on(...))` pattern as
+    // `tool_schedule_*` to avoid panicking when called from inside a Tokio
+    // runtime.
+    //
+    // Like `tool_schedule_create`, these pass `services.is_iteration` as the
+    // dispatcher's `is_unattended` flag: `run_agent_once` builds this direct-API
+    // host for schedule fires / loop iterations with `is_iteration = true`, and
+    // the run loop executes whatever tool the model emits (the allowlist only
+    // filters advertising), so `goal_set` MUST be gated here too — the shared
+    // `execute_goal_tool` dispatcher rejects it when unattended. The
+    // `mcp_tool_executor` iteration gate rejects it earlier on the ACP path as
+    // belt-and-braces.
+    // =========================================================================
+
+    fn tool_goal_set(&self, args_json: &str) -> HostResult<String> {
+        let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| HostError {
+            code: 4,
+            message: format!("invalid args JSON: {e}"),
+        })?;
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services.goal_manager.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "GoalManager not configured".into(),
+        })?;
+        let session_id = self.session_id.clone().unwrap_or_default();
+        // `is_iteration` reflects the real unattended state: `run_agent_once`
+        // sets it on the HostServices clone it installs for schedule fires /
+        // loop iterations. The gate lives in the shared `execute_goal_tool`
+        // dispatcher, so this direct-API surface is covered too (its run loop
+        // executes whatever tool the model emits, not just the advertised set).
+        let is_unattended = services.is_iteration;
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::goals::execute_goal_tool("goal_set", &args, &session_id, is_unattended, &mgr)
+                    .await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_goal_status(&self) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services.goal_manager.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "GoalManager not configured".into(),
+        })?;
+        let session_id = self.session_id.clone().unwrap_or_default();
+        let is_unattended = services.is_iteration;
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let args = serde_json::json!({});
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::goals::execute_goal_tool(
+                    "goal_status",
+                    &args,
+                    &session_id,
+                    is_unattended,
+                    &mgr,
+                )
+                .await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    fn tool_goal_clear(&self) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services.goal_manager.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "GoalManager not configured".into(),
+        })?;
+        let session_id = self.session_id.clone().unwrap_or_default();
+        let is_unattended = services.is_iteration;
+        let mgr = mgr.clone();
+        let runtime = self.runtime.clone();
+        let args = serde_json::json!({});
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::goals::execute_goal_tool(
+                    "goal_clear",
+                    &args,
+                    &session_id,
+                    is_unattended,
+                    &mgr,
+                )
+                .await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
 }
 
 impl DaemonHostFunctions {
@@ -5374,6 +6000,35 @@ impl DaemonHostFunctions {
         Ok(())
     }
 
+    /// Settle a finished stream's spend against the run token budget.
+    ///
+    /// Called with the [`StreamBudgetData`] already *removed* from
+    /// `stream_budget_data`, which is what guarantees exactly-once accrual
+    /// across the two finalization sites (`done` chunk in `llm_stream_next`,
+    /// and `llm_stream_close` for aborted/early-closed streams). Prefers real
+    /// provider-reported usage; falls back to the chars/4 estimate.
+    fn settle_stream_budget(&self, stream_id: u64, data: StreamBudgetData) {
+        let Some(budget) = &self.token_budget else {
+            return;
+        };
+        match data.usage_total_tokens {
+            Some(total) => {
+                budget.add(total);
+            }
+            None => {
+                let estimated = estimate_tokens_from_chars(data.prompt_chars, data.streamed_chars);
+                debug!(
+                    stream_id,
+                    estimated_tokens = estimated,
+                    prompt_chars = data.prompt_chars,
+                    streamed_chars = data.streamed_chars,
+                    "provider reported no usage for stream; accruing chars/4 estimate against run token budget"
+                );
+                budget.add(estimated);
+            }
+        }
+    }
+
     /// Create a clone for builtin proxy calls to avoid infinite recursion.
     fn clone_for_builtin(&self) -> Self {
         Self {
@@ -5387,6 +6042,9 @@ impl DaemonHostFunctions {
             trace_collector: self.trace_collector.clone(),
             current_iteration: AtomicU32::new(self.current_iteration.load(Ordering::Relaxed)),
             stream_trace_data: self.stream_trace_data.clone(),
+            // Shared with the parent (like stream_trace_data): stream ids come
+            // from the shared registry, so accounting must live in one map.
+            stream_budget_data: self.stream_budget_data.clone(),
             model_override_provider: self.model_override_provider.clone(),
             model_override_model: self.model_override_model.clone(),
             skill_base_path: self.skill_base_path.clone(),
@@ -5405,6 +6063,10 @@ impl DaemonHostFunctions {
             session_extractor: self.session_extractor.clone(),
             last_response_at: Mutex::new(self.last_response_at.lock().unwrap().clone()),
             canvas_video_service: self.canvas_video_service.clone(),
+            // Same run, same spend cap: nested builtin_chat/browser/agent
+            // dispatches must accrue against (and be gated by) the parent's
+            // budget, not run unmetered.
+            token_budget: self.token_budget.clone(),
         }
     }
 
@@ -5825,6 +6487,7 @@ impl DaemonHostFunctions {
             final_provider,
             final_model,
             self.sidebar_stream_tx.clone(),
+            self.token_budget.clone(),
         )
     }
 
@@ -5847,6 +6510,7 @@ impl DaemonHostFunctions {
         provider_override: Option<String>,
         model_override: Option<String>,
         sidebar_stream_tx: Option<tokio::sync::mpsc::UnboundedSender<SidebarStreamChunk>>,
+        token_budget: Option<Arc<crate::agent_exec::TokenBudget>>,
     ) -> HostResult<u64> {
         let id = subagent_registry.allocate_id();
         let task_str = task.to_string();
@@ -5889,6 +6553,13 @@ impl DaemonHostFunctions {
                 // Create a new host functions instance for the subagent
                 let mut host = DaemonHostFunctions::new(config, runtime_clone.clone());
                 host = host.with_is_subagent(true);
+                // Inherit the parent's per-run token budget so a subagent
+                // spawned from an unattended run (schedule fire / loop
+                // iteration) cannot escape `max_tokens_per_run` — its LLM
+                // boundary enforces the same shared ceiling.
+                if let Some(budget) = token_budget {
+                    host = host.with_token_budget(budget);
+                }
                 if let Some(svc) = services {
                     host = host.with_services(svc);
                 }
@@ -6262,6 +6933,300 @@ mod tests {
         let config = Arc::new(AgentConfig::default());
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _host = DaemonHostFunctions::new(config, rt.handle().clone());
+    }
+
+    // ==================== Token Budget Tests ====================
+    //
+    // Gate tests exercise only the pre-dispatch check: it happens before
+    // `resolve_provider_and_model`, so it fires deterministically even with
+    // an unconfigured `AgentConfig::default()` (no provider/API key) and
+    // never touches the network. Streaming *accrual* is testable without a
+    // network too: the registry accepts hand-registered chunk channels, so
+    // tests drive `llm_stream_next`/`llm_stream_close` against pre-queued
+    // chunks and assert the budget's `spent` counter.
+
+    fn minimal_llm_request() -> LlmRequest {
+        use nevoflux_builtin_wasm::Message;
+        LlmRequest {
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            stream: false,
+        }
+    }
+
+    #[test]
+    fn llm_chat_rejects_with_429_when_budget_exhausted_before_any_dispatch() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let budget = crate::agent_exec::TokenBudget::new(10);
+        budget.add(10); // spent == limit ⇒ exceeded()
+        let host = DaemonHostFunctions::new(config, rt.handle().clone()).with_token_budget(budget);
+
+        let err = host
+            .llm_chat(&minimal_llm_request())
+            .expect_err("exhausted budget must reject before provider resolution");
+        assert_eq!(err.code, 429);
+        assert!(err.message.contains("token budget"));
+    }
+
+    #[test]
+    fn llm_stream_start_rejects_with_429_when_budget_exhausted_before_any_dispatch() {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let budget = crate::agent_exec::TokenBudget::new(0); // zero limit ⇒ immediately exceeded
+        let host = DaemonHostFunctions::new(config, rt.handle().clone()).with_token_budget(budget);
+
+        let err = host
+            .llm_stream_start(&minimal_llm_request())
+            .expect_err("exhausted budget must reject before provider resolution");
+        assert_eq!(err.code, 429);
+        assert!(err.message.contains("token budget"));
+    }
+
+    #[test]
+    fn llm_chat_without_budget_is_unaffected_by_the_gate() {
+        // `token_budget: None` (the default, and the only state interactive
+        // hosts ever have) must not short-circuit with 429. Without a
+        // provider configured, `AgentConfig::default()` fails later in
+        // `resolve_provider_and_model` instead — proving the gate was
+        // skipped, not that the call succeeded.
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        let err = host
+            .llm_chat(&minimal_llm_request())
+            .expect_err("no provider configured");
+        assert_ne!(err.code, 429);
+    }
+
+    #[test]
+    fn llm_chat_with_budget_under_limit_reaches_provider_resolution() {
+        // A budget that is *not* exceeded must let the call proceed past the
+        // gate — it should fail for the same "no provider configured"
+        // reason as the no-budget case, not with 429.
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let budget = crate::agent_exec::TokenBudget::new(1000);
+        let host = DaemonHostFunctions::new(config, rt.handle().clone()).with_token_budget(budget);
+
+        let err = host
+            .llm_chat(&minimal_llm_request())
+            .expect_err("no provider configured");
+        assert_ne!(err.code, 429);
+    }
+
+    #[test]
+    fn spawn_legacy_subagent_installs_parent_token_budget() {
+        // A subagent spawned from an unattended run must inherit the parent's
+        // per-run token budget. With an ALREADY-exhausted budget the child's
+        // first LLM call short-circuits at the 429 gate (before any provider
+        // resolution), so the failure text is "token budget" — NOT the
+        // "no provider"/"Invalid provider" error a budget-less spawn would hit
+        // with `AgentConfig::default()`. That difference proves the budget was
+        // installed on the spawned host, not merely accepted as a parameter.
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let registry = Arc::new(SubagentRegistry::new());
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let services = Some(HostServices::new(db));
+        let budget = crate::agent_exec::TokenBudget::new(0); // exceeded() == true
+
+        let id = DaemonHostFunctions::spawn_legacy_subagent_impl(
+            &registry,
+            &config,
+            rt.handle(),
+            &services,
+            "do the thing",
+            "chat",
+            AgentMode::Chat,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(budget),
+        )
+        .expect("spawn registers the subagent");
+
+        let result_text = rt.block_on(async {
+            for _ in 0..600 {
+                let done = {
+                    let entries = registry.entries.read().unwrap();
+                    entries.get(&id).and_then(|e| {
+                        if e.status == SubagentStatus::Running {
+                            None
+                        } else {
+                            Some(e.result.clone().unwrap_or_default())
+                        }
+                    })
+                };
+                if let Some(text) = done {
+                    return text;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("subagent did not finish in time");
+        });
+
+        assert!(
+            result_text.contains("token budget"),
+            "child's LLM call must be gated by the inherited budget; got: {result_text}"
+        );
+    }
+
+    // ---- streaming accrual ----------------------------------------------
+
+    #[test]
+    fn estimate_tokens_from_chars_is_floor_of_quarter_sum() {
+        assert_eq!(estimate_tokens_from_chars(0, 0), 0);
+        assert_eq!(estimate_tokens_from_chars(3, 0), 0); // floors below one token
+        assert_eq!(estimate_tokens_from_chars(4, 4), 2);
+        assert_eq!(estimate_tokens_from_chars(10, 9), 4); // 19 / 4 = 4 (floor)
+        assert_eq!(estimate_tokens_from_chars(100, 100), 50);
+    }
+
+    /// Build a budgeted host plus a hand-registered stream: pre-queued chunks
+    /// flow through the real `llm_stream_next`/`llm_stream_close` machinery
+    /// with no network involved. Returns (host, budget, stream_id, runtime).
+    fn setup_budgeted_stream(
+        prompt_chars: usize,
+        chunks: Vec<crate::wasm::llm::LlmStreamChunk>,
+    ) -> (
+        DaemonHostFunctions,
+        Arc<crate::agent_exec::TokenBudget>,
+        u64,
+        tokio::runtime::Runtime,
+    ) {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let budget = crate::agent_exec::TokenBudget::new(1_000_000);
+        let host =
+            DaemonHostFunctions::new(config, rt.handle().clone()).with_token_budget(budget.clone());
+
+        let stream_id = host.stream_registry.allocate_id();
+        let (tx, rx) = tokio::sync::mpsc::channel(chunks.len().max(1));
+        for chunk in chunks {
+            tx.try_send(chunk).expect("pre-queue chunk");
+        }
+        host.stream_registry.register(stream_id, rx);
+        // Mirror what llm_stream_start does when a budget is present.
+        host.stream_budget_data.lock().unwrap().insert(
+            stream_id,
+            StreamBudgetData {
+                prompt_chars,
+                streamed_chars: 0,
+                usage_total_tokens: None,
+            },
+        );
+        (host, budget, stream_id, rt)
+    }
+
+    fn text_chunk(text: &str) -> crate::wasm::llm::LlmStreamChunk {
+        crate::wasm::llm::LlmStreamChunk {
+            text: Some(text.to_string()),
+            tool_calls: vec![],
+            done: false,
+            reasoning: None,
+            images: vec![],
+            usage: None,
+        }
+    }
+
+    fn done_chunk(usage: Option<crate::wasm::llm::LlmUsage>) -> crate::wasm::llm::LlmStreamChunk {
+        crate::wasm::llm::LlmStreamChunk {
+            text: None,
+            tool_calls: vec![],
+            done: true,
+            reasoning: None,
+            images: vec![],
+            usage,
+        }
+    }
+
+    /// Drain the stream via llm_stream_next until the done chunk is seen.
+    fn drain_stream(host: &DaemonHostFunctions, stream_id: u64) {
+        for _ in 0..32 {
+            match host.llm_stream_next(stream_id).expect("stream next") {
+                Some(chunk) if chunk.done => return,
+                _ => {}
+            }
+        }
+        panic!("stream never delivered a done chunk");
+    }
+
+    #[test]
+    fn stream_with_real_usage_accrues_provider_total() {
+        let usage = crate::wasm::llm::LlmUsage {
+            prompt_tokens: 100,
+            completion_tokens: 23,
+            total_tokens: 123,
+        };
+        let (host, budget, stream_id, _rt) = setup_budgeted_stream(
+            400, // would estimate to >=100 — must NOT be used when real usage exists
+            vec![text_chunk("hello world"), done_chunk(Some(usage))],
+        );
+
+        drain_stream(&host, stream_id);
+        assert_eq!(budget.spent.load(Ordering::Relaxed), 123);
+
+        // Close after done must not double-accrue (entry already settled).
+        host.llm_stream_close(stream_id).unwrap();
+        assert_eq!(budget.spent.load(Ordering::Relaxed), 123);
+    }
+
+    #[test]
+    fn stream_without_usage_accrues_chars_estimate_on_done() {
+        // prompt 20 chars + streamed 12 chars => 32 / 4 = 8 tokens.
+        let (host, budget, stream_id, _rt) =
+            setup_budgeted_stream(20, vec![text_chunk("abcdefghijkl"), done_chunk(None)]);
+
+        drain_stream(&host, stream_id);
+        assert_eq!(budget.spent.load(Ordering::Relaxed), 8);
+
+        host.llm_stream_close(stream_id).unwrap();
+        assert_eq!(budget.spent.load(Ordering::Relaxed), 8);
+    }
+
+    #[test]
+    fn stream_closed_before_done_settles_estimate_on_close() {
+        // Abort path: consume one text chunk, never see done, then close.
+        // prompt 40 + streamed 8 => 48 / 4 = 12 tokens.
+        let (host, budget, stream_id, _rt) =
+            setup_budgeted_stream(40, vec![text_chunk("12345678")]);
+
+        let chunk = host
+            .llm_stream_next(stream_id)
+            .expect("stream next")
+            .expect("first chunk");
+        assert!(!chunk.done);
+        assert_eq!(budget.spent.load(Ordering::Relaxed), 0); // nothing settled yet
+
+        host.llm_stream_close(stream_id).unwrap();
+        assert_eq!(budget.spent.load(Ordering::Relaxed), 12);
+
+        // Double-close stays settled-once.
+        host.llm_stream_close(stream_id).unwrap();
+        assert_eq!(budget.spent.load(Ordering::Relaxed), 12);
+    }
+
+    #[test]
+    fn stream_accounting_untracked_without_budget() {
+        // A host without a budget must not create accounting entries in
+        // llm_stream_start's bookkeeping map, and next/close must not panic.
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(config, rt.handle().clone());
+
+        let stream_id = host.stream_registry.allocate_id();
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.try_send(done_chunk(None)).unwrap();
+        host.stream_registry.register(stream_id, rx);
+
+        drain_stream(&host, stream_id);
+        host.llm_stream_close(stream_id).unwrap();
+        assert!(host.stream_budget_data.lock().unwrap().is_empty());
     }
 
     // ==================== Memory Tests ====================

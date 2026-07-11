@@ -317,6 +317,12 @@ pub async fn execute_mcp_tool(
                 "loop_create is forbidden inside /loop iterations (no nested loops)".to_string(),
             );
         }
+        if name == "schedule_create" {
+            return Err("schedule_create is not available inside unattended runs".to_string());
+        }
+        if name == "goal_set" {
+            return Err("goal_set is not available inside unattended runs".to_string());
+        }
     }
 
     // 0'. gbrain knowledge-base tools (M3-4).
@@ -564,6 +570,86 @@ pub async fn execute_mcp_tool(
         };
     }
 
+    // 6''. /schedule skill tools (Task 1.6).
+    //
+    // Dispatched via `crate::schedules::execute_schedule_tool`. ACP-bridge
+    // providers (claude-code, gemini-cli, kimi, openclaw) reach this branch
+    // through the MCP HTTP bridge; direct-API providers reach the same
+    // dispatcher through `agent_host.rs`'s `tool_schedule_*` methods, which
+    // call the identical `execute_schedule_tool` dispatcher — only the
+    // surface differs, mirroring the /loop wiring above.
+    //
+    // Requires `services.schedule_manager` to be set at daemon startup;
+    // until then tool calls surface a clear error.
+    if matches!(
+        name,
+        "schedule_create"
+            | "schedule_list"
+            | "schedule_cancel"
+            | "schedule_pause"
+            | "schedule_resume"
+            | "schedule_run_now"
+            | "schedule_runs"
+    ) {
+        let mgr = match services.schedule_manager.as_ref() {
+            Some(m) => m,
+            None => {
+                return Err(
+                    "/schedule tools are not available — daemon was started without a ScheduleManager"
+                        .to_string(),
+                );
+            }
+        };
+        let ctx = crate::schedules::ScheduleToolContext {
+            session_id: services.session_id.clone(),
+            is_unattended: services.is_iteration,
+        };
+        let result =
+            crate::schedules::execute_schedule_tool(name, arguments, &ctx, mgr.as_ref()).await;
+        return match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(e),
+        };
+    }
+
+    // 6'''. /goal skill tools (Task 2.3).
+    //
+    // Dispatched via `crate::goals::execute_goal_tool`. ACP-bridge providers
+    // (claude-code, gemini-cli, kimi, openclaw) reach this branch through
+    // the MCP HTTP bridge; direct-API providers reach the same dispatcher
+    // through `agent_host.rs`'s `tool_goal_*` methods, which call the
+    // identical `execute_goal_tool` dispatcher — only the surface differs,
+    // mirroring the /schedule wiring above. `goal_set` is additionally
+    // rejected earlier by the /loop iteration gate when
+    // `services.is_iteration` is true (unattended runs must not hijack the
+    // session goal — P3 composition passes goal config explicitly instead).
+    //
+    // Requires `services.goal_manager` to be set at daemon startup (Task
+    // 2.4 wires boot); until then tool calls surface a clear error.
+    if matches!(name, "goal_set" | "goal_status" | "goal_clear") {
+        let mgr = match services.goal_manager.as_ref() {
+            Some(m) => m,
+            None => {
+                return Err(
+                    "/goal tools are not available — daemon was started without a GoalManager"
+                        .to_string(),
+                );
+            }
+        };
+        let result = crate::goals::execute_goal_tool(
+            name,
+            arguments,
+            &services.session_id,
+            services.is_iteration,
+            mgr.as_ref(),
+        )
+        .await;
+        return match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(e),
+        };
+    }
+
     // 7. External MCP tools (via McpManager)
     if let Some(ref mcp_manager) = services.mcp_manager {
         if let Ok(result) = execute_mcp_manager_tool(name, arguments, mcp_manager).await {
@@ -605,6 +691,9 @@ fn tool_name_to_browser_action(name: &str) -> Option<BrowserToolAction> {
         "screenshot" => Some(BrowserToolAction::Screenshot),
         "snapshot" => Some(BrowserToolAction::Snapshot),
         "eval_js" => Some(BrowserToolAction::EvalJs),
+        // `canvas_eval` strips the `canvas_` prefix to bare `eval` (distinct
+        // from `eval_js`); run JS inside a canvas artifact's iframe (spec §6).
+        "eval" => Some(BrowserToolAction::CanvasEval),
         "wait_for" => Some(BrowserToolAction::WaitFor),
         "wait_for_stable" => Some(BrowserToolAction::WaitForStable),
         "scroll" => Some(BrowserToolAction::Scroll),
@@ -2514,6 +2603,7 @@ mod tests {
             ("browser_get_element", BrowserToolAction::GetElement),
             ("browser_get_elements", BrowserToolAction::GetElements),
             ("browser_query_all", BrowserToolAction::QueryAll),
+            ("browser_get_tabs", BrowserToolAction::ListTabs),
             ("browser_query_tabs", BrowserToolAction::QueryTabs),
             ("browser_activate_tab", BrowserToolAction::ActivateTab),
             ("browser_key_press", BrowserToolAction::KeyPress),

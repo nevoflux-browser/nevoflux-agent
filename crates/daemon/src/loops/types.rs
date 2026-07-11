@@ -3,21 +3,29 @@
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+/// Generate an 8-char lowercase alphanumeric id from a v4 UUID's simple
+/// form. This is unique enough within a session — collision probability is
+/// negligible at the scale of "tens of loops/schedules per session".
+/// Shared by `LoopId::generate` and `schedules::types::ScheduleId::generate`.
+pub(crate) fn generate_short_id() -> String {
+    let s = uuid::Uuid::new_v4().simple().to_string();
+    s.chars().take(8).collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct LoopId(pub String);
 
 impl LoopId {
-    /// Generate an 8-char lowercase loop id from a v4 UUID's simple form.
-    /// This is unique enough within a session — collision probability is
-    /// negligible at the scale of "tens of loops per session".
+    /// Generate an 8-char lowercase loop id. See `generate_short_id`.
     pub fn generate() -> Self {
-        let s = uuid::Uuid::new_v4().simple().to_string();
-        Self(s.chars().take(8).collect())
+        Self(generate_short_id())
     }
 }
 
 impl AsRef<str> for LoopId {
-    fn as_ref(&self) -> &str { &self.0 }
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
 }
 
 impl std::fmt::Display for LoopId {

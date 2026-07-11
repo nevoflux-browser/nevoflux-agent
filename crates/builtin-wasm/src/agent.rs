@@ -694,7 +694,12 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
 </CRITICAL_INSTRUCTIONS>
 
 {}"#,
-                    skill.name, skill.name, skill.base_path, skill.content, files_section, base_prompt
+                    skill.name,
+                    skill.name,
+                    skill.base_path,
+                    skill.content,
+                    files_section,
+                    base_prompt
                 )
             }
             None => base_prompt,
@@ -1079,8 +1084,22 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         });
         let tab_context_prefix = Self::format_tab_context(active_tab_info.as_ref(), &input.tab_ids);
 
-        // For browser/agent mode: extract keywords from user message and take initial viewport snapshot
-        let initial_snapshot = if matches!(input.mode, AgentMode::Browser | AgentMode::Agent) {
+        // For browser/agent mode: extract keywords from user message and take
+        // initial viewport snapshot.
+        //
+        // Skip it when the active tab is a Canvas page (`nevoflux://canvas/...`):
+        // a viewport snapshot of an internal page is meaningless, and the
+        // extension redirects it to a regular web tab — activating a discarded
+        // web tab to snapshot it STEALS focus from the Canvas tab (the user then
+        // has to click back). Suppressing the snapshot here keeps focus on the
+        // Canvas tab so canvas_eval works without manual intervention.
+        let active_tab_is_canvas = active_tab_info
+            .as_ref()
+            .map(|t| t.url.starts_with("nevoflux://canvas"))
+            .unwrap_or(false);
+        let initial_snapshot = if matches!(input.mode, AgentMode::Browser | AgentMode::Agent)
+            && !active_tab_is_canvas
+        {
             let keywords = Self::extract_keywords_from_text(&input.user_message);
             if !keywords.is_empty() {
                 eprintln!("[AGENT] Initial keywords from user message: {:?}", keywords);
@@ -1209,6 +1228,16 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     result.success,
                     result.content.len(),
                     preview
+                );
+
+                // Surface the full (untruncated) result as durable evidence for
+                // the goal evaluator + continuation anchor (spec §4.1). No-op on
+                // hosts that don't override it.
+                self.host.record_tool_result(
+                    &tool_call.name,
+                    &result.tool_call_id,
+                    &result.content,
+                    result.success,
                 );
 
                 // Dynamic truncation based on current message size
@@ -2010,6 +2039,10 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     serde_json::to_string(&result).unwrap_or_default()
                 }
             }
+            "browser_get_tabs" => {
+                let result = self.host.browser_list_tabs(None)?;
+                serde_json::to_string(&result).unwrap_or_default()
+            }
             "browser_eval_js" => {
                 let script = tool_call.arguments["script"].as_str().unwrap_or("");
                 let tab_id = tool_call.arguments["tab_id"].as_i64();
@@ -2183,6 +2216,16 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     "new_str": tool_call.arguments.get("new_str").and_then(|v| v.as_str()).unwrap_or(""),
                 });
                 let result = self.host.browser_edit_artifact(&params, tab_id)?;
+                serde_json::to_string(&result).unwrap_or_default()
+            }
+            "canvas_eval" => {
+                let tab_id = tool_call.arguments["tab_id"].as_i64();
+                let params = serde_json::json!({
+                    "artifact_id": tool_call.arguments.get("artifact_id").and_then(|v| v.as_str()).unwrap_or(""),
+                    "script": tool_call.arguments.get("script").and_then(|v| v.as_str()).unwrap_or(""),
+                    "timeout_ms": tool_call.arguments.get("timeout_ms"),
+                });
+                let result = self.host.canvas_eval(&params, tab_id)?;
                 serde_json::to_string(&result).unwrap_or_default()
             }
             // Subagent tools
@@ -2359,6 +2402,40 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             "loop_scratchpad_set" => self.host.tool_loop_scratchpad_set(
                 &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
             )?,
+            // /schedule skill tools — direct-API dispatch (Anthropic / OpenAI
+            // direct providers). The MCP/ACP path goes through
+            // `mcp_tool_executor::execute_mcp_tool::schedule_*`.
+            "schedule_create" => self.host.tool_schedule_create(
+                &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
+            )?,
+            "schedule_list" => self.host.tool_schedule_list()?,
+            "schedule_cancel" => {
+                let schedule_id = tool_call.arguments["schedule_id"].as_str().unwrap_or("");
+                self.host.tool_schedule_cancel(schedule_id)?
+            }
+            "schedule_pause" => {
+                let schedule_id = tool_call.arguments["schedule_id"].as_str().unwrap_or("");
+                self.host.tool_schedule_pause(schedule_id)?
+            }
+            "schedule_resume" => {
+                let schedule_id = tool_call.arguments["schedule_id"].as_str().unwrap_or("");
+                self.host.tool_schedule_resume(schedule_id)?
+            }
+            "schedule_run_now" => {
+                let schedule_id = tool_call.arguments["schedule_id"].as_str().unwrap_or("");
+                self.host.tool_schedule_run_now(schedule_id)?
+            }
+            "schedule_runs" => self.host.tool_schedule_runs(
+                &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
+            )?,
+            // /goal skill tools — direct-API dispatch (Anthropic / OpenAI
+            // direct providers). The MCP/ACP path goes through
+            // `mcp_tool_executor::execute_mcp_tool::goal_*`.
+            "goal_set" => self
+                .host
+                .tool_goal_set(&serde_json::to_string(&tool_call.arguments).unwrap_or_default())?,
+            "goal_status" => self.host.tool_goal_status()?,
+            "goal_clear" => self.host.tool_goal_clear()?,
             // Record & Replay (agent mode) — daemon-orchestrated via
             // tool_call_dynamic (mirrors the browser_input dispatch pattern).
             // The MCP/ACP path handles these in mcp_tool_executor instead.
@@ -2446,6 +2523,16 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 | "loop_cancel"
                 | "loop_scratchpad_get"
                 | "loop_scratchpad_set"
+                | "schedule_create"
+                | "schedule_list"
+                | "schedule_cancel"
+                | "schedule_pause"
+                | "schedule_resume"
+                | "schedule_run_now"
+                | "schedule_runs"
+                | "goal_set"
+                | "goal_status"
+                | "goal_clear"
         ) || name.starts_with("computer_")
             || name.starts_with("browser_")
     }
@@ -3118,6 +3205,28 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 }),
             },
             ToolDefinition {
+                name: "canvas_eval".into(),
+                description: "Run a JS snippet INSIDE a running canvas artifact's iframe and return the last expression's value. Use this to operate and VERIFY a live Canvas app (e.g. click its buttons and read its display) — the normal browser_* tools cannot reach the canvas page. Inside the iframe `document.querySelector('[data-testid=\"btn-3\"]').click()` is a REAL click and reading the DOM returns the REAL runtime value. Only use when an [Active Canvas] hint is present. Pair with goal_set's `check` for a build→run→verify→fix loop.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "artifact_id": {
+                            "type": "string",
+                            "description": "Artifact ID (from the [Active Canvas] context hint)"
+                        },
+                        "script": {
+                            "type": "string",
+                            "description": "JS to evaluate inside the iframe; the last expression is returned (JSON-serialized). e.g. \"document.getElementById('display').textContent\""
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "description": "Optional eval timeout in ms (default 5000)"
+                        }
+                    },
+                    "required": ["artifact_id", "script"]
+                }),
+            },
+            ToolDefinition {
                 name: "canvas_create_composition".into(),
                 description: "Create a composition artifact for video rendering. Returns \
                               {artifact_id} immediately. Stores a multi-file artifact \
@@ -3575,6 +3684,135 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     "required": ["content"]
                 }),
             },
+            // /schedule skill tools (Task 1.6).
+            ToolDefinition {
+                name: "schedule_create".into(),
+                description: "Create a recurring or one-off background job (routines-style). Minimum cadence is 1 hour — for anything sub-hourly use the loop_* tools instead. Browser policy: 'none' (default, no browser needed) / 'headless' (background web or login tasks) / 'live' (only when the run needs the user's CURRENT window/tab state — it borrows their visible browser). Always confirm the schedule's name and a human-readable cadence (e.g. 'every day at 9am') with the user before calling this.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "short human-readable name for the schedule" },
+                        "cron": { "type": "string", "description": "5-field cron expression, e.g. '0 9 * * *' — XOR with at. Minimum 1h between fires." },
+                        "at": { "type": "string", "description": "one-off fire time: RFC3339 with offset, or unix seconds — XOR with cron" },
+                        "prompt_text": { "type": "string", "description": "raw prompt re-issued each fire — XOR with wrapped_skill" },
+                        "wrapped_skill": {
+                            "type": "string",
+                            "description": "JSON-stringified `{name, args}` blob — XOR with prompt_text. Call JSON.stringify before passing."
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["chat", "browser", "agent"],
+                            "description": "Agent mode for the run. Default 'chat'."
+                        },
+                        "browser": {
+                            "type": "string",
+                            "enum": ["none", "live", "headless"],
+                            "description": "Browser policy for the run. Default 'none'."
+                        },
+                        "on_unavailable": {
+                            "type": "string",
+                            "enum": ["defer", "skip"],
+                            "description": "What to do if the required browser isn't available at fire time."
+                        },
+                        "headless_profile": { "type": "string", "description": "named headless browser profile to use" },
+                        "catch_up": { "type": "boolean", "description": "fire once on next boot if the daemon was offline at the scheduled time. Default false." },
+                        "goal_condition": { "type": "string", "description": "natural-language success condition; when set, each fire runs a goal loop that re-evaluates after every turn until met or budget/turns run out (max 4000 chars)" },
+                        "goal_max_turns": { "type": "integer", "description": "max turns for a goal-enabled run. Default 20." },
+                        "max_tokens_per_run": { "type": "integer", "description": "token budget per run (applies to plain and goal-enabled runs; goal turns + evaluator calls both count against it)" },
+                        "evaluator_model": { "type": "string", "description": "model id used to evaluate goal_condition. Default: the current model." },
+                        "evaluator_provider": { "type": "string", "description": "provider id used to evaluate goal_condition. Default: the current provider (ACP providers judge in degraded one-shot mode)." }
+                    },
+                    "required": ["name"]
+                }),
+            },
+            ToolDefinition {
+                name: "schedule_list".into(),
+                description: "List all schedules (any status: active, paused, ran, cancelled).".into(),
+                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            },
+            ToolDefinition {
+                name: "schedule_cancel".into(),
+                description: "Cancel a schedule permanently (terminal state).".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "schedule_id": { "type": "string" } },
+                    "required": ["schedule_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "schedule_pause".into(),
+                description: "Pause an active schedule so it stops firing until resumed.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "schedule_id": { "type": "string" } },
+                    "required": ["schedule_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "schedule_resume".into(),
+                description: "Resume a paused schedule, recomputing its next fire time from now.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "schedule_id": { "type": "string" } },
+                    "required": ["schedule_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "schedule_run_now".into(),
+                description: "Fire a schedule immediately, out of band, without disturbing its normal cadence.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "schedule_id": { "type": "string" } },
+                    "required": ["schedule_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "schedule_runs".into(),
+                description: "List recent run history for a schedule (status, timing, errors — not the full output text).".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "schedule_id": { "type": "string" },
+                        "limit": { "type": "integer", "description": "max rows to return, default 20, max 100" }
+                    },
+                    "required": ["schedule_id"]
+                }),
+            },
+            // /goal skill tools (Task 2.3).
+            ToolDefinition {
+                name: "goal_set".into(),
+                description: "Set a completion condition for this session. After every turn completion is decided by (a) an OPTIONAL programmatic `check` over recent tool results — if it holds the goal is met with NO model call (works with no API key / ACP-only), else (b) an independent zero-tool evaluator model. Prefer `check` whenever the condition is machine-verifiable (exit code, a read-back value like a calculator display, a knowledge-base query returning results). The condition must be self-provable from conversation output (state the check, e.g. 'cargo test exits 0'). Max 4000 chars. Optional max_turns (default 20).".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "condition": { "type": "string", "description": "natural-language, self-provable completion condition (max 4000 chars)" },
+                        "check": {
+                            "type": "object",
+                            "description": "OPTIONAL machine check over recent tool results; if it holds the goal is met WITHOUT any evaluator model. Prefer this for machine-verifiable goals.",
+                            "properties": {
+                                "tool": { "type": "string", "description": "only inspect this tool's recent result; omit = any tool" },
+                                "matches": { "type": "string", "description": "substring, or /regex/ when slash-wrapped" },
+                                "negate": { "type": "boolean", "description": "require the pattern ABSENT instead of present" }
+                            },
+                            "required": ["matches"]
+                        },
+                        "evaluator_provider": { "type": "string", "description": "provider id to use as the evaluator. Default: the current provider (ACP providers judge in degraded one-shot mode)." },
+                        "evaluator_model": { "type": "string", "description": "model id to use as the evaluator. Default: the current model." },
+                        "max_turns": { "type": "integer", "description": "turn budget before the goal expires unmet. Default 20." }
+                    },
+                    "required": ["condition"]
+                }),
+            },
+            ToolDefinition {
+                name: "goal_status".into(),
+                description: "Report the current session goal's status (active/achieved/expired/cleared/none), turns used, and the evaluator's last reason.".into(),
+                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            },
+            ToolDefinition {
+                name: "goal_clear".into(),
+                description: "Clear the active session goal, if any, stopping post-turn evaluation.".into(),
+                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            },
         ];
 
         // Dynamic tool discovery is available in every mode (including Chat) so
@@ -3664,6 +3902,18 @@ For going back, use browser_go_back. NEVER use navigate to 'go back'.".into(),
                     }
                 },
                 "required": ["url"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "browser_get_tabs".into(),
+            description: "List all open browser tabs with their tab_id, title, and URL. \
+Use this to find or verify a tab by its title — e.g. before browser_activate_tab, \
+or to confirm the page you just opened is loaded (check a tab's title)."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
             }),
         });
 
@@ -4836,7 +5086,11 @@ comprehensions, f-strings, lambda, asyncio.gather\n\
             }),
         });
 
-        tools.extend(Self::recorded_flow_tools());
+        // NOTE: recorded_flow_tools (run_flow/list_flows/report_flow_repair) are
+        // already added by get_browser_tools_without_orchestrate (which this
+        // builder starts from). Re-adding them here duplicated the names and
+        // made direct-API providers reject the request ("Tool names must be
+        // unique"). Do NOT extend them again.
 
         tools
     }
@@ -5379,6 +5633,12 @@ mod tests {
                 n.contains(&"report_flow_repair".to_string()),
                 "{mode:?}: {n:?}"
             );
+            // browser_get_tabs must be exposed so the agent can list/verify tabs
+            // by title (previously referenced in prompts but never a callable tool).
+            assert!(
+                n.contains(&"browser_get_tabs".to_string()),
+                "{mode:?}: {n:?}"
+            );
         }
         let chat = names(AgentMode::Chat);
         assert!(!chat.contains(&"run_flow".to_string()));
@@ -5479,6 +5739,33 @@ mod tests {
             orchestrate_count, 1,
             "Agent mode should have exactly 1 orchestrate tool (not duplicated from browser)"
         );
+    }
+
+    /// Every mode's tool list MUST have unique tool names — direct-API providers
+    /// (e.g. DeepSeek) reject a request whose `tools` array has any duplicate
+    /// name ("Tool names must be unique.").
+    #[test]
+    fn test_no_duplicate_tool_names_in_any_mode() {
+        let mock = MockHostFunctions::new();
+        let agent = Agent::new(mock);
+        for mode in [
+            AgentMode::Chat,
+            AgentMode::Browser,
+            AgentMode::Agent,
+            AgentMode::Code,
+        ] {
+            let tools = agent.get_tools_for_mode(mode);
+            let mut seen = std::collections::HashSet::new();
+            let dups: Vec<String> = tools
+                .iter()
+                .filter(|t| !seen.insert(t.name.clone()))
+                .map(|t| t.name.clone())
+                .collect();
+            assert!(
+                dups.is_empty(),
+                "{mode:?} mode has duplicate tool names: {dups:?}"
+            );
+        }
     }
 
     #[test]
@@ -6340,7 +6627,8 @@ mod tests {
         // counted among browser-specific tools — hence +21, was +23.
         // Recorded-flow tools (run_flow / list_flows / report_flow_repair)
         // are browser+agent only, not in chat — hence +24, was +21.
-        assert_eq!(browser_tools.len(), chat_tools.len() + 24);
+        // browser_get_tabs added (list tabs by title) — hence +25, was +24.
+        assert_eq!(browser_tools.len(), chat_tools.len() + 25);
     }
 
     #[test]

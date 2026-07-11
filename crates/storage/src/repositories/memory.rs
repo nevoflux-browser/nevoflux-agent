@@ -342,15 +342,12 @@ impl<'a> MemoryRepository<'a> {
                  LIMIT ?3",
             )?;
             let rows = stmt
-                .query_map(
-                    params![CURRENT_EMBEDDING_VERSION, cursor, limit],
-                    |row| {
-                        Ok(StaleChunk {
-                            id: row.get(0)?,
-                            content: row.get(1)?,
-                        })
-                    },
-                )?
+                .query_map(params![CURRENT_EMBEDDING_VERSION, cursor, limit], |row| {
+                    Ok(StaleChunk {
+                        id: row.get(0)?,
+                        content: row.get(1)?,
+                    })
+                })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             Ok(rows)
         })

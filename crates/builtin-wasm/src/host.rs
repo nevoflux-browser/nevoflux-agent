@@ -386,6 +386,19 @@ pub trait HostFunctions {
         tab_id: Option<i64>,
     ) -> HostResult<BrowserToolResult>;
 
+    /// Run a JS snippet inside a canvas artifact's iframe and return the last
+    /// expression's value. Default: not supported. See spec §6.
+    fn canvas_eval(
+        &self,
+        _params: &serde_json::Value,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        Err(HostError {
+            code: 5,
+            message: "canvas_eval not supported by this host".into(),
+        })
+    }
+
     /// Extract a brand's visual identity (colors / fonts / logo / hero
     /// screenshot / name / tagline) from a URL or existing tab. Backs the
     /// `canvas_extract_visual_identity` tool — used by Mode 3 (website-to-
@@ -706,6 +719,113 @@ pub trait HostFunctions {
         Err(HostError {
             code: 5,
             message: "tool_loop_scratchpad_set not supported by this host".into(),
+        })
+    }
+
+    /// Record a completed tool's result so it can be surfaced as durable
+    /// evidence (e.g. the goal evaluator's transcript and the continuation
+    /// progress anchor). Default: no-op. Called once per tool execution in the
+    /// agent loop with the full (untruncated) result content. See spec §4.1.
+    fn record_tool_result(&self, _tool_name: &str, _tool_id: &str, _content: &str, _success: bool) {
+    }
+
+    // =========================================================================
+    // /schedule skill tool functions (Task 1.6)
+    // =========================================================================
+
+    /// Create a `/schedule`. JSON args: {name, cron?, at?, prompt_text?,
+    /// wrapped_skill?, mode?, browser?, on_unavailable?, headless_profile?,
+    /// catch_up?, goal_condition?, goal_max_turns?, max_tokens_per_run?,
+    /// evaluator_model?, evaluator_provider?}. Returns JSON
+    /// {"schedule_id":"…","next_fire_at":N}.
+    /// Default impl returns Unsupported so non-daemon hosts (mocks, tests)
+    /// don't need stub code.
+    fn tool_schedule_create(&self, _args_json: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_schedule_create not supported by this host".into(),
+        })
+    }
+
+    /// List all schedules (any status). Returns JSON array.
+    fn tool_schedule_list(&self) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_schedule_list not supported by this host".into(),
+        })
+    }
+
+    /// Cancel a schedule by id. Returns JSON {"cancelled":true}.
+    fn tool_schedule_cancel(&self, _schedule_id: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_schedule_cancel not supported by this host".into(),
+        })
+    }
+
+    /// Pause an active schedule. Returns JSON {"status":"paused"}.
+    fn tool_schedule_pause(&self, _schedule_id: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_schedule_pause not supported by this host".into(),
+        })
+    }
+
+    /// Resume a paused schedule. Returns JSON {"status":"active","next_fire_at":N}.
+    fn tool_schedule_resume(&self, _schedule_id: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_schedule_resume not supported by this host".into(),
+        })
+    }
+
+    /// Fire a schedule immediately (out of band). Returns JSON {"started":true}.
+    fn tool_schedule_run_now(&self, _schedule_id: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_schedule_run_now not supported by this host".into(),
+        })
+    }
+
+    /// List recent runs for a schedule. JSON args: {schedule_id, limit?}.
+    /// Returns JSON array of run rows (final_text excluded).
+    fn tool_schedule_runs(&self, _args_json: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_schedule_runs not supported by this host".into(),
+        })
+    }
+
+    // =========================================================================
+    // /goal skill tool functions (Task 2.3)
+    // =========================================================================
+
+    /// Set (replace) the completion condition for this session. JSON args:
+    /// {condition, evaluator_provider?, evaluator_model?, max_turns?}.
+    /// Returns the goal status JSON (same shape as `tool_goal_status`).
+    /// Default impl returns Unsupported so non-daemon hosts (mocks, tests)
+    /// don't need stub code.
+    fn tool_goal_set(&self, _args_json: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_goal_set not supported by this host".into(),
+        })
+    }
+
+    /// Report the current session goal's status. Returns JSON
+    /// `{"status":"none"}` when there is none, else the full status object.
+    fn tool_goal_status(&self) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_goal_status not supported by this host".into(),
+        })
+    }
+
+    /// Clear the active session goal, if any. Returns JSON {"cleared":bool}.
+    fn tool_goal_clear(&self) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_goal_clear not supported by this host".into(),
         })
     }
 }

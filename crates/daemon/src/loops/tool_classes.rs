@@ -12,11 +12,27 @@
 //! `Agent::get_tools_for_mode(mode)`. The only iteration-specific filter
 //! left is [`is_forbidden_in_iteration`].
 
-/// Tools that are forbidden inside loop iterations regardless of mode.
+/// Single source of truth for the iteration-forbidden tool names.
 /// `loop_create` would let an iteration spawn nested loops; `ask_user` blocks
-/// on a sidebar that may be closed.
+/// on a sidebar that may be closed. `goal_set` would let an unattended
+/// iteration hijack the interactive session's active goal (goals are
+/// session-scoped, single-active), and `schedule_create` would let an
+/// iteration self-replicate scheduled jobs — both are catalog-filtered out
+/// of direct-API unattended runs here (see `agent_exec::filter_allowlist`).
+const ITERATION_FORBIDDEN: &[&str] = &["loop_create", "ask_user", "goal_set", "schedule_create"];
+
+/// Tools that are forbidden inside loop iterations regardless of mode.
 pub fn is_forbidden_in_iteration(tool_name: &str) -> bool {
-    matches!(tool_name, "loop_create" | "ask_user")
+    ITERATION_FORBIDDEN.contains(&tool_name)
+}
+
+/// The iteration-forbidden tool names as an owned list.
+///
+/// Behaviourally equivalent to filtering a catalog with
+/// [`is_forbidden_in_iteration`], but materialised so it can be handed to the
+/// shared `agent_exec` kernel as `AgentExecRequest::forbidden_tools`.
+pub fn iteration_forbidden_tools() -> Vec<String> {
+    ITERATION_FORBIDDEN.iter().map(|s| s.to_string()).collect()
 }
 
 #[cfg(test)]
@@ -27,8 +43,34 @@ mod tests {
     fn forbidden_set() {
         assert!(is_forbidden_in_iteration("loop_create"));
         assert!(is_forbidden_in_iteration("ask_user"));
+        // Unattended iterations must not hijack the session goal or
+        // self-replicate schedules.
+        assert!(is_forbidden_in_iteration("goal_set"));
+        assert!(is_forbidden_in_iteration("schedule_create"));
         assert!(!is_forbidden_in_iteration("read"));
         assert!(!is_forbidden_in_iteration("loop_scratchpad_set"));
         assert!(!is_forbidden_in_iteration("browser_get_content"));
+        // Read-only goal/schedule tools stay available inside iterations.
+        assert!(!is_forbidden_in_iteration("goal_status"));
+        assert!(!is_forbidden_in_iteration("schedule_list"));
+    }
+
+    #[test]
+    fn forbidden_list_matches_predicate() {
+        let list = iteration_forbidden_tools();
+        // Every listed name is forbidden by the predicate, and all entries
+        // are present — the kernel filter and the predicate stay in lockstep.
+        assert_eq!(
+            list,
+            vec![
+                "loop_create".to_string(),
+                "ask_user".to_string(),
+                "goal_set".to_string(),
+                "schedule_create".to_string(),
+            ]
+        );
+        for name in &list {
+            assert!(is_forbidden_in_iteration(name));
+        }
     }
 }

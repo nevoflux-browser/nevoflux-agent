@@ -251,6 +251,20 @@ pub struct HostServices {
     /// instance — tool calls return a clear ConfigMissing error.
     pub loop_manager: Option<Arc<crate::loops::LoopManager>>,
 
+    /// /schedule skill manager (Task 1.6). When set, the MCP tool executor
+    /// dispatches the `schedule_*` family (create/list/cancel/pause/resume/
+    /// run_now/runs) through this manager. `None` means /schedule is not
+    /// configured for this daemon instance — tool calls return a clear
+    /// ConfigMissing error.
+    pub schedule_manager: Option<Arc<crate::schedules::ScheduleManager>>,
+
+    /// /goal skill manager (Task 2.3). When set, the MCP tool executor
+    /// dispatches the `goal_*` family (set/status/clear) through this
+    /// manager. `None` means /goal is not configured for this daemon
+    /// instance — tool calls return a clear ConfigMissing error. Boot
+    /// wiring lands in Task 2.4.
+    pub goal_manager: Option<Arc<crate::goals::GoalManager>>,
+
     /// AgentConfig snapshot for spawning a `DaemonHostFunctions` from
     /// out-of-band callers (e.g. /loop iterations) that don't sit on the
     /// chat-session hot path. Set during server boot via
@@ -346,6 +360,8 @@ impl HostServices {
             tts_config: None,
             asset_server: None,
             loop_manager: None,
+            schedule_manager: None,
+            goal_manager: None,
             agent_config: None,
             runtime_handle: None,
             brain_slot: None,
@@ -390,6 +406,8 @@ impl HostServices {
             tts_config: None,
             asset_server: None,
             loop_manager: None,
+            schedule_manager: None,
+            goal_manager: None,
             agent_config: None,
             runtime_handle: None,
             brain_slot: None,
@@ -549,6 +567,32 @@ impl HostServices {
     /// clear ConfigMissing error instead of being silently dropped.
     pub fn with_loop_manager(mut self, manager: Arc<crate::loops::LoopManager>) -> Self {
         self.loop_manager = Some(manager);
+        self
+    }
+
+    /// Attach the /schedule skill manager (builder pattern, Task 1.6).
+    ///
+    /// Once set, `mcp_tool_executor::execute_mcp_tool` dispatches the
+    /// `schedule_create / schedule_list / schedule_cancel / schedule_pause /
+    /// schedule_resume / schedule_run_now / schedule_runs` family through
+    /// this manager. Without it, those tool calls return a clear
+    /// ConfigMissing error instead of being silently dropped.
+    pub fn with_schedule_manager(
+        mut self,
+        manager: Arc<crate::schedules::ScheduleManager>,
+    ) -> Self {
+        self.schedule_manager = Some(manager);
+        self
+    }
+
+    /// Attach the /goal skill manager (builder pattern, Task 2.3).
+    ///
+    /// Once set, `mcp_tool_executor::execute_mcp_tool` dispatches the
+    /// `goal_set / goal_status / goal_clear` family through this manager.
+    /// Without it, those tool calls return a clear ConfigMissing error
+    /// instead of being silently dropped.
+    pub fn with_goal_manager(mut self, manager: Arc<crate::goals::GoalManager>) -> Self {
+        self.goal_manager = Some(manager);
         self
     }
 
@@ -933,10 +977,7 @@ impl std::fmt::Debug for HostServices {
                 "runtime_handle",
                 &self.runtime_handle.as_ref().map(|_| "Some(...)"),
             )
-            .field(
-                "brain_slot",
-                &self.brain_slot.as_ref().map(|_| "Some(...)"),
-            )
+            .field("brain_slot", &self.brain_slot.as_ref().map(|_| "Some(...)"))
             .finish()
     }
 }

@@ -1293,6 +1293,18 @@ async fn main() {
             .map(|v| v == "1")
             .unwrap_or(false);
 
+    // A dev daemon usually learns its dev-ness from the `--dev` flag, which does
+    // NOT put NEVOFLUX_DEV in the process env. Browsers we spawn for headless
+    // runs inherit our env, and their native-messaging proxy selects Dev vs Prod
+    // solely from NEVOFLUX_DEV (see run_proxy / dev_mode above). Without this,
+    // a spawned headless browser's proxy defaults to Prod, launches its own
+    // managed daemon on 19501+, and never registers with THIS dev daemon on
+    // 19500 -> the headless readiness barrier times out. Re-export the signal so
+    // it propagates to every child process we spawn.
+    if dev_mode {
+        std::env::set_var("NEVOFLUX_DEV", "1");
+    }
+
     if cli.daemon {
         if let Err(e) = run_daemon(
             cli.verbose,

@@ -251,6 +251,20 @@ pub enum BrowserToolAction {
     /// - `lines`: new line count (on success)
     /// - `error`: error message (on failure)
     EditArtifact,
+    /// Run a JS snippet INSIDE a canvas artifact's iframe (where the app's DOM
+    /// and NevofluxSDK live) and return the last expression's value. Enables an
+    /// agent to operate + verify a running Canvas app (spec §6).
+    ///
+    /// Params:
+    /// - `artifact_id`: target artifact id
+    /// - `script`: JS to eval in the iframe; last expression is returned
+    /// - `timeout_ms`: optional (default 5000)
+    ///
+    /// Returns:
+    /// - `success`: boolean
+    /// - `result`: JSON-serialized return value (on success)
+    /// - `error`: error message (on failure, e.g. CANVAS_TAB_NOT_FOUND)
+    CanvasEval,
     /// Probe an element and return a Fingerprint (PR #2, browser_input strategy engine)
     Probe,
     /// High-level structured input tool (PR #2, browser_input)

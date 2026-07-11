@@ -22,6 +22,7 @@
 //! ```
 
 pub mod agent;
+pub mod agent_exec;
 pub mod agent_host;
 pub mod asset_server;
 pub mod automation;
@@ -40,6 +41,7 @@ pub mod error;
 pub mod event_bus;
 pub mod file_picker;
 pub mod gbrain;
+pub mod goals;
 pub mod health;
 pub mod http;
 pub mod init_brain;
@@ -58,6 +60,7 @@ pub mod recording;
 pub mod registry;
 pub mod retry;
 pub mod router;
+pub mod schedules;
 pub mod secrets;
 pub mod server;
 pub mod session;

@@ -214,6 +214,32 @@ impl<'a> MessageRepository<'a> {
         })
     }
 
+    /// List recent tool-result messages as `(tool_name, content)`, newest
+    /// first. `tool_name` is read from `metadata->>'tool_name'` (empty string
+    /// when absent). Feeds the goal evaluator's evidence and the continuation
+    /// progress anchor (spec §4.1/§4.2).
+    pub fn list_recent_tool_results(
+        &self,
+        session_id: &str,
+        limit: u32,
+    ) -> Result<Vec<(String, String)>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT COALESCE(json_extract(metadata, '$.tool_name'), ''), content
+                 FROM messages
+                 WHERE session_id = ?1 AND content_type = 'tool_result'
+                 ORDER BY created_at DESC, rowid DESC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![session_id, limit], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
     /// Get the last (most recent) message in a session.
     pub fn get_last(&self, session_id: &str) -> Result<Option<Message>> {
         self.db.with_connection(|conn| {
@@ -303,6 +329,32 @@ mod tests {
         let fetched = fetched.unwrap();
         assert_eq!(fetched.id, created.id);
         assert_eq!(fetched.content, created.content);
+    }
+
+    #[test]
+    fn test_list_recent_tool_results_newest_first_with_tool_name() {
+        let db = setup_db();
+        create_test_session(&db, "s1");
+        let repo = MessageRepository::new(&db);
+
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("tool_name".to_string(), serde_json::json!("canvas_eval"));
+        repo.create(
+            CreateMessageParams::new("s1", MessageRole::Assistant, "display=15")
+                .with_content_type(ContentType::ToolResult)
+                .with_metadata(meta),
+        )
+        .unwrap();
+        // A non-tool_result message must be excluded.
+        repo.create(CreateMessageParams::new("s1", MessageRole::User, "hi"))
+            .unwrap();
+
+        let out = repo.list_recent_tool_results("s1", 6).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0],
+            ("canvas_eval".to_string(), "display=15".to_string())
+        );
     }
 
     #[test]

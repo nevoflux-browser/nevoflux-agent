@@ -223,6 +223,56 @@ impl BrowserRegistry {
             }
         }
     }
+
+    /// Snapshot of currently-registered proxy ids. Used by headless launch to
+    /// remember which browsers were already live *before* spawning a new one,
+    /// so the new instance can be picked out from the crowd once it registers.
+    pub fn proxy_ids(&self) -> std::collections::HashSet<String> {
+        self.browsers.read().unwrap().keys().cloned().collect()
+    }
+
+    /// Any browser currently registered, regardless of how many (live-policy
+    /// availability check — unlike [`Self::single`], multiple registrants are
+    /// not an error here). Returns the first entry found, or `None`.
+    pub fn any(&self) -> Option<BrowserEntry> {
+        self.browsers.read().unwrap().values().next().cloned()
+    }
+
+    /// Wait until a browser whose proxy_id is NOT in `exclude` registers, then
+    /// resolve it. Solves the race `wait_for_browser` can't: when a live
+    /// browser is already registered (in `exclude`) and a *new* (e.g.
+    /// headless) instance is expected, `wait_for_browser`/`single` would
+    /// either bind the wrong (already-registered) browser instantly or return
+    /// `Ambiguous` once both are present. Polls every 50ms like
+    /// [`Self::wait_for_browser`]. If multiple non-excluded browsers are
+    /// registered, returns the one with the earliest `registered_at`, breaking
+    /// exact `Instant` ties on `proxy_id` so the pick is fully deterministic
+    /// (two browsers registered in the same instant would otherwise resolve
+    /// non-deterministically) rather than erroring.
+    pub async fn wait_for_new_browser(
+        &self,
+        exclude: &std::collections::HashSet<String>,
+        timeout: std::time::Duration,
+    ) -> Result<BrowserEntry, BrowserBindError> {
+        let start = Instant::now();
+        loop {
+            let candidate = {
+                let map = self.browsers.read().unwrap();
+                map.values()
+                    .filter(|e| !exclude.contains(&e.proxy_id))
+                    .min_by_key(|e| (e.registered_at, e.proxy_id.clone()))
+                    .cloned()
+            };
+            if let Some(entry) = candidate {
+                return Ok(entry);
+            }
+            if start.elapsed() < timeout {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            } else {
+                return Err(BrowserBindError::Timeout);
+            }
+        }
+    }
 }
 
 /// Process-global handle to the daemon's [`BrowserRegistry`], set once at
@@ -609,6 +659,96 @@ mod tests {
         r.unregister("proxy-b2");
         assert_eq!(r.single().unwrap().proxy_id, "proxy-b1");
         assert_eq!(r.count(), 1);
+    }
+
+    #[test]
+    fn browser_registry_proxy_ids_snapshot() {
+        let r = BrowserRegistry::new();
+        assert!(r.proxy_ids().is_empty());
+        r.register("proxy-b1", b"proxy-b1".to_vec());
+        r.register("proxy-b2", b"proxy-b2".to_vec());
+        let ids = r.proxy_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("proxy-b1"));
+        assert!(ids.contains("proxy-b2"));
+    }
+
+    #[test]
+    fn browser_registry_any_empty_and_nonempty() {
+        let r = BrowserRegistry::new();
+        assert!(r.any().is_none());
+        r.register("proxy-b1", b"proxy-b1".to_vec());
+        let e = r.any().expect("one browser registered");
+        assert_eq!(e.proxy_id, "proxy-b1");
+        // Doesn't error with multiple registered, unlike `single`.
+        r.register("proxy-b2", b"proxy-b2".to_vec());
+        assert!(r.any().is_some());
+    }
+
+    #[tokio::test]
+    async fn wait_for_new_browser_immediate_hit_when_non_excluded_present() {
+        let r = BrowserRegistry::new();
+        r.register("proxy-old", b"proxy-old".to_vec());
+        let exclude: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let e = r
+            .wait_for_new_browser(&exclude, Duration::from_millis(200))
+            .await
+            .expect("should resolve immediately");
+        assert_eq!(e.proxy_id, "proxy-old");
+    }
+
+    #[tokio::test]
+    async fn wait_for_new_browser_excludes_already_registered() {
+        let r = std::sync::Arc::new(BrowserRegistry::new());
+        r.register("proxy-live", b"proxy-live".to_vec());
+        let mut exclude = std::collections::HashSet::new();
+        exclude.insert("proxy-live".to_string());
+
+        let r2 = r.clone();
+        let handle = tokio::spawn(async move {
+            r2.wait_for_new_browser(&exclude, Duration::from_secs(2))
+                .await
+        });
+
+        // Give the waiter a moment to start polling, then register the
+        // genuinely new (headless) browser.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        r.register("proxy-headless", b"proxy-headless".to_vec());
+
+        let e = handle
+            .await
+            .unwrap()
+            .expect("should resolve to the new browser");
+        assert_eq!(e.proxy_id, "proxy-headless");
+    }
+
+    #[tokio::test]
+    async fn wait_for_new_browser_times_out_when_only_excluded_present() {
+        let r = BrowserRegistry::new();
+        r.register("proxy-live", b"proxy-live".to_vec());
+        let mut exclude = std::collections::HashSet::new();
+        exclude.insert("proxy-live".to_string());
+
+        let result = r
+            .wait_for_new_browser(&exclude, Duration::from_millis(120))
+            .await;
+        assert!(matches!(result, Err(BrowserBindError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn wait_for_new_browser_returns_earliest_registered_when_multiple_new() {
+        let r = BrowserRegistry::new();
+        let exclude: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        r.register("proxy-first", b"proxy-first".to_vec());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        r.register("proxy-second", b"proxy-second".to_vec());
+
+        let e = r
+            .wait_for_new_browser(&exclude, Duration::from_millis(200))
+            .await
+            .expect("should resolve");
+        assert_eq!(e.proxy_id, "proxy-first");
     }
 
     #[test]

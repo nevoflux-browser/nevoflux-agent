@@ -260,7 +260,7 @@ struct SubscriptionEntry {
 type SubscriptionRouter = Arc<Mutex<HashMap<String, SubscriptionEntry>>>;
 
 /// Shared mutable agent config that can be updated at runtime (e.g. when changing active LLM provider).
-type SharedAgentConfig = Arc<RwLock<Arc<AgentConfig>>>;
+pub(crate) type SharedAgentConfig = Arc<RwLock<Arc<AgentConfig>>>;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -640,12 +640,22 @@ async fn read_length_prefixed_message(
 /// - `since_last_message > idle_timeout`: also idle on the message path, which
 ///   keeps background `/loop`/agent work (streams frames, may run without a
 ///   sidebar connection) alive.
+/// - `background_jobs == 0`: no active schedule and no in-flight scheduled run.
+///   A managed daemon must outlive its browser while any schedule is armed (or
+///   a run is executing), otherwise a cron that fires while the sidebar is
+///   closed would never run. This is an *inhibitor only*: it does NOT reset the
+///   disconnect/idle clocks, so once `background_jobs` drops back to 0 the idle
+///   countdown resumes from the real elapsed times and the daemon reclaims
+///   itself on the next tick.
 fn managed_should_self_terminate(
     since_last_connection: std::time::Duration,
     since_last_message: std::time::Duration,
     idle_timeout: std::time::Duration,
+    background_jobs: usize,
 ) -> bool {
-    since_last_connection > idle_timeout && since_last_message > idle_timeout
+    background_jobs == 0
+        && since_last_connection > idle_timeout
+        && since_last_message > idle_timeout
 }
 
 /// Idle watchdog loop for a managed daemon. Every `poll_interval` it samples the
@@ -658,6 +668,7 @@ async fn managed_idle_watchdog(
     last_message_time: std::sync::Arc<Mutex<std::time::Instant>>,
     idle_timeout: std::time::Duration,
     poll_interval: std::time::Duration,
+    background_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     shutdown_tx: mpsc::Sender<()>,
 ) {
     use std::sync::atomic::Ordering;
@@ -672,7 +683,17 @@ async fn managed_idle_watchdog(
         }
         let since_last_connection = last_connected.elapsed();
         let since_last_message = last_message_time.lock().await.elapsed();
-        if managed_should_self_terminate(since_last_connection, since_last_message, idle_timeout) {
+        // Pending schedule work (active schedules + in-flight runs) inhibits
+        // termination without touching `last_connected`, so a real disconnect
+        // is not masked: the moment the counter hits 0 the countdown resumes
+        // from the already-elapsed disconnect time.
+        let background_jobs = background_jobs.load(Ordering::SeqCst);
+        if managed_should_self_terminate(
+            since_last_connection,
+            since_last_message,
+            idle_timeout,
+            background_jobs,
+        ) {
             info!(
                 "Managed daemon: no browser connected and idle for {:?}, self-terminating",
                 idle_timeout
@@ -1647,6 +1668,62 @@ pub async fn start_server(
     // services.loop_manager when claude-code (ACP) calls loop_* via MCP.
     let _ = crate::loops::CURRENT_LOOP_MANAGER.set(loop_manager.clone());
     services = services.with_loop_manager(loop_manager.clone());
+
+    // Construct the /schedule skill's ScheduleManager and inject it into
+    // HostServices so the `schedule_*` tool dispatchers (both the direct-API
+    // `agent_host` surface and the ACP `mcp_tool_executor` surface) resolve
+    // `services.schedule_manager` to a live manager. Wired AFTER loop_manager
+    // on purpose: the `Some(services.clone())` snapshot the ScheduleManager
+    // captures for its runner therefore already carries `loop_manager`, so a
+    // scheduled run can call the loop_* read tools (loop_list/loop_scratchpad_*)
+    // without a "loop not configured" error. (`schedule_create`/`loop_create`
+    // are in the runner's forbidden set, so the runner never needs
+    // `schedule_manager` in its own snapshot — no chicken-and-egg, hence no
+    // process-global back-fill is required here, unlike CURRENT_LOOP_MANAGER.
+    // For the ACP path, agent_exec.rs also back-fills loop_manager from
+    // CURRENT_LOOP_MANAGER as belt-and-suspenders.) The automation template
+    // snapshot (CURRENT_SERVICES_TEMPLATE, taken above before either manager)
+    // is intentionally left pre-manager, matching loop_manager's treatment.
+    let schedule_manager = crate::schedules::ScheduleManager::start_with_bus(
+        db.clone(),
+        Some(event_bus.clone()),
+        Some(services.clone()),
+    );
+    // Publish the process-global handle so `agent_exec::run_agent_once` can
+    // back-fill `services.schedule_manager` into an unattended run's services
+    // clone. The runner/automation snapshots above are pre-`with_schedule_manager`
+    // (chicken-and-egg), so without this the read-only `schedule_*` tools that
+    // the unattended allowlists deliberately keep available would 500.
+    let _ = crate::schedules::CURRENT_SCHEDULE_MANAGER.set(schedule_manager.clone());
+    // Scheduled runs read the LIVE config (config.llm.set / config-watcher) at
+    // fire time instead of the boot-time snapshot, so provider/model changes
+    // apply to schedules without a daemon restart — matching interactive chat.
+    schedule_manager.set_shared_config(agent_config.clone());
+    services = services.with_schedule_manager(schedule_manager.clone());
+
+    // Construct the /goal skill's GoalManager and inject it into HostServices
+    // (Task 2.4). Unlike loop/schedule managers it runs NO background task —
+    // it is a thin facade over GoalRepository + the evaluator — so there is no
+    // `start_*` handle to shut down and no chicken-and-egg with `services`.
+    // The `Arc<AgentConfig>` it needs for evaluator resolution is the same one
+    // handed to `with_agent_config` above (the current live snapshot). Wiring
+    // it here (a) makes `services.goal_manager` resolve on both the direct-API
+    // (`agent_host`) and ACP (`mcp_tool_executor`) goal_* dispatch surfaces,
+    // and (b) activates the post-turn continuation hook in
+    // `handle_chat_message_streaming`.
+    let goal_manager = crate::goals::GoalManager::new(
+        db.clone(),
+        Some(event_bus.clone()),
+        agent_config.read().unwrap().clone(),
+    );
+    // Publish the process-global handle (mirrors CURRENT_SCHEDULE_MANAGER) so an
+    // unattended run can back-fill `services.goal_manager` and answer
+    // `goal_status` instead of erroring; the snapshots above are pre-manager.
+    let _ = crate::goals::CURRENT_GOAL_MANAGER.set(goal_manager.clone());
+    // No shutdown handle is retained (GoalManager owns no background task), so
+    // move the sole `Arc` straight onto services.
+    services = services.with_goal_manager(goal_manager);
+
     if let Some(retriever) = knowledge_retriever {
         services = services.with_knowledge_retriever(retriever);
     }
@@ -1856,6 +1933,11 @@ pub async fn start_server(
     let config_idle_timeout = config.idle_timeout;
     let accept_shutdown_tx = shutdown_tx.clone();
     let shutdown_loop_manager = loop_manager.clone();
+    let shutdown_schedule_manager = schedule_manager.clone();
+    // Handle to the schedule pending-work counter for the idle watchdog spawned
+    // inside the accept loop below (a managed daemon must not self-terminate
+    // while a schedule is armed or a run is in flight).
+    let watchdog_schedule_jobs = schedule_manager.pending_work_handle();
     let terminated = Arc::new(tokio::sync::Notify::new());
     let accept_terminated = terminated.clone();
     tokio::spawn(async move {
@@ -1880,6 +1962,7 @@ pub async fn start_server(
                 last_message_time.clone(),
                 config_idle_timeout,
                 std::time::Duration::from_secs(1),
+                watchdog_schedule_jobs.clone(),
                 accept_shutdown_tx.clone(),
             ));
         }
@@ -1921,6 +2004,8 @@ pub async fn start_server(
                     info!("Server shutdown signal received");
                     info!("Tearing down /loop skill subscriptions and pending iterations…");
                     shutdown_loop_manager.shutdown().await;
+                    info!("Tearing down /schedule tick task and sweeping orphaned runs…");
+                    shutdown_schedule_manager.shutdown().await;
                     break;
                 }
             }
@@ -4236,7 +4321,9 @@ async fn handle_event_bus_request(
                     "EventBus publish routed to recording sink"
                 );
                 recording_collector.ingest(rec_id.to_string(), opts.payload);
-                return EventBusResponse::Published { event_id: String::new() };
+                return EventBusResponse::Published {
+                    event_id: String::new(),
+                };
             }
 
             let publisher = PublisherIdentity::Extension {
@@ -4507,6 +4594,97 @@ async fn load_session_history(
     }
 }
 
+/// Build the synthetic `chat_message` payload that re-enters
+/// [`handle_chat_message_streaming`] for a goal-continuation turn.
+///
+/// Pure (no I/O, no randomness) so the wire shape can be unit-tested. The
+/// `directive` is the `GoalManager::after_turn` continuation string, injected as
+/// the turn's user `content`; `mode_str` mirrors the originating turn's mode so
+/// the continuation runs in the same mode. No attachments — a continuation is a
+/// text-only nudge back into the same session.
+fn build_goal_continuation_payload(
+    directive: &str,
+    session_id: &str,
+    mode_str: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "chat_message",
+        "payload": {
+            "content": directive,
+            "session_id": session_id,
+            "mode": mode_str,
+            "attachments": [],
+        }
+    })
+}
+
+/// Fresh `request_id` for a goal-continuation turn, `goal-<uuid-simple>`.
+///
+/// The `goal-` prefix distinguishes continuation turns from user-initiated ones
+/// in logs and request tracing; the uuid keeps each continuation's streaming
+/// envelopes independently addressable.
+fn goal_continuation_request_id() -> String {
+    format!("goal-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Spawn a goal-continuation turn: re-enter [`handle_chat_message_streaming`]
+/// with `synthetic` as a fresh, detached task.
+///
+/// Deliberately a standalone **sync** fn taking owned args rather than an inline
+/// `tokio::spawn` inside `handle_chat_message_streaming`. Re-spawning in-body
+/// would make that fn's future recursively contain itself, which (a) has no
+/// finite size and (b) creates a `Send` auto-trait inference cycle — a
+/// `Box::pin` at the in-body recursion site fails to resolve `Send` (E0283)
+/// because the coercion is proven *while* the enclosing future's `Send`-ness is
+/// still being computed. Routing the re-entry through this separate fn crosses a
+/// function boundary: the caller's future only sees a synchronous `()`-returning
+/// call, so its type and `Send`-ness resolve independently, and no boxing is
+/// needed. The spawned task owning `synthetic` while its `handle_...` future
+/// borrows it is a normal self-referential async block (pinned by the runtime).
+#[allow(clippy::too_many_arguments)]
+fn spawn_goal_continuation(
+    synthetic: serde_json::Value,
+    config: Arc<AgentConfig>,
+    shared_config: SharedAgentConfig,
+    session_manager: Arc<SessionManager>,
+    services: HostServices,
+    runtime: tokio::runtime::Handle,
+    identity: Vec<u8>,
+    proxy_id: String,
+    request_id: String,
+    channel: Channel,
+    response_tx: mpsc::Sender<(Vec<u8>, DaemonEnvelope)>,
+    cancellation_registry: CancellationRegistry,
+    interrupt_registry: InterruptRegistry,
+    plan_registry: PlanRequestRegistry,
+    trace_enabled: bool,
+    extraction_registry: ExtractionRegistry,
+    canvas_video_service: Arc<crate::canvas_video::CanvasVideoService>,
+) {
+    tokio::spawn(async move {
+        handle_chat_message_streaming(
+            &synthetic,
+            &config,
+            &shared_config,
+            &session_manager,
+            &services,
+            runtime,
+            identity,
+            proxy_id,
+            request_id,
+            channel,
+            response_tx,
+            cancellation_registry,
+            interrupt_registry,
+            plan_registry,
+            trace_enabled,
+            extraction_registry,
+            canvas_video_service,
+        )
+        .await;
+    });
+}
+
 /// Handle chat channel messages with streaming support.
 ///
 /// This function processes chat messages and streams the response back to the sidebar
@@ -4624,6 +4802,15 @@ async fn handle_chat_message_streaming(
         .and_then(|m| m.as_str())
         .map(parse_agent_mode)
         .unwrap_or(AgentMode::Chat);
+    // Raw mode string, mirrored verbatim into any goal-continuation turn this
+    // turn spawns so the continuation runs in the same mode. Absent ⇒ "chat"
+    // (round-trips through `parse_agent_mode` back to `AgentMode::Chat`).
+    let mode_str = payload
+        .get("payload")
+        .and_then(|p| p.get("mode"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("chat")
+        .to_string();
 
     // Extract attachments (multimodal: images, files)
     let mut attachments: Vec<Attachment> = payload
@@ -4805,8 +4992,7 @@ async fn handle_chat_message_streaming(
                 // Mark the LLM-facing message as this skill's INPUT (not a bare
                 // question) so the model runs the skill instead of answering
                 // directly. History still stores the original `message_content`.
-                let invocation =
-                    crate::wasm::llm::skill_invocation_message(skill_name, &args);
+                let invocation = crate::wasm::llm::skill_invocation_message(skill_name, &args);
                 (invocation, Some(ctx))
             } else {
                 warn!("Skill '{}' not found in streaming path", skill_name);
@@ -5883,10 +6069,54 @@ async fn handle_chat_message_streaming(
                     .and_then(|p| p.get("session_title"))
                     .is_some()
             );
-            if let Err(e) = response_tx.send((identity, response)).await {
+            if let Err(e) = response_tx.send((identity.clone(), response)).await {
                 error!("Failed to send final response: {}", e);
             } else {
                 info!("Final stream_chunk queued for writer");
+            }
+
+            // ── Goal loop hook ────────────────────────────────────────────
+            // If this session has an active goal, evaluate it against the turn
+            // that just finished and, when the evaluator wants more work,
+            // re-enter this same pipeline as a fresh spawned turn carrying the
+            // continuation directive as a synthetic user message.
+            //
+            // Reached ONLY on the normal success path: the plan-proposal branch
+            // `return`s above, the non-`chat_message` branch `return`s at the
+            // top, and a cancelled turn `return`s before the `match`. So the
+            // guard chain (`msg_type == "chat_message"` && not cancelled) is
+            // already satisfied by position; the only remaining guard is that a
+            // GoalManager was wired at boot. `after_turn` increments the goal's
+            // turn count BEFORE deciding, so `max_turns` bounds total
+            // continuations even if a continuation turn later errors mid-stream;
+            // a broken evaluator fails safe to `None` and never continues.
+            if let Some(gm) = services.goal_manager.as_ref() {
+                if let Some(directive) = gm.after_turn(&session_id).await {
+                    // Re-enter the pipeline through a standalone sync fn so the
+                    // continuation crosses a function boundary — this detaches
+                    // the continuation as its own task and breaks the async
+                    // self-recursion (no `Box::pin` needed; see the fn's docs).
+                    // Every arg is a cheap Arc/Clone or Copy.
+                    spawn_goal_continuation(
+                        build_goal_continuation_payload(&directive, &session_id, &mode_str),
+                        config.clone(),
+                        shared_config.clone(),
+                        session_manager.clone(),
+                        services.clone(),
+                        runtime.clone(),
+                        identity.clone(),
+                        proxy_id.clone(),
+                        goal_continuation_request_id(),
+                        channel,
+                        response_tx.clone(),
+                        cancellation_registry.clone(),
+                        interrupt_registry.clone(),
+                        plan_registry.clone(),
+                        trace_enabled,
+                        extraction_registry.clone(),
+                        canvas_video_service.clone(),
+                    );
+                }
             }
         }
         Ok(Err(e)) => {
@@ -6714,6 +6944,48 @@ async fn handle_chat_message(
                 "brain.share_list" => crate::brain_share_rpc::handle_share_list(&params).await,
                 "brain.share_renew" => crate::brain_share_rpc::handle_share_renew(&params).await,
                 "brain.share_revoke" => crate::brain_share_rpc::handle_share_revoke(&params).await,
+                // Schedule & Goal management commands (Task 5.0) — thin
+                // ScheduleManager / GoalManager wrappers so the sidebar Jobs
+                // UI (P5) can manage schedules without going through the LLM
+                // tool-call loop. DRY: the mutation-y ones marshal through
+                // `crate::schedules::execute_schedule_tool` /
+                // `crate::goals::execute_goal_tool` — the same dispatcher the
+                // `schedule_*`/`goal_*` LLM tools use — rather than
+                // re-implementing the ScheduleManager/GoalManager calls here.
+                "schedule.list" => handle_schedule_list(services, &params).await,
+                "schedule.runs" => handle_schedule_runs(services, &params).await,
+                "schedule.pause" => {
+                    handle_schedule_mutation(services, &params, "schedule.pause", "schedule_pause")
+                        .await
+                }
+                "schedule.resume" => {
+                    handle_schedule_mutation(
+                        services,
+                        &params,
+                        "schedule.resume",
+                        "schedule_resume",
+                    )
+                    .await
+                }
+                "schedule.cancel" => {
+                    handle_schedule_mutation(
+                        services,
+                        &params,
+                        "schedule.cancel",
+                        "schedule_cancel",
+                    )
+                    .await
+                }
+                "schedule.run_now" => {
+                    handle_schedule_mutation(
+                        services,
+                        &params,
+                        "schedule.run_now",
+                        "schedule_run_now",
+                    )
+                    .await
+                }
+                "goal.status" => handle_goal_status(services, &params).await,
                 // Artifact persistence commands
                 "artifact.get" => handle_artifact_get(session_manager, &params).await,
                 "artifact.list" => handle_artifact_list(session_manager, &params).await,
@@ -7477,6 +7749,338 @@ async fn handle_session_pin(
                 }
             })
         }
+    }
+}
+
+/// Handle schedule.list command.
+///
+/// `{}` -> `{ schedules: [...schedule_list-tool-shaped rows], has_pending_work }`.
+/// Marshals through `execute_schedule_tool("schedule_list", ...)` (the same
+/// dispatcher the `schedule_list` LLM tool uses) rather than re-deriving the
+/// row shape here, then adds `has_pending_work` from the manager directly —
+/// the tool result doesn't carry it since no LLM tool needs it.
+async fn handle_schedule_list(
+    services: &HostServices,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let Some(mgr) = services.schedule_manager.as_ref() else {
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "schedule.list",
+                "success": false,
+                "error": {
+                    "code": "SCHEDULE_MANAGER_UNAVAILABLE",
+                    "message": "ScheduleManager not configured"
+                }
+            }
+        });
+    };
+
+    let ctx = crate::schedules::ScheduleToolContext {
+        session_id: params
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        is_unattended: false,
+    };
+
+    match crate::schedules::execute_schedule_tool(
+        "schedule_list",
+        &serde_json::json!({}),
+        &ctx,
+        mgr,
+    )
+    .await
+    {
+        Ok(schedules) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "schedule.list",
+                "success": true,
+                "data": {
+                    "schedules": schedules,
+                    "has_pending_work": mgr.has_pending_work()
+                }
+            }
+        }),
+        Err(e) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "schedule.list",
+                "success": false,
+                "error": {
+                    "code": "SCHEDULE_ERROR",
+                    "message": e
+                }
+            }
+        }),
+    }
+}
+
+/// Handle schedule.runs command.
+///
+/// `{ schedule_id, limit? = 20 }` -> `{ runs: [...] }`. `final_text` is
+/// deliberately excluded (same as the `schedule_runs` LLM tool) — history is
+/// for browsing, not for re-consuming the last run's full output.
+async fn handle_schedule_runs(
+    services: &HostServices,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let schedule_id = match params.get("schedule_id").and_then(|s| s.as_str()) {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "schedule.runs",
+                    "success": false,
+                    "error": {
+                        "code": "MISSING_PARAM",
+                        "message": "Missing or empty schedule_id parameter"
+                    }
+                }
+            });
+        }
+    };
+
+    let Some(mgr) = services.schedule_manager.as_ref() else {
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "schedule.runs",
+                "success": false,
+                "error": {
+                    "code": "SCHEDULE_MANAGER_UNAVAILABLE",
+                    "message": "ScheduleManager not configured"
+                }
+            }
+        });
+    };
+
+    let ctx = crate::schedules::ScheduleToolContext {
+        session_id: params
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        is_unattended: false,
+    };
+    let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
+    let args = serde_json::json!({ "schedule_id": schedule_id, "limit": limit });
+
+    match crate::schedules::execute_schedule_tool("schedule_runs", &args, &ctx, mgr).await {
+        Ok(runs) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "schedule.runs",
+                "success": true,
+                "data": { "runs": runs }
+            }
+        }),
+        Err(e) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "schedule.runs",
+                "success": false,
+                "error": {
+                    "code": "SCHEDULE_ERROR",
+                    "message": e
+                }
+            }
+        }),
+    }
+}
+
+/// Handle schedule.pause / schedule.resume / schedule.cancel /
+/// schedule.run_now commands.
+///
+/// All four take a single `{ schedule_id }` param and are thin wrappers over
+/// `execute_schedule_tool`; only the system_command name (`command`, used for
+/// the envelope's `command` field) and the underlying tool name
+/// (`tool_name`, one of `schedule_pause`/`schedule_resume`/`schedule_cancel`/
+/// `schedule_run_now`) differ, so they share this implementation.
+async fn handle_schedule_mutation(
+    services: &HostServices,
+    params: &serde_json::Value,
+    command: &str,
+    tool_name: &str,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let schedule_id = match params.get("schedule_id").and_then(|s| s.as_str()) {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": command,
+                    "success": false,
+                    "error": {
+                        "code": "MISSING_PARAM",
+                        "message": "Missing or empty schedule_id parameter"
+                    }
+                }
+            });
+        }
+    };
+
+    let Some(mgr) = services.schedule_manager.as_ref() else {
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": command,
+                "success": false,
+                "error": {
+                    "code": "SCHEDULE_MANAGER_UNAVAILABLE",
+                    "message": "ScheduleManager not configured"
+                }
+            }
+        });
+    };
+
+    let ctx = crate::schedules::ScheduleToolContext {
+        session_id: params
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+        is_unattended: false,
+    };
+    let args = serde_json::json!({ "schedule_id": schedule_id });
+
+    match crate::schedules::execute_schedule_tool(tool_name, &args, &ctx, mgr).await {
+        Ok(data) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": command,
+                "success": true,
+                "data": data
+            }
+        }),
+        Err(e) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": command,
+                "success": false,
+                "error": {
+                    "code": "SCHEDULE_ERROR",
+                    "message": e
+                }
+            }
+        }),
+    }
+}
+
+/// Handle goal.status command.
+///
+/// `{ session_id }` -> the `goal_status` LLM tool's status JSON
+/// (`{"status":"none"}` when the session has never had a goal, else the full
+/// goal record). `session_id` is required — unlike the `goal_status` LLM
+/// tool (which reads it from the calling session's `HostFunctions`), this is
+/// a session-scoped UI query with no implicit session context, so it must be
+/// supplied explicitly, mirroring `session.resolve`/`session.pin`.
+async fn handle_goal_status(
+    services: &HostServices,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let session_id = match params.get("session_id").and_then(|s| s.as_str()) {
+        Some(id) if !id.is_empty() => id,
+        _ => {
+            return serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "goal.status",
+                    "success": false,
+                    "error": {
+                        "code": "MISSING_PARAM",
+                        "message": "Missing or empty session_id parameter"
+                    }
+                }
+            });
+        }
+    };
+
+    let Some(mgr) = services.goal_manager.as_ref() else {
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "goal.status",
+                "success": false,
+                "error": {
+                    "code": "GOAL_MANAGER_UNAVAILABLE",
+                    "message": "GoalManager not configured"
+                }
+            }
+        });
+    };
+
+    match crate::goals::execute_goal_tool(
+        "goal_status",
+        &serde_json::json!({}),
+        session_id,
+        false,
+        mgr,
+    )
+    .await
+    {
+        Ok(status) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "goal.status",
+                "success": true,
+                "data": status
+            }
+        }),
+        Err(e) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "goal.status",
+                "success": false,
+                "error": {
+                    "code": "GOAL_ERROR",
+                    "message": e
+                }
+            }
+        }),
     }
 }
 
@@ -10059,6 +10663,53 @@ mod tests {
     }
 
     #[test]
+    fn goal_continuation_payload_has_chat_message_shape() {
+        let v = build_goal_continuation_payload(
+            "<GOAL-CONTINUATION>\nGoal not yet met\n</GOAL-CONTINUATION>",
+            "sess-42",
+            "agent",
+        );
+        assert_eq!(v["type"], serde_json::json!("chat_message"));
+        assert_eq!(
+            v["payload"]["content"],
+            serde_json::json!("<GOAL-CONTINUATION>\nGoal not yet met\n</GOAL-CONTINUATION>")
+        );
+        assert_eq!(v["payload"]["session_id"], serde_json::json!("sess-42"));
+        // Mode is mirrored verbatim so the continuation runs in the same mode,
+        // and round-trips through parse_agent_mode.
+        assert_eq!(v["payload"]["mode"], serde_json::json!("agent"));
+        assert_eq!(
+            parse_agent_mode(v["payload"]["mode"].as_str().unwrap()),
+            AgentMode::Agent
+        );
+        // Continuations carry no attachments (text-only nudge).
+        assert_eq!(v["payload"]["attachments"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn goal_continuation_payload_mirrors_chat_mode() {
+        let v = build_goal_continuation_payload("keep going", "s1", "chat");
+        assert_eq!(v["payload"]["mode"], serde_json::json!("chat"));
+        assert_eq!(
+            parse_agent_mode(v["payload"]["mode"].as_str().unwrap()),
+            AgentMode::Chat
+        );
+    }
+
+    #[test]
+    fn goal_continuation_request_id_is_prefixed_and_fresh() {
+        let a = goal_continuation_request_id();
+        let b = goal_continuation_request_id();
+        assert!(a.starts_with("goal-"), "unexpected id: {a}");
+        assert!(b.starts_with("goal-"), "unexpected id: {b}");
+        // Fresh uuid each call so continuation turns are independently
+        // addressable.
+        assert_ne!(a, b);
+        // uuid simple form is 32 hex chars after the "goal-" prefix.
+        assert_eq!(a.len(), "goal-".len() + 32);
+    }
+
+    #[test]
     fn managed_terminate_decision_requires_both_no_connection_and_no_message() {
         use std::time::Duration;
         let timeout = Duration::from_secs(30);
@@ -10068,23 +10719,36 @@ mod tests {
         // Browser connected within the window (e.g. sidebar open on the boost
         // panel, sending no chat) -> never terminate, no matter how stale the
         // message path is. This is the spurious-DAEMON_DISCONNECTED regression.
-        assert!(!managed_should_self_terminate(recent, past, timeout));
+        assert!(!managed_should_self_terminate(recent, past, timeout, 0));
         assert!(!managed_should_self_terminate(
             Duration::ZERO,
             Duration::from_secs(3600),
-            timeout
+            timeout,
+            0
         ));
 
         // Recent message but connection gone briefly -> keep running (covers a
         // background /loop that streams frames without a sidebar connection).
-        assert!(!managed_should_self_terminate(past, recent, timeout));
+        assert!(!managed_should_self_terminate(past, recent, timeout, 0));
 
         // Both continuously idle past the window -> terminate (browser gone;
         // reclaim the daemon rather than orphan it).
-        assert!(managed_should_self_terminate(past, past, timeout));
+        assert!(managed_should_self_terminate(past, past, timeout, 0));
 
         // Boundary: exactly at the timeout is not yet past it.
-        assert!(!managed_should_self_terminate(timeout, timeout, timeout));
+        assert!(!managed_should_self_terminate(timeout, timeout, timeout, 0));
+
+        // Pending schedule work inhibits termination even when fully idle and
+        // continuously disconnected past the window — a managed daemon must
+        // outlive its browser while a schedule is armed or a run is in flight.
+        assert!(!managed_should_self_terminate(past, past, timeout, 1));
+        assert!(!managed_should_self_terminate(past, past, timeout, 5));
+
+        // ...and the countdown resumes from the *same* real elapsed times once
+        // the counter hits 0: the identical (past, past) that were being
+        // ignored now trip termination on the very next evaluation. The
+        // inhibitor never reset the clocks, so a real disconnect isn't masked.
+        assert!(managed_should_self_terminate(past, past, timeout, 0));
     }
 
     // The watchdog uses real `std::time::Instant`, so these drive it with real
@@ -10106,6 +10770,7 @@ mod tests {
             last_msg,
             Duration::from_millis(120),
             Duration::from_millis(10),
+            Arc::new(AtomicUsize::new(0)),
             tx,
         ));
 
@@ -10132,6 +10797,7 @@ mod tests {
             last_msg,
             Duration::from_millis(120),
             Duration::from_millis(10),
+            Arc::new(AtomicUsize::new(0)),
             tx,
         ));
 
@@ -10158,6 +10824,7 @@ mod tests {
             last_msg,
             Duration::from_millis(120),
             Duration::from_millis(10),
+            Arc::new(AtomicUsize::new(0)),
             tx,
         ));
 
@@ -10171,6 +10838,49 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a brief reconnect gap must not trip self-termination"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn watchdog_stays_alive_while_schedules_pending_then_resumes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        // Browser gone for the whole run (count stays 0) and the message path
+        // idle, but a schedule is armed (background_jobs = 1): the managed
+        // daemon must NOT self-terminate — otherwise a cron that fires while the
+        // sidebar is closed would never run.
+        let count = Arc::new(AtomicUsize::new(0));
+        let last_msg = Arc::new(Mutex::new(std::time::Instant::now()));
+        let jobs = Arc::new(AtomicUsize::new(1));
+        let (tx, mut rx) = mpsc::channel::<()>(1);
+
+        let jobs_ctl = jobs.clone();
+        let handle = tokio::spawn(managed_idle_watchdog(
+            count,
+            last_msg,
+            Duration::from_millis(120),
+            Duration::from_millis(10),
+            jobs,
+            tx,
+        ));
+
+        // Past several idle windows with a job pending -> must stay alive.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "watchdog must not self-terminate while a schedule is armed / a run is in flight"
+        );
+
+        // The last schedule completes (counter -> 0). The idle countdown resumes
+        // from the real elapsed disconnect time — which is already well past the
+        // window — so termination fires on the next poll. The inhibitor never
+        // reset `last_connected`, so the elapsed disconnect isn't masked.
+        jobs_ctl.store(0, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            rx.try_recv().is_ok(),
+            "watchdog must resume the idle countdown from real elapsed times once jobs hit 0"
         );
         handle.abort();
     }
@@ -10704,6 +11414,211 @@ mod tests {
             !section.contains("verify before acting"),
             "Should not have freshness warning, got: {}",
             section
+        );
+    }
+
+    // ---- Task 5.0: schedule.*/goal.status system_command handlers --------
+    //
+    // `handle_chat_message` (the fn housing the `system_command` dispatch
+    // match) has no existing test harness — building one needs a full
+    // `SessionManager` + wired proxy plumbing unrelated to this task. These
+    // tests instead exercise the new arm handlers directly (same approach
+    // `brain_rpc`'s tests use for its arms), covering both the
+    // manager-absent error path and — with real `ScheduleManager` /
+    // `GoalManager` instances, mirroring `schedules::tools` /
+    // `goals::tools`'s own test fixtures — the happy path end to end.
+
+    fn schedule_test_db() -> nevoflux_storage::Database {
+        nevoflux_storage::Database::open_in_memory().unwrap()
+    }
+
+    fn base_schedule_args() -> crate::schedules::manager::CreateScheduleArgs {
+        crate::schedules::manager::CreateScheduleArgs {
+            creator_session_id: None,
+            name: "nightly report".into(),
+            cron_expr: Some("0 9 * * *".into()),
+            at_ts: None,
+            prompt_text: Some("generate the nightly report".into()),
+            wrapped_skill: None,
+            mode: AgentMode::Chat,
+            browser_policy: "none".into(),
+            on_unavailable: None,
+            headless_profile: None,
+            catch_up: false,
+            goal_condition: None,
+            goal_max_turns: None,
+            max_tokens_per_run: None,
+            evaluator_model: None,
+            evaluator_provider: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn schedule_list_errors_when_manager_unavailable() {
+        let services = HostServices::new(Arc::new(schedule_test_db()));
+        let resp =
+            handle_schedule_list(&services, &serde_json::json!({ "request_id": "r1" })).await;
+        assert_eq!(resp["type"], "system_response");
+        assert_eq!(resp["payload"]["request_id"], "r1");
+        assert_eq!(resp["payload"]["command"], "schedule.list");
+        assert_eq!(resp["payload"]["success"], false);
+        assert_eq!(
+            resp["payload"]["error"]["code"],
+            "SCHEDULE_MANAGER_UNAVAILABLE"
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_runs_missing_schedule_id_is_missing_param() {
+        let services = HostServices::new(Arc::new(schedule_test_db()));
+        let resp =
+            handle_schedule_runs(&services, &serde_json::json!({ "request_id": "r2" })).await;
+        assert_eq!(resp["payload"]["success"], false);
+        assert_eq!(resp["payload"]["command"], "schedule.runs");
+        assert_eq!(resp["payload"]["error"]["code"], "MISSING_PARAM");
+    }
+
+    #[tokio::test]
+    async fn schedule_mutation_missing_schedule_id_is_missing_param() {
+        let services = HostServices::new(Arc::new(schedule_test_db()));
+        let resp = handle_schedule_mutation(
+            &services,
+            &serde_json::json!({ "request_id": "r3" }),
+            "schedule.pause",
+            "schedule_pause",
+        )
+        .await;
+        assert_eq!(resp["payload"]["success"], false);
+        assert_eq!(resp["payload"]["command"], "schedule.pause");
+        assert_eq!(resp["payload"]["error"]["code"], "MISSING_PARAM");
+    }
+
+    #[tokio::test]
+    async fn schedule_mutation_errors_when_manager_unavailable() {
+        let services = HostServices::new(Arc::new(schedule_test_db()));
+        let resp = handle_schedule_mutation(
+            &services,
+            &serde_json::json!({ "request_id": "r4", "schedule_id": "sched-1" }),
+            "schedule.cancel",
+            "schedule_cancel",
+        )
+        .await;
+        assert_eq!(resp["payload"]["success"], false);
+        assert_eq!(resp["payload"]["command"], "schedule.cancel");
+        assert_eq!(
+            resp["payload"]["error"]["code"],
+            "SCHEDULE_MANAGER_UNAVAILABLE"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_status_missing_session_id_is_missing_param() {
+        let services = HostServices::new(Arc::new(schedule_test_db()));
+        let resp = handle_goal_status(&services, &serde_json::json!({ "request_id": "r5" })).await;
+        assert_eq!(resp["payload"]["success"], false);
+        assert_eq!(resp["payload"]["command"], "goal.status");
+        assert_eq!(resp["payload"]["error"]["code"], "MISSING_PARAM");
+    }
+
+    #[tokio::test]
+    async fn goal_status_errors_when_manager_unavailable() {
+        let services = HostServices::new(Arc::new(schedule_test_db()));
+        let resp = handle_goal_status(
+            &services,
+            &serde_json::json!({ "request_id": "r6", "session_id": "s1" }),
+        )
+        .await;
+        assert_eq!(resp["payload"]["success"], false);
+        assert_eq!(resp["payload"]["command"], "goal.status");
+        assert_eq!(resp["payload"]["error"]["code"], "GOAL_MANAGER_UNAVAILABLE");
+    }
+
+    #[tokio::test]
+    async fn schedule_list_and_pause_resume_roundtrip_via_system_command_handlers() {
+        let db = schedule_test_db();
+        let mgr = crate::schedules::ScheduleManager::start_with_bus(db.clone(), None, None);
+        let services = HostServices::new(Arc::new(db.clone())).with_schedule_manager(mgr.clone());
+
+        let id = mgr.create(base_schedule_args()).await.unwrap().0;
+
+        let listed =
+            handle_schedule_list(&services, &serde_json::json!({ "request_id": "r7" })).await;
+        assert_eq!(listed["payload"]["success"], true);
+        let schedules = listed["payload"]["data"]["schedules"].as_array().unwrap();
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0]["schedule_id"], id);
+        // A freshly-created cron schedule is immediately pending (armed for
+        // its next fire), so has_pending_work must reflect that.
+        assert_eq!(listed["payload"]["data"]["has_pending_work"], true);
+
+        let paused = handle_schedule_mutation(
+            &services,
+            &serde_json::json!({ "request_id": "r8", "schedule_id": id }),
+            "schedule.pause",
+            "schedule_pause",
+        )
+        .await;
+        assert_eq!(paused["payload"]["success"], true);
+        assert_eq!(paused["payload"]["data"]["status"], "paused");
+
+        let resumed = handle_schedule_mutation(
+            &services,
+            &serde_json::json!({ "request_id": "r9", "schedule_id": id }),
+            "schedule.resume",
+            "schedule_resume",
+        )
+        .await;
+        assert_eq!(resumed["payload"]["success"], true);
+        assert_eq!(resumed["payload"]["data"]["status"], "active");
+
+        let runs = handle_schedule_runs(
+            &services,
+            &serde_json::json!({ "request_id": "r10", "schedule_id": id }),
+        )
+        .await;
+        assert_eq!(runs["payload"]["success"], true);
+        assert_eq!(runs["payload"]["data"]["runs"], serde_json::json!([]));
+
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn goal_status_none_then_active_via_system_command_handler() {
+        let db = schedule_test_db();
+        nevoflux_storage::repositories::SessionRepository::new(&db)
+            .create(nevoflux_storage::CreateSessionParams::new().with_id("s1"))
+            .unwrap();
+
+        let mut cfg = AgentConfig::default();
+        cfg.llm.provider = Some("anthropic".to_string());
+        cfg.llm.anthropic.api_key = Some("sk-ant-test".to_string());
+        cfg.llm.anthropic.model = Some("claude-haiku-4-5".to_string());
+
+        let mgr = crate::goals::GoalManager::new(db.clone(), None, Arc::new(cfg));
+        let services = HostServices::new(Arc::new(db.clone())).with_goal_manager(mgr.clone());
+
+        let none_status = handle_goal_status(
+            &services,
+            &serde_json::json!({ "request_id": "r11", "session_id": "s1" }),
+        )
+        .await;
+        assert_eq!(none_status["payload"]["success"], true);
+        assert_eq!(none_status["payload"]["data"]["status"], "none");
+
+        mgr.set("s1", "the task is done", None, None, None)
+            .await
+            .unwrap();
+
+        let active_status = handle_goal_status(
+            &services,
+            &serde_json::json!({ "request_id": "r12", "session_id": "s1" }),
+        )
+        .await;
+        assert_eq!(active_status["payload"]["success"], true);
+        assert_eq!(active_status["payload"]["data"]["status"], "active");
+        assert_eq!(
+            active_status["payload"]["data"]["condition"],
+            "the task is done"
         );
     }
 }

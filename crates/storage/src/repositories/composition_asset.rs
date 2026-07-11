@@ -169,9 +169,7 @@ impl<'a> CompositionAssetRepository<'a> {
 ///   4. Update artifact row (files + content where entry happens to
 ///      point at a no-longer-existing key, though that shouldn't happen
 ///      since text entries always lived under `index.html` etc.)
-pub fn migrate_assets_to_composition_assets_table(
-    conn: &mut rusqlite::Connection,
-) -> Result<()> {
+pub fn migrate_assets_to_composition_assets_table(conn: &mut rusqlite::Connection) -> Result<()> {
     const MARKER: &str = "016b_composition_assets_data";
 
     let applied: bool = conn
@@ -245,8 +243,9 @@ pub fn migrate_assets_to_composition_assets_table(
 
         // Strip assets/* keys from files JSON; re-derive content if entry
         // still resolves (it should — entries are always text files).
-        let new_files = serde_json::to_string(&files)
-            .map_err(|e| StorageError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+        let new_files = serde_json::to_string(&files).map_err(|e| {
+            StorageError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?;
         let new_content = files.get(&entry).cloned();
         match new_content {
             Some(c) => {
@@ -455,7 +454,10 @@ mod tests {
         // any per-asset cleanup the artifact repository might add.
         s.database()
             .with_connection(|conn| {
-                conn.execute("DELETE FROM artifacts WHERE id = ?1", params!["art-cascade"])?;
+                conn.execute(
+                    "DELETE FROM artifacts WHERE id = ?1",
+                    params!["art-cascade"],
+                )?;
                 Ok(())
             })
             .unwrap();
@@ -475,8 +477,7 @@ mod tests {
         // entries (base64 strings). The migration should move them into
         // composition_assets and strip them from the JSON.
         let s = boot();
-        let mut files: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
+        let mut files: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         files.insert("index.html".into(), "<body/>".to_string());
         files.insert("DESIGN.md".into(), "# design".to_string());
         let png_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];

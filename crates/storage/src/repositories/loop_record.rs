@@ -440,11 +440,7 @@ mod tests {
         repo.create(&sample_loop("a")).unwrap();
 
         s.sessions()
-            .create(
-                CreateSessionParams::new()
-                    .with_id("other")
-                    .with_title("x"),
-            )
+            .create(CreateSessionParams::new().with_id("other").with_title("x"))
             .unwrap();
         let mut other = sample_loop("b");
         other.session_id = "other".into();
