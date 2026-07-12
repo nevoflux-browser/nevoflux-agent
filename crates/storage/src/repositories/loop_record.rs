@@ -7,6 +7,15 @@ use crate::error::{Result, StorageError};
 use crate::models::{IterationStatus, LoopRecord, LoopState};
 use crate::repositories::truncate_final_text;
 
+/// A compact past-iteration record for the loop's "recent runs" log.
+#[derive(Debug, Clone)]
+pub struct RecentIteration {
+    pub sequence_number: i64,
+    pub ended_at: Option<i64>,
+    pub status: String,
+    pub final_text: Option<String>,
+}
+
 pub struct LoopRepository<'a> {
     db: &'a Database,
 }
@@ -210,6 +219,30 @@ impl<'a> LoopRepository<'a> {
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    /// The most-recent `limit` finished iterations, newest first, for feeding
+    /// back into the next iteration's LOOP-CONTEXT.
+    pub fn recent_iterations(&self, loop_id: &str, limit: usize) -> Result<Vec<RecentIteration>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT sequence_number, ended_at, status, final_text
+                   FROM loop_iterations
+                  WHERE loop_id = ?1 AND status != 'running'
+               ORDER BY sequence_number DESC
+                  LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![loop_id, limit as i64], |r| {
+                Ok(RecentIteration {
+                    sequence_number: r.get(0)?,
+                    ended_at: r.get(1)?,
+                    status: r.get(2)?,
+                    final_text: r.get(3)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
         })
     }
 
@@ -615,5 +648,32 @@ mod tests {
         let mut ids: Vec<&str> = active.iter().map(|r| r.id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn recent_iterations_returns_newest_first_capped() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        for seq in 1..=3 {
+            let id = repo
+                .insert_iteration("abc", seq, seq * 100, IterationStatus::Running)
+                .unwrap();
+            repo.finish_iteration(
+                id,
+                seq * 100 + 5,
+                IterationStatus::Ok,
+                None,
+                Some("[]"),
+                Some(&format!("run {seq}")),
+                None,
+            )
+            .unwrap();
+        }
+        let recent = repo.recent_iterations("abc", 2).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].sequence_number, 3); // newest first
+        assert_eq!(recent[0].final_text.as_deref(), Some("run 3"));
+        assert_eq!(recent[1].sequence_number, 2);
     }
 }

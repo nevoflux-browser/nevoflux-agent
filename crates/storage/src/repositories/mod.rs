@@ -22,7 +22,7 @@ pub use config::ConfigRepository;
 pub use goal::GoalRepository;
 pub use knowledge::KnowledgeRepository;
 pub use learning_metrics::LearningMetricsRepository;
-pub use loop_record::LoopRepository;
+pub use loop_record::{LoopRepository, RecentIteration};
 pub use memory::{MemoryRepository, StaleChunk, CURRENT_EMBEDDING_VERSION};
 pub use message::MessageRepository;
 pub use permission::PermissionRepository;

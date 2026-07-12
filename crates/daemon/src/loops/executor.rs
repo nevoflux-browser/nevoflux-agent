@@ -165,7 +165,7 @@ impl IterationExecutor {
         // stripped from the resulting allowlist.
         let iter_mode = db_str_to_agent_mode(&rec.mode);
         let user_message =
-            build_user_message(&rec, seq, &fire_reason, self.services.as_ref()).await;
+            build_user_message(&rec, seq, &fire_reason, &self.db, self.services.as_ref()).await;
 
         // Stub path: no services → record ok without invoking LLM.
         // Preserves Phase-6 test semantics. Production callers always
@@ -326,6 +326,7 @@ pub(crate) async fn build_user_message(
     rec: &LoopRecord,
     sequence: i64,
     fire_reason: &str,
+    db: &Database,
     services: Option<&HostServices>,
 ) -> String {
     let scratchpad = if rec.scratchpad.is_empty() {
@@ -342,6 +343,35 @@ pub(crate) async fn build_user_message(
         "(no prompt or wrapped_skill)".into()
     };
 
+    // Feed the last N finished iterations' result summaries back into this
+    // iteration's context so it can see prior outcomes and stop re-doing
+    // work. Empty when the loop has no finished iterations yet (fresh loop)
+    // or the query fails — the LOOP-CONTEXT block degrades gracefully.
+    const RECENT_RUNS_N: usize = 5;
+    const RECENT_LINE_MAX: usize = 200; // one-line summary cap per run
+    let recent_block = {
+        let repo = LoopRepository::new(db);
+        match repo.recent_iterations(rec.id.as_ref(), RECENT_RUNS_N) {
+            Ok(rows) if !rows.is_empty() => {
+                let mut s = String::from("recent_runs (newest first):\n");
+                for r in &rows {
+                    let summary = r.final_text.as_deref().unwrap_or("").replace('\n', " ");
+                    let summary = if summary.len() > RECENT_LINE_MAX {
+                        format!("{}…", &summary[..RECENT_LINE_MAX])
+                    } else {
+                        summary
+                    };
+                    s.push_str(&format!(
+                        "  #{} [{}] {}\n",
+                        r.sequence_number, r.status, summary
+                    ));
+                }
+                s
+            }
+            _ => String::new(),
+        }
+    };
+
     format!(
         "<LOOP-CONTEXT>\n\
          loop_id={}\n\
@@ -350,7 +380,7 @@ pub(crate) async fn build_user_message(
          fire_reason={}\n\
          scratchpad_bytes={}\n\
          scratchpad:\n{}\n\
-         </LOOP-CONTEXT>\n\
+         {}</LOOP-CONTEXT>\n\
          \n\
          {}",
         rec.id,
@@ -359,6 +389,7 @@ pub(crate) async fn build_user_message(
         fire_reason,
         rec.scratchpad.len(),
         scratchpad,
+        recent_block,
         body,
     )
 }
@@ -443,8 +474,9 @@ mod tests {
 
     #[tokio::test]
     async fn loop_context_block_includes_required_fields() {
+        let storage = Storage::open_in_memory().unwrap();
         let rec = sample_loop("abcd1234");
-        let s = build_user_message(&rec, 1, "time", None).await;
+        let s = build_user_message(&rec, 1, "time", storage.database(), None).await;
         assert!(s.contains("loop_id=abcd1234"));
         assert!(s.contains("iteration=1"));
         assert!(s.contains("trigger=time:5m"));
@@ -456,22 +488,55 @@ mod tests {
 
     #[tokio::test]
     async fn loop_context_block_marks_empty_scratchpad() {
+        let storage = Storage::open_in_memory().unwrap();
         let mut rec = sample_loop("a");
         rec.scratchpad.clear();
-        let s = build_user_message(&rec, 1, "time", None).await;
+        let s = build_user_message(&rec, 1, "time", storage.database(), None).await;
         assert!(s.contains("scratchpad_bytes=0"));
         assert!(s.contains("(empty)"));
     }
 
     #[tokio::test]
     async fn loop_context_block_falls_back_for_wrapped_skill() {
+        let storage = Storage::open_in_memory().unwrap();
         let mut rec = sample_loop("a");
         rec.prompt_text = None;
         rec.wrapped_skill = Some(r#"{"name":"video","args":{}}"#.into());
-        let s = build_user_message(&rec, 1, "time", None).await;
+        let s = build_user_message(&rec, 1, "time", storage.database(), None).await;
         // services=None → "(wrapped_skill <name>: no skill registry available)"
         assert!(s.contains("video"));
         assert!(s.contains("no skill registry available"));
+    }
+
+    #[tokio::test]
+    async fn loop_context_includes_recent_runs() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .sessions()
+            .create(CreateSessionParams::new().with_id("s1").with_title("t"))
+            .unwrap();
+        let rec = sample_loop("L");
+        storage.loops().create(&rec).unwrap();
+        let id = storage
+            .loops()
+            .insert_iteration("L", 1, 100, IterationStatus::Running)
+            .unwrap();
+        storage
+            .loops()
+            .finish_iteration(
+                id,
+                110,
+                IterationStatus::Ok,
+                None,
+                Some("[]"),
+                Some("prior result"),
+                None,
+            )
+            .unwrap();
+
+        let msg = build_user_message(&rec, 2, "time", storage.database(), None).await;
+        assert!(msg.contains("recent_runs"));
+        assert!(msg.contains("prior result"));
     }
 
     #[tokio::test]
