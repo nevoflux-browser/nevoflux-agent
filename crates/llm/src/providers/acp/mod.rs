@@ -16,10 +16,10 @@ pub mod tools;
 pub use sacp::schema::{ContentBlock, StopReason, TextContent};
 
 use sacp::schema::{
-    ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse,
-    PromptRequest, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
-    RequestPermissionResponse, SessionId, SessionNotification, SessionUpdate,
-    SetSessionModeRequest,
+    Content, ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest,
+    NewSessionResponse, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SessionId, SessionNotification,
+    SessionUpdate, SetSessionModeRequest, ToolCallContent, ToolCallStatus,
 };
 use sacp::{ClientToAgent, JrConnectionCx, JrMessage};
 use std::path::PathBuf;
@@ -99,6 +99,12 @@ pub enum AcpUpdate {
     Complete(StopReason),
     /// A protocol-level error occurred.
     Error(String),
+    /// A native tool call (the ACP agent's own Bash/Read/Edit/etc, as opposed
+    /// to a NevoFlux MCP tool) reached a terminal status with result content.
+    /// NevoFlux MCP tool calls are excluded — those are already recorded by
+    /// `execute_mcp_tool` on the daemon side (`record_acp_tool_result`), and
+    /// forwarding them here too would double-record.
+    ToolResult { tool_name: String, content: String },
 }
 
 /// ACP-based LLM provider that communicates with a CLI agent over stdio.
@@ -329,6 +335,30 @@ async fn run_client_loop_direct(
                                 }) => {
                                     let _ = tx.try_send(AcpUpdate::Thought(text));
                                 }
+                                SessionUpdate::ToolCall(tc) => {
+                                    if let Some(update) = maybe_tool_result_update(
+                                        tc.tool_call_id.0.as_ref(),
+                                        Some(tc.title.as_str()),
+                                        tc.status,
+                                        &tc.content,
+                                    ) {
+                                        let _ = tx.try_send(update);
+                                    }
+                                }
+                                SessionUpdate::ToolCallUpdate(update) => {
+                                    if let (Some(status), Some(content)) =
+                                        (update.fields.status, update.fields.content.as_deref())
+                                    {
+                                        if let Some(result) = maybe_tool_result_update(
+                                            update.tool_call_id.0.as_ref(),
+                                            update.fields.title.as_deref(),
+                                            status,
+                                            content,
+                                        ) {
+                                            let _ = tx.try_send(result);
+                                        }
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -499,6 +529,69 @@ fn extract_tool_name_from_id(tool_call_id: &str) -> Option<String> {
     None
 }
 
+/// True when a tool call's id or title identifies it as a NevoFlux MCP tool
+/// (browser_*, run_command, etc.), routed through the MCP bridge rather than
+/// executed natively by the ACP agent. Those calls are already recorded to
+/// `messages` by `execute_mcp_tool`/`record_acp_tool_result` on the daemon
+/// side; forwarding them here too would double-record the same result.
+fn is_nevoflux_mcp_tool_call(tool_call_id: &str, title: Option<&str>) -> bool {
+    fn has_marker(s: &str) -> bool {
+        s.contains("mcp_nevoflux-tools_") || s.contains("__nevoflux-tools__")
+    }
+    has_marker(tool_call_id) || title.is_some_and(has_marker)
+}
+
+/// Concatenate the text of a tool call's content blocks into a single
+/// string. Non-text content (diffs, terminal embeds) is skipped — verify
+/// checks match against text, and we have no generic textual rendering for
+/// those variants here.
+fn tool_call_content_to_text(content: &[ToolCallContent]) -> String {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            ToolCallContent::Content(Content {
+                content: ContentBlock::Text(TextContent { text, .. }),
+                ..
+            }) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Build an [`AcpUpdate::ToolResult`] from a tool call's current snapshot, or
+/// `None` when it isn't (yet) a recordable native-tool result: the call
+/// hasn't reached a terminal status, it belongs to the NevoFlux MCP bridge
+/// (see [`is_nevoflux_mcp_tool_call`]), or it has no text content to record.
+///
+/// Terminal statuses are `Completed` and `Failed` — a failed native command's
+/// output (e.g. Bash stderr) is still useful evidence for `/loop` verify and
+/// `/goal` checks, so both are forwarded.
+fn maybe_tool_result_update(
+    tool_call_id: &str,
+    title: Option<&str>,
+    status: ToolCallStatus,
+    content: &[ToolCallContent],
+) -> Option<AcpUpdate> {
+    if !matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed) {
+        return None;
+    }
+    if is_nevoflux_mcp_tool_call(tool_call_id, title) {
+        return None;
+    }
+    let text = tool_call_content_to_text(content);
+    if text.trim().is_empty() {
+        return None;
+    }
+    let tool_name = extract_tool_name_from_id(tool_call_id)
+        .or_else(|| title.map(|t| t.to_string()))
+        .unwrap_or_else(|| "unknown".to_string());
+    Some(AcpUpdate::ToolResult {
+        tool_name,
+        content: text,
+    })
+}
+
 async fn handle_requests(
     config: AcpProviderConfig,
     cx: JrConnectionCx<ClientToAgent>,
@@ -657,4 +750,137 @@ async fn apply_session_mode(
     }
 
     Ok(session)
+}
+
+#[cfg(test)]
+mod tool_result_tests {
+    use super::*;
+
+    fn text_block(text: &str) -> ToolCallContent {
+        ToolCallContent::Content(Content::new(ContentBlock::Text(TextContent::new(text))))
+    }
+
+    // -- is_nevoflux_mcp_tool_call -------------------------------------------------
+
+    #[test]
+    fn mcp_tool_call_detected_by_gemini_style_id() {
+        assert!(is_nevoflux_mcp_tool_call(
+            "mcp_nevoflux-tools_browser_get_markdown-1774240394151",
+            None
+        ));
+    }
+
+    #[test]
+    fn mcp_tool_call_detected_by_claude_style_title() {
+        assert!(is_nevoflux_mcp_tool_call(
+            "toolu_01BKyw4Ubz7YNgaL5vNouGCo",
+            Some("mcp__nevoflux-tools__run_command")
+        ));
+    }
+
+    #[test]
+    fn native_tool_call_not_detected_as_mcp() {
+        assert!(!is_nevoflux_mcp_tool_call(
+            "toolu_01BKyw4Ubz7YNgaL5vNouGCo",
+            Some("Bash")
+        ));
+    }
+
+    // -- tool_call_content_to_text -------------------------------------------------
+
+    #[test]
+    fn concatenates_multiple_text_blocks_with_newline() {
+        let content = vec![text_block("exit 0"), text_block("OK")];
+        assert_eq!(tool_call_content_to_text(&content), "exit 0\nOK");
+    }
+
+    #[test]
+    fn ignores_non_text_content_blocks() {
+        let diff = ToolCallContent::Diff(sacp::schema::Diff::new("/tmp/f.txt", "new"));
+        let content = vec![diff, text_block("kept")];
+        assert_eq!(tool_call_content_to_text(&content), "kept");
+    }
+
+    #[test]
+    fn empty_content_yields_empty_string() {
+        assert_eq!(tool_call_content_to_text(&[]), "");
+    }
+
+    // -- maybe_tool_result_update ---------------------------------------------------
+
+    #[test]
+    fn records_completed_native_bash_result() {
+        let content = vec![text_block("total 0\n-rw-r--r-- 1 a b 0 f.txt")];
+        let update = maybe_tool_result_update(
+            "toolu_01BKyw4Ubz7YNgaL5vNouGCo",
+            Some("Bash"),
+            ToolCallStatus::Completed,
+            &content,
+        );
+        match update {
+            Some(AcpUpdate::ToolResult { tool_name, content }) => {
+                assert_eq!(tool_name, "Bash");
+                assert_eq!(content, "total 0\n-rw-r--r-- 1 a b 0 f.txt");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn records_failed_native_result_too() {
+        let content = vec![text_block("command not found: frobnicate")];
+        let update = maybe_tool_result_update(
+            "toolu_02x",
+            Some("Bash"),
+            ToolCallStatus::Failed,
+            &content,
+        );
+        assert!(matches!(update, Some(AcpUpdate::ToolResult { .. })));
+    }
+
+    #[test]
+    fn skips_pending_and_in_progress_status() {
+        let content = vec![text_block("partial output")];
+        for status in [ToolCallStatus::Pending, ToolCallStatus::InProgress] {
+            let update =
+                maybe_tool_result_update("toolu_03x", Some("Bash"), status, &content);
+            assert!(update.is_none(), "status {status:?} should not record");
+        }
+    }
+
+    #[test]
+    fn skips_nevoflux_mcp_tool_calls_to_avoid_double_recording() {
+        let content = vec![text_block("<html>page</html>")];
+        let update = maybe_tool_result_update(
+            "mcp_nevoflux-tools_browser_get_markdown-1774240394151",
+            None,
+            ToolCallStatus::Completed,
+            &content,
+        );
+        assert!(update.is_none());
+    }
+
+    #[test]
+    fn skips_empty_content() {
+        let update =
+            maybe_tool_result_update("toolu_04x", Some("Bash"), ToolCallStatus::Completed, &[]);
+        assert!(update.is_none());
+    }
+
+    #[test]
+    fn falls_back_to_title_when_id_has_no_extractable_name() {
+        let content = vec![text_block("ok")];
+        let update = maybe_tool_result_update(
+            "toolu_05x",
+            Some("Read(/etc/hosts)"),
+            ToolCallStatus::Completed,
+            &content,
+        );
+        match update {
+            Some(AcpUpdate::ToolResult { tool_name, .. }) => {
+                assert_eq!(tool_name, "Read(/etc/hosts)");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
 }
