@@ -5,7 +5,7 @@
 
 use crate::loops::manager::{CreateLoopArgs, LoopManager};
 use crate::loops::tool_classes::is_forbidden_in_iteration;
-use crate::loops::types::LoopId;
+use crate::loops::types::{GateKind, GateSpec, LoopId};
 use nevoflux_storage::connection::Database;
 use nevoflux_storage::models::current_timestamp;
 use nevoflux_storage::repositories::LoopRepository;
@@ -44,6 +44,36 @@ pub async fn execute_loop_tool(
     }
 }
 
+/// Parse the optional `gate` tool arg into a `GateSpec`.
+///
+/// Input shape: `{kind: "http"|"bash"|"event", url?, extract?, command?,
+/// path?, equals?}`. `kind` selects the `GateKind`; every other field is
+/// forwarded verbatim as `GateSpec::spec_json` — the evaluator (`loops::gate`)
+/// is what actually interprets those fields per-kind, so this parser stays
+/// agnostic to which ones a given kind needs. Trigger-compat validation
+/// happens later, in `LoopManager::create_loop`, once the trigger has also
+/// been parsed.
+fn parse_gate_arg(args: &Value) -> Result<Option<GateSpec>, String> {
+    let Some(gate) = args.get("gate") else {
+        return Ok(None);
+    };
+    if gate.is_null() {
+        return Ok(None);
+    }
+    let kind_str = gate
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .ok_or("gate.kind is required (one of \"http\", \"bash\", \"event\")")?;
+    let kind = GateKind::from_db_str(kind_str)
+        .filter(|k| !matches!(k, GateKind::None))
+        .ok_or_else(|| format!("unknown gate.kind: {kind_str} (expected http, bash, or event)"))?;
+    let mut spec_json = gate.clone();
+    if let Some(obj) = spec_json.as_object_mut() {
+        obj.remove("kind");
+    }
+    Ok(Some(GateSpec { kind, spec_json }))
+}
+
 async fn loop_create(
     args: &Value,
     ctx: &ToolCallContext,
@@ -77,6 +107,7 @@ async fn loop_create(
         .and_then(|v| v.as_str())
         .map(crate::loops::manager::db_str_to_agent_mode)
         .unwrap_or(nevoflux_builtin_wasm::AgentMode::Chat);
+    let gate = parse_gate_arg(args)?;
 
     let id = mgr
         .create_loop(CreateLoopArgs {
@@ -85,6 +116,7 @@ async fn loop_create(
             prompt_text,
             wrapped_skill,
             mode,
+            gate,
         })
         .await?;
     Ok(json!({ "loop_id": id.0 }))
@@ -230,6 +262,64 @@ mod tests {
         assert_eq!(
             arr[0].get("trigger_expr").unwrap().as_str().unwrap(),
             "time:5m"
+        );
+    }
+
+    /// W3 task 4: the `gate` tool arg parses through `parse_gate_arg` and
+    /// round-trips through `LoopRepository::get` via the JSON-arg dispatch
+    /// path (as opposed to `manager::tests`, which construct `GateSpec`
+    /// directly in Rust and never exercise `parse_gate_arg`'s JSON shape).
+    #[tokio::test]
+    async fn loop_create_with_http_gate_arg_persists_gate() {
+        let (storage, mgr) = setup();
+        let res = execute_loop_tool(
+            "loop_create",
+            &json!({
+                "trigger_expr": "time:5m",
+                "prompt_text": "x",
+                "gate": { "kind": "http", "url": "https://x", "extract": "$.v" }
+            }),
+            &ctx(false, None),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap();
+        let id = res.get("loop_id").unwrap().as_str().unwrap().to_string();
+
+        let rec = storage.loops().get(&id).unwrap().unwrap();
+        assert_eq!(rec.gate_kind, "http");
+        let spec: serde_json::Value =
+            serde_json::from_str(rec.gate_spec.as_deref().unwrap()).unwrap();
+        assert_eq!(spec["url"], "https://x");
+        assert_eq!(spec["extract"], "$.v");
+        // `kind` must not leak into spec_json — the evaluator only expects
+        // kind-specific fields there.
+        assert!(spec.get("kind").is_none());
+    }
+
+    /// Mirrors `manager::tests::create_loop_rejects_event_gate_on_time_trigger`
+    /// but through the JSON tool-arg path, confirming the error surfaces
+    /// all the way up through `execute_loop_tool`.
+    #[tokio::test]
+    async fn loop_create_with_event_gate_on_time_trigger_arg_rejected() {
+        let (storage, mgr) = setup();
+        let err = execute_loop_tool(
+            "loop_create",
+            &json!({
+                "trigger_expr": "time:5m",
+                "prompt_text": "x",
+                "gate": { "kind": "event" }
+            }),
+            &ctx(false, None),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("event"),
+            "expected event/trigger mismatch error, got: {err}"
         );
     }
 

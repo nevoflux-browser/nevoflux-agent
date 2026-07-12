@@ -2539,6 +2539,7 @@ pub async fn start_server(
                                 prompt_text,
                                 wrapped_skill,
                                 mode,
+                                gate: None,
                             })
                             .await
                         {

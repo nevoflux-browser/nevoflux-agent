@@ -9,7 +9,7 @@ use crate::loops::executor::IterationExecutor;
 use crate::loops::expression::TriggerExpr;
 use crate::loops::registry::LoopRegistry;
 use crate::loops::scheduler::{LoopFireRequest, TriggerScheduler};
-use crate::loops::types::{LoopId, LoopRuntime};
+use crate::loops::types::{GateKind, GateSpec, LoopId, LoopRuntime};
 use nevoflux_builtin_wasm::AgentMode;
 use nevoflux_storage::connection::Database;
 use nevoflux_storage::models::{current_timestamp, LoopRecord, LoopState};
@@ -60,6 +60,44 @@ pub fn db_str_to_agent_mode(s: &str) -> AgentMode {
 /// and the `registry.remove` as part of the same tear-down, so checking
 /// only one leaves a window if the two were ever to diverge — belt and
 /// suspenders.
+/// Validate that a requested gate is compatible with the loop's trigger
+/// (spec §gate). `Http`/`Bash` gates run a poll-and-diff check on the
+/// loop's own cadence, so they require a non-event trigger (`time:<dur>`,
+/// `time:dynamic`, or a `state:` watcher) — an `event:` trigger already
+/// fires only when something happens, so a value-diff gate on top of it is
+/// a config mismatch the caller almost certainly didn't intend. `Event`
+/// gates filter the triggering event's own payload, so they require an
+/// `event:` trigger — attaching one to a `time:` trigger would have
+/// nothing to filter.
+fn validate_gate_trigger_compat(gate: &GateSpec, expr: &TriggerExpr) -> Result<(), String> {
+    let is_event_trigger = matches!(expr, TriggerExpr::Event(_));
+    match gate.kind {
+        GateKind::None => Ok(()),
+        GateKind::Http | GateKind::Bash => {
+            if is_event_trigger {
+                Err(format!(
+                    "{}-gate requires a time-based (or state:) trigger, not an event: trigger — \
+                     it polls on the loop's own cadence, not the event",
+                    gate.kind.as_str()
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        GateKind::Event => {
+            if is_event_trigger {
+                Ok(())
+            } else {
+                Err(
+                    "event-gate requires an event:<topic> trigger — it filters that trigger's \
+                     payload"
+                        .into(),
+                )
+            }
+        }
+    }
+}
+
 fn loop_still_live(repo: &LoopRepository<'_>, registry: &LoopRegistry, id: &LoopId) -> bool {
     let db_live = matches!(
         repo.get(id.as_ref()).ok().flatten().map(|r| r.state),
@@ -78,6 +116,13 @@ pub struct CreateLoopArgs {
     /// iteration's tool catalog via `builtin-wasm::Agent::get_tools_for_mode`.
     /// Inherited from `SkillCommandPayload.mode` at /loop creation time.
     pub mode: nevoflux_builtin_wasm::AgentMode,
+    /// Optional deterministic pre-check gate (W3 spec §gate). `create_loop`
+    /// validates trigger-compat before persisting: `Http`/`Bash` gates
+    /// require a non-event trigger (they poll on the loop's own `time:`
+    /// cadence); `Event` gates require an `event:` trigger (they filter
+    /// that trigger's payload). `None`/absent means no gate — the loop
+    /// always fires on its trigger, matching pre-W3 behavior.
+    pub gate: Option<GateSpec>,
 }
 
 #[derive(Clone)]
@@ -538,6 +583,9 @@ impl LoopManager {
             return Err("exactly one of prompt_text or wrapped_skill is required".into());
         }
         let expr = TriggerExpr::parse(&args.trigger_expr_text).map_err(|e| e.to_string())?;
+        if let Some(gate) = &args.gate {
+            validate_gate_trigger_compat(gate, &expr)?;
+        }
 
         let id = LoopId::generate();
         let now = current_timestamp();
@@ -555,8 +603,13 @@ impl LoopManager {
             iteration_count: 0,
             created_at: now,
             updated_at: now,
-            gate_kind: "none".into(),
-            gate_spec: None,
+            gate_kind: args
+                .gate
+                .as_ref()
+                .map(|g| g.kind.as_str())
+                .unwrap_or("none")
+                .to_string(),
+            gate_spec: args.gate.as_ref().map(|g| g.spec_json.to_string()),
             gate_last_value: None,
         };
         LoopRepository::new(&self.db)
@@ -881,6 +934,7 @@ mod tests {
                 prompt_text: Some("check".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();
@@ -890,6 +944,63 @@ mod tests {
         assert_eq!(rec.trigger_expr, "time:5m");
         // mode persisted (default chat)
         assert_eq!(rec.mode, "chat");
+    }
+
+    /// W3 task 4: an `event` gate on a `time:` trigger is a config
+    /// mismatch — the gate would have no trigger payload to filter — and
+    /// must be rejected before the loop is ever persisted.
+    #[tokio::test(start_paused = true)]
+    async fn create_loop_rejects_event_gate_on_time_trigger() {
+        let storage = fresh();
+        let mgr = LoopManager::start(storage.database().clone());
+        let err = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "time:5m".into(),
+                prompt_text: Some("check".into()),
+                wrapped_skill: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: Some(crate::loops::types::GateSpec {
+                    kind: GateKind::Event,
+                    spec_json: serde_json::json!({}),
+                }),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("event") && err.contains("event:"),
+            "expected error naming the event/trigger incompatibility, got: {err}"
+        );
+    }
+
+    /// W3 task 4: an `http` gate on a `time:` trigger is the intended
+    /// shape (poll-and-diff on the loop's own cadence) — it must succeed
+    /// and the gate columns must round-trip through `LoopRepository::get`.
+    #[tokio::test(start_paused = true)]
+    async fn create_loop_with_http_gate_on_time_trigger_persists() {
+        let storage = fresh();
+        let mgr = LoopManager::start(storage.database().clone());
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "time:5m".into(),
+                prompt_text: Some("check".into()),
+                wrapped_skill: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: Some(crate::loops::types::GateSpec {
+                    kind: GateKind::Http,
+                    spec_json: serde_json::json!({"url": "https://x", "extract": "$.v"}),
+                }),
+            })
+            .await
+            .unwrap();
+
+        let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
+        assert_eq!(rec.gate_kind, "http");
+        let spec: serde_json::Value =
+            serde_json::from_str(rec.gate_spec.as_deref().unwrap()).unwrap();
+        assert_eq!(spec["url"], "https://x");
+        assert_eq!(spec["extract"], "$.v");
     }
 
     #[tokio::test(start_paused = true)]
@@ -903,6 +1014,7 @@ mod tests {
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap_err();
@@ -921,6 +1033,7 @@ mod tests {
                 prompt_text: None,
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap_err();
@@ -933,6 +1046,7 @@ mod tests {
                 prompt_text: Some("p".into()),
                 wrapped_skill: Some("{}".into()),
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap_err();
@@ -951,6 +1065,7 @@ mod tests {
                 prompt_text: Some("check".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();
@@ -986,6 +1101,7 @@ mod tests {
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();
@@ -1019,6 +1135,7 @@ mod tests {
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();
@@ -1029,6 +1146,7 @@ mod tests {
                 prompt_text: Some("q".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();
@@ -1054,6 +1172,7 @@ mod tests {
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();
@@ -1095,6 +1214,7 @@ mod tests {
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();
@@ -1139,6 +1259,7 @@ mod tests {
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();
@@ -1184,6 +1305,7 @@ mod tests {
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();
@@ -1243,6 +1365,7 @@ mod tests {
                 prompt_text: Some("watch".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();
@@ -1271,6 +1394,7 @@ mod tests {
                 prompt_text: Some("x".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();
@@ -1311,6 +1435,7 @@ mod tests {
                 prompt_text: Some("x".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();
@@ -1359,6 +1484,7 @@ mod tests {
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();
@@ -1424,6 +1550,7 @@ mod tests {
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();
@@ -1487,6 +1614,7 @@ mod tests {
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();
@@ -1529,6 +1657,7 @@ mod tests {
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();
@@ -1596,6 +1725,7 @@ mod tests {
                 prompt_text: Some("p".into()),
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
             })
             .await
             .unwrap();

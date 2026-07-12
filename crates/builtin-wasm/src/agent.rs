@@ -3651,6 +3651,23 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                             "type": "string",
                             "enum": ["chat", "browser", "agent"],
                             "description": "Agent mode for iterations. Default 'chat'."
+                        },
+                        "gate": {
+                            "type": "object",
+                            "description": "Optional deterministic pre-check that runs before the agent each fire; skips the run (no LLM cost) when nothing changed. http/bash do value-diff and only wake the agent on change; event filters the trigger payload. http/bash require a time: trigger; event requires an event: trigger.",
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["http", "bash", "event"],
+                                    "description": "Gate kind. 'http': GET url and diff the extracted value. 'bash': run command and diff its stdout. 'event': filter the event: trigger's payload."
+                                },
+                                "url": { "type": "string", "description": "http gate: URL to GET." },
+                                "extract": { "type": "string", "description": "http gate: JSONPath-ish extractor applied to the response body, e.g. '$.value'. Omit to diff the whole body." },
+                                "command": { "type": "string", "description": "bash gate: shell command to run; its stdout is diffed." },
+                                "path": { "type": "string", "description": "event gate: dot-path into the trigger's event payload to compare, e.g. 'status'." },
+                                "equals": { "type": "string", "description": "event gate: only run when the value at `path` equals this string." }
+                            },
+                            "required": ["kind"]
                         }
                     },
                     "required": ["trigger_expr"]
