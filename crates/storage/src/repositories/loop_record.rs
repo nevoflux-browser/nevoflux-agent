@@ -185,17 +185,22 @@ impl<'a> LoopRepository<'a> {
         status: IterationStatus,
         error: Option<&str>,
         tool_calls_json: Option<&str>,
+        final_text: Option<&str>,
+        tokens_used: Option<i64>,
     ) -> Result<()> {
         self.db.with_connection(|conn| {
             conn.execute(
                 "UPDATE loop_iterations
-                 SET ended_at = ?1, status = ?2, error_message = ?3, tool_calls_json = ?4
-                 WHERE id = ?5",
+                 SET ended_at = ?1, status = ?2, error_message = ?3, tool_calls_json = ?4,
+                     final_text = ?5, tokens_used = ?6
+                 WHERE id = ?7",
                 params![
                     ended_at,
                     status.as_str(),
                     error,
                     tool_calls_json,
+                    final_text,
+                    tokens_used,
                     iteration_id
                 ],
             )?;
@@ -432,7 +437,7 @@ mod tests {
         let id = repo
             .insert_iteration("abc", 1, 100, IterationStatus::Running)
             .unwrap();
-        repo.finish_iteration(id, 110, IterationStatus::Ok, None, Some("[]"))
+        repo.finish_iteration(id, 110, IterationStatus::Ok, None, Some("[]"), None, None)
             .unwrap();
         // Spot check via raw SQL since we don't have list_iterations yet:
         let row: (i64, String, Option<String>) = s
@@ -455,6 +460,39 @@ mod tests {
         assert_eq!(row.0, 110);
         assert_eq!(row.1, "ok");
         assert_eq!(row.2.as_deref(), Some("[]"));
+    }
+
+    #[test]
+    fn finish_iteration_persists_final_text_and_tokens() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        let id = repo
+            .insert_iteration("abc", 1, 100, IterationStatus::Running)
+            .unwrap();
+        repo.finish_iteration(
+            id,
+            110,
+            IterationStatus::Ok,
+            None,
+            Some("[]"),
+            Some("digested 3 new items"),
+            Some(1234),
+        )
+        .unwrap();
+        let row: (Option<String>, Option<i64>) = s
+            .database()
+            .with_connection(|c| {
+                c.query_row(
+                    "SELECT final_text, tokens_used FROM loop_iterations WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(crate::error::StorageError::from)
+            })
+            .unwrap();
+        assert_eq!(row.0.as_deref(), Some("digested 3 new items"));
+        assert_eq!(row.1, Some(1234));
     }
 
     #[test]

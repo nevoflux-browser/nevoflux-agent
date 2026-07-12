@@ -247,12 +247,20 @@ impl IterationExecutor {
         let end_now = current_timestamp();
         let repo = LoopRepository::new(&self.db);
         let _ = repo.set_consecutive_failures(loop_id.as_ref(), 0, end_now);
+        // TODO(W4): wire loop token spend. `run_agent_once` doesn't thread a
+        // token budget for iterations today (req.token_budget is always
+        // `None` above), so there's no spend to read yet — see
+        // `schedules/runner.rs::budget_spent` for the pattern to follow once
+        // loops gain a per-iteration/per-loop token limit.
+        let tokens_used: Option<i64> = None;
         let _ = repo.finish_iteration(
             iter_id,
             end_now,
             IterationStatus::Ok,
             None,
             Some(&serde_json::to_string(&trace_summary).unwrap_or_default()),
+            final_text.as_deref(),
+            tokens_used,
         );
         self.events
             .iteration_end(
@@ -283,7 +291,15 @@ impl IterationExecutor {
         let repo = LoopRepository::new(&self.db);
         let new_failures = rec.consecutive_failures + 1;
         let _ = repo.set_consecutive_failures(loop_id.as_ref(), new_failures, end_now);
-        let _ = repo.finish_iteration(iter_id, end_now, IterationStatus::Error, Some(&err), None);
+        let _ = repo.finish_iteration(
+            iter_id,
+            end_now,
+            IterationStatus::Error,
+            Some(&err),
+            None,
+            None,
+            None,
+        );
         self.events
             .iteration_end(
                 session_id,
