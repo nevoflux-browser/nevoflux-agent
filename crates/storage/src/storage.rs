@@ -7,8 +7,8 @@ use crate::error::Result;
 use crate::repositories::traces::TraceRepository;
 use crate::repositories::{
     ArtifactRepository, ConfigRepository, KnowledgeRepository, LearningMetricsRepository,
-    LoopRepository, MessageRepository, PermissionRepository, SessionRepository,
-    SiteAdaptationRepository, ToolStatsRepository,
+    LoopProposalRepository, LoopRepository, MessageRepository, PermissionRepository,
+    SessionRepository, SiteAdaptationRepository, ToolStatsRepository,
 };
 
 /// Main storage facade providing access to all repositories.
@@ -113,6 +113,14 @@ impl Storage {
     /// their per-iteration history.
     pub fn loops(&self) -> LoopRepository<'_> {
         LoopRepository::new(&self.db)
+    }
+
+    /// Get a loop proposal repository.
+    ///
+    /// Use this to create, read, and respond to /loop evolve
+    /// self-improvement proposals (W4).
+    pub fn loop_proposals(&self) -> LoopProposalRepository<'_> {
+        LoopProposalRepository::new(&self.db)
     }
 
     /// Get the underlying database (for advanced operations).

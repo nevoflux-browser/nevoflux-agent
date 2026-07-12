@@ -306,6 +306,143 @@ impl<'a> LoopRepository<'a> {
             Ok(())
         })
     }
+
+    /// Apply the accepted fields of a self-improvement proposal (W4) onto
+    /// the loop row. Only columns whose argument is `Some` are touched;
+    /// `None` leaves the existing value untouched via `COALESCE`, mirroring
+    /// `GoalRepository::set_status`'s `achieved_at` pattern.
+    pub fn apply_proposal_fields(
+        &self,
+        loop_id: &str,
+        prompt_text: Option<&str>,
+        gate_spec: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        self.db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE loops SET
+                     prompt_text = COALESCE(?1, prompt_text),
+                     gate_spec   = COALESCE(?2, gate_spec),
+                     updated_at  = ?3
+                 WHERE id = ?4",
+                params![prompt_text, gate_spec, now, loop_id],
+            )?;
+            Ok(())
+        })
+    }
+}
+
+/// A self-improvement proposal produced by the /loop evolve skill (W4):
+/// a suggested rewrite of a loop's prompt and/or gate, pending human
+/// accept/reject via `respond_proposal`.
+#[derive(Debug, Clone)]
+pub struct LoopProposal {
+    pub id: String,
+    pub loop_id: String,
+    pub created_at: i64,
+    pub rationale: String,
+    pub proposed_prompt_text: Option<String>,
+    pub proposed_gate_spec: Option<String>,
+    pub status: String,
+}
+
+fn row_to_proposal(row: &Row<'_>) -> rusqlite::Result<LoopProposal> {
+    Ok(LoopProposal {
+        id: row.get(0)?,
+        loop_id: row.get(1)?,
+        created_at: row.get(2)?,
+        rationale: row.get(3)?,
+        proposed_prompt_text: row.get(4)?,
+        proposed_gate_spec: row.get(5)?,
+        status: row.get(6)?,
+    })
+}
+
+const PROPOSAL_COLUMNS: &str =
+    "id, loop_id, created_at, rationale, proposed_prompt_text, proposed_gate_spec, status";
+
+pub struct LoopProposalRepository<'a> {
+    db: &'a Database,
+}
+
+impl<'a> LoopProposalRepository<'a> {
+    pub fn new(db: &'a Database) -> Self {
+        Self { db }
+    }
+
+    pub fn insert_proposal(&self, p: &LoopProposal) -> Result<()> {
+        self.db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO loop_proposals
+                    (id, loop_id, created_at, rationale, proposed_prompt_text,
+                     proposed_gate_spec, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    p.id,
+                    p.loop_id,
+                    p.created_at,
+                    p.rationale,
+                    p.proposed_prompt_text,
+                    p.proposed_gate_spec,
+                    p.status,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Most recent proposal still awaiting a human decision, if any.
+    pub fn latest_pending_proposal(&self, loop_id: &str) -> Result<Option<LoopProposal>> {
+        self.db.with_connection(|conn| {
+            conn.query_row(
+                &format!(
+                    "SELECT {PROPOSAL_COLUMNS} FROM loop_proposals
+                     WHERE loop_id = ?1 AND status = 'pending'
+                     ORDER BY created_at DESC LIMIT 1"
+                ),
+                params![loop_id],
+                row_to_proposal,
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
+    /// Atomically flip a pending proposal to `accepted`/`rejected`. Returns
+    /// the updated row when it actually flipped, `None` when it was no
+    /// longer pending (already responded to, or unknown id). Mirrors
+    /// `LoopRepository::transition_to_terminal`'s guarded-UPDATE pattern:
+    /// applying the accepted fields to the loop itself is the caller's
+    /// responsibility (via `LoopRepository::apply_proposal_fields`), not
+    /// this repo's.
+    pub fn respond_proposal(
+        &self,
+        id: &str,
+        accept: bool,
+        // `loop_proposals` has no responded_at column (see migration 028);
+        // kept in the signature for symmetry with the rest of this repo's
+        // now-stamped writers and in case a future migration adds one.
+        _now: i64,
+    ) -> Result<Option<LoopProposal>> {
+        let new_status = if accept { "accepted" } else { "rejected" };
+        self.db.with_connection(|conn| {
+            let n = conn.execute(
+                "UPDATE loop_proposals SET status = ?2
+                 WHERE id = ?1 AND status = 'pending'",
+                params![id, new_status],
+            )?;
+            if n == 0 {
+                return Ok(None);
+            }
+            conn.query_row(
+                &format!("SELECT {PROPOSAL_COLUMNS} FROM loop_proposals WHERE id = ?1"),
+                params![id],
+                row_to_proposal,
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
 }
 
 fn row_to_loop(row: &Row<'_>) -> rusqlite::Result<Result<LoopRecord>> {
@@ -863,5 +1000,121 @@ mod tests {
             .unwrap();
         assert_eq!(row.0, Some(0));
         assert_eq!(row.1.as_deref(), Some("check 'OK' failed"));
+    }
+
+    fn sample_proposal(id: &str, loop_id: &str, created_at: i64) -> LoopProposal {
+        LoopProposal {
+            id: id.into(),
+            loop_id: loop_id.into(),
+            created_at,
+            rationale: "iteration 5 kept timing out on step 2".into(),
+            proposed_prompt_text: None,
+            proposed_gate_spec: None,
+            status: "pending".into(),
+        }
+    }
+
+    #[test]
+    fn latest_pending_proposal_returns_inserted_row() {
+        let s = fresh();
+        LoopRepository::new(s.database())
+            .create(&sample_loop("abc"))
+            .unwrap();
+        let repo = LoopProposalRepository::new(s.database());
+        repo.insert_proposal(&sample_proposal("prop-1", "abc", 100))
+            .unwrap();
+
+        let found = repo
+            .latest_pending_proposal("abc")
+            .unwrap()
+            .expect("pending proposal should be found");
+        assert_eq!(found.id, "prop-1");
+        assert_eq!(found.status, "pending");
+        assert_eq!(found.rationale, "iteration 5 kept timing out on step 2");
+    }
+
+    #[test]
+    fn latest_pending_proposal_is_none_when_no_pending_rows() {
+        let s = fresh();
+        let repo = LoopProposalRepository::new(s.database());
+        assert!(repo
+            .latest_pending_proposal("nonexistent")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn respond_proposal_reject_flips_status_and_hides_from_pending_lookup() {
+        let s = fresh();
+        LoopRepository::new(s.database())
+            .create(&sample_loop("abc"))
+            .unwrap();
+        let repo = LoopProposalRepository::new(s.database());
+        repo.insert_proposal(&sample_proposal("prop-1", "abc", 100))
+            .unwrap();
+
+        let responded = repo
+            .respond_proposal("prop-1", false, 200)
+            .unwrap()
+            .expect("pending -> rejected must flip and return the row");
+        assert_eq!(responded.status, "rejected");
+
+        assert!(
+            repo.latest_pending_proposal("abc").unwrap().is_none(),
+            "rejected proposal must no longer be pending"
+        );
+    }
+
+    #[test]
+    fn respond_proposal_is_noop_when_already_responded() {
+        let s = fresh();
+        LoopRepository::new(s.database())
+            .create(&sample_loop("abc"))
+            .unwrap();
+        let repo = LoopProposalRepository::new(s.database());
+        repo.insert_proposal(&sample_proposal("prop-1", "abc", 100))
+            .unwrap();
+        repo.respond_proposal("prop-1", false, 200).unwrap();
+
+        let second = repo.respond_proposal("prop-1", true, 201).unwrap();
+        assert!(
+            second.is_none(),
+            "already-responded proposal must not flip again"
+        );
+    }
+
+    #[test]
+    fn respond_proposal_accept_then_apply_proposal_fields_updates_prompt_text_only() {
+        let s = fresh();
+        let loop_repo = LoopRepository::new(s.database());
+        loop_repo.create(&sample_loop("abc")).unwrap();
+
+        let repo = LoopProposalRepository::new(s.database());
+        let mut proposal = sample_proposal("prop-2", "abc", 100);
+        proposal.proposed_prompt_text = Some("new".into());
+        repo.insert_proposal(&proposal).unwrap();
+
+        let responded = repo
+            .respond_proposal("prop-2", true, 200)
+            .unwrap()
+            .expect("pending -> accepted must flip and return the row");
+        assert_eq!(responded.status, "accepted");
+        assert_eq!(responded.proposed_prompt_text.as_deref(), Some("new"));
+
+        loop_repo
+            .apply_proposal_fields(
+                "abc",
+                responded.proposed_prompt_text.as_deref(),
+                responded.proposed_gate_spec.as_deref(),
+                200,
+            )
+            .unwrap();
+
+        let updated = loop_repo.get("abc").unwrap().unwrap();
+        assert_eq!(updated.prompt_text.as_deref(), Some("new"));
+        assert_eq!(
+            updated.gate_spec, None,
+            "gate_spec must stay untouched when the proposal didn't set it"
+        );
     }
 }
