@@ -668,7 +668,8 @@ async fn managed_idle_watchdog(
     last_message_time: std::sync::Arc<Mutex<std::time::Instant>>,
     idle_timeout: std::time::Duration,
     poll_interval: std::time::Duration,
-    background_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    schedule_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    loop_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     shutdown_tx: mpsc::Sender<()>,
 ) {
     use std::sync::atomic::Ordering;
@@ -683,11 +684,12 @@ async fn managed_idle_watchdog(
         }
         let since_last_connection = last_connected.elapsed();
         let since_last_message = last_message_time.lock().await.elapsed();
-        // Pending schedule work (active schedules + in-flight runs) inhibits
-        // termination without touching `last_connected`, so a real disconnect
-        // is not masked: the moment the counter hits 0 the countdown resumes
-        // from the already-elapsed disconnect time.
-        let background_jobs = background_jobs.load(Ordering::SeqCst);
+        // Pending schedule/loop work (active schedules + in-flight runs, and
+        // armed loops) inhibits termination without touching `last_connected`,
+        // so a real disconnect is not masked: the moment both counters hit 0
+        // the countdown resumes from the already-elapsed disconnect time.
+        let background_jobs =
+            schedule_jobs.load(Ordering::SeqCst) + loop_jobs.load(Ordering::SeqCst);
         if managed_should_self_terminate(
             since_last_connection,
             since_last_message,
@@ -1941,6 +1943,7 @@ pub async fn start_server(
     // inside the accept loop below (a managed daemon must not self-terminate
     // while a schedule is armed or a run is in flight).
     let watchdog_schedule_jobs = schedule_manager.pending_work_handle();
+    let watchdog_loop_jobs = loop_manager.pending_work_handle();
     let terminated = Arc::new(tokio::sync::Notify::new());
     let accept_terminated = terminated.clone();
     tokio::spawn(async move {
@@ -1966,6 +1969,7 @@ pub async fn start_server(
                 config_idle_timeout,
                 std::time::Duration::from_secs(1),
                 watchdog_schedule_jobs.clone(),
+                watchdog_loop_jobs.clone(),
                 accept_shutdown_tx.clone(),
             ));
         }
@@ -10784,6 +10788,7 @@ mod tests {
             Duration::from_millis(120),
             Duration::from_millis(10),
             Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
             tx,
         ));
 
@@ -10811,6 +10816,7 @@ mod tests {
             Duration::from_millis(120),
             Duration::from_millis(10),
             Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
             tx,
         ));
 
@@ -10837,6 +10843,7 @@ mod tests {
             last_msg,
             Duration::from_millis(120),
             Duration::from_millis(10),
+            Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
             tx,
         ));
@@ -10875,6 +10882,7 @@ mod tests {
             Duration::from_millis(120),
             Duration::from_millis(10),
             jobs,
+            Arc::new(AtomicUsize::new(0)),
             tx,
         ));
 
@@ -10894,6 +10902,45 @@ mod tests {
         assert!(
             rx.try_recv().is_ok(),
             "watchdog must resume the idle countdown from real elapsed times once jobs hit 0"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn managed_daemon_stays_alive_while_a_loop_is_armed() {
+        use std::sync::atomic::AtomicUsize;
+        let connection_count = Arc::new(AtomicUsize::new(0)); // disconnected
+        let last_message_time = Arc::new(Mutex::new(std::time::Instant::now()));
+        let schedule_jobs = Arc::new(AtomicUsize::new(0));
+        let loop_jobs = Arc::new(AtomicUsize::new(1)); // one armed loop
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+        let idle = std::time::Duration::from_secs(30);
+
+        let handle = tokio::spawn(managed_idle_watchdog(
+            connection_count,
+            last_message_time,
+            idle,
+            std::time::Duration::from_secs(1),
+            schedule_jobs,
+            loop_jobs.clone(),
+            shutdown_tx,
+        ));
+
+        // Advance well past the idle window; the armed loop must suppress shutdown.
+        tokio::time::advance(std::time::Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            shutdown_rx.try_recv().is_err(),
+            "must NOT shut down while a loop is armed"
+        );
+
+        // Disarm the loop; now it must reclaim.
+        loop_jobs.store(0, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::advance(std::time::Duration::from_secs(35)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            shutdown_rx.recv().await.is_some(),
+            "must shut down once idle and disarmed"
         );
         handle.abort();
     }
