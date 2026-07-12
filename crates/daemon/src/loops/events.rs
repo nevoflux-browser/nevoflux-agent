@@ -117,6 +117,8 @@ impl LoopEvents {
         status: &str,
         tool_calls_summary: serde_json::Value,
         final_text: Option<&str>,
+        verify_passed: Option<bool>,
+        verify_reason: Option<&str>,
     ) {
         let Some(bus) = &self.bus else {
             return;
@@ -143,6 +145,8 @@ impl LoopEvents {
                     "status": status,
                     "tool_calls_summary": tool_calls_summary,
                     "final_text": final_text_capped,
+                    "verify_passed": verify_passed,
+                    "verify_reason": verify_reason,
                 }),
                 PublisherIdentity::Internal,
             ))
@@ -241,8 +245,18 @@ mod tests {
         evts.state_changed("s1", &id, "running", "pending", None)
             .await;
         evts.iteration_start("s1", &id, 1, 100, "time").await;
-        evts.iteration_end("s1", &id, 1, 110, "ok", serde_json::json!([]), None)
-            .await;
+        evts.iteration_end(
+            "s1",
+            &id,
+            1,
+            110,
+            "ok",
+            serde_json::json!([]),
+            None,
+            None,
+            None,
+        )
+        .await;
         evts.scratchpad_changed("s1", &id, "k=v").await;
         evts.trigger_dropped("s1", &id, 1).await;
         evts.skipped("s1", &id, "time").await;

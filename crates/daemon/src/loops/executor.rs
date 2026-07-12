@@ -162,15 +162,11 @@ impl IterationExecutor {
             Ok(s) => s,
             Err(e) => return ExecResult::Error(e.to_string()),
         };
-        let iter_id = match repo.insert_iteration(
-            loop_id.as_ref(),
-            seq,
-            now,
-            IterationStatus::Running,
-        ) {
-            Ok(i) => i,
-            Err(e) => return ExecResult::Error(e.to_string()),
-        };
+        let iter_id =
+            match repo.insert_iteration(loop_id.as_ref(), seq, now, IterationStatus::Running) {
+                Ok(i) => i,
+                Err(e) => return ExecResult::Error(e.to_string()),
+            };
 
         self.events
             .iteration_start(&session_id, &loop_id, seq, now, &fire_reason)
@@ -344,6 +340,8 @@ impl IterationExecutor {
                 "ok",
                 trace_summary,
                 final_text.as_deref(),
+                verify_passed,
+                verify_reason.as_deref(),
             )
             .await;
         ExecResult::OkWithText(final_text)
@@ -383,6 +381,8 @@ impl IterationExecutor {
                 end_now,
                 "error",
                 serde_json::json!([]),
+                None,
+                None,
                 None,
             )
             .await;
@@ -433,8 +433,7 @@ pub(crate) async fn build_user_message(
                 for r in &rows {
                     let summary = r.final_text.as_deref().unwrap_or("").replace('\n', " ");
                     let summary = if summary.chars().count() > RECENT_LINE_MAX {
-                        let truncated: String =
-                            summary.chars().take(RECENT_LINE_MAX).collect();
+                        let truncated: String = summary.chars().take(RECENT_LINE_MAX).collect();
                         format!("{}…", truncated)
                     } else {
                         summary
@@ -500,10 +499,7 @@ pub(crate) async fn materialize_wrapped_skill(
         Ok(v) => v,
         Err(e) => return format!("(wrapped_skill parse error: {e})"),
     };
-    let name = parsed
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = parsed
         .get("args")
         .and_then(|v| {
@@ -625,7 +621,10 @@ mod tests {
         // Must still land inside the <LOOP-CONTEXT> block, before the closing tag.
         let ctx_end = s.find("</LOOP-CONTEXT>").expect("context block present");
         let gate_pos = s.find("gate_output:").expect("gate_output present");
-        assert!(gate_pos < ctx_end, "gate_output must be inside LOOP-CONTEXT");
+        assert!(
+            gate_pos < ctx_end,
+            "gate_output must be inside LOOP-CONTEXT"
+        );
     }
 
     /// Gate-less loops (`GateKind::None`, the default) and gate decisions
@@ -734,7 +733,9 @@ mod tests {
         storage.loops().create(&sample_loop("abc")).unwrap();
 
         let executor = IterationExecutor::new(storage.database().clone());
-        let result = executor.execute(LoopId("abc".into()), "time".into(), None).await;
+        let result = executor
+            .execute(LoopId("abc".into()), "time".into(), None)
+            .await;
 
         assert!(result.is_ok(), "expected ok-variant, got {:?}", result);
         // Stub path (no services wired) — claims success without text.
@@ -748,7 +749,9 @@ mod tests {
     async fn execute_returns_error_for_missing_loop() {
         let storage = Storage::open_in_memory().unwrap();
         let executor = IterationExecutor::new(storage.database().clone());
-        let result = executor.execute(LoopId("nope".into()), "time".into(), None).await;
+        let result = executor
+            .execute(LoopId("nope".into()), "time".into(), None)
+            .await;
         assert!(matches!(result, ExecResult::Error(_)));
     }
 
@@ -764,7 +767,9 @@ mod tests {
         storage.loops().create(&rec).unwrap();
 
         let executor = IterationExecutor::new(storage.database().clone());
-        let result = executor.execute(LoopId("rst".into()), "time".into(), None).await;
+        let result = executor
+            .execute(LoopId("rst".into()), "time".into(), None)
+            .await;
         assert!(result.is_ok());
 
         let after = storage.loops().get("rst").unwrap().unwrap();
