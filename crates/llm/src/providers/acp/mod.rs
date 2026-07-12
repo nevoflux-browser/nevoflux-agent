@@ -19,9 +19,11 @@ use sacp::schema::{
     Content, ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest,
     NewSessionResponse, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SessionId, SessionNotification,
-    SessionUpdate, SetSessionModeRequest, ToolCallContent, ToolCallStatus,
+    SessionUpdate, SetSessionModeRequest, ToolCall, ToolCallContent, ToolCallStatus,
+    ToolCallUpdate,
 };
 use sacp::{ClientToAgent, JrConnectionCx, JrMessage};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -106,6 +108,31 @@ pub enum AcpUpdate {
     /// forwarding them here too would double-record.
     ToolResult { tool_name: String, content: String },
 }
+
+/// Metadata about a tool call, captured at creation time (`SessionUpdate::ToolCall`)
+/// when `title` is guaranteed present, and reused at completion time
+/// (`SessionUpdate::ToolCallUpdate`) where the ACP "only changed fields need to be
+/// included" convention typically leaves `title` as `None`.
+///
+/// Without this cache, a completing claude-code tool call — opaque `toolu_...` id, no
+/// marker, no title on the update — is misclassified as a native tool and its NevoFlux
+/// MCP result (already recorded once by `execute_mcp_tool`) gets forwarded and
+/// double-recorded here too.
+#[derive(Debug, Clone)]
+struct ToolCallMeta {
+    /// Whether this tool call was classified as a NevoFlux MCP tool at creation time.
+    is_mcp: bool,
+    /// Best-effort tool name resolved at creation time, used as a fallback when the
+    /// completion notification omits `title`.
+    tool_name: Option<String>,
+}
+
+/// Per-connection cache of [`ToolCallMeta`] keyed by ACP `tool_call_id`. Populated on
+/// `SessionUpdate::ToolCall` (creation) and consulted on `SessionUpdate::ToolCallUpdate`
+/// (completion) so the MCP-vs-native classification made at creation time (when `title`
+/// is present) survives to the completion notification (when it usually isn't).
+/// Cleared at the start of each new prompt to bound its size.
+type ToolCallCache = Arc<Mutex<HashMap<String, ToolCallMeta>>>;
 
 /// ACP-based LLM provider that communicates with a CLI agent over stdio.
 ///
@@ -300,6 +327,7 @@ async fn run_client_loop_direct(
 
     let prompt_response_tx: Arc<Mutex<Option<mpsc::Sender<AcpUpdate>>>> =
         Arc::new(Mutex::new(None));
+    let tool_call_cache: ToolCallCache = Arc::new(Mutex::new(HashMap::new()));
 
     let error_notify_tx = prompt_response_tx.clone();
 
@@ -307,6 +335,7 @@ async fn run_client_loop_direct(
         .on_receive_notification(
             {
                 let prompt_response_tx = prompt_response_tx.clone();
+                let tool_call_cache = tool_call_cache.clone();
                 // Use UntypedMessage to catch ALL notifications including unknown ones
                 // like `usage_update` which would crash the loop if we used SessionNotification.
                 // sacp 10.x / 11.x fails to deserialize `usage_update` variant, causing
@@ -336,27 +365,18 @@ async fn run_client_loop_direct(
                                     let _ = tx.try_send(AcpUpdate::Thought(text));
                                 }
                                 SessionUpdate::ToolCall(tc) => {
-                                    if let Some(update) = maybe_tool_result_update(
-                                        tc.tool_call_id.0.as_ref(),
-                                        Some(tc.title.as_str()),
-                                        tc.status,
-                                        &tc.content,
-                                    ) {
+                                    if let Some(update) =
+                                        handle_tool_call_notification(&tool_call_cache, &tc)
+                                    {
                                         let _ = tx.try_send(update);
                                     }
                                 }
                                 SessionUpdate::ToolCallUpdate(update) => {
-                                    if let (Some(status), Some(content)) =
-                                        (update.fields.status, update.fields.content.as_deref())
-                                    {
-                                        if let Some(result) = maybe_tool_result_update(
-                                            update.tool_call_id.0.as_ref(),
-                                            update.fields.title.as_deref(),
-                                            status,
-                                            content,
-                                        ) {
-                                            let _ = tx.try_send(result);
-                                        }
+                                    if let Some(result) = handle_tool_call_update_notification(
+                                        &tool_call_cache,
+                                        &update,
+                                    ) {
+                                        let _ = tx.try_send(result);
                                     }
                                 }
                                 _ => {}
@@ -477,6 +497,7 @@ async fn run_client_loop_direct(
                 cx,
                 &mut rx,
                 prompt_response_tx,
+                tool_call_cache,
                 init_tx,
                 tool_bridge,
             )
@@ -573,10 +594,24 @@ fn maybe_tool_result_update(
     status: ToolCallStatus,
     content: &[ToolCallContent],
 ) -> Option<AcpUpdate> {
-    if !matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed) {
+    if is_nevoflux_mcp_tool_call(tool_call_id, title) {
         return None;
     }
-    if is_nevoflux_mcp_tool_call(tool_call_id, title) {
+    build_tool_result_update(tool_call_id, title, status, content)
+}
+
+/// Same as [`maybe_tool_result_update`] but without the NevoFlux-MCP-tool skip check.
+/// Used by the `SessionUpdate::ToolCallUpdate` (completion) handler, which resolves the
+/// MCP-vs-native classification from the [`ToolCallCache`] populated at creation time
+/// rather than re-deriving it from the completion notification's (usually absent)
+/// `title` field.
+fn build_tool_result_update(
+    tool_call_id: &str,
+    title: Option<&str>,
+    status: ToolCallStatus,
+    content: &[ToolCallContent],
+) -> Option<AcpUpdate> {
+    if !matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed) {
         return None;
     }
     let text = tool_call_content_to_text(content);
@@ -592,11 +627,74 @@ fn maybe_tool_result_update(
     })
 }
 
+/// Handle a `SessionUpdate::ToolCall` (creation) notification: `title` is guaranteed
+/// present here, so this is the one point where MCP-vs-native classification can be
+/// made reliably. Caches the classification (and a best-effort tool name) under
+/// `tool_call_id` so the later completing `ToolCallUpdate` — which per the ACP "only
+/// changed fields" convention typically omits `title` — can look it back up instead of
+/// misclassifying an MCP call as native.
+///
+/// Also returns a recordable [`AcpUpdate::ToolResult`] in the (uncommon) case where the
+/// tool call already arrives in a terminal status at creation time.
+fn handle_tool_call_notification(cache: &ToolCallCache, tc: &ToolCall) -> Option<AcpUpdate> {
+    let tool_call_id = tc.tool_call_id.0.to_string();
+    let is_mcp = is_nevoflux_mcp_tool_call(&tool_call_id, Some(tc.title.as_str()));
+    let tool_name = extract_tool_name_from_id(&tool_call_id).or_else(|| Some(tc.title.clone()));
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(tool_call_id.clone(), ToolCallMeta { is_mcp, tool_name });
+    }
+    maybe_tool_result_update(
+        &tool_call_id,
+        Some(tc.title.as_str()),
+        tc.status,
+        &tc.content,
+    )
+}
+
+/// Handle a `SessionUpdate::ToolCallUpdate` (completion, typically) notification.
+/// Resolves the MCP-vs-native classification from the [`ToolCallCache`] populated by
+/// [`handle_tool_call_notification`] rather than re-deriving it from this notification's
+/// own (usually absent) `title` field — this is the fix for the double-recording bug:
+/// a claude-code native tool call's `tool_call_id` is an opaque `toolu_...` with no MCP
+/// marker, and its completing update carries `title: None`, so without the cache lookup
+/// an MCP tool call looks identical to a native one at this point and gets forwarded
+/// (and double-recorded) here.
+fn handle_tool_call_update_notification(
+    cache: &ToolCallCache,
+    update: &ToolCallUpdate,
+) -> Option<AcpUpdate> {
+    let (status, content) = (update.fields.status?, update.fields.content.as_deref()?);
+    let tool_call_id = update.tool_call_id.0.to_string();
+    let cached = cache
+        .lock()
+        .ok()
+        .and_then(|c| c.get(&tool_call_id).cloned());
+
+    // Prefer the classification cached at creation time (title was present then).
+    // Fall back to computing from the update's own fields only when we never saw a
+    // creation notification for this tool_call_id (defensive).
+    let is_mcp = match &cached {
+        Some(meta) => meta.is_mcp,
+        None => is_nevoflux_mcp_tool_call(&tool_call_id, update.fields.title.as_deref()),
+    };
+    if is_mcp {
+        return None;
+    }
+
+    let title_hint = update
+        .fields
+        .title
+        .as_deref()
+        .or_else(|| cached.as_ref().and_then(|m| m.tool_name.as_deref()));
+    build_tool_result_update(&tool_call_id, title_hint, status, content)
+}
+
 async fn handle_requests(
     config: AcpProviderConfig,
     cx: JrConnectionCx<ClientToAgent>,
     rx: &mut mpsc::Receiver<ClientRequest>,
     prompt_response_tx: Arc<Mutex<Option<mpsc::Sender<AcpUpdate>>>>,
+    tool_call_cache: ToolCallCache,
     init_tx: oneshot::Sender<Result<InitializeResponse>>,
     tool_bridge: Option<Arc<mcp_bridge::McpToolBridge>>,
 ) -> std::result::Result<(), sacp::Error> {
@@ -689,6 +787,9 @@ async fn handle_requests(
                     "ACP: sending PromptRequest"
                 );
                 *prompt_response_tx.lock().unwrap() = Some(response_tx.clone());
+                // Fresh cache per prompt turn: bounds memory and avoids stale
+                // classifications from a prior turn's tool_call_ids leaking forward.
+                tool_call_cache.lock().unwrap().clear();
 
                 let response = cx
                     .send_request(PromptRequest::new(session_id, content))
@@ -755,6 +856,7 @@ async fn apply_session_mode(
 #[cfg(test)]
 mod tool_result_tests {
     use super::*;
+    use sacp::schema::ToolCallUpdateFields;
 
     fn text_block(text: &str) -> ToolCallContent {
         ToolCallContent::Content(Content::new(ContentBlock::Text(TextContent::new(text))))
@@ -829,12 +931,8 @@ mod tool_result_tests {
     #[test]
     fn records_failed_native_result_too() {
         let content = vec![text_block("command not found: frobnicate")];
-        let update = maybe_tool_result_update(
-            "toolu_02x",
-            Some("Bash"),
-            ToolCallStatus::Failed,
-            &content,
-        );
+        let update =
+            maybe_tool_result_update("toolu_02x", Some("Bash"), ToolCallStatus::Failed, &content);
         assert!(matches!(update, Some(AcpUpdate::ToolResult { .. })));
     }
 
@@ -842,8 +940,7 @@ mod tool_result_tests {
     fn skips_pending_and_in_progress_status() {
         let content = vec![text_block("partial output")];
         for status in [ToolCallStatus::Pending, ToolCallStatus::InProgress] {
-            let update =
-                maybe_tool_result_update("toolu_03x", Some("Bash"), status, &content);
+            let update = maybe_tool_result_update("toolu_03x", Some("Bash"), status, &content);
             assert!(update.is_none(), "status {status:?} should not record");
         }
     }
@@ -882,5 +979,90 @@ mod tool_result_tests {
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }
+    }
+
+    // -- tool_call_cache: creation -> completion (reproduces the production bug) ----
+    //
+    // claude-code's tool_call_id is an opaque `toolu_...` with no MCP marker. Per the
+    // ACP "only changed fields" convention, `title` is present on the creation
+    // notification (SessionUpdate::ToolCall) but absent on the completing
+    // ToolCallUpdate. Before the cache fix, `maybe_tool_result_update` was called
+    // directly on the completion notification's own fields — title: None — so an MCP
+    // tool call was misclassified as native and forwarded, double-recording it
+    // alongside `execute_mcp_tool`'s own record.
+
+    fn empty_cache() -> ToolCallCache {
+        Arc::new(Mutex::new(std::collections::HashMap::new()))
+    }
+
+    #[test]
+    fn mcp_tool_completion_is_skipped_even_though_update_has_no_title() {
+        let cache = empty_cache();
+
+        // Creation notification: title IS present and identifies the NevoFlux MCP tool.
+        let creation = ToolCall::new("toolu_ABC", "mcp__nevoflux-tools__browser_get_markdown");
+        let creation_result = handle_tool_call_notification(&cache, &creation);
+        // Not terminal at creation (default status), so nothing to forward yet.
+        assert!(creation_result.is_none());
+
+        // Completion notification: same tool_call_id, but per the ACP "only changed
+        // fields" convention, title is None here — this is the exact production shape.
+        let completion = ToolCallUpdate::new(
+            "toolu_ABC",
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Completed)
+                .content(vec![text_block("<html>page</html>")]),
+        );
+        let completion_result = handle_tool_call_update_notification(&cache, &completion);
+
+        assert!(
+            completion_result.is_none(),
+            "MCP tool completion must be skipped (already recorded by execute_mcp_tool), \
+             got {completion_result:?}"
+        );
+    }
+
+    #[test]
+    fn native_tool_completion_is_forwarded_even_though_update_has_no_title() {
+        let cache = empty_cache();
+
+        // Creation notification for a genuine native tool (e.g. claude-code's own Bash).
+        let creation = ToolCall::new("toolu_BASH1", "Bash");
+        let creation_result = handle_tool_call_notification(&cache, &creation);
+        assert!(creation_result.is_none());
+
+        // Completion notification: title omitted, same as production.
+        let completion = ToolCallUpdate::new(
+            "toolu_BASH1",
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Completed)
+                .content(vec![text_block("total 0\n-rw-r--r-- 1 a b 0 f.txt")]),
+        );
+        let completion_result = handle_tool_call_update_notification(&cache, &completion);
+
+        match completion_result {
+            Some(AcpUpdate::ToolResult { tool_name, content }) => {
+                assert_eq!(tool_name, "Bash");
+                assert_eq!(content, "total 0\n-rw-r--r-- 1 a b 0 f.txt");
+            }
+            other => panic!("expected native ToolResult to be forwarded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_without_prior_creation_falls_back_to_own_fields() {
+        // Defensive path: no cache entry (e.g. creation notification was missed).
+        let cache = empty_cache();
+        let completion = ToolCallUpdate::new(
+            "mcp_nevoflux-tools_browser_get_markdown-1774240394151",
+            ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Completed)
+                .content(vec![text_block("<html>page</html>")]),
+        );
+        let result = handle_tool_call_update_notification(&cache, &completion);
+        assert!(
+            result.is_none(),
+            "id-based MCP marker should still be caught without a cache entry"
+        );
     }
 }
