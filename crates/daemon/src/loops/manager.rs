@@ -40,6 +40,34 @@ pub fn db_str_to_agent_mode(s: &str) -> AgentMode {
     }
 }
 
+/// Re-check whether `id` is still eligible to claim a fire. Called by the
+/// dispatcher right before it commits to running an iteration (state ->
+/// `Running`, `execute()`).
+///
+/// This exists because `evaluate_gate` can await up to `FETCH_TIMEOUT` (5s,
+/// see `gate::DefaultFetcher`) for `http`/`bash` gates. A concurrent
+/// `LoopManager::cancel_loop` can flip the loop to a terminal state,
+/// decrement `pending_work`, tear down its trigger subscriptions, and
+/// `registry.remove(id)` while the dispatcher is suspended on that await.
+/// Resuming without this check would unconditionally overwrite
+/// `Cancelled`/`Failed` back to `Running`, run a full iteration the caller
+/// already cancelled, and finish by setting `Idle` — a zombie loop with no
+/// live triggers and a permanently undercounted `pending_work`.
+///
+/// A loop is still live iff its DB row exists in a non-terminal state
+/// (`Pending`/`Running`/`Idle`) AND it is still present in the in-memory
+/// registry. `cancel_loop_inner` performs both the terminal DB transition
+/// and the `registry.remove` as part of the same tear-down, so checking
+/// only one leaves a window if the two were ever to diverge — belt and
+/// suspenders.
+fn loop_still_live(repo: &LoopRepository<'_>, registry: &LoopRegistry, id: &LoopId) -> bool {
+    let db_live = matches!(
+        repo.get(id.as_ref()).ok().flatten().map(|r| r.state),
+        Some(LoopState::Pending) | Some(LoopState::Running) | Some(LoopState::Idle)
+    );
+    db_live && registry.contains(id)
+}
+
 #[derive(Debug, Clone)]
 pub struct CreateLoopArgs {
     pub session_id: String,
@@ -240,6 +268,26 @@ impl LoopManager {
                         _ => None,
                     }
                 };
+
+                // Race guard (see `loop_still_live` docs): `evaluate_gate`
+                // above is the only new `.await` point between the busy
+                // check and claiming this fire. A concurrent `cancel_loop`
+                // may have flipped this loop terminal, decremented
+                // `pending_work`, and torn it out of the registry while we
+                // were suspended there. Re-check now, before we commit to
+                // running — do NOT touch `pending_work` here, the cancel
+                // path already accounted for it.
+                {
+                    let live_db = executor_for_task.database();
+                    let live_repo = LoopRepository::new(&live_db);
+                    if !loop_still_live(&live_repo, &registry_for_task, &req.loop_id) {
+                        tracing::debug!(
+                            loop_id = %req.loop_id.as_ref(),
+                            "loop dispatcher: fire aborted, loop cancelled/removed during gate evaluation"
+                        );
+                        continue;
+                    }
+                }
 
                 let token = Arc::new(tokio_util::sync::CancellationToken::new());
                 registry_for_task.with_mut(&req.loop_id, |rt| {
@@ -1464,6 +1512,140 @@ mod tests {
         assert_eq!(
             rec.skipped_triggers, 0,
             "a run=true decision must not bump skipped_triggers"
+        );
+    }
+
+    /// Unit coverage for the `loop_still_live` guard extracted for the W3
+    /// gate-race fix: it must require BOTH a non-terminal DB row AND
+    /// registry membership, not either alone.
+    #[tokio::test]
+    async fn loop_still_live_requires_db_state_and_registry_membership() {
+        let storage = fresh();
+        let mgr = LoopManager::start(storage.database().clone());
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "time:5m".into(),
+                prompt_text: Some("p".into()),
+                wrapped_skill: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
+            })
+            .await
+            .unwrap();
+
+        let db = storage.database().clone();
+        let repo = LoopRepository::new(&db);
+
+        // Freshly created: armed in the DB, present in the registry -> live.
+        assert!(
+            loop_still_live(&repo, mgr.registry(), &id),
+            "a freshly created, non-terminal, registered loop must be live"
+        );
+
+        // Cancel: flips the DB row terminal AND removes the registry entry
+        // (the real-world transition this guard exists to catch).
+        mgr.cancel_loop(&id, true).await.unwrap();
+        assert!(
+            !loop_still_live(&repo, mgr.registry(), &id),
+            "a cancelled, deregistered loop must not be live"
+        );
+
+        // Belt-and-suspenders: even if the DB row were somehow non-terminal
+        // again but the registry entry is still gone, still not live.
+        let _ = repo.update_state(id.as_ref(), LoopState::Idle, current_timestamp());
+        assert!(
+            !loop_still_live(&repo, mgr.registry(), &id),
+            "registry absence alone must veto liveness even with a non-terminal DB row"
+        );
+
+        // A loop id that never existed.
+        let ghost = LoopId::generate();
+        assert!(
+            !loop_still_live(&repo, mgr.registry(), &ghost),
+            "a nonexistent loop id must not be live"
+        );
+    }
+
+    /// End-to-end reproduction of the dispatcher race (Task 3 zombie-loop
+    /// bug): a `bash` gate's `evaluate_gate(...).await` can take real wall
+    /// time (here, a short `sleep`). If a concurrent `cancel_loop(force)`
+    /// completes while the dispatcher is suspended in that await, the
+    /// dispatcher must NOT resurrect the loop by overwriting `Cancelled`
+    /// back to `Running`/`Idle`, must NOT execute an iteration, and must
+    /// leave `pending_work` exactly as the cancel path left it.
+    ///
+    /// Deliberately not `start_paused`: the race only exists because the
+    /// gate await is real wall-clock time (production uses a real
+    /// `tokio::process::Command` under a 5s timeout — see
+    /// `gate::DefaultFetcher`), so this test drives an actual child process
+    /// sleep to open the same window.
+    #[tokio::test]
+    async fn cancel_during_gate_await_does_not_resurrect_loop() {
+        use crate::event_bus::types::{BusEvent, PublisherIdentity};
+        use crate::event_bus::EventBus;
+        use std::sync::Arc;
+
+        let storage = fresh();
+        let bus = Arc::new(EventBus::new());
+        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus.clone()), None);
+
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "event:test:race".into(),
+                prompt_text: Some("p".into()),
+                wrapped_skill: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
+            })
+            .await
+            .unwrap();
+        // Long enough that the test's 100ms delay below reliably lands
+        // inside the await, short enough to keep the test fast.
+        set_gate(
+            &storage,
+            id.as_ref(),
+            "bash",
+            r#"{"command":"sleep 0.4 && echo v1"}"#,
+        );
+
+        bus.publish(BusEvent::ephemeral(
+            "test:race",
+            serde_json::json!({}),
+            PublisherIdentity::Internal,
+        ))
+        .await
+        .unwrap();
+
+        // Give the dispatcher time to dequeue the fire, clear the busy
+        // check, and enter `evaluate_gate`'s bash await — well before the
+        // 0.4s sleep resolves.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        mgr.cancel_loop(&id, true).await.unwrap();
+        assert!(
+            !mgr.has_pending_work(),
+            "cancel must decrement pending_work immediately, before the gate resolves"
+        );
+
+        // Wait past the gate's sleep so the dispatcher resumes. Pre-fix,
+        // this is where it would unconditionally overwrite `Cancelled`
+        // back to `Running` and run the iteration.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
+        assert_eq!(
+            rec.state,
+            LoopState::Cancelled,
+            "the post-gate liveness re-check must stop the dispatcher from resurrecting a \
+             loop that was cancelled while the gate was awaiting"
+        );
+        assert_eq!(
+            rec.iteration_count, 0,
+            "a fire aborted by the liveness re-check must not execute an iteration"
+        );
+        assert!(
+            !mgr.has_pending_work(),
+            "pending_work must stay correctly decremented, not re-armed by the aborted fire"
         );
     }
 }
