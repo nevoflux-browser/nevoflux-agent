@@ -526,7 +526,13 @@ pub async fn execute_mcp_tool(
     // (Phase 23 wires this; until then tool calls surface a clear error).
     if matches!(
         name,
-        "loop_create" | "loop_list" | "loop_cancel" | "loop_scratchpad_get" | "loop_scratchpad_set"
+        "loop_create"
+            | "loop_list"
+            | "loop_cancel"
+            | "loop_scratchpad_get"
+            | "loop_scratchpad_set"
+            | "loop_evolve"
+            | "loop_proposal_respond"
     ) {
         let mgr = match services.loop_manager.as_ref() {
             Some(m) => m,
@@ -563,6 +569,7 @@ pub async fn execute_mcp_tool(
             &ctx,
             mgr.as_ref(),
             services.database.as_ref(),
+            Some(services),
         )
         .await;
         return match result {

@@ -722,6 +722,26 @@ pub trait HostFunctions {
         })
     }
 
+    /// Run the `/loop evolve` self-improvement meta-pass (W4 task 3). JSON
+    /// args: {loop_id:string}. Returns JSON
+    /// {"id","rationale","has_prompt_text","has_gate_spec"}.
+    fn tool_loop_evolve(&self, _args_json: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_loop_evolve not supported by this host".into(),
+        })
+    }
+
+    /// Accept or reject a loop's pending self-improvement proposal (W4 task
+    /// 3). JSON args: {proposal_id:string, accept:bool}. Returns JSON
+    /// {"applied":bool,"status":string}.
+    fn tool_loop_proposal_respond(&self, _args_json: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "tool_loop_proposal_respond not supported by this host".into(),
+        })
+    }
+
     /// Record a completed tool's result so it can be surfaced as durable
     /// evidence (e.g. the goal evaluator's transcript and the continuation
     /// progress anchor). Default: no-op. Called once per tool execution in the

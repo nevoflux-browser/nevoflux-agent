@@ -242,6 +242,35 @@ impl LoopEvents {
             .await;
     }
 
+    /// Emitted when a human accepts or rejects a pending `/loop evolve`
+    /// proposal (W4 task 3), via `loop_proposal_respond`. Distinct from
+    /// `proposal` (which announces a new pending proposal) — this announces
+    /// its resolution, so a sidebar can clear the pending-review affordance
+    /// and, on accept, reflect the loop's new prompt_text/gate_spec.
+    pub async fn proposal_resolved(
+        &self,
+        session_id: &str,
+        id: &LoopId,
+        proposal_id: &str,
+        accepted: bool,
+    ) {
+        let Some(bus) = &self.bus else {
+            return;
+        };
+        let _ = bus
+            .publish(BusEvent::ephemeral(
+                "system:loop:proposal_resolved",
+                json!({
+                    "session_id": session_id,
+                    "loop_id": id.as_ref(),
+                    "proposal_id": proposal_id,
+                    "accepted": accepted,
+                }),
+                PublisherIdentity::Internal,
+            ))
+            .await;
+    }
+
     pub async fn cancelled(&self, session_id: &str, id: &LoopId, by: &str, force: bool) {
         let Some(bus) = &self.bus else {
             return;
@@ -300,5 +329,6 @@ mod tests {
             status: "pending".into(),
         };
         evts.proposal("s1", &id, &p).await;
+        evts.proposal_resolved("s1", &id, "prop-1", true).await;
     }
 }

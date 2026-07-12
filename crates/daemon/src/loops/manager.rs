@@ -384,6 +384,17 @@ impl LoopManager {
                     .execute(req.loop_id.clone(), req.fire_reason, gate_output)
                     .await;
 
+                // TODO(W4-followup): auto-evolve every N iterations. Once
+                // there's an appetite for it, read `rec.iteration_count`
+                // here (post-increment, via `LoopRepository::get`) and, when
+                // it's a multiple of some threshold N and there's no
+                // existing `latest_pending_proposal`, spawn
+                // `crate::loops::evolve::evolve_loop` fire-and-forget (it
+                // already persists the proposal + emits
+                // `system:loop:proposal` on its own). v1 (this task) is
+                // manual-only: evolve only runs when a human/LLM explicitly
+                // calls the `loop_evolve` tool.
+
                 // 3-strike auto-cancel hook — depends on Phase 9b filling
                 // in real failure counting. Reads the current
                 // consecutive_failures and trips a soft cancel-equivalent

@@ -2402,6 +2402,12 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             "loop_scratchpad_set" => self.host.tool_loop_scratchpad_set(
                 &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
             )?,
+            "loop_evolve" => self.host.tool_loop_evolve(
+                &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
+            )?,
+            "loop_proposal_respond" => self.host.tool_loop_proposal_respond(
+                &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
+            )?,
             // /schedule skill tools — direct-API dispatch (Anthropic / OpenAI
             // direct providers). The MCP/ACP path goes through
             // `mcp_tool_executor::execute_mcp_tool::schedule_*`.
@@ -2526,6 +2532,8 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 | "loop_cancel"
                 | "loop_scratchpad_get"
                 | "loop_scratchpad_set"
+                | "loop_evolve"
+                | "loop_proposal_respond"
                 | "schedule_create"
                 | "schedule_list"
                 | "schedule_cancel"
@@ -3712,6 +3720,27 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     "type": "object",
                     "properties": { "content": { "type": "string" } },
                     "required": ["content"]
+                }),
+            },
+            ToolDefinition {
+                name: "loop_evolve".into(),
+                description: "Ask the loop to propose improvements to itself (contract/gate) based on its recent runs; creates a proposal for the user to accept or reject.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "loop_id": { "type": "string" } },
+                    "required": ["loop_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "loop_proposal_respond".into(),
+                description: "Accept (apply) or reject a loop's pending self-improvement proposal.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "proposal_id": { "type": "string" },
+                        "accept": { "type": "boolean" }
+                    },
+                    "required": ["proposal_id", "accept"]
                 }),
             },
             // /schedule skill tools (Task 1.6).

@@ -178,6 +178,14 @@ pub(crate) fn evolve_forbidden_prefixes() -> Vec<String> {
         "tts_",
         "loop_cancel",
         "loop_scratchpad_set",
+        // W4 task 3: the meta-pass must not be able to kick off a nested
+        // evolve run on itself, nor accept/reject the very proposal it is
+        // about to produce — both would let the loop's own (possibly
+        // adversarial, since it's built from `final_text`) reasoning
+        // self-apply changes without the human-in-the-loop review the
+        // whole feature exists to enforce.
+        "loop_evolve",
+        "loop_proposal_respond",
         "schedule_cancel",
         "schedule_pause",
         "schedule_resume",
@@ -402,6 +410,8 @@ mod tests {
             "tts_",
             "loop_cancel",
             "loop_scratchpad_set",
+            "loop_evolve",
+            "loop_proposal_respond",
         ] {
             assert!(
                 list.iter().any(|p| p == expected),
@@ -415,7 +425,8 @@ mod tests {
     }
 
     /// Snapshot of `builtin-wasm::Agent::get_chat_tools()`'s tool names
-    /// (captured 2026-07-12; update if that catalog changes). Used to prove
+    /// (captured 2026-07-12, updated same day to add `loop_evolve` /
+    /// `loop_proposal_respond` — W4 task 3). Used to prove
     /// the actual filter (`forbidden_tools` from `iteration_forbidden_tools()`
     /// + `forbidden_prefixes` from `evolve_forbidden_prefixes()`, exactly as
     /// `evolve_loop` passes to `AgentExecRequest`) reduces the full Chat
@@ -457,6 +468,8 @@ mod tests {
             "loop_cancel",
             "loop_scratchpad_get",
             "loop_scratchpad_set",
+            "loop_evolve",
+            "loop_proposal_respond",
             "schedule_create",
             "schedule_list",
             "schedule_cancel",
@@ -497,6 +510,10 @@ mod tests {
             "ask_user",
             "goal_set",
             "schedule_create",
+            // W4 task 3: the meta-pass must not be able to spawn a nested
+            // evolve run or self-resolve its own proposal.
+            "loop_evolve",
+            "loop_proposal_respond",
             // rest of the mutating/control-plane surface:
             "switch_model",
             "skill_load",
