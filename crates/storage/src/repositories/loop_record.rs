@@ -5,6 +5,7 @@ use rusqlite::{params, OptionalExtension, Row};
 use crate::connection::Database;
 use crate::error::{Result, StorageError};
 use crate::models::{IterationStatus, LoopRecord, LoopState};
+use crate::repositories::truncate_final_text;
 
 pub struct LoopRepository<'a> {
     db: &'a Database,
@@ -188,6 +189,10 @@ impl<'a> LoopRepository<'a> {
         final_text: Option<&str>,
         tokens_used: Option<i64>,
     ) -> Result<()> {
+        // Cap final_text at 4096 chars, same as `schedule_runs.final_text`
+        // (ScheduleRepository::record_run_end) and the event payload cap in
+        // `daemon::loops::events::iteration_end`.
+        let final_text_capped = final_text.map(truncate_final_text);
         self.db.with_connection(|conn| {
             conn.execute(
                 "UPDATE loop_iterations
@@ -199,7 +204,7 @@ impl<'a> LoopRepository<'a> {
                     status.as_str(),
                     error,
                     tool_calls_json,
-                    final_text,
+                    final_text_capped,
                     tokens_used,
                     iteration_id
                 ],
@@ -493,6 +498,45 @@ mod tests {
             .unwrap();
         assert_eq!(row.0.as_deref(), Some("digested 3 new items"));
         assert_eq!(row.1, Some(1234));
+    }
+
+    #[test]
+    fn finish_iteration_truncates_final_text_over_4096_chars() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        let id = repo
+            .insert_iteration("abc", 1, 100, IterationStatus::Running)
+            .unwrap();
+        let long_text = "x".repeat(5000);
+        repo.finish_iteration(
+            id,
+            110,
+            IterationStatus::Ok,
+            None,
+            None,
+            Some(&long_text),
+            None,
+        )
+        .unwrap();
+        let stored: Option<String> = s
+            .database()
+            .with_connection(|c| {
+                c.query_row(
+                    "SELECT final_text FROM loop_iterations WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .map_err(crate::error::StorageError::from)
+            })
+            .unwrap();
+        let stored = stored.expect("final_text should be stored");
+        assert!(
+            stored.chars().count() <= 4096,
+            "stored final_text length {} exceeds cap",
+            stored.chars().count()
+        );
+        assert_eq!(stored.chars().count(), 4096);
     }
 
     #[test]
