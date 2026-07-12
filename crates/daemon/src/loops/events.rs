@@ -186,6 +186,29 @@ impl LoopEvents {
             .await;
     }
 
+    /// Emitted when a deterministic gate (W3 §gate) suppresses an iteration
+    /// for a trigger fire — distinct from `trigger_dropped` (concurrent-run
+    /// coalescing). Both bump `skipped_triggers`; this one carries the fire
+    /// reason instead of a coalesced-count so sidebar consumers can tell
+    /// "gate said no" apart from "loop was busy".
+    pub async fn skipped(&self, session_id: &str, id: &LoopId, fire_reason: &str) {
+        let Some(bus) = &self.bus else {
+            return;
+        };
+        let _ = bus
+            .publish(BusEvent::ephemeral(
+                "system:loop:skipped",
+                json!({
+                    "session_id": session_id,
+                    "loop_id": id.as_ref(),
+                    "fire_reason": fire_reason,
+                    "reason": "gate",
+                }),
+                PublisherIdentity::Internal,
+            ))
+            .await;
+    }
+
     pub async fn cancelled(&self, session_id: &str, id: &LoopId, by: &str, force: bool) {
         let Some(bus) = &self.bus else {
             return;
@@ -222,6 +245,7 @@ mod tests {
             .await;
         evts.scratchpad_changed("s1", &id, "k=v").await;
         evts.trigger_dropped("s1", &id, 1).await;
+        evts.skipped("s1", &id, "time").await;
         evts.cancelled("s1", &id, "user", false).await;
     }
 }

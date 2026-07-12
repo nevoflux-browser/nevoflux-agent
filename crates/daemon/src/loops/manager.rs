@@ -121,6 +121,9 @@ impl LoopManager {
         let events_for_task = events.clone();
         let scheduler_for_task = scheduler.clone();
         let fire_tx_for_task = fire_tx.clone();
+        // Zero-sized real network/exec boundary for the gate evaluator
+        // (W3 §gate) — `Copy`, constructed once and reused across fires.
+        let default_fetcher = crate::loops::gate::DefaultFetcher;
         tokio::spawn(async move {
             while let Some(initial_req) = fire_rx.recv().await {
                 // SKILL.md §8.2 "drop if currently running": the dispatcher is
@@ -183,6 +186,61 @@ impl LoopManager {
                     continue;
                 }
 
+                // W3 §gate: a deterministic gate suppresses this fire unless
+                // its observed value changed (http/bash diff) or the firing
+                // event's payload matched a predicate (event gate).
+                // `GateKind::None` (the default) always runs and produces no
+                // gate_output. Every evaluator error path is fail-open (see
+                // `gate::evaluate_gate` module docs), so a malformed spec or
+                // a failed fetch still lets the iteration run.
+                let gate_output: Option<String> = {
+                    let gate_db = executor_for_task.database();
+                    let repo = LoopRepository::new(&gate_db);
+                    let rec = repo.get(req.loop_id.as_ref()).ok().flatten();
+                    match rec {
+                        Some(rec) if rec.gate_kind != "none" => {
+                            let kind =
+                                crate::loops::types::GateKind::from_db_str(&rec.gate_kind)
+                                    .unwrap_or(crate::loops::types::GateKind::None);
+                            let spec_json = rec
+                                .gate_spec
+                                .as_deref()
+                                .and_then(|s| serde_json::from_str(s).ok())
+                                .unwrap_or(serde_json::Value::Null);
+                            let spec = crate::loops::types::GateSpec { kind, spec_json };
+                            let decision = crate::loops::gate::evaluate_gate(
+                                &spec,
+                                rec.gate_last_value.as_deref(),
+                                req.event_payload.as_ref(),
+                                &default_fetcher,
+                            )
+                            .await;
+
+                            if !decision.run {
+                                let now = current_timestamp();
+                                let _ = repo.increment_skipped(req.loop_id.as_ref(), now);
+                                let session_id = registry_for_task
+                                    .with_mut(&req.loop_id, |rt| rt.session_id.clone())
+                                    .unwrap_or_default();
+                                events_for_task
+                                    .skipped(&session_id, &req.loop_id, &req.fire_reason)
+                                    .await;
+                                continue;
+                            }
+
+                            if let Some(val) = &decision.new_last_value {
+                                let _ = repo.set_gate_last_value(
+                                    req.loop_id.as_ref(),
+                                    val,
+                                    current_timestamp(),
+                                );
+                            }
+                            decision.gate_output
+                        }
+                        _ => None,
+                    }
+                };
+
                 let token = Arc::new(tokio_util::sync::CancellationToken::new());
                 registry_for_task.with_mut(&req.loop_id, |rt| {
                     rt.current_iteration = Some(token.clone());
@@ -222,7 +280,7 @@ impl LoopManager {
                     .await;
 
                 let exec_result = executor_for_task
-                    .execute(req.loop_id.clone(), req.fire_reason)
+                    .execute(req.loop_id.clone(), req.fire_reason, gate_output)
                     .await;
 
                 // 3-strike auto-cancel hook — depends on Phase 9b filling
@@ -723,6 +781,7 @@ impl LoopManager {
                     .send(LoopFireRequest {
                         loop_id: id_for_forward.clone(),
                         fire_reason: format!("combinator:{}", label_owned),
+                        event_payload: None,
                     })
                     .await
                     .is_err()
@@ -1272,6 +1331,139 @@ mod tests {
             rec.iteration_count >= 1,
             "state:* trigger should fire on dom mutation; got {}",
             rec.iteration_count
+        );
+    }
+
+    /// Attach a gate directly on the DB row (no `create_loop` support for
+    /// gates yet — gate columns are always `"none"`/`NULL` at creation).
+    /// Mirrors the raw-SQL pattern `LoopManager::shutdown` uses.
+    fn set_gate(storage: &Storage, loop_id: &str, kind: &str, spec_json: &str) {
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE loops SET gate_kind = ?1, gate_spec = ?2 WHERE id = ?3",
+                    rusqlite::params![kind, spec_json, loop_id],
+                )
+                .map(|_| ())
+                .map_err(nevoflux_storage::error::StorageError::from)
+            })
+            .unwrap();
+    }
+
+    /// W3 §gate dispatcher wiring, Step 1 of task-3: a gate whose decision is
+    /// `run=false` must suppress the iteration entirely (no executor call),
+    /// must bump `skipped_triggers` (distinct counter from the busy-drop
+    /// path), and must emit a `system:loop:skipped` event. Uses an `event`
+    /// gate so the test needs no network/bash fetcher — `evaluate_gate`'s
+    /// event path reads only `LoopFireRequest.event_payload`.
+    #[tokio::test]
+    async fn gate_skip_suppresses_iteration_and_emits_skipped() {
+        use crate::event_bus::types::{
+            BackpressurePolicy, BusEvent, PublisherIdentity, SubscriberIdentity, TopicPattern,
+        };
+        use crate::event_bus::EventBus;
+        use std::sync::Arc;
+
+        let storage = fresh();
+        let bus = Arc::new(EventBus::new());
+        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus.clone()), None);
+
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "event:test:gate".into(),
+                prompt_text: Some("p".into()),
+                wrapped_skill: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
+            })
+            .await
+            .unwrap();
+        set_gate(&storage, id.as_ref(), "event", r#"{"path":"type","equals":"go"}"#);
+
+        // Subscribe before publishing — ephemeral delivery has no replay.
+        let skipped_handle = bus
+            .subscribe(
+                TopicPattern::Exact("system:loop:skipped".into()),
+                SubscriberIdentity::Internal,
+                BackpressurePolicy::DropOldest,
+                8,
+            )
+            .expect("subscribe to skipped events");
+        let mut skipped_rx = skipped_handle.rx;
+
+        // Payload doesn't match the gate's predicate -> must skip.
+        bus.publish(BusEvent::ephemeral(
+            "test:gate",
+            serde_json::json!({"type": "not-go"}),
+            PublisherIdentity::Internal,
+        ))
+        .await
+        .unwrap();
+
+        let skipped_event =
+            tokio::time::timeout(std::time::Duration::from_millis(500), skipped_rx.recv())
+                .await
+                .expect("system:loop:skipped should fire")
+                .expect("skipped event payload");
+        assert_eq!(skipped_event.payload["loop_id"], id.as_ref());
+
+        let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
+        assert_eq!(
+            rec.iteration_count, 0,
+            "gate run=false must not call the executor"
+        );
+        assert_eq!(
+            rec.skipped_triggers, 1,
+            "gate skip must bump skipped_triggers"
+        );
+    }
+
+    /// W3 §gate dispatcher wiring: a gate whose decision is `run=true` must
+    /// let the fire proceed to `IterationExecutor::execute` as normal (same
+    /// event gate as the skip test above, but with a matching payload).
+    #[tokio::test]
+    async fn gate_run_executes_iteration() {
+        use crate::event_bus::types::{BusEvent, PublisherIdentity};
+        use crate::event_bus::EventBus;
+        use std::sync::Arc;
+
+        let storage = fresh();
+        let bus = Arc::new(EventBus::new());
+        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus.clone()), None);
+
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "event:test:gate".into(),
+                prompt_text: Some("p".into()),
+                wrapped_skill: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
+            })
+            .await
+            .unwrap();
+        set_gate(&storage, id.as_ref(), "event", r#"{"path":"type","equals":"go"}"#);
+
+        // Payload matches the gate's predicate -> must run.
+        bus.publish(BusEvent::ephemeral(
+            "test:gate",
+            serde_json::json!({"type": "go"}),
+            PublisherIdentity::Internal,
+        ))
+        .await
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
+        assert!(
+            rec.iteration_count >= 1,
+            "gate run=true must still execute the iteration; got {}",
+            rec.iteration_count
+        );
+        assert_eq!(
+            rec.skipped_triggers, 0,
+            "a run=true decision must not bump skipped_triggers"
         );
     }
 }

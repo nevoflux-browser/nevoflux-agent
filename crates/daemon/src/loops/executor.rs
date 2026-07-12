@@ -130,7 +130,17 @@ impl IterationExecutor {
 
     /// Run a single iteration. See module-level docs for the
     /// production-vs-stub split and intentionally-skipped wiring.
-    pub async fn execute(&self, loop_id: LoopId, fire_reason: String) -> ExecResult {
+    ///
+    /// `gate_output` is the deterministic gate's observed value for this
+    /// fire (W3 §gate), when the loop has a gate configured and it decided
+    /// to run — `None` for gate-less loops or fires with no gate output.
+    /// Threaded into the `<LOOP-CONTEXT>` block via `build_user_message`.
+    pub async fn execute(
+        &self,
+        loop_id: LoopId,
+        fire_reason: String,
+        gate_output: Option<String>,
+    ) -> ExecResult {
         let repo = LoopRepository::new(&self.db);
         let now = current_timestamp();
 
@@ -164,8 +174,15 @@ impl IterationExecutor {
         // forbidden in iteration context (`ask_user`, `loop_create`) are
         // stripped from the resulting allowlist.
         let iter_mode = db_str_to_agent_mode(&rec.mode);
-        let user_message =
-            build_user_message(&rec, seq, &fire_reason, &self.db, self.services.as_ref()).await;
+        let user_message = build_user_message(
+            &rec,
+            seq,
+            &fire_reason,
+            &self.db,
+            self.services.as_ref(),
+            gate_output.as_deref(),
+        )
+        .await;
 
         // Stub path: no services → record ok without invoking LLM.
         // Preserves Phase-6 test semantics. Production callers always
@@ -328,6 +345,7 @@ pub(crate) async fn build_user_message(
     fire_reason: &str,
     db: &Database,
     services: Option<&HostServices>,
+    gate_output: Option<&str>,
 ) -> String {
     let scratchpad = if rec.scratchpad.is_empty() {
         "(empty)"
@@ -374,6 +392,16 @@ pub(crate) async fn build_user_message(
         }
     };
 
+    // W3 §gate: only present when the loop has a deterministic gate that
+    // ran and produced an observed value for this fire (http/bash diff, or
+    // the matched event payload). Absent for gate-less loops and for gate
+    // decisions with no output (`GateKind::None`, event gates with no
+    // extracted value).
+    let gate_block = match gate_output {
+        Some(v) if !v.is_empty() => format!("gate_output:\n{}\n", v),
+        _ => String::new(),
+    };
+
     format!(
         "<LOOP-CONTEXT>\n\
          loop_id={}\n\
@@ -382,7 +410,7 @@ pub(crate) async fn build_user_message(
          fire_reason={}\n\
          scratchpad_bytes={}\n\
          scratchpad:\n{}\n\
-         {}</LOOP-CONTEXT>\n\
+         {}{}</LOOP-CONTEXT>\n\
          \n\
          {}",
         rec.id,
@@ -392,6 +420,7 @@ pub(crate) async fn build_user_message(
         rec.scratchpad.len(),
         scratchpad,
         recent_block,
+        gate_block,
         body,
     )
 }
@@ -481,7 +510,7 @@ mod tests {
     async fn loop_context_block_includes_required_fields() {
         let storage = Storage::open_in_memory().unwrap();
         let rec = sample_loop("abcd1234");
-        let s = build_user_message(&rec, 1, "time", storage.database(), None).await;
+        let s = build_user_message(&rec, 1, "time", storage.database(), None, None).await;
         assert!(s.contains("loop_id=abcd1234"));
         assert!(s.contains("iteration=1"));
         assert!(s.contains("trigger=time:5m"));
@@ -496,7 +525,7 @@ mod tests {
         let storage = Storage::open_in_memory().unwrap();
         let mut rec = sample_loop("a");
         rec.scratchpad.clear();
-        let s = build_user_message(&rec, 1, "time", storage.database(), None).await;
+        let s = build_user_message(&rec, 1, "time", storage.database(), None, None).await;
         assert!(s.contains("scratchpad_bytes=0"));
         assert!(s.contains("(empty)"));
     }
@@ -507,10 +536,47 @@ mod tests {
         let mut rec = sample_loop("a");
         rec.prompt_text = None;
         rec.wrapped_skill = Some(r#"{"name":"video","args":{}}"#.into());
-        let s = build_user_message(&rec, 1, "time", storage.database(), None).await;
+        let s = build_user_message(&rec, 1, "time", storage.database(), None, None).await;
         // services=None → "(wrapped_skill <name>: no skill registry available)"
         assert!(s.contains("video"));
         assert!(s.contains("no skill registry available"));
+    }
+
+    /// W3 §gate: when the dispatcher's gate evaluator produced an observed
+    /// value for this fire (http/bash diff, or a matched event payload), it
+    /// must land in the `<LOOP-CONTEXT>` block so the iteration's LLM can
+    /// see what changed.
+    #[tokio::test]
+    async fn loop_context_includes_gate_output_when_present() {
+        let storage = Storage::open_in_memory().unwrap();
+        let rec = sample_loop("abcd1234");
+        let s = build_user_message(
+            &rec,
+            1,
+            "event:test:gate",
+            storage.database(),
+            None,
+            Some("observed-42"),
+        )
+        .await;
+        assert!(
+            s.contains("gate_output:\nobserved-42"),
+            "expected gate_output section in: {s}"
+        );
+        // Must still land inside the <LOOP-CONTEXT> block, before the closing tag.
+        let ctx_end = s.find("</LOOP-CONTEXT>").expect("context block present");
+        let gate_pos = s.find("gate_output:").expect("gate_output present");
+        assert!(gate_pos < ctx_end, "gate_output must be inside LOOP-CONTEXT");
+    }
+
+    /// Gate-less loops (`GateKind::None`, the default) and gate decisions
+    /// with no output must not add a spurious `gate_output:` section.
+    #[tokio::test]
+    async fn loop_context_omits_gate_output_when_absent() {
+        let storage = Storage::open_in_memory().unwrap();
+        let rec = sample_loop("abcd1234");
+        let s = build_user_message(&rec, 1, "time", storage.database(), None, None).await;
+        assert!(!s.contains("gate_output:"));
     }
 
     #[tokio::test]
@@ -539,7 +605,7 @@ mod tests {
             )
             .unwrap();
 
-        let msg = build_user_message(&rec, 2, "time", storage.database(), None).await;
+        let msg = build_user_message(&rec, 2, "time", storage.database(), None, None).await;
         assert!(msg.contains("recent_runs"));
         assert!(msg.contains("prior result"));
     }
@@ -582,7 +648,7 @@ mod tests {
             .unwrap();
 
         // Must return normally, not panic on a mid-codepoint byte slice.
-        let msg = build_user_message(&rec, 2, "time", storage.database(), None).await;
+        let msg = build_user_message(&rec, 2, "time", storage.database(), None, None).await;
 
         let expected_truncated: String = final_text.chars().take(200).collect();
         assert!(
@@ -605,7 +671,7 @@ mod tests {
         storage.loops().create(&sample_loop("abc")).unwrap();
 
         let executor = IterationExecutor::new(storage.database().clone());
-        let result = executor.execute(LoopId("abc".into()), "time".into()).await;
+        let result = executor.execute(LoopId("abc".into()), "time".into(), None).await;
 
         assert!(result.is_ok(), "expected ok-variant, got {:?}", result);
         // Stub path (no services wired) — claims success without text.
@@ -619,7 +685,7 @@ mod tests {
     async fn execute_returns_error_for_missing_loop() {
         let storage = Storage::open_in_memory().unwrap();
         let executor = IterationExecutor::new(storage.database().clone());
-        let result = executor.execute(LoopId("nope".into()), "time".into()).await;
+        let result = executor.execute(LoopId("nope".into()), "time".into(), None).await;
         assert!(matches!(result, ExecResult::Error(_)));
     }
 
@@ -635,7 +701,7 @@ mod tests {
         storage.loops().create(&rec).unwrap();
 
         let executor = IterationExecutor::new(storage.database().clone());
-        let result = executor.execute(LoopId("rst".into()), "time".into()).await;
+        let result = executor.execute(LoopId("rst".into()), "time".into(), None).await;
         assert!(result.is_ok());
 
         let after = storage.loops().get("rst").unwrap().unwrap();

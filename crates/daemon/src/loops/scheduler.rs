@@ -14,6 +14,12 @@ use tokio_util::sync::CancellationToken;
 pub struct LoopFireRequest {
     pub loop_id: LoopId,
     pub fire_reason: String,
+    /// The triggering bus event's payload, for event-driven fires only.
+    /// `None` for time-based fires (`schedule_time`) and for combinator
+    /// forwarding, where there's no single originating event payload.
+    /// Threaded through to the dispatcher's gate evaluation
+    /// (`GateKind::Event` reads this).
+    pub event_payload: Option<serde_json::Value>,
 }
 
 #[derive(Default, Clone)]
@@ -48,6 +54,7 @@ impl TriggerScheduler {
                         if sink.send(LoopFireRequest {
                             loop_id: id.clone(),
                             fire_reason: "time".into(),
+                            event_payload: None,
                         }).await.is_err() {
                             return;
                         }
@@ -117,7 +124,7 @@ impl TriggerScheduler {
                         return;
                     }
                     msg = rx.recv() => match msg {
-                        Some(_event) => {
+                        Some(event) => {
                             tracing::debug!(
                                 loop_id = %id.as_ref(),
                                 topic = %topic_label,
@@ -126,6 +133,7 @@ impl TriggerScheduler {
                             if sink.send(LoopFireRequest {
                                 loop_id: id.clone(),
                                 fire_reason: format!("event:{}", topic_label),
+                                event_payload: Some(event.payload.clone()),
                             }).await.is_err() {
                                 tracing::warn!(
                                     loop_id = %id.as_ref(),
@@ -190,6 +198,10 @@ mod tests {
         let r = rx.recv().await.expect("first fire");
         assert_eq!(r.loop_id.as_ref(), "abc");
         assert_eq!(r.fire_reason, "time");
+        assert_eq!(
+            r.event_payload, None,
+            "time-based fires carry no event payload"
+        );
 
         // Second fire 60s later.
         tokio::time::advance(Duration::from_secs(60)).await;
@@ -279,6 +291,45 @@ mod tests {
         ).await.expect("event fire").expect("fire request");
         assert_eq!(r.loop_id.as_ref(), "a");
         assert_eq!(r.fire_reason, "event:ui:test:click");
+
+        sched.unsubscribe(&sub);
+    }
+
+    /// The dispatcher's gate evaluator (`GateKind::Event`) reads
+    /// `LoopFireRequest.event_payload`, so `schedule_event` must carry the
+    /// originating bus event's payload through — not just the topic-derived
+    /// `fire_reason` string. Time-based fires (`schedule_time`, tested in
+    /// `fires_every_interval` above) are the contrasting case: `event_payload`
+    /// stays `None` there since there's no originating event.
+    #[tokio::test]
+    async fn schedule_event_populates_event_payload() {
+        use crate::event_bus::types::{BusEvent, PublisherIdentity};
+        use crate::event_bus::EventBus;
+        use std::sync::Arc;
+
+        let bus = Arc::new(EventBus::new());
+        let sched = TriggerScheduler::new();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let sub = sched.schedule_event(
+            LoopId("a".into()),
+            "ui:test:click".into(),
+            bus.clone(),
+            tx,
+        ).expect("schedule_event");
+
+        let payload = serde_json::json!({"kind": "click", "count": 3});
+        bus.publish(BusEvent::ephemeral(
+            "ui:test:click",
+            payload.clone(),
+            PublisherIdentity::Internal,
+        )).await.unwrap();
+
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            rx.recv(),
+        ).await.expect("event fire").expect("fire request");
+        assert_eq!(r.event_payload, Some(payload));
 
         sched.unsubscribe(&sub);
     }
