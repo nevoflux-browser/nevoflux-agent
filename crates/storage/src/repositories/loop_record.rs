@@ -70,6 +70,30 @@ impl<'a> LoopRepository<'a> {
         })
     }
 
+    /// Atomically transition a loop into a terminal state (`Cancelled` /
+    /// `Failed`), but only if it is not already terminal. Returns whether a
+    /// row actually flipped. This is the concurrency primitive for every
+    /// caller that pairs a `pending_work` decrement with a terminal
+    /// transition (cancel, dispatcher auto-fail): two racing writers (a
+    /// double cancel, or cancel racing the 3-strike auto-fail) are
+    /// serialized by SQLite and exactly one observes `true`, so the
+    /// decrement can never be paired with a stale read-then-write snapshot.
+    /// Mirrors `ScheduleRepository::transition_status`.
+    pub fn transition_to_terminal(&self, id: &str, new_state: LoopState, now: i64) -> Result<bool> {
+        debug_assert!(
+            matches!(new_state, LoopState::Cancelled | LoopState::Failed),
+            "transition_to_terminal must target a terminal state"
+        );
+        self.db.with_connection(|conn| {
+            let n = conn.execute(
+                "UPDATE loops SET state = ?1, updated_at = ?2
+                 WHERE id = ?3 AND state NOT IN ('cancelled', 'failed')",
+                params![new_state.as_str(), now, id],
+            )?;
+            Ok(n > 0)
+        })
+    }
+
     pub fn update_scratchpad(&self, id: &str, content: &str, now: i64) -> Result<()> {
         // Note: 4096-byte cap is enforced by the SQL CHECK; we let it raise.
         self.db.with_connection(|conn| {
@@ -449,6 +473,46 @@ mod tests {
         let in_s1 = repo.list_by_session("s1").unwrap();
         assert_eq!(in_s1.len(), 1);
         assert_eq!(in_s1[0].id, "a");
+    }
+
+    #[test]
+    fn transition_to_terminal_flips_non_terminal_row() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+
+        let flipped = repo
+            .transition_to_terminal("abc", LoopState::Cancelled, 200)
+            .unwrap();
+        assert!(flipped, "pending -> cancelled must flip");
+        assert_eq!(
+            repo.get("abc").unwrap().unwrap().state,
+            LoopState::Cancelled
+        );
+    }
+
+    #[test]
+    fn transition_to_terminal_is_noop_when_already_terminal() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+
+        let first = repo
+            .transition_to_terminal("abc", LoopState::Cancelled, 200)
+            .unwrap();
+        assert!(first);
+
+        // Racing second caller (e.g. concurrent cancel, or cancel racing an
+        // auto-fail) must observe `false` and must NOT clobber the row.
+        let second = repo
+            .transition_to_terminal("abc", LoopState::Failed, 201)
+            .unwrap();
+        assert!(!second, "already-terminal row must not flip again");
+        assert_eq!(
+            repo.get("abc").unwrap().unwrap().state,
+            LoopState::Cancelled,
+            "state must stay at the state the winning transition set"
+        );
     }
 
     #[test]

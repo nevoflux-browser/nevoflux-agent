@@ -14,6 +14,7 @@ use nevoflux_builtin_wasm::AgentMode;
 use nevoflux_storage::connection::Database;
 use nevoflux_storage::models::{current_timestamp, LoopRecord, LoopState};
 use nevoflux_storage::repositories::LoopRepository;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -61,7 +62,7 @@ pub struct LoopManager {
     event_bus: Option<Arc<EventBus>>,
     /// Count of armed (non-terminal) loops. A managed daemon must outlive its
     /// browser while any loop is armed — mirrors `ScheduleManager::pending_work`.
-    pending_work: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pending_work: Arc<AtomicUsize>,
 }
 
 impl LoopManager {
@@ -112,7 +113,7 @@ impl LoopManager {
                 .map_err(nevoflux_storage::error::StorageError::from)
             })
             .unwrap_or(0);
-        let pending_work = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(armed as usize));
+        let pending_work = Arc::new(AtomicUsize::new(armed as usize));
         let pending_work_for_task = pending_work.clone();
 
         let registry_for_task = registry.clone();
@@ -257,36 +258,37 @@ impl LoopManager {
                         scheduler_for_task.unsubscribe(sub);
                     }
                     let _ = watchers;
-                    // Guard against double-decrement: only the transition
-                    // INTO a terminal state decrements pending_work. If a
-                    // concurrent cancel already flipped this loop to
-                    // cancelled/failed, skip the decrement here.
-                    let prior_state_terminal = LoopRepository::new(&executor_for_task.database())
-                        .get(req.loop_id.as_ref())
-                        .ok()
-                        .flatten()
-                        .map(|r| matches!(r.state, LoopState::Cancelled | LoopState::Failed))
-                        .unwrap_or(true);
-                    let _ = LoopRepository::new(&executor_for_task.database()).update_state(
-                        req.loop_id.as_ref(),
+                    // Single owner of the guarded terminal transition +
+                    // pending_work decrement (see `LoopManager::mark_terminal`
+                    // / `apply_terminal_transition`). This 'static spawned
+                    // task has no `LoopManager` handle, so it calls the same
+                    // associated function `cancel_loop_inner` and the public
+                    // `mark_terminal` both funnel through, rather than
+                    // hand-duplicating the atomic-transition + gated-decrement
+                    // logic here. The atomic `state NOT IN (...)` guard means
+                    // a concurrent cancel racing this auto-fail can never pair
+                    // two decrements with one logical transition.
+                    let flipped = LoopManager::apply_terminal_transition(
+                        &executor_for_task.database(),
+                        &pending_work_for_task,
+                        &req.loop_id,
                         LoopState::Failed,
-                        current_timestamp(),
-                    );
-                    if !prior_state_terminal {
-                        pending_work_for_task.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    )
+                    .unwrap_or(false);
+                    if flipped {
+                        events_for_task
+                            .state_changed(
+                                &session_id,
+                                &req.loop_id,
+                                "failed",
+                                "running",
+                                Some("fail_threshold"),
+                            )
+                            .await;
+                        events_for_task
+                            .cancelled(&session_id, &req.loop_id, "fail_threshold", false)
+                            .await;
                     }
-                    events_for_task
-                        .state_changed(
-                            &session_id,
-                            &req.loop_id,
-                            "failed",
-                            "running",
-                            Some("fail_threshold"),
-                        )
-                        .await;
-                    events_for_task
-                        .cancelled(&session_id, &req.loop_id, "fail_threshold", false)
-                        .await;
                     registry_for_task.remove(&req.loop_id);
                     continue;
                 }
@@ -371,13 +373,57 @@ impl LoopManager {
     }
 
     /// Handle to the armed-loop counter for the managed idle watchdog.
-    pub fn pending_work_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    pub fn pending_work_handle(&self) -> Arc<AtomicUsize> {
         self.pending_work.clone()
     }
 
     /// True while any loop is armed (non-terminal).
     pub fn has_pending_work(&self) -> bool {
-        self.pending_work.load(std::sync::atomic::Ordering::SeqCst) > 0
+        self.pending_work.load(Ordering::SeqCst) > 0
+    }
+
+    /// Atomically drive `id` into a terminal state (`Cancelled`/`Failed`) and
+    /// decrement `pending_work` exactly once for the transition that wins.
+    ///
+    /// This is the SINGLE place the guarded terminal-transition +
+    /// gated-decrement logic lives — `LoopRepository::transition_to_terminal`
+    /// does one atomic `UPDATE ... WHERE state NOT IN ('cancelled','failed')`
+    /// and reports whether a row flipped, so two racing callers (a double
+    /// cancel, or a cancel racing the dispatcher's 3-strike auto-fail) are
+    /// serialized by SQLite and exactly one observes `true`. There is no
+    /// separate `get` (read) followed by a `update_state` (write): that
+    /// read-then-write gap is exactly what allowed both racing callers to
+    /// see a non-terminal snapshot and both decrement, underflowing the
+    /// `AtomicUsize` to `usize::MAX` and pinning `has_pending_work()` true
+    /// forever.
+    ///
+    /// Free function (not `&self`) so it can be called both from
+    /// `LoopManager` methods (`cancel_loop_inner`, `mark_terminal`) and from
+    /// the dispatcher's 'static spawned task, which only has cloned
+    /// `Database`/counter handles rather than a full `LoopManager`.
+    fn apply_terminal_transition(
+        db: &Database,
+        pending_work: &Arc<AtomicUsize>,
+        id: &LoopId,
+        new_state: LoopState,
+    ) -> Result<bool, String> {
+        let flipped = LoopRepository::new(db)
+            .transition_to_terminal(id.as_ref(), new_state, current_timestamp())
+            .map_err(|e| e.to_string())?;
+        if flipped {
+            pending_work.fetch_sub(1, Ordering::SeqCst);
+        }
+        Ok(flipped)
+    }
+
+    /// Manager-owned entry point for driving a loop into a terminal state
+    /// with a guarded, race-safe `pending_work` decrement. Returns whether
+    /// this call won the transition (an already-terminal loop is an
+    /// idempotent no-op returning `false`). `mark_failed` and
+    /// `cancel_loop_inner` both route through this so the counter has
+    /// exactly one owner.
+    pub async fn mark_terminal(&self, id: &LoopId, new_state: LoopState) -> Result<bool, String> {
+        Self::apply_terminal_transition(&self.db, &self.pending_work, id, new_state)
     }
 
     pub async fn create_loop(&self, args: CreateLoopArgs) -> Result<LoopId, String> {
@@ -422,8 +468,7 @@ impl LoopManager {
             )
             .await;
 
-        self.pending_work
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.pending_work.fetch_add(1, Ordering::SeqCst);
 
         Ok(id)
     }
@@ -498,52 +543,31 @@ impl LoopManager {
         // (future phase), the bridge uninstall would happen here.
         let _ = watchers;
 
-        // Guard against double-decrement: only the transition INTO a
-        // terminal state decrements pending_work. A loop that is cancelled
-        // twice (e.g. soft-cancel followed by a force-cancel escalation
-        // racing another caller) must not underflow the counter.
-        let repo = LoopRepository::new(&self.db);
-        let prior_state_terminal = repo
-            .get(id.as_ref())
-            .map_err(|e| e.to_string())?
-            .map(|r| matches!(r.state, LoopState::Cancelled | LoopState::Failed))
-            .unwrap_or(true);
-
-        repo.update_state(id.as_ref(), LoopState::Cancelled, current_timestamp())
-            .map_err(|e| e.to_string())?;
-        if !prior_state_terminal {
-            self.pending_work
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        // Atomically flip into Cancelled and decrement pending_work exactly
+        // once for the winner. `mark_terminal` (-> `apply_terminal_transition`)
+        // is the single owner of this guard; a loop cancelled twice (e.g.
+        // soft-cancel followed by a force-cancel escalation racing another
+        // caller, or cancel racing the dispatcher's 3-strike auto-fail) can
+        // never underflow the counter or double-emit these events.
+        let flipped = self.mark_terminal(id, LoopState::Cancelled).await?;
+        if flipped {
+            self.events
+                .state_changed(&session_id, id, "cancelled", "running", Some(by))
+                .await;
+            self.events.cancelled(&session_id, id, by, force).await;
         }
-        self.events
-            .state_changed(&session_id, id, "cancelled", "running", Some(by))
-            .await;
-        self.events.cancelled(&session_id, id, by, force).await;
         self.registry.remove(id);
         Ok(())
     }
 
-    /// Mark a loop `Failed` and decrement the pending-work counter. This is
-    /// the single manager-owned entry point for driving a loop into the
-    /// `Failed` terminal state from callers that hold `&self` (e.g. the
-    /// public API, tests). The dispatcher's inline 3-strike auto-fail path
-    /// (spawned as a 'static task without a `LoopManager` handle) applies
-    /// the same guarded decrement directly against a cloned counter handle
-    /// — see `start_with_bus`.
+    /// Mark a loop `Failed` and decrement the pending-work counter. Thin
+    /// wrapper over `mark_terminal` — the single manager-owned entry point
+    /// for the guarded terminal transition + gated decrement, also used by
+    /// `cancel_loop_inner` and the dispatcher's 3-strike auto-fail path (via
+    /// the shared `apply_terminal_transition` associated function — see
+    /// `start_with_bus`).
     pub async fn mark_failed(&self, id: &LoopId) -> Result<(), String> {
-        let repo = LoopRepository::new(&self.db);
-        let prior_state_terminal = repo
-            .get(id.as_ref())
-            .map_err(|e| e.to_string())?
-            .map(|r| matches!(r.state, LoopState::Cancelled | LoopState::Failed))
-            .unwrap_or(true);
-
-        repo.update_state(id.as_ref(), LoopState::Failed, current_timestamp())
-            .map_err(|e| e.to_string())?;
-        if !prior_state_terminal {
-            self.pending_work
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        }
+        self.mark_terminal(id, LoopState::Failed).await?;
         Ok(())
     }
 
@@ -1152,6 +1176,59 @@ mod tests {
         assert!(!mgr.has_pending_work());
         let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
         assert_eq!(rec.state, LoopState::Failed);
+    }
+
+    /// Regression test for the TOCTOU double-decrement: a loop that is
+    /// already terminal (failed) must not decrement `pending_work` again
+    /// when a subsequent cancel lands on it. Before the atomic
+    /// `transition_to_terminal` guard, cancelling twice (or fail-then-cancel,
+    /// which is exactly the "cancel racing the dispatcher's auto-fail"
+    /// scenario) would wrap the counter to `usize::MAX` via a second
+    /// `fetch_sub`, pinning `has_pending_work()` true forever.
+    #[tokio::test]
+    async fn cancel_after_fail_decrements_exactly_once() {
+        use crate::event_bus::EventBus;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let storage = fresh();
+        let bus = Arc::new(EventBus::new());
+        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus), None);
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "time:1m".into(),
+                prompt_text: Some("x".into()),
+                wrapped_skill: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
+            })
+            .await
+            .unwrap();
+        assert_eq!(mgr.pending_work_handle().load(Ordering::SeqCst), 1);
+
+        // Fail it first (e.g. dispatcher's 3-strike auto-fail).
+        mgr.mark_failed(&id).await.unwrap();
+        assert_eq!(mgr.pending_work_handle().load(Ordering::SeqCst), 0);
+
+        // A cancel racing/following the fail must be a no-op on the counter:
+        // the row is already terminal, so `transition_to_terminal` reports
+        // no flip and `cancel_loop_inner` must not decrement again.
+        mgr.cancel_loop(&id, true).await.unwrap();
+        assert_eq!(
+            mgr.pending_work_handle().load(Ordering::SeqCst),
+            0,
+            "cancel after fail must not underflow the counter"
+        );
+        assert!(!mgr.has_pending_work());
+
+        // State stays at the terminal value the winning transition set
+        // (Failed) — the losing cancel does not clobber it.
+        let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
+        assert_eq!(rec.state, LoopState::Failed);
+
+        // Calling cancel a second (third overall) time is still a no-op.
+        mgr.cancel_loop(&id, true).await.unwrap();
+        assert_eq!(mgr.pending_work_handle().load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
