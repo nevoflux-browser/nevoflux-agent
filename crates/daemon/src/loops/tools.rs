@@ -74,6 +74,29 @@ fn parse_gate_arg(args: &Value) -> Result<Option<GateSpec>, String> {
     Ok(Some(GateSpec { kind, spec_json }))
 }
 
+/// Parse the optional `verify` tool arg into `CreateLoopArgs.verify_check`.
+///
+/// Input shape: `{tool?, matches, negate?}` — the same `GoalCheck` shape
+/// `/goal`'s `check` arg takes (W5 spec §verify). Validated eagerly via
+/// `goals::check::parse_check` (wrapped in a `{"check": ...}` envelope,
+/// the shape it expects) so a missing `matches` or invalid regex fails at
+/// create time with a clear error, mirroring how `parse_gate_arg` validates
+/// `gate.kind` above. Only the RAW object is persisted — not the
+/// parsed-then-re-serialized form — because `IterationExecutor::
+/// finalize_iteration` re-wraps and re-parses `verify_check` the same way
+/// on every iteration (see `executor.rs`), so the raw string is the single
+/// source of truth for the on-disk shape.
+fn parse_verify_arg(args: &Value) -> Result<Option<String>, String> {
+    let Some(verify) = args.get("verify") else {
+        return Ok(None);
+    };
+    if verify.is_null() {
+        return Ok(None);
+    }
+    crate::goals::check::parse_check(&json!({ "check": verify }))?;
+    Ok(Some(verify.to_string()))
+}
+
 async fn loop_create(
     args: &Value,
     ctx: &ToolCallContext,
@@ -108,6 +131,7 @@ async fn loop_create(
         .map(crate::loops::manager::db_str_to_agent_mode)
         .unwrap_or(nevoflux_builtin_wasm::AgentMode::Chat);
     let gate = parse_gate_arg(args)?;
+    let verify_check = parse_verify_arg(args)?;
 
     let id = mgr
         .create_loop(CreateLoopArgs {
@@ -117,6 +141,7 @@ async fn loop_create(
             wrapped_skill,
             mode,
             gate,
+            verify_check,
         })
         .await?;
     Ok(json!({ "loop_id": id.0 }))
@@ -296,6 +321,55 @@ mod tests {
         // `kind` must not leak into spec_json — the evaluator only expects
         // kind-specific fields there.
         assert!(spec.get("kind").is_none());
+    }
+
+    /// W5 task 2: the `verify` tool arg parses through `parse_verify_arg`
+    /// and round-trips through `LoopRepository::get` via the JSON-arg
+    /// dispatch path — mirrors `loop_create_with_http_gate_arg_persists_gate`.
+    #[tokio::test]
+    async fn loop_create_with_verify_arg_persists_verify_check() {
+        let (storage, mgr) = setup();
+        let res = execute_loop_tool(
+            "loop_create",
+            &json!({
+                "trigger_expr": "time:5m",
+                "prompt_text": "x",
+                "verify": { "matches": "OK" }
+            }),
+            &ctx(false, None),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap();
+        let id = res.get("loop_id").unwrap().as_str().unwrap().to_string();
+
+        let rec = storage.loops().get(&id).unwrap().unwrap();
+        let verify: serde_json::Value =
+            serde_json::from_str(rec.verify_check.as_deref().unwrap()).unwrap();
+        assert_eq!(verify["matches"], "OK");
+    }
+
+    /// W5 task 2: a `verify` arg missing `matches` must be rejected at
+    /// create time (before persisting), not silently accepted and failed
+    /// open at iteration time.
+    #[tokio::test]
+    async fn loop_create_with_verify_arg_missing_matches_rejected() {
+        let (storage, mgr) = setup();
+        let err = execute_loop_tool(
+            "loop_create",
+            &json!({
+                "trigger_expr": "time:5m",
+                "prompt_text": "x",
+                "verify": { "tool": "canvas_eval" }
+            }),
+            &ctx(false, None),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("matches"), "got: {err}");
     }
 
     /// Mirrors `manager::tests::create_loop_rejects_event_gate_on_time_trigger`

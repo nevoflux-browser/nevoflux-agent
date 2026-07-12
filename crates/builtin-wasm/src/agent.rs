@@ -3668,6 +3668,16 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                                 "equals": { "type": "string", "description": "event gate: only run when the value at `path` equals this string." }
                             },
                             "required": ["kind"]
+                        },
+                        "verify": {
+                            "type": "object",
+                            "description": "Optional check run over each iteration's tool results; stores pass/fail on the run. `matches` is a substring or `/regex/`; `tool` scopes to one tool's output; `negate` requires the pattern ABSENT. Reuses the /goal check semantics — prefer it for machine-verifiable loops. Make the iteration surface the checked evidence in a tool result.",
+                            "properties": {
+                                "tool": { "type": "string", "description": "Only consider results from this tool; omit to match any tool's result." },
+                                "matches": { "type": "string", "description": "Substring, or `/regex/` when wrapped in slashes." },
+                                "negate": { "type": "boolean", "description": "Require the pattern to be ABSENT instead of present. Default false." }
+                            },
+                            "required": ["matches"]
                         }
                     },
                     "required": ["trigger_expr"]

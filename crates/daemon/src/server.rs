@@ -2540,6 +2540,7 @@ pub async fn start_server(
                                 wrapped_skill,
                                 mode,
                                 gate: None,
+                                verify_check: None,
                             })
                             .await
                         {

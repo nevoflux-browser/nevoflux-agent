@@ -123,6 +123,14 @@ pub struct CreateLoopArgs {
     /// that trigger's payload). `None`/absent means no gate — the loop
     /// always fires on its trigger, matching pre-W3 behavior.
     pub gate: Option<GateSpec>,
+    /// Optional programmatic check (W5 spec §verify), reusing `/goal`'s
+    /// `GoalCheck` shape (`{tool?, matches, negate?}`). Stored as the RAW
+    /// JSON object string, exactly as received — `IterationExecutor`
+    /// wraps it in a `{"check": ...}` envelope and re-parses it with
+    /// `goals::check::parse_check` on every iteration (see
+    /// `executor.rs::finalize_iteration`). `None`/absent means no
+    /// per-iteration verdict is recorded.
+    pub verify_check: Option<String>,
 }
 
 #[derive(Clone)]
@@ -611,9 +619,7 @@ impl LoopManager {
                 .to_string(),
             gate_spec: args.gate.as_ref().map(|g| g.spec_json.to_string()),
             gate_last_value: None,
-            // TODO(W5 task 2/3): thread a `verify` param through
-            // `CreateLoopArgs`/`loop_create` once the tool schema lands.
-            verify_check: None,
+            verify_check: args.verify_check,
         };
         LoopRepository::new(&self.db)
             .create(&rec)
@@ -938,6 +944,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -947,6 +954,30 @@ mod tests {
         assert_eq!(rec.trigger_expr, "time:5m");
         // mode persisted (default chat)
         assert_eq!(rec.mode, "chat");
+    }
+
+    /// W5 task 2: `CreateLoopArgs.verify_check` round-trips through
+    /// `create_loop` and `LoopRepository::get` — mirrors
+    /// `create_loop_with_http_gate_on_time_trigger_persists` for gate.
+    #[tokio::test(start_paused = true)]
+    async fn create_loop_with_verify_check_persists() {
+        let storage = fresh();
+        let mgr = LoopManager::start(storage.database().clone());
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "time:5m".into(),
+                prompt_text: Some("check".into()),
+                wrapped_skill: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
+                verify_check: Some(r#"{"matches":"OK"}"#.into()),
+            })
+            .await
+            .unwrap();
+
+        let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
+        assert_eq!(rec.verify_check.as_deref(), Some(r#"{"matches":"OK"}"#));
     }
 
     /// W3 task 4: an `event` gate on a `time:` trigger is a config
@@ -967,6 +998,7 @@ mod tests {
                     kind: GateKind::Event,
                     spec_json: serde_json::json!({}),
                 }),
+                verify_check: None,
             })
             .await
             .unwrap_err();
@@ -994,6 +1026,7 @@ mod tests {
                     kind: GateKind::Http,
                     spec_json: serde_json::json!({"url": "https://x", "extract": "$.v"}),
                 }),
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -1018,6 +1051,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap_err();
@@ -1037,6 +1071,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap_err();
@@ -1050,6 +1085,7 @@ mod tests {
                 wrapped_skill: Some("{}".into()),
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap_err();
@@ -1069,6 +1105,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -1105,6 +1142,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -1139,6 +1177,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -1150,6 +1189,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -1176,6 +1216,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -1218,6 +1259,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -1263,6 +1305,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -1309,6 +1352,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -1369,6 +1413,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -1398,6 +1443,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -1439,6 +1485,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -1488,6 +1535,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -1554,6 +1602,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -1618,6 +1667,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -1661,6 +1711,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
@@ -1729,6 +1780,7 @@ mod tests {
                 wrapped_skill: None,
                 mode: nevoflux_builtin_wasm::AgentMode::Chat,
                 gate: None,
+                verify_check: None,
             })
             .await
             .unwrap();
