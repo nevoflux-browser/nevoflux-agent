@@ -284,11 +284,7 @@ impl<'a> LoopRepository<'a> {
     /// Persist the last observed gate value (deterministic-gate diff cursor,
     /// W3 spec). No-op semantics if `loop_id` doesn't exist: 0 rows affected,
     /// `Ok(())` — mirrors `update_scratchpad`/`set_consecutive_failures`.
-    pub fn set_gate_last_value(&self, loop_id: &str, value: &str) -> Result<()> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+    pub fn set_gate_last_value(&self, loop_id: &str, value: &str, now: i64) -> Result<()> {
         self.db.with_connection(|conn| {
             conn.execute(
                 "UPDATE loops SET gate_last_value = ?1, updated_at = ?2 WHERE id = ?3",
@@ -700,9 +696,10 @@ mod tests {
         );
         assert_eq!(row.gate_last_value, None);
 
-        repo.set_gate_last_value("gate1", "42").unwrap();
+        repo.set_gate_last_value("gate1", "42", 200).unwrap();
         let row = repo.get("gate1").unwrap().unwrap();
         assert_eq!(row.gate_last_value.as_deref(), Some("42"));
+        assert_eq!(row.updated_at, 200);
     }
 
     #[test]

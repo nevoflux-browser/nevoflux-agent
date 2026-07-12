@@ -96,11 +96,11 @@ impl GateKind {
 
     /// Parse from the on-disk string representation (`loops.gate_kind`).
     ///
-    /// Named `from_str` per the W3 gate spec's interface, not `FromStr::from_str`
-    /// (returns `Option`, not `Result`) — silence the trait-confusion lint rather
-    /// than rename, to match the mandated `GateKind::from_str`/`as_str` API.
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Named `from_db_str` (rather than `from_str`) so the `Option<Self>`
+    /// signature does not collide with the conventional `FromStr` trait,
+    /// which is what clippy's `should_implement_trait` lint flags. Mirrors
+    /// `LoopState::from_db_str`.
+    pub fn from_db_str(s: &str) -> Option<Self> {
         Some(match s {
             "none" => Self::None,
             "http" => Self::Http,
@@ -140,7 +140,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_kind_as_str_round_trips_through_from_str() {
+    fn gate_kind_as_str_round_trips_through_from_db_str() {
         for kind in [
             GateKind::None,
             GateKind::Http,
@@ -148,13 +148,13 @@ mod tests {
             GateKind::Event,
         ] {
             let s = kind.as_str();
-            assert_eq!(GateKind::from_str(s), Some(kind));
+            assert_eq!(GateKind::from_db_str(s), Some(kind));
         }
     }
 
     #[test]
-    fn gate_kind_from_str_rejects_unknown() {
-        assert_eq!(GateKind::from_str("bogus"), None);
+    fn gate_kind_from_db_str_rejects_unknown() {
+        assert_eq!(GateKind::from_db_str("bogus"), None);
     }
 
     #[test]
