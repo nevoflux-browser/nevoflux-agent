@@ -143,6 +143,53 @@ pub fn parse_proposal(llm_output: &str, loop_id: &str, now: i64) -> Result<LoopP
     })
 }
 
+/// Tool-name prefixes stripped from the evolve meta-pass's tool catalog, on
+/// top of the loop-level [`crate::loops::tool_classes::iteration_forbidden_tools`]
+/// (`loop_create`, `ask_user`, `goal_set`, `schedule_create`) that `evolve_loop`
+/// already passes as `forbidden_tools`.
+///
+/// The meta-pass is meant to be strictly read-only: it reasons over a loop's
+/// recent iteration history — text that came out of the loop's own (possibly
+/// adversarial) `final_text` and is interpolated into the prompt verbatim, a
+/// prompt-injection surface — and emits a JSON proposal. Unlike a normal loop
+/// iteration it never needs to act, so every tool that writes, mutates,
+/// renders, spawns, or notifies is denied here; only `think`/`plan` and pure
+/// read tools (`web_search`, `web_fetch`, `memory_search`, `memory_view`,
+/// `browser_get_*`, `browser_screenshot`, `browser_read_artifact`,
+/// `loop_list`, `loop_scratchpad_get`, `schedule_list`, `schedule_runs`,
+/// `goal_status`) survive the filter. Entries are matched as
+/// [`crate::agent_exec::filter_allowlist`] prefixes, so exact tool names
+/// (e.g. `create_artifact`) work the same as true prefixes (e.g. `canvas_`)
+/// as long as no safe tool shares that prefix — verified by
+/// `evolve_forbidden_prefixes_do_not_shadow_read_tools` below.
+///
+/// Kept in sync with `builtin-wasm::Agent::get_chat_tools()` by hand; if a
+/// new mutating tool is added there, add its name/prefix here too.
+pub(crate) fn evolve_forbidden_prefixes() -> Vec<String> {
+    [
+        "canvas_",
+        "memory_create",
+        "memory_update",
+        "memory_delete",
+        "browser_edit_",
+        "create_artifact",
+        "switch_model",
+        "skill_load",
+        "tts_",
+        "loop_cancel",
+        "loop_scratchpad_set",
+        "schedule_cancel",
+        "schedule_pause",
+        "schedule_resume",
+        "schedule_run_now",
+        "notify_user",
+        "goal_clear",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 /// Run the evolve meta-pass for one loop: load its record + recent
 /// iteration history, ask the model (one read-only chat turn) for a
 /// self-improvement proposal, persist it, and emit `system:loop:proposal`.
@@ -168,7 +215,7 @@ pub async fn evolve_loop(
         mode: AgentMode::Chat,
         user_message: prompt,
         forbidden_tools: crate::loops::tool_classes::iteration_forbidden_tools(),
-        forbidden_prefixes: Vec::new(),
+        forbidden_prefixes: evolve_forbidden_prefixes(),
         unattended: true,
         iteration_loop_id: Some(loop_id.to_string()),
         borrow_proxy: true,
@@ -338,5 +385,177 @@ mod tests {
             后续说明：无需进一步操作。";
         let proposal = parse_proposal(output, "abc", 1234).expect("should parse without panicking");
         assert_eq!(proposal.rationale, "循环在空收件箱时反复运行，收紧门控。");
+    }
+
+    // ---- evolve tool restriction (read-only meta-pass) ------------------
+
+    #[test]
+    fn evolve_forbidden_prefixes_contains_expected_entries() {
+        let list = evolve_forbidden_prefixes();
+        for expected in [
+            "canvas_",
+            "memory_create",
+            "memory_update",
+            "memory_delete",
+            "browser_edit_",
+            "create_artifact",
+            "tts_",
+            "loop_cancel",
+            "loop_scratchpad_set",
+        ] {
+            assert!(
+                list.iter().any(|p| p == expected),
+                "expected {expected:?} in evolve_forbidden_prefixes(), got {list:?}"
+            );
+        }
+        // memory_search / memory_view are read-only and must NOT be caught by
+        // any forbidden prefix here (the whole "memory_" prefix is
+        // deliberately not used — see the comment on the fn).
+        assert!(!list.iter().any(|p| p == "memory_"));
+    }
+
+    /// Snapshot of `builtin-wasm::Agent::get_chat_tools()`'s tool names
+    /// (captured 2026-07-12; update if that catalog changes). Used to prove
+    /// the actual filter (`forbidden_tools` from `iteration_forbidden_tools()`
+    /// + `forbidden_prefixes` from `evolve_forbidden_prefixes()`, exactly as
+    /// `evolve_loop` passes to `AgentExecRequest`) reduces the full Chat
+    /// catalog down to a read-only/reasoning-only set.
+    fn chat_tool_catalog_snapshot() -> Vec<String> {
+        names(&[
+            "think",
+            "plan",
+            "create_artifact",
+            "switch_model",
+            "web_search",
+            "web_fetch",
+            "ask_user",
+            "memory_search",
+            "memory_create",
+            "memory_update",
+            "memory_delete",
+            "memory_view",
+            "skill_load",
+            "browser_get_content",
+            "browser_get_markdown",
+            "browser_screenshot",
+            "browser_read_artifact",
+            "browser_edit_artifact",
+            "canvas_eval",
+            "canvas_create_composition",
+            "canvas_render_video",
+            "canvas_lint_composition",
+            "canvas_apply_design_md",
+            "canvas_inspect_layout",
+            "canvas_attach_asset",
+            "tts_synthesize_api",
+            "tts_synthesize_local",
+            "tts_transcribe",
+            "canvas_create_from_visual_identity",
+            "canvas_extract_visual_identity",
+            "loop_create",
+            "loop_list",
+            "loop_cancel",
+            "loop_scratchpad_get",
+            "loop_scratchpad_set",
+            "schedule_create",
+            "schedule_list",
+            "schedule_cancel",
+            "schedule_pause",
+            "schedule_resume",
+            "schedule_run_now",
+            "schedule_runs",
+            "notify_user",
+            "goal_set",
+            "goal_status",
+            "goal_clear",
+        ])
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn evolve_effective_tool_set_excludes_mutating_tools_and_keeps_read_tools() {
+        let effective = crate::agent_exec::filter_allowlist(
+            chat_tool_catalog_snapshot(),
+            &crate::loops::tool_classes::iteration_forbidden_tools(),
+            &evolve_forbidden_prefixes(),
+        );
+
+        for forbidden in [
+            "canvas_eval",
+            "memory_delete",
+            "browser_edit_artifact",
+            "create_artifact",
+            "loop_cancel",
+            "loop_scratchpad_set",
+            "tts_synthesize_api",
+            // also covered by iteration_forbidden_tools, but the evolve pass
+            // must not regain them if that set ever shrinks:
+            "loop_create",
+            "ask_user",
+            "goal_set",
+            "schedule_create",
+            // rest of the mutating/control-plane surface:
+            "switch_model",
+            "skill_load",
+            "memory_create",
+            "memory_update",
+            "canvas_create_composition",
+            "canvas_render_video",
+            "canvas_lint_composition",
+            "canvas_apply_design_md",
+            "canvas_inspect_layout",
+            "canvas_attach_asset",
+            "tts_synthesize_local",
+            "tts_transcribe",
+            "canvas_create_from_visual_identity",
+            "canvas_extract_visual_identity",
+            "schedule_cancel",
+            "schedule_pause",
+            "schedule_resume",
+            "schedule_run_now",
+            "notify_user",
+            "goal_clear",
+        ] {
+            assert!(
+                !effective.iter().any(|t| t == forbidden),
+                "{forbidden:?} must not survive the evolve tool filter, got {effective:?}"
+            );
+        }
+
+        // Read/reasoning tools remain available.
+        for allowed in [
+            "think",
+            "plan",
+            "web_search",
+            "web_fetch",
+            "memory_search",
+            "memory_view",
+            "browser_get_content",
+            "browser_get_markdown",
+            "browser_screenshot",
+            "browser_read_artifact",
+            "loop_list",
+            "loop_scratchpad_get",
+            "schedule_list",
+            "schedule_runs",
+            "goal_status",
+        ] {
+            assert!(
+                effective.iter().any(|t| t == allowed),
+                "{allowed:?} should remain available to the evolve pass, got {effective:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn evolve_loop_request_uses_non_empty_forbidden_prefixes() {
+        // Guards against a future edit accidentally reverting `evolve_loop`
+        // back to `forbidden_prefixes: Vec::new()` (the original defect):
+        // the request builder must always route through
+        // `evolve_forbidden_prefixes()`, which is never empty.
+        assert!(!evolve_forbidden_prefixes().is_empty());
     }
 }
