@@ -70,6 +70,7 @@ mod tests {
             gate_kind: "none".into(),
             gate_spec: None,
             gate_last_value: None,
+            verify_check: None,
         })
         .unwrap();
         repo.insert_iteration("x", 1, 0, IterationStatus::Running).unwrap();

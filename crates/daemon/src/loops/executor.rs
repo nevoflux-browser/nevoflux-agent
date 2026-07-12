@@ -259,7 +259,7 @@ impl IterationExecutor {
         session_id: &str,
         loop_id: &LoopId,
         seq: i64,
-        _rec: &LoopRecord,
+        rec: &LoopRecord,
     ) -> ExecResult {
         let end_now = current_timestamp();
         let repo = LoopRepository::new(&self.db);
@@ -270,6 +270,40 @@ impl IterationExecutor {
         // `schedules/runner.rs::budget_spent` for the pattern to follow once
         // loops gain a per-iteration/per-loop token limit.
         let tokens_used: Option<i64> = None;
+
+        // W5 §verify: run the loop's optional programmatic check (reuses the
+        // `/goal` check engine) against this iteration's tool results.
+        // `parse_check` expects a `{"check": <GoalCheck>}` envelope (that's
+        // the shape `goal_set` args carry); `verify_check` on the loop row
+        // is the bare `GoalCheck` JSON, so wrap it before parsing. Any parse
+        // failure (malformed JSON, missing `matches`, bad regex) fails open:
+        // `(None, None)` — a bad verify spec must never block the loop.
+        let (verify_passed, verify_reason) = match rec.verify_check.as_deref() {
+            Some(cj) => {
+                let parsed = serde_json::from_str::<serde_json::Value>(cj)
+                    .ok()
+                    .and_then(|v| {
+                        crate::goals::check::parse_check(&serde_json::json!({ "check": v }))
+                            .ok()
+                            .flatten()
+                    });
+                match parsed {
+                    Some(check) => {
+                        let tool_results = extract_tool_results(&trace_summary);
+                        let passed = crate::goals::check::eval_check(&check, &tool_results);
+                        let reason = format!(
+                            "check '{}' {}",
+                            check.matches,
+                            if passed { "passed" } else { "failed" }
+                        );
+                        (Some(passed), Some(reason))
+                    }
+                    None => (None, None),
+                }
+            }
+            None => (None, None),
+        };
+
         let _ = repo.finish_iteration(
             iter_id,
             end_now,
@@ -278,6 +312,8 @@ impl IterationExecutor {
             Some(&serde_json::to_string(&trace_summary).unwrap_or_default()),
             final_text.as_deref(),
             tokens_used,
+            verify_passed,
+            verify_reason.as_deref(),
         );
         self.events
             .iteration_end(
@@ -316,6 +352,8 @@ impl IterationExecutor {
             None,
             None,
             None,
+            None,
+            None,
         );
         self.events
             .iteration_end(
@@ -330,6 +368,40 @@ impl IterationExecutor {
             .await;
         ExecResult::Error(err)
     }
+}
+
+/// Pull `(tool_name, content)` pairs out of an iteration's
+/// `tool_calls_summary` trace, for feeding `goals::check::eval_check`.
+///
+/// The production trace (`AgentExecOutcome::trace`, built in
+/// `agent_exec.rs`) is currently `[{"name": ..., "ok": true}]` — no result
+/// content is carried today, so a verify check that inspects tool *content*
+/// will only ever see an empty string for real iterations until a future
+/// task threads tool results into the trace. This helper is written
+/// tolerant of that: it checks a handful of plausible content keys
+/// (`content`, `result`, `output`, `text`) so it keeps working once one
+/// shows up, and unit tests can exercise the verify path by constructing a
+/// trace with one of those keys directly.
+fn extract_tool_results(trace: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(entries) = trace.as_array() else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.get("name")?.as_str()?.to_string();
+            let content = ["content", "result", "output", "text"]
+                .iter()
+                .find_map(|key| entry.get(key))
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string())
+                })
+                .unwrap_or_default();
+            Some((name, content))
+        })
+        .collect()
 }
 
 /// Build the §7.2 LOOP-CONTEXT-prefixed user message for an iteration.
@@ -503,6 +575,7 @@ mod tests {
             gate_kind: "none".into(),
             gate_spec: None,
             gate_last_value: None,
+            verify_check: None,
         }
     }
 
@@ -602,6 +675,8 @@ mod tests {
                 Some("[]"),
                 Some("prior result"),
                 None,
+                None,
+                None,
             )
             .unwrap();
 
@@ -643,6 +718,8 @@ mod tests {
                 None,
                 Some("[]"),
                 Some(&final_text),
+                None,
+                None,
                 None,
             )
             .unwrap();
@@ -711,4 +788,188 @@ mod tests {
         );
     }
 
+    // W5 §verify: `finalize_iteration_ok` runs the loop's optional
+    // `verify_check` against the iteration's tool-call trace and persists
+    // the verdict. These call the private finalizer directly (rather than
+    // going through `execute()`'s stub path, which never produces tool
+    // results) so the check-evaluation branch is exercised without needing
+    // a real LLM run.
+
+    #[tokio::test]
+    async fn finalize_iteration_ok_stores_verify_passed_true_on_match() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .sessions()
+            .create(CreateSessionParams::new().with_id("s1").with_title("t"))
+            .unwrap();
+        let mut rec = sample_loop("v1");
+        rec.verify_check = Some(r#"{"matches":"OK"}"#.into());
+        storage.loops().create(&rec).unwrap();
+        let iter_id = storage
+            .loops()
+            .insert_iteration("v1", 1, 100, IterationStatus::Running)
+            .unwrap();
+
+        let executor = IterationExecutor::new(storage.database().clone());
+        let trace = serde_json::json!([{"name": "bash", "content": "exit 0: OK"}]);
+        let result = executor
+            .finalize_iteration_ok(
+                iter_id,
+                Some("done".into()),
+                trace,
+                "s1",
+                &LoopId("v1".into()),
+                1,
+                &rec,
+            )
+            .await;
+        assert!(result.is_ok(), "expected ok-variant, got {:?}", result);
+
+        let recent = storage.loops().recent_iterations("v1", 1).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].verify_passed, Some(true));
+        assert_eq!(
+            recent[0].verify_reason.as_deref(),
+            Some("check 'OK' passed")
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_iteration_ok_stores_verify_passed_false_on_no_match() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .sessions()
+            .create(CreateSessionParams::new().with_id("s1").with_title("t"))
+            .unwrap();
+        let mut rec = sample_loop("v2");
+        rec.verify_check = Some(r#"{"matches":"OK"}"#.into());
+        storage.loops().create(&rec).unwrap();
+        let iter_id = storage
+            .loops()
+            .insert_iteration("v2", 1, 100, IterationStatus::Running)
+            .unwrap();
+
+        let executor = IterationExecutor::new(storage.database().clone());
+        let trace = serde_json::json!([{"name": "bash", "content": "exit 1: failed"}]);
+        let result = executor
+            .finalize_iteration_ok(
+                iter_id,
+                Some("done".into()),
+                trace,
+                "s1",
+                &LoopId("v2".into()),
+                1,
+                &rec,
+            )
+            .await;
+        assert!(result.is_ok(), "expected ok-variant, got {:?}", result);
+
+        let recent = storage.loops().recent_iterations("v2", 1).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].verify_passed, Some(false));
+        assert_eq!(
+            recent[0].verify_reason.as_deref(),
+            Some("check 'OK' failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_iteration_ok_stores_no_verdict_when_no_verify_check() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .sessions()
+            .create(CreateSessionParams::new().with_id("s1").with_title("t"))
+            .unwrap();
+        let rec = sample_loop("v3"); // verify_check: None (default in sample_loop)
+        storage.loops().create(&rec).unwrap();
+        let iter_id = storage
+            .loops()
+            .insert_iteration("v3", 1, 100, IterationStatus::Running)
+            .unwrap();
+
+        let executor = IterationExecutor::new(storage.database().clone());
+        let trace = serde_json::json!([{"name": "bash", "content": "exit 0: OK"}]);
+        let result = executor
+            .finalize_iteration_ok(
+                iter_id,
+                Some("done".into()),
+                trace,
+                "s1",
+                &LoopId("v3".into()),
+                1,
+                &rec,
+            )
+            .await;
+        assert!(result.is_ok(), "expected ok-variant, got {:?}", result);
+
+        let recent = storage.loops().recent_iterations("v3", 1).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].verify_passed, None);
+        assert_eq!(recent[0].verify_reason, None);
+    }
+
+    #[tokio::test]
+    async fn finalize_iteration_ok_fails_open_on_unparseable_verify_check() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .sessions()
+            .create(CreateSessionParams::new().with_id("s1").with_title("t"))
+            .unwrap();
+        let mut rec = sample_loop("v4");
+        rec.verify_check = Some("not valid json".into());
+        storage.loops().create(&rec).unwrap();
+        let iter_id = storage
+            .loops()
+            .insert_iteration("v4", 1, 100, IterationStatus::Running)
+            .unwrap();
+
+        let executor = IterationExecutor::new(storage.database().clone());
+        let trace = serde_json::json!([{"name": "bash", "content": "exit 0: OK"}]);
+        let result = executor
+            .finalize_iteration_ok(
+                iter_id,
+                Some("done".into()),
+                trace,
+                "s1",
+                &LoopId("v4".into()),
+                1,
+                &rec,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "malformed verify_check must not fail the iteration, got {:?}",
+            result
+        );
+
+        let recent = storage.loops().recent_iterations("v4", 1).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].verify_passed, None);
+        assert_eq!(recent[0].verify_reason, None);
+    }
+
+    #[test]
+    fn extract_tool_results_reads_content_key() {
+        let trace = serde_json::json!([
+            {"name": "bash", "content": "exit 0: OK"},
+            {"name": "canvas_eval", "ok": true},
+        ]);
+        let results = extract_tool_results(&trace);
+        assert_eq!(
+            results,
+            vec![
+                ("bash".to_string(), "exit 0: OK".to_string()),
+                ("canvas_eval".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_tool_results_handles_empty_and_non_array_trace() {
+        assert_eq!(extract_tool_results(&serde_json::json!([])), Vec::new());
+        assert_eq!(
+            extract_tool_results(&serde_json::json!({"not": "an array"})),
+            Vec::new()
+        );
+    }
 }

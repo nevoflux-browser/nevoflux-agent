@@ -611,6 +611,9 @@ impl LoopManager {
                 .to_string(),
             gate_spec: args.gate.as_ref().map(|g| g.spec_json.to_string()),
             gate_last_value: None,
+            // TODO(W5 task 2/3): thread a `verify` param through
+            // `CreateLoopArgs`/`loop_create` once the tool schema lands.
+            verify_check: None,
         };
         LoopRepository::new(&self.db)
             .create(&rec)

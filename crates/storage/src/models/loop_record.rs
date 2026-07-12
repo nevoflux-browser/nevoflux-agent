@@ -64,6 +64,10 @@ pub struct LoopRecord {
     pub gate_spec: Option<String>,
     /// Last observed gate value, used as the diff cursor between iterations.
     pub gate_last_value: Option<String>,
+    /// Optional programmatic verify check (W5 §verify), JSON-encoded
+    /// `goals::check::GoalCheck` (bare, not wrapped in `{"check": ...}`).
+    /// `None` = no verify configured; the executor skips evaluation.
+    pub verify_check: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
