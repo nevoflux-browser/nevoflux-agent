@@ -10906,38 +10906,52 @@ mod tests {
         handle.abort();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn managed_daemon_stays_alive_while_a_loop_is_armed() {
-        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        // Browser gone for the whole run (count stays 0) and the message path
+        // idle, but a loop is armed (loop_jobs = 1): the managed daemon must
+        // NOT self-terminate — otherwise a loop job running while the sidebar
+        // is closed would be killed out from under itself. Mirrors
+        // `watchdog_stays_alive_while_schedules_pending_then_resumes`, but
+        // exercises the *loop* half of the `background_jobs` sum instead of
+        // the schedule half. Uses real (short) durations against the
+        // real-`Instant`-based watchdog rather than tokio's virtual clock,
+        // since `managed_idle_watchdog` measures elapsed time with
+        // `std::time::Instant::now()`, which `tokio::time::advance` does not
+        // mock.
         let connection_count = Arc::new(AtomicUsize::new(0)); // disconnected
         let last_message_time = Arc::new(Mutex::new(std::time::Instant::now()));
         let schedule_jobs = Arc::new(AtomicUsize::new(0));
         let loop_jobs = Arc::new(AtomicUsize::new(1)); // one armed loop
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-        let idle = std::time::Duration::from_secs(30);
 
+        let loop_jobs_ctl = loop_jobs.clone();
         let handle = tokio::spawn(managed_idle_watchdog(
             connection_count,
             last_message_time,
-            idle,
-            std::time::Duration::from_secs(1),
+            Duration::from_millis(120),
+            Duration::from_millis(10),
             schedule_jobs,
-            loop_jobs.clone(),
+            loop_jobs,
             shutdown_tx,
         ));
 
-        // Advance well past the idle window; the armed loop must suppress shutdown.
-        tokio::time::advance(std::time::Duration::from_secs(120)).await;
-        tokio::task::yield_now().await;
+        // Past several idle windows with a loop armed -> must stay alive.
+        tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(
             shutdown_rx.try_recv().is_err(),
             "must NOT shut down while a loop is armed"
         );
 
-        // Disarm the loop; now it must reclaim.
-        loop_jobs.store(0, std::sync::atomic::Ordering::SeqCst);
-        tokio::time::advance(std::time::Duration::from_secs(35)).await;
-        tokio::task::yield_now().await;
+        // The loop completes (counter -> 0). The idle countdown resumes from
+        // the real elapsed disconnect time — which is already well past the
+        // window — so termination fires on the next poll. The inhibitor
+        // never reset `last_connected`, so the elapsed disconnect isn't
+        // masked.
+        loop_jobs_ctl.store(0, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(120)).await;
         assert!(
             shutdown_rx.recv().await.is_some(),
             "must shut down once idle and disarmed"
