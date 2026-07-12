@@ -9,8 +9,8 @@ use crate::loops::executor::IterationExecutor;
 use crate::loops::expression::TriggerExpr;
 use crate::loops::registry::LoopRegistry;
 use crate::loops::scheduler::{LoopFireRequest, TriggerScheduler};
-use nevoflux_builtin_wasm::AgentMode;
 use crate::loops::types::{LoopId, LoopRuntime};
+use nevoflux_builtin_wasm::AgentMode;
 use nevoflux_storage::connection::Database;
 use nevoflux_storage::models::{current_timestamp, LoopRecord, LoopState};
 use nevoflux_storage::repositories::LoopRepository;
@@ -59,6 +59,9 @@ pub struct LoopManager {
     fire_tx: mpsc::Sender<LoopFireRequest>,
     events: Arc<LoopEvents>,
     event_bus: Option<Arc<EventBus>>,
+    /// Count of armed (non-terminal) loops. A managed daemon must outlive its
+    /// browser while any loop is armed — mirrors `ScheduleManager::pending_work`.
+    pending_work: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl LoopManager {
@@ -90,12 +93,27 @@ impl LoopManager {
         let registry = LoopRegistry::new();
         let scheduler = TriggerScheduler::new();
         let events = Arc::new(LoopEvents::new(bus.clone()));
-        let executor_inner =
-            IterationExecutor::new_with_events(db.clone(), events.clone());
+        let executor_inner = IterationExecutor::new_with_events(db.clone(), events.clone());
         let executor = Arc::new(match services {
             Some(s) => executor_inner.with_services(s),
             None => executor_inner,
         });
+
+        // Seed the pending-work counter with the loops that are still armed
+        // (non-terminal) at construction time, so a daemon restarted with
+        // armed loops keeps itself alive from the moment the manager starts.
+        let armed: i64 = db
+            .with_connection(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM loops WHERE state NOT IN ('cancelled','failed')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(nevoflux_storage::error::StorageError::from)
+            })
+            .unwrap_or(0);
+        let pending_work = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(armed as usize));
+        let pending_work_for_task = pending_work.clone();
 
         let registry_for_task = registry.clone();
         let executor_for_task = executor.clone();
@@ -233,20 +251,30 @@ impl LoopManager {
                         .with_mut(&req.loop_id, |rt| std::mem::take(&mut rt.dom_watchers))
                         .unwrap_or_default();
                     let subs: Vec<String> = registry_for_task
-                        .with_mut(&req.loop_id, |rt| {
-                            std::mem::take(&mut rt.subscription_ids)
-                        })
+                        .with_mut(&req.loop_id, |rt| std::mem::take(&mut rt.subscription_ids))
                         .unwrap_or_default();
                     for sub in &subs {
                         scheduler_for_task.unsubscribe(sub);
                     }
                     let _ = watchers;
-                    let _ = LoopRepository::new(&executor_for_task.database())
-                        .update_state(
-                            req.loop_id.as_ref(),
-                            LoopState::Failed,
-                            current_timestamp(),
-                        );
+                    // Guard against double-decrement: only the transition
+                    // INTO a terminal state decrements pending_work. If a
+                    // concurrent cancel already flipped this loop to
+                    // cancelled/failed, skip the decrement here.
+                    let prior_state_terminal = LoopRepository::new(&executor_for_task.database())
+                        .get(req.loop_id.as_ref())
+                        .ok()
+                        .flatten()
+                        .map(|r| matches!(r.state, LoopState::Cancelled | LoopState::Failed))
+                        .unwrap_or(true);
+                    let _ = LoopRepository::new(&executor_for_task.database()).update_state(
+                        req.loop_id.as_ref(),
+                        LoopState::Failed,
+                        current_timestamp(),
+                    );
+                    if !prior_state_terminal {
+                        pending_work_for_task.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }
                     events_for_task
                         .state_changed(
                             &session_id,
@@ -279,13 +307,7 @@ impl LoopManager {
                     );
                 }
                 events_for_task
-                    .state_changed(
-                        &session_id_for_state,
-                        &req.loop_id,
-                        "idle",
-                        "running",
-                        None,
-                    )
+                    .state_changed(&session_id_for_state, &req.loop_id, "idle", "running", None)
                     .await;
 
                 // time:dynamic protocol (spec §5.2): if the loop's trigger is
@@ -308,8 +330,7 @@ impl LoopManager {
                                         .filter(|s| s.starts_with("time-"))
                                         .cloned()
                                         .collect();
-                                    rt.subscription_ids
-                                        .retain(|s| !s.starts_with("time-"));
+                                    rt.subscription_ids.retain(|s| !s.starts_with("time-"));
                                     removed
                                 })
                                 .unwrap_or_default();
@@ -337,6 +358,7 @@ impl LoopManager {
             fire_tx,
             events,
             event_bus: bus.clone(),
+            pending_work,
         }
     }
 
@@ -346,6 +368,16 @@ impl LoopManager {
 
     pub fn registry(&self) -> &LoopRegistry {
         &self.registry
+    }
+
+    /// Handle to the armed-loop counter for the managed idle watchdog.
+    pub fn pending_work_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        self.pending_work.clone()
+    }
+
+    /// True while any loop is armed (non-terminal).
+    pub fn has_pending_work(&self) -> bool {
+        self.pending_work.load(std::sync::atomic::Ordering::SeqCst) > 0
     }
 
     pub async fn create_loop(&self, args: CreateLoopArgs) -> Result<LoopId, String> {
@@ -389,6 +421,9 @@ impl LoopManager {
                 rec.wrapped_skill.as_deref(),
             )
             .await;
+
+        self.pending_work
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         Ok(id)
     }
@@ -434,12 +469,7 @@ impl LoopManager {
     /// and tears down everything immediately. `force=false` only tears down
     /// triggers and lets the current iteration finish (the cancellation token
     /// is NOT triggered).
-    async fn cancel_loop_inner(
-        &self,
-        id: &LoopId,
-        force: bool,
-        by: &str,
-    ) -> Result<(), String> {
+    async fn cancel_loop_inner(&self, id: &LoopId, force: bool, by: &str) -> Result<(), String> {
         let session_id = self
             .registry
             .with_mut(id, |rt| rt.session_id.clone())
@@ -468,14 +498,52 @@ impl LoopManager {
         // (future phase), the bridge uninstall would happen here.
         let _ = watchers;
 
-        LoopRepository::new(&self.db)
-            .update_state(id.as_ref(), LoopState::Cancelled, current_timestamp())
+        // Guard against double-decrement: only the transition INTO a
+        // terminal state decrements pending_work. A loop that is cancelled
+        // twice (e.g. soft-cancel followed by a force-cancel escalation
+        // racing another caller) must not underflow the counter.
+        let repo = LoopRepository::new(&self.db);
+        let prior_state_terminal = repo
+            .get(id.as_ref())
+            .map_err(|e| e.to_string())?
+            .map(|r| matches!(r.state, LoopState::Cancelled | LoopState::Failed))
+            .unwrap_or(true);
+
+        repo.update_state(id.as_ref(), LoopState::Cancelled, current_timestamp())
             .map_err(|e| e.to_string())?;
+        if !prior_state_terminal {
+            self.pending_work
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
         self.events
             .state_changed(&session_id, id, "cancelled", "running", Some(by))
             .await;
         self.events.cancelled(&session_id, id, by, force).await;
         self.registry.remove(id);
+        Ok(())
+    }
+
+    /// Mark a loop `Failed` and decrement the pending-work counter. This is
+    /// the single manager-owned entry point for driving a loop into the
+    /// `Failed` terminal state from callers that hold `&self` (e.g. the
+    /// public API, tests). The dispatcher's inline 3-strike auto-fail path
+    /// (spawned as a 'static task without a `LoopManager` handle) applies
+    /// the same guarded decrement directly against a cloned counter handle
+    /// — see `start_with_bus`.
+    pub async fn mark_failed(&self, id: &LoopId) -> Result<(), String> {
+        let repo = LoopRepository::new(&self.db);
+        let prior_state_terminal = repo
+            .get(id.as_ref())
+            .map_err(|e| e.to_string())?
+            .map(|r| matches!(r.state, LoopState::Cancelled | LoopState::Failed))
+            .unwrap_or(true);
+
+        repo.update_state(id.as_ref(), LoopState::Failed, current_timestamp())
+            .map_err(|e| e.to_string())?;
+        if !prior_state_terminal {
+            self.pending_work
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -485,9 +553,7 @@ impl LoopManager {
     pub async fn shutdown(&self) {
         let ids = self.registry.ids();
         for id in &ids {
-            let _ = self
-                .cancel_loop_inner(id, true, "daemon-shutdown")
-                .await;
+            let _ = self.cancel_loop_inner(id, true, "daemon-shutdown").await;
         }
         // Any rows still `running` (shouldn't be after the per-id force
         // cancels, but defensive) get demoted to idle.
@@ -544,7 +610,10 @@ impl LoopManager {
             }
             TriggerExpr::Event(topic) => {
                 let Some(bus) = self.event_bus.clone() else {
-                    tracing::warn!("event:{} ignored — LoopManager has no EventBus handle", topic);
+                    tracing::warn!(
+                        "event:{} ignored — LoopManager has no EventBus handle",
+                        topic
+                    );
                     return;
                 };
                 match self
@@ -552,7 +621,8 @@ impl LoopManager {
                     .schedule_event(id.clone(), topic.clone(), bus, sink)
                 {
                     Ok(sub) => {
-                        self.registry.with_mut(id, |rt| rt.subscription_ids.push(sub));
+                        self.registry
+                            .with_mut(id, |rt| rt.subscription_ids.push(sub));
                     }
                     Err(e) => {
                         tracing::warn!("event:{} subscription failed: {e}", topic);
@@ -572,10 +642,7 @@ impl LoopManager {
                     return;
                 };
                 let topic = "ui:tab:dom:mutation".to_string();
-                match self
-                    .scheduler
-                    .schedule_event(id.clone(), topic, bus, sink)
-                {
+                match self.scheduler.schedule_event(id.clone(), topic, bus, sink) {
                     Ok(sub) => {
                         self.registry
                             .with_mut(id, |rt| rt.subscription_ids.push(sub));
@@ -846,25 +913,34 @@ mod tests {
         let bus = Arc::new(EventBus::new());
         let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus.clone()), None);
 
-        let id = mgr.create_loop(CreateLoopArgs {
-            session_id: "s1".into(),
-            trigger_expr_text: "event:ui:test:click".into(),
-            prompt_text: Some("p".into()),
-            wrapped_skill: None,
-            mode: nevoflux_builtin_wasm::AgentMode::Chat,
-        }).await.unwrap();
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "event:ui:test:click".into(),
+                prompt_text: Some("p".into()),
+                wrapped_skill: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
+            })
+            .await
+            .unwrap();
 
         bus.publish(BusEvent::ephemeral(
             "ui:test:click",
             serde_json::json!({}),
             PublisherIdentity::Internal,
-        )).await.unwrap();
+        ))
+        .await
+        .unwrap();
 
         // Real-time wait for the dispatcher + executor to run.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
-        assert!(rec.iteration_count >= 1, "iteration_count was {}", rec.iteration_count);
+        assert!(
+            rec.iteration_count >= 1,
+            "iteration_count was {}",
+            rec.iteration_count
+        );
     }
 
     #[tokio::test]
@@ -1012,6 +1088,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_work_tracks_create_and_cancel() {
+        use crate::event_bus::EventBus;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let storage = fresh();
+        let bus = Arc::new(EventBus::new());
+        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus), None);
+
+        // No loops yet.
+        assert_eq!(mgr.pending_work_handle().load(Ordering::SeqCst), 0);
+        assert!(!mgr.has_pending_work());
+
+        // Create one armed loop -> counter is 1.
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "time:10m".into(),
+                prompt_text: Some("watch".into()),
+                wrapped_skill: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
+            })
+            .await
+            .unwrap();
+        assert_eq!(mgr.pending_work_handle().load(Ordering::SeqCst), 1);
+        assert!(mgr.has_pending_work());
+
+        // Cancel it (terminal) -> counter back to 0.
+        mgr.cancel_loop(&id, false).await.unwrap();
+        assert_eq!(mgr.pending_work_handle().load(Ordering::SeqCst), 0);
+        assert!(!mgr.has_pending_work());
+    }
+
+    #[tokio::test]
+    async fn pending_work_decrements_on_auto_fail() {
+        use crate::event_bus::EventBus;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let storage = fresh();
+        let bus = Arc::new(EventBus::new());
+        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus), None);
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "time:1m".into(),
+                prompt_text: Some("x".into()),
+                wrapped_skill: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
+            })
+            .await
+            .unwrap();
+        assert_eq!(mgr.pending_work_handle().load(Ordering::SeqCst), 1);
+
+        // Drive the loop to Failed directly through the manager method that
+        // owns the counter (the registry is pure in-memory runtime state and
+        // has no `update_state`; the DB-backed fail transition must go
+        // through `mark_failed` so the counter stays in sync).
+        mgr.mark_failed(&id).await.unwrap();
+
+        assert_eq!(mgr.pending_work_handle().load(Ordering::SeqCst), 0);
+        assert!(!mgr.has_pending_work());
+        let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
+        assert_eq!(rec.state, LoopState::Failed);
+    }
+
+    #[tokio::test]
     async fn state_trigger_fires_on_dom_mutation_event() {
         use crate::event_bus::types::{BusEvent, PublisherIdentity};
         use crate::event_bus::EventBus;
@@ -1020,11 +1163,7 @@ mod tests {
 
         let storage = fresh();
         let bus = Arc::new(EventBus::new());
-        let mgr = LoopManager::start_with_bus(
-            storage.database().clone(),
-            Some(bus.clone()),
-            None,
-        );
+        let mgr = LoopManager::start_with_bus(storage.database().clone(), Some(bus.clone()), None);
 
         let id = mgr
             .create_loop(CreateLoopArgs {
