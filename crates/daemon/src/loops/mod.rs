@@ -5,6 +5,7 @@
 pub mod combinator;
 pub mod dynamic;
 pub mod events;
+pub mod evolve;
 pub mod executor;
 pub mod expression;
 pub mod gate;

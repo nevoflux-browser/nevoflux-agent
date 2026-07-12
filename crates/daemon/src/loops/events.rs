@@ -213,6 +213,35 @@ impl LoopEvents {
             .await;
     }
 
+    /// Emitted when the `/loop evolve` meta-pass (W4) produces a
+    /// self-improvement proposal for a loop. Carries the same fields a
+    /// sidebar accept/reject UI needs to render the diff without a
+    /// follow-up fetch.
+    pub async fn proposal(
+        &self,
+        session_id: &str,
+        id: &LoopId,
+        p: &nevoflux_storage::repositories::LoopProposal,
+    ) {
+        let Some(bus) = &self.bus else {
+            return;
+        };
+        let _ = bus
+            .publish(BusEvent::ephemeral(
+                "system:loop:proposal",
+                json!({
+                    "session_id": session_id,
+                    "loop_id": id.as_ref(),
+                    "id": p.id,
+                    "rationale": p.rationale,
+                    "proposed_prompt_text": p.proposed_prompt_text,
+                    "proposed_gate_spec": p.proposed_gate_spec,
+                }),
+                PublisherIdentity::Internal,
+            ))
+            .await;
+    }
+
     pub async fn cancelled(&self, session_id: &str, id: &LoopId, by: &str, force: bool) {
         let Some(bus) = &self.bus else {
             return;
@@ -261,5 +290,15 @@ mod tests {
         evts.trigger_dropped("s1", &id, 1).await;
         evts.skipped("s1", &id, "time").await;
         evts.cancelled("s1", &id, "user", false).await;
+        let p = nevoflux_storage::repositories::LoopProposal {
+            id: "prop-1".into(),
+            loop_id: "abc".into(),
+            created_at: 1,
+            rationale: "healthy".into(),
+            proposed_prompt_text: None,
+            proposed_gate_spec: None,
+            status: "pending".into(),
+        };
+        evts.proposal("s1", &id, &p).await;
     }
 }
