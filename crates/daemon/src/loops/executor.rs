@@ -57,9 +57,16 @@ use crate::loops::tool_classes::iteration_forbidden_tools;
 use crate::loops::types::LoopId;
 use crate::wasm::services::HostServices;
 use nevoflux_storage::models::{current_timestamp, IterationStatus, LoopRecord};
-use nevoflux_storage::repositories::LoopRepository;
+use nevoflux_storage::repositories::{LoopRepository, MessageRepository};
 use nevoflux_storage::Database;
 use std::sync::Arc;
+
+/// W5 §verify: how many of the session's most-recent `tool_result` messages
+/// to read back for a loop iteration's programmatic check. Mirrors
+/// `goals/manager.rs::TOOL_RESULTS_WINDOW` in spirit but sized a bit larger
+/// since loop iterations can invoke more tools per turn than a chat goal
+/// turn does.
+const VERIFY_TOOL_RESULTS_WINDOW: u32 = 20;
 
 #[derive(Debug)]
 pub enum ExecResult {
@@ -278,6 +285,17 @@ impl IterationExecutor {
         // is the bare `GoalCheck` JSON, so wrap it before parsing. Any parse
         // failure (malformed JSON, missing `matches`, bad regex) fails open:
         // `(None, None)` — a bad verify spec must never block the loop.
+        //
+        // Content source: NOT `trace_summary` — the production trace built
+        // by `agent_exec.rs` only carries `{name, ok}` per tool call, no
+        // result content, so a content-matching check would silently always
+        // fail against it. Reuse `/goal`'s exact data source instead: real
+        // tool-result content is persisted to the `messages` table
+        // (`content_type='tool_result'`) by `DaemonHostFunctions::
+        // record_tool_result` on the same `Agent::run` pipeline loops use.
+        // This is also why we must NOT feed `final_text` in here — that's
+        // the model's own paraphrase, not the independent tool read-back the
+        // check engine is meant to verify against.
         let (verify_passed, verify_reason) = match rec.verify_check.as_deref() {
             Some(cj) => {
                 let parsed = serde_json::from_str::<serde_json::Value>(cj)
@@ -289,7 +307,9 @@ impl IterationExecutor {
                     });
                 match parsed {
                     Some(check) => {
-                        let tool_results = extract_tool_results(&trace_summary);
+                        let tool_results = MessageRepository::new(&self.db)
+                            .list_recent_tool_results(session_id, VERIFY_TOOL_RESULTS_WINDOW)
+                            .unwrap_or_default();
                         let passed = crate::goals::check::eval_check(&check, &tool_results);
                         let reason = format!(
                             "check '{}' {}",
@@ -368,40 +388,6 @@ impl IterationExecutor {
             .await;
         ExecResult::Error(err)
     }
-}
-
-/// Pull `(tool_name, content)` pairs out of an iteration's
-/// `tool_calls_summary` trace, for feeding `goals::check::eval_check`.
-///
-/// The production trace (`AgentExecOutcome::trace`, built in
-/// `agent_exec.rs`) is currently `[{"name": ..., "ok": true}]` — no result
-/// content is carried today, so a verify check that inspects tool *content*
-/// will only ever see an empty string for real iterations until a future
-/// task threads tool results into the trace. This helper is written
-/// tolerant of that: it checks a handful of plausible content keys
-/// (`content`, `result`, `output`, `text`) so it keeps working once one
-/// shows up, and unit tests can exercise the verify path by constructing a
-/// trace with one of those keys directly.
-fn extract_tool_results(trace: &serde_json::Value) -> Vec<(String, String)> {
-    let Some(entries) = trace.as_array() else {
-        return Vec::new();
-    };
-    entries
-        .iter()
-        .filter_map(|entry| {
-            let name = entry.get("name")?.as_str()?.to_string();
-            let content = ["content", "result", "output", "text"]
-                .iter()
-                .find_map(|key| entry.get(key))
-                .map(|v| {
-                    v.as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| v.to_string())
-                })
-                .unwrap_or_default();
-            Some((name, content))
-        })
-        .collect()
 }
 
 /// Build the §7.2 LOOP-CONTEXT-prefixed user message for an iteration.
@@ -789,11 +775,32 @@ mod tests {
     }
 
     // W5 §verify: `finalize_iteration_ok` runs the loop's optional
-    // `verify_check` against the iteration's tool-call trace and persists
-    // the verdict. These call the private finalizer directly (rather than
-    // going through `execute()`'s stub path, which never produces tool
-    // results) so the check-evaluation branch is exercised without needing
-    // a real LLM run.
+    // `verify_check` against the iteration's real tool-result content, read
+    // back from the `messages` table (`content_type='tool_result'`) — the
+    // same source `/goal`'s programmatic check reads via
+    // `MessageRepository::list_recent_tool_results`. The `trace_summary`
+    // passed in below intentionally carries NO `content` field (mirroring
+    // the production `agent_exec.rs` trace shape, which is `{name, ok}`
+    // only) to prove the verify path no longer depends on it. These tests
+    // call the private finalizer directly (rather than going through
+    // `execute()`'s stub path, which never produces tool results) so the
+    // check-evaluation branch is exercised without needing a real LLM run.
+
+    /// Seed a `tool_result` message directly into the `messages` table,
+    /// mirroring what `DaemonHostFunctions::record_tool_result` persists in
+    /// production. Same pattern as `goals::manager::tests::seed_tool_result`.
+    fn seed_tool_result(db: &Database, session_id: &str, tool: &str, content: &str) {
+        use nevoflux_storage::models::{ContentType, CreateMessageParams, MessageRole};
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("tool_name".to_string(), serde_json::json!(tool));
+        nevoflux_storage::repositories::MessageRepository::new(db)
+            .create(
+                CreateMessageParams::new(session_id, MessageRole::Assistant, content)
+                    .with_content_type(ContentType::ToolResult)
+                    .with_metadata(meta),
+            )
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn finalize_iteration_ok_stores_verify_passed_true_on_match() {
@@ -809,9 +816,12 @@ mod tests {
             .loops()
             .insert_iteration("v1", 1, 100, IterationStatus::Running)
             .unwrap();
+        seed_tool_result(storage.database(), "s1", "bash", "exit 0: OK");
 
         let executor = IterationExecutor::new(storage.database().clone());
-        let trace = serde_json::json!([{"name": "bash", "content": "exit 0: OK"}]);
+        // No `content` key — proves the check reads the messages table, not
+        // the trace, for the actual matching content.
+        let trace = serde_json::json!([{"name": "bash", "ok": true}]);
         let result = executor
             .finalize_iteration_ok(
                 iter_id,
@@ -848,9 +858,10 @@ mod tests {
             .loops()
             .insert_iteration("v2", 1, 100, IterationStatus::Running)
             .unwrap();
+        seed_tool_result(storage.database(), "s1", "bash", "exit 1: failed");
 
         let executor = IterationExecutor::new(storage.database().clone());
-        let trace = serde_json::json!([{"name": "bash", "content": "exit 1: failed"}]);
+        let trace = serde_json::json!([{"name": "bash", "ok": false}]);
         let result = executor
             .finalize_iteration_ok(
                 iter_id,
@@ -886,9 +897,10 @@ mod tests {
             .loops()
             .insert_iteration("v3", 1, 100, IterationStatus::Running)
             .unwrap();
+        seed_tool_result(storage.database(), "s1", "bash", "exit 0: OK");
 
         let executor = IterationExecutor::new(storage.database().clone());
-        let trace = serde_json::json!([{"name": "bash", "content": "exit 0: OK"}]);
+        let trace = serde_json::json!([{"name": "bash", "ok": true}]);
         let result = executor
             .finalize_iteration_ok(
                 iter_id,
@@ -922,9 +934,10 @@ mod tests {
             .loops()
             .insert_iteration("v4", 1, 100, IterationStatus::Running)
             .unwrap();
+        seed_tool_result(storage.database(), "s1", "bash", "exit 0: OK");
 
         let executor = IterationExecutor::new(storage.database().clone());
-        let trace = serde_json::json!([{"name": "bash", "content": "exit 0: OK"}]);
+        let trace = serde_json::json!([{"name": "bash", "ok": true}]);
         let result = executor
             .finalize_iteration_ok(
                 iter_id,
@@ -946,30 +959,5 @@ mod tests {
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].verify_passed, None);
         assert_eq!(recent[0].verify_reason, None);
-    }
-
-    #[test]
-    fn extract_tool_results_reads_content_key() {
-        let trace = serde_json::json!([
-            {"name": "bash", "content": "exit 0: OK"},
-            {"name": "canvas_eval", "ok": true},
-        ]);
-        let results = extract_tool_results(&trace);
-        assert_eq!(
-            results,
-            vec![
-                ("bash".to_string(), "exit 0: OK".to_string()),
-                ("canvas_eval".to_string(), String::new()),
-            ]
-        );
-    }
-
-    #[test]
-    fn extract_tool_results_handles_empty_and_non_array_trace() {
-        assert_eq!(extract_tool_results(&serde_json::json!([])), Vec::new());
-        assert_eq!(
-            extract_tool_results(&serde_json::json!({"not": "an array"})),
-            Vec::new()
-        );
     }
 }
