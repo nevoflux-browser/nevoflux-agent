@@ -519,6 +519,85 @@ mod tests {
         );
     }
 
+    /// Regression for the evolve human-in-the-loop gate: an unattended
+    /// iteration must not be able to propose (`loop_evolve`) or accept/
+    /// reject (`loop_proposal_respond`) a self-improvement rewrite —
+    /// both are creation/approval operations, same class as `loop_create`.
+    /// Mirrors `loop_create_blocked_in_iteration`.
+    #[tokio::test]
+    async fn evolve_tools_blocked_in_iteration() {
+        let (storage, mgr) = setup();
+
+        let err = exec(
+            "loop_evolve",
+            &json!({ "loop_id": "aaa" }),
+            &ctx(true, Some("aaa")),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("forbidden") || err.contains("inside an iteration"),
+            "got: {err}"
+        );
+
+        let err = exec(
+            "loop_proposal_respond",
+            &json!({ "proposal_id": "bbb", "accept": true }),
+            &ctx(true, Some("aaa")),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("forbidden") || err.contains("inside an iteration"),
+            "got: {err}"
+        );
+    }
+
+    /// Outside an iteration, both evolve tools must still dispatch through
+    /// to their handlers (i.e. not be rejected by the iteration guard).
+    /// `loop_evolve` errors on `services: None` (not on the forbidden
+    /// check) and `loop_proposal_respond` errors on an unknown-but-valid
+    /// `proposal_id` shape resolving to "no pending proposal" — neither
+    /// error is the iteration-forbidden message.
+    #[tokio::test]
+    async fn evolve_tools_allowed_outside_iteration() {
+        let (storage, mgr) = setup();
+
+        let err = exec(
+            "loop_evolve",
+            &json!({ "loop_id": "aaa" }),
+            &ctx(false, None),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !err.contains("forbidden inside loop iterations"),
+            "got: {err}"
+        );
+        assert!(err.contains("HostServices"), "got: {err}");
+
+        let res = exec(
+            "loop_proposal_respond",
+            &json!({ "proposal_id": "bbb", "accept": true }),
+            &ctx(false, None),
+            &mgr,
+            storage.database(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.get("applied").unwrap().as_bool().unwrap(), false);
+        assert_eq!(
+            res.get("status").unwrap().as_str().unwrap(),
+            "no_pending_proposal"
+        );
+    }
+
     #[tokio::test]
     async fn scratchpad_set_rejects_oversize() {
         let (storage, mgr) = setup();
