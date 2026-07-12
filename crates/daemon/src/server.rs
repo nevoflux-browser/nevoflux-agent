@@ -2468,6 +2468,150 @@ pub async fn start_server(
                 continue;
             }
 
+            // Handle loop_evolve_command from sidebar (Loop Jobs panel "Evolve
+            // now" button, W4 evolve UI wiring). Runs the self-improvement
+            // meta-pass (an LLM turn) for a loop. `evolve_loop` already
+            // inserts the resulting proposal row and emits
+            // `system:loop:proposal` on success, which is what the panel
+            // actually listens for — so this handler only needs to kick the
+            // pass off and log the outcome. Spawned off the message loop
+            // (mirrors the ProcessChat pattern above) since the LLM call can
+            // take several seconds and must not block other sidebar traffic.
+            if msg_type == "loop_evolve_command" {
+                info!("Processing loop_evolve_command message");
+                if let Some(payload) = envelope.payload.get("payload") {
+                    let loop_id = payload
+                        .get("loop_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    if let Some(loop_id) = loop_id {
+                        let evolve_services = process_services.clone();
+                        tokio::spawn(async move {
+                            let db = evolve_services.database.clone();
+                            match crate::loops::evolve::evolve_loop(
+                                db.as_ref(),
+                                &evolve_services,
+                                &loop_id,
+                            )
+                            .await
+                            {
+                                Ok(proposal) => {
+                                    info!(
+                                        "loop_evolve_command produced proposal {} for loop {}",
+                                        proposal.id, loop_id
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("loop_evolve_command failed for {}: {}", loop_id, e);
+                                }
+                            }
+                        });
+                    } else {
+                        warn!("loop_evolve_command missing loop_id");
+                    }
+                }
+                continue;
+            }
+
+            // Handle loop_proposal_respond_command from sidebar (Loop Jobs
+            // panel Accept/Reject buttons, W4 evolve UI wiring). Mirrors the
+            // `loop_proposal_respond` tool handler in `loops::tools` (that
+            // function isn't directly reusable here without a session_id,
+            // which the command payload deliberately omits — see
+            // `LoopProposalRespondCommandPayload` — so the loop's own
+            // session_id is looked up from the record instead of trusting
+            // whatever session happens to be attached to this connection).
+            if msg_type == "loop_proposal_respond_command" {
+                info!("Processing loop_proposal_respond_command message");
+                if let Some(payload) = envelope.payload.get("payload") {
+                    let proposal_id = payload
+                        .get("proposal_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let accept = payload.get("accept").and_then(|v| v.as_bool());
+                    match (proposal_id, accept) {
+                        (Some(proposal_id), Some(accept)) => {
+                            if let Some(mgr) = process_services.loop_manager.as_ref() {
+                                let db = process_services.database.as_ref();
+                                let now = nevoflux_storage::models::current_timestamp();
+                                let proposal_repo =
+                                    nevoflux_storage::repositories::LoopProposalRepository::new(
+                                        db,
+                                    );
+                                match proposal_repo.respond_proposal(&proposal_id, accept, now) {
+                                    Ok(Some(proposal)) => {
+                                        if accept {
+                                            if let Err(e) =
+                                                nevoflux_storage::repositories::LoopRepository::new(
+                                                    db,
+                                                )
+                                                .apply_proposal_fields(
+                                                    &proposal.loop_id,
+                                                    proposal.proposed_prompt_text.as_deref(),
+                                                    proposal.proposed_gate_spec.as_deref(),
+                                                    now,
+                                                )
+                                            {
+                                                warn!(
+                                                    "loop_proposal_respond_command: failed to apply proposal {} to loop {}: {}",
+                                                    proposal.id, proposal.loop_id, e
+                                                );
+                                            }
+                                        }
+                                        let loop_session_id =
+                                            nevoflux_storage::repositories::LoopRepository::new(
+                                                db,
+                                            )
+                                            .get(&proposal.loop_id)
+                                            .ok()
+                                            .flatten()
+                                            .map(|rec| rec.session_id)
+                                            .unwrap_or_default();
+                                        mgr.events()
+                                            .proposal_resolved(
+                                                &loop_session_id,
+                                                &crate::loops::LoopId(proposal.loop_id.clone()),
+                                                &proposal.id,
+                                                accept,
+                                            )
+                                            .await;
+                                        info!(
+                                            "loop_proposal_respond_command: proposal {} for loop {} {}",
+                                            proposal.id,
+                                            proposal.loop_id,
+                                            if accept { "accepted" } else { "rejected" }
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        warn!(
+                                            "loop_proposal_respond_command: no pending proposal {}",
+                                            proposal_id
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "loop_proposal_respond_command: failed to respond to proposal {}: {}",
+                                            proposal_id, e
+                                        );
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    "loop_proposal_respond_command received for {} but no LoopManager configured",
+                                    proposal_id
+                                );
+                            }
+                        }
+                        _ => {
+                            warn!(
+                                "loop_proposal_respond_command missing proposal_id or accept"
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Handle skill_command messages from sidebar — currently used
             // by the /loop slash command (Phase 17). Routes skill_name=="loop"
             // to LoopManager::create_loop. Other skill_names fall through and
