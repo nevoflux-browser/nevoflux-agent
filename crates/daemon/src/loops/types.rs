@@ -71,6 +71,55 @@ impl LoopRuntime {
     }
 }
 
+/// Kind of deterministic gate attached to a loop (W3 spec §gate). `None` is
+/// the default — the loop always fires on its trigger. The other variants
+/// suppress an iteration unless the gate's observed value differs from
+/// `LoopRecord::gate_last_value`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateKind {
+    None,
+    Http,
+    Bash,
+    Event,
+}
+
+impl GateKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Http => "http",
+            Self::Bash => "bash",
+            Self::Event => "event",
+        }
+    }
+
+    /// Parse from the on-disk string representation (`loops.gate_kind`).
+    ///
+    /// Named `from_str` per the W3 gate spec's interface, not `FromStr::from_str`
+    /// (returns `Option`, not `Result`) — silence the trait-confusion lint rather
+    /// than rename, to match the mandated `GateKind::from_str`/`as_str` API.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "none" => Self::None,
+            "http" => Self::Http,
+            "bash" => Self::Bash,
+            "event" => Self::Event,
+            _ => return None,
+        })
+    }
+}
+
+/// A parsed deterministic gate: kind + kind-specific JSON config
+/// (`loops.gate_spec`). The evaluator (later W3 task) interprets `spec_json`
+/// according to `kind` — e.g. for `Http`, `{"url": ..., "extract": ...}`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GateSpec {
+    pub kind: GateKind,
+    pub spec_json: serde_json::Value,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,6 +137,34 @@ mod tests {
         let a = LoopId::generate();
         let b = LoopId::generate();
         assert_ne!(a, b, "two consecutive UUID-derived ids should not collide");
+    }
+
+    #[test]
+    fn gate_kind_as_str_round_trips_through_from_str() {
+        for kind in [
+            GateKind::None,
+            GateKind::Http,
+            GateKind::Bash,
+            GateKind::Event,
+        ] {
+            let s = kind.as_str();
+            assert_eq!(GateKind::from_str(s), Some(kind));
+        }
+    }
+
+    #[test]
+    fn gate_kind_from_str_rejects_unknown() {
+        assert_eq!(GateKind::from_str("bogus"), None);
+    }
+
+    #[test]
+    fn gate_spec_holds_kind_and_json() {
+        let spec = GateSpec {
+            kind: GateKind::Http,
+            spec_json: serde_json::json!({"url": "https://x", "extract": "$.v"}),
+        };
+        assert_eq!(spec.kind, GateKind::Http);
+        assert_eq!(spec.spec_json["url"], "https://x");
     }
 
     #[test]

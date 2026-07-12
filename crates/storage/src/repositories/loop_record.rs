@@ -31,8 +31,9 @@ impl<'a> LoopRepository<'a> {
                 "INSERT INTO loops
                     (id, session_id, trigger_expr, prompt_text, wrapped_skill,
                      mode, scratchpad, state, consecutive_failures,
-                     skipped_triggers, iteration_count, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     skipped_triggers, iteration_count, created_at, updated_at,
+                     gate_kind, gate_spec, gate_last_value)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     rec.id,
                     rec.session_id,
@@ -47,6 +48,9 @@ impl<'a> LoopRepository<'a> {
                     rec.iteration_count,
                     rec.created_at,
                     rec.updated_at,
+                    rec.gate_kind,
+                    rec.gate_spec,
+                    rec.gate_last_value,
                 ],
             )?;
             Ok(rec.id.clone())
@@ -59,7 +63,8 @@ impl<'a> LoopRepository<'a> {
                 "SELECT id, session_id, trigger_expr, prompt_text, wrapped_skill,
                         mode, scratchpad, state,
                         consecutive_failures, skipped_triggers, iteration_count,
-                        created_at, updated_at
+                        created_at, updated_at,
+                        gate_kind, gate_spec, gate_last_value
                  FROM loops WHERE id = ?1",
                 params![id],
                 row_to_loop,
@@ -252,7 +257,8 @@ impl<'a> LoopRepository<'a> {
                 "SELECT id, session_id, trigger_expr, prompt_text, wrapped_skill,
                         mode, scratchpad, state,
                         consecutive_failures, skipped_triggers, iteration_count,
-                        created_at, updated_at
+                        created_at, updated_at,
+                        gate_kind, gate_spec, gate_last_value
                  FROM loops WHERE session_id = ?1 ORDER BY created_at",
             )?;
             let rows = stmt.query_map(params![session_id], row_to_loop)?;
@@ -266,11 +272,29 @@ impl<'a> LoopRepository<'a> {
                 "SELECT id, session_id, trigger_expr, prompt_text, wrapped_skill,
                         mode, scratchpad, state,
                         consecutive_failures, skipped_triggers, iteration_count,
-                        created_at, updated_at
+                        created_at, updated_at,
+                        gate_kind, gate_spec, gate_last_value
                  FROM loops WHERE state IN ('pending', 'running') ORDER BY created_at",
             )?;
             let rows = stmt.query_map([], row_to_loop)?;
             rows.map(|r| r?).collect()
+        })
+    }
+
+    /// Persist the last observed gate value (deterministic-gate diff cursor,
+    /// W3 spec). No-op semantics if `loop_id` doesn't exist: 0 rows affected,
+    /// `Ok(())` — mirrors `update_scratchpad`/`set_consecutive_failures`.
+    pub fn set_gate_last_value(&self, loop_id: &str, value: &str) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE loops SET gate_last_value = ?1, updated_at = ?2 WHERE id = ?3",
+                params![value, now, loop_id],
+            )?;
+            Ok(())
         })
     }
 }
@@ -289,6 +313,9 @@ fn row_to_loop(row: &Row<'_>) -> rusqlite::Result<Result<LoopRecord>> {
     let iteration_count: i64 = row.get(10)?;
     let created_at: i64 = row.get(11)?;
     let updated_at: i64 = row.get(12)?;
+    let gate_kind: String = row.get(13)?;
+    let gate_spec: Option<String> = row.get(14)?;
+    let gate_last_value: Option<String> = row.get(15)?;
 
     Ok((|| -> Result<LoopRecord> {
         let state = LoopState::from_db_str(&state_str).ok_or_else(|| {
@@ -308,6 +335,9 @@ fn row_to_loop(row: &Row<'_>) -> rusqlite::Result<Result<LoopRecord>> {
             iteration_count,
             created_at,
             updated_at,
+            gate_kind,
+            gate_spec,
+            gate_last_value,
         })
     })())
 }
@@ -341,6 +371,9 @@ mod tests {
             iteration_count: 0,
             created_at: 100,
             updated_at: 100,
+            gate_kind: "none".into(),
+            gate_spec: None,
+            gate_last_value: None,
         }
     }
 
@@ -648,6 +681,28 @@ mod tests {
         let mut ids: Vec<&str> = active.iter().map(|r| r.id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn gate_columns_round_trip_and_set_gate_last_value() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        let mut rec = sample_loop("gate1");
+        rec.gate_kind = "http".into();
+        rec.gate_spec = Some(r#"{"url":"https://x","extract":"$.v"}"#.into());
+        repo.create(&rec).unwrap();
+
+        let row = repo.get("gate1").unwrap().unwrap();
+        assert_eq!(row.gate_kind, "http");
+        assert_eq!(
+            row.gate_spec.as_deref(),
+            Some(r#"{"url":"https://x","extract":"$.v"}"#)
+        );
+        assert_eq!(row.gate_last_value, None);
+
+        repo.set_gate_last_value("gate1", "42").unwrap();
+        let row = repo.get("gate1").unwrap().unwrap();
+        assert_eq!(row.gate_last_value.as_deref(), Some("42"));
     }
 
     #[test]

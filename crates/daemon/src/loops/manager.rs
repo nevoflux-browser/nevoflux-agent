@@ -449,6 +449,9 @@ impl LoopManager {
             iteration_count: 0,
             created_at: now,
             updated_at: now,
+            gate_kind: "none".into(),
+            gate_spec: None,
+            gate_last_value: None,
         };
         LoopRepository::new(&self.db)
             .create(&rec)

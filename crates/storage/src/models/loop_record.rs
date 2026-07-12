@@ -57,6 +57,13 @@ pub struct LoopRecord {
     pub iteration_count: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Optional deterministic gate kind ("none" | "http" | "bash" | "event";
+    /// W3 spec). Defaults to "none" at the DB level.
+    pub gate_kind: String,
+    /// Kind-specific gate config, JSON-encoded.
+    pub gate_spec: Option<String>,
+    /// Last observed gate value, used as the diff cursor between iterations.
+    pub gate_last_value: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
