@@ -348,7 +348,7 @@ pub(crate) async fn build_user_message(
     // work. Empty when the loop has no finished iterations yet (fresh loop)
     // or the query fails — the LOOP-CONTEXT block degrades gracefully.
     const RECENT_RUNS_N: usize = 5;
-    const RECENT_LINE_MAX: usize = 200; // one-line summary cap per run
+    const RECENT_LINE_MAX: usize = 200; // one-line summary cap per run, in chars (char-safe truncation)
     let recent_block = {
         let repo = LoopRepository::new(db);
         match repo.recent_iterations(rec.id.as_ref(), RECENT_RUNS_N) {
@@ -356,8 +356,10 @@ pub(crate) async fn build_user_message(
                 let mut s = String::from("recent_runs (newest first):\n");
                 for r in &rows {
                     let summary = r.final_text.as_deref().unwrap_or("").replace('\n', " ");
-                    let summary = if summary.len() > RECENT_LINE_MAX {
-                        format!("{}…", &summary[..RECENT_LINE_MAX])
+                    let summary = if summary.chars().count() > RECENT_LINE_MAX {
+                        let truncated: String =
+                            summary.chars().take(RECENT_LINE_MAX).collect();
+                        format!("{}…", truncated)
                     } else {
                         summary
                     };
@@ -537,6 +539,57 @@ mod tests {
         let msg = build_user_message(&rec, 2, "time", storage.database(), None).await;
         assert!(msg.contains("recent_runs"));
         assert!(msg.contains("prior result"));
+    }
+
+    /// Regression test for a byte-slice truncation panic: `final_text` is
+    /// unconstrained LLM output and routinely contains multibyte UTF-8 (CJK,
+    /// emoji). Slicing `&summary[..RECENT_LINE_MAX]` on a byte index that
+    /// falls mid-codepoint panics. This builds a 207-char summary (199 ASCII
+    /// + 8 CJK chars) so the 200-char cap lands inside the multibyte tail,
+    /// then asserts `build_user_message` returns normally and truncates on a
+    /// char boundary.
+    #[tokio::test]
+    async fn loop_context_truncates_multibyte_summary_without_panicking() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .sessions()
+            .create(CreateSessionParams::new().with_id("s1").with_title("t"))
+            .unwrap();
+        let rec = sample_loop("M");
+        storage.loops().create(&rec).unwrap();
+        let id = storage
+            .loops()
+            .insert_iteration("M", 1, 100, IterationStatus::Running)
+            .unwrap();
+
+        let final_text = format!("{}{}", "a".repeat(199), "中文摘要内容测试");
+        assert_eq!(final_text.chars().count(), 207, "sanity: 199 ascii + 8 cjk");
+
+        storage
+            .loops()
+            .finish_iteration(
+                id,
+                110,
+                IterationStatus::Ok,
+                None,
+                Some("[]"),
+                Some(&final_text),
+                None,
+            )
+            .unwrap();
+
+        // Must return normally, not panic on a mid-codepoint byte slice.
+        let msg = build_user_message(&rec, 2, "time", storage.database(), None).await;
+
+        let expected_truncated: String = final_text.chars().take(200).collect();
+        assert!(
+            msg.contains(&format!("{}…", expected_truncated)),
+            "expected char-safe 200-char truncation with ellipsis; got: {msg}"
+        );
+        assert!(
+            !msg.contains(&final_text),
+            "full untruncated multibyte summary should not appear"
+        );
     }
 
     #[tokio::test]
