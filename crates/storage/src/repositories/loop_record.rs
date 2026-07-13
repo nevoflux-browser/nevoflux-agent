@@ -5,6 +5,18 @@ use rusqlite::{params, OptionalExtension, Row};
 use crate::connection::Database;
 use crate::error::{Result, StorageError};
 use crate::models::{IterationStatus, LoopRecord, LoopState};
+use crate::repositories::truncate_final_text;
+
+/// A compact past-iteration record for the loop's "recent runs" log.
+#[derive(Debug, Clone)]
+pub struct RecentIteration {
+    pub sequence_number: i64,
+    pub ended_at: Option<i64>,
+    pub status: String,
+    pub final_text: Option<String>,
+    pub verify_passed: Option<bool>,
+    pub verify_reason: Option<String>,
+}
 
 pub struct LoopRepository<'a> {
     db: &'a Database,
@@ -21,8 +33,9 @@ impl<'a> LoopRepository<'a> {
                 "INSERT INTO loops
                     (id, session_id, trigger_expr, prompt_text, wrapped_skill,
                      mode, scratchpad, state, consecutive_failures,
-                     skipped_triggers, iteration_count, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                     skipped_triggers, iteration_count, created_at, updated_at,
+                     gate_kind, gate_spec, gate_last_value, verify_check)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     rec.id,
                     rec.session_id,
@@ -37,6 +50,10 @@ impl<'a> LoopRepository<'a> {
                     rec.iteration_count,
                     rec.created_at,
                     rec.updated_at,
+                    rec.gate_kind,
+                    rec.gate_spec,
+                    rec.gate_last_value,
+                    rec.verify_check,
                 ],
             )?;
             Ok(rec.id.clone())
@@ -49,7 +66,8 @@ impl<'a> LoopRepository<'a> {
                 "SELECT id, session_id, trigger_expr, prompt_text, wrapped_skill,
                         mode, scratchpad, state,
                         consecutive_failures, skipped_triggers, iteration_count,
-                        created_at, updated_at
+                        created_at, updated_at,
+                        gate_kind, gate_spec, gate_last_value, verify_check
                  FROM loops WHERE id = ?1",
                 params![id],
                 row_to_loop,
@@ -67,6 +85,30 @@ impl<'a> LoopRepository<'a> {
                 params![state.as_str(), now, id],
             )?;
             Ok(())
+        })
+    }
+
+    /// Atomically transition a loop into a terminal state (`Cancelled` /
+    /// `Failed`), but only if it is not already terminal. Returns whether a
+    /// row actually flipped. This is the concurrency primitive for every
+    /// caller that pairs a `pending_work` decrement with a terminal
+    /// transition (cancel, dispatcher auto-fail): two racing writers (a
+    /// double cancel, or cancel racing the 3-strike auto-fail) are
+    /// serialized by SQLite and exactly one observes `true`, so the
+    /// decrement can never be paired with a stale read-then-write snapshot.
+    /// Mirrors `ScheduleRepository::transition_status`.
+    pub fn transition_to_terminal(&self, id: &str, new_state: LoopState, now: i64) -> Result<bool> {
+        debug_assert!(
+            matches!(new_state, LoopState::Cancelled | LoopState::Failed),
+            "transition_to_terminal must target a terminal state"
+        );
+        self.db.with_connection(|conn| {
+            let n = conn.execute(
+                "UPDATE loops SET state = ?1, updated_at = ?2
+                 WHERE id = ?3 AND state NOT IN ('cancelled', 'failed')",
+                params![new_state.as_str(), now, id],
+            )?;
+            Ok(n > 0)
         })
     }
 
@@ -154,6 +196,7 @@ impl<'a> LoopRepository<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn finish_iteration(
         &self,
         iteration_id: i64,
@@ -161,21 +204,63 @@ impl<'a> LoopRepository<'a> {
         status: IterationStatus,
         error: Option<&str>,
         tool_calls_json: Option<&str>,
+        final_text: Option<&str>,
+        tokens_used: Option<i64>,
+        verify_passed: Option<bool>,
+        verify_reason: Option<&str>,
     ) -> Result<()> {
+        // Cap final_text at 4096 chars, same as `schedule_runs.final_text`
+        // (ScheduleRepository::record_run_end) and the event payload cap in
+        // `daemon::loops::events::iteration_end`.
+        let final_text_capped = final_text.map(truncate_final_text);
+        let verify_passed_int: Option<i64> = verify_passed.map(|b| b as i64);
         self.db.with_connection(|conn| {
             conn.execute(
                 "UPDATE loop_iterations
-                 SET ended_at = ?1, status = ?2, error_message = ?3, tool_calls_json = ?4
-                 WHERE id = ?5",
+                 SET ended_at = ?1, status = ?2, error_message = ?3, tool_calls_json = ?4,
+                     final_text = ?5, tokens_used = ?6, verify_passed = ?7, verify_reason = ?8
+                 WHERE id = ?9",
                 params![
                     ended_at,
                     status.as_str(),
                     error,
                     tool_calls_json,
+                    final_text_capped,
+                    tokens_used,
+                    verify_passed_int,
+                    verify_reason,
                     iteration_id
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    /// The most-recent `limit` finished iterations, newest first, for feeding
+    /// back into the next iteration's LOOP-CONTEXT.
+    pub fn recent_iterations(&self, loop_id: &str, limit: usize) -> Result<Vec<RecentIteration>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT sequence_number, ended_at, status, final_text,
+                        verify_passed, verify_reason
+                   FROM loop_iterations
+                  WHERE loop_id = ?1 AND status != 'running'
+               ORDER BY sequence_number DESC
+                  LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![loop_id, limit as i64], |r| {
+                let verify_passed: Option<i64> = r.get(4)?;
+                Ok(RecentIteration {
+                    sequence_number: r.get(0)?,
+                    ended_at: r.get(1)?,
+                    status: r.get(2)?,
+                    final_text: r.get(3)?,
+                    verify_passed: verify_passed.map(|i| i != 0),
+                    verify_reason: r.get(5)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
         })
     }
 
@@ -185,7 +270,8 @@ impl<'a> LoopRepository<'a> {
                 "SELECT id, session_id, trigger_expr, prompt_text, wrapped_skill,
                         mode, scratchpad, state,
                         consecutive_failures, skipped_triggers, iteration_count,
-                        created_at, updated_at
+                        created_at, updated_at,
+                        gate_kind, gate_spec, gate_last_value, verify_check
                  FROM loops WHERE session_id = ?1 ORDER BY created_at",
             )?;
             let rows = stmt.query_map(params![session_id], row_to_loop)?;
@@ -199,11 +285,162 @@ impl<'a> LoopRepository<'a> {
                 "SELECT id, session_id, trigger_expr, prompt_text, wrapped_skill,
                         mode, scratchpad, state,
                         consecutive_failures, skipped_triggers, iteration_count,
-                        created_at, updated_at
+                        created_at, updated_at,
+                        gate_kind, gate_spec, gate_last_value, verify_check
                  FROM loops WHERE state IN ('pending', 'running') ORDER BY created_at",
             )?;
             let rows = stmt.query_map([], row_to_loop)?;
             rows.map(|r| r?).collect()
+        })
+    }
+
+    /// Persist the last observed gate value (deterministic-gate diff cursor,
+    /// W3 spec). No-op semantics if `loop_id` doesn't exist: 0 rows affected,
+    /// `Ok(())` — mirrors `update_scratchpad`/`set_consecutive_failures`.
+    pub fn set_gate_last_value(&self, loop_id: &str, value: &str, now: i64) -> Result<()> {
+        self.db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE loops SET gate_last_value = ?1, updated_at = ?2 WHERE id = ?3",
+                params![value, now, loop_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Apply the accepted fields of a self-improvement proposal (W4) onto
+    /// the loop row. Only columns whose argument is `Some` are touched;
+    /// `None` leaves the existing value untouched via `COALESCE`, mirroring
+    /// `GoalRepository::set_status`'s `achieved_at` pattern.
+    pub fn apply_proposal_fields(
+        &self,
+        loop_id: &str,
+        prompt_text: Option<&str>,
+        gate_spec: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        self.db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE loops SET
+                     prompt_text = COALESCE(?1, prompt_text),
+                     gate_spec   = COALESCE(?2, gate_spec),
+                     updated_at  = ?3
+                 WHERE id = ?4",
+                params![prompt_text, gate_spec, now, loop_id],
+            )?;
+            Ok(())
+        })
+    }
+}
+
+/// A self-improvement proposal produced by the /loop evolve skill (W4):
+/// a suggested rewrite of a loop's prompt and/or gate, pending human
+/// accept/reject via `respond_proposal`.
+#[derive(Debug, Clone)]
+pub struct LoopProposal {
+    pub id: String,
+    pub loop_id: String,
+    pub created_at: i64,
+    pub rationale: String,
+    pub proposed_prompt_text: Option<String>,
+    pub proposed_gate_spec: Option<String>,
+    pub status: String,
+}
+
+fn row_to_proposal(row: &Row<'_>) -> rusqlite::Result<LoopProposal> {
+    Ok(LoopProposal {
+        id: row.get(0)?,
+        loop_id: row.get(1)?,
+        created_at: row.get(2)?,
+        rationale: row.get(3)?,
+        proposed_prompt_text: row.get(4)?,
+        proposed_gate_spec: row.get(5)?,
+        status: row.get(6)?,
+    })
+}
+
+const PROPOSAL_COLUMNS: &str =
+    "id, loop_id, created_at, rationale, proposed_prompt_text, proposed_gate_spec, status";
+
+pub struct LoopProposalRepository<'a> {
+    db: &'a Database,
+}
+
+impl<'a> LoopProposalRepository<'a> {
+    pub fn new(db: &'a Database) -> Self {
+        Self { db }
+    }
+
+    pub fn insert_proposal(&self, p: &LoopProposal) -> Result<()> {
+        self.db.with_connection(|conn| {
+            conn.execute(
+                "INSERT INTO loop_proposals
+                    (id, loop_id, created_at, rationale, proposed_prompt_text,
+                     proposed_gate_spec, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    p.id,
+                    p.loop_id,
+                    p.created_at,
+                    p.rationale,
+                    p.proposed_prompt_text,
+                    p.proposed_gate_spec,
+                    p.status,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Most recent proposal still awaiting a human decision, if any.
+    pub fn latest_pending_proposal(&self, loop_id: &str) -> Result<Option<LoopProposal>> {
+        self.db.with_connection(|conn| {
+            conn.query_row(
+                &format!(
+                    "SELECT {PROPOSAL_COLUMNS} FROM loop_proposals
+                     WHERE loop_id = ?1 AND status = 'pending'
+                     ORDER BY created_at DESC LIMIT 1"
+                ),
+                params![loop_id],
+                row_to_proposal,
+            )
+            .optional()
+            .map_err(StorageError::from)
+        })
+    }
+
+    /// Atomically flip a pending proposal to `accepted`/`rejected`. Returns
+    /// the updated row when it actually flipped, `None` when it was no
+    /// longer pending (already responded to, or unknown id). Mirrors
+    /// `LoopRepository::transition_to_terminal`'s guarded-UPDATE pattern:
+    /// applying the accepted fields to the loop itself is the caller's
+    /// responsibility (via `LoopRepository::apply_proposal_fields`), not
+    /// this repo's.
+    pub fn respond_proposal(
+        &self,
+        id: &str,
+        accept: bool,
+        // `loop_proposals` has no responded_at column (see migration 028);
+        // kept in the signature for symmetry with the rest of this repo's
+        // now-stamped writers and in case a future migration adds one.
+        _now: i64,
+    ) -> Result<Option<LoopProposal>> {
+        let new_status = if accept { "accepted" } else { "rejected" };
+        self.db.with_connection(|conn| {
+            let n = conn.execute(
+                "UPDATE loop_proposals SET status = ?2
+                 WHERE id = ?1 AND status = 'pending'",
+                params![id, new_status],
+            )?;
+            if n == 0 {
+                return Ok(None);
+            }
+            conn.query_row(
+                &format!("SELECT {PROPOSAL_COLUMNS} FROM loop_proposals WHERE id = ?1"),
+                params![id],
+                row_to_proposal,
+            )
+            .optional()
+            .map_err(StorageError::from)
         })
     }
 }
@@ -222,6 +459,10 @@ fn row_to_loop(row: &Row<'_>) -> rusqlite::Result<Result<LoopRecord>> {
     let iteration_count: i64 = row.get(10)?;
     let created_at: i64 = row.get(11)?;
     let updated_at: i64 = row.get(12)?;
+    let gate_kind: String = row.get(13)?;
+    let gate_spec: Option<String> = row.get(14)?;
+    let gate_last_value: Option<String> = row.get(15)?;
+    let verify_check: Option<String> = row.get(16)?;
 
     Ok((|| -> Result<LoopRecord> {
         let state = LoopState::from_db_str(&state_str).ok_or_else(|| {
@@ -241,6 +482,10 @@ fn row_to_loop(row: &Row<'_>) -> rusqlite::Result<Result<LoopRecord>> {
             iteration_count,
             created_at,
             updated_at,
+            gate_kind,
+            gate_spec,
+            gate_last_value,
+            verify_check,
         })
     })())
 }
@@ -274,6 +519,10 @@ mod tests {
             iteration_count: 0,
             created_at: 100,
             updated_at: 100,
+            gate_kind: "none".into(),
+            gate_spec: None,
+            gate_last_value: None,
+            verify_check: None,
         }
     }
 
@@ -408,8 +657,18 @@ mod tests {
         let id = repo
             .insert_iteration("abc", 1, 100, IterationStatus::Running)
             .unwrap();
-        repo.finish_iteration(id, 110, IterationStatus::Ok, None, Some("[]"))
-            .unwrap();
+        repo.finish_iteration(
+            id,
+            110,
+            IterationStatus::Ok,
+            None,
+            Some("[]"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         // Spot check via raw SQL since we don't have list_iterations yet:
         let row: (i64, String, Option<String>) = s
             .database()
@@ -434,6 +693,82 @@ mod tests {
     }
 
     #[test]
+    fn finish_iteration_persists_final_text_and_tokens() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        let id = repo
+            .insert_iteration("abc", 1, 100, IterationStatus::Running)
+            .unwrap();
+        repo.finish_iteration(
+            id,
+            110,
+            IterationStatus::Ok,
+            None,
+            Some("[]"),
+            Some("digested 3 new items"),
+            Some(1234),
+            None,
+            None,
+        )
+        .unwrap();
+        let row: (Option<String>, Option<i64>) = s
+            .database()
+            .with_connection(|c| {
+                c.query_row(
+                    "SELECT final_text, tokens_used FROM loop_iterations WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(crate::error::StorageError::from)
+            })
+            .unwrap();
+        assert_eq!(row.0.as_deref(), Some("digested 3 new items"));
+        assert_eq!(row.1, Some(1234));
+    }
+
+    #[test]
+    fn finish_iteration_truncates_final_text_over_4096_chars() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        let id = repo
+            .insert_iteration("abc", 1, 100, IterationStatus::Running)
+            .unwrap();
+        let long_text = "x".repeat(5000);
+        repo.finish_iteration(
+            id,
+            110,
+            IterationStatus::Ok,
+            None,
+            None,
+            Some(&long_text),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let stored: Option<String> = s
+            .database()
+            .with_connection(|c| {
+                c.query_row(
+                    "SELECT final_text FROM loop_iterations WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .map_err(crate::error::StorageError::from)
+            })
+            .unwrap();
+        let stored = stored.expect("final_text should be stored");
+        assert!(
+            stored.chars().count() <= 4096,
+            "stored final_text length {} exceeds cap",
+            stored.chars().count()
+        );
+        assert_eq!(stored.chars().count(), 4096);
+    }
+
+    #[test]
     fn list_by_session_filters_correctly() {
         let s = fresh();
         let repo = LoopRepository::new(s.database());
@@ -449,6 +784,46 @@ mod tests {
         let in_s1 = repo.list_by_session("s1").unwrap();
         assert_eq!(in_s1.len(), 1);
         assert_eq!(in_s1[0].id, "a");
+    }
+
+    #[test]
+    fn transition_to_terminal_flips_non_terminal_row() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+
+        let flipped = repo
+            .transition_to_terminal("abc", LoopState::Cancelled, 200)
+            .unwrap();
+        assert!(flipped, "pending -> cancelled must flip");
+        assert_eq!(
+            repo.get("abc").unwrap().unwrap().state,
+            LoopState::Cancelled
+        );
+    }
+
+    #[test]
+    fn transition_to_terminal_is_noop_when_already_terminal() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+
+        let first = repo
+            .transition_to_terminal("abc", LoopState::Cancelled, 200)
+            .unwrap();
+        assert!(first);
+
+        // Racing second caller (e.g. concurrent cancel, or cancel racing an
+        // auto-fail) must observe `false` and must NOT clobber the row.
+        let second = repo
+            .transition_to_terminal("abc", LoopState::Failed, 201)
+            .unwrap();
+        assert!(!second, "already-terminal row must not flip again");
+        assert_eq!(
+            repo.get("abc").unwrap().unwrap().state,
+            LoopState::Cancelled,
+            "state must stay at the state the winning transition set"
+        );
     }
 
     #[test]
@@ -469,5 +844,277 @@ mod tests {
         let mut ids: Vec<&str> = active.iter().map(|r| r.id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn gate_columns_round_trip_and_set_gate_last_value() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        let mut rec = sample_loop("gate1");
+        rec.gate_kind = "http".into();
+        rec.gate_spec = Some(r#"{"url":"https://x","extract":"$.v"}"#.into());
+        repo.create(&rec).unwrap();
+
+        let row = repo.get("gate1").unwrap().unwrap();
+        assert_eq!(row.gate_kind, "http");
+        assert_eq!(
+            row.gate_spec.as_deref(),
+            Some(r#"{"url":"https://x","extract":"$.v"}"#)
+        );
+        assert_eq!(row.gate_last_value, None);
+
+        repo.set_gate_last_value("gate1", "42", 200).unwrap();
+        let row = repo.get("gate1").unwrap().unwrap();
+        assert_eq!(row.gate_last_value.as_deref(), Some("42"));
+        assert_eq!(row.updated_at, 200);
+    }
+
+    #[test]
+    fn recent_iterations_returns_newest_first_capped() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        for seq in 1..=3 {
+            let id = repo
+                .insert_iteration("abc", seq, seq * 100, IterationStatus::Running)
+                .unwrap();
+            // seq 3 gets a verify verdict; seq 1/2 have no verify configured.
+            let (verify_passed, verify_reason) = if seq == 3 {
+                (Some(true), Some("check 'OK' passed"))
+            } else {
+                (None, None)
+            };
+            repo.finish_iteration(
+                id,
+                seq * 100 + 5,
+                IterationStatus::Ok,
+                None,
+                Some("[]"),
+                Some(&format!("run {seq}")),
+                None,
+                verify_passed,
+                verify_reason,
+            )
+            .unwrap();
+        }
+        let recent = repo.recent_iterations("abc", 2).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].sequence_number, 3); // newest first
+        assert_eq!(recent[0].final_text.as_deref(), Some("run 3"));
+        assert_eq!(recent[0].verify_passed, Some(true));
+        assert_eq!(
+            recent[0].verify_reason.as_deref(),
+            Some("check 'OK' passed")
+        );
+        assert_eq!(recent[1].sequence_number, 2);
+        assert_eq!(recent[1].verify_passed, None);
+        assert_eq!(recent[1].verify_reason, None);
+    }
+
+    #[test]
+    fn verify_check_round_trips_on_create_and_get() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        let mut rec = sample_loop("v1");
+        rec.verify_check = Some(r#"{"matches":"OK"}"#.into());
+        repo.create(&rec).unwrap();
+
+        let row = repo.get("v1").unwrap().unwrap();
+        assert_eq!(row.verify_check.as_deref(), Some(r#"{"matches":"OK"}"#));
+    }
+
+    #[test]
+    fn verify_check_defaults_to_none() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("v2")).unwrap();
+        let row = repo.get("v2").unwrap().unwrap();
+        assert_eq!(row.verify_check, None);
+    }
+
+    #[test]
+    fn finish_iteration_persists_verify_verdict() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        let id = repo
+            .insert_iteration("abc", 1, 100, IterationStatus::Running)
+            .unwrap();
+        repo.finish_iteration(
+            id,
+            110,
+            IterationStatus::Ok,
+            None,
+            Some("[]"),
+            None,
+            None,
+            Some(true),
+            Some("check 'OK' passed"),
+        )
+        .unwrap();
+        let row: (Option<i64>, Option<String>) = s
+            .database()
+            .with_connection(|c| {
+                c.query_row(
+                    "SELECT verify_passed, verify_reason FROM loop_iterations WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(crate::error::StorageError::from)
+            })
+            .unwrap();
+        assert_eq!(row.0, Some(1));
+        assert_eq!(row.1.as_deref(), Some("check 'OK' passed"));
+    }
+
+    #[test]
+    fn finish_iteration_persists_verify_verdict_false() {
+        let s = fresh();
+        let repo = LoopRepository::new(s.database());
+        repo.create(&sample_loop("abc")).unwrap();
+        let id = repo
+            .insert_iteration("abc", 1, 100, IterationStatus::Running)
+            .unwrap();
+        repo.finish_iteration(
+            id,
+            110,
+            IterationStatus::Ok,
+            None,
+            Some("[]"),
+            None,
+            None,
+            Some(false),
+            Some("check 'OK' failed"),
+        )
+        .unwrap();
+        let row: (Option<i64>, Option<String>) = s
+            .database()
+            .with_connection(|c| {
+                c.query_row(
+                    "SELECT verify_passed, verify_reason FROM loop_iterations WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(crate::error::StorageError::from)
+            })
+            .unwrap();
+        assert_eq!(row.0, Some(0));
+        assert_eq!(row.1.as_deref(), Some("check 'OK' failed"));
+    }
+
+    fn sample_proposal(id: &str, loop_id: &str, created_at: i64) -> LoopProposal {
+        LoopProposal {
+            id: id.into(),
+            loop_id: loop_id.into(),
+            created_at,
+            rationale: "iteration 5 kept timing out on step 2".into(),
+            proposed_prompt_text: None,
+            proposed_gate_spec: None,
+            status: "pending".into(),
+        }
+    }
+
+    #[test]
+    fn latest_pending_proposal_returns_inserted_row() {
+        let s = fresh();
+        LoopRepository::new(s.database())
+            .create(&sample_loop("abc"))
+            .unwrap();
+        let repo = LoopProposalRepository::new(s.database());
+        repo.insert_proposal(&sample_proposal("prop-1", "abc", 100))
+            .unwrap();
+
+        let found = repo
+            .latest_pending_proposal("abc")
+            .unwrap()
+            .expect("pending proposal should be found");
+        assert_eq!(found.id, "prop-1");
+        assert_eq!(found.status, "pending");
+        assert_eq!(found.rationale, "iteration 5 kept timing out on step 2");
+    }
+
+    #[test]
+    fn latest_pending_proposal_is_none_when_no_pending_rows() {
+        let s = fresh();
+        let repo = LoopProposalRepository::new(s.database());
+        assert!(repo
+            .latest_pending_proposal("nonexistent")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn respond_proposal_reject_flips_status_and_hides_from_pending_lookup() {
+        let s = fresh();
+        LoopRepository::new(s.database())
+            .create(&sample_loop("abc"))
+            .unwrap();
+        let repo = LoopProposalRepository::new(s.database());
+        repo.insert_proposal(&sample_proposal("prop-1", "abc", 100))
+            .unwrap();
+
+        let responded = repo
+            .respond_proposal("prop-1", false, 200)
+            .unwrap()
+            .expect("pending -> rejected must flip and return the row");
+        assert_eq!(responded.status, "rejected");
+
+        assert!(
+            repo.latest_pending_proposal("abc").unwrap().is_none(),
+            "rejected proposal must no longer be pending"
+        );
+    }
+
+    #[test]
+    fn respond_proposal_is_noop_when_already_responded() {
+        let s = fresh();
+        LoopRepository::new(s.database())
+            .create(&sample_loop("abc"))
+            .unwrap();
+        let repo = LoopProposalRepository::new(s.database());
+        repo.insert_proposal(&sample_proposal("prop-1", "abc", 100))
+            .unwrap();
+        repo.respond_proposal("prop-1", false, 200).unwrap();
+
+        let second = repo.respond_proposal("prop-1", true, 201).unwrap();
+        assert!(
+            second.is_none(),
+            "already-responded proposal must not flip again"
+        );
+    }
+
+    #[test]
+    fn respond_proposal_accept_then_apply_proposal_fields_updates_prompt_text_only() {
+        let s = fresh();
+        let loop_repo = LoopRepository::new(s.database());
+        loop_repo.create(&sample_loop("abc")).unwrap();
+
+        let repo = LoopProposalRepository::new(s.database());
+        let mut proposal = sample_proposal("prop-2", "abc", 100);
+        proposal.proposed_prompt_text = Some("new".into());
+        repo.insert_proposal(&proposal).unwrap();
+
+        let responded = repo
+            .respond_proposal("prop-2", true, 200)
+            .unwrap()
+            .expect("pending -> accepted must flip and return the row");
+        assert_eq!(responded.status, "accepted");
+        assert_eq!(responded.proposed_prompt_text.as_deref(), Some("new"));
+
+        loop_repo
+            .apply_proposal_fields(
+                "abc",
+                responded.proposed_prompt_text.as_deref(),
+                responded.proposed_gate_spec.as_deref(),
+                200,
+            )
+            .unwrap();
+
+        let updated = loop_repo.get("abc").unwrap().unwrap();
+        assert_eq!(updated.prompt_text.as_deref(), Some("new"));
+        assert_eq!(
+            updated.gate_spec, None,
+            "gate_spec must stay untouched when the proposal didn't set it"
+        );
     }
 }

@@ -67,6 +67,10 @@ mod tests {
             iteration_count: 0,
             created_at: 0,
             updated_at: 0,
+            gate_kind: "none".into(),
+            gate_spec: None,
+            gate_last_value: None,
+            verify_check: None,
         })
         .unwrap();
         repo.insert_iteration("x", 1, 0, IterationStatus::Running).unwrap();

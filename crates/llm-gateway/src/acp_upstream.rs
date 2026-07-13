@@ -118,6 +118,11 @@ pub fn aggregate_updates(updates: impl IntoIterator<Item = AcpUpdate>) -> Aggreg
         match update {
             AcpUpdate::Text(t) => content.push_str(&t),
             AcpUpdate::Thought(_) => {}
+            // No OpenAI-compat analog for a native tool-call result; the
+            // daemon's `/loop`/`/goal` machinery records these separately
+            // (see `crates/daemon/src/wasm/llm.rs`). Gateway responses only
+            // ever surface assistant text.
+            AcpUpdate::ToolResult { .. } => {}
             AcpUpdate::Error(e) => return Aggregated::Failed(e),
             AcpUpdate::Complete(stop) => {
                 return Aggregated::Done {
@@ -338,6 +343,9 @@ fn stream_response(
                     yield emit(make(delta, None));
                 }
                 Some(AcpUpdate::Thought(_)) => {}
+                // See the comment in `aggregate_updates` above — nothing to
+                // surface over the OpenAI-compat SSE stream.
+                Some(AcpUpdate::ToolResult { .. }) => {}
                 Some(AcpUpdate::Complete(stop)) => {
                     let fr = stop_reason_to_finish_reason(stop).to_string();
                     yield emit(make(OpenAIDelta::default(), Some(fr)));

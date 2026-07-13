@@ -4319,9 +4319,13 @@ impl HostFunctions for DaemonHostFunctions {
         self.execute_browser_action(BrowserToolAction::Snapshot, params, tab_id)
     }
 
-    fn browser_list_tabs(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
-        debug!("browser_list_tabs: listing all open tabs");
-        self.execute_browser_action(BrowserToolAction::ListTabs, serde_json::json!({}), tab_id)
+    fn browser_list_tabs(
+        &self,
+        params: &serde_json::Value,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        debug!("browser_list_tabs: listing open tabs, params={}", params);
+        self.execute_browser_action(BrowserToolAction::ListTabs, params.clone(), tab_id)
     }
 
     fn browser_query_tabs(
@@ -5358,7 +5362,8 @@ impl HostFunctions for DaemonHostFunctions {
         let runtime = self.runtime.clone();
         let result = tokio::task::block_in_place(|| {
             runtime.block_on(async move {
-                crate::loops::execute_loop_tool("loop_create", &args, &ctx, &mgr, db.as_ref()).await
+                crate::loops::execute_loop_tool("loop_create", &args, &ctx, &mgr, db.as_ref(), None)
+                    .await
             })
         });
         match result {
@@ -5391,7 +5396,8 @@ impl HostFunctions for DaemonHostFunctions {
         let args = serde_json::json!({});
         let result = tokio::task::block_in_place(|| {
             runtime.block_on(async move {
-                crate::loops::execute_loop_tool("loop_list", &args, &ctx, &mgr, db.as_ref()).await
+                crate::loops::execute_loop_tool("loop_list", &args, &ctx, &mgr, db.as_ref(), None)
+                    .await
             })
         });
         match result {
@@ -5424,7 +5430,8 @@ impl HostFunctions for DaemonHostFunctions {
         let args = serde_json::json!({ "loop_id": loop_id });
         let result = tokio::task::block_in_place(|| {
             runtime.block_on(async move {
-                crate::loops::execute_loop_tool("loop_cancel", &args, &ctx, &mgr, db.as_ref()).await
+                crate::loops::execute_loop_tool("loop_cancel", &args, &ctx, &mgr, db.as_ref(), None)
+                    .await
             })
         });
         match result {
@@ -5466,6 +5473,7 @@ impl HostFunctions for DaemonHostFunctions {
                     &ctx,
                     &mgr,
                     db.as_ref(),
+                    None,
                 )
                 .await
             })
@@ -5513,6 +5521,102 @@ impl HostFunctions for DaemonHostFunctions {
                     &ctx,
                     &mgr,
                     db.as_ref(),
+                    None,
+                )
+                .await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    /// `loop_evolve {loop_id}` (W4 task 3) — unlike the other `/loop` tool
+    /// functions above, this one needs `HostServices` itself (the meta-pass
+    /// runs a real LLM turn via `evolve::evolve_loop`), so it clones the
+    /// whole `HostServices` (cheap — internally `Arc`-backed) into the
+    /// spawned block rather than just `mgr`/`db`.
+    fn tool_loop_evolve(&self, args_json: &str) -> HostResult<String> {
+        let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| HostError {
+            code: 4,
+            message: format!("invalid args JSON: {e}"),
+        })?;
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services.loop_manager.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "LoopManager not configured".into(),
+        })?;
+        let session_id = self.session_id.clone().unwrap_or_default();
+        let ctx = crate::loops::ToolCallContext {
+            session_id,
+            is_iteration: false,
+            own_loop_id: None,
+        };
+        let mgr = mgr.clone();
+        let db = services.database.clone();
+        let services_clone = services.clone();
+        let runtime = self.runtime.clone();
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::loops::execute_loop_tool(
+                    "loop_evolve",
+                    &args,
+                    &ctx,
+                    &mgr,
+                    db.as_ref(),
+                    Some(&services_clone),
+                )
+                .await
+            })
+        });
+        match result {
+            Ok(v) => Ok(serde_json::to_string(&v).unwrap_or_default()),
+            Err(e) => Err(HostError {
+                code: 100,
+                message: e,
+            }),
+        }
+    }
+
+    /// `loop_proposal_respond {proposal_id, accept}` (W4 task 3).
+    fn tool_loop_proposal_respond(&self, args_json: &str) -> HostResult<String> {
+        let args: serde_json::Value = serde_json::from_str(args_json).map_err(|e| HostError {
+            code: 4,
+            message: format!("invalid args JSON: {e}"),
+        })?;
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "HostServices not configured".into(),
+        })?;
+        let mgr = services.loop_manager.as_ref().ok_or_else(|| HostError {
+            code: 3,
+            message: "LoopManager not configured".into(),
+        })?;
+        let session_id = self.session_id.clone().unwrap_or_default();
+        let ctx = crate::loops::ToolCallContext {
+            session_id,
+            is_iteration: false,
+            own_loop_id: None,
+        };
+        let mgr = mgr.clone();
+        let db = services.database.clone();
+        let runtime = self.runtime.clone();
+        let result = tokio::task::block_in_place(|| {
+            runtime.block_on(async move {
+                crate::loops::execute_loop_tool(
+                    "loop_proposal_respond",
+                    &args,
+                    &ctx,
+                    &mgr,
+                    db.as_ref(),
+                    None,
                 )
                 .await
             })

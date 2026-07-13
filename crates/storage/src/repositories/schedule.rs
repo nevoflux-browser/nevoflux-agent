@@ -9,6 +9,7 @@ use rusqlite::{params, OptionalExtension, Row};
 use crate::connection::Database;
 use crate::error::{Result, StorageError};
 use crate::models::schedule::{ScheduleRecord, ScheduleRun, ScheduleRunStatus, ScheduleStatus};
+use crate::repositories::truncate_final_text;
 
 // `evaluator_provider` is appended last (migration 023 added it after
 // `updated_at` physically); keeping it at the tail of this explicit list means
@@ -19,17 +20,6 @@ const SCHEDULE_COLUMNS: &str =
      goal_condition, goal_max_turns, max_tokens_per_run, evaluator_model,
      status, next_fire_at, last_run_status, last_run_at,
      consecutive_failures, run_count, created_at, updated_at, evaluator_provider";
-
-/// Cap `final_text` at 4096 chars before insert — same cap `daemon::loops::events`
-/// applies to loop iteration output, so a long run response doesn't bloat the
-/// `schedule_runs` summary row (full transcripts live in messages, not here).
-fn truncate_final_text(s: &str) -> String {
-    if s.chars().count() > 4096 {
-        s.chars().take(4096).collect()
-    } else {
-        s.to_string()
-    }
-}
 
 pub struct ScheduleRepository<'a> {
     db: &'a Database,

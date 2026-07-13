@@ -74,6 +74,13 @@ pub async fn acp_oneshot(provider: ProviderType, _model: &str, prompt: &str) -> 
         match update {
             AcpUpdate::Text(t) => text.push_str(&t),
             AcpUpdate::Thought(_) => {}
+            // Goal-evaluator one-shot judgment call (route B): by design this
+            // accumulates only the verdict text and ignores tool activity
+            // (see the doc comment on `evaluate_via_acp`). This call site has
+            // no daemon session_id/db handle in scope to record against —
+            // recording here would also be semantically wrong, since this is
+            // an ephemeral judge session, not the task session being judged.
+            AcpUpdate::ToolResult { .. } => {}
             AcpUpdate::Complete(_) => break,
             AcpUpdate::Error(e) => {
                 return Err(DaemonError::InternalError(format!(
@@ -3950,6 +3957,21 @@ async fn stream_acp_completion(
                             images: vec![],
                         })
                         .await;
+                }
+                AcpUpdate::ToolResult { tool_name, content } => {
+                    // Native ACP-agent tool (Bash/Read/Edit/etc, not a
+                    // NevoFlux MCP tool — those are already recorded by
+                    // `execute_mcp_tool`). Record it the same way so
+                    // `/loop` verify and `/goal` checks can find it via
+                    // `MessageRepository::list_recent_tool_results`,
+                    // regardless of which tool the ACP agent used.
+                    if let Some(services) = host_services.as_ref() {
+                        crate::wasm::mcp_tool_executor::record_acp_tool_result(
+                            services,
+                            &tool_name,
+                            &content,
+                        );
+                    }
                 }
                 AcpUpdate::Complete(_) => {
                     if use_mcp_bridge {

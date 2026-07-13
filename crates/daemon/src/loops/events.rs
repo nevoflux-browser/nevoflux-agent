@@ -117,6 +117,8 @@ impl LoopEvents {
         status: &str,
         tool_calls_summary: serde_json::Value,
         final_text: Option<&str>,
+        verify_passed: Option<bool>,
+        verify_reason: Option<&str>,
     ) {
         let Some(bus) = &self.bus else {
             return;
@@ -143,6 +145,8 @@ impl LoopEvents {
                     "status": status,
                     "tool_calls_summary": tool_calls_summary,
                     "final_text": final_text_capped,
+                    "verify_passed": verify_passed,
+                    "verify_reason": verify_reason,
                 }),
                 PublisherIdentity::Internal,
             ))
@@ -186,6 +190,87 @@ impl LoopEvents {
             .await;
     }
 
+    /// Emitted when a deterministic gate (W3 §gate) suppresses an iteration
+    /// for a trigger fire — distinct from `trigger_dropped` (concurrent-run
+    /// coalescing). Both bump `skipped_triggers`; this one carries the fire
+    /// reason instead of a coalesced-count so sidebar consumers can tell
+    /// "gate said no" apart from "loop was busy".
+    pub async fn skipped(&self, session_id: &str, id: &LoopId, fire_reason: &str) {
+        let Some(bus) = &self.bus else {
+            return;
+        };
+        let _ = bus
+            .publish(BusEvent::ephemeral(
+                "system:loop:skipped",
+                json!({
+                    "session_id": session_id,
+                    "loop_id": id.as_ref(),
+                    "fire_reason": fire_reason,
+                    "reason": "gate",
+                }),
+                PublisherIdentity::Internal,
+            ))
+            .await;
+    }
+
+    /// Emitted when the `/loop evolve` meta-pass (W4) produces a
+    /// self-improvement proposal for a loop. Carries the same fields a
+    /// sidebar accept/reject UI needs to render the diff without a
+    /// follow-up fetch.
+    pub async fn proposal(
+        &self,
+        session_id: &str,
+        id: &LoopId,
+        p: &nevoflux_storage::repositories::LoopProposal,
+    ) {
+        let Some(bus) = &self.bus else {
+            return;
+        };
+        let _ = bus
+            .publish(BusEvent::ephemeral(
+                "system:loop:proposal",
+                json!({
+                    "session_id": session_id,
+                    "loop_id": id.as_ref(),
+                    "id": p.id,
+                    "rationale": p.rationale,
+                    "proposed_prompt_text": p.proposed_prompt_text,
+                    "proposed_gate_spec": p.proposed_gate_spec,
+                }),
+                PublisherIdentity::Internal,
+            ))
+            .await;
+    }
+
+    /// Emitted when a human accepts or rejects a pending `/loop evolve`
+    /// proposal (W4 task 3), via `loop_proposal_respond`. Distinct from
+    /// `proposal` (which announces a new pending proposal) — this announces
+    /// its resolution, so a sidebar can clear the pending-review affordance
+    /// and, on accept, reflect the loop's new prompt_text/gate_spec.
+    pub async fn proposal_resolved(
+        &self,
+        session_id: &str,
+        id: &LoopId,
+        proposal_id: &str,
+        accepted: bool,
+    ) {
+        let Some(bus) = &self.bus else {
+            return;
+        };
+        let _ = bus
+            .publish(BusEvent::ephemeral(
+                "system:loop:proposal_resolved",
+                json!({
+                    "session_id": session_id,
+                    "loop_id": id.as_ref(),
+                    "proposal_id": proposal_id,
+                    "accepted": accepted,
+                }),
+                PublisherIdentity::Internal,
+            ))
+            .await;
+    }
+
     pub async fn cancelled(&self, session_id: &str, id: &LoopId, by: &str, force: bool) {
         let Some(bus) = &self.bus else {
             return;
@@ -218,10 +303,32 @@ mod tests {
         evts.state_changed("s1", &id, "running", "pending", None)
             .await;
         evts.iteration_start("s1", &id, 1, 100, "time").await;
-        evts.iteration_end("s1", &id, 1, 110, "ok", serde_json::json!([]), None)
-            .await;
+        evts.iteration_end(
+            "s1",
+            &id,
+            1,
+            110,
+            "ok",
+            serde_json::json!([]),
+            None,
+            None,
+            None,
+        )
+        .await;
         evts.scratchpad_changed("s1", &id, "k=v").await;
         evts.trigger_dropped("s1", &id, 1).await;
+        evts.skipped("s1", &id, "time").await;
         evts.cancelled("s1", &id, "user", false).await;
+        let p = nevoflux_storage::repositories::LoopProposal {
+            id: "prop-1".into(),
+            loop_id: "abc".into(),
+            created_at: 1,
+            rationale: "healthy".into(),
+            proposed_prompt_text: None,
+            proposed_gate_spec: None,
+            status: "pending".into(),
+        };
+        evts.proposal("s1", &id, &p).await;
+        evts.proposal_resolved("s1", &id, "prop-1", true).await;
     }
 }

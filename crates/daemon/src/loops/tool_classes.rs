@@ -19,7 +19,19 @@
 /// session-scoped, single-active), and `schedule_create` would let an
 /// iteration self-replicate scheduled jobs — both are catalog-filtered out
 /// of direct-API unattended runs here (see `agent_exec::filter_allowlist`).
-const ITERATION_FORBIDDEN: &[&str] = &["loop_create", "ask_user", "goal_set", "schedule_create"];
+/// `loop_evolve` and `loop_proposal_respond` are the self-improvement
+/// (evolve) feature's propose/accept operations; letting an unattended
+/// iteration call both in the same turn would let it approve its own
+/// rewrite with zero human review, defeating the whole point of the
+/// evolve accept/reject gate.
+const ITERATION_FORBIDDEN: &[&str] = &[
+    "loop_create",
+    "ask_user",
+    "goal_set",
+    "schedule_create",
+    "loop_evolve",
+    "loop_proposal_respond",
+];
 
 /// Tools that are forbidden inside loop iterations regardless of mode.
 pub fn is_forbidden_in_iteration(tool_name: &str) -> bool {
@@ -47,6 +59,9 @@ mod tests {
         // self-replicate schedules.
         assert!(is_forbidden_in_iteration("goal_set"));
         assert!(is_forbidden_in_iteration("schedule_create"));
+        // Evolve propose/accept must never run unattended.
+        assert!(is_forbidden_in_iteration("loop_evolve"));
+        assert!(is_forbidden_in_iteration("loop_proposal_respond"));
         assert!(!is_forbidden_in_iteration("read"));
         assert!(!is_forbidden_in_iteration("loop_scratchpad_set"));
         assert!(!is_forbidden_in_iteration("browser_get_content"));
@@ -67,6 +82,8 @@ mod tests {
                 "ask_user".to_string(),
                 "goal_set".to_string(),
                 "schedule_create".to_string(),
+                "loop_evolve".to_string(),
+                "loop_proposal_respond".to_string(),
             ]
         );
         for name in &list {

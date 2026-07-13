@@ -57,9 +57,16 @@ use crate::loops::tool_classes::iteration_forbidden_tools;
 use crate::loops::types::LoopId;
 use crate::wasm::services::HostServices;
 use nevoflux_storage::models::{current_timestamp, IterationStatus, LoopRecord};
-use nevoflux_storage::repositories::LoopRepository;
+use nevoflux_storage::repositories::{LoopRepository, MessageRepository};
 use nevoflux_storage::Database;
 use std::sync::Arc;
+
+/// W5 §verify: how many of the session's most-recent `tool_result` messages
+/// to read back for a loop iteration's programmatic check. Mirrors
+/// `goals/manager.rs::TOOL_RESULTS_WINDOW` in spirit but sized a bit larger
+/// since loop iterations can invoke more tools per turn than a chat goal
+/// turn does.
+const VERIFY_TOOL_RESULTS_WINDOW: u32 = 20;
 
 #[derive(Debug)]
 pub enum ExecResult {
@@ -130,7 +137,17 @@ impl IterationExecutor {
 
     /// Run a single iteration. See module-level docs for the
     /// production-vs-stub split and intentionally-skipped wiring.
-    pub async fn execute(&self, loop_id: LoopId, fire_reason: String) -> ExecResult {
+    ///
+    /// `gate_output` is the deterministic gate's observed value for this
+    /// fire (W3 §gate), when the loop has a gate configured and it decided
+    /// to run — `None` for gate-less loops or fires with no gate output.
+    /// Threaded into the `<LOOP-CONTEXT>` block via `build_user_message`.
+    pub async fn execute(
+        &self,
+        loop_id: LoopId,
+        fire_reason: String,
+        gate_output: Option<String>,
+    ) -> ExecResult {
         let repo = LoopRepository::new(&self.db);
         let now = current_timestamp();
 
@@ -145,15 +162,11 @@ impl IterationExecutor {
             Ok(s) => s,
             Err(e) => return ExecResult::Error(e.to_string()),
         };
-        let iter_id = match repo.insert_iteration(
-            loop_id.as_ref(),
-            seq,
-            now,
-            IterationStatus::Running,
-        ) {
-            Ok(i) => i,
-            Err(e) => return ExecResult::Error(e.to_string()),
-        };
+        let iter_id =
+            match repo.insert_iteration(loop_id.as_ref(), seq, now, IterationStatus::Running) {
+                Ok(i) => i,
+                Err(e) => return ExecResult::Error(e.to_string()),
+            };
 
         self.events
             .iteration_start(&session_id, &loop_id, seq, now, &fire_reason)
@@ -164,8 +177,15 @@ impl IterationExecutor {
         // forbidden in iteration context (`ask_user`, `loop_create`) are
         // stripped from the resulting allowlist.
         let iter_mode = db_str_to_agent_mode(&rec.mode);
-        let user_message =
-            build_user_message(&rec, seq, &fire_reason, self.services.as_ref()).await;
+        let user_message = build_user_message(
+            &rec,
+            seq,
+            &fire_reason,
+            &self.db,
+            self.services.as_ref(),
+            gate_output.as_deref(),
+        )
+        .await;
 
         // Stub path: no services → record ok without invoking LLM.
         // Preserves Phase-6 test semantics. Production callers always
@@ -242,17 +262,74 @@ impl IterationExecutor {
         session_id: &str,
         loop_id: &LoopId,
         seq: i64,
-        _rec: &LoopRecord,
+        rec: &LoopRecord,
     ) -> ExecResult {
         let end_now = current_timestamp();
         let repo = LoopRepository::new(&self.db);
         let _ = repo.set_consecutive_failures(loop_id.as_ref(), 0, end_now);
+        // TODO(W4): wire loop token spend. `run_agent_once` doesn't thread a
+        // token budget for iterations today (req.token_budget is always
+        // `None` above), so there's no spend to read yet — see
+        // `schedules/runner.rs::budget_spent` for the pattern to follow once
+        // loops gain a per-iteration/per-loop token limit.
+        let tokens_used: Option<i64> = None;
+
+        // W5 §verify: run the loop's optional programmatic check (reuses the
+        // `/goal` check engine) against this iteration's tool results.
+        // `parse_check` expects a `{"check": <GoalCheck>}` envelope (that's
+        // the shape `goal_set` args carry); `verify_check` on the loop row
+        // is the bare `GoalCheck` JSON, so wrap it before parsing. Any parse
+        // failure (malformed JSON, missing `matches`, bad regex) fails open:
+        // `(None, None)` — a bad verify spec must never block the loop.
+        //
+        // Content source: NOT `trace_summary` — the production trace built
+        // by `agent_exec.rs` only carries `{name, ok}` per tool call, no
+        // result content, so a content-matching check would silently always
+        // fail against it. Reuse `/goal`'s exact data source instead: real
+        // tool-result content is persisted to the `messages` table
+        // (`content_type='tool_result'`) by `DaemonHostFunctions::
+        // record_tool_result` on the same `Agent::run` pipeline loops use.
+        // This is also why we must NOT feed `final_text` in here — that's
+        // the model's own paraphrase, not the independent tool read-back the
+        // check engine is meant to verify against.
+        let (verify_passed, verify_reason) = match rec.verify_check.as_deref() {
+            Some(cj) => {
+                let parsed = serde_json::from_str::<serde_json::Value>(cj)
+                    .ok()
+                    .and_then(|v| {
+                        crate::goals::check::parse_check(&serde_json::json!({ "check": v }))
+                            .ok()
+                            .flatten()
+                    });
+                match parsed {
+                    Some(check) => {
+                        let tool_results = MessageRepository::new(&self.db)
+                            .list_recent_tool_results(session_id, VERIFY_TOOL_RESULTS_WINDOW)
+                            .unwrap_or_default();
+                        let passed = crate::goals::check::eval_check(&check, &tool_results);
+                        let reason = format!(
+                            "check '{}' {}",
+                            check.matches,
+                            if passed { "passed" } else { "failed" }
+                        );
+                        (Some(passed), Some(reason))
+                    }
+                    None => (None, None),
+                }
+            }
+            None => (None, None),
+        };
+
         let _ = repo.finish_iteration(
             iter_id,
             end_now,
             IterationStatus::Ok,
             None,
             Some(&serde_json::to_string(&trace_summary).unwrap_or_default()),
+            final_text.as_deref(),
+            tokens_used,
+            verify_passed,
+            verify_reason.as_deref(),
         );
         self.events
             .iteration_end(
@@ -263,6 +340,8 @@ impl IterationExecutor {
                 "ok",
                 trace_summary,
                 final_text.as_deref(),
+                verify_passed,
+                verify_reason.as_deref(),
             )
             .await;
         ExecResult::OkWithText(final_text)
@@ -283,7 +362,17 @@ impl IterationExecutor {
         let repo = LoopRepository::new(&self.db);
         let new_failures = rec.consecutive_failures + 1;
         let _ = repo.set_consecutive_failures(loop_id.as_ref(), new_failures, end_now);
-        let _ = repo.finish_iteration(iter_id, end_now, IterationStatus::Error, Some(&err), None);
+        let _ = repo.finish_iteration(
+            iter_id,
+            end_now,
+            IterationStatus::Error,
+            Some(&err),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         self.events
             .iteration_end(
                 session_id,
@@ -292,6 +381,8 @@ impl IterationExecutor {
                 end_now,
                 "error",
                 serde_json::json!([]),
+                None,
+                None,
                 None,
             )
             .await;
@@ -310,7 +401,9 @@ pub(crate) async fn build_user_message(
     rec: &LoopRecord,
     sequence: i64,
     fire_reason: &str,
+    db: &Database,
     services: Option<&HostServices>,
+    gate_output: Option<&str>,
 ) -> String {
     let scratchpad = if rec.scratchpad.is_empty() {
         "(empty)"
@@ -326,6 +419,46 @@ pub(crate) async fn build_user_message(
         "(no prompt or wrapped_skill)".into()
     };
 
+    // Feed the last N finished iterations' result summaries back into this
+    // iteration's context so it can see prior outcomes and stop re-doing
+    // work. Empty when the loop has no finished iterations yet (fresh loop)
+    // or the query fails — the LOOP-CONTEXT block degrades gracefully.
+    const RECENT_RUNS_N: usize = 5;
+    const RECENT_LINE_MAX: usize = 200; // one-line summary cap per run, in chars (char-safe truncation)
+    let recent_block = {
+        let repo = LoopRepository::new(db);
+        match repo.recent_iterations(rec.id.as_ref(), RECENT_RUNS_N) {
+            Ok(rows) if !rows.is_empty() => {
+                let mut s = String::from("recent_runs (newest first):\n");
+                for r in &rows {
+                    let summary = r.final_text.as_deref().unwrap_or("").replace('\n', " ");
+                    let summary = if summary.chars().count() > RECENT_LINE_MAX {
+                        let truncated: String = summary.chars().take(RECENT_LINE_MAX).collect();
+                        format!("{}…", truncated)
+                    } else {
+                        summary
+                    };
+                    s.push_str(&format!(
+                        "  #{} [{}] {}\n",
+                        r.sequence_number, r.status, summary
+                    ));
+                }
+                s
+            }
+            _ => String::new(),
+        }
+    };
+
+    // W3 §gate: only present when the loop has a deterministic gate that
+    // ran and produced an observed value for this fire (http/bash diff, or
+    // the matched event payload). Absent for gate-less loops and for gate
+    // decisions with no output (`GateKind::None`, event gates with no
+    // extracted value).
+    let gate_block = match gate_output {
+        Some(v) if !v.is_empty() => format!("gate_output:\n{}\n", v),
+        _ => String::new(),
+    };
+
     format!(
         "<LOOP-CONTEXT>\n\
          loop_id={}\n\
@@ -334,7 +467,7 @@ pub(crate) async fn build_user_message(
          fire_reason={}\n\
          scratchpad_bytes={}\n\
          scratchpad:\n{}\n\
-         </LOOP-CONTEXT>\n\
+         {}{}</LOOP-CONTEXT>\n\
          \n\
          {}",
         rec.id,
@@ -343,6 +476,8 @@ pub(crate) async fn build_user_message(
         fire_reason,
         rec.scratchpad.len(),
         scratchpad,
+        recent_block,
+        gate_block,
         body,
     )
 }
@@ -364,10 +499,7 @@ pub(crate) async fn materialize_wrapped_skill(
         Ok(v) => v,
         Err(e) => return format!("(wrapped_skill parse error: {e})"),
     };
-    let name = parsed
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let name = parsed.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let args = parsed
         .get("args")
         .and_then(|v| {
@@ -422,13 +554,18 @@ mod tests {
             iteration_count: 0,
             created_at: 0,
             updated_at: 0,
+            gate_kind: "none".into(),
+            gate_spec: None,
+            gate_last_value: None,
+            verify_check: None,
         }
     }
 
     #[tokio::test]
     async fn loop_context_block_includes_required_fields() {
+        let storage = Storage::open_in_memory().unwrap();
         let rec = sample_loop("abcd1234");
-        let s = build_user_message(&rec, 1, "time", None).await;
+        let s = build_user_message(&rec, 1, "time", storage.database(), None, None).await;
         assert!(s.contains("loop_id=abcd1234"));
         assert!(s.contains("iteration=1"));
         assert!(s.contains("trigger=time:5m"));
@@ -440,22 +577,150 @@ mod tests {
 
     #[tokio::test]
     async fn loop_context_block_marks_empty_scratchpad() {
+        let storage = Storage::open_in_memory().unwrap();
         let mut rec = sample_loop("a");
         rec.scratchpad.clear();
-        let s = build_user_message(&rec, 1, "time", None).await;
+        let s = build_user_message(&rec, 1, "time", storage.database(), None, None).await;
         assert!(s.contains("scratchpad_bytes=0"));
         assert!(s.contains("(empty)"));
     }
 
     #[tokio::test]
     async fn loop_context_block_falls_back_for_wrapped_skill() {
+        let storage = Storage::open_in_memory().unwrap();
         let mut rec = sample_loop("a");
         rec.prompt_text = None;
         rec.wrapped_skill = Some(r#"{"name":"video","args":{}}"#.into());
-        let s = build_user_message(&rec, 1, "time", None).await;
+        let s = build_user_message(&rec, 1, "time", storage.database(), None, None).await;
         // services=None → "(wrapped_skill <name>: no skill registry available)"
         assert!(s.contains("video"));
         assert!(s.contains("no skill registry available"));
+    }
+
+    /// W3 §gate: when the dispatcher's gate evaluator produced an observed
+    /// value for this fire (http/bash diff, or a matched event payload), it
+    /// must land in the `<LOOP-CONTEXT>` block so the iteration's LLM can
+    /// see what changed.
+    #[tokio::test]
+    async fn loop_context_includes_gate_output_when_present() {
+        let storage = Storage::open_in_memory().unwrap();
+        let rec = sample_loop("abcd1234");
+        let s = build_user_message(
+            &rec,
+            1,
+            "event:test:gate",
+            storage.database(),
+            None,
+            Some("observed-42"),
+        )
+        .await;
+        assert!(
+            s.contains("gate_output:\nobserved-42"),
+            "expected gate_output section in: {s}"
+        );
+        // Must still land inside the <LOOP-CONTEXT> block, before the closing tag.
+        let ctx_end = s.find("</LOOP-CONTEXT>").expect("context block present");
+        let gate_pos = s.find("gate_output:").expect("gate_output present");
+        assert!(
+            gate_pos < ctx_end,
+            "gate_output must be inside LOOP-CONTEXT"
+        );
+    }
+
+    /// Gate-less loops (`GateKind::None`, the default) and gate decisions
+    /// with no output must not add a spurious `gate_output:` section.
+    #[tokio::test]
+    async fn loop_context_omits_gate_output_when_absent() {
+        let storage = Storage::open_in_memory().unwrap();
+        let rec = sample_loop("abcd1234");
+        let s = build_user_message(&rec, 1, "time", storage.database(), None, None).await;
+        assert!(!s.contains("gate_output:"));
+    }
+
+    #[tokio::test]
+    async fn loop_context_includes_recent_runs() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .sessions()
+            .create(CreateSessionParams::new().with_id("s1").with_title("t"))
+            .unwrap();
+        let rec = sample_loop("L");
+        storage.loops().create(&rec).unwrap();
+        let id = storage
+            .loops()
+            .insert_iteration("L", 1, 100, IterationStatus::Running)
+            .unwrap();
+        storage
+            .loops()
+            .finish_iteration(
+                id,
+                110,
+                IterationStatus::Ok,
+                None,
+                Some("[]"),
+                Some("prior result"),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let msg = build_user_message(&rec, 2, "time", storage.database(), None, None).await;
+        assert!(msg.contains("recent_runs"));
+        assert!(msg.contains("prior result"));
+    }
+
+    /// Regression test for a byte-slice truncation panic: `final_text` is
+    /// unconstrained LLM output and routinely contains multibyte UTF-8 (CJK,
+    /// emoji). Slicing `&summary[..RECENT_LINE_MAX]` on a byte index that
+    /// falls mid-codepoint panics. This builds a 207-char summary (199 ASCII
+    /// + 8 CJK chars) so the 200-char cap lands inside the multibyte tail,
+    /// then asserts `build_user_message` returns normally and truncates on a
+    /// char boundary.
+    #[tokio::test]
+    async fn loop_context_truncates_multibyte_summary_without_panicking() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .sessions()
+            .create(CreateSessionParams::new().with_id("s1").with_title("t"))
+            .unwrap();
+        let rec = sample_loop("M");
+        storage.loops().create(&rec).unwrap();
+        let id = storage
+            .loops()
+            .insert_iteration("M", 1, 100, IterationStatus::Running)
+            .unwrap();
+
+        let final_text = format!("{}{}", "a".repeat(199), "中文摘要内容测试");
+        assert_eq!(final_text.chars().count(), 207, "sanity: 199 ascii + 8 cjk");
+
+        storage
+            .loops()
+            .finish_iteration(
+                id,
+                110,
+                IterationStatus::Ok,
+                None,
+                Some("[]"),
+                Some(&final_text),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Must return normally, not panic on a mid-codepoint byte slice.
+        let msg = build_user_message(&rec, 2, "time", storage.database(), None, None).await;
+
+        let expected_truncated: String = final_text.chars().take(200).collect();
+        assert!(
+            msg.contains(&format!("{}…", expected_truncated)),
+            "expected char-safe 200-char truncation with ellipsis; got: {msg}"
+        );
+        assert!(
+            !msg.contains(&final_text),
+            "full untruncated multibyte summary should not appear"
+        );
     }
 
     #[tokio::test]
@@ -468,7 +733,9 @@ mod tests {
         storage.loops().create(&sample_loop("abc")).unwrap();
 
         let executor = IterationExecutor::new(storage.database().clone());
-        let result = executor.execute(LoopId("abc".into()), "time".into()).await;
+        let result = executor
+            .execute(LoopId("abc".into()), "time".into(), None)
+            .await;
 
         assert!(result.is_ok(), "expected ok-variant, got {:?}", result);
         // Stub path (no services wired) — claims success without text.
@@ -482,7 +749,9 @@ mod tests {
     async fn execute_returns_error_for_missing_loop() {
         let storage = Storage::open_in_memory().unwrap();
         let executor = IterationExecutor::new(storage.database().clone());
-        let result = executor.execute(LoopId("nope".into()), "time".into()).await;
+        let result = executor
+            .execute(LoopId("nope".into()), "time".into(), None)
+            .await;
         assert!(matches!(result, ExecResult::Error(_)));
     }
 
@@ -498,7 +767,9 @@ mod tests {
         storage.loops().create(&rec).unwrap();
 
         let executor = IterationExecutor::new(storage.database().clone());
-        let result = executor.execute(LoopId("rst".into()), "time".into()).await;
+        let result = executor
+            .execute(LoopId("rst".into()), "time".into(), None)
+            .await;
         assert!(result.is_ok());
 
         let after = storage.loops().get("rst").unwrap().unwrap();
@@ -508,4 +779,190 @@ mod tests {
         );
     }
 
+    // W5 §verify: `finalize_iteration_ok` runs the loop's optional
+    // `verify_check` against the iteration's real tool-result content, read
+    // back from the `messages` table (`content_type='tool_result'`) — the
+    // same source `/goal`'s programmatic check reads via
+    // `MessageRepository::list_recent_tool_results`. The `trace_summary`
+    // passed in below intentionally carries NO `content` field (mirroring
+    // the production `agent_exec.rs` trace shape, which is `{name, ok}`
+    // only) to prove the verify path no longer depends on it. These tests
+    // call the private finalizer directly (rather than going through
+    // `execute()`'s stub path, which never produces tool results) so the
+    // check-evaluation branch is exercised without needing a real LLM run.
+
+    /// Seed a `tool_result` message directly into the `messages` table,
+    /// mirroring what `DaemonHostFunctions::record_tool_result` persists in
+    /// production. Same pattern as `goals::manager::tests::seed_tool_result`.
+    fn seed_tool_result(db: &Database, session_id: &str, tool: &str, content: &str) {
+        use nevoflux_storage::models::{ContentType, CreateMessageParams, MessageRole};
+        let mut meta = std::collections::HashMap::new();
+        meta.insert("tool_name".to_string(), serde_json::json!(tool));
+        nevoflux_storage::repositories::MessageRepository::new(db)
+            .create(
+                CreateMessageParams::new(session_id, MessageRole::Assistant, content)
+                    .with_content_type(ContentType::ToolResult)
+                    .with_metadata(meta),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn finalize_iteration_ok_stores_verify_passed_true_on_match() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .sessions()
+            .create(CreateSessionParams::new().with_id("s1").with_title("t"))
+            .unwrap();
+        let mut rec = sample_loop("v1");
+        rec.verify_check = Some(r#"{"matches":"OK"}"#.into());
+        storage.loops().create(&rec).unwrap();
+        let iter_id = storage
+            .loops()
+            .insert_iteration("v1", 1, 100, IterationStatus::Running)
+            .unwrap();
+        seed_tool_result(storage.database(), "s1", "bash", "exit 0: OK");
+
+        let executor = IterationExecutor::new(storage.database().clone());
+        // No `content` key — proves the check reads the messages table, not
+        // the trace, for the actual matching content.
+        let trace = serde_json::json!([{"name": "bash", "ok": true}]);
+        let result = executor
+            .finalize_iteration_ok(
+                iter_id,
+                Some("done".into()),
+                trace,
+                "s1",
+                &LoopId("v1".into()),
+                1,
+                &rec,
+            )
+            .await;
+        assert!(result.is_ok(), "expected ok-variant, got {:?}", result);
+
+        let recent = storage.loops().recent_iterations("v1", 1).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].verify_passed, Some(true));
+        assert_eq!(
+            recent[0].verify_reason.as_deref(),
+            Some("check 'OK' passed")
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_iteration_ok_stores_verify_passed_false_on_no_match() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .sessions()
+            .create(CreateSessionParams::new().with_id("s1").with_title("t"))
+            .unwrap();
+        let mut rec = sample_loop("v2");
+        rec.verify_check = Some(r#"{"matches":"OK"}"#.into());
+        storage.loops().create(&rec).unwrap();
+        let iter_id = storage
+            .loops()
+            .insert_iteration("v2", 1, 100, IterationStatus::Running)
+            .unwrap();
+        seed_tool_result(storage.database(), "s1", "bash", "exit 1: failed");
+
+        let executor = IterationExecutor::new(storage.database().clone());
+        let trace = serde_json::json!([{"name": "bash", "ok": false}]);
+        let result = executor
+            .finalize_iteration_ok(
+                iter_id,
+                Some("done".into()),
+                trace,
+                "s1",
+                &LoopId("v2".into()),
+                1,
+                &rec,
+            )
+            .await;
+        assert!(result.is_ok(), "expected ok-variant, got {:?}", result);
+
+        let recent = storage.loops().recent_iterations("v2", 1).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].verify_passed, Some(false));
+        assert_eq!(
+            recent[0].verify_reason.as_deref(),
+            Some("check 'OK' failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_iteration_ok_stores_no_verdict_when_no_verify_check() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .sessions()
+            .create(CreateSessionParams::new().with_id("s1").with_title("t"))
+            .unwrap();
+        let rec = sample_loop("v3"); // verify_check: None (default in sample_loop)
+        storage.loops().create(&rec).unwrap();
+        let iter_id = storage
+            .loops()
+            .insert_iteration("v3", 1, 100, IterationStatus::Running)
+            .unwrap();
+        seed_tool_result(storage.database(), "s1", "bash", "exit 0: OK");
+
+        let executor = IterationExecutor::new(storage.database().clone());
+        let trace = serde_json::json!([{"name": "bash", "ok": true}]);
+        let result = executor
+            .finalize_iteration_ok(
+                iter_id,
+                Some("done".into()),
+                trace,
+                "s1",
+                &LoopId("v3".into()),
+                1,
+                &rec,
+            )
+            .await;
+        assert!(result.is_ok(), "expected ok-variant, got {:?}", result);
+
+        let recent = storage.loops().recent_iterations("v3", 1).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].verify_passed, None);
+        assert_eq!(recent[0].verify_reason, None);
+    }
+
+    #[tokio::test]
+    async fn finalize_iteration_ok_fails_open_on_unparseable_verify_check() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .sessions()
+            .create(CreateSessionParams::new().with_id("s1").with_title("t"))
+            .unwrap();
+        let mut rec = sample_loop("v4");
+        rec.verify_check = Some("not valid json".into());
+        storage.loops().create(&rec).unwrap();
+        let iter_id = storage
+            .loops()
+            .insert_iteration("v4", 1, 100, IterationStatus::Running)
+            .unwrap();
+        seed_tool_result(storage.database(), "s1", "bash", "exit 0: OK");
+
+        let executor = IterationExecutor::new(storage.database().clone());
+        let trace = serde_json::json!([{"name": "bash", "ok": true}]);
+        let result = executor
+            .finalize_iteration_ok(
+                iter_id,
+                Some("done".into()),
+                trace,
+                "s1",
+                &LoopId("v4".into()),
+                1,
+                &rec,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "malformed verify_check must not fail the iteration, got {:?}",
+            result
+        );
+
+        let recent = storage.loops().recent_iterations("v4", 1).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].verify_passed, None);
+        assert_eq!(recent[0].verify_reason, None);
+    }
 }

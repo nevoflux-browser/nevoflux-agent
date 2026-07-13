@@ -2040,7 +2040,17 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 }
             }
             "browser_get_tabs" => {
-                let result = self.host.browser_list_tabs(None)?;
+                // scope/scope_id are Zen-aware filters; forward them through as
+                // params (mirrors browser_query_tabs's params passthrough) so
+                // the extension can filter by space/folder/live-folder.
+                let params = if let Some(obj) = tool_call.arguments.as_object() {
+                    let mut clean = obj.clone();
+                    clean.remove("tab_id");
+                    serde_json::Value::Object(clean)
+                } else {
+                    serde_json::json!({})
+                };
+                let result = self.host.browser_list_tabs(&params, None)?;
                 serde_json::to_string(&result).unwrap_or_default()
             }
             "browser_eval_js" => {
@@ -2402,6 +2412,12 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             "loop_scratchpad_set" => self.host.tool_loop_scratchpad_set(
                 &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
             )?,
+            "loop_evolve" => self.host.tool_loop_evolve(
+                &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
+            )?,
+            "loop_proposal_respond" => self.host.tool_loop_proposal_respond(
+                &serde_json::to_string(&tool_call.arguments).unwrap_or_default(),
+            )?,
             // /schedule skill tools — direct-API dispatch (Anthropic / OpenAI
             // direct providers). The MCP/ACP path goes through
             // `mcp_tool_executor::execute_mcp_tool::schedule_*`.
@@ -2526,6 +2542,8 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 | "loop_cancel"
                 | "loop_scratchpad_get"
                 | "loop_scratchpad_set"
+                | "loop_evolve"
+                | "loop_proposal_respond"
                 | "schedule_create"
                 | "schedule_list"
                 | "schedule_cancel"
@@ -3651,6 +3669,33 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                             "type": "string",
                             "enum": ["chat", "browser", "agent"],
                             "description": "Agent mode for iterations. Default 'chat'."
+                        },
+                        "gate": {
+                            "type": "object",
+                            "description": "Optional deterministic pre-check that runs before the agent each fire; skips the run (no LLM cost) when nothing changed. http/bash do value-diff and only wake the agent on change; event filters the trigger payload. http/bash require a time: trigger; event requires an event: trigger.",
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["http", "bash", "event"],
+                                    "description": "Gate kind. 'http': GET url and diff the extracted value. 'bash': run command and diff its stdout. 'event': filter the event: trigger's payload."
+                                },
+                                "url": { "type": "string", "description": "http gate: URL to GET." },
+                                "extract": { "type": "string", "description": "http gate: JSONPath-ish extractor applied to the response body, e.g. '$.value'. Omit to diff the whole body." },
+                                "command": { "type": "string", "description": "bash gate: shell command to run; its stdout is diffed." },
+                                "path": { "type": "string", "description": "event gate: dot-path into the trigger's event payload to compare, e.g. 'status'." },
+                                "equals": { "type": "string", "description": "event gate: only run when the value at `path` equals this string." }
+                            },
+                            "required": ["kind"]
+                        },
+                        "verify": {
+                            "type": "object",
+                            "description": "Optional check run over each iteration's tool results; stores pass/fail on the run. `matches` is a substring or `/regex/`; `tool` scopes to one tool's output; `negate` requires the pattern ABSENT. Reuses the /goal check semantics — prefer it for machine-verifiable loops. Make the iteration surface the checked evidence in a tool result.",
+                            "properties": {
+                                "tool": { "type": "string", "description": "Only consider results from this tool; omit to match any tool's result." },
+                                "matches": { "type": "string", "description": "Substring, or `/regex/` when wrapped in slashes." },
+                                "negate": { "type": "boolean", "description": "Require the pattern to be ABSENT instead of present. Default false." }
+                            },
+                            "required": ["matches"]
                         }
                     },
                     "required": ["trigger_expr"]
@@ -3685,6 +3730,27 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     "type": "object",
                     "properties": { "content": { "type": "string" } },
                     "required": ["content"]
+                }),
+            },
+            ToolDefinition {
+                name: "loop_evolve".into(),
+                description: "Ask the loop to propose improvements to itself (contract/gate) based on its recent runs; creates a proposal for the user to accept or reject.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "loop_id": { "type": "string" } },
+                    "required": ["loop_id"]
+                }),
+            },
+            ToolDefinition {
+                name: "loop_proposal_respond".into(),
+                description: "Accept (apply) or reject a loop's pending self-improvement proposal.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "proposal_id": { "type": "string" },
+                        "accept": { "type": "boolean" }
+                    },
+                    "required": ["proposal_id", "accept"]
                 }),
             },
             // /schedule skill tools (Task 1.6).
@@ -3923,13 +3989,32 @@ For going back, use browser_go_back. NEVER use navigate to 'go back'.".into(),
 
         tools.push(ToolDefinition {
             name: "browser_get_tabs".into(),
-            description: "List all open browser tabs with their tab_id, title, and URL. \
+            description: "List open browser tabs with their tab_id, title, URL, and Zen \
+metadata (space, folder, liveFolder, discarded). \
 Use this to find or verify a tab by its title — e.g. before browser_activate_tab, \
-or to confirm the page you just opened is loaded (check a tab's title)."
+or to confirm the page you just opened is loaded (check a tab's title). \
+By default (scope omitted) this returns all tabs EXCEPT tabs inside a live folder — \
+pass scope=\"live_folder\" to see those, or scope=\"all\" to include everything."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["all", "space", "folder", "live_folder"],
+                        "description": "Filter by Zen scope. Omitted (default): all tabs \
+except those in a live folder. \"all\": every tab, including live folders. \"space\": tabs \
+in a space (optionally scope_id), excluding live folders. \"folder\": tabs in a non-live \
+folder (optionally scope_id), excluding live folders. \"live_folder\": ONLY tabs in a live \
+folder (optionally scope_id)."
+                    },
+                    "scope_id": {
+                        "type": "string",
+                        "description": "Optional id to narrow scope: a space uuid (with \
+scope=\"space\"), a folder id (with scope=\"folder\"), or a live-folder id (with \
+scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope."
+                    }
+                }
             }),
         });
 

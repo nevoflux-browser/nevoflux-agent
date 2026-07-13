@@ -5,8 +5,10 @@
 pub mod combinator;
 pub mod dynamic;
 pub mod events;
+pub mod evolve;
 pub mod executor;
 pub mod expression;
+pub mod gate;
 pub mod manager;
 pub mod registry;
 pub mod scheduler;
@@ -16,6 +18,7 @@ pub mod tools;
 pub mod types;
 pub use executor::{ExecResult, IterationExecutor};
 pub use expression::{ParseError, TabRef, TriggerExpr};
+pub use gate::{evaluate_gate, DefaultFetcher, Fetcher, GateDecision};
 pub use manager::{CreateLoopArgs, LoopManager};
 pub use registry::LoopRegistry;
 pub use scheduler::{LoopFireRequest, TriggerScheduler};

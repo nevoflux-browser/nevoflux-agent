@@ -668,7 +668,8 @@ async fn managed_idle_watchdog(
     last_message_time: std::sync::Arc<Mutex<std::time::Instant>>,
     idle_timeout: std::time::Duration,
     poll_interval: std::time::Duration,
-    background_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    schedule_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    loop_jobs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     shutdown_tx: mpsc::Sender<()>,
 ) {
     use std::sync::atomic::Ordering;
@@ -683,11 +684,12 @@ async fn managed_idle_watchdog(
         }
         let since_last_connection = last_connected.elapsed();
         let since_last_message = last_message_time.lock().await.elapsed();
-        // Pending schedule work (active schedules + in-flight runs) inhibits
-        // termination without touching `last_connected`, so a real disconnect
-        // is not masked: the moment the counter hits 0 the countdown resumes
-        // from the already-elapsed disconnect time.
-        let background_jobs = background_jobs.load(Ordering::SeqCst);
+        // Pending schedule/loop work (active schedules + in-flight runs, and
+        // armed loops) inhibits termination without touching `last_connected`,
+        // so a real disconnect is not masked: the moment both counters hit 0
+        // the countdown resumes from the already-elapsed disconnect time.
+        let background_jobs =
+            schedule_jobs.load(Ordering::SeqCst) + loop_jobs.load(Ordering::SeqCst);
         if managed_should_self_terminate(
             since_last_connection,
             since_last_message,
@@ -1941,6 +1943,7 @@ pub async fn start_server(
     // inside the accept loop below (a managed daemon must not self-terminate
     // while a schedule is armed or a run is in flight).
     let watchdog_schedule_jobs = schedule_manager.pending_work_handle();
+    let watchdog_loop_jobs = loop_manager.pending_work_handle();
     let terminated = Arc::new(tokio::sync::Notify::new());
     let accept_terminated = terminated.clone();
     tokio::spawn(async move {
@@ -1966,6 +1969,7 @@ pub async fn start_server(
                 config_idle_timeout,
                 std::time::Duration::from_secs(1),
                 watchdog_schedule_jobs.clone(),
+                watchdog_loop_jobs.clone(),
                 accept_shutdown_tx.clone(),
             ));
         }
@@ -2464,6 +2468,150 @@ pub async fn start_server(
                 continue;
             }
 
+            // Handle loop_evolve_command from sidebar (Loop Jobs panel "Evolve
+            // now" button, W4 evolve UI wiring). Runs the self-improvement
+            // meta-pass (an LLM turn) for a loop. `evolve_loop` already
+            // inserts the resulting proposal row and emits
+            // `system:loop:proposal` on success, which is what the panel
+            // actually listens for — so this handler only needs to kick the
+            // pass off and log the outcome. Spawned off the message loop
+            // (mirrors the ProcessChat pattern above) since the LLM call can
+            // take several seconds and must not block other sidebar traffic.
+            if msg_type == "loop_evolve_command" {
+                info!("Processing loop_evolve_command message");
+                if let Some(payload) = envelope.payload.get("payload") {
+                    let loop_id = payload
+                        .get("loop_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    if let Some(loop_id) = loop_id {
+                        let evolve_services = process_services.clone();
+                        tokio::spawn(async move {
+                            let db = evolve_services.database.clone();
+                            match crate::loops::evolve::evolve_loop(
+                                db.as_ref(),
+                                &evolve_services,
+                                &loop_id,
+                            )
+                            .await
+                            {
+                                Ok(proposal) => {
+                                    info!(
+                                        "loop_evolve_command produced proposal {} for loop {}",
+                                        proposal.id, loop_id
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("loop_evolve_command failed for {}: {}", loop_id, e);
+                                }
+                            }
+                        });
+                    } else {
+                        warn!("loop_evolve_command missing loop_id");
+                    }
+                }
+                continue;
+            }
+
+            // Handle loop_proposal_respond_command from sidebar (Loop Jobs
+            // panel Accept/Reject buttons, W4 evolve UI wiring). Mirrors the
+            // `loop_proposal_respond` tool handler in `loops::tools` (that
+            // function isn't directly reusable here without a session_id,
+            // which the command payload deliberately omits — see
+            // `LoopProposalRespondCommandPayload` — so the loop's own
+            // session_id is looked up from the record instead of trusting
+            // whatever session happens to be attached to this connection).
+            if msg_type == "loop_proposal_respond_command" {
+                info!("Processing loop_proposal_respond_command message");
+                if let Some(payload) = envelope.payload.get("payload") {
+                    let proposal_id = payload
+                        .get("proposal_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let accept = payload.get("accept").and_then(|v| v.as_bool());
+                    match (proposal_id, accept) {
+                        (Some(proposal_id), Some(accept)) => {
+                            if let Some(mgr) = process_services.loop_manager.as_ref() {
+                                let db = process_services.database.as_ref();
+                                let now = nevoflux_storage::models::current_timestamp();
+                                let proposal_repo =
+                                    nevoflux_storage::repositories::LoopProposalRepository::new(
+                                        db,
+                                    );
+                                match proposal_repo.respond_proposal(&proposal_id, accept, now) {
+                                    Ok(Some(proposal)) => {
+                                        if accept {
+                                            if let Err(e) =
+                                                nevoflux_storage::repositories::LoopRepository::new(
+                                                    db,
+                                                )
+                                                .apply_proposal_fields(
+                                                    &proposal.loop_id,
+                                                    proposal.proposed_prompt_text.as_deref(),
+                                                    proposal.proposed_gate_spec.as_deref(),
+                                                    now,
+                                                )
+                                            {
+                                                warn!(
+                                                    "loop_proposal_respond_command: failed to apply proposal {} to loop {}: {}",
+                                                    proposal.id, proposal.loop_id, e
+                                                );
+                                            }
+                                        }
+                                        let loop_session_id =
+                                            nevoflux_storage::repositories::LoopRepository::new(
+                                                db,
+                                            )
+                                            .get(&proposal.loop_id)
+                                            .ok()
+                                            .flatten()
+                                            .map(|rec| rec.session_id)
+                                            .unwrap_or_default();
+                                        mgr.events()
+                                            .proposal_resolved(
+                                                &loop_session_id,
+                                                &crate::loops::LoopId(proposal.loop_id.clone()),
+                                                &proposal.id,
+                                                accept,
+                                            )
+                                            .await;
+                                        info!(
+                                            "loop_proposal_respond_command: proposal {} for loop {} {}",
+                                            proposal.id,
+                                            proposal.loop_id,
+                                            if accept { "accepted" } else { "rejected" }
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        warn!(
+                                            "loop_proposal_respond_command: no pending proposal {}",
+                                            proposal_id
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "loop_proposal_respond_command: failed to respond to proposal {}: {}",
+                                            proposal_id, e
+                                        );
+                                    }
+                                }
+                            } else {
+                                warn!(
+                                    "loop_proposal_respond_command received for {} but no LoopManager configured",
+                                    proposal_id
+                                );
+                            }
+                        }
+                        _ => {
+                            warn!(
+                                "loop_proposal_respond_command missing proposal_id or accept"
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+
             // Handle skill_command messages from sidebar — currently used
             // by the /loop slash command (Phase 17). Routes skill_name=="loop"
             // to LoopManager::create_loop. Other skill_names fall through and
@@ -2535,6 +2683,8 @@ pub async fn start_server(
                                 prompt_text,
                                 wrapped_skill,
                                 mode,
+                                gate: None,
+                                verify_check: None,
                             })
                             .await
                         {
@@ -10784,6 +10934,7 @@ mod tests {
             Duration::from_millis(120),
             Duration::from_millis(10),
             Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
             tx,
         ));
 
@@ -10811,6 +10962,7 @@ mod tests {
             Duration::from_millis(120),
             Duration::from_millis(10),
             Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
             tx,
         ));
 
@@ -10837,6 +10989,7 @@ mod tests {
             last_msg,
             Duration::from_millis(120),
             Duration::from_millis(10),
+            Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
             tx,
         ));
@@ -10875,6 +11028,7 @@ mod tests {
             Duration::from_millis(120),
             Duration::from_millis(10),
             jobs,
+            Arc::new(AtomicUsize::new(0)),
             tx,
         ));
 
@@ -10894,6 +11048,59 @@ mod tests {
         assert!(
             rx.try_recv().is_ok(),
             "watchdog must resume the idle countdown from real elapsed times once jobs hit 0"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn managed_daemon_stays_alive_while_a_loop_is_armed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        // Browser gone for the whole run (count stays 0) and the message path
+        // idle, but a loop is armed (loop_jobs = 1): the managed daemon must
+        // NOT self-terminate — otherwise a loop job running while the sidebar
+        // is closed would be killed out from under itself. Mirrors
+        // `watchdog_stays_alive_while_schedules_pending_then_resumes`, but
+        // exercises the *loop* half of the `background_jobs` sum instead of
+        // the schedule half. Uses real (short) durations against the
+        // real-`Instant`-based watchdog rather than tokio's virtual clock,
+        // since `managed_idle_watchdog` measures elapsed time with
+        // `std::time::Instant::now()`, which `tokio::time::advance` does not
+        // mock.
+        let connection_count = Arc::new(AtomicUsize::new(0)); // disconnected
+        let last_message_time = Arc::new(Mutex::new(std::time::Instant::now()));
+        let schedule_jobs = Arc::new(AtomicUsize::new(0));
+        let loop_jobs = Arc::new(AtomicUsize::new(1)); // one armed loop
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+
+        let loop_jobs_ctl = loop_jobs.clone();
+        let handle = tokio::spawn(managed_idle_watchdog(
+            connection_count,
+            last_message_time,
+            Duration::from_millis(120),
+            Duration::from_millis(10),
+            schedule_jobs,
+            loop_jobs,
+            shutdown_tx,
+        ));
+
+        // Past several idle windows with a loop armed -> must stay alive.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            shutdown_rx.try_recv().is_err(),
+            "must NOT shut down while a loop is armed"
+        );
+
+        // The loop completes (counter -> 0). The idle countdown resumes from
+        // the real elapsed disconnect time — which is already well past the
+        // window — so termination fires on the next poll. The inhibitor
+        // never reset `last_connected`, so the elapsed disconnect isn't
+        // masked.
+        loop_jobs_ctl.store(0, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            shutdown_rx.recv().await.is_some(),
+            "must shut down once idle and disarmed"
         );
         handle.abort();
     }

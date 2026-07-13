@@ -295,8 +295,67 @@ async fn execute_ask_user(
 // Top-level dispatcher
 // ============================================================================
 
+/// Persist an ACP-bridge tool's result as a `tool_result` message, mirroring
+/// `DaemonHostFunctions::record_tool_result` (agent_host.rs) for the
+/// direct-API path. Without this, `/loop` verify checks and `/goal`
+/// programmatic checks — which read `messages` where
+/// `content_type='tool_result'` via `MessageRepository::list_recent_tool_results`
+/// — always find nothing for ACP-bridge providers (claude-code, kimi-agent,
+/// ...), because their tool calls execute here in `execute_mcp_tool` rather
+/// than on the `Agent::run` / `DaemonHostFunctions` path.
+///
+/// Best effort: skips silently when there is no session_id, the content is
+/// empty/whitespace, or the tool is the meta `think` tool (reasoning, not an
+/// observation) — same skip conditions as `record_tool_result`. Persist
+/// failures are logged, not propagated, so a storage hiccup never fails the
+/// tool call itself.
+pub(crate) fn record_acp_tool_result(services: &HostServices, tool_name: &str, content: &str) {
+    if content.trim().is_empty() || tool_name == "think" {
+        return;
+    }
+    if services.session_id.is_empty() {
+        return;
+    }
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("tool_name".to_string(), serde_json::json!(tool_name));
+    metadata.insert("tool_id".to_string(), serde_json::json!(""));
+    let params = nevoflux_storage::CreateMessageParams::new(
+        &services.session_id,
+        nevoflux_storage::models::MessageRole::Assistant,
+        content,
+    )
+    .with_content_type(nevoflux_storage::models::ContentType::ToolResult)
+    .with_metadata(metadata);
+    if let Err(e) =
+        nevoflux_storage::repositories::MessageRepository::new(&services.database).create(params)
+    {
+        tracing::warn!(tool = tool_name, error = %e, "record_acp_tool_result: persist failed");
+    }
+}
+
 /// Execute a single MCP tool call, routing to the correct category.
+///
+/// Thin wrapper around [`execute_mcp_tool_inner`] that records a successful
+/// result to the `messages` table via [`record_acp_tool_result`] before
+/// returning it unchanged — see that function's docs for why. Errors are not
+/// recorded (a failed tool call is not an observation to match against).
 pub async fn execute_mcp_tool(
+    name: &str,
+    arguments: &serde_json::Value,
+    services: &HostServices,
+    tool_bridge: &Arc<McpToolBridge>,
+) -> Result<String, String> {
+    let result = execute_mcp_tool_inner(name, arguments, services, tool_bridge).await;
+    if let Ok(ref content) = result {
+        record_acp_tool_result(services, name, content);
+    }
+    result
+}
+
+/// Actual dispatch logic for [`execute_mcp_tool`]. Split out so the public
+/// entry point can wrap every return path with a single result-recording
+/// call instead of touching each of the many `return` sites below.
+async fn execute_mcp_tool_inner(
     name: &str,
     arguments: &serde_json::Value,
     services: &HostServices,
@@ -526,7 +585,13 @@ pub async fn execute_mcp_tool(
     // (Phase 23 wires this; until then tool calls surface a clear error).
     if matches!(
         name,
-        "loop_create" | "loop_list" | "loop_cancel" | "loop_scratchpad_get" | "loop_scratchpad_set"
+        "loop_create"
+            | "loop_list"
+            | "loop_cancel"
+            | "loop_scratchpad_get"
+            | "loop_scratchpad_set"
+            | "loop_evolve"
+            | "loop_proposal_respond"
     ) {
         let mgr = match services.loop_manager.as_ref() {
             Some(m) => m,
@@ -563,6 +628,7 @@ pub async fn execute_mcp_tool(
             &ctx,
             mgr.as_ref(),
             services.database.as_ref(),
+            Some(services),
         )
         .await;
         return match result {
@@ -2692,6 +2758,155 @@ mod tests {
 
     fn make_test_bridge() -> Arc<McpToolBridge> {
         Arc::new(McpToolBridge::new())
+    }
+
+    // ------------------------------------------------------------------
+    // record_acp_tool_result — ACP-bridge tool-result recording (fixes the
+    // gap where /loop verify and /goal programmatic checks always failed
+    // for claude-code / kimi-agent / etc. sessions, since their tool calls
+    // never wrote a `tool_result` row to `messages`).
+    // ------------------------------------------------------------------
+
+    /// Seed a `sessions` row so `messages.session_id`'s FK constraint is
+    /// satisfied — `messages` REFERENCES `sessions(id)` (see
+    /// `crates/storage/src/migrations/001_initial.sql`), so a bare insert
+    /// against a session-less in-memory DB fails FK enforcement (silently,
+    /// since `record_acp_tool_result` is best-effort and only warns).
+    fn seed_session(db: &nevoflux_storage::Database, session_id: &str) {
+        nevoflux_storage::repositories::SessionRepository::new(db)
+            .create(nevoflux_storage::models::CreateSessionParams::new().with_id(session_id))
+            .unwrap();
+    }
+
+    #[test]
+    fn record_acp_tool_result_writes_tool_result_row() {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        seed_session(&db, "sess-1");
+        let services = HostServices::new(db.clone()).with_session_id("sess-1".to_string());
+
+        record_acp_tool_result(&services, "bash", "exit 0: OK");
+
+        let rows = nevoflux_storage::repositories::MessageRepository::new(&db)
+            .list_recent_tool_results("sess-1", 10)
+            .unwrap();
+        assert_eq!(rows, vec![("bash".to_string(), "exit 0: OK".to_string())]);
+    }
+
+    #[test]
+    fn record_acp_tool_result_skips_think_tool() {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        seed_session(&db, "sess-1");
+        let services = HostServices::new(db.clone()).with_session_id("sess-1".to_string());
+
+        record_acp_tool_result(&services, "think", "some internal reasoning");
+
+        let rows = nevoflux_storage::repositories::MessageRepository::new(&db)
+            .list_recent_tool_results("sess-1", 10)
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn record_acp_tool_result_skips_empty_content() {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        seed_session(&db, "sess-1");
+        let services = HostServices::new(db.clone()).with_session_id("sess-1".to_string());
+
+        record_acp_tool_result(&services, "bash", "   ");
+
+        let rows = nevoflux_storage::repositories::MessageRepository::new(&db)
+            .list_recent_tool_results("sess-1", 10)
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn record_acp_tool_result_skips_empty_session_id() {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        // session_id left at HostServices::new's default: "".
+        let services = HostServices::new(db.clone());
+
+        record_acp_tool_result(&services, "bash", "exit 0: OK");
+
+        // Nothing should have been written under the empty session_id either.
+        let rows = nevoflux_storage::repositories::MessageRepository::new(&db)
+            .list_recent_tool_results("", 10)
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn execute_mcp_tool_wrapper_records_result_for_acp_bridge() {
+        // End-to-end: the public `execute_mcp_tool` entry point (the only
+        // dispatch surface ACP-bridge providers use) must record a
+        // `tool_result` row on success, without any caller opting in.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        seed_session(&db, "sess-wrap");
+        let services = HostServices::new(db.clone()).with_session_id("sess-wrap".to_string());
+        let bridge = make_test_bridge();
+
+        let result = rt.block_on(execute_mcp_tool(
+            "create_plan",
+            &serde_json::json!({}),
+            &services,
+            &bridge,
+        ));
+        assert_eq!(result, Ok("Plan submitted for review.".to_string()));
+
+        let rows = nevoflux_storage::repositories::MessageRepository::new(&db)
+            .list_recent_tool_results("sess-wrap", 10)
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "create_plan".to_string(),
+                "Plan submitted for review.".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn execute_mcp_tool_wrapper_skips_think_tool() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        seed_session(&db, "sess-think");
+        let services = HostServices::new(db.clone()).with_session_id("sess-think".to_string());
+        let bridge = make_test_bridge();
+
+        let _ = rt.block_on(execute_mcp_tool(
+            "think",
+            &serde_json::json!({}),
+            &services,
+            &bridge,
+        ));
+
+        let rows = nevoflux_storage::repositories::MessageRepository::new(&db)
+            .list_recent_tool_results("sess-think", 10)
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn execute_mcp_tool_wrapper_does_not_record_on_error() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        seed_session(&db, "sess-err");
+        let services = HostServices::new(db.clone()).with_session_id("sess-err".to_string());
+        let bridge = make_test_bridge();
+
+        let result = rt.block_on(execute_mcp_tool(
+            "nonexistent_tool",
+            &serde_json::json!({}),
+            &services,
+            &bridge,
+        ));
+        assert!(result.is_err());
+
+        let rows = nevoflux_storage::repositories::MessageRepository::new(&db)
+            .list_recent_tool_results("sess-err", 10)
+            .unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]
