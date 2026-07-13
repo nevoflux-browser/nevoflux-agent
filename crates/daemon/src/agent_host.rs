@@ -4319,9 +4319,13 @@ impl HostFunctions for DaemonHostFunctions {
         self.execute_browser_action(BrowserToolAction::Snapshot, params, tab_id)
     }
 
-    fn browser_list_tabs(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
-        debug!("browser_list_tabs: listing all open tabs");
-        self.execute_browser_action(BrowserToolAction::ListTabs, serde_json::json!({}), tab_id)
+    fn browser_list_tabs(
+        &self,
+        params: &serde_json::Value,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
+        debug!("browser_list_tabs: listing open tabs, params={}", params);
+        self.execute_browser_action(BrowserToolAction::ListTabs, params.clone(), tab_id)
     }
 
     fn browser_query_tabs(

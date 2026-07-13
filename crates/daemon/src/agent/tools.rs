@@ -898,6 +898,13 @@ impl BrowserTool {
                 if let Some(active) = arguments.get("active").and_then(|v| v.as_bool()) {
                     p.insert("active".into(), serde_json::json!(active));
                 }
+                // browser_get_tabs Zen-aware scope filters (space/folder/live_folder).
+                if let Some(scope) = arguments.get("scope").and_then(|v| v.as_str()) {
+                    p.insert("scope".into(), serde_json::json!(scope));
+                }
+                if let Some(scope_id) = arguments.get("scope_id").and_then(|v| v.as_str()) {
+                    p.insert("scope_id".into(), serde_json::json!(scope_id));
+                }
                 serde_json::Value::Object(p)
             }
             BrowserToolAction::ClickById => {

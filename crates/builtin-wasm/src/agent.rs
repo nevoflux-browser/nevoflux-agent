@@ -2040,7 +2040,17 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 }
             }
             "browser_get_tabs" => {
-                let result = self.host.browser_list_tabs(None)?;
+                // scope/scope_id are Zen-aware filters; forward them through as
+                // params (mirrors browser_query_tabs's params passthrough) so
+                // the extension can filter by space/folder/live-folder.
+                let params = if let Some(obj) = tool_call.arguments.as_object() {
+                    let mut clean = obj.clone();
+                    clean.remove("tab_id");
+                    serde_json::Value::Object(clean)
+                } else {
+                    serde_json::json!({})
+                };
+                let result = self.host.browser_list_tabs(&params, None)?;
                 serde_json::to_string(&result).unwrap_or_default()
             }
             "browser_eval_js" => {
@@ -3979,13 +3989,32 @@ For going back, use browser_go_back. NEVER use navigate to 'go back'.".into(),
 
         tools.push(ToolDefinition {
             name: "browser_get_tabs".into(),
-            description: "List all open browser tabs with their tab_id, title, and URL. \
+            description: "List open browser tabs with their tab_id, title, URL, and Zen \
+metadata (space, folder, liveFolder, discarded). \
 Use this to find or verify a tab by its title — e.g. before browser_activate_tab, \
-or to confirm the page you just opened is loaded (check a tab's title)."
+or to confirm the page you just opened is loaded (check a tab's title). \
+By default (scope omitted) this returns all tabs EXCEPT tabs inside a live folder — \
+pass scope=\"live_folder\" to see those, or scope=\"all\" to include everything."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["all", "space", "folder", "live_folder"],
+                        "description": "Filter by Zen scope. Omitted (default): all tabs \
+except those in a live folder. \"all\": every tab, including live folders. \"space\": tabs \
+in a space (optionally scope_id), excluding live folders. \"folder\": tabs in a non-live \
+folder (optionally scope_id), excluding live folders. \"live_folder\": ONLY tabs in a live \
+folder (optionally scope_id)."
+                    },
+                    "scope_id": {
+                        "type": "string",
+                        "description": "Optional id to narrow scope: a space uuid (with \
+scope=\"space\"), a folder id (with scope=\"folder\"), or a live-folder id (with \
+scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope."
+                    }
+                }
             }),
         });
 

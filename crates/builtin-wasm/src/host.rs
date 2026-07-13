@@ -362,8 +362,13 @@ pub trait HostFunctions {
         keywords: Option<Vec<String>>,
     ) -> HostResult<BrowserToolResult>;
 
-    /// List all open browser tabs.
-    fn browser_list_tabs(&self, tab_id: Option<i64>) -> HostResult<BrowserToolResult>;
+    /// List open browser tabs, optionally filtered by Zen scope
+    /// (`{"scope": "all"|"space"|"folder"|"live_folder", "scope_id": "..."}`).
+    fn browser_list_tabs(
+        &self,
+        params: &serde_json::Value,
+        tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult>;
 
     /// Query tabs with optional filters (url, title, active).
     fn browser_query_tabs(
@@ -1363,11 +1368,15 @@ impl HostFunctions for MockHostFunctions {
         })))
     }
 
-    fn browser_list_tabs(&self, _tab_id: Option<i64>) -> HostResult<BrowserToolResult> {
+    fn browser_list_tabs(
+        &self,
+        _params: &serde_json::Value,
+        _tab_id: Option<i64>,
+    ) -> HostResult<BrowserToolResult> {
         Ok(BrowserToolResult::success(serde_json::json!({
             "tabs": [
-                {"id": 1, "url": "https://example.com", "title": "Example", "active": true, "windowId": 1},
-                {"id": 2, "url": "https://test.com", "title": "Test Page", "active": false, "windowId": 1}
+                {"id": 1, "url": "https://example.com", "title": "Example", "active": true, "windowId": 1, "space": null, "folder": null, "liveFolder": null, "discarded": false},
+                {"id": 2, "url": "https://test.com", "title": "Test Page", "active": false, "windowId": 1, "space": null, "folder": null, "liveFolder": null, "discarded": false}
             ]
         })))
     }
