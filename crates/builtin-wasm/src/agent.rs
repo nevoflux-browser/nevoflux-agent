@@ -4017,36 +4017,9 @@ For going back, use browser_go_back. NEVER use navigate to 'go back'.".into(),
             }),
         });
 
-        tools.push(ToolDefinition {
-            name: "browser_get_tabs".into(),
-            description: "List open browser tabs with their tab_id, title, URL, and Zen \
-metadata (space, folder, liveFolder, discarded). \
-Use this to find or verify a tab by its title — e.g. before browser_activate_tab, \
-or to confirm the page you just opened is loaded (check a tab's title). \
-By default (scope omitted) this returns all tabs EXCEPT tabs inside a live folder — \
-pass scope=\"live_folder\" to see those, or scope=\"all\" to include everything."
-                .into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "scope": {
-                        "type": "string",
-                        "enum": ["all", "space", "folder", "live_folder"],
-                        "description": "Filter by Zen scope. Omitted (default): all tabs \
-except those in a live folder. \"all\": every tab, including live folders. \"space\": tabs \
-in a space (optionally scope_id), excluding live folders. \"folder\": tabs in a non-live \
-folder (optionally scope_id), excluding live folders. \"live_folder\": ONLY tabs in a live \
-folder (optionally scope_id)."
-                    },
-                    "scope_id": {
-                        "type": "string",
-                        "description": "Optional id to narrow scope: a space uuid (with \
-scope=\"space\"), a folder id (with scope=\"folder\"), or a live-folder id (with \
-scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope."
-                    }
-                }
-            }),
-        });
+        // browser_get_tabs is inherited from get_chat_tools() (added there so it
+        // is available in chat mode too); do not re-push it here or Browser/Agent
+        // modes would carry a duplicate.
 
         tools.push(ToolDefinition {
             name: "browser_activate_tab".into(),
@@ -6759,8 +6732,10 @@ mod tests {
         // counted among browser-specific tools — hence +21, was +23.
         // Recorded-flow tools (run_flow / list_flows / report_flow_repair)
         // are browser+agent only, not in chat — hence +24, was +21.
-        // browser_get_tabs added (list tabs by title) — hence +25, was +24.
-        assert_eq!(browser_tools.len(), chat_tools.len() + 25);
+        // browser_get_tabs moved INTO get_chat_tools() (so chat can list tabs);
+        // it is now part of the chat baseline (inherited by browser/agent) and
+        // no longer browser-specific — hence back to +24, was +25.
+        assert_eq!(browser_tools.len(), chat_tools.len() + 24);
     }
 
     #[test]
