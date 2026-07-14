@@ -3934,6 +3934,17 @@ async fn stream_acp_completion(
             }
         };
 
+        // antigravity-acp spawns `agy -p <prompt>` per turn, passing the ENTIRE
+        // prompt as one command-line argument; Windows CreateProcess caps the
+        // command line at ~32767 chars, so a normal prompt overflows with
+        // ENAMETOOLONG. Persistent-process ACP agents (claude/gemini/openclaw)
+        // stream the prompt over stdio and are unaffected — cap only antigravity.
+        let content = if matches!(provider, ProviderType::Antigravity) {
+            cap_acp_content_for_spawn(content, ANTIGRAVITY_PROMPT_CHAR_BUDGET)
+        } else {
+            content
+        };
+
         let providers = acp_providers().lock().await;
         let acp = providers
             .get(&provider_key)
@@ -4159,6 +4170,47 @@ fn build_acp_content(
 }
 
 /// Build minimal ACP content: system prompt + last message only.
+/// Command-line-safe prompt budget for the antigravity provider. The
+/// antigravity-acp adapter spawns `agy -p <prompt>` and Windows CreateProcess
+/// caps the whole command line at 32767 chars; leave headroom for agy's other
+/// args (`--add-dir <path>`, `--dangerously-skip-permissions`, `--model`, …).
+const ANTIGRAVITY_PROMPT_CHAR_BUDGET: usize = 30_000;
+
+/// Cap total ACP prompt text so it fits in a single command-line argument
+/// (see [`ANTIGRAVITY_PROMPT_CHAR_BUDGET`]). Keeps the head (system framing)
+/// and tail (recent history + current user message), dropping the middle.
+/// Lossy but keeps antigravity usable instead of hard-failing ENAMETOOLONG.
+fn cap_acp_content_for_spawn(content: Vec<ContentBlock>, max_chars: usize) -> Vec<ContentBlock> {
+    let mut joined = String::new();
+    for block in &content {
+        if let ContentBlock::Text(t) = block {
+            if !joined.is_empty() {
+                joined.push_str("\n\n");
+            }
+            joined.push_str(&t.text);
+        }
+    }
+    if joined.chars().count() <= max_chars {
+        return content;
+    }
+    let marker =
+        "\n\n...[earlier context truncated to fit the Antigravity CLI command-line limit]...\n\n";
+    let keep = max_chars.saturating_sub(marker.chars().count());
+    let head = keep * 45 / 100;
+    let tail = keep - head;
+    let chars: Vec<char> = joined.chars().collect();
+    tracing::warn!(
+        "antigravity: prompt {} chars > {} budget; truncating older context to fit agy -p",
+        chars.len(),
+        max_chars
+    );
+    let head_s: String = chars[..head].iter().collect();
+    let tail_s: String = chars[chars.len() - tail..].iter().collect();
+    vec![ContentBlock::Text(TextContent::new(format!(
+        "{head_s}{marker}{tail_s}"
+    )))]
+}
+
 fn build_acp_content_minimal(request: &LlmChatRequest) -> Vec<ContentBlock> {
     let mut blocks = Vec::new();
 
@@ -5317,6 +5369,39 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_acp_content_leaves_small_prompt_untouched() {
+        let content = vec![
+            ContentBlock::Text(TextContent::new("system".to_string())),
+            ContentBlock::Text(TextContent::new("hello".to_string())),
+        ];
+        let capped = cap_acp_content_for_spawn(content, 30_000);
+        // Under budget → unchanged (still two blocks).
+        assert_eq!(capped.len(), 2);
+    }
+
+    #[test]
+    fn cap_acp_content_truncates_oversized_prompt_to_budget() {
+        let head = "H".repeat(40_000);
+        let tail = "USER_QUESTION_AT_END".to_string();
+        let content = vec![
+            ContentBlock::Text(TextContent::new(head)),
+            ContentBlock::Text(TextContent::new(tail.clone())),
+        ];
+        let capped = cap_acp_content_for_spawn(content, 30_000);
+        assert_eq!(capped.len(), 1, "oversized prompt collapses to one block");
+        let ContentBlock::Text(t) = &capped[0] else {
+            panic!("expected text block");
+        };
+        // Fits the command-line budget...
+        assert!(t.text.chars().count() <= 30_000, "capped under budget");
+        // ...keeps the head framing and the current user question at the tail...
+        assert!(t.text.starts_with("HHHH"));
+        assert!(t.text.contains(&tail), "current user message preserved");
+        // ...and marks the dropped middle.
+        assert!(t.text.contains("truncated to fit the Antigravity CLI"));
+    }
 
     #[test]
     fn test_llm_message_serialization() {
