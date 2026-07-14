@@ -4,6 +4,7 @@
 //! sacp protocol. A background tokio task owns the `ClientToAgent` connection;
 //! the public `AcpProvider` sends requests through an `mpsc` channel.
 
+pub mod antigravity;
 pub mod claude;
 pub mod context;
 pub mod gemini;
@@ -75,6 +76,12 @@ pub struct AcpProviderConfig {
     /// Whether to inject MCP URL into NewSessionRequest.
     /// false for OpenClaw (registers via gateway config instead).
     pub inject_mcp_url: bool,
+    /// When true, the daemon-side HTTP MCP server enforces
+    /// `McpToolBridge::request_permission` on every `tools/call` before
+    /// executing. Needed for agents that never send
+    /// `session/request_permission` themselves (antigravity-acp). Keep false
+    /// for agents that self-report (claude-code) or gating would double-prompt.
+    pub gate_tool_calls: bool,
 }
 
 /// Internal request sent from `AcpProvider` to the background client loop.
@@ -149,7 +156,9 @@ impl AcpProvider {
     /// Create a new (disconnected) provider with the given config.
     pub fn new(config: AcpProviderConfig) -> Self {
         let tool_bridge = if config.use_mcp_bridge {
-            Some(Arc::new(mcp_bridge::McpToolBridge::new()))
+            let bridge = mcp_bridge::McpToolBridge::new();
+            bridge.set_gate_tool_calls(config.gate_tool_calls);
+            Some(Arc::new(bridge))
         } else {
             None
         };

@@ -77,6 +77,10 @@ pub struct McpToolBridge {
     permission_tx: Arc<Mutex<Option<mpsc::Sender<PermissionRequest>>>>,
     /// Tools that user has approved "Always Allow" for this session.
     always_allowed_tools: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// When true, the HTTP MCP server gates every tools/call through
+    /// `request_permission` (server-side enforcement for agents that never
+    /// send session/request_permission).
+    gate_tool_calls: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for McpToolBridge {
@@ -109,6 +113,7 @@ impl McpToolBridge {
             tool_call_log: Arc::new(Mutex::new(Vec::new())),
             permission_tx: Arc::new(Mutex::new(None)),
             always_allowed_tools: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            gate_tool_calls: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -176,6 +181,16 @@ impl McpToolBridge {
     /// Set the permission handler channel (daemon side connects to sidebar).
     pub fn set_permission_handler(&self, tx: mpsc::Sender<PermissionRequest>) {
         *self.permission_tx.lock().unwrap() = Some(tx);
+    }
+
+    pub fn set_gate_tool_calls(&self, on: bool) {
+        self.gate_tool_calls
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn gate_tool_calls(&self) -> bool {
+        self.gate_tool_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Check if a tool is in the session-level always-allow list.
