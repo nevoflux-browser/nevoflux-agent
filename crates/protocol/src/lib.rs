@@ -37,6 +37,7 @@ pub mod extract;
 pub mod json_repair;
 pub mod mcp;
 pub mod subagent;
+pub mod tools;
 pub mod tts;
 
 // Re-export canvas share types
@@ -59,6 +60,7 @@ pub use canvas_tools::{
 pub use channel::Channel;
 pub use envelope::{AuthInfo, DaemonEnvelope, ProxyEnvelope};
 pub use error::{ProtocolError, Result};
+pub use tools::{is_read_only_tool, READ_ONLY_TOOLS};
 
 // Re-export chat messages
 pub use chat::{
