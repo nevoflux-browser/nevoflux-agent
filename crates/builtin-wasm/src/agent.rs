@@ -3121,6 +3121,36 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             },
             // Browser content tools (also available in chat mode for tab context)
             ToolDefinition {
+                name: "browser_get_tabs".into(),
+                description: "List open browser tabs with their tab_id, title, URL, and Zen \
+metadata (space, folder, liveFolder, discarded). \
+Use this to find or verify a tab by its title — e.g. before browser_activate_tab, \
+or to confirm the page you just opened is loaded (check a tab's title). \
+By default (scope omitted) this returns all tabs EXCEPT tabs inside a live folder — \
+pass scope=\"live_folder\" to see those, or scope=\"all\" to include everything."
+                    .into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "scope": {
+                            "type": "string",
+                            "enum": ["all", "space", "folder", "live_folder"],
+                            "description": "Filter by Zen scope. Omitted (default): all tabs \
+except those in a live folder. \"all\": every tab, including live folders. \"space\": tabs \
+in a space (optionally scope_id), excluding live folders. \"folder\": tabs in a non-live \
+folder (optionally scope_id), excluding live folders. \"live_folder\": ONLY tabs in a live \
+folder (optionally scope_id)."
+                        },
+                        "scope_id": {
+                            "type": "string",
+                            "description": "Optional id to narrow scope: a space uuid (with \
+scope=\"space\"), a folder id (with scope=\"folder\"), or a live-folder id (with \
+scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope."
+                        }
+                    }
+                }),
+            },
+            ToolDefinition {
                 name: "browser_get_content".into(),
                 description: "Get full raw HTML of the page. High token cost. Use ONLY when user needs actual HTML/CSS code structure (e.g., 'build a page like this'). For content reading, use browser_get_markdown instead.".into(),
                 input_schema: serde_json::json!({
@@ -5752,6 +5782,7 @@ mod tests {
 
         let chat_tools = agent.get_tools_for_mode(AgentMode::Chat);
         assert!(chat_tools.iter().any(|t| t.name == "web_search"));
+        assert!(chat_tools.iter().any(|t| t.name == "browser_get_tabs"));
         assert!(!chat_tools.iter().any(|t| t.name == "bash"));
 
         let browser_tools = agent.get_tools_for_mode(AgentMode::Browser);
