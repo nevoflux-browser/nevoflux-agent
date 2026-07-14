@@ -2199,6 +2199,8 @@ async fn execute_subagent_tool(
                         c.provider,
                         nevoflux_llm::ProviderType::ClaudeCode
                             | nevoflux_llm::ProviderType::GeminiCli
+                            | nevoflux_llm::ProviderType::OpenClaw
+                            | nevoflux_llm::ProviderType::Antigravity
                     )
                 });
                 if is_acp_mode {
