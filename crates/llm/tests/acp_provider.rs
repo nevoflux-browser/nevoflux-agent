@@ -162,3 +162,48 @@ async fn test_antigravity_acp_basic_prompt() {
     );
     provider.shutdown().await;
 }
+
+/// Validates the daemon's antigravity prompt-cap budget (30_000 chars) against
+/// the real Windows command-line limit + real agy: a near-budget prompt must
+/// spawn agy WITHOUT `ENAMETOOLONG` (the bug the cap fixes). Regression guard
+/// for the char budget in `daemon::wasm::llm::ANTIGRAVITY_PROMPT_CHAR_BUDGET`.
+#[tokio::test]
+async fn test_antigravity_acp_near_budget_prompt_no_enametoolong() {
+    if !antigravity_acp_available() {
+        eprintln!("SKIP: antigravity-acp not installed");
+        return;
+    }
+
+    let config = nevoflux_llm::providers::acp::antigravity::build_config("", PathBuf::from("."));
+    let mut provider = AcpProvider::new(config);
+    provider.connect().await.expect("Failed to connect");
+
+    // ~29_500 chars — just under the daemon's 30_000 cap, to prove the budget
+    // clears the real CreateProcess ~32767 limit once agy's other args are added.
+    let big = format!(
+        "{}\n\nIgnore the padding above. Reply with just: ok",
+        "x ".repeat(14_700)
+    );
+    let session_id = provider.new_session().await.expect("new_session");
+    let mut rx = provider
+        .prompt(
+            session_id,
+            vec![ContentBlock::Text(TextContent::new(big))],
+        )
+        .await
+        .expect("prompt");
+
+    let mut got_complete = false;
+    while let Some(update) = rx.recv().await {
+        match update {
+            AcpUpdate::Complete(_) => {
+                got_complete = true;
+                break;
+            }
+            AcpUpdate::Error(e) => panic!("near-budget prompt errored (ENAMETOOLONG?): {e}"),
+            _ => {}
+        }
+    }
+    assert!(got_complete, "near-budget prompt must spawn agy and complete");
+    provider.shutdown().await;
+}
