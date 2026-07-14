@@ -427,9 +427,12 @@ pub async fn execute_llm_chat(
         ProviderType::Together => {
             execute_together_chat(api_key, model, request, provider, base_url).await
         }
-        ProviderType::ClaudeCode | ProviderType::GeminiCli | ProviderType::OpenClaw => Err(
-            DaemonError::InternalError("ACP providers only support streaming mode".to_string()),
-        ),
+        ProviderType::ClaudeCode
+        | ProviderType::GeminiCli
+        | ProviderType::OpenClaw
+        | ProviderType::Antigravity => Err(DaemonError::InternalError(
+            "ACP providers only support streaming mode".to_string(),
+        )),
         ProviderType::KimiAgent => {
             execute_kimi_agent_chat(api_key, model, request, provider, base_url).await
         }
@@ -2514,7 +2517,10 @@ async fn execute_llm_stream_inner(
         ProviderType::Together => {
             stream_together(api_key, model, request, tx, provider, base_url).await
         }
-        ProviderType::ClaudeCode | ProviderType::GeminiCli | ProviderType::OpenClaw => {
+        ProviderType::ClaudeCode
+        | ProviderType::GeminiCli
+        | ProviderType::OpenClaw
+        | ProviderType::Antigravity => {
             stream_acp_completion(
                 api_key,
                 model,
