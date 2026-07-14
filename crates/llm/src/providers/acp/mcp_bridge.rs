@@ -195,41 +195,11 @@ impl McpToolBridge {
     }
 
     /// Check if a tool is low-risk (read-only) and can be auto-approved.
+    /// Delegates to the canonical protocol list (single source of truth). The
+    /// MCP-prefix stripping (e.g. "mcp__nevoflux-tools__browser_get_markdown")
+    /// now lives in `is_read_only_tool`.
     fn is_low_risk_tool(tool_name: &str) -> bool {
-        // Strip MCP prefix if present (e.g. "mcp__nevoflux-tools__browser_get_markdown")
-        let name = tool_name.rsplit("__").next().unwrap_or(tool_name);
-        // Also handle the raw title format from ACP (e.g. "{\"tab_id\":3}")
-        // which means the tool name is in the request title, not parsed
-        matches!(
-            name,
-            // Read-only browser tools
-            "browser_get_markdown"
-                | "browser_snapshot"
-                | "browser_get_tabs"
-                | "browser_query_tabs"
-                | "browser_get_elements"
-                | "browser_get_element"
-                | "browser_get_content"
-                | "browser_screenshot"
-                | "browser_read_artifact"
-                | "browser_query_all"
-                | "browser_scroll"
-                // Wait/utility tools (no side effects)
-                | "browser_wait_for"
-                | "browser_wait_for_stable"
-                | "browser_ask_user"
-                // Web fetch (read-only)
-                | "web_search"
-                | "fetch_page"
-                // Memory/knowledge read
-                | "memory_search"
-                | "memory_view"
-                // Agent internal tools
-                | "tool_search"
-                | "skill_load"
-                | "think"
-                | "create_plan"
-        )
+        nevoflux_protocol::is_read_only_tool(tool_name)
     }
 
     /// Request permission for a tool call. Returns the user's decision.

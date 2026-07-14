@@ -1084,41 +1084,11 @@ impl DaemonHostFunctions {
 /// Check if a tool is low-risk (read-only) for API mode permission control.
 /// Same list as ACP mode's `McpToolBridge::is_low_risk_tool`.
 fn is_low_risk_tool_api(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        // Read-only browser tools
-        "browser_get_markdown"
-            | "browser_snapshot"
-            | "browser_get_tabs"
-            | "browser_query_tabs"
-            | "browser_get_elements"
-            | "browser_get_element"
-            | "browser_get_content"
-            | "browser_screenshot"
-            | "browser_read_artifact"
-            | "browser_query_all"
-            | "browser_scroll"
-            // Wait/utility (no side effects)
-            | "browser_wait_for"
-            | "browser_wait_for_stable"
-            | "browser_ask_user"
-            // Web fetch (read-only)
-            | "web_search"
-            | "fetch_page"
-            // Memory/knowledge read
-            | "memory_search"
-            | "memory_view"
-            // Agent internal
-            | "tool_search"
-            | "skill_load"
-            | "think"
-            | "create_plan"
-            // File read (read-only)
-            | "read_file"
-            | "list_files"
-            | "glob"
-            | "grep"
-    )
+    // Single source of truth (protocol). NOTE: the local file-read tools
+    // (read_file/list_files/glob/grep) are intentionally NOT in the canonical
+    // list; they never reach this check on the native path today, so dropping
+    // them here is behavior-neutral.
+    nevoflux_protocol::is_read_only_tool(tool_name)
 }
 
 /// Expand ~ to actual home directory in a file path.
