@@ -9579,10 +9579,10 @@ const PROVIDER_METAS: &[ProviderMeta] = &[
         icon_bytes: include_bytes!("../../../assets/icons/providers/anthropic.webp"),
     },
     ProviderMeta {
-        id: "gemini-cli",
-        display_name: "Gemini CLI",
+        id: "antigravity",
+        display_name: "Antigravity",
         provider_type: "cli",
-        icon_bytes: include_bytes!("../../../assets/icons/providers/gemini.webp"),
+        icon_bytes: include_bytes!("../../../assets/icons/providers/antigravity.webp"),
     },
     ProviderMeta {
         id: "kimi-agent",
@@ -9619,6 +9619,7 @@ fn get_provider_config<'a>(
         "ollama" => Some(&llm.ollama),
         "claude-code" | "claude_code" => Some(&llm.claude_code),
         "gemini-cli" | "gemini_cli" => Some(&llm.gemini_cli),
+        "antigravity" | "antigravity-cli" | "antigravity_cli" => Some(&llm.antigravity),
         "kimi-agent" | "kimi_agent" | "kimi" => Some(&llm.kimi_agent),
         "openclaw" | "open_claw" | "open-claw" => Some(&llm.openclaw),
         _ => None,
@@ -9650,6 +9651,7 @@ fn get_provider_config_mut<'a>(
         "ollama" => Some(&mut llm.ollama),
         "claude-code" | "claude_code" => Some(&mut llm.claude_code),
         "gemini-cli" | "gemini_cli" => Some(&mut llm.gemini_cli),
+        "antigravity" | "antigravity-cli" | "antigravity_cli" => Some(&mut llm.antigravity),
         "kimi-agent" | "kimi_agent" | "kimi" => Some(&mut llm.kimi_agent),
         "openclaw" | "open_claw" | "open-claw" => Some(&mut llm.openclaw),
         _ => None,
@@ -9679,6 +9681,9 @@ async fn handle_config_llm_list(params: &serde_json::Value) -> serde_json::Value
             let is_active = active.as_deref() == Some(meta.id)
                 || (meta.id == "claude-code" && active.as_deref() == Some("claude_code"))
                 || (meta.id == "gemini-cli" && active.as_deref() == Some("gemini_cli"))
+                || (meta.id == "antigravity"
+                    && (active.as_deref() == Some("antigravity-cli")
+                        || active.as_deref() == Some("antigravity_cli")))
                 || (meta.id == "kimi-agent"
                     && (active.as_deref() == Some("kimi_agent")
                         || active.as_deref() == Some("kimi")));
@@ -9925,6 +9930,21 @@ async fn handle_config_llm_set(
             let is_active = config.llm.provider.as_deref() == Some(provider_id);
             // Update the in-memory runtime config so changes take effect immediately
             *shared_config.write().unwrap() = Arc::new(config);
+            // ACP providers bake their config (model via env/args) into the
+            // subprocess at spawn. Drop the cached instance so the next chat
+            // respawns with the just-saved settings — generic on purpose:
+            // fixes the same staleness for gemini-cli/claude-code too.
+            if let Ok(pt) = provider_id.parse::<nevoflux_llm::ProviderType>() {
+                let key = format!("{:?}", pt);
+                let acp = crate::wasm::llm::acp_providers().clone();
+                tokio::spawn(async move {
+                    if acp.lock().await.remove(&key).is_some() {
+                        tracing::info!(
+                            "config.llm.set: dropped cached ACP provider '{key}' so new settings apply"
+                        );
+                    }
+                });
+            }
             info!(
                 "config.llm.set: updated provider {} (active={}, runtime config updated)",
                 provider_id, is_active
