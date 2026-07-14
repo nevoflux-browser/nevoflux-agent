@@ -3759,6 +3759,15 @@ async fn stream_acp_completion(
                 ProviderType::OpenClaw => nevoflux_llm::providers::acp::openclaw::build_config(
                     std::path::PathBuf::from(&work_dir),
                 ),
+                ProviderType::Antigravity => {
+                    // Sandbox work_dir: agy's built-in coding tools run with
+                    // --dangerously-skip-permissions (one-shot -p has no TTY),
+                    // so keep them out of real user directories.
+                    nevoflux_llm::providers::acp::antigravity::build_config(
+                        model,
+                        crate::antigravity_setup::workspace_dir(),
+                    )
+                }
                 _ => {
                     return Err(DaemonError::InternalError(format!(
                         "ACP not supported for {:?}",
@@ -3798,6 +3807,17 @@ async fn stream_acp_completion(
                     let url = format!("http://127.0.0.1:{port}/mcp");
                     tracing::info!("MCP HTTP server started at {}", url);
                     tool_bridge.set_mcp_server_url(url.clone());
+                    // Antigravity: agy discovers our tools via the
+                    // .agents/mcp_config.json inside our sandbox workspace
+                    // (the adapter drops session mcp_servers). agy re-reads it
+                    // on every one-shot spawn, and agy only spawns at prompt
+                    // time — after this point — so the URL is always fresh
+                    // for this daemon lifetime.
+                    if matches!(provider, ProviderType::Antigravity) {
+                        if let Err(e) = crate::antigravity_setup::write_mcp_config(&url) {
+                            tracing::warn!("antigravity: failed to write agy mcp_config.json: {e}");
+                        }
+                    }
                     tool_bridge.set_server_handle(handle);
                     // Write URL to state file so OpenClaw plugin can discover it
                     if let Err(e) = crate::openclaw_setup::write_mcp_url(&url) {
