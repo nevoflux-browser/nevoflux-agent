@@ -35,10 +35,25 @@ pub fn build_config(model: &str, work_dir: PathBuf) -> AcpProviderConfig {
         extra = format!("--model {model} {extra}");
     }
 
+    let mut env = vec![("AGY_EXTRA_ARGS".to_string(), extra)];
+    // Point the adapter at the user's installed `agy`. The adapter does NOT
+    // consult PATH: it looks in its own managed dir and otherwise auto-downloads
+    // agy — and that download URL currently 404s
+    // (github.com/google-antigravity/antigravity-cli/releases/.../agy_cli_windows_x64.zip),
+    // so without this the provider fails at first prompt with "agy not found".
+    // `resolve_program` returns an absolute path when agy is found on the
+    // (npm-extended) PATH, or the bare name on miss — only set AGY_BIN on a hit.
+    let agy = crate::util::resolve_program("agy");
+    if agy.is_absolute() {
+        if let Some(agy) = agy.to_str() {
+            env.push(("AGY_BIN".to_string(), agy.to_string()));
+        }
+    }
+
     AcpProviderConfig {
         command,
         args: vec![],
-        env: vec![("AGY_EXTRA_ARGS".to_string(), extra)],
+        env,
         env_remove: vec![],
         work_dir,
         // Must match the adapter's default mode id so `session/set_mode`
