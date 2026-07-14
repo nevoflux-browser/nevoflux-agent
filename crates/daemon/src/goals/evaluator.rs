@@ -65,6 +65,9 @@ const ACP_PROVIDERS: &[&str] = &[
     "openclaw",
     "open_claw",
     "open-claw",
+    "antigravity",
+    "antigravity-cli",
+    "antigravity_cli",
 ];
 
 /// Tail sizing: the last N messages, then clipped to a byte budget (oldest
@@ -486,7 +489,7 @@ mod tests {
     fn resolve_rejects_all_acp_providers() {
         // Every streaming-only ACP provider (as active) must be rejected with a
         // direct-API hint. kimi-agent is excluded: it resolves as direct-API.
-        for acp in ["claude-code", "gemini-cli", "openclaw"] {
+        for acp in ["claude-code", "gemini-cli", "openclaw", "antigravity"] {
             let cfg = config_active(acp);
             let err = resolve_evaluator(&cfg, None, None).unwrap_err();
             assert!(

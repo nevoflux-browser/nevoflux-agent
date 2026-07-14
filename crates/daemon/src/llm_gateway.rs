@@ -117,6 +117,7 @@ fn read_llm_provider_section(llm: &LlmConfig, provider: &str) -> LlmProviderSnap
         "openrouter" => Some(&llm.openrouter),
         "claude-code" | "claude_code" => Some(&llm.claude_code),
         "gemini-cli" | "gemini_cli" => Some(&llm.gemini_cli),
+        "antigravity" | "antigravity-cli" | "antigravity_cli" => Some(&llm.antigravity),
         "gemini" => Some(&llm.gemini),
         "groq" => Some(&llm.groq),
         "ollama" => Some(&llm.ollama),
@@ -177,7 +178,8 @@ fn provider_canonical_base_url(provider: &str) -> &'static str {
         "cohere" => "https://api.cohere.ai",
         "perplexity" => "https://api.perplexity.ai",
         "together" => "https://api.together.xyz",
-        "gemini" | "gemini-cli" | "gemini_cli" => "https://generativelanguage.googleapis.com",
+        "gemini" | "gemini-cli" | "gemini_cli" | "antigravity" | "antigravity-cli"
+        | "antigravity_cli" => "https://generativelanguage.googleapis.com",
         "ollama" => "http://localhost:11434",
         _ => "",
     }

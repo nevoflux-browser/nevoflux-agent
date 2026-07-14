@@ -9793,6 +9793,9 @@ async fn handle_config_llm_get(params: &serde_json::Value) -> serde_json::Value 
     let is_active = config.llm.active_provider() == Some(provider_id)
         || (provider_id == "claude-code" && config.llm.active_provider() == Some("claude_code"))
         || (provider_id == "gemini-cli" && config.llm.active_provider() == Some("gemini_cli"))
+        || (provider_id == "antigravity"
+            && (config.llm.active_provider() == Some("antigravity-cli")
+                || config.llm.active_provider() == Some("antigravity_cli")))
         || (provider_id == "kimi-agent"
             && (config.llm.active_provider() == Some("kimi_agent")
                 || config.llm.active_provider() == Some("kimi")));
