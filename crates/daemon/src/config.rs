@@ -273,6 +273,7 @@ impl AgentConfig {
         merge_provider(&mut self.llm.openrouter, &other.llm.openrouter);
         merge_provider(&mut self.llm.claude_code, &other.llm.claude_code);
         merge_provider(&mut self.llm.gemini_cli, &other.llm.gemini_cli);
+        merge_provider(&mut self.llm.antigravity, &other.llm.antigravity);
         merge_provider(&mut self.llm.gemini, &other.llm.gemini);
         merge_provider(&mut self.llm.groq, &other.llm.groq);
         merge_provider(&mut self.llm.ollama, &other.llm.ollama);
@@ -394,6 +395,10 @@ pub struct LlmConfig {
     /// Gemini CLI-specific configuration.
     #[serde(default)]
     pub gemini_cli: ProviderConfig,
+
+    /// Antigravity-specific configuration.
+    #[serde(default)]
+    pub antigravity: ProviderConfig,
 
     /// Gemini API-specific configuration.
     #[serde(default)]
@@ -522,6 +527,7 @@ impl LlmConfig {
             &self.ollama,
             &self.claude_code,
             &self.gemini_cli,
+            &self.antigravity,
             &self.kimi_agent,
             &self.openclaw,
         ]
@@ -538,6 +544,9 @@ impl LlmConfig {
             "claude_code",
             "gemini-cli",
             "gemini_cli",
+            "antigravity",
+            "antigravity-cli",
+            "antigravity_cli",
             "kimi-agent",
             "kimi_agent",
             "kimi",
@@ -563,6 +572,11 @@ impl LlmConfig {
             "gemini-cli" | "gemini_cli" => {
                 self.gemini_cli.api_key.as_deref().or(Some("gemini-cli"))
             }
+            "antigravity" | "antigravity-cli" | "antigravity_cli" => self
+                .antigravity
+                .api_key
+                .as_deref()
+                .or(Some("antigravity")),
             "gemini" => self.gemini.api_key.as_deref(),
             "groq" => self.groq.api_key.as_deref(),
             "ollama" => self.ollama.api_key.as_deref().or(Some("ollama-local")),
@@ -593,6 +607,9 @@ impl LlmConfig {
             "openrouter" => self.openrouter.model.as_deref(),
             "claude-code" | "claude_code" => self.claude_code.model.as_deref(),
             "gemini-cli" | "gemini_cli" => self.gemini_cli.model.as_deref(),
+            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
+                self.antigravity.model.as_deref()
+            }
             "gemini" => self.gemini.model.as_deref(),
             "groq" => self.groq.model.as_deref(),
             "ollama" => self.ollama.model.as_deref(),
@@ -617,6 +634,9 @@ impl LlmConfig {
             "openrouter" => self.openrouter.model.as_deref(),
             "claude-code" | "claude_code" => self.claude_code.model.as_deref(),
             "gemini-cli" | "gemini_cli" => self.gemini_cli.model.as_deref(),
+            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
+                self.antigravity.model.as_deref()
+            }
             "gemini" => self.gemini.model.as_deref(),
             "groq" => self.groq.model.as_deref(),
             "ollama" => self.ollama.model.as_deref(),
@@ -641,6 +661,9 @@ impl LlmConfig {
             "openrouter" => self.openrouter.base_url.as_deref(),
             "claude-code" | "claude_code" => self.claude_code.base_url.as_deref(),
             "gemini-cli" | "gemini_cli" => self.gemini_cli.base_url.as_deref(),
+            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
+                self.antigravity.base_url.as_deref()
+            }
             "gemini" => self.gemini.base_url.as_deref(),
             "groq" => self.groq.base_url.as_deref(),
             "ollama" => self.ollama.base_url.as_deref(),
@@ -665,6 +688,9 @@ impl LlmConfig {
             "openrouter" => self.openrouter.base_url.as_deref(),
             "claude-code" | "claude_code" => self.claude_code.base_url.as_deref(),
             "gemini-cli" | "gemini_cli" => self.gemini_cli.base_url.as_deref(),
+            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
+                self.antigravity.base_url.as_deref()
+            }
             "gemini" => self.gemini.base_url.as_deref(),
             "groq" => self.groq.base_url.as_deref(),
             "ollama" => self.ollama.base_url.as_deref(),
@@ -699,6 +725,9 @@ impl LlmConfig {
             "openrouter" => self.openrouter.use_streaming,
             "claude-code" | "claude_code" => self.claude_code.use_streaming,
             "gemini-cli" | "gemini_cli" => self.gemini_cli.use_streaming,
+            "antigravity" | "antigravity-cli" | "antigravity_cli" => {
+                self.antigravity.use_streaming
+            }
             "gemini" => self.gemini.use_streaming,
             "groq" => self.groq.use_streaming,
             "ollama" => self.ollama.use_streaming,
@@ -721,7 +750,7 @@ impl LlmConfig {
     pub fn configured_providers(&self) -> Vec<(String, String)> {
         let mut result = Vec::new();
         let active = self.active_provider();
-        let providers: [(&str, &ProviderConfig); 17] = [
+        let providers: [(&str, &ProviderConfig); 18] = [
             ("anthropic", &self.anthropic),
             ("openai", &self.openai),
             ("openrouter", &self.openrouter),
@@ -729,6 +758,7 @@ impl LlmConfig {
             ("deepseek", &self.deepseek),
             ("claude-code", &self.claude_code),
             ("gemini-cli", &self.gemini_cli),
+            ("antigravity", &self.antigravity),
             ("gemini", &self.gemini),
             ("groq", &self.groq),
             ("ollama", &self.ollama),
@@ -774,6 +804,9 @@ impl LlmConfig {
             Some("deepseek") => self.deepseek.context_window,
             Some("claude-code") | Some("claude_code") => self.claude_code.context_window,
             Some("gemini-cli") | Some("gemini_cli") => self.gemini_cli.context_window,
+            Some("antigravity") | Some("antigravity-cli") | Some("antigravity_cli") => {
+                self.antigravity.context_window
+            }
             Some("gemini") => self.gemini.context_window,
             Some("groq") => self.groq.context_window,
             Some("ollama") => self.ollama.context_window,
@@ -820,6 +853,7 @@ impl Default for LlmConfig {
             openrouter: ProviderConfig::default(),
             claude_code: ProviderConfig::default(),
             gemini_cli: ProviderConfig::default(),
+            antigravity: ProviderConfig::default(),
             gemini: ProviderConfig::default(),
             groq: ProviderConfig::default(),
             ollama: ProviderConfig::default(),
