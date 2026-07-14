@@ -36,8 +36,14 @@ fn antigravity_build_config_invariants() {
 
     let (k, v) = &cfg.env[0];
     assert_eq!(k, "AGY_EXTRA_ARGS");
-    assert!(v.contains("--model gemini-3-pro"));
+    // Model must NOT ride AGY_EXTRA_ARGS (adapter whitespace-splits it, and agy
+    // model ids contain spaces); it goes via config_options instead.
+    assert!(!v.contains("--model"));
     assert!(v.contains("--dangerously-skip-permissions"));
+    assert_eq!(
+        cfg.config_options,
+        vec![("model".to_string(), "gemini-3-pro".to_string())]
+    );
 }
 
 #[tokio::test]

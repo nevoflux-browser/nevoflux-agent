@@ -163,6 +163,95 @@ async fn test_antigravity_acp_basic_prompt() {
     provider.shutdown().await;
 }
 
+/// Live-verifies the model-selection path: when `build_config` is given a real
+/// agy model id (which contains spaces + parens), the provider must send it via
+/// `session/set_config_option` — NOT via the whitespace-split `AGY_EXTRA_ARGS`
+/// (the bug that made agy hang). This test installs a tracing subscriber and
+/// asserts on its own captured output that the adapter ACCEPTED the request
+/// (info "ACP: set config option ...") rather than rejecting it (warn
+/// "... rejected: ...") — proving the guessed method name is correct against the
+/// real antigravity-acp adapter. Run with `-- --nocapture` to eyeball the turn.
+#[tokio::test]
+async fn test_antigravity_acp_model_via_set_config_option() {
+    use std::sync::{Arc, Mutex};
+    use std::io::Write;
+
+    if !antigravity_acp_available() {
+        eprintln!("SKIP: antigravity-acp not installed");
+        return;
+    }
+
+    // Capture tracing output into a shared buffer so we can assert on the exact
+    // accept/reject log line the provider emits for set_config_option.
+    #[derive(Clone)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let shared = SharedBuf(buf.clone());
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || shared.clone())
+            .finish(),
+    );
+
+    // A real agy model id (from `agy models`) — spaces + parens are the whole point.
+    let model = "Gemini 3.5 Flash (High)";
+    let config = nevoflux_llm::providers::acp::antigravity::build_config(model, PathBuf::from("."));
+    assert_eq!(
+        config.config_options,
+        vec![("model".to_string(), model.to_string())],
+        "model must travel via config_options, not AGY_EXTRA_ARGS"
+    );
+
+    let mut provider = AcpProvider::new(config);
+    provider.connect().await.expect("connect");
+    // new_session() internally sends session/set_config_option for the model.
+    let session_id = provider.new_session().await.expect("new_session");
+
+    let mut rx = provider
+        .prompt(
+            session_id,
+            vec![ContentBlock::Text(TextContent::new(
+                "Say exactly: ok".to_string(),
+            ))],
+        )
+        .await
+        .expect("prompt");
+    let mut got_complete = false;
+    while let Some(update) = rx.recv().await {
+        match update {
+            AcpUpdate::Complete(_) => {
+                got_complete = true;
+                break;
+            }
+            AcpUpdate::Error(e) => panic!("model-selection turn errored: {e}"),
+            _ => {}
+        }
+    }
+    provider.shutdown().await;
+    assert!(got_complete, "model-selection turn must complete");
+
+    let logs = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    eprintln!("---- captured provider logs ----\n{logs}\n--------------------------------");
+    assert!(
+        !logs.contains("rejected"),
+        "adapter rejected session/set_config_option (wrong method name?): {logs}"
+    );
+    assert!(
+        logs.contains("set config option model="),
+        "expected the set_config_option accept log; got: {logs}"
+    );
+}
+
 /// Validates the daemon's antigravity prompt-cap budget (30_000 chars) against
 /// the real Windows command-line limit + real agy: a near-budget prompt must
 /// spawn agy WITHOUT `ENAMETOOLONG` (the bug the cap fixes). Regression guard

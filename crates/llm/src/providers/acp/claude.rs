@@ -48,6 +48,7 @@ pub fn build_config(work_dir: PathBuf) -> AcpProviderConfig {
         use_mcp_bridge: true,
         inject_mcp_url: true,
         gate_tool_calls: false,
+        config_options: vec![],
     }
 }
 

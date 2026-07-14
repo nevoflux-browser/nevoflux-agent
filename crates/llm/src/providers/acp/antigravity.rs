@@ -30,10 +30,14 @@ const ANTIGRAVITY_ACP_BINARY: &str = "antigravity-acp";
 pub fn build_config(model: &str, work_dir: PathBuf) -> AcpProviderConfig {
     let command = crate::util::resolve_program(ANTIGRAVITY_ACP_BINARY);
 
-    let mut extra = String::from("--dangerously-skip-permissions");
-    if !model.is_empty() && model != "default" {
-        extra = format!("--model {model} {extra}");
-    }
+    // NOTE: the model must NOT go through AGY_EXTRA_ARGS. The adapter splits
+    // that env var on whitespace, but EVERY agy model id contains spaces (e.g.
+    // "Gemini 3.5 Flash (Medium)"), so `--model Gemini 3.5 Flash` would be
+    // shredded into bogus args and agy hangs. The model is passed instead via
+    // the ACP `session/set_config_option` request (see `config_options`), which
+    // the adapter forwards to agy as a single discrete `--model <id>` argv
+    // element. Only whitespace-free flags belong in AGY_EXTRA_ARGS.
+    let extra = String::from("--dangerously-skip-permissions");
 
     let mut env = vec![("AGY_EXTRA_ARGS".to_string(), extra)];
     // Point the adapter at the user's installed `agy`. The adapter does NOT
@@ -50,6 +54,15 @@ pub fn build_config(model: &str, work_dir: PathBuf) -> AcpProviderConfig {
         }
     }
 
+    // Model → ACP `session/set_config_option` (configId "model"), the only
+    // channel that survives agy's space-containing model ids. Empty/"default"
+    // leaves agy on its own default.
+    let config_options = if !model.is_empty() && model != "default" {
+        vec![("model".to_string(), model.to_string())]
+    } else {
+        vec![]
+    };
+
     AcpProviderConfig {
         command,
         args: vec![],
@@ -63,6 +76,7 @@ pub fn build_config(model: &str, work_dir: PathBuf) -> AcpProviderConfig {
         use_mcp_bridge: true,
         inject_mcp_url: false,
         gate_tool_calls: true,
+        config_options,
     }
 }
 
@@ -71,17 +85,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bypass_always_present_model_only_when_set() {
-        let cfg = build_config("gemini-3-pro", PathBuf::from("."));
-        let (k, v) = &cfg.env[0];
-        assert_eq!(k, "AGY_EXTRA_ARGS");
-        assert!(v.contains("--model gemini-3-pro"));
-        assert!(v.contains("--dangerously-skip-permissions"));
+    fn bypass_in_env_model_via_config_option_never_in_env() {
+        // AGY_EXTRA_ARGS carries ONLY whitespace-free flags (the adapter splits
+        // it on whitespace). The model — whose agy ids contain spaces — must NOT
+        // appear there; it travels via config_options instead.
+        let cfg = build_config("Gemini 3.5 Flash (High)", PathBuf::from("."));
+        assert_eq!(cfg.env[0].0, "AGY_EXTRA_ARGS");
+        assert_eq!(cfg.env[0].1, "--dangerously-skip-permissions");
+        assert!(!cfg.env[0].1.contains("--model"), "model must not ride env");
+        assert_eq!(
+            cfg.config_options,
+            vec![("model".to_string(), "Gemini 3.5 Flash (High)".to_string())]
+        );
 
-        let cfg = build_config("default", PathBuf::from("."));
-        assert_eq!(cfg.env[0].1, "--dangerously-skip-permissions");
-        let cfg = build_config("", PathBuf::from("."));
-        assert_eq!(cfg.env[0].1, "--dangerously-skip-permissions");
+        // Empty / "default" → no config option (agy keeps its own default).
+        assert!(build_config("default", PathBuf::from(".")).config_options.is_empty());
+        assert!(build_config("", PathBuf::from(".")).config_options.is_empty());
     }
 
     #[test]

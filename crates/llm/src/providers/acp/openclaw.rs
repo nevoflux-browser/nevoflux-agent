@@ -28,5 +28,6 @@ pub fn build_config(work_dir: PathBuf) -> AcpProviderConfig {
         use_mcp_bridge: true,             // Start HTTP MCP server (same as Claude Code/Gemini CLI)
         inject_mcp_url: false, // OpenClaw rejects per-session MCP; uses plugin bridge instead
         gate_tool_calls: false,
+        config_options: vec![],
     }
 }
