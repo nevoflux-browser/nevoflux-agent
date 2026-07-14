@@ -3446,6 +3446,7 @@ dependencies = [
  "fastembed",
  "futures",
  "mockall",
+ "nevoflux-protocol",
  "reqwest",
  "rig-core",
  "sacp",

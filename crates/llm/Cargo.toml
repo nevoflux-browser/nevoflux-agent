@@ -26,6 +26,7 @@ ort-download-binaries = ["fastembed?/ort-download-binaries"]
 ort-load-dynamic = ["fastembed?/ort-load-dynamic"]
 
 [dependencies]
+nevoflux-protocol = { path = "../protocol" }
 rig-core = { workspace = true }
 tokio = { workspace = true, features = ["io-util"] }
 tokio-stream = { workspace = true, features = ["io-util"] }
