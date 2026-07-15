@@ -3936,17 +3936,17 @@ async fn stream_acp_completion(
 
         let req_hashes = antigravity_session::message_hashes(&request.messages);
         let req_sys_hash = antigravity_session::system_hash(&request.system);
-        // TEMP DIAGNOSTIC: per-message fingerprint (role:len:hash8) so a smoke can
-        // see turn-over-turn exactly which historical message (if any) mutated and
-        // defeats the strict-prefix match. Cheap; antigravity-only.
-        {
+        // Per-message fingerprint (role:len:hash8) — DEBUG-level so it's available
+        // when diagnosing a drift (turn-over-turn, which historical message
+        // mutated) without spamming normal INFO logs. antigravity-only.
+        if tracing::enabled!(tracing::Level::DEBUG) {
             let fp: Vec<String> = request
                 .messages
                 .iter()
                 .zip(req_hashes.iter())
                 .map(|(m, h)| format!("{}:{}:{:08x}", m.role, m.content.chars().count(), h))
                 .collect();
-            tracing::info!("antigravity: msg fingerprints [{}]", fp.join(", "));
+            tracing::debug!("antigravity: msg fingerprints [{}]", fp.join(", "));
         }
         let (decision, rebuild_reason) = {
             let cache = antigravity_session::session_cache().lock().await;
