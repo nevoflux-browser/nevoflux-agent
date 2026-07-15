@@ -21,6 +21,22 @@ fn antigravity_acp_available() -> bool {
     which::which("antigravity-acp").is_ok()
 }
 
+/// Drains an ACP update stream, accumulating `Text` deltas into a transcript.
+/// Returns the transcript on `Complete`; panics on `Error` (so failures show up
+/// as a clear test failure instead of a silently empty transcript).
+async fn drain_until_complete(rx: &mut tokio::sync::mpsc::Receiver<AcpUpdate>) -> String {
+    let mut transcript = String::new();
+    while let Some(update) = rx.recv().await {
+        match update {
+            AcpUpdate::Text(t) => transcript.push_str(&t),
+            AcpUpdate::Complete(_) => return transcript,
+            AcpUpdate::Error(e) => panic!("ACP error: {}", e),
+            _ => {}
+        }
+    }
+    transcript
+}
+
 #[tokio::test]
 async fn test_claude_acp_basic_prompt() {
     if !claude_acp_available() {
@@ -294,5 +310,53 @@ async fn test_antigravity_acp_near_budget_prompt_no_enametoolong() {
         }
     }
     assert!(got_complete, "near-budget prompt must spawn agy and complete");
+    provider.shutdown().await;
+}
+
+/// Proves the antigravity-acp adapter resumes an agy conversation when the SAME
+/// ACP session is reused across turns (it passes --conversation): turn 1 states
+/// a secret, turn 2 (same session_id) recalls it. If continuation were broken,
+/// agy would have no memory of the secret, since turn 2 only sends the new
+/// question — not the prior turn's history.
+#[tokio::test]
+async fn test_antigravity_session_continuity() {
+    if !antigravity_acp_available() {
+        eprintln!("SKIP: antigravity-acp not installed");
+        return;
+    }
+
+    let config = nevoflux_llm::providers::acp::antigravity::build_config("", PathBuf::from("."));
+    let mut provider = AcpProvider::new(config);
+    provider.connect().await.expect("connect");
+    let session = provider.new_session().await.expect("new_session");
+
+    // Turn 1: plant a secret.
+    let mut rx = provider
+        .prompt(
+            session.clone(),
+            vec![ContentBlock::Text(TextContent::new(
+                "Remember this secret codeword: BANANA-42. Reply with just: ok".to_string(),
+            ))],
+        )
+        .await
+        .expect("prompt1");
+    drain_until_complete(&mut rx).await;
+
+    // Turn 2: SAME session, ask for the secret. Only the new question is sent.
+    let mut rx2 = provider
+        .prompt(
+            session,
+            vec![ContentBlock::Text(TextContent::new(
+                "What was the secret codeword? Reply with just the codeword.".to_string(),
+            ))],
+        )
+        .await
+        .expect("prompt2");
+    let transcript = drain_until_complete(&mut rx2).await;
+    eprintln!("---- turn 2 transcript ----\n{transcript}\n----------------------------");
+    assert!(
+        transcript.to_uppercase().contains("BANANA-42"),
+        "agy must recall the secret via --conversation continuation; got: {transcript}"
+    );
     provider.shutdown().await;
 }
