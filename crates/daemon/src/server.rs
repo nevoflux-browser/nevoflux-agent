@@ -9945,6 +9945,9 @@ async fn handle_config_llm_set(
                         tracing::info!(
                             "config.llm.set: dropped cached ACP provider '{key}' so new settings apply"
                         );
+                        if key == "Antigravity" {
+                            crate::wasm::antigravity_session::clear().await;
+                        }
                     }
                 });
             }

@@ -3782,6 +3782,10 @@ async fn stream_acp_completion(
                 .await
                 .map_err(|e| DaemonError::InternalError(format!("Failed to connect ACP: {}", e)))?;
             providers.insert(provider_key.clone(), acp);
+            if matches!(provider, ProviderType::Antigravity) {
+                // A fresh adapter process means the old session_id is dead — invalidate.
+                crate::wasm::antigravity_session::clear().await;
+            }
         }
     }
 
