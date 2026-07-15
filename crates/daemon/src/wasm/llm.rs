@@ -3924,6 +3924,16 @@ async fn stream_acp_completion(
 
     // ---- Antigravity stateful fast-path (design §4.2). Other providers skip. ----
     if matches!(provider, ProviderType::Antigravity) {
+        // Externalize a large (skill-laden) system prompt into a workspace file
+        // BEFORE hashing: keeps the inline `agy -p` prompt under the CLI budget so
+        // turn 1 isn't truncated → it can commit → turn 2 can actually go
+        // incremental. Also makes `system_hash` reflect the stable pointer, so an
+        // unchanged system prompt doesn't spuriously re-send. antigravity-only.
+        antigravity_externalize_system(
+            &mut request,
+            &crate::antigravity_setup::workspace_dir(),
+        );
+
         let req_hashes = antigravity_session::message_hashes(&request.messages);
         let req_sys_hash = antigravity_session::system_hash(&request.system);
         let decision = {
@@ -4756,6 +4766,60 @@ fn skill_file_fallback(
     true
 }
 
+/// The workspace file agy reads its externalized system prompt from.
+const ANTIGRAVITY_SYSTEM_FILE: &str = "system-context.md";
+
+/// Externalize the antigravity system prompt to a file once it exceeds this many
+/// chars (half the CLI budget), leaving the rest of the budget for the actual
+/// message content. Small system prompts stay inline (no behavior change).
+const ANTIGRAVITY_SYSTEM_FILE_THRESHOLD: usize = ANTIGRAVITY_PROMPT_CHAR_BUDGET / 2;
+
+/// antigravity-only budget guard. A skill-laden system prompt (dozens of skills)
+/// can *alone* exceed [`ANTIGRAVITY_PROMPT_CHAR_BUDGET`], so inlining it in
+/// `agy -p` truncates every turn and — via the cache-honesty gate — keeps the
+/// session from ever committing, so incremental continuation never engages.
+///
+/// When the system prompt is large, write it to a workspace file agy can read
+/// (its cwd IS the workspace) and replace `request.system` with a short pointer
+/// that embeds a content-version hash: an unchanged system prompt yields the
+/// same pointer (stable `system_hash` → no spurious `context_update`), while a
+/// changed one changes the pointer → `system_changed` → a re-read is emitted.
+///
+/// MUST run before the session hashes are computed so `system_hash` reflects the
+/// (stable, tiny) pointer rather than the volatile full text. antigravity-only:
+/// the sole caller is gated on `ProviderType::Antigravity`. Returns whether it
+/// rewrote the system prompt.
+fn antigravity_externalize_system(
+    request: &mut LlmChatRequest,
+    workspace: &std::path::Path,
+) -> bool {
+    use std::hash::{Hash, Hasher};
+    let Some(sys) = request.system.as_ref() else {
+        return false;
+    };
+    if sys.chars().count() <= ANTIGRAVITY_SYSTEM_FILE_THRESHOLD {
+        return false;
+    }
+    let version = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        sys.hash(&mut h);
+        h.finish()
+    };
+    if std::fs::create_dir_all(workspace).is_err() {
+        return false;
+    }
+    let file = workspace.join(ANTIGRAVITY_SYSTEM_FILE);
+    if std::fs::write(&file, sys).is_err() {
+        return false;
+    }
+    request.system = Some(format!(
+        "Your full system instructions live in the file `{ANTIGRAVITY_SYSTEM_FILE}` in your \
+         workspace (version {version:x}). Read that file NOW and follow it EXACTLY as your \
+         system prompt for this and every following turn in this conversation."
+    ));
+    true
+}
+
 fn sanitize_skill_filename(name: &str) -> String {
     name.chars()
         .map(|c| {
@@ -4930,6 +4994,79 @@ mod acp_skill_router_tests {
         assert_eq!(last.role, "user");
         assert!(last.content.contains("Read the file skills/big-skill.md"));
         assert!(last.content.contains("do the thing"));
+    }
+
+    /// A large (skill-laden) system prompt must be externalized to a workspace
+    /// file so the inline `agy -p` prompt stays under budget — the fix that lets
+    /// turn 1 commit and turn 2 go incremental. Also guards the two properties
+    /// the session cache relies on: the pointer is small (system_hash tiny), and
+    /// it is STABLE for identical system text (no spurious context_update) yet
+    /// CHANGES when the system text changes (a real re-read fires).
+    #[test]
+    fn antigravity_externalize_system_shrinks_and_versions() {
+        use super::{
+            antigravity_externalize_system, ANTIGRAVITY_PROMPT_CHAR_BUDGET, ANTIGRAVITY_SYSTEM_FILE,
+            ANTIGRAVITY_SYSTEM_FILE_THRESHOLD,
+        };
+        use crate::wasm::llm::{LlmChatRequest, LlmMessage};
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+
+        // A system prompt well over the threshold (mimics dozens of injected skills).
+        let big_sys = "SKILL INSTRUCTIONS ".repeat(3_000); // ~57k chars
+        assert!(big_sys.chars().count() > ANTIGRAVITY_SYSTEM_FILE_THRESHOLD);
+        let mut req = LlmChatRequest {
+            messages: vec![LlmMessage::user("remember BANANA-42")],
+            system: Some(big_sys.clone()),
+            ..Default::default()
+        };
+
+        let rewrote = antigravity_externalize_system(&mut req, workspace.path());
+        assert!(rewrote, "large system prompt must be externalized");
+
+        // The file holds the FULL original system text.
+        let file = workspace.path().join(ANTIGRAVITY_SYSTEM_FILE);
+        assert!(file.exists());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), big_sys);
+
+        // The inline system is now a short pointer well under budget.
+        let ptr = req.system.clone().expect("pointer");
+        assert!(ptr.contains(ANTIGRAVITY_SYSTEM_FILE));
+        assert!(
+            ptr.chars().count() < ANTIGRAVITY_PROMPT_CHAR_BUDGET / 10,
+            "pointer must be tiny; got {} chars",
+            ptr.chars().count()
+        );
+
+        // Stable: same system text → identical pointer (no spurious re-send).
+        let mut req_same = LlmChatRequest {
+            messages: vec![LlmMessage::user("x")],
+            system: Some(big_sys.clone()),
+            ..Default::default()
+        };
+        assert!(antigravity_externalize_system(&mut req_same, workspace.path()));
+        assert_eq!(req_same.system, req.system, "identical system → identical pointer");
+
+        // Versioned: different system text → different pointer (triggers re-read).
+        let mut req_changed = LlmChatRequest {
+            messages: vec![LlmMessage::user("x")],
+            system: Some(format!("{big_sys} CHANGED")),
+            ..Default::default()
+        };
+        assert!(antigravity_externalize_system(&mut req_changed, workspace.path()));
+        assert_ne!(
+            req_changed.system, req.system,
+            "changed system → changed pointer (context_update must fire)"
+        );
+
+        // Below threshold: left inline, no file rewrite (non-antigravity-sized prompts unaffected).
+        let mut req_small = LlmChatRequest {
+            messages: vec![LlmMessage::user("hi")],
+            system: Some("short system".to_string()),
+            ..Default::default()
+        };
+        assert!(!antigravity_externalize_system(&mut req_small, workspace.path()));
+        assert_eq!(req_small.system.as_deref(), Some("short system"));
     }
 
     #[test]
