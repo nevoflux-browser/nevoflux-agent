@@ -3954,7 +3954,7 @@ async fn stream_acp_completion(
             DaemonError::InternalError(format!("Failed to create ACP session: {}", e))
         })?;
 
-        let mut response_rx = acp
+        let response_rx = acp
             .prompt(session_id, content)
             .await
             .map_err(|e| DaemonError::InternalError(format!("Failed to send ACP prompt: {}", e)))?;
@@ -3962,61 +3962,146 @@ async fn stream_acp_completion(
         // Drop the lock before doing I/O on the receiver.
         drop(providers);
 
-        // Accumulate all text to extract <tool_call> XML at the end.
-        let mut accumulated_text = String::new();
-        let mut had_context_error = false;
+        let outcome = drive_acp_prompt(
+            response_rx,
+            use_mcp_bridge,
+            level,
+            &tx,
+            host_services.as_ref(),
+        )
+        .await;
 
-        while let Some(update) = response_rx.recv().await {
-            match update {
-                AcpUpdate::Text(text) => {
-                    accumulated_text.push_str(&text);
-                    // Stream text chunks immediately for real-time display.
-                    // Tool call extraction happens at Complete.
-                    let _ = tx
-                        .send(LlmStreamChunk {
-                            usage: None,
-                            text: Some(text),
-                            tool_calls: vec![],
-                            done: false,
-                            reasoning: None,
-                            images: vec![],
-                        })
-                        .await;
+        match outcome? {
+            AcpAttempt::Completed => return Ok(()),
+            AcpAttempt::ContextLengthRetry => continue,
+        }
+    }
+
+    Ok(())
+}
+
+/// Outcome of a single ACP prompt attempt.
+enum AcpAttempt {
+    /// The agent finished the turn (Complete, or the stream closed cleanly).
+    Completed,
+    /// The agent reported a context-length error and a lower compression level
+    /// should be retried (only returned when `level < 2`).
+    ContextLengthRetry,
+}
+
+/// Send one prompt and consume its streamed updates, forwarding text/thought/
+/// tool-result chunks to `tx` exactly as the inline loop did. Returns
+/// `Completed` on `Complete`/clean close, `ContextLengthRetry` on a
+/// context-length error when `level < 2`, and `Err` on any other error (or a
+/// context-length error at `level == 2`).
+async fn drive_acp_prompt(
+    mut response_rx: mpsc::Receiver<AcpUpdate>,
+    use_mcp_bridge: bool,
+    level: u8,
+    tx: &mpsc::Sender<LlmStreamChunk>,
+    host_services: Option<&crate::wasm::services::HostServices>,
+) -> Result<AcpAttempt> {
+    // Accumulate all text to extract <tool_call> XML at the end.
+    let mut accumulated_text = String::new();
+
+    while let Some(update) = response_rx.recv().await {
+        match update {
+            AcpUpdate::Text(text) => {
+                accumulated_text.push_str(&text);
+                // Stream text chunks immediately for real-time display.
+                // Tool call extraction happens at Complete.
+                let _ = tx
+                    .send(LlmStreamChunk {
+                        usage: None,
+                        text: Some(text),
+                        tool_calls: vec![],
+                        done: false,
+                        reasoning: None,
+                        images: vec![],
+                    })
+                    .await;
+            }
+            AcpUpdate::Thought(thought) => {
+                let _ = tx
+                    .send(LlmStreamChunk {
+                        usage: None,
+                        text: None,
+                        tool_calls: vec![],
+                        done: false,
+                        reasoning: Some(thought),
+                        images: vec![],
+                    })
+                    .await;
+            }
+            AcpUpdate::ToolResult { tool_name, content } => {
+                // Native ACP-agent tool (Bash/Read/Edit/etc, not a
+                // NevoFlux MCP tool — those are already recorded by
+                // `execute_mcp_tool`). Record it the same way so
+                // `/loop` verify and `/goal` checks can find it via
+                // `MessageRepository::list_recent_tool_results`,
+                // regardless of which tool the ACP agent used.
+                if let Some(services) = host_services {
+                    crate::wasm::mcp_tool_executor::record_acp_tool_result(
+                        services,
+                        &tool_name,
+                        &content,
+                    );
                 }
-                AcpUpdate::Thought(thought) => {
+            }
+            AcpUpdate::Complete(_) => {
+                if use_mcp_bridge {
+                    // MCP mode: no tool call extraction — tools called natively via MCP.
+                    // Send done:true so the forwarder completes and agent returns.
+                    // Pending artifacts (from create_artifact) are drained and sent
+                    // by server.rs after the agent returns — sidebar handles artifact
+                    // messages independently of the streaming done signal.
                     let _ = tx
                         .send(LlmStreamChunk {
                             usage: None,
                             text: None,
                             tool_calls: vec![],
-                            done: false,
-                            reasoning: Some(thought),
+                            done: true,
+                            reasoning: None,
                             images: vec![],
                         })
                         .await;
-                }
-                AcpUpdate::ToolResult { tool_name, content } => {
-                    // Native ACP-agent tool (Bash/Read/Edit/etc, not a
-                    // NevoFlux MCP tool — those are already recorded by
-                    // `execute_mcp_tool`). Record it the same way so
-                    // `/loop` verify and `/goal` checks can find it via
-                    // `MessageRepository::list_recent_tool_results`,
-                    // regardless of which tool the ACP agent used.
-                    if let Some(services) = host_services.as_ref() {
-                        crate::wasm::mcp_tool_executor::record_acp_tool_result(
-                            services,
-                            &tool_name,
-                            &content,
+                } else {
+                    // Direct mode: extract tool calls from the accumulated text.
+                    let (cleaned_text, extracted) =
+                        extract_tool_calls_from_text(&accumulated_text);
+
+                    let tool_calls: Vec<LlmToolCall> = extracted
+                        .into_iter()
+                        .map(|tc| LlmToolCall {
+                            id: tc.id.clone(),
+                            call_id: Some(tc.id),
+                            name: tc.name,
+                            arguments: tc.arguments,
+                            signature: None,
+                        })
+                        .collect();
+
+                    if !tool_calls.is_empty() {
+                        tracing::info!(
+                            "ACP: extracted {} tool calls from text",
+                            tool_calls.len()
                         );
-                    }
-                }
-                AcpUpdate::Complete(_) => {
-                    if use_mcp_bridge {
-                        // MCP mode: no tool call extraction — tools called natively via MCP.
-                        // Send done:true so the forwarder completes and agent returns.
-                        // Pending artifacts (from create_artifact) are drained and sent
-                        // by server.rs after the agent returns — sidebar handles artifact
-                        // messages independently of the streaming done signal.
+                        // Send cleaned text (without <tool_call> XML) + tool calls
+                        let _ = tx
+                            .send(LlmStreamChunk {
+                                usage: None,
+                                text: if cleaned_text.is_empty() {
+                                    None
+                                } else {
+                                    Some(cleaned_text)
+                                },
+                                tool_calls,
+                                done: true,
+                                reasoning: None,
+                                images: vec![],
+                            })
+                            .await;
+                    } else {
                         let _ = tx
                             .send(LlmStreamChunk {
                                 usage: None,
@@ -4027,81 +4112,28 @@ async fn stream_acp_completion(
                                 images: vec![],
                             })
                             .await;
-                    } else {
-                        // Direct mode: extract tool calls from the accumulated text.
-                        let (cleaned_text, extracted) =
-                            extract_tool_calls_from_text(&accumulated_text);
-
-                        let tool_calls: Vec<LlmToolCall> = extracted
-                            .into_iter()
-                            .map(|tc| LlmToolCall {
-                                id: tc.id.clone(),
-                                call_id: Some(tc.id),
-                                name: tc.name,
-                                arguments: tc.arguments,
-                                signature: None,
-                            })
-                            .collect();
-
-                        if !tool_calls.is_empty() {
-                            tracing::info!(
-                                "ACP: extracted {} tool calls from text",
-                                tool_calls.len()
-                            );
-                            // Send cleaned text (without <tool_call> XML) + tool calls
-                            let _ = tx
-                                .send(LlmStreamChunk {
-                                    usage: None,
-                                    text: if cleaned_text.is_empty() {
-                                        None
-                                    } else {
-                                        Some(cleaned_text)
-                                    },
-                                    tool_calls,
-                                    done: true,
-                                    reasoning: None,
-                                    images: vec![],
-                                })
-                                .await;
-                        } else {
-                            let _ = tx
-                                .send(LlmStreamChunk {
-                                    usage: None,
-                                    text: None,
-                                    tool_calls: vec![],
-                                    done: true,
-                                    reasoning: None,
-                                    images: vec![],
-                                })
-                                .await;
-                        }
                     }
-                    return Ok(());
                 }
-                AcpUpdate::Error(e) => {
-                    if e.to_lowercase().contains("context")
-                        && e.to_lowercase().contains("length")
-                        && level < 2
-                    {
-                        tracing::warn!(
-                            "Context length exceeded at level {}, retrying with level {}",
-                            level,
-                            level + 1
-                        );
-                        had_context_error = true;
-                        break;
-                    }
-                    return Err(DaemonError::InternalError(format!("ACP error: {}", e)));
-                }
+                return Ok(AcpAttempt::Completed);
             }
-        }
-
-        if !had_context_error {
-            return Ok(());
+            AcpUpdate::Error(e) => {
+                if e.to_lowercase().contains("context")
+                    && e.to_lowercase().contains("length")
+                    && level < 2
+                {
+                    tracing::warn!(
+                        "Context length exceeded at level {}, retrying with level {}",
+                        level,
+                        level + 1
+                    );
+                    return Ok(AcpAttempt::ContextLengthRetry);
+                }
+                return Err(DaemonError::InternalError(format!("ACP error: {}", e)));
+            }
         }
     }
 
-    Ok(())
+    Ok(AcpAttempt::Completed)
 }
 
 /// Build the system prompt with tool definitions appended.
