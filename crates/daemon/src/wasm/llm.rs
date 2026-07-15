@@ -3930,6 +3930,31 @@ async fn stream_acp_completion(
             let cache = antigravity_session::session_cache().lock().await;
             antigravity_session::decide(&cache, &req_hashes, req_sys_hash)
         };
+        // One line per turn so a smoke can SEE which path ran — increment and
+        // rebuild both preserve context, so behavior alone can't distinguish
+        // them. (antigravity-only; other providers never reach this branch.)
+        match &decision {
+            antigravity_session::BindDecision::Incremental {
+                prefix_len,
+                system_changed,
+                ..
+            } => {
+                tracing::info!(
+                    "antigravity: incremental session HIT — reusing agy conversation \
+                     (prefix_len={}, new_msgs={}, system_changed={})",
+                    prefix_len,
+                    request.messages.len().saturating_sub(*prefix_len),
+                    system_changed
+                );
+            }
+            antigravity_session::BindDecision::Rebuild => {
+                tracing::info!(
+                    "antigravity: session REBUILD — new agy conversation \
+                     (cache miss / history drift, {} msgs)",
+                    request.messages.len()
+                );
+            }
+        }
         if let antigravity_session::BindDecision::Incremental {
             session_id,
             prefix_len,
