@@ -3936,9 +3936,30 @@ async fn stream_acp_completion(
 
         let req_hashes = antigravity_session::message_hashes(&request.messages);
         let req_sys_hash = antigravity_session::system_hash(&request.system);
-        let decision = {
+        // TEMP DIAGNOSTIC: per-message fingerprint (role:len:hash8) so a smoke can
+        // see turn-over-turn exactly which historical message (if any) mutated and
+        // defeats the strict-prefix match. Cheap; antigravity-only.
+        {
+            let fp: Vec<String> = request
+                .messages
+                .iter()
+                .zip(req_hashes.iter())
+                .map(|(m, h)| format!("{}:{}:{:08x}", m.role, m.content.chars().count(), h))
+                .collect();
+            tracing::info!("antigravity: msg fingerprints [{}]", fp.join(", "));
+        }
+        let (decision, rebuild_reason) = {
             let cache = antigravity_session::session_cache().lock().await;
-            antigravity_session::decide(&cache, &req_hashes, req_sys_hash)
+            let decision = antigravity_session::decide(&cache, &req_hashes, req_sys_hash);
+            // Compute the diagnostic while the cache is still borrowed, so a smoke
+            // can tell "prior turn never committed" apart from "history drift".
+            let reason = match &decision {
+                antigravity_session::BindDecision::Rebuild => {
+                    Some(antigravity_session::rebuild_reason(&cache, &req_hashes))
+                }
+                _ => None,
+            };
+            (decision, reason)
         };
         // One line per turn so a smoke can SEE which path ran — increment and
         // rebuild both preserve context, so behavior alone can't distinguish
@@ -3959,9 +3980,9 @@ async fn stream_acp_completion(
             }
             antigravity_session::BindDecision::Rebuild => {
                 tracing::info!(
-                    "antigravity: session REBUILD — new agy conversation \
-                     (cache miss / history drift, {} msgs)",
-                    request.messages.len()
+                    "antigravity: session REBUILD — new agy conversation ({} msgs): {}",
+                    request.messages.len(),
+                    rebuild_reason.as_deref().unwrap_or("unknown"),
                 );
             }
         }
@@ -4031,7 +4052,15 @@ async fn stream_acp_completion(
                     .await
                 {
                     Ok(AcpAttempt::Completed) => {
-                        antigravity_session::commit(session_id, req_hashes, req_sys_hash).await;
+                        // Commit only settled history (all-but-last): the current
+                        // enriched message would hash differently once persisted raw.
+                        let commit_hashes =
+                            antigravity_session::stable_commit_hashes(&request.messages);
+                        tracing::info!(
+                            "antigravity: commit (incremental) — session now holds {} settled msgs",
+                            commit_hashes.len()
+                        );
+                        antigravity_session::commit(session_id, commit_hashes, req_sys_hash).await;
                         return Ok(());
                     }
                     Ok(AcpAttempt::ContextLengthRetry) => {
@@ -4155,16 +4184,30 @@ async fn stream_acp_completion(
                 // either dropped content, agy holds less than request.messages,
                 // so leave the cache empty and let the next turn rebuild honestly
                 // rather than send a delta assuming context agy never received.
-                if matches!(provider, ProviderType::Antigravity)
-                    && level == 0
-                    && !antigravity_capped
-                {
-                    antigravity_session::commit(
-                        session_id_for_commit.clone(),
-                        antigravity_session::message_hashes(&request.messages),
-                        antigravity_session::system_hash(&request.system),
-                    )
-                    .await;
+                if matches!(provider, ProviderType::Antigravity) {
+                    if level == 0 && !antigravity_capped {
+                        // Commit only settled history (all-but-last): the current
+                        // enriched message would hash differently once persisted raw.
+                        let commit_hashes =
+                            antigravity_session::stable_commit_hashes(&request.messages);
+                        tracing::info!(
+                            "antigravity: commit (rebuild) — session now holds {} settled msgs",
+                            commit_hashes.len()
+                        );
+                        antigravity_session::commit(
+                            session_id_for_commit.clone(),
+                            commit_hashes,
+                            antigravity_session::system_hash(&request.system),
+                        )
+                        .await;
+                    } else {
+                        tracing::warn!(
+                            "antigravity: NOT committing (level={}, capped={}) — next turn will \
+                             rebuild; incremental cannot engage while this holds",
+                            level,
+                            antigravity_capped
+                        );
+                    }
                 }
                 return Ok(());
             }

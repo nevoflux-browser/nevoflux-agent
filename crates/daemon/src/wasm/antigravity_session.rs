@@ -61,6 +61,24 @@ fn hash_str(s: &str) -> u64 {
     h.finish()
 }
 
+/// Hashes for the COMMITTED prefix: every message EXCEPT the last one.
+///
+/// The last message is the current turn's user input, which NevoFlux enriches
+/// with transient per-turn context (current page/tab/selection) at send time but
+/// PERSISTS RAW. So the identical logical message hashes one way as "current"
+/// (enriched, e.g. 361 chars) and another as "historical" (raw, e.g. 22 chars) —
+/// which broke strict-prefix matching on the next turn and forced a perpetual
+/// REBUILD (confirmed via smoke: drift always at the just-committed message).
+///
+/// Committing only settled history (all-but-last) keeps the prefix stable across
+/// turns. The cost is a small bounded redundancy: the next turn's delta re-sends
+/// the prior user message in raw form (assistant deltas are dropped, so it stays
+/// tiny). antigravity-only.
+pub fn stable_commit_hashes(messages: &[LlmMessage]) -> Vec<u64> {
+    let end = messages.len().saturating_sub(1);
+    message_hashes(&messages[..end])
+}
+
 /// Order-sensitive per-message hash list (role + content).
 pub fn message_hashes(messages: &[LlmMessage]) -> Vec<u64> {
     messages
@@ -92,6 +110,37 @@ pub enum BindDecision {
     },
     /// No usable cache — caller must `new_session()` and send full content.
     Rebuild,
+}
+
+/// Human-readable explanation of why `decide` returned `Rebuild`, for smoke
+/// diagnostics. Distinguishes an empty cache (turn 1 / post-clear / prior turn
+/// never committed) from history drift (a prefix message's hash changed — e.g.
+/// the per-turn context builder mutated a historical message), and for drift
+/// reports the first divergent index and the two lengths.
+pub fn rebuild_reason(cached: &Option<BoundSession>, req_hashes: &[u64]) -> String {
+    match cached {
+        None => "no cached session (turn 1, post-clear, or prior turn did not commit)".to_string(),
+        Some(b) => {
+            let cached_len = b.message_hashes.len();
+            let cur_len = req_hashes.len();
+            let diverge = b
+                .message_hashes
+                .iter()
+                .zip(req_hashes.iter())
+                .position(|(a, c)| a != c);
+            match diverge {
+                Some(i) => format!(
+                    "history drift: cached {cached_len} msgs, current {cur_len}, first differing hash at index {i} (a historical message's content changed)"
+                ),
+                None if cur_len <= cached_len => format!(
+                    "no new message: cached {cached_len} msgs, current {cur_len} (not a strict extension)"
+                ),
+                None => format!(
+                    "unexpected: prefix matches (cached {cached_len}, current {cur_len}) yet not Incremental"
+                ),
+            }
+        }
+    }
 }
 
 pub fn decide(
@@ -203,6 +252,34 @@ mod tests {
             }
             BindDecision::Rebuild => panic!("expected incremental hit"),
         }
+    }
+
+    #[test]
+    fn stable_commit_excludes_current_enriched_message() {
+        // Turn 1: the LAST message is the current user input, enriched at send
+        // time (e.g. 361 chars). Committing all-but-last stores only the settled
+        // system message — NOT the enriched user msg.
+        let t1 = vec![msg("system", "SYS"), msg("user", "ENRICHED-with-page-context-361")];
+        let committed = stable_commit_hashes(&t1);
+        assert_eq!(committed, message_hashes(&t1[..1]), "only settled history committed");
+
+        // Turn 2: that first user message now appears RAW ("记住暗号"), followed by
+        // assistant replies + a new enriched current message. The committed prefix
+        // ([system]) MUST still be a strict prefix — this is the drift fix.
+        let t2 = vec![
+            msg("system", "SYS"),
+            msg("user", "raw-记住暗号"),
+            msg("assistant", "ok"),
+            msg("user", "NEW-enriched-349"),
+        ];
+        assert!(
+            is_strict_prefix(&committed, &message_hashes(&t2)),
+            "committed stable prefix must survive the current→historical enrichment change"
+        );
+
+        // Safety: empty / single-message inputs never panic and commit nothing.
+        assert!(stable_commit_hashes(&[]).is_empty());
+        assert!(stable_commit_hashes(&[msg("user", "only")]).is_empty());
     }
 
     #[test]
