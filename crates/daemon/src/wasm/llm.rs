@@ -3963,41 +3963,56 @@ async fn stream_acp_completion(
                     req_sys_hash = antigravity_session::system_hash(&request.system);
                 }
             }
-            // The cap is always the final safety net, fallback or not.
-            let content = cap_acp_content_for_spawn(content, ANTIGRAVITY_PROMPT_CHAR_BUDGET);
+            // If the incremental delta ITSELF exceeds the CLI budget (a single
+            // huge message, or a large system context_update), the cap would
+            // drop content agy never re-sees — and committing afterward would
+            // falsely record it as fully delivered. Don't send a truncated
+            // delta: clear the binding and rebuild the whole conversation via
+            // the full loop (which re-windows history + gates its own commit on
+            // "not capped"). Rare — normal deltas are just the new message.
+            if content_char_count(&content) > ANTIGRAVITY_PROMPT_CHAR_BUDGET {
+                tracing::warn!(
+                    "antigravity: incremental delta exceeds CLI budget; rebuilding session"
+                );
+                antigravity_session::clear().await;
+                // fall through to the full loop below (do NOT prompt the delta)
+            } else {
+                // Cap is a no-op here (delta fits) — kept as a uniform safety net.
+                let content = cap_acp_content_for_spawn(content, ANTIGRAVITY_PROMPT_CHAR_BUDGET);
 
-            let providers = acp_providers().lock().await;
-            let acp = providers.get(&provider_key).ok_or_else(|| {
-                DaemonError::InternalError("ACP provider disappeared".to_string())
-            })?;
-            let response_rx = acp
-                .prompt(session_id.clone(), content)
-                .await
-                .map_err(|e| {
-                    DaemonError::InternalError(format!("Failed to send ACP prompt: {}", e))
+                let providers = acp_providers().lock().await;
+                let acp = providers.get(&provider_key).ok_or_else(|| {
+                    DaemonError::InternalError("ACP provider disappeared".to_string())
                 })?;
-            drop(providers);
+                let response_rx = acp
+                    .prompt(session_id.clone(), content)
+                    .await
+                    .map_err(|e| {
+                        DaemonError::InternalError(format!("Failed to send ACP prompt: {}", e))
+                    })?;
+                drop(providers);
 
-            match drive_acp_prompt(response_rx, use_mcp_bridge, 0, &tx, host_services.as_ref())
-                .await
-            {
-                Ok(AcpAttempt::Completed) => {
-                    antigravity_session::commit(session_id, req_hashes, req_sys_hash).await;
-                    return Ok(());
-                }
-                Ok(AcpAttempt::ContextLengthRetry) => {
-                    // agy's OWN accumulated conversation overflowed the model window;
-                    // compressing our tiny delta won't help. Drop the binding and
-                    // fall through to a full rebuild (new conversation + our
-                    // compressed history via the level loop).
-                    tracing::warn!(
-                        "antigravity: incremental turn hit context-length; rebuilding session"
-                    );
-                    antigravity_session::clear().await;
-                }
-                Err(e) => {
-                    antigravity_session::clear().await;
-                    return Err(e);
+                match drive_acp_prompt(response_rx, use_mcp_bridge, 0, &tx, host_services.as_ref())
+                    .await
+                {
+                    Ok(AcpAttempt::Completed) => {
+                        antigravity_session::commit(session_id, req_hashes, req_sys_hash).await;
+                        return Ok(());
+                    }
+                    Ok(AcpAttempt::ContextLengthRetry) => {
+                        // agy's OWN accumulated conversation overflowed the model window;
+                        // compressing our tiny delta won't help. Drop the binding and
+                        // fall through to a full rebuild (new conversation + our
+                        // compressed history via the level loop).
+                        tracing::warn!(
+                            "antigravity: incremental turn hit context-length; rebuilding session"
+                        );
+                        antigravity_session::clear().await;
+                    }
+                    Err(e) => {
+                        antigravity_session::clear().await;
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -4029,6 +4044,12 @@ async fn stream_acp_completion(
         };
         let mut content = build_content(&request);
 
+        // Whether the antigravity char-cap actually truncated this turn's prompt.
+        // If it did, agy received LESS than the full prefix, so the incremental
+        // cache must NOT be trusted — otherwise a next-turn strict-prefix "hit"
+        // would send a delta assuming agy holds content the cap silently dropped.
+        let mut antigravity_capped = false;
+
         // antigravity-acp spawns `agy -p <prompt>` per turn, passing the ENTIRE
         // prompt as one command-line argument; Windows CreateProcess caps the
         // command line at ~32767 chars, so a normal prompt overflows with
@@ -4038,8 +4059,8 @@ async fn stream_acp_completion(
             // If a skill was folded into this turn and pushed the prompt over
             // the CLI budget, rewrite the inlined instructions into a file
             // pointer instead of letting the cap below shred them. The loop's
-            // level==0 commit below reads `request.system`/`request.messages`
-            // fresh, so this mutation is already picked up there.
+            // commit below reads `request.system`/`request.messages` fresh, so
+            // this mutation is already picked up there.
             if let Some(applied) = applied_skill.as_ref() {
                 if content_char_count(&content) > ANTIGRAVITY_PROMPT_CHAR_BUDGET
                     && skill_file_fallback(
@@ -4051,6 +4072,10 @@ async fn stream_acp_completion(
                     content = build_content(&request);
                 }
             }
+            // Measure BEFORE the cap (using the cap's exact "\n\n"-join
+            // accounting) so the commit gate below knows whether the cap dropped
+            // anything.
+            antigravity_capped = content_char_count(&content) > ANTIGRAVITY_PROMPT_CHAR_BUDGET;
             // The cap is always the final safety net, fallback or not.
             cap_acp_content_for_spawn(content, ANTIGRAVITY_PROMPT_CHAR_BUDGET)
         } else {
@@ -4089,10 +4114,16 @@ async fn stream_acp_completion(
 
         match outcome? {
             AcpAttempt::Completed => {
-                // Only trust the incremental cache when the FULL prefix was actually
-                // delivered (no compression). If level>0 dropped history, leave the
-                // cache empty so the next turn rebuilds honestly.
-                if matches!(provider, ProviderType::Antigravity) && level == 0 {
+                // Only trust the incremental cache when the FULL prefix was
+                // actually delivered to agy: level 0 (build_acp_content did not
+                // compress-drop history) AND the char-cap did not truncate. If
+                // either dropped content, agy holds less than request.messages,
+                // so leave the cache empty and let the next turn rebuild honestly
+                // rather than send a delta assuming context agy never received.
+                if matches!(provider, ProviderType::Antigravity)
+                    && level == 0
+                    && !antigravity_capped
+                {
                     antigravity_session::commit(
                         session_id_for_commit.clone(),
                         antigravity_session::message_hashes(&request.messages),
@@ -4342,13 +4373,22 @@ const ANTIGRAVITY_PROMPT_CHAR_BUDGET: usize = 30_000;
 /// pre-cap "would this overflow the budget" check matches what the cap
 /// itself measures.
 fn content_char_count(content: &[ContentBlock]) -> usize {
-    content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text(t) => Some(t.text.chars().count()),
-            _ => None,
-        })
-        .sum()
+    // Mirror cap_acp_content_for_spawn's `joined` exactly: text blocks joined by
+    // a blank line ("\n\n" = 2 chars) between adjacent blocks. This makes the
+    // count an EXACT predicate for "would the cap truncate this?", which the
+    // antigravity cache-commit honesty gate relies on.
+    let mut total = 0usize;
+    let mut first = true;
+    for block in content {
+        if let ContentBlock::Text(t) = block {
+            if !first {
+                total += 2; // "\n\n" join separator
+            }
+            first = false;
+            total += t.text.chars().count();
+        }
+    }
+    total
 }
 
 /// Cap total ACP prompt text so it fits in a single command-line argument
@@ -5730,6 +5770,60 @@ mod tests {
         assert!(t.text.contains(&tail), "current user message preserved");
         // ...and marks the dropped middle.
         assert!(t.text.contains("truncated to fit the Antigravity CLI"));
+    }
+
+    /// The antigravity cache-commit honesty gate trusts the cache only when
+    /// `content_char_count(&content) <= ANTIGRAVITY_PROMPT_CHAR_BUDGET`, taking
+    /// that as "the cap did NOT truncate". This regression guards that the
+    /// predicate is EXACT against `cap_acp_content_for_spawn`: whenever the
+    /// count exceeds the budget the cap truncates (collapses to one block), and
+    /// whenever it's within budget the cap is a no-op. If these ever diverge, a
+    /// capped-but-committed turn would cause a false incremental hit next turn
+    /// (agy asked for context the cap silently dropped) — the Critical bug this
+    /// test exists to prevent.
+    #[test]
+    fn content_char_count_matches_cap_truncation_exactly() {
+        // Two blocks joined by "\n\n": count MUST include the 2 separator chars.
+        let a = "x".repeat(10);
+        let b = "y".repeat(20);
+        let content = vec![
+            ContentBlock::Text(TextContent::new(a.clone())),
+            ContentBlock::Text(TextContent::new(b.clone())),
+        ];
+        assert_eq!(
+            content_char_count(&content),
+            10 + 2 + 20,
+            "must count the \\n\\n join separator, matching cap's `joined`"
+        );
+
+        // Just OVER budget → count > budget AND cap truncates (one block).
+        let budget = 30_000usize;
+        let over = vec![
+            ContentBlock::Text(TextContent::new("H".repeat(budget))),
+            ContentBlock::Text(TextContent::new("TAIL".to_string())),
+        ];
+        assert!(
+            content_char_count(&over) > budget,
+            "count must exceed budget when the cap would truncate"
+        );
+        assert_eq!(
+            cap_acp_content_for_spawn(over, budget).len(),
+            1,
+            "cap truncates -> commit gate must refuse (count > budget)"
+        );
+
+        // Exactly AT budget → count == budget AND cap is a no-op (blocks kept).
+        let at = vec![ContentBlock::Text(TextContent::new("Z".repeat(budget)))];
+        assert_eq!(content_char_count(&at), budget);
+        assert!(
+            content_char_count(&at) <= budget,
+            "at-budget content is honestly committable"
+        );
+        assert_eq!(
+            cap_acp_content_for_spawn(at, budget).len(),
+            1,
+            "at-budget content is not truncated"
+        );
     }
 
     #[test]
