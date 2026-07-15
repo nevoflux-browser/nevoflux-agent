@@ -41,6 +41,10 @@ nevoflux-builtin-wasm = { path = "../builtin-wasm" }
 nevoflux-brain = { path = "../brain" }
 nevoflux-pack = { path = "../pack" }
 
+# ACP protocol schema types (SessionId, etc.) — matches the version pinned by
+# nevoflux-llm so the two crates share one `sacp` instance.
+sacp = "10.1.0"
+
 # Pack protocol: semantic versioning for resolved paths / compatibility checks
 semver = { version = "1", features = ["serde"] }
 
