@@ -16,9 +16,13 @@
 use std::sync::Arc;
 
 use nevoflux_daemon::antigravity_setup;
+use nevoflux_daemon::wasm::antigravity_session::{self, BindDecision};
 use nevoflux_daemon::wasm::mcp_http_server::start_mcp_http_server;
+use nevoflux_daemon::wasm::{LlmChatRequest, LlmMessage};
 use nevoflux_llm::providers::acp::antigravity;
 use nevoflux_llm::providers::acp::mcp_bridge::{McpToolBridge, ToolCallRequest};
+use nevoflux_llm::providers::acp::ContentBlock;
+use sacp::schema::SessionId;
 
 /// Create a reqwest client that bypasses proxy env vars for localhost tests.
 /// Matches `test_client()` in mcp_http_server.rs's own test module.
@@ -135,4 +139,119 @@ async fn antigravity_daemon_chain_end_to_end() {
     // (g) Cleanup.
     std::env::remove_var("NEVOFLUX_DATA_DIR");
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Integration-level substitute for a true two-turn `stream_acp_completion`
+/// e2e (which would require spawning a real `agy` subprocess — not available
+/// in CI; see Task 6's live test for that end-to-end assertion, and
+/// `crates/daemon/src/wasm/antigravity_session.rs`'s own unit tests for the
+/// underlying `decide`/`is_strict_prefix` logic in isolation).
+///
+/// This test drives the SAME sequence `stream_acp_completion`'s fast-path
+/// drives: `commit()` a turn-1 session into the process-wide cache (mirroring
+/// what the loop's `AcpAttempt::Completed` arm does on a successful level==0
+/// turn), then feed a turn-2 request — turn1's messages plus one appended
+/// user message, same system prompt — through `decide()` exactly as the
+/// fast-path block does. Asserts:
+///   - the cache HITS (`Incremental`, not `Rebuild`) on turn 2
+///   - the bound session id is turn 1's — i.e. no `new_session()` would be
+///     called for turn 2, since `decide()` returning `Incremental` is what
+///     lets `stream_acp_completion` skip the loop's `new_session()`/full
+///     resend entirely
+///   - `prefix_len` matches turn 1's message count exactly
+///   - `build_incremental_content` emits ONLY the new message, not a resend
+///     of the already-delivered prefix
+#[tokio::test]
+async fn antigravity_incremental_fastpath_hits_after_appended_message() {
+    fn msg(role: &str, content: &str) -> LlmMessage {
+        LlmMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: Vec::new(),
+            reasoning: None,
+        }
+    }
+
+    // Isolate from any other test in this binary that might touch the
+    // process-wide cache (defensive — none currently do).
+    antigravity_session::clear().await;
+
+    // Turn 1: as if the loop's `AcpAttempt::Completed` arm just committed a
+    // successful level==0 turn via `antigravity_session::commit(...)`.
+    let turn1 = LlmChatRequest {
+        messages: vec![msg("user", "hello"), msg("assistant", "hi there")],
+        system: Some("sys-prompt-v1".to_string()),
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+    };
+    let session_id = SessionId::from("agy-session-1");
+    antigravity_session::commit(
+        session_id.clone(),
+        antigravity_session::message_hashes(&turn1.messages),
+        antigravity_session::system_hash(&turn1.system),
+    )
+    .await;
+
+    // Turn 2: turn1's messages + one appended user message, same system
+    // prompt — the strict-continuation case the fast-path exists for.
+    let turn2 = LlmChatRequest {
+        messages: vec![
+            msg("user", "hello"),
+            msg("assistant", "hi there"),
+            msg("user", "follow-up question"),
+        ],
+        system: Some("sys-prompt-v1".to_string()),
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+    };
+
+    let req_hashes = antigravity_session::message_hashes(&turn2.messages);
+    let req_sys_hash = antigravity_session::system_hash(&turn2.system);
+    let decision = {
+        let cache = antigravity_session::session_cache().lock().await;
+        antigravity_session::decide(&cache, &req_hashes, req_sys_hash)
+    };
+
+    match decision {
+        BindDecision::Incremental {
+            session_id: bound_id,
+            prefix_len,
+            system_changed,
+        } => {
+            assert_eq!(
+                bound_id, session_id,
+                "must reuse turn 1's session id — no new_session() for turn 2"
+            );
+            assert_eq!(prefix_len, 2, "prefix_len must equal turn 1's message count");
+            assert!(
+                !system_changed,
+                "identical system prompt must not trigger a context_update"
+            );
+
+            let content =
+                antigravity_session::build_incremental_content(&turn2, prefix_len, system_changed);
+            let ContentBlock::Text(text) = &content[0] else {
+                panic!("expected text content block");
+            };
+            assert!(
+                text.text.contains("follow-up question"),
+                "delta must carry the new message: {}",
+                text.text
+            );
+            assert!(
+                !text.text.contains("hello") && !text.text.contains("hi there"),
+                "delta must NOT resend the already-delivered prefix: {}",
+                text.text
+            );
+        }
+        BindDecision::Rebuild => {
+            panic!("expected Incremental hit on strict-prefix continuation")
+        }
+    }
+
+    antigravity_session::clear().await;
 }

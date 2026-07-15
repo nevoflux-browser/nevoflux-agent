@@ -4,6 +4,7 @@
 //! from Wasm guest modules via host functions.
 
 use crate::error::{DaemonError, Result};
+use crate::wasm::antigravity_session;
 use futures::StreamExt;
 use nevoflux_llm::providers::acp::context::compress_history;
 use nevoflux_llm::providers::acp::tools::{
@@ -3913,6 +3914,68 @@ async fn stream_acp_completion(
         apply_acp_skill_command(&mut request, services).await;
     }
 
+    // ---- Antigravity stateful fast-path (design §4.2). Other providers skip. ----
+    if matches!(provider, ProviderType::Antigravity) {
+        let req_hashes = antigravity_session::message_hashes(&request.messages);
+        let req_sys_hash = antigravity_session::system_hash(&request.system);
+        let decision = {
+            let cache = antigravity_session::session_cache().lock().await;
+            antigravity_session::decide(&cache, &req_hashes, req_sys_hash)
+        };
+        if let antigravity_session::BindDecision::Incremental {
+            session_id,
+            prefix_len,
+            system_changed,
+        } = decision
+        {
+            let content = antigravity_session::build_incremental_content(
+                &request,
+                prefix_len,
+                system_changed,
+            );
+            // Task 5 will insert skill file-fallback here; the cap is always the
+            // final safety net.
+            let content = cap_acp_content_for_spawn(content, ANTIGRAVITY_PROMPT_CHAR_BUDGET);
+
+            let providers = acp_providers().lock().await;
+            let acp = providers.get(&provider_key).ok_or_else(|| {
+                DaemonError::InternalError("ACP provider disappeared".to_string())
+            })?;
+            let response_rx = acp
+                .prompt(session_id.clone(), content)
+                .await
+                .map_err(|e| {
+                    DaemonError::InternalError(format!("Failed to send ACP prompt: {}", e))
+                })?;
+            drop(providers);
+
+            match drive_acp_prompt(response_rx, use_mcp_bridge, 0, &tx, host_services.as_ref())
+                .await
+            {
+                Ok(AcpAttempt::Completed) => {
+                    antigravity_session::commit(session_id, req_hashes, req_sys_hash).await;
+                    return Ok(());
+                }
+                Ok(AcpAttempt::ContextLengthRetry) => {
+                    // agy's OWN accumulated conversation overflowed the model window;
+                    // compressing our tiny delta won't help. Drop the binding and
+                    // fall through to a full rebuild (new conversation + our
+                    // compressed history via the level loop).
+                    tracing::warn!(
+                        "antigravity: incremental turn hit context-length; rebuilding session"
+                    );
+                    antigravity_session::clear().await;
+                }
+                Err(e) => {
+                    antigravity_session::clear().await;
+                    return Err(e);
+                }
+            }
+        }
+        // Miss (Rebuild) or incremental-overflow: fall through to the full loop,
+        // which for antigravity uses a NEW session and commits on level-0 success.
+    }
+
     // Retry with progressive compression on context length errors.
     for level in 0..=2u8 {
         let content = if skip_tool_xml {
@@ -3954,6 +4017,10 @@ async fn stream_acp_completion(
             DaemonError::InternalError(format!("Failed to create ACP session: {}", e))
         })?;
 
+        // SessionId is `Arc<str>`; cloning here is cheap and lets us commit the
+        // antigravity cache after `session_id` is moved into `prompt()` below.
+        let session_id_for_commit = session_id.clone();
+
         let response_rx = acp
             .prompt(session_id, content)
             .await
@@ -3972,7 +4039,20 @@ async fn stream_acp_completion(
         .await;
 
         match outcome? {
-            AcpAttempt::Completed => return Ok(()),
+            AcpAttempt::Completed => {
+                // Only trust the incremental cache when the FULL prefix was actually
+                // delivered (no compression). If level>0 dropped history, leave the
+                // cache empty so the next turn rebuilds honestly.
+                if matches!(provider, ProviderType::Antigravity) && level == 0 {
+                    antigravity_session::commit(
+                        session_id_for_commit.clone(),
+                        antigravity_session::message_hashes(&request.messages),
+                        antigravity_session::system_hash(&request.system),
+                    )
+                    .await;
+                }
+                return Ok(());
+            }
             AcpAttempt::ContextLengthRetry => continue,
         }
     }
