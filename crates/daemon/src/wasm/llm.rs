@@ -3914,9 +3914,13 @@ async fn stream_acp_completion(
     // (and its declared convention files) here — the single chokepoint every
     // ACP-bound prompt passes through — so explicit invocations work
     // deterministically. No-op when there's no leading slash command.
-    if let Some(services) = host_services.as_ref() {
-        apply_acp_skill_command(&mut request, services).await;
-    }
+    // Non-antigravity providers ignore this — their prompt-building never
+    // consults `applied_skill`, so behavior is byte-identical to before.
+    let applied_skill = if let Some(services) = host_services.as_ref() {
+        apply_acp_skill_command(&mut request, services).await
+    } else {
+        None
+    };
 
     // ---- Antigravity stateful fast-path (design §4.2). Other providers skip. ----
     if matches!(provider, ProviderType::Antigravity) {
@@ -3932,13 +3936,34 @@ async fn stream_acp_completion(
             system_changed,
         } = decision
         {
-            let content = antigravity_session::build_incremental_content(
+            let mut content = antigravity_session::build_incremental_content(
                 &request,
                 prefix_len,
                 system_changed,
             );
-            // Task 5 will insert skill file-fallback here; the cap is always the
-            // final safety net.
+            let mut req_sys_hash = req_sys_hash;
+            // If a skill was folded into this turn and pushed the prompt over
+            // the CLI budget, rewrite the inlined instructions into a file
+            // pointer instead of letting the blunt char-cap below shred them.
+            if let Some(applied) = applied_skill.as_ref() {
+                if content_char_count(&content) > ANTIGRAVITY_PROMPT_CHAR_BUDGET
+                    && skill_file_fallback(
+                        &mut request,
+                        applied,
+                        &crate::antigravity_setup::workspace_dir(),
+                    )
+                {
+                    content = antigravity_session::build_incremental_content(
+                        &request,
+                        prefix_len,
+                        system_changed,
+                    );
+                    // request.system just changed — the cache must reflect
+                    // what was actually sent, not the pre-fallback prompt.
+                    req_sys_hash = antigravity_session::system_hash(&request.system);
+                }
+            }
+            // The cap is always the final safety net, fallback or not.
             let content = cap_acp_content_for_spawn(content, ANTIGRAVITY_PROMPT_CHAR_BUDGET);
 
             let providers = acp_providers().lock().await;
@@ -3982,24 +4007,27 @@ async fn stream_acp_completion(
 
     // Retry with progressive compression on context length errors.
     for level in 0..=2u8 {
-        let content = if skip_tool_xml {
-            // MCP/OpenClaw mode: system prompt WITHOUT tool XML
-            build_acp_content_mcp(
-                &request,
-                context_limit,
+        let build_content = |request: &LlmChatRequest| -> Vec<ContentBlock> {
+            if skip_tool_xml {
+                // MCP/OpenClaw mode: system prompt WITHOUT tool XML
+                build_acp_content_mcp(
+                    request,
+                    context_limit,
+                    match level {
+                        0 => 0.30,
+                        1 => 0.15,
+                        _ => 0.0,
+                    },
+                )
+            } else {
                 match level {
-                    0 => 0.30,
-                    1 => 0.15,
-                    _ => 0.0,
-                },
-            )
-        } else {
-            match level {
-                0 => build_acp_content(&request, context_limit, 0.30),
-                1 => build_acp_content(&request, context_limit, 0.15),
-                _ => build_acp_content_minimal(&request),
+                    0 => build_acp_content(request, context_limit, 0.30),
+                    1 => build_acp_content(request, context_limit, 0.15),
+                    _ => build_acp_content_minimal(request),
+                }
             }
         };
+        let mut content = build_content(&request);
 
         // antigravity-acp spawns `agy -p <prompt>` per turn, passing the ENTIRE
         // prompt as one command-line argument; Windows CreateProcess caps the
@@ -4007,6 +4035,23 @@ async fn stream_acp_completion(
         // ENAMETOOLONG. Persistent-process ACP agents (claude/gemini/openclaw)
         // stream the prompt over stdio and are unaffected — cap only antigravity.
         let content = if matches!(provider, ProviderType::Antigravity) {
+            // If a skill was folded into this turn and pushed the prompt over
+            // the CLI budget, rewrite the inlined instructions into a file
+            // pointer instead of letting the cap below shred them. The loop's
+            // level==0 commit below reads `request.system`/`request.messages`
+            // fresh, so this mutation is already picked up there.
+            if let Some(applied) = applied_skill.as_ref() {
+                if content_char_count(&content) > ANTIGRAVITY_PROMPT_CHAR_BUDGET
+                    && skill_file_fallback(
+                        &mut request,
+                        applied,
+                        &crate::antigravity_setup::workspace_dir(),
+                    )
+                {
+                    content = build_content(&request);
+                }
+            }
+            // The cap is always the final safety net, fallback or not.
             cap_acp_content_for_spawn(content, ANTIGRAVITY_PROMPT_CHAR_BUDGET)
         } else {
             content
@@ -4292,6 +4337,20 @@ fn build_acp_content(
 /// args (`--add-dir <path>`, `--dangerously-skip-permissions`, `--model`, …).
 const ANTIGRAVITY_PROMPT_CHAR_BUDGET: usize = 30_000;
 
+/// Total character count across a content block list's text, using the same
+/// join-with-blank-line accounting as [`cap_acp_content_for_spawn`] so the
+/// pre-cap "would this overflow the budget" check matches what the cap
+/// itself measures.
+fn content_char_count(content: &[ContentBlock]) -> usize {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(t) => Some(t.text.chars().count()),
+            _ => None,
+        })
+        .sum()
+}
+
 /// Cap total ACP prompt text so it fits in a single command-line argument
 /// (see [`ANTIGRAVITY_PROMPT_CHAR_BUDGET`]). Keeps the head (system framing)
 /// and tail (recent history + current user message), dropping the middle.
@@ -4485,22 +4544,41 @@ pub(crate) fn skill_invocation_message(skill_name: &str, args: &str) -> String {
     }
 }
 
+/// A skill successfully folded into an ACP request by
+/// [`apply_acp_skill_command`]. Antigravity paths retain this so that, if the
+/// resulting prompt overflows the command-line budget, [`skill_file_fallback`]
+/// can rewrite the inlined instructions into a file pointer instead of losing
+/// them to the blunt char-cap. Other providers ignore the return value —
+/// their behavior is unaffected.
+pub(crate) struct AppliedSkill {
+    pub name: String,
+    pub args: String,
+    /// The exact `<CRITICAL_INSTRUCTIONS>…</CRITICAL_INSTRUCTIONS>` block
+    /// prepended to `request.system`, so it can be located and stripped
+    /// verbatim if the file fallback fires.
+    pub prefix: String,
+    pub body: String,
+    pub conventions: Vec<(String, String)>,
+}
+
 /// When the last user message is an explicit `/skillname` invocation, fold the
 /// skill's instructions (and its declared convention files) into the request so
 /// they reach ACP agents that bypass the native `/skill` router. No-op when
 /// there is no leading slash command or the skill is unknown — so messages
 /// already routed natively (slash already stripped) are left untouched, which
-/// avoids double injection.
+/// avoids double injection. Returns the injected skill's details so antigravity
+/// callers can fall back to a file-based pointer if the prompt overflows its
+/// command-line budget; other providers discard the return value.
 async fn apply_acp_skill_command(
     request: &mut LlmChatRequest,
     services: &crate::wasm::services::HostServices,
-) {
+) -> Option<AppliedSkill> {
     let Some(idx) = request.messages.iter().rposition(|m| m.role == "user") else {
-        return;
+        return None;
     };
     let (name, args) = match parse_slash_command(&request.messages[idx].content) {
         Some((n, a)) => (n.to_string(), a.to_string()),
-        None => return,
+        None => return None,
     };
 
     // Resolve the skill + its convention dependencies, cloning owned strings so
@@ -4515,7 +4593,7 @@ async fn apply_acp_skill_command(
                 "ACP skill router: '/{}' is not a known skill, leaving as-is",
                 name
             );
-            return;
+            return None;
         };
         let body = skill.content.clone();
         let mut conv: Vec<(String, String)> = Vec::new();
@@ -4546,7 +4624,7 @@ async fn apply_acp_skill_command(
     let (prefix, cleaned) = build_skill_injection(&name, &args, &skill_body, &conventions);
     request.system = Some(match request.system.take() {
         Some(existing) => format!("{prefix}\n\n{existing}"),
-        None => prefix,
+        None => prefix.clone(),
     });
     request.messages[idx].content = cleaned;
 
@@ -4555,6 +4633,74 @@ async fn apply_acp_skill_command(
         name,
         conv_count
     );
+
+    Some(AppliedSkill {
+        name,
+        args,
+        prefix,
+        body: skill_body,
+        conventions,
+    })
+}
+
+/// When a skill-injected antigravity prompt would exceed the CLI budget, the
+/// blunt char-cap would shred the skill instructions. Instead, write the skill
+/// body (+conventions) to a file in agy's workspace (already exposed via
+/// --add-dir) and replace the inlined body with a short "read this file"
+/// pointer. Returns false if the file couldn't be written (caller then falls
+/// back to the cap).
+fn skill_file_fallback(
+    request: &mut LlmChatRequest,
+    applied: &AppliedSkill,
+    workspace: &std::path::Path,
+) -> bool {
+    let dir = workspace.join("skills");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let file = dir.join(format!("{}.md", sanitize_skill_filename(&applied.name)));
+    let mut doc = applied.body.clone();
+    for (label, content) in &applied.conventions {
+        doc.push_str(&format!(
+            "\n\n<convention source=\"{label}\">\n{content}\n</convention>"
+        ));
+    }
+    if std::fs::write(&file, doc).is_err() {
+        return false;
+    }
+    // Strip the inlined CRITICAL_INSTRUCTIONS block from system.
+    if let Some(sys) = request.system.take() {
+        let stripped = sys
+            .strip_prefix(&applied.prefix)
+            .map(|s| s.trim_start().to_string())
+            .unwrap_or(sys);
+        request.system = if stripped.is_empty() {
+            None
+        } else {
+            Some(stripped)
+        };
+    }
+    // Point the LAST user message at the file.
+    if let Some(idx) = request.messages.iter().rposition(|m| m.role == "user") {
+        request.messages[idx].content = format!(
+            "Read the file skills/{name}.md in your workspace and follow it EXACTLY as the \"{name}\" skill. Input from the user:\n\n{args}",
+            name = sanitize_skill_filename(&applied.name),
+            args = applied.args,
+        );
+    }
+    true
+}
+
+fn sanitize_skill_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -4663,6 +4809,73 @@ mod acp_skill_router_tests {
         let (_, cleaned) = build_skill_injection("brain-recall", "", "BODY", &[]);
         assert!(cleaned.contains("brain-recall"));
         assert!(!cleaned.starts_with('/'));
+    }
+
+    #[test]
+    fn skill_file_fallback_writes_file_and_rewrites_pointer() {
+        use super::{sanitize_skill_filename, skill_file_fallback, AppliedSkill};
+        use crate::wasm::llm::{LlmChatRequest, LlmMessage};
+
+        // Build an oversized skill body/prefix the same way the real
+        // injection path does, so `prefix` matches what would actually have
+        // been prepended to `request.system`.
+        let body = "BODY LINE ".repeat(5_000); // ~50k chars — well over budget
+        let conventions = vec![(
+            "conv:label".to_string(),
+            "CONVENTION CONTENT".to_string(),
+        )];
+        let (prefix, _cleaned) =
+            build_skill_injection("big-skill", "do the thing", &body, &conventions);
+        let applied = AppliedSkill {
+            name: "big-skill".to_string(),
+            args: "do the thing".to_string(),
+            prefix: prefix.clone(),
+            body: body.clone(),
+            conventions: conventions.clone(),
+        };
+
+        let mut request = LlmChatRequest {
+            messages: vec![LlmMessage::user("some prior cleaned content")],
+            system: Some(format!("{prefix}\n\nEXISTING SYSTEM PROMPT")),
+            ..Default::default()
+        };
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let ok = skill_file_fallback(&mut request, &applied, workspace.path());
+        assert!(ok, "skill_file_fallback should succeed writing to a temp dir");
+
+        // File exists and contains the body + conventions.
+        let file_path = workspace
+            .path()
+            .join("skills")
+            .join(format!("{}.md", sanitize_skill_filename(&applied.name)));
+        assert!(file_path.exists(), "expected {:?} to exist", file_path);
+        let contents = std::fs::read_to_string(&file_path).expect("read fallback file");
+        assert!(contents.contains(&body));
+        assert!(contents.contains("CONVENTION CONTENT"));
+
+        // The inlined CRITICAL_INSTRUCTIONS prefix was stripped from system,
+        // leaving the pre-existing system text intact.
+        let sys = request.system.as_deref().expect("system retained");
+        assert!(!sys.contains("CRITICAL_INSTRUCTIONS"));
+        assert!(sys.contains("EXISTING SYSTEM PROMPT"));
+
+        // The last user message became the "read this file" pointer.
+        let last = request.messages.last().expect("has a message");
+        assert_eq!(last.role, "user");
+        assert!(last.content.contains("Read the file skills/big-skill.md"));
+        assert!(last.content.contains("do the thing"));
+    }
+
+    #[test]
+    fn sanitize_skill_filename_escapes_unsafe_chars() {
+        use super::sanitize_skill_filename;
+        assert_eq!(sanitize_skill_filename("brain-recall"), "brain-recall");
+        assert_eq!(sanitize_skill_filename("my_skill_2"), "my_skill_2");
+        assert_eq!(
+            sanitize_skill_filename("weird/name with spaces?.md"),
+            "weird_name_with_spaces__md"
+        );
     }
 }
 
