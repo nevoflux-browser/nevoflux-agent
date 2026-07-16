@@ -327,12 +327,15 @@ pub fn get_summarization_provider(
             }
         });
 
-    // ACP providers (ClaudeCode, GeminiCli, OpenClaw) only support streaming mode.
+    // ACP providers (ClaudeCode, GeminiCli, OpenClaw, Antigravity) only support streaming mode.
     // Summarization/extraction uses non-streaming calls, so we must fallback to
     // a provider with an API key that supports non-streaming.
     let is_acp = matches!(
         provider,
-        ProviderType::ClaudeCode | ProviderType::GeminiCli | ProviderType::OpenClaw
+        ProviderType::ClaudeCode
+            | ProviderType::GeminiCli
+            | ProviderType::OpenClaw
+            | ProviderType::Antigravity
     );
 
     if is_acp {

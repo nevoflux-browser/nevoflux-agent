@@ -1073,6 +1073,10 @@ impl DaemonHostFunctions {
                 // Kimi Agent CLI manages its own auth; return a placeholder
                 Ok("kimi-agent-cli".to_string())
             }
+            Err(_) if pt == ProviderType::Antigravity => {
+                // Antigravity CLI manages its own auth; return a placeholder
+                Ok("antigravity-cli".to_string())
+            }
             Err(_) => Err(HostError {
                 code: 2,
                 message: format!("No API key found for provider: {}", provider),

@@ -50,3 +50,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 mockall = { workspace = true }
 toml = "0.8"
 serde = { workspace = true }
+tracing-subscriber = { workspace = true }

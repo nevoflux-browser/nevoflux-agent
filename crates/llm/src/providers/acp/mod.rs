@@ -4,6 +4,7 @@
 //! sacp protocol. A background tokio task owns the `ClientToAgent` connection;
 //! the public `AcpProvider` sends requests through an `mpsc` channel.
 
+pub mod antigravity;
 pub mod claude;
 pub mod context;
 pub mod gemini;
@@ -75,6 +76,17 @@ pub struct AcpProviderConfig {
     /// Whether to inject MCP URL into NewSessionRequest.
     /// false for OpenClaw (registers via gateway config instead).
     pub inject_mcp_url: bool,
+    /// When true, the daemon-side HTTP MCP server enforces
+    /// `McpToolBridge::request_permission` on every `tools/call` before
+    /// executing. Needed for agents that never send
+    /// `session/request_permission` themselves (antigravity-acp). Keep false
+    /// for agents that self-report (claude-code) or gating would double-prompt.
+    pub gate_tool_calls: bool,
+    /// Per-session config options to apply after `session/new` via
+    /// `session/set_config_option` (list of `(configId, value)`). Used to pass
+    /// the model to agents (e.g. antigravity) whose model ids contain spaces
+    /// and therefore cannot travel through whitespace-split env/args.
+    pub config_options: Vec<(String, String)>,
 }
 
 /// Internal request sent from `AcpProvider` to the background client loop.
@@ -149,7 +161,9 @@ impl AcpProvider {
     /// Create a new (disconnected) provider with the given config.
     pub fn new(config: AcpProviderConfig) -> Self {
         let tool_bridge = if config.use_mcp_bridge {
-            Some(Arc::new(mcp_bridge::McpToolBridge::new()))
+            let bridge = mcp_bridge::McpToolBridge::new();
+            bridge.set_gate_tool_calls(config.gate_tool_calls);
+            Some(Arc::new(bridge))
         } else {
             None
         };
@@ -760,7 +774,13 @@ async fn handle_requests(
                             modes = %modes_str,
                             "ACP: session created"
                         );
-                        apply_session_mode(&config, &cx, session).await
+                        match apply_session_mode(&config, &cx, session).await {
+                            Ok(session) => {
+                                apply_config_options(&config, &cx, &session).await;
+                                Ok(session)
+                            }
+                            Err(e) => Err(e),
+                        }
                     }
                     Err(err) => Err(AcpError::Internal(format!("ACP session/new failed: {err}"))),
                 };
@@ -851,6 +871,64 @@ async fn apply_session_mode(
     }
 
     Ok(session)
+}
+
+/// `session/set_config_option` request. Not in sacp 10.1.0's typed schema, but
+/// the antigravity-acp adapter (and newer ACP) implement it. We send it to set
+/// agy's model — whose ids contain spaces (e.g. "Gemini 3.5 Flash (Medium)") and
+/// therefore cannot ride the whitespace-split `AGY_EXTRA_ARGS`. The adapter maps
+/// configId "model" to a discrete `--model <id>` argv element when spawning agy.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetConfigOptionRequest {
+    session_id: sacp::schema::SessionId,
+    config_id: String,
+    value: String,
+}
+
+impl sacp::JrMessage for SetConfigOptionRequest {
+    fn method(&self) -> &str {
+        "session/set_config_option"
+    }
+    fn to_untyped_message(&self) -> std::result::Result<sacp::UntypedMessage, sacp::Error> {
+        sacp::UntypedMessage::new(self.method(), self)
+    }
+    fn parse_message(
+        _method: &str,
+        _params: &impl serde::Serialize,
+    ) -> Option<std::result::Result<Self, sacp::Error>> {
+        // Outgoing-only request — the agent never sends this to us.
+        None
+    }
+}
+
+impl sacp::JrRequest for SetConfigOptionRequest {
+    // The adapter replies with an (often empty) object; accept it untyped.
+    type Response = serde_json::Value;
+}
+
+/// Apply per-session config options (e.g. model) after `session/new`, via
+/// `session/set_config_option`. Failures warn but never abort the session — the
+/// agent falls back to its default for that option (better a working chat on the
+/// default model than a hard failure).
+async fn apply_config_options(
+    config: &AcpProviderConfig,
+    cx: &JrConnectionCx<ClientToAgent>,
+    session: &NewSessionResponse,
+) {
+    for (config_id, value) in &config.config_options {
+        let req = SetConfigOptionRequest {
+            session_id: session.session_id.clone(),
+            config_id: config_id.clone(),
+            value: value.clone(),
+        };
+        match cx.send_request(req).block_task().await {
+            Ok(_) => tracing::info!("ACP: set config option {config_id}={value}"),
+            Err(e) => {
+                tracing::warn!("ACP: session/set_config_option {config_id}={value} rejected: {e}")
+            }
+        }
+    }
 }
 
 #[cfg(test)]

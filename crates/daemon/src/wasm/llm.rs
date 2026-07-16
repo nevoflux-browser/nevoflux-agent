@@ -4,6 +4,7 @@
 //! from Wasm guest modules via host functions.
 
 use crate::error::{DaemonError, Result};
+use crate::wasm::antigravity_session;
 use futures::StreamExt;
 use nevoflux_llm::providers::acp::context::compress_history;
 use nevoflux_llm::providers::acp::tools::{
@@ -427,9 +428,12 @@ pub async fn execute_llm_chat(
         ProviderType::Together => {
             execute_together_chat(api_key, model, request, provider, base_url).await
         }
-        ProviderType::ClaudeCode | ProviderType::GeminiCli | ProviderType::OpenClaw => Err(
-            DaemonError::InternalError("ACP providers only support streaming mode".to_string()),
-        ),
+        ProviderType::ClaudeCode
+        | ProviderType::GeminiCli
+        | ProviderType::OpenClaw
+        | ProviderType::Antigravity => Err(DaemonError::InternalError(
+            "ACP providers only support streaming mode".to_string(),
+        )),
         ProviderType::KimiAgent => {
             execute_kimi_agent_chat(api_key, model, request, provider, base_url).await
         }
@@ -2514,7 +2518,10 @@ async fn execute_llm_stream_inner(
         ProviderType::Together => {
             stream_together(api_key, model, request, tx, provider, base_url).await
         }
-        ProviderType::ClaudeCode | ProviderType::GeminiCli | ProviderType::OpenClaw => {
+        ProviderType::ClaudeCode
+        | ProviderType::GeminiCli
+        | ProviderType::OpenClaw
+        | ProviderType::Antigravity => {
             stream_acp_completion(
                 api_key,
                 model,
@@ -3753,6 +3760,15 @@ async fn stream_acp_completion(
                 ProviderType::OpenClaw => nevoflux_llm::providers::acp::openclaw::build_config(
                     std::path::PathBuf::from(&work_dir),
                 ),
+                ProviderType::Antigravity => {
+                    // Sandbox work_dir: agy's built-in coding tools run with
+                    // --dangerously-skip-permissions (one-shot -p has no TTY),
+                    // so keep them out of real user directories.
+                    nevoflux_llm::providers::acp::antigravity::build_config(
+                        model,
+                        crate::antigravity_setup::workspace_dir(),
+                    )
+                }
                 _ => {
                     return Err(DaemonError::InternalError(format!(
                         "ACP not supported for {:?}",
@@ -3766,6 +3782,10 @@ async fn stream_acp_completion(
                 .await
                 .map_err(|e| DaemonError::InternalError(format!("Failed to connect ACP: {}", e)))?;
             providers.insert(provider_key.clone(), acp);
+            if matches!(provider, ProviderType::Antigravity) {
+                // A fresh adapter process means the old session_id is dead — invalidate.
+                crate::wasm::antigravity_session::clear().await;
+            }
         }
     }
 
@@ -3792,6 +3812,17 @@ async fn stream_acp_completion(
                     let url = format!("http://127.0.0.1:{port}/mcp");
                     tracing::info!("MCP HTTP server started at {}", url);
                     tool_bridge.set_mcp_server_url(url.clone());
+                    // Antigravity: agy discovers our tools via the
+                    // .agents/mcp_config.json inside our sandbox workspace
+                    // (the adapter drops session mcp_servers). agy re-reads it
+                    // on every one-shot spawn, and agy only spawns at prompt
+                    // time — after this point — so the URL is always fresh
+                    // for this daemon lifetime.
+                    if matches!(provider, ProviderType::Antigravity) {
+                        if let Err(e) = crate::antigravity_setup::write_mcp_config(&url) {
+                            tracing::warn!("antigravity: failed to write agy mcp_config.json: {e}");
+                        }
+                    }
                     tool_bridge.set_server_handle(handle);
                     // Write URL to state file so OpenClaw plugin can discover it
                     if let Err(e) = crate::openclaw_setup::write_mcp_url(&url) {
@@ -3883,29 +3914,236 @@ async fn stream_acp_completion(
     // (and its declared convention files) here — the single chokepoint every
     // ACP-bound prompt passes through — so explicit invocations work
     // deterministically. No-op when there's no leading slash command.
-    if let Some(services) = host_services.as_ref() {
-        apply_acp_skill_command(&mut request, services).await;
+    // Non-antigravity providers ignore this — their prompt-building never
+    // consults `applied_skill`, so behavior is byte-identical to before.
+    let applied_skill = if let Some(services) = host_services.as_ref() {
+        apply_acp_skill_command(&mut request, services).await
+    } else {
+        None
+    };
+
+    // ---- Antigravity stateful fast-path (design §4.2). Other providers skip. ----
+    if matches!(provider, ProviderType::Antigravity) {
+        // Externalize a large (skill-laden) system prompt into a workspace file
+        // BEFORE hashing: keeps the inline `agy -p` prompt under the CLI budget so
+        // turn 1 isn't truncated → it can commit → turn 2 can actually go
+        // incremental. Also makes `system_hash` reflect the stable pointer, so an
+        // unchanged system prompt doesn't spuriously re-send. antigravity-only.
+        antigravity_externalize_system(
+            &mut request,
+            &crate::antigravity_setup::workspace_dir(),
+        );
+
+        let req_hashes = antigravity_session::message_hashes(&request.messages);
+        let req_sys_hash = antigravity_session::system_hash(&request.system);
+        // Per-message fingerprint (role:len:hash8) — DEBUG-level so it's available
+        // when diagnosing a drift (turn-over-turn, which historical message
+        // mutated) without spamming normal INFO logs. antigravity-only.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let fp: Vec<String> = request
+                .messages
+                .iter()
+                .zip(req_hashes.iter())
+                .map(|(m, h)| format!("{}:{}:{:08x}", m.role, m.content.chars().count(), h))
+                .collect();
+            tracing::debug!("antigravity: msg fingerprints [{}]", fp.join(", "));
+        }
+        let (decision, rebuild_reason) = {
+            let cache = antigravity_session::session_cache().lock().await;
+            let decision = antigravity_session::decide(&cache, &req_hashes, req_sys_hash);
+            // Compute the diagnostic while the cache is still borrowed, so a smoke
+            // can tell "prior turn never committed" apart from "history drift".
+            let reason = match &decision {
+                antigravity_session::BindDecision::Rebuild => {
+                    Some(antigravity_session::rebuild_reason(&cache, &req_hashes))
+                }
+                _ => None,
+            };
+            (decision, reason)
+        };
+        // One line per turn so a smoke can SEE which path ran — increment and
+        // rebuild both preserve context, so behavior alone can't distinguish
+        // them. (antigravity-only; other providers never reach this branch.)
+        match &decision {
+            antigravity_session::BindDecision::Incremental {
+                prefix_len,
+                system_changed,
+                ..
+            } => {
+                tracing::info!(
+                    "antigravity: incremental session HIT — reusing agy conversation \
+                     (prefix_len={}, new_msgs={}, system_changed={})",
+                    prefix_len,
+                    request.messages.len().saturating_sub(*prefix_len),
+                    system_changed
+                );
+            }
+            antigravity_session::BindDecision::Rebuild => {
+                tracing::info!(
+                    "antigravity: session REBUILD — new agy conversation ({} msgs): {}",
+                    request.messages.len(),
+                    rebuild_reason.as_deref().unwrap_or("unknown"),
+                );
+            }
+        }
+        if let antigravity_session::BindDecision::Incremental {
+            session_id,
+            prefix_len,
+            system_changed,
+        } = decision
+        {
+            let mut content = antigravity_session::build_incremental_content(
+                &request,
+                prefix_len,
+                system_changed,
+            );
+            let mut req_sys_hash = req_sys_hash;
+            // If a skill was folded into this turn and pushed the prompt over
+            // the CLI budget, rewrite the inlined instructions into a file
+            // pointer instead of letting the blunt char-cap below shred them.
+            if let Some(applied) = applied_skill.as_ref() {
+                if content_char_count(&content) > ANTIGRAVITY_PROMPT_CHAR_BUDGET
+                    && skill_file_fallback(
+                        &mut request,
+                        applied,
+                        &crate::antigravity_setup::workspace_dir(),
+                    )
+                {
+                    content = antigravity_session::build_incremental_content(
+                        &request,
+                        prefix_len,
+                        system_changed,
+                    );
+                    // request.system just changed — the cache must reflect
+                    // what was actually sent, not the pre-fallback prompt.
+                    req_sys_hash = antigravity_session::system_hash(&request.system);
+                }
+            }
+            // If the incremental delta ITSELF exceeds the CLI budget (a single
+            // huge message, or a large system context_update), the cap would
+            // drop content agy never re-sees — and committing afterward would
+            // falsely record it as fully delivered. Don't send a truncated
+            // delta: clear the binding and rebuild the whole conversation via
+            // the full loop (which re-windows history + gates its own commit on
+            // "not capped"). Rare — normal deltas are just the new message.
+            if content_char_count(&content) > ANTIGRAVITY_PROMPT_CHAR_BUDGET {
+                tracing::warn!(
+                    "antigravity: incremental delta exceeds CLI budget; rebuilding session"
+                );
+                antigravity_session::clear().await;
+                // fall through to the full loop below (do NOT prompt the delta)
+            } else {
+                // Cap is a no-op here (delta fits) — kept as a uniform safety net.
+                let content = cap_acp_content_for_spawn(content, ANTIGRAVITY_PROMPT_CHAR_BUDGET);
+
+                let providers = acp_providers().lock().await;
+                let acp = providers.get(&provider_key).ok_or_else(|| {
+                    DaemonError::InternalError("ACP provider disappeared".to_string())
+                })?;
+                let response_rx = acp
+                    .prompt(session_id.clone(), content)
+                    .await
+                    .map_err(|e| {
+                        DaemonError::InternalError(format!("Failed to send ACP prompt: {}", e))
+                    })?;
+                drop(providers);
+
+                match drive_acp_prompt(response_rx, use_mcp_bridge, 0, &tx, host_services.as_ref())
+                    .await
+                {
+                    Ok(AcpAttempt::Completed) => {
+                        // Commit only settled history (all-but-last): the current
+                        // enriched message would hash differently once persisted raw.
+                        let commit_hashes =
+                            antigravity_session::stable_commit_hashes(&request.messages);
+                        tracing::info!(
+                            "antigravity: commit (incremental) — session now holds {} settled msgs",
+                            commit_hashes.len()
+                        );
+                        antigravity_session::commit(session_id, commit_hashes, req_sys_hash).await;
+                        return Ok(());
+                    }
+                    Ok(AcpAttempt::ContextLengthRetry) => {
+                        // agy's OWN accumulated conversation overflowed the model window;
+                        // compressing our tiny delta won't help. Drop the binding and
+                        // fall through to a full rebuild (new conversation + our
+                        // compressed history via the level loop).
+                        tracing::warn!(
+                            "antigravity: incremental turn hit context-length; rebuilding session"
+                        );
+                        antigravity_session::clear().await;
+                    }
+                    Err(e) => {
+                        antigravity_session::clear().await;
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        // Miss (Rebuild) or incremental-overflow: fall through to the full loop,
+        // which for antigravity uses a NEW session and commits on level-0 success.
     }
 
     // Retry with progressive compression on context length errors.
     for level in 0..=2u8 {
-        let content = if skip_tool_xml {
-            // MCP/OpenClaw mode: system prompt WITHOUT tool XML
-            build_acp_content_mcp(
-                &request,
-                context_limit,
+        let build_content = |request: &LlmChatRequest| -> Vec<ContentBlock> {
+            if skip_tool_xml {
+                // MCP/OpenClaw mode: system prompt WITHOUT tool XML
+                build_acp_content_mcp(
+                    request,
+                    context_limit,
+                    match level {
+                        0 => 0.30,
+                        1 => 0.15,
+                        _ => 0.0,
+                    },
+                )
+            } else {
                 match level {
-                    0 => 0.30,
-                    1 => 0.15,
-                    _ => 0.0,
-                },
-            )
-        } else {
-            match level {
-                0 => build_acp_content(&request, context_limit, 0.30),
-                1 => build_acp_content(&request, context_limit, 0.15),
-                _ => build_acp_content_minimal(&request),
+                    0 => build_acp_content(request, context_limit, 0.30),
+                    1 => build_acp_content(request, context_limit, 0.15),
+                    _ => build_acp_content_minimal(request),
+                }
             }
+        };
+        let mut content = build_content(&request);
+
+        // Whether the antigravity char-cap actually truncated this turn's prompt.
+        // If it did, agy received LESS than the full prefix, so the incremental
+        // cache must NOT be trusted — otherwise a next-turn strict-prefix "hit"
+        // would send a delta assuming agy holds content the cap silently dropped.
+        let mut antigravity_capped = false;
+
+        // antigravity-acp spawns `agy -p <prompt>` per turn, passing the ENTIRE
+        // prompt as one command-line argument; Windows CreateProcess caps the
+        // command line at ~32767 chars, so a normal prompt overflows with
+        // ENAMETOOLONG. Persistent-process ACP agents (claude/gemini/openclaw)
+        // stream the prompt over stdio and are unaffected — cap only antigravity.
+        let content = if matches!(provider, ProviderType::Antigravity) {
+            // If a skill was folded into this turn and pushed the prompt over
+            // the CLI budget, rewrite the inlined instructions into a file
+            // pointer instead of letting the cap below shred them. The loop's
+            // commit below reads `request.system`/`request.messages` fresh, so
+            // this mutation is already picked up there.
+            if let Some(applied) = applied_skill.as_ref() {
+                if content_char_count(&content) > ANTIGRAVITY_PROMPT_CHAR_BUDGET
+                    && skill_file_fallback(
+                        &mut request,
+                        applied,
+                        &crate::antigravity_setup::workspace_dir(),
+                    )
+                {
+                    content = build_content(&request);
+                }
+            }
+            // Measure BEFORE the cap (using the cap's exact "\n\n"-join
+            // accounting) so the commit gate below knows whether the cap dropped
+            // anything.
+            antigravity_capped = content_char_count(&content) > ANTIGRAVITY_PROMPT_CHAR_BUDGET;
+            // The cap is always the final safety net, fallback or not.
+            cap_acp_content_for_spawn(content, ANTIGRAVITY_PROMPT_CHAR_BUDGET)
+        } else {
+            content
         };
 
         let providers = acp_providers().lock().await;
@@ -3917,7 +4155,11 @@ async fn stream_acp_completion(
             DaemonError::InternalError(format!("Failed to create ACP session: {}", e))
         })?;
 
-        let mut response_rx = acp
+        // SessionId is `Arc<str>`; cloning here is cheap and lets us commit the
+        // antigravity cache after `session_id` is moved into `prompt()` below.
+        let session_id_for_commit = session_id.clone();
+
+        let response_rx = acp
             .prompt(session_id, content)
             .await
             .map_err(|e| DaemonError::InternalError(format!("Failed to send ACP prompt: {}", e)))?;
@@ -3925,61 +4167,179 @@ async fn stream_acp_completion(
         // Drop the lock before doing I/O on the receiver.
         drop(providers);
 
-        // Accumulate all text to extract <tool_call> XML at the end.
-        let mut accumulated_text = String::new();
-        let mut had_context_error = false;
+        let outcome = drive_acp_prompt(
+            response_rx,
+            use_mcp_bridge,
+            level,
+            &tx,
+            host_services.as_ref(),
+        )
+        .await;
 
-        while let Some(update) = response_rx.recv().await {
-            match update {
-                AcpUpdate::Text(text) => {
-                    accumulated_text.push_str(&text);
-                    // Stream text chunks immediately for real-time display.
-                    // Tool call extraction happens at Complete.
-                    let _ = tx
-                        .send(LlmStreamChunk {
-                            usage: None,
-                            text: Some(text),
-                            tool_calls: vec![],
-                            done: false,
-                            reasoning: None,
-                            images: vec![],
-                        })
+        match outcome? {
+            AcpAttempt::Completed => {
+                // Only trust the incremental cache when the FULL prefix was
+                // actually delivered to agy: level 0 (build_acp_content did not
+                // compress-drop history) AND the char-cap did not truncate. If
+                // either dropped content, agy holds less than request.messages,
+                // so leave the cache empty and let the next turn rebuild honestly
+                // rather than send a delta assuming context agy never received.
+                if matches!(provider, ProviderType::Antigravity) {
+                    if level == 0 && !antigravity_capped {
+                        // Commit only settled history (all-but-last): the current
+                        // enriched message would hash differently once persisted raw.
+                        let commit_hashes =
+                            antigravity_session::stable_commit_hashes(&request.messages);
+                        tracing::info!(
+                            "antigravity: commit (rebuild) — session now holds {} settled msgs",
+                            commit_hashes.len()
+                        );
+                        antigravity_session::commit(
+                            session_id_for_commit.clone(),
+                            commit_hashes,
+                            antigravity_session::system_hash(&request.system),
+                        )
                         .await;
+                    } else {
+                        tracing::warn!(
+                            "antigravity: NOT committing (level={}, capped={}) — next turn will \
+                             rebuild; incremental cannot engage while this holds",
+                            level,
+                            antigravity_capped
+                        );
+                    }
                 }
-                AcpUpdate::Thought(thought) => {
+                return Ok(());
+            }
+            AcpAttempt::ContextLengthRetry => continue,
+        }
+    }
+
+    Ok(())
+}
+
+/// Outcome of a single ACP prompt attempt.
+enum AcpAttempt {
+    /// The agent finished the turn (Complete, or the stream closed cleanly).
+    Completed,
+    /// The agent reported a context-length error and a lower compression level
+    /// should be retried (only returned when `level < 2`).
+    ContextLengthRetry,
+}
+
+/// Send one prompt and consume its streamed updates, forwarding text/thought/
+/// tool-result chunks to `tx` exactly as the inline loop did. Returns
+/// `Completed` on `Complete`/clean close, `ContextLengthRetry` on a
+/// context-length error when `level < 2`, and `Err` on any other error (or a
+/// context-length error at `level == 2`).
+async fn drive_acp_prompt(
+    mut response_rx: mpsc::Receiver<AcpUpdate>,
+    use_mcp_bridge: bool,
+    level: u8,
+    tx: &mpsc::Sender<LlmStreamChunk>,
+    host_services: Option<&crate::wasm::services::HostServices>,
+) -> Result<AcpAttempt> {
+    // Accumulate all text to extract <tool_call> XML at the end.
+    let mut accumulated_text = String::new();
+
+    while let Some(update) = response_rx.recv().await {
+        match update {
+            AcpUpdate::Text(text) => {
+                accumulated_text.push_str(&text);
+                // Stream text chunks immediately for real-time display.
+                // Tool call extraction happens at Complete.
+                let _ = tx
+                    .send(LlmStreamChunk {
+                        usage: None,
+                        text: Some(text),
+                        tool_calls: vec![],
+                        done: false,
+                        reasoning: None,
+                        images: vec![],
+                    })
+                    .await;
+            }
+            AcpUpdate::Thought(thought) => {
+                let _ = tx
+                    .send(LlmStreamChunk {
+                        usage: None,
+                        text: None,
+                        tool_calls: vec![],
+                        done: false,
+                        reasoning: Some(thought),
+                        images: vec![],
+                    })
+                    .await;
+            }
+            AcpUpdate::ToolResult { tool_name, content } => {
+                // Native ACP-agent tool (Bash/Read/Edit/etc, not a
+                // NevoFlux MCP tool — those are already recorded by
+                // `execute_mcp_tool`). Record it the same way so
+                // `/loop` verify and `/goal` checks can find it via
+                // `MessageRepository::list_recent_tool_results`,
+                // regardless of which tool the ACP agent used.
+                if let Some(services) = host_services {
+                    crate::wasm::mcp_tool_executor::record_acp_tool_result(
+                        services,
+                        &tool_name,
+                        &content,
+                    );
+                }
+            }
+            AcpUpdate::Complete(_) => {
+                if use_mcp_bridge {
+                    // MCP mode: no tool call extraction — tools called natively via MCP.
+                    // Send done:true so the forwarder completes and agent returns.
+                    // Pending artifacts (from create_artifact) are drained and sent
+                    // by server.rs after the agent returns — sidebar handles artifact
+                    // messages independently of the streaming done signal.
                     let _ = tx
                         .send(LlmStreamChunk {
                             usage: None,
                             text: None,
                             tool_calls: vec![],
-                            done: false,
-                            reasoning: Some(thought),
+                            done: true,
+                            reasoning: None,
                             images: vec![],
                         })
                         .await;
-                }
-                AcpUpdate::ToolResult { tool_name, content } => {
-                    // Native ACP-agent tool (Bash/Read/Edit/etc, not a
-                    // NevoFlux MCP tool — those are already recorded by
-                    // `execute_mcp_tool`). Record it the same way so
-                    // `/loop` verify and `/goal` checks can find it via
-                    // `MessageRepository::list_recent_tool_results`,
-                    // regardless of which tool the ACP agent used.
-                    if let Some(services) = host_services.as_ref() {
-                        crate::wasm::mcp_tool_executor::record_acp_tool_result(
-                            services,
-                            &tool_name,
-                            &content,
+                } else {
+                    // Direct mode: extract tool calls from the accumulated text.
+                    let (cleaned_text, extracted) =
+                        extract_tool_calls_from_text(&accumulated_text);
+
+                    let tool_calls: Vec<LlmToolCall> = extracted
+                        .into_iter()
+                        .map(|tc| LlmToolCall {
+                            id: tc.id.clone(),
+                            call_id: Some(tc.id),
+                            name: tc.name,
+                            arguments: tc.arguments,
+                            signature: None,
+                        })
+                        .collect();
+
+                    if !tool_calls.is_empty() {
+                        tracing::info!(
+                            "ACP: extracted {} tool calls from text",
+                            tool_calls.len()
                         );
-                    }
-                }
-                AcpUpdate::Complete(_) => {
-                    if use_mcp_bridge {
-                        // MCP mode: no tool call extraction — tools called natively via MCP.
-                        // Send done:true so the forwarder completes and agent returns.
-                        // Pending artifacts (from create_artifact) are drained and sent
-                        // by server.rs after the agent returns — sidebar handles artifact
-                        // messages independently of the streaming done signal.
+                        // Send cleaned text (without <tool_call> XML) + tool calls
+                        let _ = tx
+                            .send(LlmStreamChunk {
+                                usage: None,
+                                text: if cleaned_text.is_empty() {
+                                    None
+                                } else {
+                                    Some(cleaned_text)
+                                },
+                                tool_calls,
+                                done: true,
+                                reasoning: None,
+                                images: vec![],
+                            })
+                            .await;
+                    } else {
                         let _ = tx
                             .send(LlmStreamChunk {
                                 usage: None,
@@ -3990,81 +4350,28 @@ async fn stream_acp_completion(
                                 images: vec![],
                             })
                             .await;
-                    } else {
-                        // Direct mode: extract tool calls from the accumulated text.
-                        let (cleaned_text, extracted) =
-                            extract_tool_calls_from_text(&accumulated_text);
-
-                        let tool_calls: Vec<LlmToolCall> = extracted
-                            .into_iter()
-                            .map(|tc| LlmToolCall {
-                                id: tc.id.clone(),
-                                call_id: Some(tc.id),
-                                name: tc.name,
-                                arguments: tc.arguments,
-                                signature: None,
-                            })
-                            .collect();
-
-                        if !tool_calls.is_empty() {
-                            tracing::info!(
-                                "ACP: extracted {} tool calls from text",
-                                tool_calls.len()
-                            );
-                            // Send cleaned text (without <tool_call> XML) + tool calls
-                            let _ = tx
-                                .send(LlmStreamChunk {
-                                    usage: None,
-                                    text: if cleaned_text.is_empty() {
-                                        None
-                                    } else {
-                                        Some(cleaned_text)
-                                    },
-                                    tool_calls,
-                                    done: true,
-                                    reasoning: None,
-                                    images: vec![],
-                                })
-                                .await;
-                        } else {
-                            let _ = tx
-                                .send(LlmStreamChunk {
-                                    usage: None,
-                                    text: None,
-                                    tool_calls: vec![],
-                                    done: true,
-                                    reasoning: None,
-                                    images: vec![],
-                                })
-                                .await;
-                        }
                     }
-                    return Ok(());
                 }
-                AcpUpdate::Error(e) => {
-                    if e.to_lowercase().contains("context")
-                        && e.to_lowercase().contains("length")
-                        && level < 2
-                    {
-                        tracing::warn!(
-                            "Context length exceeded at level {}, retrying with level {}",
-                            level,
-                            level + 1
-                        );
-                        had_context_error = true;
-                        break;
-                    }
-                    return Err(DaemonError::InternalError(format!("ACP error: {}", e)));
-                }
+                return Ok(AcpAttempt::Completed);
             }
-        }
-
-        if !had_context_error {
-            return Ok(());
+            AcpUpdate::Error(e) => {
+                if e.to_lowercase().contains("context")
+                    && e.to_lowercase().contains("length")
+                    && level < 2
+                {
+                    tracing::warn!(
+                        "Context length exceeded at level {}, retrying with level {}",
+                        level,
+                        level + 1
+                    );
+                    return Ok(AcpAttempt::ContextLengthRetry);
+                }
+                return Err(DaemonError::InternalError(format!("ACP error: {}", e)));
+            }
         }
     }
 
-    Ok(())
+    Ok(AcpAttempt::Completed)
 }
 
 /// Build the system prompt with tool definitions appended.
@@ -4133,6 +4440,70 @@ fn build_acp_content(
 }
 
 /// Build minimal ACP content: system prompt + last message only.
+/// Command-line-safe prompt budget for the antigravity provider. The
+/// antigravity-acp adapter spawns `agy -p <prompt>` and Windows CreateProcess
+/// caps the whole command line at 32767 chars; leave headroom for agy's other
+/// args (`--add-dir <path>`, `--dangerously-skip-permissions`, `--model`, …).
+const ANTIGRAVITY_PROMPT_CHAR_BUDGET: usize = 30_000;
+
+/// Total character count across a content block list's text, using the same
+/// join-with-blank-line accounting as [`cap_acp_content_for_spawn`] so the
+/// pre-cap "would this overflow the budget" check matches what the cap
+/// itself measures.
+fn content_char_count(content: &[ContentBlock]) -> usize {
+    // Mirror cap_acp_content_for_spawn's `joined` exactly: text blocks joined by
+    // a blank line ("\n\n" = 2 chars) between adjacent blocks. This makes the
+    // count an EXACT predicate for "would the cap truncate this?", which the
+    // antigravity cache-commit honesty gate relies on.
+    let mut total = 0usize;
+    let mut first = true;
+    for block in content {
+        if let ContentBlock::Text(t) = block {
+            if !first {
+                total += 2; // "\n\n" join separator
+            }
+            first = false;
+            total += t.text.chars().count();
+        }
+    }
+    total
+}
+
+/// Cap total ACP prompt text so it fits in a single command-line argument
+/// (see [`ANTIGRAVITY_PROMPT_CHAR_BUDGET`]). Keeps the head (system framing)
+/// and tail (recent history + current user message), dropping the middle.
+/// Lossy but keeps antigravity usable instead of hard-failing ENAMETOOLONG.
+fn cap_acp_content_for_spawn(content: Vec<ContentBlock>, max_chars: usize) -> Vec<ContentBlock> {
+    let mut joined = String::new();
+    for block in &content {
+        if let ContentBlock::Text(t) = block {
+            if !joined.is_empty() {
+                joined.push_str("\n\n");
+            }
+            joined.push_str(&t.text);
+        }
+    }
+    if joined.chars().count() <= max_chars {
+        return content;
+    }
+    let marker =
+        "\n\n...[earlier context truncated to fit the Antigravity CLI command-line limit]...\n\n";
+    let keep = max_chars.saturating_sub(marker.chars().count());
+    let head = keep * 45 / 100;
+    let tail = keep - head;
+    let chars: Vec<char> = joined.chars().collect();
+    tracing::warn!(
+        "antigravity: prompt {} chars > {} budget; truncating older context to fit agy -p",
+        chars.len(),
+        max_chars
+    );
+    let head_s: String = chars[..head].iter().collect();
+    let tail_s: String = chars[chars.len() - tail..].iter().collect();
+    vec![ContentBlock::Text(TextContent::new(format!(
+        "{head_s}{marker}{tail_s}"
+    )))]
+}
+
 fn build_acp_content_minimal(request: &LlmChatRequest) -> Vec<ContentBlock> {
     let mut blocks = Vec::new();
 
@@ -4291,22 +4662,41 @@ pub(crate) fn skill_invocation_message(skill_name: &str, args: &str) -> String {
     }
 }
 
+/// A skill successfully folded into an ACP request by
+/// [`apply_acp_skill_command`]. Antigravity paths retain this so that, if the
+/// resulting prompt overflows the command-line budget, [`skill_file_fallback`]
+/// can rewrite the inlined instructions into a file pointer instead of losing
+/// them to the blunt char-cap. Other providers ignore the return value —
+/// their behavior is unaffected.
+pub(crate) struct AppliedSkill {
+    pub name: String,
+    pub args: String,
+    /// The exact `<CRITICAL_INSTRUCTIONS>…</CRITICAL_INSTRUCTIONS>` block
+    /// prepended to `request.system`, so it can be located and stripped
+    /// verbatim if the file fallback fires.
+    pub prefix: String,
+    pub body: String,
+    pub conventions: Vec<(String, String)>,
+}
+
 /// When the last user message is an explicit `/skillname` invocation, fold the
 /// skill's instructions (and its declared convention files) into the request so
 /// they reach ACP agents that bypass the native `/skill` router. No-op when
 /// there is no leading slash command or the skill is unknown — so messages
 /// already routed natively (slash already stripped) are left untouched, which
-/// avoids double injection.
+/// avoids double injection. Returns the injected skill's details so antigravity
+/// callers can fall back to a file-based pointer if the prompt overflows its
+/// command-line budget; other providers discard the return value.
 async fn apply_acp_skill_command(
     request: &mut LlmChatRequest,
     services: &crate::wasm::services::HostServices,
-) {
+) -> Option<AppliedSkill> {
     let Some(idx) = request.messages.iter().rposition(|m| m.role == "user") else {
-        return;
+        return None;
     };
     let (name, args) = match parse_slash_command(&request.messages[idx].content) {
         Some((n, a)) => (n.to_string(), a.to_string()),
-        None => return,
+        None => return None,
     };
 
     // Resolve the skill + its convention dependencies, cloning owned strings so
@@ -4321,7 +4711,7 @@ async fn apply_acp_skill_command(
                 "ACP skill router: '/{}' is not a known skill, leaving as-is",
                 name
             );
-            return;
+            return None;
         };
         let body = skill.content.clone();
         let mut conv: Vec<(String, String)> = Vec::new();
@@ -4352,7 +4742,7 @@ async fn apply_acp_skill_command(
     let (prefix, cleaned) = build_skill_injection(&name, &args, &skill_body, &conventions);
     request.system = Some(match request.system.take() {
         Some(existing) => format!("{prefix}\n\n{existing}"),
-        None => prefix,
+        None => prefix.clone(),
     });
     request.messages[idx].content = cleaned;
 
@@ -4361,6 +4751,128 @@ async fn apply_acp_skill_command(
         name,
         conv_count
     );
+
+    Some(AppliedSkill {
+        name,
+        args,
+        prefix,
+        body: skill_body,
+        conventions,
+    })
+}
+
+/// When a skill-injected antigravity prompt would exceed the CLI budget, the
+/// blunt char-cap would shred the skill instructions. Instead, write the skill
+/// body (+conventions) to a file in agy's workspace (already exposed via
+/// --add-dir) and replace the inlined body with a short "read this file"
+/// pointer. Returns false if the file couldn't be written (caller then falls
+/// back to the cap).
+fn skill_file_fallback(
+    request: &mut LlmChatRequest,
+    applied: &AppliedSkill,
+    workspace: &std::path::Path,
+) -> bool {
+    let dir = workspace.join("skills");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    let file = dir.join(format!("{}.md", sanitize_skill_filename(&applied.name)));
+    let mut doc = applied.body.clone();
+    for (label, content) in &applied.conventions {
+        doc.push_str(&format!(
+            "\n\n<convention source=\"{label}\">\n{content}\n</convention>"
+        ));
+    }
+    if std::fs::write(&file, doc).is_err() {
+        return false;
+    }
+    // Strip the inlined CRITICAL_INSTRUCTIONS block from system.
+    if let Some(sys) = request.system.take() {
+        let stripped = sys
+            .strip_prefix(&applied.prefix)
+            .map(|s| s.trim_start().to_string())
+            .unwrap_or(sys);
+        request.system = if stripped.is_empty() {
+            None
+        } else {
+            Some(stripped)
+        };
+    }
+    // Point the LAST user message at the file.
+    if let Some(idx) = request.messages.iter().rposition(|m| m.role == "user") {
+        request.messages[idx].content = format!(
+            "Read the file skills/{name}.md in your workspace and follow it EXACTLY as the \"{name}\" skill. Input from the user:\n\n{args}",
+            name = sanitize_skill_filename(&applied.name),
+            args = applied.args,
+        );
+    }
+    true
+}
+
+/// The workspace file agy reads its externalized system prompt from.
+const ANTIGRAVITY_SYSTEM_FILE: &str = "system-context.md";
+
+/// Externalize the antigravity system prompt to a file once it exceeds this many
+/// chars (half the CLI budget), leaving the rest of the budget for the actual
+/// message content. Small system prompts stay inline (no behavior change).
+const ANTIGRAVITY_SYSTEM_FILE_THRESHOLD: usize = ANTIGRAVITY_PROMPT_CHAR_BUDGET / 2;
+
+/// antigravity-only budget guard. A skill-laden system prompt (dozens of skills)
+/// can *alone* exceed [`ANTIGRAVITY_PROMPT_CHAR_BUDGET`], so inlining it in
+/// `agy -p` truncates every turn and — via the cache-honesty gate — keeps the
+/// session from ever committing, so incremental continuation never engages.
+///
+/// When the system prompt is large, write it to a workspace file agy can read
+/// (its cwd IS the workspace) and replace `request.system` with a short pointer
+/// that embeds a content-version hash: an unchanged system prompt yields the
+/// same pointer (stable `system_hash` → no spurious `context_update`), while a
+/// changed one changes the pointer → `system_changed` → a re-read is emitted.
+///
+/// MUST run before the session hashes are computed so `system_hash` reflects the
+/// (stable, tiny) pointer rather than the volatile full text. antigravity-only:
+/// the sole caller is gated on `ProviderType::Antigravity`. Returns whether it
+/// rewrote the system prompt.
+fn antigravity_externalize_system(
+    request: &mut LlmChatRequest,
+    workspace: &std::path::Path,
+) -> bool {
+    use std::hash::{Hash, Hasher};
+    let Some(sys) = request.system.as_ref() else {
+        return false;
+    };
+    if sys.chars().count() <= ANTIGRAVITY_SYSTEM_FILE_THRESHOLD {
+        return false;
+    }
+    let version = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        sys.hash(&mut h);
+        h.finish()
+    };
+    if std::fs::create_dir_all(workspace).is_err() {
+        return false;
+    }
+    let file = workspace.join(ANTIGRAVITY_SYSTEM_FILE);
+    if std::fs::write(&file, sys).is_err() {
+        return false;
+    }
+    request.system = Some(format!(
+        "Your full system instructions live in the file `{ANTIGRAVITY_SYSTEM_FILE}` in your \
+         workspace (version {version:x}). Read that file NOW and follow it EXACTLY as your \
+         system prompt for this and every following turn in this conversation."
+    ));
+    true
+}
+
+fn sanitize_skill_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -4469,6 +4981,146 @@ mod acp_skill_router_tests {
         let (_, cleaned) = build_skill_injection("brain-recall", "", "BODY", &[]);
         assert!(cleaned.contains("brain-recall"));
         assert!(!cleaned.starts_with('/'));
+    }
+
+    #[test]
+    fn skill_file_fallback_writes_file_and_rewrites_pointer() {
+        use super::{sanitize_skill_filename, skill_file_fallback, AppliedSkill};
+        use crate::wasm::llm::{LlmChatRequest, LlmMessage};
+
+        // Build an oversized skill body/prefix the same way the real
+        // injection path does, so `prefix` matches what would actually have
+        // been prepended to `request.system`.
+        let body = "BODY LINE ".repeat(5_000); // ~50k chars — well over budget
+        let conventions = vec![(
+            "conv:label".to_string(),
+            "CONVENTION CONTENT".to_string(),
+        )];
+        let (prefix, _cleaned) =
+            build_skill_injection("big-skill", "do the thing", &body, &conventions);
+        let applied = AppliedSkill {
+            name: "big-skill".to_string(),
+            args: "do the thing".to_string(),
+            prefix: prefix.clone(),
+            body: body.clone(),
+            conventions: conventions.clone(),
+        };
+
+        let mut request = LlmChatRequest {
+            messages: vec![LlmMessage::user("some prior cleaned content")],
+            system: Some(format!("{prefix}\n\nEXISTING SYSTEM PROMPT")),
+            ..Default::default()
+        };
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let ok = skill_file_fallback(&mut request, &applied, workspace.path());
+        assert!(ok, "skill_file_fallback should succeed writing to a temp dir");
+
+        // File exists and contains the body + conventions.
+        let file_path = workspace
+            .path()
+            .join("skills")
+            .join(format!("{}.md", sanitize_skill_filename(&applied.name)));
+        assert!(file_path.exists(), "expected {:?} to exist", file_path);
+        let contents = std::fs::read_to_string(&file_path).expect("read fallback file");
+        assert!(contents.contains(&body));
+        assert!(contents.contains("CONVENTION CONTENT"));
+
+        // The inlined CRITICAL_INSTRUCTIONS prefix was stripped from system,
+        // leaving the pre-existing system text intact.
+        let sys = request.system.as_deref().expect("system retained");
+        assert!(!sys.contains("CRITICAL_INSTRUCTIONS"));
+        assert!(sys.contains("EXISTING SYSTEM PROMPT"));
+
+        // The last user message became the "read this file" pointer.
+        let last = request.messages.last().expect("has a message");
+        assert_eq!(last.role, "user");
+        assert!(last.content.contains("Read the file skills/big-skill.md"));
+        assert!(last.content.contains("do the thing"));
+    }
+
+    /// A large (skill-laden) system prompt must be externalized to a workspace
+    /// file so the inline `agy -p` prompt stays under budget — the fix that lets
+    /// turn 1 commit and turn 2 go incremental. Also guards the two properties
+    /// the session cache relies on: the pointer is small (system_hash tiny), and
+    /// it is STABLE for identical system text (no spurious context_update) yet
+    /// CHANGES when the system text changes (a real re-read fires).
+    #[test]
+    fn antigravity_externalize_system_shrinks_and_versions() {
+        use super::{
+            antigravity_externalize_system, ANTIGRAVITY_PROMPT_CHAR_BUDGET, ANTIGRAVITY_SYSTEM_FILE,
+            ANTIGRAVITY_SYSTEM_FILE_THRESHOLD,
+        };
+        use crate::wasm::llm::{LlmChatRequest, LlmMessage};
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+
+        // A system prompt well over the threshold (mimics dozens of injected skills).
+        let big_sys = "SKILL INSTRUCTIONS ".repeat(3_000); // ~57k chars
+        assert!(big_sys.chars().count() > ANTIGRAVITY_SYSTEM_FILE_THRESHOLD);
+        let mut req = LlmChatRequest {
+            messages: vec![LlmMessage::user("remember BANANA-42")],
+            system: Some(big_sys.clone()),
+            ..Default::default()
+        };
+
+        let rewrote = antigravity_externalize_system(&mut req, workspace.path());
+        assert!(rewrote, "large system prompt must be externalized");
+
+        // The file holds the FULL original system text.
+        let file = workspace.path().join(ANTIGRAVITY_SYSTEM_FILE);
+        assert!(file.exists());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), big_sys);
+
+        // The inline system is now a short pointer well under budget.
+        let ptr = req.system.clone().expect("pointer");
+        assert!(ptr.contains(ANTIGRAVITY_SYSTEM_FILE));
+        assert!(
+            ptr.chars().count() < ANTIGRAVITY_PROMPT_CHAR_BUDGET / 10,
+            "pointer must be tiny; got {} chars",
+            ptr.chars().count()
+        );
+
+        // Stable: same system text → identical pointer (no spurious re-send).
+        let mut req_same = LlmChatRequest {
+            messages: vec![LlmMessage::user("x")],
+            system: Some(big_sys.clone()),
+            ..Default::default()
+        };
+        assert!(antigravity_externalize_system(&mut req_same, workspace.path()));
+        assert_eq!(req_same.system, req.system, "identical system → identical pointer");
+
+        // Versioned: different system text → different pointer (triggers re-read).
+        let mut req_changed = LlmChatRequest {
+            messages: vec![LlmMessage::user("x")],
+            system: Some(format!("{big_sys} CHANGED")),
+            ..Default::default()
+        };
+        assert!(antigravity_externalize_system(&mut req_changed, workspace.path()));
+        assert_ne!(
+            req_changed.system, req.system,
+            "changed system → changed pointer (context_update must fire)"
+        );
+
+        // Below threshold: left inline, no file rewrite (non-antigravity-sized prompts unaffected).
+        let mut req_small = LlmChatRequest {
+            messages: vec![LlmMessage::user("hi")],
+            system: Some("short system".to_string()),
+            ..Default::default()
+        };
+        assert!(!antigravity_externalize_system(&mut req_small, workspace.path()));
+        assert_eq!(req_small.system.as_deref(), Some("short system"));
+    }
+
+    #[test]
+    fn sanitize_skill_filename_escapes_unsafe_chars() {
+        use super::sanitize_skill_filename;
+        assert_eq!(sanitize_skill_filename("brain-recall"), "brain-recall");
+        assert_eq!(sanitize_skill_filename("my_skill_2"), "my_skill_2");
+        assert_eq!(
+            sanitize_skill_filename("weird/name with spaces?.md"),
+            "weird_name_with_spaces__md"
+        );
     }
 }
 
@@ -5291,6 +5943,93 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cap_acp_content_leaves_small_prompt_untouched() {
+        let content = vec![
+            ContentBlock::Text(TextContent::new("system".to_string())),
+            ContentBlock::Text(TextContent::new("hello".to_string())),
+        ];
+        let capped = cap_acp_content_for_spawn(content, 30_000);
+        // Under budget → unchanged (still two blocks).
+        assert_eq!(capped.len(), 2);
+    }
+
+    #[test]
+    fn cap_acp_content_truncates_oversized_prompt_to_budget() {
+        let head = "H".repeat(40_000);
+        let tail = "USER_QUESTION_AT_END".to_string();
+        let content = vec![
+            ContentBlock::Text(TextContent::new(head)),
+            ContentBlock::Text(TextContent::new(tail.clone())),
+        ];
+        let capped = cap_acp_content_for_spawn(content, 30_000);
+        assert_eq!(capped.len(), 1, "oversized prompt collapses to one block");
+        let ContentBlock::Text(t) = &capped[0] else {
+            panic!("expected text block");
+        };
+        // Fits the command-line budget...
+        assert!(t.text.chars().count() <= 30_000, "capped under budget");
+        // ...keeps the head framing and the current user question at the tail...
+        assert!(t.text.starts_with("HHHH"));
+        assert!(t.text.contains(&tail), "current user message preserved");
+        // ...and marks the dropped middle.
+        assert!(t.text.contains("truncated to fit the Antigravity CLI"));
+    }
+
+    /// The antigravity cache-commit honesty gate trusts the cache only when
+    /// `content_char_count(&content) <= ANTIGRAVITY_PROMPT_CHAR_BUDGET`, taking
+    /// that as "the cap did NOT truncate". This regression guards that the
+    /// predicate is EXACT against `cap_acp_content_for_spawn`: whenever the
+    /// count exceeds the budget the cap truncates (collapses to one block), and
+    /// whenever it's within budget the cap is a no-op. If these ever diverge, a
+    /// capped-but-committed turn would cause a false incremental hit next turn
+    /// (agy asked for context the cap silently dropped) — the Critical bug this
+    /// test exists to prevent.
+    #[test]
+    fn content_char_count_matches_cap_truncation_exactly() {
+        // Two blocks joined by "\n\n": count MUST include the 2 separator chars.
+        let a = "x".repeat(10);
+        let b = "y".repeat(20);
+        let content = vec![
+            ContentBlock::Text(TextContent::new(a.clone())),
+            ContentBlock::Text(TextContent::new(b.clone())),
+        ];
+        assert_eq!(
+            content_char_count(&content),
+            10 + 2 + 20,
+            "must count the \\n\\n join separator, matching cap's `joined`"
+        );
+
+        // Just OVER budget → count > budget AND cap truncates (one block).
+        let budget = 30_000usize;
+        let over = vec![
+            ContentBlock::Text(TextContent::new("H".repeat(budget))),
+            ContentBlock::Text(TextContent::new("TAIL".to_string())),
+        ];
+        assert!(
+            content_char_count(&over) > budget,
+            "count must exceed budget when the cap would truncate"
+        );
+        assert_eq!(
+            cap_acp_content_for_spawn(over, budget).len(),
+            1,
+            "cap truncates -> commit gate must refuse (count > budget)"
+        );
+
+        // Exactly AT budget → count == budget AND cap is a no-op (blocks kept).
+        let at = vec![ContentBlock::Text(TextContent::new("Z".repeat(budget)))];
+        assert_eq!(content_char_count(&at), budget);
+        assert!(
+            content_char_count(&at) <= budget,
+            "at-budget content is honestly committable"
+        );
+        assert_eq!(
+            cap_acp_content_for_spawn(at, budget).len(),
+            1,
+            "at-budget content is not truncated"
+        );
+    }
 
     #[test]
     fn test_llm_message_serialization() {

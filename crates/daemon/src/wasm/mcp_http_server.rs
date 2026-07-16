@@ -143,6 +143,30 @@ async fn handle_mcp_request(
 
             tracing::info!(tool = %name, "MCP tools/call received from LLM");
 
+            // Server-side permission gate. Agents that never send
+            // session/request_permission themselves (antigravity-acp) get
+            // their tool calls gated HERE instead: read-only tools
+            // auto-approve (protocol::is_read_only_tool), everything else
+            // asks the sidebar. Providers whose agents self-report
+            // (claude-code) keep this off to avoid double prompts.
+            if state.tool_bridge.gate_tool_calls() {
+                use nevoflux_llm::providers::acp::mcp_bridge::PermissionResponse;
+                let args_summary = serde_json::to_string(&arguments).unwrap_or_default();
+                let decision = state
+                    .tool_bridge
+                    .request_permission(&name, &args_summary)
+                    .await;
+                if matches!(decision, PermissionResponse::Reject) {
+                    return json_rpc_result(
+                        id,
+                        serde_json::json!({
+                            "content": [{ "type": "text", "text": format!("Permission denied by user for tool '{}'", name) }],
+                            "isError": true
+                        }),
+                    );
+                }
+            }
+
             let tx = match state.tool_bridge.clone_executor() {
                 Some(tx) => tx,
                 None => {
@@ -374,6 +398,102 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("No active tool executor"));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_gated_bridge_rejects_mutating_tool_without_permission_handler() {
+        // gate_tool_calls=true and no permission handler set => request_permission
+        // returns Reject for non-read-only tools (mcp_bridge.rs: falls through to
+        // "no sidebar to ask user" branch). An executor IS registered to prove the
+        // rejection happens at the gate, before the tool ever reaches it.
+        let bridge = Arc::new(McpToolBridge::new());
+        bridge.set_gate_tool_calls(true);
+        let (tool_tx, mut tool_rx) = tokio::sync::mpsc::channel::<ToolCallRequest>(1);
+        bridge.set_executor(tool_tx);
+
+        // If the gate fails to reject, the executor would receive the call —
+        // fail loudly so a regression here doesn't hang the test on the
+        // never-satisfied result_rx below.
+        tokio::spawn(async move {
+            if let Some(req) = tool_rx.recv().await {
+                panic!(
+                    "gate should have rejected '{}' before reaching the executor",
+                    req.name
+                );
+            }
+        });
+
+        let (port, handle) = start_mcp_http_server(bridge).await.unwrap();
+
+        let client = test_client();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "browser_click",
+                    "arguments": { "selector": "#submit" }
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["result"]["isError"], true);
+        assert!(body["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Permission denied"));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_gated_bridge_auto_approves_read_only_tool() {
+        // gate_tool_calls=true but the tool ("browser_get_tabs") is read-only,
+        // so request_permission auto-approves it (mcp_bridge.rs is_low_risk_tool)
+        // without ever consulting a permission handler. The call must still
+        // reach the registered executor and complete normally.
+        assert!(nevoflux_protocol::is_read_only_tool("browser_get_tabs"));
+
+        let bridge = Arc::new(McpToolBridge::new());
+        bridge.set_gate_tool_calls(true);
+        let (tool_tx, mut tool_rx) = tokio::sync::mpsc::channel::<ToolCallRequest>(1);
+        bridge.set_executor(tool_tx);
+
+        tokio::spawn(async move {
+            if let Some(req) = tool_rx.recv().await {
+                assert_eq!(req.name, "browser_get_tabs");
+                let _ = req.result_tx.send(Ok("[]".to_string()));
+            }
+        });
+
+        let (port, handle) = start_mcp_http_server(bridge).await.unwrap();
+
+        let client = test_client();
+        let resp = client
+            .post(format!("http://127.0.0.1:{port}/mcp"))
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "browser_get_tabs",
+                    "arguments": {}
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["result"]["isError"], false);
+        assert_eq!(body["result"]["content"][0]["text"], "[]");
 
         handle.abort();
     }
