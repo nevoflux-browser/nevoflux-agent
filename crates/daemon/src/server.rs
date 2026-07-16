@@ -7106,6 +7106,7 @@ async fn handle_chat_message(
                 // `schedule_*`/`goal_*` LLM tools use — rather than
                 // re-implementing the ScheduleManager/GoalManager calls here.
                 "schedule.list" => handle_schedule_list(services, &params).await,
+                "loop.list" => handle_loop_list(services, &params).await,
                 "schedule.runs" => handle_schedule_runs(services, &params).await,
                 "schedule.pause" => {
                     handle_schedule_mutation(services, &params, "schedule.pause", "schedule_pause")
@@ -7976,6 +7977,84 @@ async fn handle_schedule_list(
                     "code": "SCHEDULE_ERROR",
                     "message": e
                 }
+            }
+        }),
+    }
+}
+
+/// Handle loop.list command — the Loop Jobs panel's on-open backfill.
+///
+/// `{ session_id }` -> `{ loops: [...] }`. Queries the LoopManager's DB directly
+/// (`list_by_session`), so it works regardless of whether loop EventBus events
+/// were ever published — the maximized Loop Jobs panel loads as a fresh page
+/// with an empty `ctx.loops` and needs an authoritative snapshot, and some
+/// create/iteration paths drive a bus-less LoopManager that emits no
+/// `system:loop:*` events at all. Mirrors `handle_schedule_list` +
+/// `jobs_panel`'s `schedule_list()`-on-open. Each row carries the full field set
+/// the sidebar `LoopState` needs so the panel can render complete cards.
+async fn handle_loop_list(
+    services: &HostServices,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+    let session_id = params
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let Some(mgr) = services.loop_manager.as_ref() else {
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "loop.list",
+                "success": false,
+                "error": { "code": "LOOP_MANAGER_UNAVAILABLE", "message": "LoopManager not configured" }
+            }
+        });
+    };
+
+    match mgr.list_by_session(&session_id).await {
+        Ok(rows) => {
+            let loops: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "loop_id": r.id,
+                        "session_id": r.session_id,
+                        "trigger_expr": r.trigger_expr,
+                        "prompt_text": r.prompt_text,
+                        "wrapped_skill": r.wrapped_skill,
+                        "state": r.state.as_str(),
+                        "iteration_count": r.iteration_count,
+                        "skipped_triggers": r.skipped_triggers,
+                        "scratchpad_bytes": r.scratchpad.chars().count() as i64,
+                        "scratchpad_preview": r.scratchpad.chars().take(120).collect::<String>(),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "type": "system_response",
+                "payload": {
+                    "request_id": request_id,
+                    "command": "loop.list",
+                    "success": true,
+                    "data": { "loops": loops }
+                }
+            })
+        }
+        Err(e) => serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "loop.list",
+                "success": false,
+                "error": { "code": "LOOP_ERROR", "message": e }
             }
         }),
     }
