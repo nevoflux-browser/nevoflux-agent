@@ -41,8 +41,17 @@ impl LoopEvents {
         let Some(bus) = &self.bus else {
             return;
         };
+        // STICKY (not ephemeral): the EventBus only replays sticky events to new
+        // subscribers. A loop still in its initial `Pending` state has emitted
+        // ONLY this `created` event (no `state_changed` yet), so if it were
+        // ephemeral a fresh subscriber — e.g. the maximized Loop Jobs panel,
+        // which loads as a brand-new page with an empty `ctx.loops` — would never
+        // learn the loop exists and render an empty panel. Sticky makes `created`
+        // replay on subscribe, mirroring `state_changed` below and the schedule
+        // events. Terminal loops stay consistent: the cancel/fail paths emit a
+        // sticky `state_changed` → terminal that supersedes this on replay.
         let _ = bus
-            .publish(BusEvent::ephemeral(
+            .publish(BusEvent::sticky(
                 "system:loop:created",
                 json!({
                     "session_id": session_id,
@@ -330,5 +339,50 @@ mod tests {
         };
         evts.proposal("s1", &id, &p).await;
         evts.proposal_resolved("s1", &id, "prop-1", true).await;
+    }
+
+    /// Regression: `system:loop:created` MUST be sticky so a subscriber that
+    /// joins AFTER the loop was created still learns it exists. This is the
+    /// maximized Loop Jobs panel: maximizing opens a brand-new page that
+    /// subscribes fresh (`replay_sticky=true`) with an empty `ctx.loops`. If
+    /// `created` were ephemeral (the bug), a loop still in `Pending` — which has
+    /// emitted only `created`, no `state_changed` yet — would never be replayed
+    /// and the panel would be empty.
+    #[tokio::test]
+    async fn created_is_sticky_so_late_subscribers_see_the_loop() {
+        use crate::event_bus::types::{
+            BackpressurePolicy, Delivery, SubscriberIdentity, TopicPattern,
+        };
+        use std::sync::Arc;
+
+        let bus = Arc::new(EventBus::new());
+        let evts = LoopEvents::from_arc(bus.clone());
+        let id = LoopId("loop-xyz".into());
+
+        // Loop is created BEFORE anyone subscribes (docked sidebar was the only
+        // live listener; it then goes away when the user maximizes).
+        evts.created("sess-1", &id, "time:2m", Some("drink water"), None)
+            .await;
+
+        // A NEW subscriber joins afterwards (the maximized panel) and asks for
+        // sticky replay — exactly what the sidebar does.
+        let mut handle = bus
+            .subscribe_with_options(
+                TopicPattern::double_wildcard("system:loop"),
+                SubscriberIdentity::Internal,
+                BackpressurePolicy::DropNewest,
+                32,
+                true, // replay_sticky
+            )
+            .expect("subscribe should succeed");
+
+        let ev = handle
+            .rx
+            .try_recv()
+            .expect("late subscriber must receive the replayed created event");
+        assert_eq!(ev.topic, "system:loop:created");
+        assert_eq!(ev.delivery, Delivery::Sticky, "created must be sticky");
+        assert_eq!(ev.payload["loop_id"], serde_json::json!("loop-xyz"));
+        assert_eq!(ev.payload["session_id"], serde_json::json!("sess-1"));
     }
 }
