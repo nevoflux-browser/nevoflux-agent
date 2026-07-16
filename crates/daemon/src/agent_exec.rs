@@ -165,6 +165,20 @@ pub(crate) fn backfill_managers(services: &mut HostServices) {
             services.goal_manager = Some(mgr.clone());
         }
     }
+    // Back-fill the shared EventBus for the same reason as the managers above:
+    // an unattended run (loop/schedule/evolve iteration) inherits a services
+    // snapshot captured at boot BEFORE `with_event_bus` was applied (the
+    // IterationExecutor's snapshot is taken at server.rs where the LoopManager
+    // is constructed, one line before `services.with_event_bus`). Without this,
+    // `notify_user` inside an iteration fails with "EventBus not configured"
+    // and the loop can only degrade to a verbal reminder. `CURRENT_EVENT_BUS`
+    // is published at daemon startup (server::start), so this restores the real
+    // toast/OS-notification bridge for every run_agent_once caller.
+    if services.event_bus.is_none() {
+        if let Some(bus) = crate::kb_wizard::CURRENT_EVENT_BUS.get() {
+            services.event_bus = Some(bus.clone());
+        }
+    }
 }
 
 /// Run a single unattended agent turn.
@@ -497,12 +511,15 @@ mod tests {
             None,
             Arc::new(crate::config::AgentConfig::default()),
         ));
+        let _ =
+            crate::kb_wizard::CURRENT_EVENT_BUS.set(Arc::new(crate::event_bus::EventBus::new()));
 
-        // A snapshot with none of the three managers wired.
+        // A snapshot with no managers and no event bus wired.
         let mut services = HostServices::new(Arc::new(db));
         assert!(services.loop_manager.is_none());
         assert!(services.schedule_manager.is_none());
         assert!(services.goal_manager.is_none());
+        assert!(services.event_bus.is_none());
 
         backfill_managers(&mut services);
 
@@ -517,6 +534,10 @@ mod tests {
         assert!(
             services.goal_manager.is_some(),
             "goal_manager back-filled from CURRENT_GOAL_MANAGER"
+        );
+        assert!(
+            services.event_bus.is_some(),
+            "event_bus back-filled from CURRENT_EVENT_BUS so notify_user works in iterations"
         );
     }
 
