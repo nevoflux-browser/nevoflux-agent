@@ -4852,14 +4852,54 @@ fn antigravity_externalize_system(
         return false;
     }
     let file = workspace.join(ANTIGRAVITY_SYSTEM_FILE);
-    if std::fs::write(&file, sys).is_err() {
+
+    // The `# Skills` catalog is what drives the model's `skill_load(name)`
+    // decisions (e.g. "每2分钟提醒我喝水" → the `loop` skill). agy does NOT
+    // reliably read the externalized workspace file (probe: it connects to our
+    // MCP server and fetches the full tool list, yet makes zero tool calls —
+    // never even `skill_load` — when the catalog is behind a "read this file"
+    // pointer). So we keep the skills catalog INLINE and externalize only the
+    // bulkier surrounding sections (base framing, tool/agent prose). The
+    // catalog sits in the prompt head, well inside the cap's head budget, so it
+    // survives `cap_acp_content_for_spawn` even on long turns.
+    const SKILLS_HEADING: &str = "\n\n# Skills\n\n";
+    let (externalized_body, inline_skills): (String, Option<String>) =
+        if let Some(start) = sys.find(SKILLS_HEADING) {
+            // Skills section runs from its heading to the next top-level `\n\n# `
+            // heading (tools/agents prose) or end of prompt.
+            let body_start = start + SKILLS_HEADING.len();
+            let end = sys[body_start..]
+                .find("\n\n# ")
+                .map(|i| body_start + i)
+                .unwrap_or_else(|| sys.len());
+            let skills = sys[start..end].to_string();
+            // Everything else = base (before skills) + trailing sections (after).
+            let mut rest = String::with_capacity(sys.len() - skills.len());
+            rest.push_str(&sys[..start]);
+            rest.push_str(&sys[end..]);
+            (rest, Some(skills))
+        } else {
+            // No skills catalog (e.g. skills disabled) — fall back to full
+            // externalization, unchanged behavior.
+            (sys.clone(), None)
+        };
+
+    if std::fs::write(&file, &externalized_body).is_err() {
         return false;
     }
-    request.system = Some(format!(
-        "Your full system instructions live in the file `{ANTIGRAVITY_SYSTEM_FILE}` in your \
-         workspace (version {version:x}). Read that file NOW and follow it EXACTLY as your \
-         system prompt for this and every following turn in this conversation."
-    ));
+
+    let pointer = format!(
+        "The rest of your system instructions (base framing, tool and agent \
+         reference) live in the file `{ANTIGRAVITY_SYSTEM_FILE}` in your workspace \
+         (version {version:x}). Read that file NOW and follow it EXACTLY for this and \
+         every following turn in this conversation."
+    );
+    request.system = Some(match inline_skills {
+        // Skills catalog stays inline (the model must see it to route requests
+        // to `skill_load`); the pointer covers the externalized remainder.
+        Some(skills) => format!("{pointer}{skills}"),
+        None => pointer,
+    });
     true
 }
 
@@ -5110,6 +5150,55 @@ mod acp_skill_router_tests {
         };
         assert!(!antigravity_externalize_system(&mut req_small, workspace.path()));
         assert_eq!(req_small.system.as_deref(), Some("short system"));
+    }
+
+    /// The `# Skills` catalog MUST stay inline (agy doesn't read the externalized
+    /// file, so a pointer-only system prompt leaves it unable to route requests
+    /// to `skill_load` — the "agy never calls loop_create" bug). Only the base
+    /// framing and trailing tool/agent prose get externalized.
+    #[test]
+    fn antigravity_externalize_keeps_skills_catalog_inline() {
+        use super::{
+            antigravity_externalize_system, ANTIGRAVITY_SYSTEM_FILE,
+            ANTIGRAVITY_SYSTEM_FILE_THRESHOLD,
+        };
+        use crate::wasm::llm::{LlmChatRequest, LlmMessage};
+
+        let workspace = tempfile::tempdir().expect("tempdir");
+
+        // Realistic shape: base framing, then the Skills catalog (incl. `loop`),
+        // then trailing tool/agent prose. Padded past the externalize threshold.
+        let base = format!("BASE FRAMING {}\n", "x".repeat(ANTIGRAVITY_SYSTEM_FILE_THRESHOLD));
+        let skills = "\n\n# Skills\n\nWhen a request matches, you MUST use `skill_load(name)`.\n\n\
+             - **loop**: Re-run a prompt on a time/event/DOM trigger.\n\
+             - **schedule**: Cron or one-off background jobs.\n";
+        let trailing = "\n\n# NevoFlux Tools\n\nSome tool prose.\n\n# NevoFlux Agents\n\nAgent prose.\n";
+        let sys = format!("{base}{skills}{trailing}");
+
+        let mut req = LlmChatRequest {
+            messages: vec![LlmMessage::user("每2分钟提醒我喝水")],
+            system: Some(sys.clone()),
+            ..Default::default()
+        };
+        assert!(antigravity_externalize_system(&mut req, workspace.path()));
+
+        let inline = req.system.clone().expect("system retained");
+        // Skills catalog (incl. the loop skill + the skill_load directive) is inline.
+        assert!(inline.contains("# Skills"), "skills heading must stay inline");
+        assert!(inline.contains("**loop**"), "loop skill must stay inline");
+        assert!(inline.contains("skill_load"), "skill_load directive must stay inline");
+        // A pointer to the externalized remainder is present.
+        assert!(inline.contains(ANTIGRAVITY_SYSTEM_FILE), "pointer to file present");
+        // Base framing and trailing prose were externalized OUT of the inline text.
+        assert!(!inline.contains("BASE FRAMING"), "base framing must be externalized");
+        assert!(!inline.contains("NevoFlux Agents"), "trailing prose must be externalized");
+
+        // The file holds the externalized remainder (base + trailing), not the skills.
+        let file = workspace.path().join(ANTIGRAVITY_SYSTEM_FILE);
+        let body = std::fs::read_to_string(&file).expect("read externalized file");
+        assert!(body.contains("BASE FRAMING"), "file has base framing");
+        assert!(body.contains("NevoFlux Agents"), "file has trailing prose");
+        assert!(!body.contains("**loop**"), "skills must NOT be duplicated in the file");
     }
 
     #[test]
