@@ -4,9 +4,13 @@
 //!
 //!   **Builtin < User < Session**
 //!
-//! - [`ToolSource::Builtin`] tools are shipped with the daemon.
+//! - [`ToolSource::Builtin`] tools would ship with the daemon. None do today —
+//!   the daemon configures no builtin directory, so this layer stays empty and
+//!   `is_override` is always false. The tier is kept because it is part of the
+//!   wire protocol and the override/restore semantics below.
 //! - [`ToolSource::User`] tools are loaded from the user's config directory
-//!   and override builtins with the same name.
+//!   (hand-authored, or installed by a pack) and override builtins with the
+//!   same name.
 //! - [`ToolSource::Session`] tools are registered dynamically at runtime and
 //!   take the highest priority; they survive [`load_from_disk`](ToolWhitelistRegistry::load_from_disk)
 //!   reloads.
@@ -61,7 +65,29 @@ impl ToolWhitelistRegistry {
         }
     }
 
-    /// Create a registry that knows where to load tool definitions from disk.
+    /// Create a registry that loads tool definitions from a user directory.
+    ///
+    /// No builtin directory is configured: the daemon does not ship any builtin
+    /// canvas tools, so the Builtin layer stays empty. Tool definitions reach a
+    /// user through their config dir, either hand-authored or installed by a
+    /// pack (see `nevoflux_pack::lifecycle`).
+    pub fn with_user_dir(user_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            tools: DashMap::new(),
+            shadowed_builtins: DashMap::new(),
+            builtin_dir: None,
+            user_dir: Some(user_dir.into()),
+        }
+    }
+
+    /// Create a registry that loads from both a builtin and a user directory.
+    ///
+    /// Nothing in the daemon ships builtin tools today, so this constructor
+    /// only backs the tests that cover the Builtin-under-User layering. Should
+    /// builtin tools ever ship, they should be embedded with `include_str!`
+    /// (see `nevoflux_builtin_wasm::BUILTIN_AGENT_ROLES`) rather than read from
+    /// a source-tree path, which does not exist on an installed binary.
+    #[cfg(test)]
     pub fn with_dirs(builtin_dir: impl Into<PathBuf>, user_dir: impl Into<PathBuf>) -> Self {
         Self {
             tools: DashMap::new(),
