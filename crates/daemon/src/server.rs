@@ -1527,9 +1527,8 @@ pub async fn start_server(
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("nevoflux");
-        let builtin_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("canvas-tools");
         let user_dir = config_dir.join("canvas-tools");
-        let reg = Arc::new(ToolWhitelistRegistry::with_dirs(builtin_dir, user_dir));
+        let reg = Arc::new(ToolWhitelistRegistry::with_user_dir(user_dir));
         // Load tools from disk in a background task
         let bg_reg = Arc::clone(&reg);
         tokio::spawn(async move {
@@ -2221,8 +2220,6 @@ pub async fn start_server(
         .unwrap_or_else(|| PathBuf::from("."))
         .join("nevoflux")
         .join("canvas-tools");
-    let process_canvas_builtin_dir =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("canvas-tools");
     let process_canvas_share_service = canvas_share_service.clone();
     let process_canvas_persist_service = canvas_persist_service.clone();
     let process_canvas_video_service = canvas_video_service.clone();
@@ -2762,9 +2759,9 @@ pub async fn start_server(
             }
 
             // Handle canvas_tool_get_raw — return the raw TOML text for the named tool.
-            // Looks in the user dir first (for User/override entries), falls back to
-            // the builtin dir. Session-source tools have no on-disk source; we report
-            // `no_raw_for_session` in that case.
+            // Only User-source tools have a file to read back: session tools are
+            // registered in-memory (`no_raw_for_session`), and no builtin tools ship
+            // with the daemon (`invalid_source`).
             if msg_type == "canvas_tool_get_raw" {
                 info!("Processing canvas_tool_get_raw message");
                 let req: Option<nevoflux_protocol::CanvasToolGetRawRequest> = envelope
@@ -2802,14 +2799,20 @@ pub async fn start_server(
                                     }),
                                 }
                             }
+                            Some(crate::canvas_tools::types::ToolSource::Builtin) => {
+                                nevoflux_protocol::CanvasToolGetRawResponse {
+                                    success: false,
+                                    toml_text: None,
+                                    origin_source: None,
+                                    error: Some(nevoflux_protocol::CanvasToolError {
+                                        code: "invalid_source".into(),
+                                        message: "only user tools have a raw source".into(),
+                                        field: None,
+                                    }),
+                                }
+                            }
                             Some(src) => {
-                                let dir = match src {
-                                    crate::canvas_tools::types::ToolSource::User => {
-                                        &process_canvas_user_dir
-                                    }
-                                    _ => &process_canvas_builtin_dir,
-                                };
-                                let path = dir.join(format!("{name}.toml"));
+                                let path = process_canvas_user_dir.join(format!("{name}.toml"));
                                 match std::fs::read_to_string(&path) {
                                     Ok(text) => nevoflux_protocol::CanvasToolGetRawResponse {
                                         success: true,
