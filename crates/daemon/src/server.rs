@@ -1510,9 +1510,7 @@ pub async fn start_server(
             .unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
             .join("nevoflux")
             .join("agents");
-        let builtin_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../builtin-wasm/prompts/agents");
-        let mut registry = crate::agent::roles::AgentRoleRegistry::new(user_dir, builtin_dir);
+        let mut registry = crate::agent::roles::AgentRoleRegistry::new(user_dir);
         if let Err(e) = registry.scan() {
             tracing::warn!("Failed to scan agent roles: {}", e);
         } else {

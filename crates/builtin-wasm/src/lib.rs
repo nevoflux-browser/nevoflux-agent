@@ -50,6 +50,22 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Wasm ABI version for compatibility checking.
 pub const ABI_VERSION: u32 = 1;
 
+/// Built-in agent role definitions as `(name, file content)` pairs.
+///
+/// The files under `prompts/agents/` are embedded at compile time so the daemon
+/// can resolve built-in roles from an installed binary, where the source tree
+/// this crate was built from does not exist. The daemon layers user-defined
+/// roles from `<config_dir>/nevoflux/agents` on top of these.
+pub const BUILTIN_AGENT_ROLES: &[(&str, &str)] = &[
+    ("explorer", include_str!("../prompts/agents/explorer.md")),
+    ("reader", include_str!("../prompts/agents/reader.md")),
+    (
+        "researcher",
+        include_str!("../prompts/agents/researcher.md"),
+    ),
+    ("worker", include_str!("../prompts/agents/worker.md")),
+];
+
 // Entry points for the Wasm module.
 // These are called by the Wasmtime host.
 

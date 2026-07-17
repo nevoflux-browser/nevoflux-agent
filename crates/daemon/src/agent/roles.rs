@@ -160,7 +160,9 @@ pub fn parse_role_frontmatter(content: &str) -> Result<(AgentRoleMetadata, Strin
 /// - L1 (scan): Parse frontmatter only to build summaries
 /// - L2 (get): Full parse on demand with caching
 ///
-/// User-defined roles override built-in roles with the same name.
+/// Built-in roles are compiled into the binary and act as a read-only base
+/// layer; user-defined roles from `user_dir` override built-ins with the same
+/// name.
 pub struct AgentRoleRegistry {
     /// L1 summaries (name -> description)
     summaries: HashMap<String, AgentRoleSummary>,
@@ -168,32 +170,52 @@ pub struct AgentRoleRegistry {
     definitions: RwLock<HashMap<String, AgentRoleDefinition>>,
     /// User role definitions directory
     user_dir: PathBuf,
-    /// Built-in role definitions directory
-    builtin_dir: PathBuf,
+    /// Built-in role sources as (name, file content) pairs.
+    ///
+    /// These are compiled into the binary rather than read from disk, so they
+    /// resolve on an installed machine where no source tree is present.
+    builtin: Vec<(String, String)>,
 }
 
 impl AgentRoleRegistry {
-    /// Create a new registry with the given directories.
-    pub fn new(user_dir: PathBuf, builtin_dir: PathBuf) -> Self {
+    /// Create a registry over `user_dir`, backed by the compiled-in built-in roles.
+    pub fn new(user_dir: PathBuf) -> Self {
+        Self::with_builtin_sources(
+            user_dir,
+            nevoflux_builtin_wasm::BUILTIN_AGENT_ROLES
+                .iter()
+                .map(|(name, content)| (name.to_string(), content.to_string()))
+                .collect(),
+        )
+    }
+
+    /// Create a registry with an explicit built-in layer.
+    ///
+    /// Tests use this to exercise the fallback behavior against synthetic roles
+    /// instead of whichever roles happen to ship in the binary.
+    pub fn with_builtin_sources(user_dir: PathBuf, builtin: Vec<(String, String)>) -> Self {
         Self {
             summaries: HashMap::new(),
             definitions: RwLock::new(HashMap::new()),
             user_dir,
-            builtin_dir,
+            builtin,
         }
     }
 
-    /// Scan both directories for role definitions (L1 loading).
+    /// Collect role summaries from both layers (L1 loading).
     ///
-    /// Scans the built-in directory first, then the user directory.
+    /// Reads the built-in layer first, then the user directory.
     /// User roles override built-in roles with the same name.
-    /// Returns the total number of roles found.
+    /// Returns the total number of distinct roles found.
     pub fn scan(&mut self) -> Result<usize, String> {
         self.summaries.clear();
         self.definitions.write().unwrap().clear();
 
-        // Scan builtin directory first
-        self.scan_directory(&self.builtin_dir.clone())?;
+        // Built-in layer first
+        let builtin = self.builtin.clone();
+        for (name, content) in &builtin {
+            self.insert_summary(content, &format!("<builtin>/{}.md", name));
+        }
         // Scan user directory (overrides builtins with same name)
         self.scan_directory(&self.user_dir.clone())?;
 
@@ -257,39 +279,50 @@ impl AgentRoleRegistry {
                 }
             };
 
-            let (metadata, _body) = match parse_role_frontmatter(&content) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    tracing::warn!("Failed to parse role file {}: {}", path.display(), e);
-                    continue;
-                }
-            };
-
-            if metadata.name.is_empty() {
-                tracing::warn!("Skipping role file {} with empty name", path.display());
-                continue;
+            if self.insert_summary(&content, &path.display().to_string()) {
+                count += 1;
             }
-
-            if metadata.description.is_empty() {
-                tracing::warn!("Role file {} has empty description", path.display());
-            }
-
-            self.summaries.insert(
-                metadata.name.clone(),
-                AgentRoleSummary {
-                    name: metadata.name,
-                    description: metadata.description,
-                },
-            );
-            count += 1;
         }
 
         Ok(count)
     }
 
-    /// Load a full role definition from disk.
+    /// Parse `content` and record its L1 summary, overwriting any earlier entry
+    /// with the same role name. `origin` labels the source in warnings.
     ///
-    /// Checks the user directory first, then falls back to the built-in directory.
+    /// Returns `true` when a summary was recorded.
+    fn insert_summary(&mut self, content: &str, origin: &str) -> bool {
+        let (metadata, _body) = match parse_role_frontmatter(content) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::warn!("Failed to parse role file {}: {}", origin, e);
+                return false;
+            }
+        };
+
+        if metadata.name.is_empty() {
+            tracing::warn!("Skipping role file {} with empty name", origin);
+            return false;
+        }
+
+        if metadata.description.is_empty() {
+            tracing::warn!("Role file {} has empty description", origin);
+        }
+
+        self.summaries.insert(
+            metadata.name.clone(),
+            AgentRoleSummary {
+                name: metadata.name,
+                description: metadata.description,
+            },
+        );
+        true
+    }
+
+    /// Load a full role definition.
+    ///
+    /// Checks the user directory first, then falls back to the compiled-in
+    /// built-in layer.
     fn load_definition(&self, name: &str) -> Result<AgentRoleDefinition, String> {
         // Try user directory first
         let user_path = self.user_dir.join(format!("{}.md", name));
@@ -297,10 +330,10 @@ impl AgentRoleRegistry {
             return self.parse_definition_file(&user_path);
         }
 
-        // Fall back to built-in directory
-        let builtin_path = self.builtin_dir.join(format!("{}.md", name));
-        if builtin_path.exists() {
-            return self.parse_definition_file(&builtin_path);
+        // Fall back to the built-in layer
+        if let Some((_, content)) = self.builtin.iter().find(|(n, _)| n == name) {
+            let (metadata, body) = parse_role_frontmatter(content)?;
+            return AgentRoleDefinition::from_metadata_and_body(metadata, body);
         }
 
         Err(format!("Role '{}' not found", name))
@@ -548,10 +581,7 @@ You write clean code.
         // Non-.md file should be ignored
         std::fs::write(roles_dir.join("notes.txt"), "not a role").unwrap();
 
-        let builtin_dir = temp_dir.path().join("builtin");
-        std::fs::create_dir_all(&builtin_dir).unwrap();
-
-        let mut registry = AgentRoleRegistry::new(roles_dir, builtin_dir);
+        let mut registry = AgentRoleRegistry::with_builtin_sources(roles_dir, Vec::new());
         let count = registry.scan().unwrap();
         assert_eq!(count, 2);
 
@@ -566,23 +596,20 @@ You write clean code.
     #[test]
     fn test_registry_user_overrides_builtin() {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let builtin_dir = temp_dir.path().join("builtin");
         let user_dir = temp_dir.path().join("user");
-        std::fs::create_dir_all(&builtin_dir).unwrap();
         std::fs::create_dir_all(&user_dir).unwrap();
 
-        // Builtin role
-        std::fs::write(
-            builtin_dir.join("writer.md"),
+        let builtin = vec![(
+            "writer".to_string(),
             r#"---
 name: writer
 description: Built-in writer role
 ---
 
 Built-in prompt.
-"#,
-        )
-        .unwrap();
+"#
+            .to_string(),
+        )];
 
         // User role with same name
         std::fs::write(
@@ -597,7 +624,7 @@ Custom prompt.
         )
         .unwrap();
 
-        let mut registry = AgentRoleRegistry::new(user_dir, builtin_dir);
+        let mut registry = AgentRoleRegistry::with_builtin_sources(user_dir, builtin);
         let count = registry.scan().unwrap();
         assert_eq!(count, 1); // Same name, so only 1 summary
 
@@ -611,9 +638,7 @@ Custom prompt.
     fn test_registry_get_caches() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let user_dir = temp_dir.path().join("user");
-        let builtin_dir = temp_dir.path().join("builtin");
         std::fs::create_dir_all(&user_dir).unwrap();
-        std::fs::create_dir_all(&builtin_dir).unwrap();
 
         std::fs::write(
             user_dir.join("tester.md"),
@@ -628,7 +653,7 @@ You test things.
         )
         .unwrap();
 
-        let mut registry = AgentRoleRegistry::new(user_dir, builtin_dir);
+        let mut registry = AgentRoleRegistry::with_builtin_sources(user_dir, Vec::new());
         registry.scan().unwrap();
 
         // First get loads from disk
@@ -648,11 +673,9 @@ You test things.
     fn test_registry_get_not_found() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let user_dir = temp_dir.path().join("user");
-        let builtin_dir = temp_dir.path().join("builtin");
         std::fs::create_dir_all(&user_dir).unwrap();
-        std::fs::create_dir_all(&builtin_dir).unwrap();
 
-        let mut registry = AgentRoleRegistry::new(user_dir, builtin_dir);
+        let mut registry = AgentRoleRegistry::with_builtin_sources(user_dir, Vec::new());
         registry.scan().unwrap();
 
         let result = registry.get("nonexistent");
@@ -664,22 +687,20 @@ You test things.
     fn test_registry_get_prefers_user_over_builtin() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let user_dir = temp_dir.path().join("user");
-        let builtin_dir = temp_dir.path().join("builtin");
         std::fs::create_dir_all(&user_dir).unwrap();
-        std::fs::create_dir_all(&builtin_dir).unwrap();
 
-        // Same name in both directories
-        std::fs::write(
-            builtin_dir.join("helper.md"),
+        // Same name in both layers
+        let builtin = vec![(
+            "helper".to_string(),
             r#"---
 name: helper
 description: Built-in helper
 ---
 
 Built-in helper prompt.
-"#,
-        )
-        .unwrap();
+"#
+            .to_string(),
+        )];
 
         std::fs::write(
             user_dir.join("helper.md"),
@@ -693,7 +714,7 @@ User helper prompt.
         )
         .unwrap();
 
-        let mut registry = AgentRoleRegistry::new(user_dir, builtin_dir);
+        let mut registry = AgentRoleRegistry::with_builtin_sources(user_dir, builtin);
         registry.scan().unwrap();
 
         let def = registry.get("helper").unwrap();
@@ -705,9 +726,8 @@ User helper prompt.
     fn test_registry_scan_nonexistent_directory() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let user_dir = temp_dir.path().join("nonexistent_user");
-        let builtin_dir = temp_dir.path().join("nonexistent_builtin");
 
-        let mut registry = AgentRoleRegistry::new(user_dir, builtin_dir);
+        let mut registry = AgentRoleRegistry::with_builtin_sources(user_dir, Vec::new());
         let count = registry.scan().unwrap();
         assert_eq!(count, 0);
         assert!(registry.list().is_empty());
@@ -717,9 +737,7 @@ User helper prompt.
     fn test_registry_scan_skips_invalid_files() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let user_dir = temp_dir.path().join("user");
-        let builtin_dir = temp_dir.path().join("builtin");
         std::fs::create_dir_all(&user_dir).unwrap();
-        std::fs::create_dir_all(&builtin_dir).unwrap();
 
         // Valid role
         std::fs::write(
@@ -749,7 +767,7 @@ Content.
         // Missing frontmatter
         std::fs::write(user_dir.join("nofm.md"), "No frontmatter here").unwrap();
 
-        let mut registry = AgentRoleRegistry::new(user_dir, builtin_dir);
+        let mut registry = AgentRoleRegistry::with_builtin_sources(user_dir, Vec::new());
         let count = registry.scan().unwrap();
         assert_eq!(count, 1);
         assert_eq!(registry.list().len(), 1);
@@ -814,12 +832,17 @@ Always add tests.
         assert!(body.contains("Always add tests."));
     }
 
+    /// Look up a role's embedded source by its catalog key.
+    fn embedded_role(name: &str) -> &'static str {
+        nevoflux_builtin_wasm::BUILTIN_AGENT_ROLES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("Built-in role not embedded: {}", name))
+            .1
+    }
+
     #[test]
     fn test_builtin_roles_parse() {
-        // Path to built-in role files relative to daemon crate
-        let builtin_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../builtin-wasm/prompts/agents");
-
         let expected_roles = vec![
             ("explorer", "browser", 10),
             ("researcher", "browser", 20),
@@ -828,15 +851,7 @@ Always add tests.
         ];
 
         for (name, mode, max_iter) in expected_roles {
-            let path = builtin_dir.join(format!("{}.md", name));
-            assert!(
-                path.exists(),
-                "Built-in role file not found: {}",
-                path.display()
-            );
-
-            let content = std::fs::read_to_string(&path).unwrap();
-            let (meta, body) = parse_role_frontmatter(&content).unwrap();
+            let (meta, body) = parse_role_frontmatter(embedded_role(name)).unwrap();
 
             assert_eq!(meta.name, name, "Name mismatch for {}", name);
             assert!(
@@ -855,6 +870,50 @@ Always add tests.
             // Verify it validates as a definition too
             let def = AgentRoleDefinition::from_metadata_and_body(meta, body).unwrap();
             assert_eq!(def.name, name);
+        }
+    }
+
+    /// `load_definition` looks built-ins up by their catalog key, while `scan`
+    /// advertises the frontmatter `name`. If the two ever diverged, `get()`
+    /// would fail for a role that `list()` reports as available.
+    #[test]
+    fn test_builtin_catalog_key_matches_frontmatter_name() {
+        for (key, content) in nevoflux_builtin_wasm::BUILTIN_AGENT_ROLES {
+            let (meta, _) = parse_role_frontmatter(content)
+                .unwrap_or_else(|e| panic!("Built-in role '{}' failed to parse: {}", key, e));
+            assert_eq!(
+                &meta.name, key,
+                "Built-in role catalog key '{}' does not match its frontmatter name '{}'",
+                key, meta.name
+            );
+        }
+    }
+
+    /// The built-in roles must resolve with no role directory on disk anywhere.
+    /// This is what an installed binary sees: the source tree it was built from
+    /// is gone, and the user has never created `<config>/nevoflux/agents`.
+    #[test]
+    fn test_builtin_roles_resolve_without_any_directory() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let missing_user_dir = temp_dir.path().join("no_such_agents_dir");
+        assert!(!missing_user_dir.exists());
+
+        let mut registry = AgentRoleRegistry::new(missing_user_dir);
+        let count = registry.scan().unwrap();
+        assert_eq!(count, 4, "Expected the 4 embedded built-in roles");
+
+        let names: Vec<String> = registry.list().into_iter().map(|s| s.name).collect();
+        for expected in ["explorer", "researcher", "worker", "reader"] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "Missing {}",
+                expected
+            );
+
+            // L2 load must work too, not just the L1 summary.
+            let def = registry.get(expected).unwrap();
+            assert_eq!(def.name, expected);
+            assert!(!def.system_prompt.is_empty());
         }
     }
 }

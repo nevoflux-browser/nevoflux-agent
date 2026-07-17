@@ -3,7 +3,6 @@
 //! These tests verify the end-to-end behavior of the role registry, spawn
 //! configuration, nesting prevention, and tool filtering components.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use nevoflux_builtin_wasm::host::HostFunctions;
@@ -14,11 +13,6 @@ use nevoflux_protocol::subagent::{
     is_tool_allowed, matches_tool_pattern, SpawnSubagentConfig, ToolsConfig,
 };
 
-/// Path to the built-in role definition files from the daemon crate's perspective.
-fn builtin_agents_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../builtin-wasm/prompts/agents")
-}
-
 // =============================================================================
 // Test 1: Registry with builtin roles
 // =============================================================================
@@ -26,9 +20,7 @@ fn builtin_agents_dir() -> PathBuf {
 #[test]
 fn test_role_registry_with_builtin_roles() {
     let user_dir = tempfile::TempDir::new().unwrap();
-    let builtin_dir = builtin_agents_dir();
-
-    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf(), builtin_dir);
+    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf());
     let count = registry.scan().unwrap();
 
     // We expect at least 4 built-in roles: explorer, researcher, worker, reader
@@ -76,9 +68,7 @@ fn test_role_registry_with_builtin_roles() {
 #[test]
 fn test_spawn_config_role_resolution() {
     let user_dir = tempfile::TempDir::new().unwrap();
-    let builtin_dir = builtin_agents_dir();
-
-    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf(), builtin_dir);
+    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf());
     registry.scan().unwrap();
 
     // Create a SpawnSubagentConfig with role: "reader"
@@ -140,9 +130,7 @@ fn test_spawn_config_role_resolution() {
 #[test]
 fn test_spawn_config_inline_overrides() {
     let user_dir = tempfile::TempDir::new().unwrap();
-    let builtin_dir = builtin_agents_dir();
-
-    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf(), builtin_dir);
+    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf());
     registry.scan().unwrap();
 
     // Create config with role: "explorer" + max_iterations override
@@ -250,9 +238,7 @@ fn test_spawn_config_backward_compat() {
 #[test]
 fn test_list_agents_returns_builtin_roles() {
     let user_dir = tempfile::TempDir::new().unwrap();
-    let builtin_dir = builtin_agents_dir();
-
-    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf(), builtin_dir);
+    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf());
     registry.scan().unwrap();
 
     let summaries = registry.list();
@@ -515,9 +501,7 @@ fn test_tools_config_none_returns_empty() {
 #[test]
 fn test_role_definitions_have_system_prompts() {
     let user_dir = tempfile::TempDir::new().unwrap();
-    let builtin_dir = builtin_agents_dir();
-
-    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf(), builtin_dir);
+    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf());
     registry.scan().unwrap();
 
     let expected_roles = ["explorer", "researcher", "worker", "reader"];
@@ -559,8 +543,6 @@ fn test_wildcard_pattern_matching() {
 #[test]
 fn test_user_role_overrides_builtin() {
     let user_dir = tempfile::TempDir::new().unwrap();
-    let builtin_dir = builtin_agents_dir();
-
     // Create a user role file that overrides the builtin "explorer"
     std::fs::write(
         user_dir.path().join("explorer.md"),
@@ -576,7 +558,7 @@ You are a custom explorer agent with additional capabilities.
     )
     .unwrap();
 
-    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf(), builtin_dir);
+    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf());
     registry.scan().unwrap();
 
     // The user override should win
@@ -598,9 +580,7 @@ You are a custom explorer agent with additional capabilities.
 #[test]
 fn test_full_config_merge_chain() {
     let user_dir = tempfile::TempDir::new().unwrap();
-    let builtin_dir = builtin_agents_dir();
-
-    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf(), builtin_dir);
+    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf());
     registry.scan().unwrap();
 
     // Config with role + some overrides
@@ -675,9 +655,7 @@ fn test_non_subagent_can_list() {
 #[test]
 fn test_config_tools_override_beats_role() {
     let user_dir = tempfile::TempDir::new().unwrap();
-    let builtin_dir = builtin_agents_dir();
-
-    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf(), builtin_dir);
+    let mut registry = AgentRoleRegistry::new(user_dir.path().to_path_buf());
     registry.scan().unwrap();
 
     // Explorer role has Allow([browser tools...])
