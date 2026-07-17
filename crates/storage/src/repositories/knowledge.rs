@@ -550,6 +550,11 @@ impl<'a> KnowledgeRepository<'a> {
     }
 
     /// List all hot knowledge entries, ordered by confidence descending.
+    ///
+    /// Unbounded: callers that walk every hot entry (embedding-based dedup,
+    /// duplicate detection during extraction) depend on the full set. Callers
+    /// that inject entries into a prompt should use [`Self::list_hot_limited`]
+    /// instead, since hot entries only ever accumulate.
     pub fn list_hot(&self) -> Result<Vec<Knowledge>> {
         self.db.with_connection(|conn| {
             let mut stmt = conn.prepare(
@@ -568,6 +573,43 @@ impl<'a> KnowledgeRepository<'a> {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
 
             Ok(rows)
+        })
+    }
+
+    /// List at most `limit` hot knowledge entries, ordered by confidence descending.
+    ///
+    /// The ordering means truncation keeps the highest-confidence entries.
+    /// A `limit` of 0 returns an empty vector.
+    pub fn list_hot_limited(&self, limit: usize) -> Result<Vec<Knowledge>> {
+        self.db.with_connection(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, category, subcategory, domain, summary, details,
+                        resolution, confidence, hit_count, success_count, fail_count,
+                        effectiveness, priority, status, source_ids, related_ids, tags,
+                        privacy_level, promotion_target, promoted_section,
+                        source_type, created_at, updated_at, last_hit_at, promoted_at,
+                        embedding, hot, hot_summary
+                 FROM knowledge WHERE hot = 1
+                 ORDER BY confidence DESC
+                 LIMIT ?1",
+            )?;
+
+            let rows = stmt
+                .query_map([limit as i64], row_to_knowledge)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+
+            Ok(rows)
+        })
+    }
+
+    /// Count hot knowledge entries.
+    pub fn count_hot(&self) -> Result<usize> {
+        self.db.with_connection(|conn| {
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM knowledge WHERE hot = 1", [], |row| {
+                    row.get(0)
+                })?;
+            Ok(count as usize)
         })
     }
 

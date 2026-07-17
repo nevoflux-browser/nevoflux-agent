@@ -1106,6 +1106,14 @@ pub struct ContextConfig {
     /// Minutes of inactivity before forcing full microcompact (0 = disabled).
     #[serde(default = "default_time_gap_threshold_minutes")]
     pub time_gap_threshold_minutes: u64,
+    /// Maximum hot knowledge entries injected into the system prompt each turn.
+    ///
+    /// Hot entries are set by `knowledge_teach` / `memory_create` and are never
+    /// cleared automatically, so injecting all of them grows the fixed per-turn
+    /// token cost without bound. Entries are injected highest-confidence first,
+    /// so the cap drops the least-confident ones.
+    #[serde(default = "default_hot_knowledge_limit")]
+    pub hot_knowledge_limit: usize,
 }
 
 impl Default for ContextConfig {
@@ -1126,8 +1134,13 @@ impl Default for ContextConfig {
             microcompact_keep_recent: default_microcompact_keep_recent(),
             microcompact_content_threshold: default_microcompact_content_threshold(),
             time_gap_threshold_minutes: default_time_gap_threshold_minutes(),
+            hot_knowledge_limit: default_hot_knowledge_limit(),
         }
     }
+}
+
+fn default_hot_knowledge_limit() -> usize {
+    30
 }
 
 fn default_enable_compression() -> bool {

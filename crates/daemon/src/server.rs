@@ -4578,8 +4578,14 @@ fn build_soul_context(services: &HostServices) -> Option<String> {
         sections.push(cache.agents_raw.trim().to_string());
     }
 
-    // Layer 1: inject hot knowledge entries from SQLite
-    let hot_section = build_hot_knowledge_section(&services.database);
+    // Layer 1: inject hot knowledge entries from SQLite, capped so the
+    // per-turn token cost stays bounded as hot entries accumulate.
+    let hot_limit = services
+        .agent_config
+        .as_ref()
+        .map(|c| c.daemon.context.hot_knowledge_limit)
+        .unwrap_or_else(|| crate::config::ContextConfig::default().hot_knowledge_limit);
+    let hot_section = build_hot_knowledge_section(&services.database, hot_limit);
     if let Some(hot) = hot_section {
         sections.push(hot);
     }
@@ -4624,14 +4630,31 @@ fn populate_mcp_tool_inventory(mut content: String, services: &HostServices) -> 
 
 /// Build a markdown section from hot knowledge entries, grouped by category.
 ///
+/// At most `limit` entries are injected, highest-confidence first; hot entries
+/// accumulate without bound, so injecting all of them would grow the fixed
+/// per-turn token cost forever. When entries are dropped, the section says so
+/// rather than silently presenting a partial set as complete.
+///
 /// Returns `None` if there are no hot entries.
-fn build_hot_knowledge_section(database: &nevoflux_storage::Database) -> Option<String> {
+fn build_hot_knowledge_section(
+    database: &nevoflux_storage::Database,
+    limit: usize,
+) -> Option<String> {
     let repo = nevoflux_storage::KnowledgeRepository::new(database);
-    let hot_entries = repo.list_hot().ok()?;
+    let hot_entries = repo.list_hot_limited(limit).ok()?;
 
     if hot_entries.is_empty() {
         return None;
     }
+
+    // Only pay for the count query when the cap may actually have bitten.
+    let omitted = if hot_entries.len() == limit {
+        repo.count_hot()
+            .unwrap_or(hot_entries.len())
+            .saturating_sub(hot_entries.len())
+    } else {
+        0
+    };
 
     let mut site_lines = Vec::new();
     let mut tool_lines = Vec::new();
@@ -4690,6 +4713,13 @@ fn build_hot_knowledge_section(database: &nevoflux_storage::Database) -> Option<
     if !error_lines.is_empty() {
         parts.push("### Error Patterns / 错误模式".to_string());
         parts.extend(error_lines);
+    }
+
+    if omitted > 0 {
+        parts.push(format!(
+            "\n_({} more lower-confidence entries not shown; use memory_search to look them up.)_",
+            omitted
+        ));
     }
 
     Some(parts.join("\n"))
@@ -11504,6 +11534,124 @@ mod tests {
     // E2E: hot knowledge → system prompt injection
     // -----------------------------------------------------------------------
 
+    /// Injection cap for tests that are not exercising truncation. Large enough
+    /// that every entry those tests insert is injected.
+    const TEST_HOT_LIMIT: usize = 30;
+
+    /// The hot knowledge layer must cap how many entries it injects: hot entries
+    /// are only ever added (`knowledge_teach` / `memory_create`), so an uncapped
+    /// layer grows the fixed per-turn token cost without bound.
+    #[test]
+    fn hot_knowledge_section_caps_injected_entries() {
+        use nevoflux_storage::{CreateKnowledgeParams, Storage};
+
+        const LIMIT: usize = 10;
+        const EXTRA: usize = 5;
+
+        let storage = Storage::open_in_memory().unwrap();
+
+        // Insert LIMIT + EXTRA hot entries with descending confidence, so entry
+        // i's rank is known: entry 0 is the most confident.
+        for i in 0..(LIMIT + EXTRA) {
+            let id = storage
+                .knowledge()
+                .create(CreateKnowledgeParams {
+                    category: "user_preference".into(),
+                    summary: format!("hot entry number {}", i),
+                    details: "details".into(),
+                    ..Default::default()
+                })
+                .unwrap()
+                .id;
+
+            let confidence = 1.0 - (i as f64) * 0.01;
+            storage
+                .database()
+                .with_connection(|conn| {
+                    conn.execute(
+                        "UPDATE knowledge SET hot = 1, status = 'promoted', confidence = ?1 \
+                         WHERE id = ?2",
+                        rusqlite::params![confidence, id],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        let section = build_hot_knowledge_section(storage.database(), LIMIT)
+            .expect("Should produce a section when hot entries exist");
+
+        // The LIMIT highest-confidence entries are injected...
+        for i in 0..LIMIT {
+            assert!(
+                section.contains(&format!("hot entry number {}\n", i))
+                    || section.ends_with(&format!("hot entry number {}", i)),
+                "Entry {} should be injected. Got:\n{}",
+                i,
+                section
+            );
+        }
+
+        // ...and the lower-confidence remainder is not.
+        for i in LIMIT..(LIMIT + EXTRA) {
+            assert!(
+                !section.contains(&format!("hot entry number {}", i)),
+                "Entry {} is past the cap and must not be injected. Got:\n{}",
+                i,
+                section
+            );
+        }
+
+        // The prompt states what was dropped rather than passing off a partial
+        // set as the whole.
+        assert!(
+            section.contains(&format!(
+                "{} more lower-confidence entries not shown",
+                EXTRA
+            )),
+            "Section should report the omitted entries. Got:\n{}",
+            section
+        );
+    }
+
+    /// A hot set that fits under the cap must not claim entries were omitted.
+    #[test]
+    fn hot_knowledge_section_no_omission_notice_when_under_limit() {
+        use nevoflux_storage::{CreateKnowledgeParams, Storage};
+
+        let storage = Storage::open_in_memory().unwrap();
+
+        let id = storage
+            .knowledge()
+            .create(CreateKnowledgeParams {
+                category: "user_preference".into(),
+                summary: "the only hot entry".into(),
+                details: "details".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .id;
+        storage
+            .database()
+            .with_connection(|conn| {
+                conn.execute(
+                    "UPDATE knowledge SET hot = 1, status = 'promoted' WHERE id = ?1",
+                    rusqlite::params![id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Cap of exactly 1: the count matches the cap, but nothing was dropped.
+        let section = build_hot_knowledge_section(storage.database(), 1).unwrap();
+        assert!(section.contains("the only hot entry"));
+        assert!(
+            !section.contains("not shown"),
+            "Should not report omissions when nothing was dropped. Got:\n{}",
+            section
+        );
+    }
+
     /// Verify that promoted hot knowledge entries are rendered into the
     /// correct markdown format by `build_hot_knowledge_section()`.
     ///
@@ -11588,7 +11736,7 @@ mod tests {
             .unwrap();
 
         // Call build_hot_knowledge_section
-        let section = build_hot_knowledge_section(storage.database())
+        let section = build_hot_knowledge_section(storage.database(), TEST_HOT_LIMIT)
             .expect("Should produce a section when hot entries exist");
 
         // Verify section header
@@ -11656,7 +11804,7 @@ mod tests {
             })
             .unwrap();
 
-        let section = build_hot_knowledge_section(storage.database());
+        let section = build_hot_knowledge_section(storage.database(), TEST_HOT_LIMIT);
         assert!(
             section.is_none(),
             "Should return None when no hot entries exist"
@@ -11700,7 +11848,7 @@ mod tests {
             })
             .unwrap();
 
-        let section = build_hot_knowledge_section(storage.database()).unwrap();
+        let section = build_hot_knowledge_section(storage.database(), TEST_HOT_LIMIT).unwrap();
         assert!(
             section.contains("old, verify before acting]"),
             "Expected freshness warning, got: {}",
@@ -11732,7 +11880,7 @@ mod tests {
             .mark_hot(&entry.id, "Fresh preference")
             .unwrap();
 
-        let section = build_hot_knowledge_section(storage.database()).unwrap();
+        let section = build_hot_knowledge_section(storage.database(), TEST_HOT_LIMIT).unwrap();
         assert!(
             !section.contains("verify before acting"),
             "Should not have freshness warning, got: {}",

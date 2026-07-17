@@ -55,6 +55,10 @@
 # Whether to include current page info
 # include_current_page = true
 
+# Maximum hot knowledge entries injected into the system prompt each turn.
+# Highest-confidence entries are kept; the rest are reachable via memory_search.
+# hot_knowledge_limit = 30
+
 [llm]
 # Default LLM provider: "anthropic", "openai", "qwen"
 # default_provider = "anthropic"
