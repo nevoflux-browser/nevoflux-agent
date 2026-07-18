@@ -8,6 +8,9 @@ pub mod computer_tools;
 pub mod flows;
 pub mod roles;
 pub mod runner;
+pub mod soul_resolver;
+pub mod soul_rpc;
+pub mod space_souls;
 pub mod streaming;
 pub mod tools;
 

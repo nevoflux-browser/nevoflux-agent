@@ -543,9 +543,11 @@ fn test_wildcard_pattern_matching() {
 #[test]
 fn test_user_role_overrides_builtin() {
     let user_dir = tempfile::TempDir::new().unwrap();
-    // Create a user role file that overrides the builtin "explorer"
+    // Create a user role directory that overrides the builtin "explorer" by slug
+    let explorer = user_dir.path().join("explorer");
+    std::fs::create_dir_all(&explorer).unwrap();
     std::fs::write(
-        user_dir.path().join("explorer.md"),
+        explorer.join("IDENTITY.md"),
         r#"---
 name: explorer
 description: "Custom explorer with extra tools"
@@ -553,8 +555,13 @@ mode: agent
 max_iterations: 25
 ---
 
-You are a custom explorer agent with additional capabilities.
+My own explorer.
 "#,
+    )
+    .unwrap();
+    std::fs::write(
+        explorer.join("SOUL.md"),
+        "You are a custom explorer agent with additional capabilities.\n",
     )
     .unwrap();
 

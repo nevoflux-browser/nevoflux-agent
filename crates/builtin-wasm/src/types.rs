@@ -275,7 +275,7 @@ pub struct LlmResponse {
 }
 
 /// Agent input from host.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentInput {
     /// Session ID.
     pub session_id: String,
@@ -299,6 +299,14 @@ pub struct AgentInput {
     /// This is primarily used for sub-agents that need specialized instructions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_system_prompt: Option<String>,
+    /// Skills to suggest this turn, when the bound soul narrows them.
+    ///
+    /// `None` means suggest everything, which is what an unbound session does.
+    /// This only trims what the prompt advertises: `skill_load` and an explicit
+    /// `/skill` still reach any skill, because a soul narrowing its suggestions is
+    /// about prompt size, not about permission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills_filter: Option<Vec<String>>,
     /// Current active browser tab ID.
     ///
     /// When set, the agent knows which tab to interact with using browser tools.
@@ -664,6 +672,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
         assert_eq!(input.mode, AgentMode::Agent);
@@ -688,6 +697,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
         assert!(input.custom_system_prompt.is_some());
@@ -715,6 +725,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -737,6 +748,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
         let json2 = serde_json::to_string(&input_no_prompt).unwrap();
@@ -960,6 +972,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -988,6 +1001,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
         let json = serde_json::to_string(&input).unwrap();
@@ -1012,6 +1026,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
         assert_eq!(input.tab_id, Some(42));
@@ -1036,6 +1051,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
         let json2 = serde_json::to_string(&input_no_tab).unwrap();
@@ -1078,6 +1094,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
         assert_eq!(input.tab_ids.len(), 3);
@@ -1110,6 +1127,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
         let json2 = serde_json::to_string(&input_no_tabs).unwrap();

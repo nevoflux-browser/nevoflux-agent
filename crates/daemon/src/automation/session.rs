@@ -148,6 +148,8 @@ pub async fn execute_task_attempt(
     let allowlist = policy.tool_allowlist(&mode_tools);
 
     let input = nevoflux_builtin_wasm::AgentInput {
+        // No soul is bound on this path, so every skill stays suggested.
+        skills_filter: None,
         session_id,
         mode,
         user_message: task.to_string(),

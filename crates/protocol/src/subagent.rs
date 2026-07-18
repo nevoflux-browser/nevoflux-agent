@@ -20,7 +20,13 @@ pub enum ToolsConfig {
 /// Summary of an agent role for listing/discovery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRoleSummary {
-    /// Role name identifier
+    /// Directory name: the stable key for lookups and bindings.
+    ///
+    /// Defaults to empty for compatibility with payloads written before roles
+    /// gained directories; callers that need a key should fall back to `name`.
+    #[serde(default)]
+    pub slug: String,
+    /// Display name, shown to users and used for `@`-mentions
     pub name: String,
     /// Human-readable description
     pub description: String,
@@ -248,11 +254,22 @@ mod tests {
     #[test]
     fn test_agent_role_summary_serde() {
         let summary = AgentRoleSummary {
+            slug: "research".to_string(),
             name: "researcher".to_string(),
             description: "A role for web research tasks".to_string(),
         };
         let json = serde_json::to_string(&summary).unwrap();
         let deserialized: AgentRoleSummary = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, summary);
+    }
+
+    /// Payloads written before roles gained directories carry no `slug`. They
+    /// must still deserialize rather than break an older sidebar's round-trip.
+    #[test]
+    fn test_agent_role_summary_accepts_payload_without_slug() {
+        let legacy = r#"{"name":"researcher","description":"A role"}"#;
+        let summary: AgentRoleSummary = serde_json::from_str(legacy).unwrap();
+        assert_eq!(summary.name, "researcher");
+        assert!(summary.slug.is_empty());
     }
 }

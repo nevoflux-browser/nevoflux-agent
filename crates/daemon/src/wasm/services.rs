@@ -178,6 +178,11 @@ pub struct HostServices {
     pub subagent_executor: Option<Arc<SubagentExecutor>>,
     /// Agent role registry for subagent role definitions.
     pub role_registry: Option<Arc<AgentRoleRegistry>>,
+    /// Container (cookieStoreId) → soul bindings, hot-reloaded from
+    /// `space_souls.toml`. Empty means nothing is bound and every chat resolves
+    /// to the default assistant.
+    pub space_soul_bindings:
+        Option<Arc<std::sync::RwLock<crate::agent::space_souls::SpaceSoulBindings>>>,
     /// Current client identity for routing browser tool responses.
     pub client_identity: Vec<u8>,
     /// Current proxy ID for the response envelope.
@@ -346,6 +351,7 @@ impl HostServices {
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             subagent_executor: None,
             role_registry: None,
+            space_soul_bindings: None,
             client_identity: Vec::new(),
             proxy_id: String::new(),
             session_id: String::new(),
@@ -393,6 +399,7 @@ impl HostServices {
             interrupt_flag: Arc::new(AtomicBool::new(false)),
             subagent_executor: None,
             role_registry: None,
+            space_soul_bindings: None,
             client_identity: Vec::new(),
             proxy_id: String::new(),
             session_id: String::new(),
@@ -717,6 +724,16 @@ impl HostServices {
     /// Set the agent role registry.
     pub fn with_role_registry(mut self, registry: Arc<AgentRoleRegistry>) -> Self {
         self.role_registry = Some(registry);
+        self
+    }
+
+    /// Set the container → soul bindings, shared so the file watcher can swap
+    /// them in when `space_souls.toml` changes.
+    pub fn with_space_soul_bindings(
+        mut self,
+        bindings: Arc<std::sync::RwLock<crate::agent::space_souls::SpaceSoulBindings>>,
+    ) -> Self {
+        self.space_soul_bindings = Some(bindings);
         self
     }
 

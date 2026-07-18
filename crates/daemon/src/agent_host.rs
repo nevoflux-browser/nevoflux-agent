@@ -199,6 +199,21 @@ pub struct DaemonHostFunctions {
     subagent_sandbox: Option<String>,
     /// When true, this agent is a subagent and cannot spawn further subagents.
     is_subagent: bool,
+    /// The soul answering this run, when one is bound.
+    ///
+    /// Its `tools_config` is a ceiling that the dynamic tool layer must honour:
+    /// `filter_tools` only narrows the tools *advertised* to the model, so a model
+    /// that names a tool anyway would otherwise reach it through
+    /// `tool_call_dynamic`. Its `subagents` list is the same kind of ceiling for
+    /// delegation. `None` means nothing is bound and nothing is restricted.
+    active_soul: Option<Arc<crate::agent::roles::AgentRoleDefinition>>,
+    /// The container (cookieStoreId) this run is happening in.
+    ///
+    /// Memory recall is filtered by it: the browser already keeps each
+    /// container's cookies apart, and what the assistant remembers follows the
+    /// same boundary. `None` means the caller is not container-aware (an
+    /// unattended run, say) and recall is not filtered.
+    active_container: Option<String>,
     /// Current thinking block ID for reasoning→ThinkingEvent conversion.
     current_thinking_id: Arc<Mutex<Option<String>>>,
     /// Domain from the most recent successful browser_navigate.
@@ -256,6 +271,8 @@ impl DaemonHostFunctions {
             skill_base_path: None,
             subagent_sandbox: None,
             is_subagent: false,
+            active_soul: None,
+            active_container: None,
             current_thinking_id: Arc::new(Mutex::new(None)),
             last_navigated_domain: Arc::new(Mutex::new(None)),
             compression_circuit_breaker,
@@ -272,6 +289,56 @@ impl DaemonHostFunctions {
     pub fn with_services(mut self, services: HostServices) -> Self {
         self.services = Some(services);
         self
+    }
+
+    /// Bind the soul answering this run.
+    ///
+    /// The soul is a ceiling on the dynamic tool layer, not a suggestion: see
+    /// [`DaemonHostFunctions::active_soul`].
+    pub fn with_active_soul(
+        mut self,
+        soul: Option<Arc<crate::agent::roles::AgentRoleDefinition>>,
+    ) -> Self {
+        self.active_soul = soul;
+        self
+    }
+
+    /// Bind the container this run is happening in, so memory recall stays inside
+    /// it. See [`DaemonHostFunctions::active_container`].
+    pub fn with_active_container(mut self, container: impl Into<String>) -> Self {
+        self.active_container = Some(container.into());
+        self
+    }
+
+    /// Why `tool_name` is out of reach for this run, if it is.
+    ///
+    /// Returns the reason rather than a bool so the model is told something
+    /// actionable instead of just "no".
+    ///
+    /// This is the same allowlist `filter_tools` applies to the advertised tool
+    /// list, enforced again at the point of call: advertising is a hint, and a
+    /// model can name a tool it was never shown.
+    fn dynamic_tool_denial(&self, tool_name: &str) -> Option<String> {
+        let soul = self.active_soul.as_ref()?;
+        match &soul.tools_config {
+            None => None,
+            Some(nevoflux_protocol::subagent::ToolsConfig::None) => Some(format!(
+                "'{}' is not available: {} runs without tools.",
+                tool_name, soul.name
+            )),
+            Some(nevoflux_protocol::subagent::ToolsConfig::Allow(allowlist)) => {
+                if nevoflux_protocol::subagent::is_tool_allowed(allowlist, tool_name) {
+                    None
+                } else {
+                    Some(format!(
+                        "'{}' is not available to {}. Its tools are: {}.",
+                        tool_name,
+                        soul.name,
+                        allowlist.join(", ")
+                    ))
+                }
+            }
+        }
     }
 
     /// Add a sidebar stream sender for streaming chunks.
@@ -1935,7 +2002,7 @@ impl HostFunctions for DaemonHostFunctions {
         let fetch_limit = limit * 3; // Fetch more candidates for merging
 
         // Path 1: FTS5 keyword search
-        let fts_results = services
+        let fts_all = services
             .database
             .memory()
             .search_fts(query, fetch_limit)
@@ -1943,6 +2010,17 @@ impl HostFunctions for DaemonHostFunctions {
                 code: 100,
                 message: format!("Memory search failed: {}", e),
             })?;
+
+        // Keep recall inside the container the user is working in. The index has
+        // no container column, so this is a post-filter; `fetch_limit` already
+        // over-fetches for the merge below, which absorbs most of the loss.
+        let fts_results: Vec<_> = match self.active_container.as_deref() {
+            Some(container) => fts_all
+                .into_iter()
+                .filter(|c| chunk_visible_in_container(&c.metadata, container))
+                .collect(),
+            None => fts_all,
+        };
 
         // Path 2: Vector semantic search (if embedding provider is available)
         let semantic_results = if let Some(provider) =
@@ -1988,8 +2066,13 @@ impl HostFunctions for DaemonHostFunctions {
         }
 
         // Hybrid merge: combine FTS and semantic scores
-        let merged =
-            merge_search_results(&fts_results, &semantic_results, limit, &services.database);
+        let merged = merge_search_results(
+            &fts_results,
+            &semantic_results,
+            limit,
+            &services.database,
+            self.active_container.as_deref(),
+        );
         Ok(merged)
     }
 
@@ -3233,13 +3316,34 @@ impl HostFunctions for DaemonHostFunctions {
             message: "Tool search not configured".into(),
         })?;
 
+        // A soul must not be shown tools it may not call, or it will plan around
+        // them and be refused at the point of use. Over-fetch so narrowing the
+        // results does not also shorten them.
+        let restricted = self
+            .active_soul
+            .as_ref()
+            .is_some_and(|s| s.tools_config.is_some());
+        let fetch_limit = if restricted {
+            max_results.saturating_mul(4).max(max_results)
+        } else {
+            max_results
+        };
+
         // Use blocking_read for synchronous context
         let index = tool_search.blocking_read();
-        let results = index.search_limit(query, max_results);
+        let found = index.search_limit(query, fetch_limit);
+        let total_found = found.len();
+
+        let results: Vec<_> = found
+            .into_iter()
+            .filter(|r| self.dynamic_tool_denial(&r.tool.name).is_none())
+            .take(max_results)
+            .collect();
 
         debug!(
-            "tool_search: query='{}', found {} results",
+            "tool_search: query='{}', found {} results ({} after the active soul's allowlist)",
             query,
+            total_found,
             results.len()
         );
 
@@ -3266,6 +3370,17 @@ impl HostFunctions for DaemonHostFunctions {
             "tool_call_dynamic: tool='{}', arguments={}",
             tool_name, arguments
         );
+
+        // The advertised tool list is only a hint; this is where a soul's
+        // allowlist is actually binding. Checked before any routing so no
+        // backend can be reached around it.
+        if let Some(reason) = self.dynamic_tool_denial(tool_name) {
+            debug!("tool_call_dynamic denied: {}", reason);
+            return Err(HostError {
+                code: 403,
+                message: reason,
+            });
+        }
 
         // Intercept PR #2 browser input strategy engine tools.
         //
@@ -6169,6 +6284,11 @@ impl DaemonHostFunctions {
             skill_base_path: self.skill_base_path.clone(),
             subagent_sandbox: self.subagent_sandbox.clone(),
             is_subagent: self.is_subagent,
+            // The proxy runs on the same turn, so it inherits the same ceiling:
+            // dropping it here would let a builtin dispatch reach tools the soul
+            // is not allowed to use.
+            active_soul: self.active_soul.clone(),
+            active_container: self.active_container.clone(),
             current_thinking_id: Arc::new(Mutex::new(None)),
             last_navigated_domain: self.last_navigated_domain.clone(),
             compression_circuit_breaker: crate::context::CompressionCircuitBreaker::new(
@@ -6519,6 +6639,29 @@ impl DaemonHostFunctions {
             None
         };
 
+        // 2b. A soul may name the souls it is allowed to hand work to. Checked
+        // against the resolved slug, so naming a role by its display name cannot
+        // slip past the list.
+        if let Some(caller) = self.active_soul.as_ref() {
+            if !caller.subagents.is_empty() {
+                let requested = role_def.as_ref().map(|d| d.slug.as_str());
+                let permitted = requested.is_some_and(|slug| {
+                    caller.subagents.iter().any(|allowed| allowed == slug)
+                });
+                if !permitted {
+                    return Err(HostError {
+                        code: 403,
+                        message: format!(
+                            "{} may only delegate to: {}. Requested: {}.",
+                            caller.name,
+                            caller.subagents.join(", "),
+                            requested.unwrap_or("(no role)")
+                        ),
+                    });
+                }
+            }
+        }
+
         // 3. Merge config: defaults <- role <- spawn params
         let final_mode_str = config
             .mode
@@ -6700,6 +6843,8 @@ impl DaemonHostFunctions {
                         .to_string()
                 });
                 let input = AgentInput {
+                    // Builtin proxy dispatch: no soul, so every skill stays suggested.
+                    skills_filter: None,
                     session_id: format!("subagent-{}", id),
                     mode: agent_mode,
                     user_message: task_str.clone(),
@@ -6881,11 +7026,36 @@ fn parse_key_str(key_str: &str) -> Result<nevoflux_computer::KeyOrChar, String> 
 ///
 /// For chunks that appear only in semantic results (not in FTS), the function looks them
 /// up from the database to build the full `MemoryChunk`.
+/// Key under which a memory chunk records the container it was learned in.
+///
+/// Matches the key stamped on messages (`server::CONTAINER_METADATA_KEY`); a
+/// chunk inherits it from the message it was extracted from.
+pub const MEMORY_CONTAINER_KEY: &str = "container";
+
+/// Whether a chunk may be recalled while working in `current`.
+///
+/// Chunks written before containers were recorded carry no stamp. They are
+/// treated as belonging to the default container rather than as universal: a
+/// container someone created for their bank should start empty, not inherit
+/// everything the assistant ever learned.
+fn chunk_visible_in_container(chunk_metadata: &serde_json::Value, current: &str) -> bool {
+    let stamped = chunk_metadata
+        .get(MEMORY_CONTAINER_KEY)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+
+    match stamped {
+        Some(container) => container == current,
+        None => current == nevoflux_protocol::chat::DEFAULT_COOKIE_STORE_ID,
+    }
+}
+
 fn merge_search_results(
     fts_chunks: &[nevoflux_storage::MemoryChunk],
     semantic_results: &[VectorSearchResult],
     limit: usize,
     database: &nevoflux_storage::Database,
+    container: Option<&str>,
 ) -> Vec<MemoryChunk> {
     let fts_weight = 0.4;
     let semantic_weight = 0.6;
@@ -6940,14 +7110,23 @@ fn merge_search_results(
                     score: score as f32,
                 });
             }
-            // Semantic-only hit: look up from database
+            // Semantic-only hit: look up from database. The vector index holds
+            // no metadata, so this is the only place a semantic match can be
+            // checked against the container.
             match database.memory().get(id) {
-                Ok(Some(chunk)) => Some(MemoryChunk {
-                    id: chunk.id,
-                    content: chunk.content,
-                    session_id: chunk.session_id,
-                    score: score as f32,
-                }),
+                Ok(Some(chunk)) => {
+                    if container
+                        .is_some_and(|c| !chunk_visible_in_container(&chunk.metadata, c))
+                    {
+                        return None;
+                    }
+                    Some(MemoryChunk {
+                        id: chunk.id,
+                        content: chunk.content,
+                        session_id: chunk.session_id,
+                        score: score as f32,
+                    })
+                }
                 Ok(None) => {
                     warn!(
                         "Memory chunk {} found in vector index but not in database",
@@ -8986,6 +9165,158 @@ mod tests {
         assert!(hint.contains("- /Cargo.toml"));
         assert!(hint.contains("Use read_file"));
         assert!(!hint.contains("browser page"));
+    }
+
+    // ── The soul's tool ceiling on the dynamic layer ───────────────────
+    //
+    // `filter_tools` only narrows what the model is *shown*. A model can name a
+    // tool it was never shown, and `tool_call_dynamic` would route it. These
+    // tests pin the ceiling that stops that.
+
+    fn host_with_soul(soul: Option<crate::agent::roles::AgentRoleDefinition>) -> DaemonHostFunctions {
+        let config = Arc::new(AgentConfig::default());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        DaemonHostFunctions::new(config, rt.handle().clone()).with_active_soul(soul.map(Arc::new))
+    }
+
+    fn soul_with_tools(
+        tools_config: Option<nevoflux_protocol::subagent::ToolsConfig>,
+    ) -> crate::agent::roles::AgentRoleDefinition {
+        crate::agent::roles::AgentRoleDefinition {
+            slug: "research".into(),
+            name: "alex".into(),
+            description: String::new(),
+            avatar: None,
+            system_prompt: String::new(),
+            identity: String::new(),
+            tools_doc: None,
+            agents_doc: None,
+            mode: "agent".into(),
+            provider: None,
+            model: None,
+            tools_config,
+            advertised_tools: vec![],
+            subagents: vec![],
+            skills: vec![],
+            max_iterations: 10,
+        }
+    }
+
+    /// Nothing bound: the dynamic layer is as open as it always was.
+    #[test]
+    fn dynamic_layer_is_unrestricted_without_a_soul() {
+        let host = host_with_soul(None);
+        assert!(host.dynamic_tool_denial("brain_teach").is_none());
+        assert!(host.dynamic_tool_denial("anything_at_all").is_none());
+    }
+
+    /// A soul that lists no tools inherits its mode's set, so nothing is denied.
+    #[test]
+    fn dynamic_layer_is_unrestricted_when_soul_lists_no_tools() {
+        let host = host_with_soul(Some(soul_with_tools(None)));
+        assert!(host.dynamic_tool_denial("brain_teach").is_none());
+    }
+
+    /// The allowlist binds here, not just in the advertised list.
+    #[test]
+    fn dynamic_layer_denies_tools_outside_the_allowlist() {
+        use nevoflux_protocol::subagent::ToolsConfig;
+        let host = host_with_soul(Some(soul_with_tools(Some(ToolsConfig::Allow(vec![
+            "web_search".into(),
+            "brain_*".into(),
+        ])))));
+
+        assert!(host.dynamic_tool_denial("web_search").is_none());
+        assert!(
+            host.dynamic_tool_denial("brain_teach").is_none(),
+            "wildcards must work the same way they do when filtering the tool list"
+        );
+
+        let denial = host
+            .dynamic_tool_denial("bash")
+            .expect("a tool outside the allowlist must be refused");
+        assert!(denial.contains("bash"), "the message should name the tool");
+        assert!(denial.contains("alex"), "and say whose limit it is");
+        assert!(
+            denial.contains("web_search"),
+            "and say what is available instead"
+        );
+    }
+
+    /// `tools: none` means none, including through the dynamic layer.
+    #[test]
+    fn dynamic_layer_denies_everything_for_a_toolless_soul() {
+        use nevoflux_protocol::subagent::ToolsConfig;
+        let host = host_with_soul(Some(soul_with_tools(Some(ToolsConfig::None))));
+
+        assert!(host.dynamic_tool_denial("web_search").is_some());
+        assert!(host.dynamic_tool_denial("brain_teach").is_some());
+    }
+
+    // ── Memory recall stays inside its container ───────────────────────
+    //
+    // NOTE: nothing in production writes `memory_chunks` today (every
+    // `MemoryRepository::create` call site is test code), so this guard has
+    // nothing to guard yet. It is the boundary the design asks for, enforced at
+    // the point recall happens, so it holds the moment writes appear. What the
+    // assistant actually remembers today lives in the `knowledge` table, which
+    // has no container dimension — see PLAN-phase-2 §6.
+
+    #[test]
+    fn recall_keeps_a_container_to_itself() {
+        let banking = serde_json::json!({ "container": "firefox-container-2" });
+
+        assert!(chunk_visible_in_container(&banking, "firefox-container-2"));
+        assert!(
+            !chunk_visible_in_container(&banking, "firefox-container-1"),
+            "another container must not see it"
+        );
+        assert!(!chunk_visible_in_container(&banking, "firefox-default"));
+    }
+
+    /// A container someone made for their bank starts empty: memory learned
+    /// before containers were recorded belongs to the default one, not to
+    /// everyone.
+    #[test]
+    fn unstamped_memory_belongs_to_the_default_container() {
+        let legacy = serde_json::json!({ "source": "chat" });
+
+        assert!(chunk_visible_in_container(&legacy, "firefox-default"));
+        assert!(!chunk_visible_in_container(&legacy, "firefox-container-2"));
+    }
+
+    /// An empty stamp is not a container.
+    #[test]
+    fn blank_container_stamp_reads_as_unstamped() {
+        let blank = serde_json::json!({ "container": "" });
+
+        assert!(chunk_visible_in_container(&blank, "firefox-default"));
+        assert!(!chunk_visible_in_container(&blank, "firefox-container-2"));
+    }
+
+    /// Callers that are not container-aware (unattended runs) recall as before.
+    #[test]
+    fn recall_is_unfiltered_without_a_container() {
+        let host = host_with_soul(None);
+        assert!(
+            host.active_container.is_none(),
+            "a host built without a container must not silently filter recall"
+        );
+    }
+
+    /// A builtin proxy runs on the same turn and must not be a way around the
+    /// ceiling.
+    #[test]
+    fn builtin_proxy_inherits_the_ceiling() {
+        use nevoflux_protocol::subagent::ToolsConfig;
+        let host = host_with_soul(Some(soul_with_tools(Some(ToolsConfig::Allow(vec![
+            "web_search".into(),
+        ])))));
+
+        let proxy = host.clone_for_builtin();
+
+        assert!(proxy.dynamic_tool_denial("bash").is_some());
+        assert!(proxy.dynamic_tool_denial("web_search").is_none());
     }
 
     #[test]

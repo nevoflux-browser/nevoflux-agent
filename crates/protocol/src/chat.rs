@@ -17,10 +17,32 @@ use serde::{Deserialize, Serialize};
 // Sidebar → Agent Messages
 // ============================================================================
 
+/// The cookieStoreId of a tab that belongs to no container.
+///
+/// Firefox reports this for ordinary tabs, and it is the single canonical value
+/// for "no container" on the wire: never an empty string, never `"default"`.
+/// Mirrors `DEFAULT_COOKIE_STORE_ID` in the browser's `shared-protocol` crate.
+pub const DEFAULT_COOKIE_STORE_ID: &str = "firefox-default";
+
+/// Normalize a wire `space` value to a canonical cookieStoreId.
+///
+/// Older sidebars sent an empty string or `"default"` for a container-less tab.
+/// Everything downstream keys on this value, so it is normalized at the door
+/// rather than at each use.
+pub fn normalize_cookie_store_id(space: &str) -> String {
+    match space.trim() {
+        "" | "default" => DEFAULT_COOKIE_STORE_ID.to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Information about a browser tab.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabInfo {
-    /// The space/group the tab belongs to (e.g., workspace name).
+    /// The tab's cookieStoreId (`firefox-default` or `firefox-container-N`).
+    ///
+    /// Named `space` because Zen derives a Space's identity from its container.
+    /// Normalize incoming values with [`normalize_cookie_store_id`].
     #[serde(default)]
     pub space: String,
     /// The tab's unique ID.
@@ -1495,5 +1517,31 @@ mod tests {
             assert_eq!(r.tools.len(), 1);
             assert_eq!(r.tools[0].name, "cargo_test");
         }
+    }
+
+    /// Every "no container" spelling a sidebar has ever sent must collapse to one
+    /// canonical value, or the same tab would key two different bindings.
+    #[test]
+    fn test_normalize_cookie_store_id_collapses_no_container_spellings() {
+        for legacy in ["", "  ", "default"] {
+            assert_eq!(
+                normalize_cookie_store_id(legacy),
+                DEFAULT_COOKIE_STORE_ID,
+                "'{}' should normalize to the canonical no-container id",
+                legacy
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_cookie_store_id_passes_real_containers_through() {
+        assert_eq!(
+            normalize_cookie_store_id("firefox-container-2"),
+            "firefox-container-2"
+        );
+        assert_eq!(
+            normalize_cookie_store_id(DEFAULT_COOKIE_STORE_ID),
+            DEFAULT_COOKIE_STORE_ID
+        );
     }
 }

@@ -1753,6 +1753,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
 

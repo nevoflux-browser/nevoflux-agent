@@ -50,20 +50,46 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Wasm ABI version for compatibility checking.
 pub const ABI_VERSION: u32 = 1;
 
-/// Built-in agent role definitions as `(name, file content)` pairs.
+/// Built-in agent role definitions as `(slug, [(filename, content)])` pairs.
+///
+/// A role is a directory: `IDENTITY.md` and `SOUL.md` are required, `TOOLS.md`
+/// and `AGENTS.md` are optional overlays over the global soul documents. The
+/// directory name is the slug; the display name comes from IDENTITY.md's
+/// frontmatter.
 ///
 /// The files under `prompts/agents/` are embedded at compile time so the daemon
 /// can resolve built-in roles from an installed binary, where the source tree
 /// this crate was built from does not exist. The daemon layers user-defined
-/// roles from `<config_dir>/nevoflux/agents` on top of these.
-pub const BUILTIN_AGENT_ROLES: &[(&str, &str)] = &[
-    ("explorer", include_str!("../prompts/agents/explorer.md")),
-    ("reader", include_str!("../prompts/agents/reader.md")),
+/// roles from `<config_dir>/nevoflux/agents` on top of these, overriding by slug.
+pub const BUILTIN_AGENT_ROLES: &[(&str, &[(&str, &str)])] = &[
+    (
+        "explorer",
+        &[
+            ("IDENTITY.md", include_str!("../prompts/agents/explorer/IDENTITY.md")),
+            ("SOUL.md", include_str!("../prompts/agents/explorer/SOUL.md")),
+        ],
+    ),
+    (
+        "reader",
+        &[
+            ("IDENTITY.md", include_str!("../prompts/agents/reader/IDENTITY.md")),
+            ("SOUL.md", include_str!("../prompts/agents/reader/SOUL.md")),
+        ],
+    ),
     (
         "researcher",
-        include_str!("../prompts/agents/researcher.md"),
+        &[
+            ("IDENTITY.md", include_str!("../prompts/agents/researcher/IDENTITY.md")),
+            ("SOUL.md", include_str!("../prompts/agents/researcher/SOUL.md")),
+        ],
     ),
-    ("worker", include_str!("../prompts/agents/worker.md")),
+    (
+        "worker",
+        &[
+            ("IDENTITY.md", include_str!("../prompts/agents/worker/IDENTITY.md")),
+            ("SOUL.md", include_str!("../prompts/agents/worker/SOUL.md")),
+        ],
+    ),
 ];
 
 // Entry points for the Wasm module.
@@ -148,6 +174,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
 
@@ -183,6 +210,7 @@ mod tests {
                 mcp_servers: vec![],
                 soul_context: None,
                 tools_config: None,
+                skills_filter: None,
                 os_platform: None,
             };
 
@@ -211,6 +239,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
 
@@ -244,6 +273,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
 

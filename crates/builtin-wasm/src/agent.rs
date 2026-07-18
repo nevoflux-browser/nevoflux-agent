@@ -642,7 +642,10 @@ impl<H: HostFunctions> Agent<H> {
         let base_prompt = match &input.custom_system_prompt {
             Some(custom) => custom.clone(),
             None => {
-                let skills = self.host.skill_list().unwrap_or_default();
+                let skills = filter_skills(
+                    self.host.skill_list().unwrap_or_default(),
+                    input.skills_filter.as_deref(),
+                );
                 let cu_flags = self.computer_use_flags(mode);
                 Self::build_system_prompt(
                     mode,
@@ -5352,6 +5355,21 @@ fn parse_tool_calls_from_text(text: &str) -> (String, Vec<ToolCall>) {
     (cleaned, tool_calls)
 }
 
+/// Narrow the skills a soul suggests each turn.
+///
+/// `None` suggests everything. A soul that lists skills is saying which ones are
+/// worth its turn — not which ones exist, so an unknown name in the list is
+/// simply ignored rather than an error.
+fn filter_skills(skills: Vec<SkillSummary>, allowed: Option<&[String]>) -> Vec<SkillSummary> {
+    let Some(allowed) = allowed.filter(|a| !a.is_empty()) else {
+        return skills;
+    };
+    skills
+        .into_iter()
+        .filter(|s| allowed.iter().any(|a| a.eq_ignore_ascii_case(&s.name)))
+        .collect()
+}
+
 /// Format skill summaries for system prompt injection.
 fn format_skill_summaries(skills: &[SkillSummary]) -> String {
     skills
@@ -5624,6 +5642,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
 
@@ -5893,6 +5912,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
 
@@ -5920,6 +5940,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
 
@@ -5947,6 +5968,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
 
@@ -5997,6 +6019,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
 
@@ -6022,6 +6045,63 @@ mod tests {
         // Subagent prompts
         assert!(SUBAGENT_BROWSER_PROMPT.contains("CANNOT interact"));
         assert!(SUBAGENT_AGENT_PROMPT.contains("sandbox"));
+    }
+
+    // ── filter_skills ──────────────────────────────────────────────────
+
+    fn skills_fixture() -> Vec<SkillSummary> {
+        vec![
+            SkillSummary {
+                name: "research".into(),
+                description: "Deep research".into(),
+                tags: vec![],
+            },
+            SkillSummary {
+                name: "app".into(),
+                description: "Build web apps".into(),
+                tags: vec![],
+            },
+        ]
+    }
+
+    /// An unbound session — and a soul that names no skills — suggests everything.
+    #[test]
+    fn no_filter_suggests_every_skill() {
+        assert_eq!(filter_skills(skills_fixture(), None).len(), 2);
+        assert_eq!(filter_skills(skills_fixture(), Some(&[])).len(), 2);
+    }
+
+    #[test]
+    fn a_filter_narrows_the_suggestions() {
+        let filtered = filter_skills(skills_fixture(), Some(&["research".to_string()]));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "research");
+    }
+
+    #[test]
+    fn filtering_ignores_case() {
+        let filtered = filter_skills(skills_fixture(), Some(&["RESEARCH".to_string()]));
+        assert_eq!(filtered.len(), 1);
+    }
+
+    /// A soul naming a skill that no longer exists is not an error: the list says
+    /// what is worth suggesting, not what exists.
+    #[test]
+    fn naming_a_missing_skill_is_not_an_error() {
+        let filtered = filter_skills(
+            skills_fixture(),
+            Some(&["research".to_string(), "gone".to_string()]),
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "research");
+    }
+
+    /// A soul that narrows to nothing it has gets no suggestions — but the prompt
+    /// simply omits the section, and `skill_load` still works.
+    #[test]
+    fn narrowing_to_nothing_leaves_no_suggestions() {
+        let filtered = filter_skills(skills_fixture(), Some(&["nonexistent".to_string()]));
+        assert!(filtered.is_empty());
     }
 
     #[test]
@@ -6759,6 +6839,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
 
@@ -6790,6 +6871,7 @@ mod tests {
             mcp_servers: vec![],
             soul_context: None,
             tools_config: None,
+            skills_filter: None,
             os_platform: None,
         };
 

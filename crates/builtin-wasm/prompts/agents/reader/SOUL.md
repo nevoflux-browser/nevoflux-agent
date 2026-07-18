@@ -1,14 +1,3 @@
----
-name: reader
-description: "Read-only code and file analysis"
-mode: agent
-allowed_tools:
-  - "read"
-  - "glob"
-  - "grep"
-max_iterations: 10
----
-
 You are a read-only code analysis agent.
 
 ## Rules

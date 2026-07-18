@@ -1,5 +1,6 @@
 //! TCP server for the daemon.
 
+use crate::agent::roles::AgentRoleDefinition;
 use crate::agent_host::{DaemonHostFunctions, SidebarStreamChunk};
 use crate::config::AgentConfig;
 use crate::error::{DaemonError, Result};
@@ -1255,9 +1256,20 @@ pub async fn start_server(
         }
     };
 
+    // Container → soul bindings. Shared so the watcher below can swap in a new
+    // set when the user edits space_souls.toml.
+    let space_soul_bindings = {
+        let config_dir = dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("nevoflux");
+        Arc::new(std::sync::RwLock::new(
+            crate::agent::space_souls::SpaceSoulBindings::load(&config_dir),
+        ))
+    };
+
     // Start soul document file watcher for detecting external edits
     {
-        use crate::learning::soul::watcher::SoulWatcher;
+        use crate::learning::soul::watcher::{SoulDirChange, SoulWatcher};
 
         let soul_dir = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -1265,36 +1277,58 @@ pub async fn start_server(
         match SoulWatcher::start(&soul_dir) {
             Ok(mut watcher) => {
                 let retriever_for_watcher = knowledge_retriever.clone();
+                let bindings_for_watcher = Arc::clone(&space_soul_bindings);
                 tokio::spawn(async move {
-                    while let Some(changed_path) = watcher.next_change().await {
-                        let filename = changed_path
+                    while let Some(change) = watcher.next_change().await {
+                        let filename = change
+                            .path()
                             .file_name()
                             .and_then(|f| f.to_str())
-                            .unwrap_or("unknown");
-                        info!("Soul document changed externally: {}", filename);
+                            .unwrap_or("unknown")
+                            .to_string();
 
-                        // Reload the soul manager and update the retriever's cache
-                        if let Some(ref retriever) = retriever_for_watcher {
-                            match crate::learning::soul::manager::SoulManager::load(
-                                watcher.soul_dir(),
-                            )
-                            .await
-                            {
-                                Ok(mut manager) => {
-                                    retriever.update_soul_cache(manager.cache().clone());
-
-                                    // Mark all sections in the changed file as manually
-                                    // edited so that system promotions don't overwrite
-                                    // user changes.
-                                    manager.mark_file_manual(filename).await;
-
-                                    info!(
-                                        "Soul cache reloaded after external edit to {}",
-                                        filename
-                                    );
+                        match change {
+                            SoulDirChange::Bindings(path) => {
+                                info!("Space→soul bindings changed externally: {}", filename);
+                                let reloaded =
+                                    crate::agent::space_souls::SpaceSoulBindings::load_from(&path);
+                                match bindings_for_watcher.write() {
+                                    Ok(mut guard) => *guard = reloaded,
+                                    Err(e) => {
+                                        warn!("Could not swap in reloaded bindings: {}", e)
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!("Failed to reload soul documents after edit: {}", e);
+                            }
+                            SoulDirChange::SoulDoc(_) => {
+                                info!("Soul document changed externally: {}", filename);
+
+                                // Reload the soul manager and update the retriever's cache
+                                if let Some(ref retriever) = retriever_for_watcher {
+                                    match crate::learning::soul::manager::SoulManager::load(
+                                        watcher.soul_dir(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(mut manager) => {
+                                            retriever.update_soul_cache(manager.cache().clone());
+
+                                            // Mark all sections in the changed file as manually
+                                            // edited so that system promotions don't overwrite
+                                            // user changes.
+                                            manager.mark_file_manual(&filename).await;
+
+                                            info!(
+                                                "Soul cache reloaded after external edit to {}",
+                                                filename
+                                            );
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Failed to reload soul documents after edit: {}",
+                                                e
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1641,6 +1675,7 @@ pub async fn start_server(
         .with_shared_tool_search(tool_search_index)
         .with_vector_index(vector_index)
         .with_role_registry(role_registry)
+        .with_space_soul_bindings(Arc::clone(&space_soul_bindings))
         .with_embedding(Arc::clone(&shared_embedding))
         .with_canvas_video_service(canvas_video_service.clone())
         .with_tts_config(agent_config.read().unwrap().tts.clone())
@@ -4553,32 +4588,237 @@ async fn cleanup_proxy_subscriptions(
     }
 }
 
+/// What a chat payload said about which soul should answer.
+///
+/// Owned rather than borrowed so it can outlive the payload it was parsed from.
+/// The three cases are deliberately distinct: saying nothing leaves a pin alone,
+/// while asking to go back to normal removes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SoulMentionIntent {
+    /// The payload said nothing about souls.
+    Absent,
+    /// The user picked a soul (a slug the sidebar already resolved).
+    Soul(String),
+    /// The user asked to go back to this Space's own soul.
+    Clear,
+}
+
+impl SoulMentionIntent {
+    fn as_mention(&self) -> crate::agent::soul_resolver::Mention<'_> {
+        use crate::agent::soul_resolver::Mention;
+        match self {
+            Self::Absent => Mention::None,
+            Self::Soul(slug) => Mention::Soul(slug),
+            Self::Clear => Mention::Clear,
+        }
+    }
+}
+
+/// Read the soul mention out of a chat payload.
+///
+/// Wire shape (see `shared-protocol`'s `SoulMention`):
+/// - field absent            → the user said nothing
+/// - `{"slug": "research"}`  → use that soul
+/// - `{"slug": null}` or `{}` → go back to this Space's own soul
+fn parse_soul_mention(payload: &serde_json::Value) -> SoulMentionIntent {
+    let Some(mention) = payload.get("payload").and_then(|p| p.get("soul_mention")) else {
+        return SoulMentionIntent::Absent;
+    };
+    if mention.is_null() {
+        return SoulMentionIntent::Absent;
+    }
+
+    match mention.get("slug").and_then(|s| s.as_str()) {
+        Some(slug) if !slug.trim().is_empty() => SoulMentionIntent::Soul(slug.to_string()),
+        _ => SoulMentionIntent::Clear,
+    }
+}
+
+/// The skills a soul narrows itself to, if it names any.
+///
+/// An empty list in the frontmatter means the same as no list: suggest
+/// everything. Only an explicit selection narrows anything.
+fn soul_skills_filter(active: Option<&AgentRoleDefinition>) -> Option<Vec<String>> {
+    active
+        .filter(|s| !s.skills.is_empty())
+        .map(|s| s.skills.clone())
+}
+
+/// The container this turn is happening in.
+///
+/// The wire carries every referenced tab, so pick the one the user is actually
+/// looking at; anything else would bind a chat to a tab that merely got mentioned.
+/// Falls back to the container-less default, which is also what a client too old
+/// to send containers gets.
+fn current_container(tab_id: Option<i64>, tab_ids: &[nevoflux_builtin_wasm::TabInfo]) -> String {
+    let current = tab_id
+        .and_then(|id| tab_ids.iter().find(|t| t.tab_id == id))
+        .or_else(|| tab_ids.first());
+
+    current
+        .map(|t| nevoflux_protocol::chat::normalize_cookie_store_id(&t.space))
+        .unwrap_or_else(|| nevoflux_protocol::chat::DEFAULT_COOKIE_STORE_ID.to_string())
+}
+
+/// Resolve which soul answers this turn and persist any change to the pin.
+///
+/// Returns `None` when nothing is bound, which is the pre-souls behaviour: the
+/// caller then builds exactly the prompt and tool set it always did.
+async fn resolve_active_soul(
+    services: &HostServices,
+    session_manager: &SessionManager,
+    session_id: &str,
+    container: &str,
+    mention: SoulMentionIntent,
+) -> Option<AgentRoleDefinition> {
+    use crate::agent::soul_resolver::{self, OverrideAction};
+
+    let registry = services.role_registry()?;
+    let bindings = services.space_soul_bindings.as_ref()?;
+
+    let session = session_manager.get_session(session_id).await.ok().flatten();
+    let stored = session
+        .as_ref()
+        .and_then(|s| soul_resolver::override_from_metadata(s.metadata.as_ref()));
+
+    let resolution = {
+        let bindings = bindings.read().ok()?;
+        soul_resolver::resolve(
+            mention.as_mention(),
+            stored.as_ref(),
+            container,
+            &bindings,
+            &registry,
+        )
+    };
+
+    // Persist the pin change, if any. A failure here costs stickiness, not the turn.
+    if resolution.action != OverrideAction::Keep {
+        let mut metadata = session.and_then(|s| s.metadata).unwrap_or_default();
+        if soul_resolver::apply_override_action(&mut metadata, &resolution.action) {
+            if let Err(e) = session_manager
+                .update_session_metadata(session_id, metadata)
+                .await
+            {
+                warn!("Could not persist soul override for session {}: {}", session_id, e);
+            }
+        }
+    }
+
+    let slug = resolution.slug?;
+    match registry.get(&slug) {
+        Ok(def) => {
+            debug!(
+                "Active soul for session {} in {}: {} ({})",
+                session_id, container, def.name, def.slug
+            );
+            announce_active_soul(services, &def).await;
+            Some(def)
+        }
+        Err(e) => {
+            warn!("Could not load soul '{}': {}", slug, e);
+            None
+        }
+    }
+}
+
+/// Tell the rest of the browser who is answering, so the floating avatar can
+/// wear the right face.
+///
+/// Sticky, because the background script subscribes when it feels like it — an
+/// ephemeral event would leave a minimized avatar showing the previous soul until
+/// the next message. Published only on change: this runs every turn, and a
+/// re-publish of the same soul is noise for every subscriber.
+async fn announce_active_soul(services: &HostServices, soul: &AgentRoleDefinition) {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    let Some(bus) = services.event_bus.as_ref() else {
+        return;
+    };
+
+    static LAST_ANNOUNCED: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    let last = LAST_ANNOUNCED.get_or_init(|| Mutex::new(None));
+    {
+        let mut guard = match last.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("Could not read the last announced soul: {}", e);
+                return;
+            }
+        };
+        if guard.as_deref() == Some(soul.slug.as_str()) {
+            return;
+        }
+        *guard = Some(soul.slug.clone());
+    }
+
+    let avatar = crate::agent::soul_rpc::soul_avatar_data_uri(soul);
+    let _ = bus
+        .publish(crate::event_bus::BusEvent::sticky(
+            "ui:soul:active",
+            serde_json::json!({
+                "slug": soul.slug,
+                "name": soul.name,
+                "avatar": avatar,
+            }),
+            crate::event_bus::PublisherIdentity::Internal,
+        ))
+        .await;
+}
+
 /// Build soul context string from the knowledge retriever's soul cache,
 /// plus hot knowledge entries from SQLite (Layer 1).
 ///
+/// When `active` is `Some`, that role overlays the global soul documents: it
+/// replaces the identity and personality sections, and replaces the tool and
+/// subagent guidance if it carries its own. USER.md and the hot knowledge layer
+/// are always global — the user's own profile and what the assistant has learned
+/// belong to the user, not to whichever persona is answering.
+///
+/// When `active` is `None` the output is exactly what it was before roles could
+/// be bound, so an unbound user sees no change at all.
+///
 /// Returns `None` if no retriever is available or all soul documents are empty.
-fn build_soul_context(services: &HostServices) -> Option<String> {
+fn build_soul_context(
+    services: &HostServices,
+    active: Option<&AgentRoleDefinition>,
+) -> Option<String> {
     let retriever = services.knowledge_retriever.as_ref()?;
     let cache = retriever.soul_cache();
 
+    // A role's section wins when it has content; otherwise the global one stands.
+    let overlay = |role_section: Option<&str>, global: &str| -> Option<String> {
+        let chosen = role_section
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(global.trim());
+        (!chosen.is_empty()).then(|| chosen.to_string())
+    };
+
     let mut sections = Vec::new();
-    if !cache.identity_raw.trim().is_empty() {
-        sections.push(cache.identity_raw.trim().to_string());
+    if let Some(identity) = overlay(active.map(|a| a.identity.as_str()), &cache.identity_raw) {
+        sections.push(identity);
     }
-    if !cache.soul_raw.trim().is_empty() {
-        sections.push(cache.soul_raw.trim().to_string());
+    if let Some(soul) = overlay(active.map(|a| a.system_prompt.as_str()), &cache.soul_raw) {
+        sections.push(soul);
     }
+    // USER.md is the user's own profile: never per-soul.
     if !cache.user_raw.trim().is_empty() {
         sections.push(cache.user_raw.trim().to_string());
     }
-    if !cache.tools_raw.trim().is_empty() {
-        let mut tools_content = cache.tools_raw.trim().to_string();
+    if let Some(tools) = overlay(
+        active.and_then(|a| a.tools_doc.as_deref()),
+        &cache.tools_raw,
+    ) {
         // Replace MCP Tool Inventory placeholder with actual tool data
-        tools_content = populate_mcp_tool_inventory(tools_content, services);
-        sections.push(tools_content);
+        sections.push(populate_mcp_tool_inventory(tools, services));
     }
-    if !cache.agents_raw.trim().is_empty() {
-        sections.push(cache.agents_raw.trim().to_string());
+    if let Some(agents) = overlay(
+        active.and_then(|a| a.agents_doc.as_deref()),
+        &cache.agents_raw,
+    ) {
+        sections.push(agents);
     }
 
     // Layer 1: inject hot knowledge entries from SQLite, capped so the
@@ -4729,7 +4969,67 @@ fn build_hot_knowledge_section(
 }
 
 /// Convert storage messages to wasm messages for the agent history.
-fn convert_history_messages(messages: Vec<StorageMessage>) -> Vec<WasmMessage> {
+/// Key under which a message records the soul that produced it.
+pub const PERSONA_METADATA_KEY: &str = "persona";
+/// Key under which a message records the container it was sent from.
+pub const CONTAINER_METADATA_KEY: &str = "container";
+
+/// Stamp a message with the container it belongs to and the soul that spoke.
+///
+/// The container travels on every message because a thread can move between
+/// containers, and memory extracted from a message must land in the container it
+/// came from — stamping the session instead would file a banking answer under
+/// whichever container the conversation happened to start in.
+///
+/// The persona key is omitted when no soul is active, so messages from an unbound
+/// chat look exactly like every message written before souls existed.
+fn stamp_message_metadata(
+    existing: Option<std::collections::HashMap<String, serde_json::Value>>,
+    container: &str,
+    active_soul: Option<&AgentRoleDefinition>,
+) -> Option<std::collections::HashMap<String, serde_json::Value>> {
+    let mut metadata = existing.unwrap_or_default();
+    metadata.insert(
+        CONTAINER_METADATA_KEY.to_string(),
+        serde_json::Value::String(container.to_string()),
+    );
+    if let Some(soul) = active_soul {
+        metadata.insert(
+            PERSONA_METADATA_KEY.to_string(),
+            serde_json::Value::String(soul.slug.clone()),
+        );
+    }
+    Some(metadata)
+}
+
+/// The soul slug recorded on a stored message, if any.
+///
+/// Messages written before souls existed carry no persona, which reads as
+/// "the default assistant".
+fn message_persona(msg: &StorageMessage) -> Option<&str> {
+    msg.metadata
+        .as_ref()?
+        .get(PERSONA_METADATA_KEY)?
+        .as_str()
+        .filter(|s| !s.is_empty())
+}
+
+/// Convert stored messages into the history the LLM sees.
+///
+/// An LLM only has user/assistant/system, so a thread where several souls have
+/// spoken cannot express "a different assistant said this" natively. Replies from
+/// anyone other than the soul answering now are therefore handed over as user
+/// turns, labelled with who said them; only the active soul's own replies stay
+/// assistant turns.
+///
+/// `active` is the slug answering this turn; `display_name` maps a slug to the
+/// name users see. With `active = None` the output is byte-identical to what it
+/// was before souls existed.
+fn convert_history_messages(
+    messages: Vec<StorageMessage>,
+    active: Option<&str>,
+    display_name: &dyn Fn(&str) -> String,
+) -> Vec<WasmMessage> {
     messages
         .into_iter()
         .filter_map(|msg| match msg.role {
@@ -4741,7 +5041,20 @@ fn convert_history_messages(messages: Vec<StorageMessage>) -> Vec<WasmMessage> {
                 if msg.content_type == ContentType::ToolUse {
                     return None;
                 }
-                Some(WasmMessage::assistant(msg.content))
+                match (active, message_persona(&msg)) {
+                    // No soul is answering: history is what it always was.
+                    (None, _) => Some(WasmMessage::assistant(msg.content)),
+                    // The active soul's own words.
+                    (Some(a), Some(p)) if a == p => Some(WasmMessage::assistant(msg.content)),
+                    // Someone else's words, attributed so the active soul does not
+                    // mistake them for its own.
+                    (Some(_), other) => {
+                        let speaker = other
+                            .map(display_name)
+                            .unwrap_or_else(|| "assistant".to_string());
+                        Some(WasmMessage::user(format!("[{}] {}", speaker, msg.content)))
+                    }
+                }
             }
             MessageRole::System => None,
         })
@@ -4753,10 +5066,15 @@ fn convert_history_messages(messages: Vec<StorageMessage>) -> Vec<WasmMessage> {
 /// Retrieves only the most recent messages using an efficient SQL query with
 /// `ORDER BY created_at DESC LIMIT N` (leverages composite index), then removes
 /// the last message (the current user message just saved).
+///
+/// `active_soul` decides how other souls' replies are labelled; see
+/// [`convert_history_messages`].
 async fn load_session_history(
     session_manager: &SessionManager,
     session_id: &str,
     max_messages: u32,
+    services: &HostServices,
+    active_soul: Option<&AgentRoleDefinition>,
 ) -> Vec<WasmMessage> {
     // Fetch max_messages + 1 so we can pop the current user message and still
     // have max_messages of history.
@@ -4769,7 +5087,15 @@ async fn load_session_history(
             if !messages.is_empty() {
                 messages.pop();
             }
-            convert_history_messages(messages)
+            let registry = services.role_registry();
+            let display_name = |slug: &str| -> String {
+                registry
+                    .as_ref()
+                    .and_then(|r| r.get(slug).ok())
+                    .map(|def| def.name)
+                    .unwrap_or_else(|| slug.to_string())
+            };
+            convert_history_messages(messages, active_soul.map(|s| s.slug.as_str()), &display_name)
         }
         Err(e) => {
             warn!("Failed to load session history for {}: {}", session_id, e);
@@ -4986,6 +5312,10 @@ async fn handle_chat_message_streaming(
         .and_then(|m| m.as_str())
         .map(parse_agent_mode)
         .unwrap_or(AgentMode::Chat);
+    // What the user's `@` said this turn. The sidebar resolves `@name` to a slug;
+    // the daemon never scans message text for mentions, so an address in a
+    // sentence is not a request to switch persona.
+    let soul_mention = parse_soul_mention(&payload);
     // Raw mode string, mirrored verbatim into any goal-continuation turn this
     // turn spawns so the continuation runs in the same mode. Absent ⇒ "chat"
     // (round-trips through `parse_agent_mode` back to `AgentMode::Chat`).
@@ -5054,11 +5384,9 @@ async fn handle_chat_message_streaming(
         .map(|arr| {
             arr.iter()
                 .filter_map(|v| {
-                    let space = v
-                        .get("space")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                    let space = nevoflux_protocol::chat::normalize_cookie_store_id(
+                        v.get("space").and_then(|s| s.as_str()).unwrap_or(""),
+                    );
                     let tab_id = v.get("tab_id").and_then(|t| t.as_i64())?;
                     let tab_title = v
                         .get("tab_title")
@@ -5080,6 +5408,10 @@ async fn handle_chat_message_streaming(
                 .collect()
         })
         .unwrap_or_default();
+
+    // The container this turn happens in: the key for the soul binding, for the
+    // memory it may write, and for the cookie jar the browser already isolates.
+    let container = current_container(tab_id, &tab_ids);
 
     // Detect and process /skillname commands (same logic as non-streaming path).
     // Tolerates a leading full-width `／` and leading whitespace via the shared
@@ -5241,7 +5573,7 @@ async fn handle_chat_message_streaming(
             &session_id,
             MessageRole::User,
             message_content,
-            attachment_metadata,
+            stamp_message_metadata(attachment_metadata, &container, None),
         )
         .await
     {
@@ -5324,7 +5656,22 @@ async fn handle_chat_message_streaming(
     // Share session extractor with HostServices so MCP tool executor can use it
     services_with_context.session_extractor = Some(session_extractor.clone());
 
+    // Which soul answers this turn. `None` keeps the pre-souls behaviour. Resolved
+    // before the host is built: the host enforces the soul's tool ceiling, so it
+    // has to know about it from its first tool call.
+    let active_soul = resolve_active_soul(
+        &services,
+        session_manager,
+        &session_id,
+        &container,
+        soul_mention,
+    )
+    .await
+    .map(Arc::new);
+
     let mut host = DaemonHostFunctions::new(config.clone(), runtime.clone())
+        .with_active_soul(active_soul.clone())
+        .with_active_container(&container)
         .with_services(services_with_context)
         .with_sidebar_stream(stream_tx)
         .with_session_id(session_id.clone())
@@ -5373,26 +5720,34 @@ async fn handle_chat_message_streaming(
             session_manager,
             &session_id,
             config.daemon.context.max_history_messages,
+            &services,
+            active_soul.as_deref(),
         )
         .await,
         attachments,
         local_files,
         custom_system_prompt: None, // Use default mode-based prompt
+        // A soul may narrow which skills are worth suggesting; `skill_load` and an
+        // explicit `/skill` still reach any of them.
+        skills_filter: soul_skills_filter(active_soul.as_deref()),
         tab_id,
         tab_ids,
         skill_context,
         available_models: config.llm.configured_providers(),
         mcp_servers: mcp_servers.clone(),
         soul_context: {
-            let sc = build_soul_context(&services);
+            let sc = build_soul_context(&services, active_soul.as_deref());
             debug!(
-                "soul_context for AgentInput: has_retriever={}, len={:?}",
+                "soul_context for AgentInput: has_retriever={}, soul={:?}, len={:?}",
                 services.knowledge_retriever.is_some(),
+                active_soul.as_deref().map(|s| &s.slug),
                 sc.as_ref().map(|s| s.len())
             );
             sc
         },
-        tools_config: None,
+        // A soul may narrow the tools it can reach, but it never widens them and
+        // never touches mode/provider/model: those stay the user's call.
+        tools_config: active_soul.as_deref().and_then(|s| s.tools_config.clone()),
         os_platform: Some(std::env::consts::OS.to_string()),
     };
 
@@ -5723,18 +6078,23 @@ async fn handle_chat_message_streaming(
                                 session_manager,
                                 &session_id,
                                 config.daemon.context.max_history_messages,
+                                &services,
+                                active_soul.as_deref(),
                             )
                             .await,
                             attachments: vec![],
                             local_files: vec![],
                             custom_system_prompt: None,
+                            skills_filter: soul_skills_filter(active_soul.as_deref()),
                             tab_id,
                             tab_ids: tab_ids_for_rerun.clone(),
                             skill_context: None,
                             available_models: config.llm.configured_providers(),
                             mcp_servers: mcp_servers.clone(),
-                            soul_context: build_soul_context(&services),
-                            tools_config: None,
+                            // The re-run continues the same turn, so it keeps the
+                            // soul that was resolved for it.
+                            soul_context: build_soul_context(&services, active_soul.as_deref()),
+                            tools_config: active_soul.as_deref().and_then(|s| s.tools_config.clone()),
                             os_platform: Some(std::env::consts::OS.to_string()),
                         };
 
@@ -6121,7 +6481,12 @@ async fn handle_chat_message_streaming(
             // Save assistant response to database
             if !final_text.is_empty() {
                 match session_manager
-                    .add_message(&session_id, MessageRole::Assistant, &final_text)
+                    .add_message_with_metadata(
+                        &session_id,
+                        MessageRole::Assistant,
+                        &final_text,
+                        stamp_message_metadata(None, &container, active_soul.as_deref()),
+                    )
                     .await
                 {
                     Ok(msg) => {
@@ -6681,6 +7046,8 @@ async fn handle_chat_message(
                 .and_then(|m| m.as_str())
                 .map(parse_agent_mode)
                 .unwrap_or(AgentMode::Chat);
+            // See the streaming handler.
+            let soul_mention = parse_soul_mention(&payload);
 
             // Extract attachments (multimodal: images, files)
             let mut attachments: Vec<Attachment> = payload
@@ -6745,11 +7112,9 @@ async fn handle_chat_message(
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|v| {
-                            let space = v
-                                .get("space")
-                                .and_then(|s| s.as_str())
-                                .unwrap_or("")
-                                .to_string();
+                            let space = nevoflux_protocol::chat::normalize_cookie_store_id(
+                                v.get("space").and_then(|s| s.as_str()).unwrap_or(""),
+                            );
                             let tab_id = v.get("tab_id").and_then(|t| t.as_i64())?;
                             let tab_title = v
                                 .get("tab_title")
@@ -6771,6 +7136,9 @@ async fn handle_chat_message(
                         .collect()
                 })
                 .unwrap_or_default();
+
+            // See the streaming handler.
+            let container = current_container(tab_id, &tab_ids);
 
             debug!(
                 "Processing chat message with mode={:?}, session={}, attachments={}, local_files={}, tab_id={:?}, tab_ids={}",
@@ -6805,7 +7173,7 @@ async fn handle_chat_message(
                     &session_id,
                     MessageRole::User,
                     message_content,
-                    attachment_metadata,
+                    stamp_message_metadata(attachment_metadata, &container, None),
                 )
                 .await
             {
@@ -6832,7 +7200,20 @@ async fn handle_chat_message(
             }
 
             // Create host functions with config and runtime
+            // See the streaming handler: resolved before the host is built.
+            let active_soul = resolve_active_soul(
+                &services,
+                session_manager,
+                &session_id,
+                &container,
+                soul_mention,
+            )
+            .await
+            .map(Arc::new);
+
             let mut host = DaemonHostFunctions::new(config.clone(), runtime)
+                .with_active_soul(active_soul.clone())
+                .with_active_container(&container)
                 .with_services(services.clone())
                 .with_session_id(session_id.clone())
                 .with_canvas_video_service(canvas_video_service.clone());
@@ -6867,18 +7248,23 @@ async fn handle_chat_message(
                     session_manager,
                     &session_id,
                     config.daemon.context.max_history_messages,
+                    &services,
+                    active_soul.as_deref(),
                 )
                 .await,
                 attachments,
                 local_files,
                 custom_system_prompt: None, // Use default mode-based prompt
+                skills_filter: soul_skills_filter(active_soul.as_deref()),
                 tab_id,
                 tab_ids,
                 skill_context,
                 available_models: config.llm.configured_providers(),
                 mcp_servers,
-                soul_context: build_soul_context(&services),
-                tools_config: None,
+                soul_context: build_soul_context(&services, active_soul.as_deref()),
+                // A soul may narrow the tools it can reach, but never widens them
+                // and never touches mode/provider/model.
+                tools_config: active_soul.as_deref().and_then(|s| s.tools_config.clone()),
                 os_platform: Some(std::env::consts::OS.to_string()),
             };
 
@@ -6891,7 +7277,12 @@ async fn handle_chat_message(
                     // Save assistant response to database
                     if !final_text.is_empty() {
                         match session_manager
-                            .add_message(&session_id, MessageRole::Assistant, &final_text)
+                            .add_message_with_metadata(
+                                &session_id,
+                                MessageRole::Assistant,
+                                &final_text,
+                                stamp_message_metadata(None, &container, active_soul.as_deref()),
+                            )
                             .await
                         {
                             Ok(msg) => {
@@ -7136,6 +7527,30 @@ async fn handle_chat_message(
                 // `crate::goals::execute_goal_tool` — the same dispatcher the
                 // `schedule_*`/`goal_*` LLM tools use — rather than
                 // re-implementing the ScheduleManager/GoalManager calls here.
+                // Space Souls management (settings UI). Thin registry/bindings
+                // wrappers so the UI never has to go through the LLM.
+                "soul.list" => crate::agent::soul_rpc::handle_soul_list(services, &params).await,
+                "soul.bindings" => {
+                    crate::agent::soul_rpc::handle_soul_bindings(services, &params).await
+                }
+                "soul.bind" => crate::agent::soul_rpc::handle_soul_bind(services, &params).await,
+                "soul.unbind" => {
+                    crate::agent::soul_rpc::handle_soul_unbind(services, &params).await
+                }
+                "soul.read" => crate::agent::soul_rpc::handle_soul_read(services, &params).await,
+                "soul.write" => crate::agent::soul_rpc::handle_soul_write(services, &params).await,
+                "soul.create" => {
+                    crate::agent::soul_rpc::handle_soul_create(services, &params).await
+                }
+                "soul.delete" => {
+                    crate::agent::soul_rpc::handle_soul_delete(services, &params).await
+                }
+                "soul.set_avatar" => {
+                    crate::agent::soul_rpc::handle_soul_set_avatar(services, &params).await
+                }
+                "soul.generate" => {
+                    crate::agent::soul_rpc::handle_soul_generate(services, &params).await
+                }
                 "schedule.list" => handle_schedule_list(services, &params).await,
                 "loop.list" => handle_loop_list(services, &params).await,
                 "schedule.runs" => handle_schedule_runs(services, &params).await,
@@ -10945,6 +11360,286 @@ fn guess_mime_type(path: &str) -> &'static str {
         "yaml" | "yml" => "application/yaml",
         "csv" => "text/csv",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod soul_binding_tests {
+    use super::*;
+    use nevoflux_builtin_wasm::TabInfo;
+    use nevoflux_storage::models::Message as StorageMsg;
+    use std::collections::HashMap;
+
+    fn tab(tab_id: i64, space: &str) -> TabInfo {
+        TabInfo {
+            space: space.to_string(),
+            tab_id,
+            tab_title: String::new(),
+            url: String::new(),
+        }
+    }
+
+    fn assistant(content: &str, persona: Option<&str>) -> StorageMsg {
+        StorageMsg {
+            id: format!("m-{}", content),
+            session_id: "s1".to_string(),
+            role: MessageRole::Assistant,
+            content: content.to_string(),
+            content_type: ContentType::Text,
+            created_at: 0,
+            metadata: persona.map(|p| {
+                let mut m = HashMap::new();
+                m.insert(
+                    PERSONA_METADATA_KEY.to_string(),
+                    serde_json::Value::String(p.to_string()),
+                );
+                m
+            }),
+        }
+    }
+
+    fn user(content: &str) -> StorageMsg {
+        StorageMsg {
+            id: format!("m-{}", content),
+            session_id: "s1".to_string(),
+            role: MessageRole::User,
+            content: content.to_string(),
+            content_type: ContentType::Text,
+            created_at: 0,
+            metadata: None,
+        }
+    }
+
+    fn tool_use(content: &str) -> StorageMsg {
+        StorageMsg {
+            content_type: ContentType::ToolUse,
+            ..assistant(content, None)
+        }
+    }
+
+    /// slug → name, as the registry would provide.
+    fn names(slug: &str) -> String {
+        match slug {
+            "research" => "alex".to_string(),
+            "engineer" => "nova".to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    // ── parse_soul_mention ─────────────────────────────────────────────
+
+    fn payload_with(mention: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "payload": { "soul_mention": mention } })
+    }
+
+    /// A client that knows nothing about souls must not look like a request to
+    /// change them.
+    #[test]
+    fn absent_mention_says_nothing() {
+        assert_eq!(
+            parse_soul_mention(&serde_json::json!({ "payload": {} })),
+            SoulMentionIntent::Absent
+        );
+        assert_eq!(
+            parse_soul_mention(&serde_json::json!({})),
+            SoulMentionIntent::Absent
+        );
+        assert_eq!(
+            parse_soul_mention(&payload_with(serde_json::Value::Null)),
+            SoulMentionIntent::Absent
+        );
+    }
+
+    #[test]
+    fn a_named_soul_is_a_pick() {
+        assert_eq!(
+            parse_soul_mention(&payload_with(serde_json::json!({ "slug": "research" }))),
+            SoulMentionIntent::Soul("research".into())
+        );
+    }
+
+    /// A present mention carrying no soul is the user asking to go back to
+    /// normal — which is not the same as saying nothing.
+    #[test]
+    fn a_mention_without_a_soul_is_an_explicit_clear() {
+        assert_eq!(
+            parse_soul_mention(&payload_with(serde_json::json!({ "slug": null }))),
+            SoulMentionIntent::Clear
+        );
+        assert_eq!(
+            parse_soul_mention(&payload_with(serde_json::json!({}))),
+            SoulMentionIntent::Clear
+        );
+        assert_eq!(
+            parse_soul_mention(&payload_with(serde_json::json!({ "slug": "   " }))),
+            SoulMentionIntent::Clear,
+            "a blank slug is not a soul"
+        );
+    }
+
+    // ── current_container ──────────────────────────────────────────────
+
+    /// The chat belongs to the tab the user is looking at, not to whichever tab
+    /// happens to be first in the list.
+    #[test]
+    fn current_container_prefers_the_active_tab() {
+        let tabs = vec![tab(1, "firefox-container-1"), tab(2, "firefox-container-2")];
+        assert_eq!(current_container(Some(2), &tabs), "firefox-container-2");
+    }
+
+    #[test]
+    fn current_container_falls_back_to_first_tab() {
+        let tabs = vec![tab(1, "firefox-container-1")];
+        assert_eq!(current_container(None, &tabs), "firefox-container-1");
+        assert_eq!(
+            current_container(Some(99), &tabs),
+            "firefox-container-1",
+            "an unknown tab id should not lose the container"
+        );
+    }
+
+    /// A client too old to send containers, or a chat with no tabs at all, is
+    /// container-less rather than unknown.
+    #[test]
+    fn current_container_defaults_when_absent_or_empty() {
+        assert_eq!(current_container(None, &[]), "firefox-default");
+        assert_eq!(
+            current_container(Some(1), &[tab(1, "")]),
+            "firefox-default",
+            "an empty space must normalize, not key its own binding"
+        );
+    }
+
+    // ── convert_history_messages ───────────────────────────────────────
+
+    /// Nothing bound: the history is byte-for-byte what it was before souls.
+    #[test]
+    fn history_without_a_soul_is_unchanged() {
+        let msgs = vec![
+            user("hi"),
+            assistant("hello", None),
+            assistant("hello from alex", Some("research")),
+        ];
+
+        let out = convert_history_messages(msgs, None, &names);
+
+        assert_eq!(out.len(), 3);
+        assert!(matches!(out[0].role, nevoflux_builtin_wasm::MessageRole::User));
+        assert!(matches!(out[1].role, nevoflux_builtin_wasm::MessageRole::Assistant));
+        assert_eq!(out[1].content, "hello");
+        assert!(
+            matches!(out[2].role, nevoflux_builtin_wasm::MessageRole::Assistant),
+            "a persona tag must not relabel anything while no soul is active"
+        );
+        assert_eq!(out[2].content, "hello from alex");
+    }
+
+    /// A single soul talking to itself sees a normal transcript.
+    #[test]
+    fn history_for_the_same_soul_is_unchanged() {
+        let msgs = vec![user("hi"), assistant("hello", Some("research"))];
+
+        let out = convert_history_messages(msgs, Some("research"), &names);
+
+        assert!(matches!(out[1].role, nevoflux_builtin_wasm::MessageRole::Assistant));
+        assert_eq!(out[1].content, "hello");
+    }
+
+    /// Another soul's reply is handed over as a labelled user turn, so the active
+    /// soul cannot mistake it for something it said itself.
+    #[test]
+    fn other_personas_become_labelled_user_turns() {
+        let msgs = vec![assistant("I looked it up", Some("engineer"))];
+
+        let out = convert_history_messages(msgs, Some("research"), &names);
+
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0].role, nevoflux_builtin_wasm::MessageRole::User));
+        assert_eq!(out[0].content, "[nova] I looked it up", "labelled by name, not slug");
+    }
+
+    /// The label falls back to the slug rather than vanishing when a soul has been
+    /// deleted since it spoke.
+    #[test]
+    fn unknown_persona_falls_back_to_its_slug() {
+        let msgs = vec![assistant("from a deleted soul", Some("gone"))];
+
+        let out = convert_history_messages(msgs, Some("research"), &names);
+
+        assert_eq!(out[0].content, "[gone] from a deleted soul");
+    }
+
+    /// Replies written before souls existed read as the default assistant.
+    #[test]
+    fn legacy_replies_are_attributed_to_the_default_assistant() {
+        let msgs = vec![assistant("older reply", None)];
+
+        let out = convert_history_messages(msgs, Some("research"), &names);
+
+        assert!(matches!(out[0].role, nevoflux_builtin_wasm::MessageRole::User));
+        assert_eq!(out[0].content, "[assistant] older reply");
+    }
+
+    /// Tool steps stay out of history whoever is answering.
+    #[test]
+    fn tool_messages_are_dropped_for_every_persona() {
+        for active in [None, Some("research")] {
+            let msgs = vec![tool_use("{\"tool\":\"web_search\"}"), user("hi")];
+            let out = convert_history_messages(msgs, active, &names);
+            assert_eq!(out.len(), 1, "only the user turn survives");
+            assert!(matches!(out[0].role, nevoflux_builtin_wasm::MessageRole::User));
+        }
+    }
+
+    // ── stamp_message_metadata ─────────────────────────────────────────
+
+    /// An unbound chat writes messages that look exactly like the old ones, plus
+    /// the container they came from.
+    #[test]
+    fn stamping_without_a_soul_records_no_persona() {
+        let meta = stamp_message_metadata(None, "firefox-default", None).unwrap();
+
+        assert_eq!(
+            meta.get(CONTAINER_METADATA_KEY).and_then(|v| v.as_str()),
+            Some("firefox-default")
+        );
+        assert!(
+            !meta.contains_key(PERSONA_METADATA_KEY),
+            "no soul answered, so no persona should be claimed"
+        );
+    }
+
+    #[test]
+    fn stamping_preserves_existing_metadata() {
+        let mut existing = HashMap::new();
+        existing.insert("attachments".to_string(), serde_json::json!(["a.png"]));
+
+        let meta = stamp_message_metadata(Some(existing), "firefox-container-2", None).unwrap();
+
+        assert!(meta.contains_key("attachments"), "attachment metadata must survive");
+        assert_eq!(
+            meta.get(CONTAINER_METADATA_KEY).and_then(|v| v.as_str()),
+            Some("firefox-container-2")
+        );
+    }
+
+    #[test]
+    fn message_persona_reads_what_stamping_wrote() {
+        let msg = assistant("hi", Some("research"));
+        assert_eq!(message_persona(&msg), Some("research"));
+
+        assert_eq!(message_persona(&assistant("hi", None)), None);
+    }
+
+    /// A persona key that is present but blank is not an attribution.
+    #[test]
+    fn blank_persona_reads_as_absent() {
+        let mut msg = assistant("hi", Some("research"));
+        msg.metadata.as_mut().unwrap().insert(
+            PERSONA_METADATA_KEY.to_string(),
+            serde_json::Value::String(String::new()),
+        );
+        assert_eq!(message_persona(&msg), None);
     }
 }
 

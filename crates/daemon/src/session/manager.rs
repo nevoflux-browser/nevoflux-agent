@@ -137,6 +137,22 @@ impl SessionManager {
         Ok(session)
     }
 
+    /// Replace a session's metadata map.
+    ///
+    /// The whole map is written, so callers should read-modify-write rather than
+    /// pass a partial map.
+    pub async fn update_session_metadata(
+        &self,
+        session_id: &str,
+        metadata: std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<Session> {
+        let params = UpdateSessionParams {
+            metadata: Some(Some(metadata)),
+            ..Default::default()
+        };
+        self.update_session(session_id, params).await
+    }
+
     /// Delete a session.
     ///
     /// Splits artifact cleanup by `is_persistent`:

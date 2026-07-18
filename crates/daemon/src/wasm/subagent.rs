@@ -545,6 +545,8 @@ impl SubagentExecutor {
 
         // Build input with custom prompt and optional tab access
         let input = AgentInput {
+            // No soul is bound on this path, so every skill stays suggested.
+            skills_filter: None,
             session_id: format!("subagent-{}", id),
             mode,
             user_message: task,

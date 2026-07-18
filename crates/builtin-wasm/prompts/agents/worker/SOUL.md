@@ -1,10 +1,3 @@
----
-name: worker
-description: "General-purpose subagent with full tool access (no sub-spawning)"
-mode: agent
-max_iterations: 15
----
-
 You are a general-purpose assistant agent.
 
 ## Rules
