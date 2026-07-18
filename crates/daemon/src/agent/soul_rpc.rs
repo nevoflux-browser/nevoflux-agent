@@ -668,28 +668,63 @@ impl DraftTarget {
         }
     }
 
-    /// What this file is, in the model's terms.
+    /// What this file is and the exact shape it must take, with a worked
+    /// example. The example matters: without it the model writes plausible prose
+    /// that ignores the file's format (an identity line that reads like ad copy
+    /// instead of "Name — …").
     fn brief(self) -> &'static str {
         match self {
             Self::Soul => {
-                "SOUL.md — the assistant's personality. Write it as instructions addressed to \
-                 the assistant itself ('You are …'). Cover how it thinks, what it insists on, \
-                 and what it refuses to do. It replaces the user's global personality while \
-                 this soul is answering, so it must stand on its own."
+                "SOUL.md — the assistant's personality, written as instructions addressed to \
+                 the assistant itself. It replaces the user's global personality while this \
+                 soul is answering. Write ONLY the persona: do NOT open with a 'You are \
+                 <name> …' line and do NOT restate who or what the assistant is — its identity \
+                 already lives in IDENTITY.md, and repeating it here just wastes the context. \
+                 Start directly at the first heading. Follow this shape exactly, keeping the \
+                 four sections:\n\n\
+                 ## Core values\n\
+                 - <what it fundamentally cares about and refuses to compromise on>\n\n\
+                 ## How it thinks\n\
+                 - <the lens it approaches problems through>\n\n\
+                 ## Communication style\n\
+                 - <how it talks: tone, directness, when it pushes back>\n\n\
+                 ## Red lines & banned words\n\
+                 - Never <phrases or behaviours it must never produce>\n\n\
+                 Put 2–4 concrete bullets under each heading — every bullet must change how the \
+                 assistant behaves, no filler. Translate the headings only if you are writing \
+                 the body in another language."
             }
             Self::Identity => {
-                "IDENTITY.md body — two or three lines saying who this assistant is, in the \
-                 third person. It is the short self-description shown alongside the personality."
+                "IDENTITY.md body — ONE short line: the assistant introducing itself, in the \
+                 first person, with a bit of character. Keep it to a single sentence (roughly \
+                 12–25 words), because this is the fixed identity line and the real task needs \
+                 the rest of the context. Give it a personality — a stance, an attitude — while \
+                 staying honest that it is an AI, and name the role it plays and where it works. \
+                 Its name and avatar are set elsewhere, so add no emoji and no 'Name:' label. Do \
+                 NOT list its values, thinking, style, or rules — that all lives in SOUL.md. \
+                 Shape:\n\n\
+                 I'm <Name> — <a personable one-line self-introduction: what I am, the role I \
+                 play, and where I work>.\n\n\
+                 Example: \"I'm IronMan — an AI that lives in your browser and treats every real \
+                 machine, file, and account I touch as mine to look after.\""
             }
             Self::Tools => {
-                "TOOLS.md — guidance on which tools this assistant should reach for and when. \
-                 It replaces the user's global tool guidance while this soul is answering, so \
-                 only write it if this soul really works differently."
+                "TOOLS.md — short guidance on which tools this assistant reaches for and when, \
+                 as bullets under a heading. It replaces the user's global tool guidance while \
+                 this soul is answering. Follow this shape:\n\n\
+                 ## Tool preferences\n\n\
+                 - <when to prefer one tool over another>\n\
+                 - <a habit worth enforcing>\n\n\
+                 Only write it if this soul really works differently from the default; otherwise \
+                 an empty file inherits the global guidance."
             }
             Self::Agents => {
-                "AGENTS.md — guidance on what work this assistant should hand to other \
-                 assistants, and what it should keep. It replaces the user's global delegation \
-                 guidance while this soul is answering."
+                "AGENTS.md — short guidance on what work this assistant hands to other assistants \
+                 and what it keeps, as bullets under a heading. It replaces the user's global \
+                 delegation guidance while this soul is answering. Follow this shape:\n\n\
+                 ## Delegation\n\n\
+                 - <what to hand off, and to whom>\n\
+                 - <what to keep and do itself>"
             }
         }
     }
@@ -779,10 +814,14 @@ pub async fn handle_soul_generate(
 }
 
 const DRAFT_SYSTEM_PROMPT: &str = "\
-You write configuration files for a browser assistant. Return the file's contents \
-and nothing else: no preamble, no explanation, no code fence. Write plainly and \
-concretely — every line should change how the assistant behaves. Keep it short \
-enough to read in one sitting.";
+You write configuration files that define an assistant's persona. The assistant \
+can be anything — a code reviewer, a writer, a researcher, a browser operator — so \
+take its role only from the name, purpose, and existing files you are given; do not \
+assume it works with the browser or any other particular domain. Write in English by \
+default; use another language only when the user's request or the file's existing \
+content is written in that language. Return the file's contents and nothing else: no \
+preamble, no explanation, no code fence. Write plainly and concretely — every line \
+should change how the assistant behaves. Keep it short enough to read in one sitting.";
 
 /// Assemble what the model needs to write a useful draft.
 ///
@@ -794,8 +833,9 @@ fn build_draft_prompt(
     target: DraftTarget,
 ) -> String {
     let field = |key: &str| params.get(key).and_then(|v| v.as_str()).unwrap_or("").trim();
+    let target_key = target_field_key(target);
 
-    let mut prompt = format!("Write this file:\n{}\n\n", target.brief());
+    let mut prompt = format!("Write the {}.\n\n{}\n\n", target_label(target), target.brief());
 
     let name = field("name");
     let description = field("description");
@@ -806,23 +846,42 @@ fn build_draft_prompt(
         prompt.push_str(&format!("Its purpose: {}\n", description));
     }
 
-    // A soul the user is editing already has files; a new one has none, and this
-    // section simply stays empty.
-    let existing: Vec<(&str, &str)> = [
-        ("Personality (SOUL.md)", field("soul")),
-        ("Identity (IDENTITY.md)", field("identity")),
-        ("Tool guidance (TOOLS.md)", field("tools")),
-        ("Delegation guidance (AGENTS.md)", field("agents")),
+    // The field the user is drafting is the starting point, not something to
+    // ignore: if they have already written some of it, rewrite from there rather
+    // than replacing it wholesale; if it is empty, write a first version from the
+    // name, purpose, and the other files.
+    let current = field(target_key);
+    if current.is_empty() {
+        prompt.push_str(
+            "\nThere is no draft of this file yet. Write a first version from the assistant's \
+             name and purpose, and keep it consistent with its other files below.\n",
+        );
+    } else {
+        prompt.push_str(&format!(
+            "\nHere is the current {} — improve it: keep what works, apply the request below, \
+             and make it match the format above.\n\n--- current {} ---\n{}\n",
+            target_label(target),
+            target_label(target),
+            current
+        ));
+    }
+
+    // The other files come along so the draft stays consistent with them — a soul
+    // is one assistant described several ways.
+    let others: Vec<(&str, &str)> = [
+        ("soul", "Personality (SOUL.md)", field("soul")),
+        ("identity", "Identity (IDENTITY.md)", field("identity")),
+        ("tools", "Tool guidance (TOOLS.md)", field("tools")),
+        ("agents", "Delegation guidance (AGENTS.md)", field("agents")),
     ]
     .into_iter()
-    .filter(|(label, content)| {
-        !content.is_empty() && !label.contains(target_label(target))
-    })
+    .filter(|(key, _, content)| *key != target_key && !content.is_empty())
+    .map(|(_, label, content)| (label, content))
     .collect();
 
-    if !existing.is_empty() {
-        prompt.push_str("\nIts other files already say:\n");
-        for (label, content) in existing {
+    if !others.is_empty() {
+        prompt.push_str("\nIts other files already say (for consistency, do not copy):\n");
+        for (label, content) in others {
             prompt.push_str(&format!("\n--- {} ---\n{}\n", label, content));
         }
     }
@@ -846,6 +905,16 @@ fn build_draft_prompt(
     }
 
     prompt
+}
+
+/// The params key the frontend sends a given file's current content under.
+fn target_field_key(target: DraftTarget) -> &'static str {
+    match target {
+        DraftTarget::Soul => "soul",
+        DraftTarget::Identity => "identity",
+        DraftTarget::Tools => "tools",
+        DraftTarget::Agents => "agents",
+    }
 }
 
 fn target_label(target: DraftTarget) -> &'static str {
