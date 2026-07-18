@@ -2478,6 +2478,60 @@ pub async fn start_llm_stream(
     Ok(stream_id)
 }
 
+/// Run a chat request and collect the whole reply as one string.
+///
+/// Streams under the hood and accumulates the deltas, so it works with every
+/// provider — including the ACP ones (claude-code, gemini-cli, antigravity, …),
+/// which only support streaming and reject the one-shot [`execute_llm_chat`].
+/// Use this for short one-shot text jobs (e.g. drafting a soul file) that want a
+/// `String`, not a live stream.
+pub async fn execute_llm_text(
+    provider: ProviderType,
+    api_key: &str,
+    model: &str,
+    request: LlmChatRequest,
+    base_url: Option<&str>,
+    host_services: Option<crate::wasm::services::HostServices>,
+) -> Result<String> {
+    let (tx, mut rx) = mpsc::channel(32);
+    let api_key = api_key.to_string();
+    let model = model.to_string();
+    let base_url_owned = base_url.map(String::from);
+
+    let worker = tokio::spawn(async move {
+        execute_llm_stream_inner(
+            provider,
+            &api_key,
+            &model,
+            request,
+            tx,
+            base_url_owned.as_deref(),
+            host_services,
+        )
+        .await
+    });
+
+    let mut out = String::new();
+    while let Some(chunk) = rx.recv().await {
+        if let Some(text) = chunk.text {
+            out.push_str(&text);
+        }
+        if chunk.done {
+            break;
+        }
+    }
+
+    // Surface a streaming error rather than returning a half-written draft.
+    match worker.await {
+        Ok(Ok(())) => Ok(out),
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(DaemonError::InternalError(format!(
+            "draft stream task failed: {}",
+            e
+        ))),
+    }
+}
+
 /// Internal function to execute a streaming LLM request.
 async fn execute_llm_stream_inner(
     provider: ProviderType,

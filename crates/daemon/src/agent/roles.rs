@@ -51,6 +51,13 @@ pub struct AgentRoleMetadata {
     /// Display name; `@`-mentions and the UI use this. Empty means "fall back to the slug".
     #[serde(default)]
     pub name: String,
+    /// What this role is for: a `"soul"` (a Space's main-session assistant, which
+    /// users create and bind to containers) or a `"subagent"` (a fixed worker the
+    /// main assistant dispatches for a clean-context subtask). They share one
+    /// directory format but never appear in each other's lists: souls in the Space
+    /// bindings, subagents in the delegation targets.
+    #[serde(default = "default_kind")]
+    pub kind: String,
     /// Human-readable description
     #[serde(default)]
     pub description: String,
@@ -77,9 +84,6 @@ pub struct AgentRoleMetadata {
     /// Empty means "advertise everything allowed".
     #[serde(default)]
     pub advertised_tools: Vec<String>,
-    /// Roles this one may delegate to. Empty means "no restriction".
-    #[serde(default)]
-    pub subagents: Vec<String>,
     /// Skills suggested to this role each turn. Empty means "all skills".
     #[serde(default)]
     pub skills: Vec<String>,
@@ -95,6 +99,7 @@ impl Default for AgentRoleMetadata {
     fn default() -> Self {
         Self {
             name: String::new(),
+            kind: default_kind(),
             description: String::new(),
             avatar: None,
             mode: default_mode(),
@@ -102,7 +107,6 @@ impl Default for AgentRoleMetadata {
             model: None,
             allowed_tools: Vec::new(),
             advertised_tools: Vec::new(),
-            subagents: Vec::new(),
             skills: Vec::new(),
             tools: None,
             max_iterations: default_max_iterations(),
@@ -113,6 +117,18 @@ impl Default for AgentRoleMetadata {
 fn default_mode() -> String {
     "agent".to_string()
 }
+
+/// A role with no declared `kind` is a soul. Subagent workers opt in explicitly,
+/// so the four built-ins carry `kind: subagent` and everything a user creates is a
+/// soul by default.
+fn default_kind() -> String {
+    ROLE_KIND_SOUL.to_string()
+}
+
+/// A Space's main-session assistant.
+pub const ROLE_KIND_SOUL: &str = "soul";
+/// A fixed worker dispatched for a clean-context subtask.
+pub const ROLE_KIND_SUBAGENT: &str = "subagent";
 
 fn default_max_iterations() -> u32 {
     10
@@ -211,6 +227,8 @@ pub struct AgentRoleDefinition {
     pub slug: String,
     /// Display name (frontmatter `name`, defaulting to the slug)
     pub name: String,
+    /// `"soul"` (a Space assistant) or `"subagent"` (a dispatchable worker).
+    pub kind: String,
     /// Human-readable description
     pub description: String,
     /// Avatar path (relative to the role directory) or inline `data:` URI
@@ -233,8 +251,6 @@ pub struct AgentRoleDefinition {
     pub tools_config: Option<ToolsConfig>,
     /// Tools kept in every request; empty means "advertise everything allowed"
     pub advertised_tools: Vec<String>,
-    /// Roles this one may delegate to; empty means "no restriction"
-    pub subagents: Vec<String>,
     /// Skills suggested each turn; empty means "all skills"
     pub skills: Vec<String>,
     /// Maximum iterations before timeout
@@ -286,6 +302,7 @@ impl AgentRoleDefinition {
         Ok(Self {
             slug: slug.to_string(),
             name,
+            kind: meta.kind,
             description: meta.description,
             avatar: meta.avatar,
             system_prompt: bodies.soul,
@@ -297,10 +314,19 @@ impl AgentRoleDefinition {
             model: meta.model,
             tools_config,
             advertised_tools: meta.advertised_tools,
-            subagents: meta.subagents,
             skills: meta.skills,
             max_iterations,
         })
+    }
+
+    /// Whether this role is a Space assistant (as opposed to a subagent worker).
+    pub fn is_soul(&self) -> bool {
+        self.kind != ROLE_KIND_SUBAGENT
+    }
+
+    /// Whether this role is a dispatchable subagent worker.
+    pub fn is_subagent(&self) -> bool {
+        self.kind == ROLE_KIND_SUBAGENT
     }
 }
 
@@ -326,6 +352,7 @@ impl AgentRoleDefinition {
         let tools = matches!(self.tools_config, Some(ToolsConfig::None)).then(|| "none".to_string());
         AgentRoleMetadata {
             name: self.name,
+            kind: self.kind,
             description: self.description,
             avatar: self.avatar,
             mode: self.mode,
@@ -333,7 +360,6 @@ impl AgentRoleDefinition {
             model: self.model,
             allowed_tools,
             advertised_tools: self.advertised_tools,
-            subagents: self.subagents,
             skills: self.skills,
             tools,
             max_iterations: self.max_iterations,
@@ -629,6 +655,7 @@ impl AgentRoleRegistry {
             slug.to_string(),
             AgentRoleSummary {
                 slug: slug.to_string(),
+                kind: metadata.kind,
                 name: metadata.name.clone(),
                 description: metadata.description,
             },
@@ -1053,8 +1080,8 @@ Just an identity line.
         assert!(meta.model.is_none());
         assert!(meta.allowed_tools.is_empty());
         assert!(meta.advertised_tools.is_empty());
-        assert!(meta.subagents.is_empty());
         assert!(meta.skills.is_empty());
+        assert_eq!(meta.kind, "soul"); // default
         assert!(meta.avatar.is_none());
         assert!(meta.tools.is_none());
         assert!(body.contains("identity line"));
@@ -1689,7 +1716,7 @@ Always add tests.
             &user_dir,
             "kitted",
             "---\nname: kitted\ndescription: All keys\nadvertised_tools:\n  - web_search\n\
-             subagents:\n  - reader\nskills:\n  - research\n---\n",
+             skills:\n  - research\n---\n",
             "Prompt.",
         );
 
@@ -1698,8 +1725,45 @@ Always add tests.
 
         let def = registry.get("kitted").unwrap();
         assert_eq!(def.advertised_tools, vec!["web_search"]);
-        assert_eq!(def.subagents, vec!["reader"]);
         assert_eq!(def.skills, vec!["research"]);
+    }
+
+    /// A role's `kind` defaults to soul; the built-ins opt into subagent.
+    #[test]
+    fn test_kind_defaults_to_soul_and_can_be_subagent() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let user_dir = temp_dir.path().join("user");
+        std::fs::create_dir_all(&user_dir).unwrap();
+
+        write_role_dir(
+            &user_dir,
+            "mine",
+            "---\nname: mine\ndescription: A soul\n---\n",
+            "Prompt.",
+        );
+        write_role_dir(
+            &user_dir,
+            "helper",
+            "---\nname: helper\nkind: subagent\ndescription: A worker\n---\n",
+            "Prompt.",
+        );
+
+        let registry = AgentRoleRegistry::with_builtin_sources(user_dir, Vec::new());
+        registry.scan().unwrap();
+
+        let mine = registry.get("mine").unwrap();
+        assert!(mine.is_soul());
+        assert!(!mine.is_subagent());
+
+        let helper = registry.get("helper").unwrap();
+        assert!(helper.is_subagent());
+        assert!(!helper.is_soul());
+
+        // The summaries carry kind too, so callers can filter without a full load.
+        let by_slug: std::collections::HashMap<_, _> =
+            registry.list().into_iter().map(|s| (s.slug, s.kind)).collect();
+        assert_eq!(by_slug["mine"], "soul");
+        assert_eq!(by_slug["helper"], "subagent");
     }
 
     // ── Legacy flat-file migration ─────────────────────────────────────
@@ -1850,7 +1914,6 @@ Always add tests.
             description: "Research copilot".into(),
             avatar: Some("./avatar.png".into()),
             allowed_tools: vec!["web_search".into()],
-            subagents: vec!["reader".into()],
             ..Default::default()
         };
         let bodies = RoleBodies {
@@ -1871,7 +1934,7 @@ Always add tests.
         assert_eq!(def.system_prompt, "You are alex.");
         assert_eq!(def.tools_doc.as_deref(), Some("Prefer web_search."));
         assert!(def.agents_doc.is_none(), "an absent optional stays absent");
-        assert_eq!(def.subagents, vec!["reader"]);
+        assert!(def.is_soul(), "a user-written role is a soul by default");
         assert_eq!(
             def.tools_config,
             Some(ToolsConfig::Allow(vec!["web_search".into()]))

@@ -26,10 +26,18 @@ pub struct AgentRoleSummary {
     /// gained directories; callers that need a key should fall back to `name`.
     #[serde(default)]
     pub slug: String,
+    /// `"soul"` (a Space assistant) or `"subagent"` (a dispatchable worker).
+    /// Defaults to `"soul"` so payloads written before the split still deserialize.
+    #[serde(default = "default_role_kind")]
+    pub kind: String,
     /// Display name, shown to users and used for `@`-mentions
     pub name: String,
     /// Human-readable description
     pub description: String,
+}
+
+fn default_role_kind() -> String {
+    "soul".to_string()
 }
 
 /// Configuration for spawning a subagent.
@@ -255,6 +263,7 @@ mod tests {
     fn test_agent_role_summary_serde() {
         let summary = AgentRoleSummary {
             slug: "research".to_string(),
+            kind: "soul".to_string(),
             name: "researcher".to_string(),
             description: "A role for web research tasks".to_string(),
         };
@@ -263,13 +272,14 @@ mod tests {
         assert_eq!(deserialized, summary);
     }
 
-    /// Payloads written before roles gained directories carry no `slug`. They
-    /// must still deserialize rather than break an older sidebar's round-trip.
+    /// Payloads written before roles gained directories carry no `slug`/`kind`.
+    /// They must still deserialize rather than break an older sidebar's round-trip.
     #[test]
     fn test_agent_role_summary_accepts_payload_without_slug() {
         let legacy = r#"{"name":"researcher","description":"A role"}"#;
         let summary: AgentRoleSummary = serde_json::from_str(legacy).unwrap();
         assert_eq!(summary.name, "researcher");
         assert!(summary.slug.is_empty());
+        assert_eq!(summary.kind, "soul", "an unmarked role defaults to soul");
     }
 }

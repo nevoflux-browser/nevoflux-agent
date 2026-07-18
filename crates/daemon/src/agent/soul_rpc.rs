@@ -63,6 +63,9 @@ pub async fn handle_soul_list(services: &HostServices, params: &serde_json::Valu
     let mut souls: Vec<serde_json::Value> = registry
         .list()
         .into_iter()
+        // Subagent workers share the role directory format but are not Space
+        // assistants; they belong in the delegation list, not here.
+        .filter(|s| s.kind != crate::agent::roles::ROLE_KIND_SUBAGENT)
         .map(|s| {
             // The avatar is loaded per soul rather than in `list()` because it
             // means reading (and possibly re-encoding) a file.
@@ -332,7 +335,6 @@ pub async fn handle_soul_read(services: &HostServices, params: &serde_json::Valu
                 "description": def.description,
                 "avatar": soul_avatar_data_uri(&def),
                 "allowed_tools": def.allowed_tools_list(),
-                "subagents": def.subagents,
                 "identity": def.identity,
                 "soul": def.system_prompt,
                 "tools": def.tools_doc,
@@ -425,9 +427,8 @@ pub async fn handle_soul_write(
     if let Some(list) = params.get("allowed_tools") {
         meta.allowed_tools = string_list(list);
     }
-    if let Some(list) = params.get("subagents") {
-        meta.subagents = string_list(list);
-    }
+    // A soul the user creates is a soul, never a subagent worker.
+    meta.kind = crate::agent::roles::ROLE_KIND_SOUL.to_string();
 
     let bodies = crate::agent::roles::RoleBodies {
         identity: params
@@ -745,17 +746,21 @@ pub async fn handle_soul_generate(
         tools: None,
     };
 
-    match crate::wasm::llm::execute_llm_chat(
+    // Stream and collect: ACP providers (claude-code, antigravity, …) reject the
+    // one-shot chat path, so a draft has to go through the streaming path even
+    // though it wants a single string back.
+    match crate::wasm::llm::execute_llm_text(
         llm.provider,
         &llm.api_key,
         &llm.model,
         request,
         llm.base_url.as_deref(),
+        Some(services.clone()),
     )
     .await
     {
         Ok(response) => {
-            let content = strip_code_fence(&response.content);
+            let content = strip_code_fence(&response);
             if content.trim().is_empty() {
                 return respond(
                     &request_id,

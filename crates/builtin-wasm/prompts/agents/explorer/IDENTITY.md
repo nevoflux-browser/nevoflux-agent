@@ -1,5 +1,6 @@
 ---
 name: explorer
+kind: subagent
 description: "Quick read-only page browsing and info extraction"
 mode: browser
 allowed_tools:

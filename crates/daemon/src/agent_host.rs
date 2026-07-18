@@ -4617,7 +4617,13 @@ impl HostFunctions for DaemonHostFunctions {
 
         let summaries: Vec<AgentRoleSummary> = if let Some(services) = &self.services {
             if let Some(registry) = services.role_registry() {
-                registry.list()
+                // Only subagent workers are dispatchable; souls are the user's
+                // main-session assistants and never spawned as subtasks.
+                registry
+                    .list()
+                    .into_iter()
+                    .filter(|s| s.kind == crate::agent::roles::ROLE_KIND_SUBAGENT)
+                    .collect()
             } else {
                 vec![]
             }
@@ -6638,29 +6644,6 @@ impl DaemonHostFunctions {
         } else {
             None
         };
-
-        // 2b. A soul may name the souls it is allowed to hand work to. Checked
-        // against the resolved slug, so naming a role by its display name cannot
-        // slip past the list.
-        if let Some(caller) = self.active_soul.as_ref() {
-            if !caller.subagents.is_empty() {
-                let requested = role_def.as_ref().map(|d| d.slug.as_str());
-                let permitted = requested.is_some_and(|slug| {
-                    caller.subagents.iter().any(|allowed| allowed == slug)
-                });
-                if !permitted {
-                    return Err(HostError {
-                        code: 403,
-                        message: format!(
-                            "{} may only delegate to: {}. Requested: {}.",
-                            caller.name,
-                            caller.subagents.join(", "),
-                            requested.unwrap_or("(no role)")
-                        ),
-                    });
-                }
-            }
-        }
 
         // 3. Merge config: defaults <- role <- spawn params
         let final_mode_str = config
@@ -9185,6 +9168,7 @@ mod tests {
         crate::agent::roles::AgentRoleDefinition {
             slug: "research".into(),
             name: "alex".into(),
+            kind: "soul".into(),
             description: String::new(),
             avatar: None,
             system_prompt: String::new(),
@@ -9196,7 +9180,6 @@ mod tests {
             model: None,
             tools_config,
             advertised_tools: vec![],
-            subagents: vec![],
             skills: vec![],
             max_iterations: 10,
         }

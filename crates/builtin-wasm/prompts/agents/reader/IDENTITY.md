@@ -1,5 +1,6 @@
 ---
 name: reader
+kind: subagent
 description: "Read-only code and file analysis"
 mode: agent
 allowed_tools:

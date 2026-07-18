@@ -1,5 +1,6 @@
 ---
 name: researcher
+kind: subagent
 description: "Deep browser research with memory read/write"
 mode: browser
 allowed_tools:
