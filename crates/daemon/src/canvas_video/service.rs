@@ -310,17 +310,11 @@ impl CanvasVideoService {
         self: &Arc<Self>,
         req: nevoflux_protocol::canvas_video::CreateFromVisualIdentityRequest,
     ) -> Result<CreateCompositionResponse> {
-        use nevoflux_protocol::extract::VisualIdentity;
-
         // Deserialize the embedded VI blob. We expose it as serde_json::Value
         // in the protocol so this module doesn't have to leak `extract`
-        // types into every CRUD call site, but parse strictly here.
-        let vi: VisualIdentity =
-            serde_json::from_value(req.visual_identity.clone()).map_err(|e| {
-                crate::error::DaemonError::InvalidRequest(format!(
-                    "create_from_visual_identity: visual_identity is not a valid VisualIdentity: {e}"
-                ))
-            })?;
+        // types into every CRUD call site, but parse strictly here — via the
+        // string-or-object-tolerant helper (see `parse_visual_identity`).
+        let vi = parse_visual_identity(&req.visual_identity)?;
 
         let design_md = crate::canvas_video::vi_to_design::vi_to_design_md(&vi);
 
@@ -986,6 +980,111 @@ impl CanvasVideoService {
 impl Default for CanvasVideoService {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Decode the embedded `VisualIdentity` blob, tolerating both the object form
+/// and the JSON-stringified form.
+///
+/// The `canvas_create_from_visual_identity` tool schema declares
+/// `visual_identity` as `type: "string"` (a JSON-stringified blob) so it
+/// survives the OpenAI Responses API strict-mode validation, which rejects
+/// bare `{type: object}` subschemas without explicit `properties`. Callers
+/// therefore send it as a string. The direct-API host path unwraps that
+/// string before it reaches the protocol struct, but the MCP/ACP dispatch
+/// path forwards the arguments verbatim — so by the time it lands in
+/// `CreateFromVisualIdentityRequest::visual_identity` (typed
+/// `serde_json::Value`) it can be either a `Value::String` (schema-conformant
+/// callers / MCP path) or a `Value::Object` (older direct-API callers). Accept
+/// both here, at the one chokepoint both dispatch paths funnel through, so the
+/// Mode-3 entry point can't regress on either.
+fn parse_visual_identity(
+    value: &serde_json::Value,
+) -> Result<nevoflux_protocol::extract::VisualIdentity> {
+    use nevoflux_protocol::extract::VisualIdentity;
+
+    let parsed = match value {
+        serde_json::Value::String(s) => serde_json::from_str::<VisualIdentity>(s),
+        other => serde_json::from_value::<VisualIdentity>(other.clone()),
+    };
+    parsed.map_err(|e| {
+        DaemonError::InvalidRequest(format!(
+            "create_from_visual_identity: visual_identity is not a valid VisualIdentity: {e}"
+        ))
+    })
+}
+
+#[cfg(test)]
+mod vi_parse_tests {
+    use super::*;
+    use nevoflux_protocol::canvas_video::CreateFromVisualIdentityRequest;
+
+    fn vi_json() -> serde_json::Value {
+        serde_json::json!({
+            "url": "https://stripe.com",
+            "name": "Stripe",
+            "tagline": "Payments infrastructure",
+            "extracted_at": 0,
+        })
+    }
+
+    #[test]
+    fn parse_accepts_json_stringified_vi() {
+        // The tool schema declares `visual_identity` as a JSON string (OpenAI
+        // strict-mode compat), so schema-conformant / MCP-path callers send a
+        // Value::String. Regression guard: this must decode, not error.
+        let as_string = serde_json::Value::String(vi_json().to_string());
+        let vi = parse_visual_identity(&as_string).expect("stringified VI must parse");
+        assert_eq!(vi.url, "https://stripe.com");
+        assert_eq!(vi.name.as_deref(), Some("Stripe"));
+    }
+
+    #[test]
+    fn parse_accepts_object_vi() {
+        // Older direct-API callers pass the bare object; still supported.
+        let vi = parse_visual_identity(&vi_json()).expect("object VI must parse");
+        assert_eq!(vi.url, "https://stripe.com");
+    }
+
+    #[test]
+    fn parse_rejects_non_vi_string() {
+        let bad = serde_json::Value::String("not json at all".into());
+        let err = parse_visual_identity(&bad).unwrap_err();
+        assert!(
+            format!("{err}").contains("not a valid VisualIdentity"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_from_visual_identity_accepts_stringified_vi() {
+        // End-to-end at the real Mode-3 entry point: feed `visual_identity` as
+        // a JSON string (the exact shape the tool schema produces) and assert
+        // it is accepted past the VI-parse boundary. The test skill registry
+        // is empty, so the create then fails at template resolution — that is
+        // fine; the point is it no longer dies at "not a valid VisualIdentity".
+        let svc = Arc::new(CanvasVideoService::new_for_tests());
+        let req = CreateFromVisualIdentityRequest {
+            title: "t".into(),
+            width: 640,
+            height: 360,
+            duration_sec: 5.0,
+            fps: 30,
+            bg: None,
+            visual_identity: serde_json::Value::String(vi_json().to_string()),
+            template: "website-promo-16x9".into(),
+            session_id: None,
+        };
+        let err = svc.create_from_visual_identity(req).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("not a valid VisualIdentity"),
+            "stringified VI must be accepted at the handler; got: {msg}"
+        );
+        assert!(
+            msg.contains("skill asset not found") || msg.contains("SkillAssetNotFound"),
+            "expected failure past VI-parse at template resolution; got: {msg}"
+        );
     }
 }
 
