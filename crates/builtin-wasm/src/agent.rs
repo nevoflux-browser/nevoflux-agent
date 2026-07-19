@@ -1060,6 +1060,46 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
     }
 
     /// Core agent loop.
+    /// Canvas/artifact tools that operate on an ALREADY-EXISTING artifact or
+    /// composition (each takes an id / composition_id and is useless without
+    /// one). They are held back from the request until a canvas is actually in
+    /// play — see the canvas gate in `run_loop`. Creation entry points
+    /// (`create_artifact`, `canvas_create_composition`,
+    /// `canvas_create_from_visual_identity`) are deliberately NOT here: they
+    /// must always be reachable to START canvas work.
+    const CANVAS_OPERATE_TOOLS: &'static [&'static str] = &[
+        "browser_read_artifact",
+        "browser_edit_artifact",
+        "canvas_eval",
+        "canvas_attach_asset",
+        "canvas_lint_composition",
+        "canvas_inspect_layout",
+        "canvas_apply_design_md",
+        "canvas_render_video",
+    ];
+
+    /// Tools whose execution creates/opens an artifact. Running any of them
+    /// unlocks `CANVAS_OPERATE_TOOLS` for the rest of the turn, so a same-turn
+    /// "create then operate" flow never loses the operate tools.
+    const CANVAS_CREATING_TOOLS: &'static [&'static str] = &[
+        "create_artifact",
+        "canvas_create_composition",
+        "canvas_create_from_visual_identity",
+    ];
+
+    /// Return `full` unchanged when `unlocked`, otherwise with the
+    /// operate-on-existing-artifact canvas tools filtered out. Cheap: the
+    /// rebuild happens at most twice per turn (start + first creation).
+    fn gate_canvas_tools(full: &[ToolDefinition], unlocked: bool) -> Vec<ToolDefinition> {
+        if unlocked {
+            return full.to_vec();
+        }
+        full.iter()
+            .filter(|t| !Self::CANVAS_OPERATE_TOOLS.contains(&t.name.as_str()))
+            .cloned()
+            .collect()
+    }
+
     fn run_loop(
         &self,
         input: &AgentInput,
@@ -1145,6 +1185,18 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             ));
         }
 
+        // --- Canvas tool gate -------------------------------------------
+        // Tools that only operate on an existing artifact are held back until
+        // a canvas is actually in play — either already open at turn start
+        // (active tab is a nevoflux://canvas page, or the [Active Canvas] hint
+        // rode in on the user message) or created earlier this turn. This
+        // trims the operate-tool schemas from the request on the majority of
+        // turns that never touch a canvas, with no same-turn regression:
+        // creating an artifact unlocks them mid-loop (see below).
+        let mut canvas_unlocked =
+            active_tab_is_canvas || input.user_message.contains("[Active Canvas");
+        let mut active_tools = Self::gate_canvas_tools(tools, canvas_unlocked);
+
         let mut iterations = 0;
         let mut final_text = String::new();
         let mut all_tool_calls = Vec::new();
@@ -1163,12 +1215,12 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
 
             // Use streaming or non-streaming LLM based on config
             let response = if self.config.use_streaming && !self.config.suppress_streaming {
-                self.call_llm_streaming(&messages, tools)?
+                self.call_llm_streaming(&messages, &active_tools)?
             } else {
                 // Call LLM non-streaming
                 let request = LlmRequest {
                     messages: messages.clone(),
-                    tools: tools.to_vec(),
+                    tools: active_tools.clone(),
                     stream: false,
                 };
                 self.host.llm_chat(&request)?
@@ -1182,7 +1234,7 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
 
             // When tools are disabled (empty tools vec), ignore any tool_use blocks
             // and treat the response as a final text response.
-            if tools.is_empty() {
+            if active_tools.is_empty() {
                 final_text = response.text;
                 break;
             }
@@ -1285,6 +1337,18 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 if self.host.is_interrupted()? {
                     break;
                 }
+            }
+
+            // Unlock the canvas operate-tools for the rest of the turn once an
+            // artifact has been created/opened this turn, so the model can
+            // read/edit/render it in the same run without regression.
+            if !canvas_unlocked
+                && tool_calls
+                    .iter()
+                    .any(|tc| Self::CANVAS_CREATING_TOOLS.contains(&tc.name.as_str()))
+            {
+                canvas_unlocked = true;
+                active_tools = Self::gate_canvas_tools(tools, true);
             }
 
             // Move tool calls into the accumulator (avoids a second clone)
@@ -2866,6 +2930,32 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
     }
 
     /// Get available tools for chat mode.
+    /// Shared property definitions for the two composition-creating tools
+    /// (`canvas_create_composition`, `canvas_create_from_visual_identity`) so the
+    /// field set + template enum are defined once and cannot drift apart.
+    fn composition_base_properties() -> serde_json::Value {
+        serde_json::json!({
+            "title":        { "type": "string" },
+            "width":        { "type": "integer", "minimum": 1, "maximum": 1920 },
+            "height":       { "type": "integer", "minimum": 1, "maximum": 1920 },
+            "duration_sec": { "type": "number",  "minimum": 0.5, "maximum": 60 },
+            "fps":          { "type": "integer", "enum": [24, 25, 30] },
+            "bg":           { "type": ["string", "null"] },
+            "template":     {
+                "type": "string",
+                "enum": [
+                    "website-promo-16x9",
+                    "product-intro-16x9",
+                    "product-intro-9x16",
+                    "tiktok-hook",
+                    "video-overlay",
+                    "logo-3d-reveal",
+                    "product-3d-spin"
+                ]
+            }
+        })
+    }
+
     fn get_chat_tools(&self) -> Vec<ToolDefinition> {
         let mut tools = vec![
             ToolDefinition {
@@ -3282,100 +3372,26 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
             },
             ToolDefinition {
                 name: "canvas_create_composition".into(),
-                description: "Create a composition artifact for video rendering. Returns \
-                              {artifact_id} immediately. Stores a multi-file artifact \
-                              (index.html + DESIGN.md + composition.meta.json).\n\n\
-                              **TEMPLATE-VS-CUSTOM DECISION (read first):**\n\
-                              The seven shipped templates are PRE-BAKED scenes for specific \
-                              creative briefs. Pick `template` ONLY when the user's request \
-                              cleanly matches one — e.g. \"3-second TikTok hook\" → \
-                              tiktok-hook; \"product feature reel\" → product-intro-*; \
-                              \"website screenshot promo\" → website-promo-16x9; \"3D logo \
-                              reveal\" → logo-3d-reveal.\n\
-                              When the user says \"make a video of <THIS IMAGE>\" / \"animate \
-                              this picture\" / \"video about X\" without naming a template \
-                              vibe, USE `html` (custom layout) — DO NOT default to a template. \
-                              Templates have their own opinionated copy slots, scene timing \
-                              and decoratives that will fight the user's actual content. \
-                              Defaulting to a template is a known failure mode; the resulting \
-                              video looks like the template, not what the user asked for.\n\n\
-                              **IMAGE INPUT — call canvas_attach_asset FIRST:**\n\
-                              If the user provided an image (uploaded / URL / clipboard) that \
-                              should appear in the video, you MUST call canvas_attach_asset \
-                              BEFORE referencing it. The asset goes into the composition's \
-                              files map at `assets/<name>` and the renderer auto-inlines it. \
-                              Putting `<img src=\"https://...\">` directly in HTML or pasting \
-                              base64 inline both fail.\n\n\
-                              THREE LAYERS — separate concerns, edit independently:\n\
-                              1. STRUCTURE (`template` OR `html`): layout, scene rhythm, GSAP \
-                                 timeline. Pick at create time. Shipped templates: \
-                                 website-promo-16x9, product-intro-16x9, product-intro-9x16, \
-                                 tiktok-hook, video-overlay, logo-3d-reveal, product-3d-spin. \
-                                 When both are supplied, `html` wins.\n\
-                              2. BRAND (`design_md`): colors, typography, spacing, motion \
-                                 easings. Optional YAML+markdown following Google design.md \
-                                 spec + NevoFlux video extension. Daemon parses the YAML \
-                                 frontmatter and injects a `<style data-nf-design-tokens>` \
-                                 block at the top of the composition's <head>.\n\
-                              3. CONTENT (post-create): use browser_edit_artifact on the \
-                                 returned artifact_id to replace text placeholders, edit \
-                                 copy, and add `<img src=\"assets/...\">` references after \
-                                 canvas_attach_asset. After editing DESIGN.md separately, \
-                                 call canvas_apply_design_md to refresh the brand layer.\n\n\
-                              Arguments: title (str); width (int 1-1920); height (int 1-1920); \
-                              duration_sec (number 0.5-60); fps (24|25|30); bg (optional CSS \
-                              color string); plus exactly one of `template` or `html`; plus \
-                              optional `design_md` (string).".into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "title":        { "type": "string" },
-                        "width":        { "type": "integer", "minimum": 1, "maximum": 1920 },
-                        "height":       { "type": "integer", "minimum": 1, "maximum": 1920 },
-                        "duration_sec": { "type": "number",  "minimum": 0.5, "maximum": 60 },
-                        "fps":          { "type": "integer", "enum": [24, 25, 30] },
-                        "bg":           { "type": ["string", "null"] },
-                        "template":     {
-                            "type": "string",
-                            "enum": [
-                                "website-promo-16x9",
-                                "product-intro-16x9",
-                                "product-intro-9x16",
-                                "tiktok-hook",
-                                "video-overlay",
-                                "logo-3d-reveal",
-                                "product-3d-spin"
-                            ],
-                            "description": "Skill template name. ONLY pick when the user's \
-                                            request matches a template's specific creative \
-                                            brief (e.g. they say 'TikTok hook' or 'product \
-                                            intro'). For generic / image-driven requests \
-                                            ('make a video of this picture'), use `html` \
-                                            instead — defaulting to a template makes the \
-                                            output look like the template, not the user's \
-                                            content."
-                        },
-                        "html": {
-                            "type": "string",
-                            "description": "Raw composition HTML body. Use this when the user \
-                                            didn't request a specific template style, when \
-                                            their main content is a user-supplied image / \
-                                            text, or when no shipped template's creative brief \
-                                            fits. Overrides `template` when both are supplied."
-                        },
-                        "design_md": {
-                            "type": "string",
-                            "description": "Brand identity (Google design.md + NevoFlux video \
-                                            extension). YAML frontmatter must include colors \
-                                            (primary/secondary/accent/background/foreground), \
-                                            typography (hero/body), spacing. The daemon parses \
-                                            and injects --color-* / --typography-* / --spacing-* \
-                                            CSS variables into the composition's <head>. Omit \
-                                            to use the template's own default brand defaults."
-                        }
-                    },
-                    "required": ["title", "width", "height", "duration_sec", "fps"]
-                }),
+                description: "Create a composition artifact for video rendering. Returns {artifact_id} immediately (multi-file: index.html + DESIGN.md + composition.meta.json). Load the full rules first with skill_load(\"video\") (template-vs-custom, image-asset gate, structure/brand/content layers). Two guardrails that bite: (1) if the user gave an image to feature, call canvas_attach_asset FIRST and reference assets/<name> -- inline base64 or external <img src> both fail. (2) Pass `template` ONLY when the request matches a shipped template's brief; for generic/image-driven requests use `html`, since defaulting to a template is a known failure mode. Supply exactly one of `template` or `html`.".into(),
+                input_schema: {
+                    let mut props = Self::composition_base_properties();
+                    props["template"]["description"] = serde_json::json!(
+                        "Use ONLY when the request matches a shipped template's brief; otherwise use `html`."
+                    );
+                    props["html"] = serde_json::json!({
+                        "type": "string",
+                        "description": "Raw composition HTML body for generic / image-driven requests. Overrides `template` when both are supplied."
+                    });
+                    props["design_md"] = serde_json::json!({
+                        "type": "string",
+                        "description": "Optional brand identity (design.md YAML frontmatter: colors / typography / spacing) injected as CSS vars into <head>."
+                    });
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": props,
+                        "required": ["title", "width", "height", "duration_sec", "fps"]
+                    })
+                },
             },
             ToolDefinition {
                 name: "canvas_render_video".into(),
@@ -3401,16 +3417,7 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
             },
             ToolDefinition {
                 name: "canvas_apply_design_md".into(),
-                description: "Re-apply the composition's stored DESIGN.md to its rendered HTML. \
-                              Reads `artifact.files['DESIGN.md']`, parses the YAML frontmatter, \
-                              and replaces the `<style data-nf-design-tokens>:root { ... }</style>` \
-                              block at the top of `index.html`. Idempotent and non-destructive: \
-                              only the marked block changes, so any text/copy/CSS edits the \
-                              user (or you) made elsewhere in `index.html` survive untouched.\n\n\
-                              Use this AFTER the user edits DESIGN.md (in the Canvas Editor or \
-                              via any other mechanism) to refresh the brand layer without \
-                              regenerating the composition. Returns { composition_id }. \
-                              Arguments: composition_id (string).".into(),
+                description: "Re-apply the composition's stored DESIGN.md to its rendered index.html: parses the YAML frontmatter and replaces only the <style data-nf-design-tokens> block, so other edits survive. Idempotent and non-destructive. Call AFTER the user edits DESIGN.md to refresh the brand layer without regenerating. Returns {composition_id}.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -3421,28 +3428,7 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
             },
             ToolDefinition {
                 name: "canvas_inspect_layout".into(),
-                description: "Run a visual layout + WCAG contrast audit on a composition. \
-                              The daemon broadcasts the request to the extension, which loads \
-                              the composition into a sandbox iframe, seeks the timeline at N \
-                              evenly-spaced timestamps (plus any hero frames you specify in \
-                              `at`), collects bounding boxes for every `[data-track-index]` / \
-                              `.clip` element, and runs a WCAG AA contrast check on every text \
-                              element.\n\n\
-                              Returns issues of these kinds (`kind` field):\n\
-                              - `overflow_x` / `overflow_y` — element extends past stage edges\n\
-                              - `off_stage` — element entirely outside the stage rect\n\
-                              - `zero_size` — `[data-track-index]` element has 0×0 bbox during \
-                                its `data-start..+data-duration` window (visibility/opacity \
-                                misuse)\n\
-                              - `contrast` — text contrast ratio below 4.5:1 (3:1 for large \
-                                text); includes `fg`, `bg`, `ratio`, `required` fields\n\n\
-                              Run AFTER `canvas_lint_composition` succeeds — lint catches \
-                              static rules, inspect catches runtime/visual issues. Iterate: \
-                              tweak DESIGN.md / scene padding / max-width, re-inspect, until \
-                              `issues` is empty (or only known-acceptable items remain).\n\n\
-                              Default frames=8 (good for most compositions). Bump to 15 for \
-                              dense videos with rapid scene changes. Use `at` to additionally \
-                              check exact hero-frame timestamps you suspect.".into(),
+                description: "Run a visual layout + WCAG contrast audit on a composition: loads it into a sandbox iframe, samples the timeline at N evenly-spaced timestamps (plus any in `at`), and reports issues per `kind` -- overflow_x/overflow_y (past stage edges), off_stage, zero_size ([data-track-index] element 0x0 during its window), contrast (text below 4.5:1, or 3:1 for large text). Run AFTER canvas_lint_composition (lint = static rules, inspect = runtime/visual). Default frames=8; bump to 15 for dense videos.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -3455,38 +3441,7 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
             },
             ToolDefinition {
                 name: "canvas_attach_asset".into(),
-                description: "Attach an image / video / audio / font / arbitrary file to a \
-                              composition under `assets/<name>.<ext>`. The renderer auto-inlines \
-                              every `<img src=\"assets/X\">`, `<video src=\"assets/X\">`, CSS \
-                              `url(assets/X)`, etc. into a `data:` URI at render time, so the \
-                              agent can write template-style references and trust they'll show up.\n\n\
-                              **Use this whenever the user provides an image** (drag-drop, URL, \
-                              clipboard, local file). DO NOT paste base64 data URIs directly \
-                              into composition HTML — that bloats the artifact, breaks lint, \
-                              and can't be re-used across compositions. Call canvas_attach_asset, \
-                              then reference the returned `path`.\n\n\
-                              Provide EXACTLY ONE source:\n\
-                              - `local_path`: absolute filesystem path (e.g.\n\
-                                `/tmp/Generated_Image_xyz.png`). **Use this when the path is \
-                                visible in your local_files context** (the user uploaded a \
-                                file to chat). The daemon reads the bytes server-side, so \
-                                multi-megabyte images don't blow tool-arg size limits.\n\
-                              - `data_b64`:   base64-encoded bytes (good for ≤ 1 MB only — \
-                                tool-arg size limit). For bigger files use `local_path` or \
-                                `url` instead.\n\
-                              - `url`:        http(s) URL the daemon fetches (10s timeout).\n\
-                              - `from_tab`:   not yet wired; use data_b64 with screenshot bytes.\n\n\
-                              **Decision tree for user-attached files (most common case):**\n\
-                              1. Look for the path in your local_files context (the daemon \
-                                 surfaces it as a path string near your user message).\n\
-                              2. Call `canvas_attach_asset({ composition_id, local_path })`.\n\
-                              3. Reference the returned `path` as `<img src=\"assets/...\">`.\n\
-                              DO NOT glob /tmp/, DO NOT search the page for path keywords, \
-                              DO NOT ask the user for the path again — it's already in your \
-                              context.\n\n\
-                              Returns `{ path, mime_type, size_bytes }`. Use `path` (e.g. \
-                              \"assets/hero.png\") in HTML — NEVER reference the URL, the \
-                              base64, or the local_path again.".into(),
+                description: "Attach an image/video/audio/font/file to a composition under assets/<name>; the renderer auto-inlines assets/X references at render time. Use whenever the user provides an image -- do NOT paste base64 data URIs into composition HTML (bloats the artifact, breaks lint). Provide EXACTLY ONE source: local_path (absolute path from your local_files context -- preferred, bypasses arg-size limits), data_b64 (<=1MB only), or url (daemon fetches, 10s timeout). Returns {path, mime_type, size_bytes}; reference the returned path in HTML. See skill_load(\"video\") for the full asset gate.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -3504,25 +3459,7 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
             },
             ToolDefinition {
                 name: "tts_synthesize_api".into(),
-                description: "Synthesize speech via the ElevenLabs HTTP API and return the \
-                              audio bytes (base64 MP3). Requires `[tts.elevenlabs] api_key` \
-                              configured in `~/.config/nevoflux/config.toml`; returns a clear \
-                              ConfigMissing error otherwise.\n\n\
-                              Usage in /video Mode 3 narrated flow:\n\
-                              1. After creating a composition, call this tool with \
-                              `composition_id` set — daemon writes the MP3 directly into the \
-                              artifact's files map as `narration.mp3`.\n\
-                              2. Edit the composition's `index.html` to add an \
-                              `<audio src=\"narration.mp3\" data-start=\"0\" data-duration=\"<sec>\"/>` \
-                              element on a track-index ≥ 100.\n\
-                              3. Render — the audio is muxed into the output MP4 (P5b-final).\n\n\
-                              Limits: text ≤ 600 chars (~60s of speech). Returns audio_b64 \
-                              (always), wrote_to_files (only when composition_id supplied), \
-                              voice_id (echoes which voice was used after default-fallback), \
-                              duration_sec (estimated, ~2.5 chars/s for English).\n\n\
-                              Voice IDs: ElevenLabs catalog (e.g. `21m00Tcm4TlvDq8ikWAM` = \
-                              Rachel, `pNInz6obpgDQGcFmaJgB` = Adam). Defaults to Rachel \
-                              (en-US female) if voice_id and config default both omitted.".into(),
+                description: "Synthesize speech via the ElevenLabs HTTP API; returns base64 MP3 (audio_b64). Requires [tts.elevenlabs] api_key in ~/.config/nevoflux/config.toml (clear ConfigMissing error otherwise). Pass composition_id to also write the MP3 into that artifact as narration.mp3, then add <audio src=\"narration.mp3\" data-start=\"0\" data-duration=\"<sec>\"/> on a track-index >=100 and render to mux it in. Limit: text <=600 chars (~60s). See skill_load(\"video\") for the narrated flow.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -3536,20 +3473,7 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
             },
             ToolDefinition {
                 name: "tts_synthesize_local".into(),
-                description: "Synthesize speech via local Kokoro-82M ONNX inference (no API \
-                              key required, no network). Returns base64 WAV audio. \
-                              \n\n\
-                              STATUS: This tool is REGISTERED but the ONNX runtime \
-                              integration is the next nevoflux-tts crate milestone. Calling \
-                              it today returns a clear ConfigMissing error pointing at the \
-                              setup steps; PREFER `tts_synthesize_api` (ElevenLabs) for \
-                              narration that needs to ship now.\n\n\
-                              When wired up, voice tags follow Kokoro convention: `af` (American \
-                              female), `am` (American male), `bf` (British female), `bm` \
-                              (British male), `zf` / `zm` (Mandarin female / male). The \
-                              composition_id contract matches `tts_synthesize_api`: when \
-                              provided, the audio lands in `narration.wav` inside the \
-                              artifact's files map.".into(),
+                description: "Synthesize speech via local Kokoro-82M ONNX (no API key); returns base64 WAV. REGISTERED but ONNX inference not yet wired -- returns ConfigMissing today; prefer tts_synthesize_api for narration that must ship now. See skill_load(\"video\").".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -3562,18 +3486,7 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
             },
             ToolDefinition {
                 name: "tts_transcribe".into(),
-                description: "Transcribe audio to text + per-segment timestamps via local \
-                              Whisper ONNX. Used by P5c auto-captions to drive caption \
-                              tracks from a composition's narration.mp3.\n\n\
-                              STATUS: REGISTERED but inference not yet wired (ships with \
-                              Kokoro in the nevoflux-tts crate). Returns ConfigMissing today.\n\n\
-                              Provide EXACTLY ONE input source:\n\
-                              - `audio_b64`: raw audio bytes (MP3/WAV/etc.), OR\n\
-                              - `composition_id` + `file_path`: read the audio from an \
-                                artifact's files map (e.g. file_path=\"narration.mp3\").\n\n\
-                              Returns { text, segments: [{start_ms, end_ms, text}, ...] } — \
-                              the segments stream straight into a caption track in the \
-                              composition's HTML.".into(),
+                description: "Transcribe audio to text + per-segment timestamps via local Whisper ONNX (drives P5c auto-captions). REGISTERED but inference not yet wired -- returns ConfigMissing today. Provide EXACTLY ONE of audio_b64, or composition_id + file_path (e.g. narration.mp3). See skill_load(\"video\").".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -3602,53 +3515,22 @@ scope=\"live_folder\"). Omit to include all spaces/folders for the chosen scope.
                               Pass the VI as a JSON string — call JSON.stringify on \
                               canvas_extract_visual_identity's result before passing; \
                               do NOT re-render fields manually.".into(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "title":         { "type": "string" },
-                        "width":         { "type": "integer", "minimum": 1, "maximum": 1920 },
-                        "height":        { "type": "integer", "minimum": 1, "maximum": 1920 },
-                        "duration_sec":  { "type": "number",  "minimum": 0.5, "maximum": 60 },
-                        "fps":           { "type": "integer", "enum": [24, 25, 30] },
-                        "bg":            { "type": ["string", "null"] },
-                        "template":      {
-                            "type": "string",
-                            "enum": [
-                                "website-promo-16x9",
-                                "product-intro-16x9",
-                                "product-intro-9x16",
-                                "tiktok-hook",
-                                "video-overlay",
-                                "logo-3d-reveal",
-                                "product-3d-spin"
-                            ]
-                        },
-                        "visual_identity": {
-                            "type": "string",
-                            "description": "JSON-stringified VisualIdentity blob returned by canvas_extract_visual_identity. Call JSON.stringify on its result before passing. Must include `url`; other fields are optional but inform DESIGN.md output. Sent as a string (not an object) because OpenAI Responses API strict-mode rejects subschemas of bare `{type:object}` without explicit `properties`."
-                        }
-                    },
-                    "required": ["title", "width", "height", "duration_sec", "fps", "bg", "template", "visual_identity"]
-                }),
+                input_schema: {
+                    let mut props = Self::composition_base_properties();
+                    props["visual_identity"] = serde_json::json!({
+                        "type": "string",
+                        "description": "JSON-stringified VisualIdentity from canvas_extract_visual_identity (call JSON.stringify first). Must include `url`. Sent as a string because OpenAI strict-mode rejects bare object subschemas."
+                    });
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": props,
+                        "required": ["title", "width", "height", "duration_sec", "fps", "bg", "template", "visual_identity"]
+                    })
+                },
             },
             ToolDefinition {
                 name: "canvas_extract_visual_identity".into(),
-                description: "Extract a brand's visual identity (name, tagline, primary URL, \
-                              hero screenshot, and — once Slice B lands — colors / fonts / \
-                              logo / key value-prop items) from a URL or an existing tab. \
-                              Used by Mode 3 (website-to-video): given a URL, the agent \
-                              calls this first to populate a composition's DESIGN.md.\n\n\
-                              Tab handling:\n\
-                              - URL mode: opens a background tab, runs extraction, closes it.\n\
-                              - Tab mode: reuses the existing tab, leaves it open.\n\
-                              Provide EXACTLY ONE of `target.url` or `target.tab_id`.\n\n\
-                              Slice A returns { name, tagline, url, hero_screenshot_b64, \
-                              extracted_at, warnings }. Color / font / logo / key_assets \
-                              fields are present but empty until Slice B; consumers should \
-                              treat them as optional.\n\n\
-                              Returns the full `VisualIdentity` JSON; pass through to \
-                              `browser_edit_artifact` on a composition's DESIGN.md to wire \
-                              into the Mode 3 workflow.".into(),
+                description: "Extract a brand's visual identity (name, tagline, url, hero screenshot; colors/fonts/logo once Slice B lands) from a URL or existing tab -- the Mode-3 (website-to-video) first step that seeds a composition's DESIGN.md. Provide EXACTLY ONE of target.url (opens then closes a background tab) or target.tab_id (reuses it). Returns the VisualIdentity JSON; pass it to canvas_create_from_visual_identity or browser_edit_artifact.".into(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -6545,6 +6427,156 @@ mod tests {
             render.description.to_lowercase().contains("sidebar"),
             "description must mention 'sidebar'; got: {}",
             render.description
+        );
+    }
+
+    #[test]
+    fn canvas_gate_hides_operate_tools_when_locked() {
+        let mk = |n: &str| ToolDefinition {
+            name: n.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+        };
+        let full: Vec<ToolDefinition> = [
+            "web_search",
+            "create_artifact",
+            "canvas_create_composition",
+            "canvas_create_from_visual_identity",
+            "browser_read_artifact",
+            "browser_edit_artifact",
+            "canvas_eval",
+            "canvas_attach_asset",
+            "canvas_lint_composition",
+            "canvas_inspect_layout",
+            "canvas_apply_design_md",
+            "canvas_render_video",
+        ]
+        .iter()
+        .map(|n| mk(n))
+        .collect();
+
+        let gated = Agent::<MockHostFunctions>::gate_canvas_tools(&full, false);
+        let names: Vec<&str> = gated.iter().map(|t| t.name.as_str()).collect();
+        // Creation entry points + unrelated tools stay reachable.
+        assert!(names.contains(&"web_search"));
+        assert!(names.contains(&"create_artifact"));
+        assert!(names.contains(&"canvas_create_composition"));
+        assert!(names.contains(&"canvas_create_from_visual_identity"));
+        // Operate-on-existing-artifact tools are gated out while locked.
+        for hidden in Agent::<MockHostFunctions>::CANVAS_OPERATE_TOOLS {
+            assert!(
+                !names.contains(hidden),
+                "operate tool {} should be gated out when locked",
+                hidden
+            );
+        }
+    }
+
+    #[test]
+    fn canvas_gate_unlocked_keeps_everything() {
+        let mk = |n: &str| ToolDefinition {
+            name: n.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+        };
+        let full: Vec<ToolDefinition> = ["web_search", "canvas_eval", "canvas_render_video"]
+            .iter()
+            .map(|n| mk(n))
+            .collect();
+        let gated = Agent::<MockHostFunctions>::gate_canvas_tools(&full, true);
+        assert_eq!(gated.len(), full.len());
+    }
+
+    /// End-to-end wiring check: with no active canvas at turn start, run_loop
+    /// must withhold the operate-on-existing-artifact tools, then unlock them
+    /// for the rest of the turn once a composition is created — so a same-turn
+    /// create→operate flow never loses the operate tools.
+    #[test]
+    fn run_loop_gates_operate_tools_until_composition_created() {
+        let mock = MockHostFunctions::new();
+        // Iteration 1: model calls canvas_create_composition (a creator that
+        // does NOT terminate the loop). Iteration 2: model finishes.
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                call_id: Some("c1".into()),
+                name: "canvas_create_composition".into(),
+                arguments: serde_json::json!({
+                    "title": "v", "width": 1920, "height": 1080,
+                    "duration_sec": 5, "fps": 30
+                }),
+                signature: None,
+            }],
+            reasoning: None,
+        });
+        mock.add_llm_response(LlmResponse {
+            text: "done".into(),
+            tool_calls: vec![],
+            reasoning: None,
+        });
+
+        let config = AgentConfig {
+            max_iterations: 5,
+            use_streaming: false,
+            suppress_streaming: false,
+            is_subagent: false,
+        };
+        let agent = Agent::with_config(mock, config);
+        let tools = agent.get_chat_tools();
+
+        let input = AgentInput {
+            session_id: "t".into(),
+            mode: AgentMode::Chat,
+            user_message: "make me a short promo video".into(),
+            history: vec![],
+            attachments: vec![],
+            local_files: vec![],
+            custom_system_prompt: None,
+            skills_filter: None,
+            tab_id: None, // no active canvas at turn start
+            tab_ids: vec![],
+            skill_context: None,
+            available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
+            tools_config: None,
+            os_platform: None,
+        };
+
+        agent.run_loop(&input, "system", &tools).unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert_eq!(
+            captured.len(),
+            2,
+            "expected two LLM calls, got {}",
+            captured.len()
+        );
+
+        // Turn start (locked): operate tools withheld, creator stays reachable.
+        assert!(
+            captured[0].contains(&"canvas_create_composition".to_string()),
+            "creation entry point must always be visible"
+        );
+        assert!(
+            !captured[0].contains(&"browser_edit_artifact".to_string()),
+            "operate tool must be gated out at turn start (no active canvas)"
+        );
+        assert!(
+            !captured[0].contains(&"canvas_render_video".to_string()),
+            "operate tool must be gated out at turn start (no active canvas)"
+        );
+
+        // After the composition is created: operate tools unlocked for the rest
+        // of the turn — same-turn create→operate does not regress.
+        assert!(
+            captured[1].contains(&"browser_edit_artifact".to_string()),
+            "operate tool must be unlocked after creating a composition"
+        );
+        assert!(
+            captured[1].contains(&"canvas_render_video".to_string()),
+            "operate tool must be unlocked after creating a composition"
         );
     }
 

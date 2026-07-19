@@ -878,6 +878,9 @@ pub struct MockHostFunctions {
     next_subagent_id: std::cell::Cell<u64>,
     /// Subagent registry for tracking spawned subagents.
     subagents: std::cell::RefCell<Vec<SubagentInfo>>,
+    /// Tool names passed to each `llm_chat` call, in order — lets tests assert
+    /// which tools were advertised on each iteration (e.g. the canvas gate).
+    pub captured_tool_names: std::cell::RefCell<Vec<Vec<String>>>,
 }
 
 #[cfg(test)]
@@ -897,6 +900,7 @@ impl MockHostFunctions {
             interrupted: std::cell::Cell::new(false),
             next_subagent_id: std::cell::Cell::new(1),
             subagents: std::cell::RefCell::new(vec![]),
+            captured_tool_names: std::cell::RefCell::new(vec![]),
         }
     }
 
@@ -918,7 +922,10 @@ impl MockHostFunctions {
 
 #[cfg(test)]
 impl HostFunctions for MockHostFunctions {
-    fn llm_chat(&self, _request: &LlmRequest) -> HostResult<LlmResponse> {
+    fn llm_chat(&self, request: &LlmRequest) -> HostResult<LlmResponse> {
+        self.captured_tool_names
+            .borrow_mut()
+            .push(request.tools.iter().map(|t| t.name.clone()).collect());
         let mut responses = self.llm_responses.borrow_mut();
         if responses.is_empty() {
             Ok(LlmResponse {
