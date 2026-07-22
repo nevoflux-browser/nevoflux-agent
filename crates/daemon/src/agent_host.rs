@@ -1160,15 +1160,29 @@ impl DaemonHostFunctions {
 
 /// Resolve the effective "Agent execution" tier for the permission gate.
 ///
-/// Reads `config:settings → general.agentExecution` from the daemon's SQLite
-/// config store (where the browser persists it via `content_store.set`). Read
-/// fresh on each gate check so a mid-session tier change takes effect on the
-/// next tool call. Any missing/legacy/invalid value falls back to the safest
-/// tier (read-only) via `ExecutionTier::from_setting`.
+/// Precedence: a per-session override (`config:session:<id>:agentExecution`,
+/// written by the sidebar's tier chip) wins over the global default
+/// (`config:settings → general.agentExecution`). Both live in the daemon's
+/// SQLite config store (persisted by the browser via `content_store.set`).
+/// Read fresh on each gate check so a mid-session tier change takes effect on
+/// the next tool call. Any missing/legacy/invalid value falls back to the
+/// safest tier (read-only) via `ExecutionTier::from_setting`.
 fn resolve_execution_tier(services: &HostServices) -> nevoflux_protocol::ExecutionTier {
     use nevoflux_storage::ConfigRepository;
-    ConfigRepository::new(&services.database)
-        .get("config:settings")
+    let repo = ConfigRepository::new(&services.database);
+
+    // Per-session override (does not leak to the global default).
+    if !services.session_id.is_empty() {
+        let key = format!("config:session:{}:agentExecution", services.session_id);
+        if let Ok(Some(v)) = repo.get(&key) {
+            if let Some(s) = v.as_str() {
+                return nevoflux_protocol::ExecutionTier::from_setting(s);
+            }
+        }
+    }
+
+    // Global default.
+    repo.get("config:settings")
         .ok()
         .flatten()
         .and_then(|v| {
