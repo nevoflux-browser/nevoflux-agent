@@ -3917,6 +3917,10 @@ async fn stream_acp_completion(
                 nevoflux_llm::providers::acp::mcp_bridge::PermissionRequest,
             >(4);
             tool_bridge.set_permission_handler(perm_tx);
+            // Make the ACP gate tier-aware, mirroring the native gate: resolve
+            // the effective "Agent execution" tier (global default + per-session
+            // override) from config and hand it to the bridge.
+            tool_bridge.set_execution_tier(crate::agent_host::resolve_execution_tier(&services));
             let is_iteration = services.is_iteration;
             if let Some(browser_ctx) = services.browser_context() {
                 tokio::spawn(crate::wasm::mcp_tool_executor::run_permission_handler(

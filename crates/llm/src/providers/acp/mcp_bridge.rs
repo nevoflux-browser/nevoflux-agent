@@ -81,6 +81,10 @@ pub struct McpToolBridge {
     /// `request_permission` (server-side enforcement for agents that never
     /// send session/request_permission).
     gate_tool_calls: std::sync::atomic::AtomicBool,
+    /// Effective "Agent execution" tier for the current run. Set by the daemon
+    /// (which resolves it from config, incl. per-session override) so this ACP
+    /// gate auto-approves the same risk buckets as the native gate.
+    execution_tier: RwLock<nevoflux_protocol::ExecutionTier>,
 }
 
 impl Drop for McpToolBridge {
@@ -114,6 +118,7 @@ impl McpToolBridge {
             permission_tx: Arc::new(Mutex::new(None)),
             always_allowed_tools: Arc::new(RwLock::new(std::collections::HashSet::new())),
             gate_tool_calls: std::sync::atomic::AtomicBool::new(false),
+            execution_tier: RwLock::new(nevoflux_protocol::ExecutionTier::default()),
         }
     }
 
@@ -193,6 +198,11 @@ impl McpToolBridge {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Set the effective "Agent execution" tier used by `request_permission`.
+    pub fn set_execution_tier(&self, tier: nevoflux_protocol::ExecutionTier) {
+        *self.execution_tier.write().unwrap() = tier;
+    }
+
     /// Check if a tool is in the session-level always-allow list.
     pub fn is_always_allowed(&self, tool_name: &str) -> bool {
         self.always_allowed_tools
@@ -209,13 +219,6 @@ impl McpToolBridge {
             .insert(tool_name.to_string());
     }
 
-    /// Check if a tool is low-risk (read-only) and can be auto-approved.
-    /// Delegates to the canonical protocol list (single source of truth). The
-    /// MCP-prefix stripping (e.g. "mcp__nevoflux-tools__browser_get_markdown")
-    /// now lives in `is_read_only_tool`.
-    fn is_low_risk_tool(tool_name: &str) -> bool {
-        nevoflux_protocol::is_read_only_tool(tool_name)
-    }
 
     /// Request permission for a tool call. Returns the user's decision.
     /// Low-risk (read-only) tools are auto-approved.
@@ -226,8 +229,13 @@ impl McpToolBridge {
         tool_name: &str,
         arguments_summary: &str,
     ) -> PermissionResponse {
-        // Auto-approve low-risk read-only tools
-        if Self::is_low_risk_tool(tool_name) {
+        // Tier-based auto-approve: same classifier the native gate uses, so the
+        // ACP path honors the "Agent execution" setting instead of a fixed
+        // read-only-only list.
+        if nevoflux_protocol::tier_auto_approves(
+            tool_name,
+            *self.execution_tier.read().unwrap(),
+        ) {
             return PermissionResponse::AllowOnce;
         }
 

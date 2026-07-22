@@ -1167,7 +1167,7 @@ impl DaemonHostFunctions {
 /// Read fresh on each gate check so a mid-session tier change takes effect on
 /// the next tool call. Any missing/legacy/invalid value falls back to the
 /// safest tier (read-only) via `ExecutionTier::from_setting`.
-fn resolve_execution_tier(services: &HostServices) -> nevoflux_protocol::ExecutionTier {
+pub(crate) fn resolve_execution_tier(services: &HostServices) -> nevoflux_protocol::ExecutionTier {
     use nevoflux_storage::ConfigRepository;
     let repo = ConfigRepository::new(&services.database);
 
