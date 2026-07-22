@@ -498,16 +498,22 @@ impl DaemonHostFunctions {
     /// Low-risk read-only tools are auto-approved. Others prompt via browser_ask_user.
     /// Session-level "Always Allow" decisions are cached.
     fn check_tool_permission(&self, tool_name: &str, args_summary: &str) -> HostResult<()> {
-        // Low-risk tools: auto-approve
-        if is_low_risk_tool_api(tool_name) {
-            return Ok(());
-        }
-
-        // Need services for always-allow cache and browser_sender
+        // Need services for the execution-tier config, always-allow cache and
+        // browser_sender.
         let Some(services) = self.services.as_ref() else {
             // No services (e.g. unit tests) — auto-approve since there's no UI
             return Ok(());
         };
+
+        // Tier-based auto-approve: the "Agent execution" setting
+        // (config:settings → general.agentExecution) decides which risk buckets
+        // skip the confirmation dialog. Read fresh so a mid-session tier change
+        // (e.g. per-session chip) takes effect on the next tool call. This
+        // replaces the old read-only-only gate; see nevoflux_protocol::execution_tier.
+        let tier = resolve_execution_tier(services);
+        if nevoflux_protocol::tier_auto_approves(tool_name, tier) {
+            return Ok(());
+        }
 
         // /loop iteration: auto-approve (no sidebar to display dialog to;
         // tool gating is via the loop's `allowed_tool_classes`).
@@ -1152,14 +1158,26 @@ impl DaemonHostFunctions {
     }
 }
 
-/// Check if a tool is low-risk (read-only) for API mode permission control.
-/// Same list as ACP mode's `McpToolBridge::is_low_risk_tool`.
-fn is_low_risk_tool_api(tool_name: &str) -> bool {
-    // Single source of truth (protocol). NOTE: the local file-read tools
-    // (read_file/list_files/glob/grep) are intentionally NOT in the canonical
-    // list; they never reach this check on the native path today, so dropping
-    // them here is behavior-neutral.
-    nevoflux_protocol::is_read_only_tool(tool_name)
+/// Resolve the effective "Agent execution" tier for the permission gate.
+///
+/// Reads `config:settings → general.agentExecution` from the daemon's SQLite
+/// config store (where the browser persists it via `content_store.set`). Read
+/// fresh on each gate check so a mid-session tier change takes effect on the
+/// next tool call. Any missing/legacy/invalid value falls back to the safest
+/// tier (read-only) via `ExecutionTier::from_setting`.
+fn resolve_execution_tier(services: &HostServices) -> nevoflux_protocol::ExecutionTier {
+    use nevoflux_storage::ConfigRepository;
+    ConfigRepository::new(&services.database)
+        .get("config:settings")
+        .ok()
+        .flatten()
+        .and_then(|v| {
+            v.get("general")
+                .and_then(|g| g.get("agentExecution"))
+                .and_then(|t| t.as_str())
+                .map(nevoflux_protocol::ExecutionTier::from_setting)
+        })
+        .unwrap_or_default()
 }
 
 /// Expand ~ to actual home directory in a file path.
@@ -2502,6 +2520,11 @@ impl HostFunctions for DaemonHostFunctions {
         use std::fs;
         use std::io::{BufRead, BufReader};
 
+        // L0 (local file read) — gated by the "Agent execution" tier. Auto in
+        // browser-auto-local-read / full-auto; confirmed in read-only /
+        // browser-auto. (Previously local reads bypassed the gate entirely.)
+        self.check_tool_permission("read_file", path)?;
+
         let start = std::time::Instant::now();
         debug!(
             "tool_read: path={}, offset={:?}, limit={:?}",
@@ -2869,6 +2892,8 @@ impl HostFunctions for DaemonHostFunctions {
     }
 
     fn tool_glob(&self, pattern: &str, path: Option<&str>) -> HostResult<Vec<String>> {
+        // L0 (local file read) — gated by the "Agent execution" tier.
+        self.check_tool_permission("glob", pattern)?;
         let start = std::time::Instant::now();
         let full_pattern = match path {
             Some(p) => format!("{}/{}", p, pattern),
@@ -2923,6 +2948,9 @@ impl HostFunctions for DaemonHostFunctions {
     ) -> HostResult<GrepResult> {
         use grep_regex::RegexMatcherBuilder;
         use grep_searcher::{sinks::UTF8, SearcherBuilder};
+
+        // L0 (local file read) — gated by the "Agent execution" tier.
+        self.check_tool_permission("grep", pattern)?;
 
         let start = std::time::Instant::now();
         let search_path = path.unwrap_or(".");
