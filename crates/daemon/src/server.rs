@@ -7645,6 +7645,101 @@ async fn handle_chat_message(
                         }
                     }
                 }
+                // --- Remote-gateway A1 account / device-grant (S5 login gate).
+                // The account token is held daemon-side (crate::remote::account);
+                // these commands never return it to the sidebar — only status.
+                "account.status" => {
+                    let store = crate::remote::account::FileTokenStore::new(
+                        crate::paths::resolve_from_daemon()
+                            .data_dir
+                            .join("account-token"),
+                    );
+                    serde_json::json!({
+                        "type": "system_response",
+                        "payload": {
+                            "request_id": request_id,
+                            "command": "account.status",
+                            "success": true,
+                            "data": { "is_logged_in": crate::remote::account::is_logged_in(&store) }
+                        }
+                    })
+                }
+                "account.device_grant_start" => {
+                    let base = std::env::var("NEVOFLUX_ACCOUNT_URL")
+                        .unwrap_or_else(|_| "https://nevoflux.app".to_string());
+                    match crate::remote::account::request_device_code(&base, "nevoflux-daemon").await
+                    {
+                        Ok(r) => serde_json::json!({
+                            "type": "system_response",
+                            "payload": {
+                                "request_id": request_id,
+                                "command": "account.device_grant_start",
+                                "success": true,
+                                "data": {
+                                    "device_code": r.device_code,
+                                    "user_code": r.user_code,
+                                    "verification_uri": r.verification_uri,
+                                    "interval_secs": r.interval_secs,
+                                    "expires_in_secs": r.expires_in_secs
+                                }
+                            }
+                        }),
+                        Err(e) => serde_json::json!({
+                            "type": "system_response",
+                            "payload": {
+                                "request_id": request_id,
+                                "command": "account.device_grant_start",
+                                "success": false,
+                                "error": { "code": "DEVICE_GRANT_ERROR", "message": e.to_string() }
+                            }
+                        }),
+                    }
+                }
+                "account.device_grant_poll" => {
+                    let base = std::env::var("NEVOFLUX_ACCOUNT_URL")
+                        .unwrap_or_else(|_| "https://nevoflux.app".to_string());
+                    let device_code =
+                        params.get("device_code").and_then(|v| v.as_str()).unwrap_or("");
+                    match crate::remote::account::poll_device_token(&base, "nevoflux-daemon", device_code)
+                        .await
+                    {
+                        Ok(outcome) => {
+                            use crate::remote::account::PollOutcome;
+                            let (kind, token_stored, detail) = match &outcome {
+                                PollOutcome::Pending => ("pending", false, String::new()),
+                                PollOutcome::SlowDown => ("slow_down", false, String::new()),
+                                PollOutcome::Denied(d) => ("denied", false, d.clone()),
+                                PollOutcome::Token(t) => {
+                                    use crate::remote::account::TokenStore;
+                                    let store = crate::remote::account::FileTokenStore::new(
+                                        crate::paths::resolve_from_daemon()
+                                            .data_dir
+                                            .join("account-token"),
+                                    );
+                                    ("token", store.save(t).is_ok(), String::new())
+                                }
+                            };
+                            serde_json::json!({
+                                "type": "system_response",
+                                "payload": {
+                                    "request_id": request_id,
+                                    "command": "account.device_grant_poll",
+                                    "success": true,
+                                    "data": { "outcome": kind, "token_stored": token_stored, "detail": detail }
+                                }
+                            })
+                        }
+                        Err(e) => serde_json::json!({
+                            "type": "system_response",
+                            "payload": {
+                                "request_id": request_id,
+                                "command": "account.device_grant_poll",
+                                "success": false,
+                                "error": { "code": "DEVICE_GRANT_ERROR", "message": e.to_string() }
+                            }
+                        }),
+                    }
+                }
                 "content_store.delete" => {
                     let key = params.get("key").and_then(|k| k.as_str()).unwrap_or("");
                     if key.is_empty() {
