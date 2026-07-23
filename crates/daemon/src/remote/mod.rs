@@ -1,0 +1,8 @@
+//! Remote-access (Remote Gateway) support: portal / social remote control.
+//!
+//! Design: `docs/Portal 远程控制/remote-gateway-design.md` (§9 gateway
+//! abstraction, §2/§S2 channel crypto, §4b account). This module currently
+//! provides the end-to-end channel crypto layer (S2); the `RemoteGateway`
+//! trait + registry + WS transport + account wiring land in later phases.
+
+pub mod crypto;
