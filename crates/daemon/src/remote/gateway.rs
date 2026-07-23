@@ -123,6 +123,56 @@ impl GatewayRegistry {
     }
 }
 
+/// EventBus topic prefixes projected into [`OutboundEvent::Activity`]
+/// (design §9.6 ingress #2). Deliberately excludes `system:boot` and other
+/// non-activity `system:*` topics.
+const ACTIVITY_PREFIXES: &[&str] = &[
+    "system:goal",
+    "system:loop",
+    "system:schedule",
+    "system:pack",
+];
+
+/// Project an EventBus event (`topic` + `payload`) into an [`OutboundEvent`],
+/// or `None` if it is not a topic gateways relay.
+///
+/// This is the pure core of the daemon's second outbound source (design §9.6):
+/// `ui:notification:*` (from `notify_user`, see `crate::notify`) → a
+/// `Notification`; the activity `system:*` topics → an `Activity`. The chat
+/// stream is the *other* source (M2 tap), not this one. The live subscribe loop
+/// (spawn a task reading a `SubscriptionHandle` and calling
+/// `GatewayRegistry::fan_out`) wraps this function and lands with the transport.
+pub fn project_bus_event(topic: &str, payload: &serde_json::Value) -> Option<OutboundEvent> {
+    if topic.starts_with("ui:notification") {
+        let body = payload
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let title = payload
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let source = payload
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        return Some(OutboundEvent::Notification(NotificationEvent {
+            title,
+            body,
+            source,
+        }));
+    }
+    if ACTIVITY_PREFIXES.iter().any(|p| topic.starts_with(p)) {
+        return Some(OutboundEvent::Activity(ActivityEvent {
+            topic: topic.to_string(),
+            payload: payload.clone(),
+        }));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +239,60 @@ mod tests {
         let reg = GatewayRegistry::new();
         assert!(reg.is_empty());
         reg.fan_out(&notif()).await; // must not panic
+    }
+
+    #[test]
+    fn project_notification_topic() {
+        let payload = serde_json::json!({
+            "title": "Reminder", "body": "drink water", "source": "notify_user"
+        });
+        let ev = project_bus_event("ui:notification:agent", &payload).unwrap();
+        assert_eq!(
+            ev,
+            OutboundEvent::Notification(NotificationEvent {
+                title: Some("Reminder".into()),
+                body: "drink water".into(),
+                source: "notify_user".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn project_notification_missing_title_is_none() {
+        let payload = serde_json::json!({ "body": "hi", "source": "notify_user" });
+        match project_bus_event("ui:notification:agent", &payload).unwrap() {
+            OutboundEvent::Notification(n) => {
+                assert_eq!(n.title, None);
+                assert_eq!(n.body, "hi");
+            }
+            other => panic!("expected Notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_activity_topics() {
+        for topic in [
+            "system:loop:progress",
+            "system:goal:updated",
+            "system:schedule:fired",
+            "system:pack:progress",
+        ] {
+            let payload = serde_json::json!({ "x": 1 });
+            match project_bus_event(topic, &payload) {
+                Some(OutboundEvent::Activity(a)) => assert_eq!(a.topic, topic),
+                other => panic!("expected Activity for {topic}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn project_ignores_unrelated_topics() {
+        for topic in ["task:status", "system:boot", "chat:whatever"] {
+            assert!(
+                project_bus_event(topic, &serde_json::json!({})).is_none(),
+                "topic {topic} must not project"
+            );
+        }
     }
 
     #[tokio::test]
