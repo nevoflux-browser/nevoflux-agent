@@ -5488,6 +5488,15 @@ impl HostFunctions for DaemonHostFunctions {
             code: 3,
             message: "LoopManager not configured".into(),
         })?;
+        // Gate G / 附录 C 缺口 1+2: bound the new loop's capability by the
+        // creating session's execution tier before it can be created (loop
+        // iterations auto-approve their own tools, so the ceiling must be set
+        // here). A bash gate or an agent/browser mode above the tier is rejected.
+        let tier = resolve_execution_tier(services);
+        crate::loops::tools::guard_loop_create(&args, tier).map_err(|e| HostError {
+            code: 100,
+            message: e,
+        })?;
         let session_id = self.session_id.clone().unwrap_or_default();
         let ctx = crate::loops::ToolCallContext {
             session_id,
@@ -7140,9 +7149,7 @@ fn merge_search_results(
             // checked against the container.
             match database.memory().get(id) {
                 Ok(Some(chunk)) => {
-                    if container
-                        .is_some_and(|c| !chunk_visible_in_container(&chunk.metadata, c))
-                    {
+                    if container.is_some_and(|c| !chunk_visible_in_container(&chunk.metadata, c)) {
                         return None;
                     }
                     Some(MemoryChunk {
@@ -9198,7 +9205,9 @@ mod tests {
     // tool it was never shown, and `tool_call_dynamic` would route it. These
     // tests pin the ceiling that stops that.
 
-    fn host_with_soul(soul: Option<crate::agent::roles::AgentRoleDefinition>) -> DaemonHostFunctions {
+    fn host_with_soul(
+        soul: Option<crate::agent::roles::AgentRoleDefinition>,
+    ) -> DaemonHostFunctions {
         let config = Arc::new(AgentConfig::default());
         let rt = tokio::runtime::Runtime::new().unwrap();
         DaemonHostFunctions::new(config, rt.handle().clone()).with_active_soul(soul.map(Arc::new))

@@ -622,6 +622,14 @@ async fn execute_mcp_tool_inner(
                 .as_ref()
                 .map(|id| crate::loops::LoopId(id.clone())),
         };
+        // Gate G / 附录 C 缺口 1+2: bound a newly created loop's capability by
+        // the session's execution tier on the ACP/MCP path too (mirrors the
+        // native `agent_host::tool_loop_create` guard). Only applies to
+        // creation; other loop_* tools are unaffected.
+        if name == "loop_create" {
+            let tier = crate::agent_host::resolve_execution_tier(services);
+            crate::loops::tools::guard_loop_create(arguments, tier)?;
+        }
         let result = crate::loops::execute_loop_tool(
             name,
             arguments,
