@@ -5,5 +5,6 @@
 //! provides the end-to-end channel crypto layer (S2); the `RemoteGateway`
 //! trait + registry + WS transport + account wiring land in later phases.
 
+pub mod account;
 pub mod crypto;
 pub mod gateway;
