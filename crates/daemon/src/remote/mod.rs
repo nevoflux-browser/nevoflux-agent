@@ -6,3 +6,4 @@
 //! trait + registry + WS transport + account wiring land in later phases.
 
 pub mod crypto;
+pub mod gateway;
