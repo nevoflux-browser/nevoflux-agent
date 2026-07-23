@@ -81,6 +81,60 @@ fn parse_gate_arg(args: &Value) -> Result<Option<GateSpec>, String> {
     Ok(Some(GateSpec { kind, spec_json }))
 }
 
+/// Gate `loop_create` args by the creating session's execution tier.
+///
+/// A loop's iteration auto-approves its own tools (the `is_iteration`
+/// short-circuit in `agent_host::check_tool_permission`), so its blast radius
+/// must be bounded **at creation** by the session tier — otherwise a Chat/
+/// ReadOnly session can mint a loop whose iterations silently run FullAuto
+/// tools. The loop's declared `mode` and a `bash` gate (arbitrary shell) each
+/// map to a representative risk bucket (see `execution_tier::classify_tool`)
+/// that the session tier must already auto-approve.
+///
+/// Closes remote-gateway-design.md 附录 C 缺口 1（bash gate 无权限门）与
+/// 缺口 2（loop_create mode 不继承 session）— implemented as a tier ceiling
+/// rather than mode inheritance because mode is per-run and not reachable at
+/// the `ToolCallContext` construction sites, whereas tier is persistent and
+/// resolvable via `resolve_execution_tier`.
+pub(crate) fn guard_loop_create(
+    args: &Value,
+    tier: nevoflux_protocol::ExecutionTier,
+) -> Result<(), String> {
+    // `mode` → representative tool. Chat is read-only (R bucket), auto-approved
+    // even at ReadOnly, so it needs no gate. Browser maps to a B1 interaction;
+    // agent (and any unknown value) maps to shell/write (X bucket, FullAuto).
+    let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("chat");
+    let mode_rep: Option<&str> = match mode {
+        "chat" => None,
+        "browser" => Some("browser_click_by_id"),
+        _ => Some("run_command"),
+    };
+    if let Some(rep) = mode_rep {
+        if !nevoflux_protocol::tier_auto_approves(rep, tier) {
+            return Err(format!(
+                "loop mode '{mode}' requires a higher Agent execution tier \
+                 (current: {tier:?}); its iterations would auto-run tools the \
+                 session tier does not permit"
+            ));
+        }
+    }
+
+    // A `bash` gate runs arbitrary shell on the loop's schedule (X bucket).
+    let is_bash_gate = args
+        .get("gate")
+        .and_then(|g| g.get("kind"))
+        .and_then(|k| k.as_str())
+        == Some("bash");
+    if is_bash_gate && !nevoflux_protocol::tier_auto_approves("run_command", tier) {
+        return Err(format!(
+            "a bash gate runs arbitrary shell and requires FullAuto tier \
+             (current: {tier:?})"
+        ));
+    }
+
+    Ok(())
+}
+
 /// Parse the optional `verify` tool arg into `CreateLoopArgs.verify_check`.
 ///
 /// Input shape: `{tool?, matches, negate?}` — the same `GoalCheck` shape
@@ -344,6 +398,56 @@ mod tests {
             is_iteration: is_iter,
             own_loop_id: own.map(|s| LoopId(s.into())),
         }
+    }
+
+    // --- guard_loop_create (加固门 G / 附录 C 缺口 1+2) ---
+    use nevoflux_protocol::ExecutionTier;
+
+    #[test]
+    fn guard_rejects_bash_gate_below_full_auto() {
+        let args = json!({
+            "trigger_expr": "time:5m",
+            "gate": { "kind": "bash", "command": "echo x" }
+        });
+        for t in [
+            ExecutionTier::ReadOnly,
+            ExecutionTier::BrowserAuto,
+            ExecutionTier::BrowserAutoLocalRead,
+        ] {
+            assert!(
+                guard_loop_create(&args, t).is_err(),
+                "bash gate must be rejected at {t:?}"
+            );
+        }
+        assert!(guard_loop_create(&args, ExecutionTier::FullAuto).is_ok());
+    }
+
+    #[test]
+    fn guard_rejects_agent_mode_below_full_auto() {
+        let args = json!({ "trigger_expr": "time:5m", "mode": "agent" });
+        assert!(guard_loop_create(&args, ExecutionTier::ReadOnly).is_err());
+        assert!(guard_loop_create(&args, ExecutionTier::BrowserAutoLocalRead).is_err());
+        assert!(guard_loop_create(&args, ExecutionTier::FullAuto).is_ok());
+    }
+
+    #[test]
+    fn guard_allows_chat_loop_at_readonly() {
+        let args = json!({ "trigger_expr": "time:5m" });
+        assert!(guard_loop_create(&args, ExecutionTier::ReadOnly).is_ok());
+    }
+
+    #[test]
+    fn guard_rejects_browser_mode_at_readonly_allows_at_browserauto() {
+        let args = json!({ "trigger_expr": "time:5m", "mode": "browser" });
+        assert!(guard_loop_create(&args, ExecutionTier::ReadOnly).is_err());
+        assert!(guard_loop_create(&args, ExecutionTier::BrowserAuto).is_ok());
+    }
+
+    #[test]
+    fn guard_unknown_mode_treated_as_agent() {
+        let args = json!({ "trigger_expr": "time:5m", "mode": "wat" });
+        assert!(guard_loop_create(&args, ExecutionTier::ReadOnly).is_err());
+        assert!(guard_loop_create(&args, ExecutionTier::FullAuto).is_ok());
     }
 
     /// Thin wrapper around `execute_loop_tool` that passes `services: None`
