@@ -83,6 +83,17 @@ pub struct PortalGateway {
     /// Whether giving up on the peer path has been said. Once is the point.
     #[cfg(feature = "webrtc")]
     gave_up_on_peer: std::sync::atomic::AtomicBool,
+    /// Set when the relay reports that a frame this end sent reached nobody,
+    /// and cleared by resending once somebody arrives.
+    ///
+    /// The replay that follows an `attach` is the case this exists for. The app
+    /// shell asks for a conversation over the *control* channel and then
+    /// navigates, so the data channel's socket is being torn down while the
+    /// replay is written to it — and the page that comes up next opens a *first*
+    /// connection, on which the portal sends no `resume`. Nobody ever asks for
+    /// those frames again, and the phone shows an empty conversation under a log
+    /// line that says the transcript was replayed.
+    sent_to_an_empty_channel: std::sync::atomic::AtomicBool,
     /// This session's second socket, carrying media only.
     ///
     /// `None` where none was opened (tests, and any caller that did not ask for
@@ -290,6 +301,7 @@ impl PortalGateway {
             unanswered_offers: Mutex::new(0),
             #[cfg(feature = "webrtc")]
             gave_up_on_peer: std::sync::atomic::AtomicBool::new(false),
+            sent_to_an_empty_channel: std::sync::atomic::AtomicBool::new(false),
             media_sink: None,
             channel_id: channel_id.to_string(),
         }
@@ -1221,15 +1233,32 @@ impl PortalGateway {
                     // Cheap, idempotent, and the portal cannot render a reply
                     // without it.
                     self.announce().await;
+                    // And by exactly the same reasoning, they may have missed
+                    // the conversation. Resending from the start of the buffer
+                    // is safe to repeat: every frame carries a sequence number
+                    // and the far end drops the ones it already has, so the
+                    // cost of being wrong here is bytes, while the cost of not
+                    // doing it is a transcript nobody will ever ask for again.
+                    if self
+                        .sent_to_an_empty_channel
+                        .swap(false, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        self.resume(0).await;
+                    }
                     // Deliberately not a reason to reconsider a peer path that
                     // has been refused: this notice is a count, and it arrives
                     // on every reconnect. See `rtc::GIVE_UP_AFTER_FAILURES`.
                     self.spawn_offer();
                 } else {
-                    // The relay saying a frame reached nobody. Worth a line:
-                    // otherwise a head goes on answering into an empty channel
-                    // and the only symptom is a phone that shows nothing, with
-                    // a log that says every reply was sent.
+                    // The relay saying a frame reached nobody. Remembered, not
+                    // just logged: it is the one moment this end learns that
+                    // what it sent was dropped, and the next arrival is the
+                    // only chance to put it right.
+                    self.sent_to_an_empty_channel
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    // Worth a line too: otherwise a head goes on answering into
+                    // an empty channel and the only symptom is a phone that
+                    // shows nothing, with a log that says every reply was sent.
                     tracing::info!(
                         target: "remote",
                         "nobody is attached to this channel; frames are going nowhere"
@@ -2454,6 +2483,91 @@ mod tests {
             inj.injected.lock().await.len(),
             1,
             "the gateway still works after ignoring the notice"
+        );
+    }
+
+    /// The replay that follows an `attach` lands in an empty channel, because
+    /// the app shell asks for the conversation over the control channel and
+    /// then navigates — the socket meant to catch it does not exist yet. And
+    /// the page that comes up opens a *first* connection, on which the portal
+    /// sends no `resume`, so without this nobody ever asks for those frames
+    /// again. Observed twice on real devices: `replayed the conversation
+    /// frames=16`, nineteen relay receipts saying it reached nobody, a listener
+    /// three seconds later, and an empty conversation on the phone.
+    #[tokio::test]
+    async fn frames_sent_into_an_empty_channel_are_resent_when_somebody_arrives() {
+        let sink = Arc::new(CollectSink::default());
+        let gw = Arc::new(PortalGateway::new(
+            None, sink.clone(), "sess", None, None, "chan",
+        ));
+        let inj = CollectInjector::default();
+        let peers = |n: u64| Wire::Text(format!(r#"{{"k":"peers","n":{n}}}"#));
+
+        gw.project(&OutboundEvent::Chat(chat_env("a", false))).await; // seq 0, 1
+        let dropped = seqs_of(&sink.sent.lock().await);
+        assert_eq!(dropped, vec![0, 1], "the transcript went out, sequenced");
+
+        // The relay's receipt: it reached nobody. Then the far end turns up.
+        sink.sent.lock().await.clear();
+        gw.on_wire_in(peers(0), &inj).await;
+        gw.on_wire_in(peers(1), &inj).await;
+
+        let resent = seqs_of(&sink.sent.lock().await);
+        for seq in dropped {
+            assert!(
+                resent.contains(&seq),
+                "seq {seq} was dropped and is back on the wire; got {resent:?}"
+            );
+        }
+    }
+
+    /// The `seq` of every sequenced frame on the wire, in order.
+    fn seqs_of(wires: &[Wire]) -> Vec<u64> {
+        wires
+            .iter()
+            .filter_map(|w| match w {
+                Wire::Text(t) => serde_json::from_str::<serde_json::Value>(t)
+                    .ok()?
+                    .get("seq")?
+                    .as_u64(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Only when something was actually dropped, and only once. This notice
+    /// arrives on every reconnect, and a channel that missed nothing must not
+    /// replay itself at each one.
+    #[tokio::test]
+    async fn an_arrival_that_missed_nothing_is_not_resent_to() {
+        let sink = Arc::new(CollectSink::default());
+        let gw = Arc::new(PortalGateway::new(
+            None, sink.clone(), "sess", None, None, "chan",
+        ));
+        let inj = CollectInjector::default();
+        let peers = |n: u64| Wire::Text(format!(r#"{{"k":"peers","n":{n}}}"#));
+
+        gw.project(&OutboundEvent::Chat(chat_env("a", false))).await;
+        sink.sent.lock().await.clear();
+        gw.on_wire_in(peers(1), &inj).await;
+        let announce = sink.sent.lock().await.len();
+
+        // A drop, then an arrival: the transcript rides along.
+        sink.sent.lock().await.clear();
+        gw.on_wire_in(peers(0), &inj).await;
+        gw.on_wire_in(peers(1), &inj).await;
+        assert!(
+            sink.sent.lock().await.len() > announce,
+            "the arrival that followed a drop got the transcript"
+        );
+
+        // The next one does not: the resend is spent, not standing.
+        sink.sent.lock().await.clear();
+        gw.on_wire_in(peers(1), &inj).await;
+        assert_eq!(
+            sink.sent.lock().await.len(),
+            announce,
+            "an arrival that missed nothing gets only the announce"
         );
     }
 
