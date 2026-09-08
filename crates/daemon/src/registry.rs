@@ -205,6 +205,37 @@ impl BrowserRegistry {
         }
     }
 
+    /// Whether `proxy_id` is one of the browsers.
+    pub fn is_browser(&self, proxy_id: &str) -> bool {
+        self.browsers.read().unwrap().contains_key(proxy_id)
+    }
+
+    /// The end that should answer a browser call made during a turn from
+    /// `sender`, when that is not the sender itself.
+    ///
+    /// `None` means "leave it addressed as it is", and covers the ordinary case
+    /// completely: a sidebar chat arrives from the browser it is meant to
+    /// drive, so the sender is already right.
+    ///
+    /// The case it exists for is a turn from something that is not a browser
+    /// and never will be. A paired phone's messages are injected under the
+    /// `remote-control` proxy, so `browser_get_tabs` from a phone was addressed
+    /// to the phone, projected onto the relay, and answered by nobody — thirty
+    /// seconds later the agent was told the browser had timed out, which is
+    /// true and explains nothing. Remote control exists to drive *this*
+    /// machine's browser; when the sender is not one, the registry is what
+    /// says which is.
+    ///
+    /// Still `None` when the answer is not obvious. No browser, or more than
+    /// one, and the call stays where it was: a timeout is a bad outcome, but
+    /// quietly driving a browser the caller did not mean is a worse one.
+    pub fn redirect_for(&self, sender: &str) -> Option<BrowserEntry> {
+        if self.is_browser(sender) {
+            return None;
+        }
+        self.single().ok()
+    }
+
     /// Wait until at least one browser is registered, then resolve it.
     /// Returns [`BrowserBindError::Timeout`] if none registers in `timeout`.
     pub async fn wait_for_browser(
@@ -555,6 +586,37 @@ impl RequestRegistry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_browser_answers_its_own_calls() {
+        // The ordinary case: a sidebar chat arrives from the browser it drives.
+        let r = BrowserRegistry::new();
+        r.register("proxy-ed88ab2b", b"proxy-ed88ab2b".to_vec());
+        assert!(r.redirect_for("proxy-ed88ab2b").is_none());
+    }
+
+    #[test]
+    fn a_turn_from_something_that_is_not_a_browser_is_redirected_to_one() {
+        // A paired phone's messages are injected under `remote-control`, and a
+        // browser call addressed there reaches a device that cannot answer it.
+        let r = BrowserRegistry::new();
+        r.register("proxy-ed88ab2b", b"proxy-ed88ab2b".to_vec());
+        let to = r.redirect_for("remote-control").expect("redirected");
+        assert_eq!(to.proxy_id, "proxy-ed88ab2b");
+        assert_eq!(to.client_identity, b"proxy-ed88ab2b".to_vec());
+    }
+
+    #[test]
+    fn with_no_browser_or_several_the_call_stays_where_it_was() {
+        // Timing out is bad; driving a browser nobody named is worse.
+        let empty = BrowserRegistry::new();
+        assert!(empty.redirect_for("remote-control").is_none());
+
+        let many = BrowserRegistry::new();
+        many.register("a", b"a".to_vec());
+        many.register("b", b"b".to_vec());
+        assert!(many.redirect_for("remote-control").is_none());
+    }
+
     use super::*;
     use std::time::Duration;
 
