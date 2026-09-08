@@ -128,8 +128,19 @@ impl ControlGateway {
 
     /// Put the current list on the wire.
     pub async fn sync(&self) {
+        let rows = self.rows().await;
+        // Said out loud because the alternative is what this path cost a day of
+        // debugging: a device sitting on a green "Connected" beside an empty
+        // list, with nothing anywhere to say whether the list had been sent, or
+        // sent empty, or sent and not understood.
+        tracing::info!(
+            target: "remote",
+            channel = %self.id,
+            rows = rows.len(),
+            "sent the session list"
+        );
         let frame = sessions_frame(
-            &self.rows().await,
+            &rows,
             self.vapid_public.as_deref(),
             self.data_channel_id.as_deref(),
         );
@@ -195,13 +206,34 @@ impl ControlGateway {
         // keeps nothing for a channel nobody was attached to.
         if let Wire::Text(text) = wire {
             if let Some(n) = super::relay_protocol::peer_count(text) {
+                tracing::info!(
+                    target: "remote",
+                    channel = %self.id,
+                    peers = n,
+                    "control channel presence"
+                );
                 if n > 0 {
                     self.sync().await;
                 }
                 return None;
             }
         }
-        let msg = super::channel_codec::decode(self.key.as_ref(), wire)?;
+        let Some(msg) = super::channel_codec::decode(self.key.as_ref(), wire) else {
+            // Only for the sealed ones. A *text* frame failing here is routine:
+            // the relay forwards whatever any other peer sent, and a portal's
+            // keepalive is not addressed to this end at all. A **binary** frame
+            // that will not open is the interesting one, and it has exactly one
+            // likely cause — the far end derived its keys from a different
+            // pairing code, which is a thing a person types off a screen.
+            if matches!(wire, Wire::Binary(_)) {
+                tracing::warn!(
+                    target: "remote",
+                    channel = %self.id,
+                    "a sealed control frame would not open; the far end's pairing code does not match this channel"
+                );
+            }
+            return None;
+        };
         let WireMessage::Frame { frame, .. } = msg else {
             // `Resume` and `Resync` belong to a sequenced channel. This one
             // answers a reconnect with the whole truth, so there is nothing
