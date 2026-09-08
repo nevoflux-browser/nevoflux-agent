@@ -159,6 +159,13 @@ pub enum BrowserBindError {
 /// connection itself.
 pub struct ConnectedClients {
     clients: RwLock<HashMap<String, Vec<u8>>>,
+    /// The last connection that spoke for itself.
+    ///
+    /// A turn from a live connection is a person typing into the sidebar of the
+    /// browser this daemon serves, so it names that browser better than
+    /// anything else available — and better than "the only connection", which
+    /// stops being true the moment anything else attaches.
+    last_local: RwLock<Option<String>>,
 }
 
 impl Default for ConnectedClients {
@@ -171,6 +178,7 @@ impl ConnectedClients {
     pub fn new() -> Self {
         Self {
             clients: RwLock::new(HashMap::new()),
+            last_local: RwLock::new(None),
         }
     }
 
@@ -185,6 +193,27 @@ impl ConnectedClients {
     /// Forget one (on disconnect).
     pub fn unregister(&self, proxy_id: &str) {
         self.clients.write().unwrap().remove(proxy_id);
+        let mut last = self.last_local.write().unwrap();
+        if last.as_deref() == Some(proxy_id) {
+            *last = None;
+        }
+    }
+
+    /// Note that `proxy_id` sent a turn of its own.
+    ///
+    /// Ignored for anything that is not a live connection: an injected turn
+    /// carries a label, and a label cannot answer a browser call.
+    pub fn note_local_turn(&self, proxy_id: &str) {
+        if self.is_connected(proxy_id) {
+            *self.last_local.write().unwrap() = Some(proxy_id.to_string());
+        }
+    }
+
+    /// The last live connection to have spoken, if it is still here.
+    pub fn last_local(&self) -> Option<(String, Vec<u8>)> {
+        let id = self.last_local.read().unwrap().clone()?;
+        let map = self.clients.read().unwrap();
+        map.get(&id).map(|identity| (id.clone(), identity.clone()))
     }
 
     /// Whether `proxy_id` is a live connection.
@@ -239,7 +268,10 @@ pub fn browser_target_for(
     if let Ok(entry) = browsers.single() {
         return Some((entry.proxy_id, entry.client_identity));
     }
-    clients.single()
+    // The connection that has been talking, before the connection that happens
+    // to be alone: "only one" is a fact about this minute, not about which
+    // browser the person meant.
+    clients.last_local().or_else(|| clients.single())
 }
 
 /// [`browser_target_for`] against the registries this process installed.
@@ -700,6 +732,64 @@ mod tests {
         let (proxy, _) =
             browser_target_for("remote-control", &browsers, &clients).expect("redirected");
         assert_eq!(proxy, "headless-1");
+    }
+
+    #[test]
+    fn the_connection_that_has_been_talking_wins_over_arithmetic() {
+        // Two clients is enough to make "the only one" meaningless, and an MCP
+        // host attaching is enough to make it two. What still holds is that a
+        // turn came from the sidebar of the browser being driven.
+        let browsers = BrowserRegistry::new();
+        let clients = ConnectedClients::new();
+        clients.register("proxy-sidebar", b"proxy-sidebar".to_vec());
+        clients.register("proxy-mcp", b"proxy-mcp".to_vec());
+        assert!(browser_target_for("remote-control", &browsers, &clients).is_none());
+
+        clients.note_local_turn("proxy-sidebar");
+        let (proxy, _) =
+            browser_target_for("remote-control", &browsers, &clients).expect("redirected");
+        assert_eq!(proxy, "proxy-sidebar");
+    }
+
+    #[test]
+    fn a_label_never_becomes_the_answer() {
+        // `remote-control` is not a socket; noting it must change nothing.
+        let browsers = BrowserRegistry::new();
+        let clients = ConnectedClients::new();
+        clients.register("proxy-sidebar", b"proxy-sidebar".to_vec());
+        clients.note_local_turn("remote-control");
+        assert!(clients.last_local().is_none());
+    }
+
+    #[test]
+    fn a_departed_talker_is_not_still_the_answer() {
+        // Its identity is stale the moment the socket goes, and re-addressing a
+        // call to a connection that has closed is a timeout with extra steps.
+        let browsers = BrowserRegistry::new();
+        let clients = ConnectedClients::new();
+        clients.register("proxy-sidebar", b"proxy-sidebar".to_vec());
+        clients.register("proxy-mcp", b"proxy-mcp".to_vec());
+        clients.register("proxy-other", b"proxy-other".to_vec());
+        clients.note_local_turn("proxy-sidebar");
+        clients.unregister("proxy-sidebar");
+
+        assert!(clients.last_local().is_none(), "forgotten with the socket");
+        // Two are left and neither has spoken, so there is no honest answer —
+        // which is the same as having been given none.
+        assert!(browser_target_for("remote-control", &browsers, &clients).is_none());
+    }
+
+    #[test]
+    fn the_lone_connection_still_answers_before_anyone_has_spoken() {
+        // The phone can ask first: a daemon that has just started has a sidebar
+        // attached and nothing typed into it yet, and that sidebar is still the
+        // only thing on this machine that can serve the call.
+        let browsers = BrowserRegistry::new();
+        let clients = ConnectedClients::new();
+        clients.register("proxy-sidebar", b"proxy-sidebar".to_vec());
+        let (proxy, _) =
+            browser_target_for("remote-control", &browsers, &clients).expect("redirected");
+        assert_eq!(proxy, "proxy-sidebar");
     }
 
     #[test]
