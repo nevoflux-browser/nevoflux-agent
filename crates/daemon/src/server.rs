@@ -2322,6 +2322,22 @@ pub async fn start_server(
                 _ => (request, response_sender),
             };
 
+            // Every browser call passes through here, whichever layer built
+            // it, which is why the routing decision belongs here and not at one
+            // of the several places that construct a request. Done at
+            // `browser_context()` it reached some of them and not this one; it
+            // would also have moved the permission dialogs, which are meant to
+            // follow the person and not the browser.
+            let mut request = request;
+            if let Some((proxy_id, identity)) = crate::registry::browser_target(&request.proxy_id) {
+                info!(
+                    "Browser request re-addressed: {} cannot answer one; sending to {}",
+                    request.proxy_id, proxy_id
+                );
+                request.proxy_id = proxy_id;
+                request.client_identity = identity;
+            }
+
             let request_id = request.request_id.clone();
             info!(
                 "Browser request sending to sidebar: id={}, action={:?}, proxy_id={}, identity_len={}",
