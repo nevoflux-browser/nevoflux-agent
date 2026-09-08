@@ -493,10 +493,7 @@ impl HostServices {
         // tool addressed there is delivered to the phone — see
         // `BrowserRegistry::redirect_for`, which is also the rule the script
         // tools already follow.
-        let (proxy_id, client_identity) = crate::registry::CURRENT_BROWSER_REGISTRY
-            .get()
-            .and_then(|r| r.redirect_for(&self.proxy_id))
-            .map(|e| (e.proxy_id, e.client_identity))
+        let (proxy_id, client_identity) = crate::registry::browser_target(&self.proxy_id)
             .unwrap_or_else(|| (self.proxy_id.clone(), self.client_identity.clone()));
         self.browser_sender.clone().map(|sender| BrowserContext {
             sender,
