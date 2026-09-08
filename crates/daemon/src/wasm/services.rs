@@ -488,17 +488,10 @@ impl HostServices {
     ///
     /// Returns `None` if no browser_sender is configured.
     pub fn browser_context(&self) -> Option<BrowserContext> {
-        // Who answers a browser call is not always who asked. A turn injected
-        // from a paired phone carries the injector's proxy id, and a browser
-        // tool addressed there is delivered to the phone — see
-        // `BrowserRegistry::redirect_for`, which is also the rule the script
-        // tools already follow.
-        let (proxy_id, client_identity) = crate::registry::browser_target(&self.proxy_id)
-            .unwrap_or_else(|| (self.proxy_id.clone(), self.client_identity.clone()));
         self.browser_sender.clone().map(|sender| BrowserContext {
             sender,
-            proxy_id,
-            client_identity,
+            proxy_id: self.proxy_id.clone(),
+            client_identity: self.client_identity.clone(),
             session_id: self.session_id.clone(),
             asset_server: self.asset_server.clone(),
             recording_collector: self.recording_collector.clone(),
