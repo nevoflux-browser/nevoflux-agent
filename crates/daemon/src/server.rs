@@ -2603,6 +2603,14 @@ pub async fn start_server(
                 .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown");
+            // A turn from a live connection names the browser this daemon
+            // serves, which is what a browser call from an injected turn is
+            // re-addressed to. Noting it here rather than counting connections
+            // later: "the only one" stops being true as soon as anything else
+            // attaches, and the failure that follows is silent.
+            if let Some(clients) = crate::registry::CURRENT_CONNECTED_CLIENTS.get() {
+                clients.note_local_turn(&proxy_id);
+            }
             info!(
                 "Message loop received: type={}, proxy_id={}, channel={:?}, identity_len={}",
                 msg_type,
