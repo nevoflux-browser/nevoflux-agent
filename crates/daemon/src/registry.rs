@@ -148,6 +148,107 @@ pub enum BrowserBindError {
     Timeout,
 }
 
+/// The clients that are actually connected, whatever role they declared.
+///
+/// Distinct from [`BrowserRegistry`], and the distinction is the whole point:
+/// that one holds connections that declared `role:"browser"`, which is the
+/// *headless* automation target. A headed desktop never declares it — the
+/// extension registers as `Control`, deliberately, "preserving headed
+/// behavior" — so on the machine people actually sit at, `BrowserRegistry` is
+/// empty and the only thing that can serve a `browser_*` call is the sidebar
+/// connection itself.
+pub struct ConnectedClients {
+    clients: RwLock<HashMap<String, Vec<u8>>>,
+}
+
+impl Default for ConnectedClients {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConnectedClients {
+    pub fn new() -> Self {
+        Self {
+            clients: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Record a live connection.
+    pub fn register(&self, proxy_id: impl Into<String>, client_identity: Vec<u8>) {
+        self.clients
+            .write()
+            .unwrap()
+            .insert(proxy_id.into(), client_identity);
+    }
+
+    /// Forget one (on disconnect).
+    pub fn unregister(&self, proxy_id: &str) {
+        self.clients.write().unwrap().remove(proxy_id);
+    }
+
+    /// Whether `proxy_id` is a live connection.
+    ///
+    /// False for an injector: `remote-control` is a label a paired device's
+    /// messages are stamped with, not a socket anybody is holding.
+    pub fn is_connected(&self, proxy_id: &str) -> bool {
+        self.clients.read().unwrap().contains_key(proxy_id)
+    }
+
+    /// The single live connection, when there is exactly one.
+    pub fn single(&self) -> Option<(String, Vec<u8>)> {
+        let map = self.clients.read().unwrap();
+        (map.len() == 1)
+            .then(|| map.iter().next().map(|(k, v)| (k.clone(), v.clone())))
+            .flatten()
+    }
+}
+
+/// Set once at startup, so the routing decision is reachable from the tool
+/// layer without threading a registry through every call between.
+pub static CURRENT_CONNECTED_CLIENTS: std::sync::OnceLock<std::sync::Arc<ConnectedClients>> =
+    std::sync::OnceLock::new();
+
+/// Who should answer a browser call made during a turn from `sender`.
+///
+/// `None` means "leave it addressed as it is", which covers the ordinary case
+/// completely: a sidebar chat arrives from the connection that owns the browser
+/// it means to drive, so the sender is already right.
+///
+/// It exists for a turn from something that is not a connection at all. A
+/// paired phone's messages are injected under the `remote-control` proxy, so
+/// `browser_get_tabs` from a phone was addressed to the phone, projected onto
+/// the relay, and answered by nobody — thirty seconds later the agent was told
+/// the browser had timed out, which is true and explains nothing. Remote
+/// control exists to drive *this* machine's browser; when the sender is not
+/// something that can hold one, this is what says which is.
+///
+/// A declared headless browser wins, because it was named on purpose. Failing
+/// that, the single live client — on a desktop that is the sidebar, and it is
+/// the only thing there that can answer. Still `None` when the answer is not
+/// obvious: several of either, or none, and the call stays where it was. A
+/// timeout is a bad outcome; quietly driving a browser nobody named is worse.
+pub fn browser_target_for(
+    sender: &str,
+    browsers: &BrowserRegistry,
+    clients: &ConnectedClients,
+) -> Option<(String, Vec<u8>)> {
+    if browsers.is_browser(sender) || clients.is_connected(sender) {
+        return None;
+    }
+    if let Ok(entry) = browsers.single() {
+        return Some((entry.proxy_id, entry.client_identity));
+    }
+    clients.single()
+}
+
+/// [`browser_target_for`] against the registries this process installed.
+pub fn browser_target(sender: &str) -> Option<(String, Vec<u8>)> {
+    let browsers = CURRENT_BROWSER_REGISTRY.get()?;
+    let clients = CURRENT_CONNECTED_CLIENTS.get()?;
+    browser_target_for(sender, browsers, clients)
+}
+
 /// Registry of connections that declared `role:"browser"`. Distinct from
 /// [`ProxyRegistry`] (which tracks all proxies) and [`SessionProxyTracker`]
 /// (the `/loop` borrow hack): this is the explicit routing target for
@@ -208,32 +309,6 @@ impl BrowserRegistry {
     /// Whether `proxy_id` is one of the browsers.
     pub fn is_browser(&self, proxy_id: &str) -> bool {
         self.browsers.read().unwrap().contains_key(proxy_id)
-    }
-
-    /// The end that should answer a browser call made during a turn from
-    /// `sender`, when that is not the sender itself.
-    ///
-    /// `None` means "leave it addressed as it is", and covers the ordinary case
-    /// completely: a sidebar chat arrives from the browser it is meant to
-    /// drive, so the sender is already right.
-    ///
-    /// The case it exists for is a turn from something that is not a browser
-    /// and never will be. A paired phone's messages are injected under the
-    /// `remote-control` proxy, so `browser_get_tabs` from a phone was addressed
-    /// to the phone, projected onto the relay, and answered by nobody — thirty
-    /// seconds later the agent was told the browser had timed out, which is
-    /// true and explains nothing. Remote control exists to drive *this*
-    /// machine's browser; when the sender is not one, the registry is what
-    /// says which is.
-    ///
-    /// Still `None` when the answer is not obvious. No browser, or more than
-    /// one, and the call stays where it was: a timeout is a bad outcome, but
-    /// quietly driving a browser the caller did not mean is a worse one.
-    pub fn redirect_for(&self, sender: &str) -> Option<BrowserEntry> {
-        if self.is_browser(sender) {
-            return None;
-        }
-        self.single().ok()
     }
 
     /// Wait until at least one browser is registered, then resolve it.
@@ -586,39 +661,59 @@ impl RequestRegistry {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn a_browser_answers_its_own_calls() {
-        // The ordinary case: a sidebar chat arrives from the browser it drives.
-        let r = BrowserRegistry::new();
-        r.register("proxy-ed88ab2b", b"proxy-ed88ab2b".to_vec());
-        assert!(r.redirect_for("proxy-ed88ab2b").is_none());
-    }
-
-    #[test]
-    fn a_turn_from_something_that_is_not_a_browser_is_redirected_to_one() {
-        // A paired phone's messages are injected under `remote-control`, and a
-        // browser call addressed there reaches a device that cannot answer it.
-        let r = BrowserRegistry::new();
-        r.register("proxy-ed88ab2b", b"proxy-ed88ab2b".to_vec());
-        let to = r.redirect_for("remote-control").expect("redirected");
-        assert_eq!(to.proxy_id, "proxy-ed88ab2b");
-        assert_eq!(to.client_identity, b"proxy-ed88ab2b".to_vec());
-    }
-
-    #[test]
-    fn with_no_browser_or_several_the_call_stays_where_it_was() {
-        // Timing out is bad; driving a browser nobody named is worse.
-        let empty = BrowserRegistry::new();
-        assert!(empty.redirect_for("remote-control").is_none());
-
-        let many = BrowserRegistry::new();
-        many.register("a", b"a".to_vec());
-        many.register("b", b"b".to_vec());
-        assert!(many.redirect_for("remote-control").is_none());
-    }
-
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_client_answers_its_own_calls() {
+        // The ordinary case, and the one a headed desktop is always in: the
+        // sidebar chat arrives from the connection that owns the browser.
+        let browsers = BrowserRegistry::new();
+        let clients = ConnectedClients::new();
+        clients.register("proxy-b838f640", b"proxy-b838f640".to_vec());
+        assert!(browser_target_for("proxy-b838f640", &browsers, &clients).is_none());
+    }
+
+    #[test]
+    fn a_turn_from_an_injector_goes_to_the_live_client() {
+        // A paired phone's messages are stamped `remote-control`, which is a
+        // label and not a socket. On a desktop `BrowserRegistry` is empty by
+        // design — the extension registers as Control — so the sidebar
+        // connection is the only thing that can answer.
+        let browsers = BrowserRegistry::new();
+        let clients = ConnectedClients::new();
+        clients.register("proxy-b838f640", b"proxy-b838f640".to_vec());
+        let (proxy, identity) =
+            browser_target_for("remote-control", &browsers, &clients).expect("redirected");
+        assert_eq!(proxy, "proxy-b838f640");
+        assert_eq!(identity, b"proxy-b838f640".to_vec());
+    }
+
+    #[test]
+    fn a_declared_headless_browser_wins_over_a_bare_connection() {
+        // It was named on purpose; the connection is only a fallback.
+        let browsers = BrowserRegistry::new();
+        browsers.register("headless-1", b"headless-1".to_vec());
+        let clients = ConnectedClients::new();
+        clients.register("headless-1", b"headless-1".to_vec());
+        clients.register("proxy-b838f640", b"proxy-b838f640".to_vec());
+        let (proxy, _) =
+            browser_target_for("remote-control", &browsers, &clients).expect("redirected");
+        assert_eq!(proxy, "headless-1");
+    }
+
+    #[test]
+    fn with_nothing_or_too_much_the_call_stays_where_it_was() {
+        // Timing out is bad; driving a browser nobody named is worse.
+        let browsers = BrowserRegistry::new();
+        let none = ConnectedClients::new();
+        assert!(browser_target_for("remote-control", &browsers, &none).is_none());
+
+        let many = ConnectedClients::new();
+        many.register("a", b"a".to_vec());
+        many.register("b", b"b".to_vec());
+        assert!(browser_target_for("remote-control", &browsers, &many).is_none());
+    }
 
     #[test]
     fn test_proxy_info_new() {

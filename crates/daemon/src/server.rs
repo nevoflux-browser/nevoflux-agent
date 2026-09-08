@@ -553,6 +553,13 @@ async fn handle_proxy_connection(
     // Identity bytes (proxy_id encoded as UTF-8) for compatibility with existing pipeline
     let identity = proxy_id.as_bytes().to_vec();
 
+    // Every live connection, whatever role it claimed. A browser call from a
+    // turn nobody is holding a socket for — a paired phone's, injected under
+    // `remote-control` — is routed to one of these.
+    if let Some(clients) = crate::registry::CURRENT_CONNECTED_CLIENTS.get() {
+        clients.register(proxy_id.clone(), identity.clone());
+    }
+
     // Track browsers so `browser_*` tools can be routed to an explicitly-bound
     // browser (headless automation) rather than the chat sender (see P2/Q2-Q3).
     if role == crate::registry::RegisterRole::Browser {
@@ -595,6 +602,9 @@ async fn handle_proxy_connection(
     writers.lock().await.remove(&proxy_id);
     connection_count.fetch_sub(1, Ordering::SeqCst);
     browser_registry.unregister(&proxy_id);
+    if let Some(clients) = crate::registry::CURRENT_CONNECTED_CLIENTS.get() {
+        clients.unregister(&proxy_id);
+    }
 
     // Notify the message loop about the disconnect so EventBus subscriptions
     // belonging to this proxy can be cleaned up.
@@ -1773,6 +1783,12 @@ pub async fn start_server(
     // resolve the bound browser off the task path (see ADJ-2). Ignore if
     // already set (e.g. a second daemon in tests).
     let _ = crate::registry::CURRENT_BROWSER_REGISTRY.set(available_browsers.clone());
+    // Its headed counterpart. `available_browsers` only ever holds a client
+    // that declared `role:"browser"`, which a desktop extension deliberately
+    // does not, so without this there is nothing to route a browser call to on
+    // the machine anybody actually uses.
+    let connected_clients = std::sync::Arc::new(crate::registry::ConnectedClients::new());
+    let _ = crate::registry::CURRENT_CONNECTED_CLIENTS.set(connected_clients.clone());
 
     let mut services = HostServices::with_skills(Arc::new(db.clone()), shared_skills)
         .with_browser_sender(browser_tx)
