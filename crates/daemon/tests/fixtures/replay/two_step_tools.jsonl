@@ -1,0 +1,14 @@
+{"seq":1,"ts":1757000100000,"type":"turn/start","turn":1}
+{"seq":2,"ts":1757000100001,"type":"system/message","content":"SYS","sections":[],"origin":"kernel"}
+{"seq":3,"ts":1757000100002,"type":"user/message","content":"open example.com and read it","attachments":[],"origin":"user"}
+{"seq":4,"ts":1757000100003,"type":"request/header","provider":"anthropic","model":"claude-opus-5","tools_hash":"0000000000000000","reason":"initial"}
+{"seq":5,"ts":1757000100004,"type":"step/start","step":0,"turn":1}
+{"seq":6,"ts":1757000100005,"type":"tool/call","id":"t1","name":"browser_navigate","args":{"url":"https://example.com"},"origin":"model"}
+{"seq":7,"ts":1757000100006,"type":"tool/result","id":"t1","content":"navigated","is_error":false,"duration_ms":120}
+{"seq":8,"ts":1757000100007,"type":"assistant/message","content":"navigating","tool_calls":[],"model":"claude-opus-5","provider":"anthropic"}
+{"seq":9,"ts":1757000100008,"type":"step/end","step":0,"turn":1}
+{"seq":10,"ts":1757000100009,"type":"step/start","step":1,"turn":1}
+{"seq":11,"ts":1757000100010,"type":"tool/call","id":"t2","name":"browser_get_content","args":{},"origin":"model"}
+{"seq":12,"ts":1757000100011,"type":"tool/result","id":"t2","content":"tab closed","is_error":true,"duration_ms":30}
+{"seq":13,"ts":1757000100012,"type":"step/end","step":1,"turn":1}
+{"seq":14,"ts":1757000100013,"type":"turn/end","turn":1}

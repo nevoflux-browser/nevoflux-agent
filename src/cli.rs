@@ -145,6 +145,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: AccountAction,
     },
+    /// Session event log: export a session as JSONL, or replay it
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
     /// Run interactive setup wizard
     Setup,
     /// Generate shell completions
@@ -265,6 +270,31 @@ pub enum AccountAction {
     Status,
     /// Remove the stored account-token file.
     Logout,
+}
+
+/// Session subcommand actions.
+///
+/// The event log is the session's source of truth (design spec §3); these two
+/// verbs are how it leaves the database — `export` for a dsh-compatible JSONL
+/// file, `replay` for the tool sequence a log implies.
+#[derive(Subcommand, Debug)]
+pub enum SessionAction {
+    /// Export a session's event log as JSONL (one event per line)
+    Export {
+        /// Session id to export
+        session_id: String,
+        /// Write to this file instead of stdout
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Replay a session's event log and print the tool sequence it implies
+    Replay {
+        /// Session id to replay
+        session_id: String,
+        /// Stop after this sequence number
+        #[arg(long)]
+        until: Option<i64>,
+    },
 }
 
 #[cfg(test)]
@@ -544,6 +574,44 @@ mod tests {
                 assert!(no_save);
             }
             _ => panic!("Expected Account::Login with flags"),
+        }
+    }
+
+    #[test]
+    fn session_export_accepts_an_optional_out_path() {
+        let cli = Cli::try_parse_from(["nevoflux", "session", "export", "s1"]).unwrap();
+        match cli.command {
+            Some(Commands::Session {
+                action: SessionAction::Export { session_id, out },
+            }) => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(out, None);
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["nevoflux", "session", "export", "s1", "--out", "a.jsonl"])
+            .unwrap();
+        match cli.command {
+            Some(Commands::Session {
+                action: SessionAction::Export { out, .. },
+            }) => assert_eq!(out.as_deref(), Some("a.jsonl")),
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_replay_accepts_an_optional_until_bound() {
+        let cli =
+            Cli::try_parse_from(["nevoflux", "session", "replay", "s1", "--until", "7"]).unwrap();
+        match cli.command {
+            Some(Commands::Session {
+                action: SessionAction::Replay { session_id, until },
+            }) => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(until, Some(7));
+            }
+            other => panic!("unexpected parse: {other:?}"),
         }
     }
 

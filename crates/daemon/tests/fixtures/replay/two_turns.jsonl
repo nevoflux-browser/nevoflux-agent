@@ -1,0 +1,15 @@
+{"seq":1,"ts":1757000200000,"type":"turn/start","turn":1}
+{"seq":2,"ts":1757000200001,"type":"system/message","content":"SYS","sections":[],"origin":"kernel"}
+{"seq":3,"ts":1757000200002,"type":"user/message","content":"what is 2+2","attachments":[],"origin":"user"}
+{"seq":4,"ts":1757000200003,"type":"request/header","provider":"anthropic","model":"claude-opus-5","tools_hash":"0000000000000000","reason":"initial"}
+{"seq":5,"ts":1757000200004,"type":"step/start","step":0,"turn":1}
+{"seq":6,"ts":1757000200005,"type":"assistant/message","content":"4","tool_calls":[],"usage":{"input_tokens":10,"output_tokens":1},"model":"claude-opus-5","provider":"anthropic"}
+{"seq":7,"ts":1757000200006,"type":"step/end","step":0,"turn":1}
+{"seq":8,"ts":1757000200007,"type":"turn/end","turn":1}
+{"seq":9,"ts":1757000200008,"type":"turn/start","turn":2}
+{"seq":10,"ts":1757000200009,"type":"user/message","content":"now double it","attachments":[],"origin":"user"}
+{"seq":11,"ts":1757000200010,"type":"step/start","step":0,"turn":2}
+{"seq":12,"ts":1757000200011,"type":"tool/call","id":"t9","name":"code_mode","args":{"code":"print(4*2)"},"origin":"model"}
+{"seq":13,"ts":1757000200012,"type":"tool/result","id":"t9","content":"8","is_error":false,"duration_ms":45}
+{"seq":14,"ts":1757000200013,"type":"step/end","step":0,"turn":2}
+{"seq":15,"ts":1757000200014,"type":"turn/end","turn":2}
