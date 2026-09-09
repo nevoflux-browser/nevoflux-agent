@@ -840,7 +840,16 @@ pub trait HostFunctions {
     /// evidence (e.g. the goal evaluator's transcript and the continuation
     /// progress anchor). Default: no-op. Called once per tool execution in the
     /// agent loop with the full (untruncated) result content. See spec §4.1.
-    fn record_tool_result(&self, _tool_name: &str, _tool_id: &str, _content: &str, _success: bool) {
+    /// `duration_ms` is measured around dispatch only — policy time is not the
+    /// tool's time, so the gate is outside the measurement.
+    fn record_tool_result(
+        &self,
+        _tool_name: &str,
+        _tool_id: &str,
+        _content: &str,
+        _success: bool,
+        _duration_ms: u64,
+    ) {
     }
 
     /// Announce a tool call before it executes.
@@ -1020,6 +1029,15 @@ pub struct MockHostFunctions {
     /// strings — lets tests assert that a tool is announced before it runs and
     /// that turn/step boundaries pair up.
     pub recorded_events: std::cell::RefCell<Vec<String>>,
+    /// Verdict this mock's `tool_pre` returns. Tests set it to exercise the
+    /// Deny and Rewrite paths.
+    pub gate: std::cell::RefCell<ToolGate>,
+    /// Arguments each call carried when it reached `tool_post` — i.e. after any
+    /// Rewrite, which is the only way to observe that a rewrite took effect.
+    pub post_arguments: std::cell::RefCell<Vec<serde_json::Value>>,
+    /// Milliseconds `tool_read` sleeps, so a test can produce a measurable
+    /// tool duration without depending on machine speed.
+    pub tool_read_delay_ms: std::cell::Cell<u64>,
 }
 
 #[cfg(test)]
@@ -1041,6 +1059,9 @@ impl MockHostFunctions {
             subagents: std::cell::RefCell::new(vec![]),
             captured_tool_names: std::cell::RefCell::new(vec![]),
             recorded_events: std::cell::RefCell::new(vec![]),
+            gate: std::cell::RefCell::new(ToolGate::Allow),
+            post_arguments: std::cell::RefCell::new(vec![]),
+            tool_read_delay_ms: std::cell::Cell::new(0),
         }
     }
 
@@ -1068,10 +1089,28 @@ impl HostFunctions for MockHostFunctions {
             .push(format!("call:{tool_name}:{tool_id}"));
     }
 
-    fn record_tool_result(&self, tool_name: &str, tool_id: &str, _content: &str, _success: bool) {
+    fn record_tool_result(
+        &self,
+        tool_name: &str,
+        tool_id: &str,
+        _content: &str,
+        _success: bool,
+        duration_ms: u64,
+    ) {
         self.recorded_events
             .borrow_mut()
-            .push(format!("result:{tool_name}:{tool_id}"));
+            .push(format!("result:{tool_name}:{tool_id}:dur={duration_ms}"));
+    }
+
+    fn tool_pre(&self, _call: &ToolCall, _ctx: &ToolContext) -> ToolGate {
+        self.gate.borrow().clone()
+    }
+
+    fn tool_post(&self, call: &ToolCall, _ctx: &ToolContext, result: ToolResult) -> ToolResult {
+        self.post_arguments
+            .borrow_mut()
+            .push(call.arguments.clone());
+        result
     }
 
     fn record_turn_boundary(&self, turn: u32, start: bool) {
@@ -1179,6 +1218,12 @@ impl HostFunctions for MockHostFunctions {
         _offset: Option<u64>,
         _limit: Option<u64>,
     ) -> HostResult<ReadResult> {
+        // Lets a test produce a measurable tool duration without depending on
+        // how fast the machine is.
+        let delay = self.tool_read_delay_ms.get();
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
         Ok(ReadResult {
             total_lines: 1,
             total_bytes: 12,

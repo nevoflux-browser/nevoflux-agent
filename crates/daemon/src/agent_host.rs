@@ -1342,7 +1342,14 @@ impl HostFunctions for DaemonHostFunctions {
     /// continuation anchor can name what already happened (spec §4.1). Best
     /// effort: skips when no services/session, empty content, or the meta
     /// `think` tool (reasoning, not an observation).
-    fn record_tool_result(&self, tool_name: &str, tool_id: &str, content: &str, success: bool) {
+    fn record_tool_result(
+        &self,
+        tool_name: &str,
+        tool_id: &str,
+        content: &str,
+        success: bool,
+        duration_ms: u64,
+    ) {
         if content.trim().is_empty() || tool_name == "think" {
             return;
         }
@@ -1381,9 +1388,7 @@ impl HostFunctions for DaemonHostFunctions {
                     id: tool_id.to_string(),
                     content: content.to_string(),
                     is_error: !success,
-                    // Timing is measured in the tool pipeline P1 introduces;
-                    // 0 here means "not measured", not "instant".
-                    duration_ms: 0,
+                    duration_ms,
                 },
             );
         }
