@@ -150,6 +150,42 @@ pub fn load_installed_rules(packs_dir: &std::path::Path) -> Vec<SiteRule> {
     out
 }
 
+/// The `active`-scope rules of the named packs.
+///
+/// Separate from [`load_installed_rules`] because the two answer different
+/// questions: installed rules apply to every session, active ones only while a
+/// session has chosen the pack. Not cached — activation changes within a
+/// session, which is exactly what a directory-mtime cache cannot see.
+pub fn load_active_rules(packs_dir: &std::path::Path, active: &[String]) -> Vec<SiteRule> {
+    let mut out = Vec::new();
+    for name in active {
+        let manifest_path = packs_dir.join(name).join("pack.toml");
+        let Ok(src) = std::fs::read_to_string(&manifest_path) else {
+            continue;
+        };
+        let Ok(manifest) = nevoflux_pack::manifest::Manifest::parse(&src) else {
+            continue;
+        };
+        for tp in &manifest.components.tool_policy {
+            if tp.scope != "active" {
+                continue;
+            }
+            out.push(SiteRule {
+                pack: manifest.pack.name.clone(),
+                urls: tp.match_on.url.clone(),
+                deny: tp.deny.clone(),
+                ask: tp.ask.clone(),
+                message: if tp.message.is_empty() {
+                    format!("`{}` restricts this action here", manifest.pack.name)
+                } else {
+                    tp.message.clone()
+                },
+            });
+        }
+    }
+    out
+}
+
 /// Installed rules, reloaded when the packs directory changes.
 ///
 /// Re-reading and re-parsing every manifest on every tool call would be
@@ -461,6 +497,47 @@ message = "no automation on banking sites"
         let rules = load_installed_rules(&tmp);
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].pack, "bank-guard");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// An active rule only applies while the session has chosen the pack, so it
+    /// must not be picked up by the installed loader and must be picked up by
+    /// the active one.
+    #[test]
+    fn an_active_rule_loads_only_for_a_pack_the_session_activated() {
+        let tmp = std::env::temp_dir().join(format!("nf-sp-act-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        write_pack(&tmp, "bank-guard", &manifest_with("active"));
+
+        assert!(
+            load_installed_rules(&tmp).is_empty(),
+            "an active rule is not an installed rule"
+        );
+        assert!(
+            load_active_rules(&tmp, &[]).is_empty(),
+            "no pack activated means no active rules"
+        );
+        assert_eq!(
+            load_active_rules(&tmp, &["bank-guard".to_string()]).len(),
+            1
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Activating a pack that contributes only installed rules adds nothing
+    /// twice: the installed loader already has them.
+    #[test]
+    fn activating_a_pack_does_not_duplicate_its_installed_rules() {
+        let tmp = std::env::temp_dir().join(format!("nf-sp-dup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        write_pack(&tmp, "bank-guard", &manifest_with("installed"));
+
+        assert_eq!(load_installed_rules(&tmp).len(), 1);
+        assert!(load_active_rules(&tmp, &["bank-guard".to_string()]).is_empty());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

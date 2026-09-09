@@ -43,6 +43,8 @@ pub struct Components {
     /// Site rules this pack contributes (0.2). Can only ever tighten.
     #[serde(default)]
     pub tool_policy: Vec<ToolPolicyComponent>,
+    /// A WebAssembly module this pack runs at named points (0.2).
+    pub hooks: Option<HooksComponent>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -180,6 +182,75 @@ pub struct Permissions {
     pub side_effects: Vec<String>,
 }
 
+/// Execution budget for one hook call.
+///
+/// Both limits exist because they catch different failures: fuel stops a tight
+/// loop that never yields, and the wall clock stops a module that is waiting on
+/// something. A hook that exceeds either is cut off, and what happens next
+/// depends on its scope (see [`HooksComponent::scope`]).
+#[derive(Debug, Clone, Deserialize)]
+pub struct HookBudget {
+    /// Wall-clock ceiling per call.
+    #[serde(default = "default_hook_ms")]
+    pub ms: u64,
+    /// Wasmtime fuel ceiling per call.
+    #[serde(default = "default_hook_fuel")]
+    pub fuel: u64,
+}
+
+impl Default for HookBudget {
+    fn default() -> Self {
+        Self {
+            ms: default_hook_ms(),
+            fuel: default_hook_fuel(),
+        }
+    }
+}
+
+fn default_hook_ms() -> u64 {
+    50
+}
+
+fn default_hook_fuel() -> u64 {
+    1_000_000
+}
+
+/// A pack-supplied WebAssembly module and the points it runs at.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HooksComponent {
+    /// Module path inside the pack.
+    pub file: String,
+    /// `active` (session-scoped) or `installed` (always on).
+    ///
+    /// This decides what a failure means. An `installed` hook is a guard, so
+    /// a trap or a timeout counts as a refusal -- a guard that cannot run must
+    /// not wave things through. An `active` hook contributes context, so a
+    /// failure counts as abstention: losing an injection should not take down
+    /// the turn (invariant I6).
+    #[serde(default = "default_hook_scope")]
+    pub scope: String,
+    /// Hook points this module implements, e.g. `on_tool_pre`.
+    #[serde(default)]
+    pub points: Vec<String>,
+    /// Per-call budget.
+    #[serde(default)]
+    pub budget: HookBudget,
+}
+
+fn default_hook_scope() -> String {
+    "active".to_string()
+}
+
+/// Hook points the kernel knows how to call.
+pub const KNOWN_HOOK_POINTS: &[&str] = &[
+    "on_tool_pre",
+    "on_tool_post",
+    "on_context_assemble",
+    "on_knowledge_write",
+    "on_loop_iteration_start",
+    "on_loop_iteration_end",
+];
+
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["pack-protocol/0.1", "pack-protocol/0.2"];
 
 /// Components and fields that only exist from `pack-protocol/0.2` onward.
@@ -229,6 +300,9 @@ impl Manifest {
             if !self.components.tool_policy.is_empty() {
                 only_in_0_2.push("components.tool_policy");
             }
+            if self.components.hooks.is_some() {
+                only_in_0_2.push("components.hooks");
+            }
             if self.components.dashboard.as_ref().is_some_and(|d| {
                 !d.capabilities.call_tool.is_empty() || !d.capabilities.invoke.is_empty()
             }) {
@@ -272,6 +346,33 @@ impl Manifest {
                 return Err(
                     "a tool_policy rule must deny or ask something; it cannot only match".into(),
                 );
+            }
+        }
+
+        // hooks: known scope, known points, and a budget that can finish.
+        if let Some(h) = &self.components.hooks {
+            if !matches!(h.scope.as_str(), "active" | "installed") {
+                return Err(format!(
+                    "hooks.scope '{}' unsupported (active | installed)",
+                    h.scope
+                ));
+            }
+            if h.points.is_empty() {
+                return Err("hooks declares no points, so the module would never run".into());
+            }
+            for point in &h.points {
+                if !KNOWN_HOOK_POINTS.contains(&point.as_str()) {
+                    return Err(format!(
+                        "hooks.points '{}' is not a point the kernel calls",
+                        point
+                    ));
+                }
+            }
+            // A zero budget cannot complete any call. Rejecting it beats
+            // installing a hook that is guaranteed to be cut off -- and for an
+            // installed hook, one that is guaranteed to refuse everything.
+            if h.budget.ms == 0 || h.budget.fuel == 0 {
+                return Err("hooks.budget must allow some time and some fuel".into());
             }
         }
 
@@ -452,6 +553,94 @@ mod tests {
         let d = m.components.dashboard.unwrap();
         assert!(d.capabilities.call_tool.is_empty());
         assert!(d.capabilities.invoke.is_empty());
+    }
+
+    const HOOKS: &str = r#"
+        [components.hooks]
+        file   = "hooks.wasm"
+        scope  = "installed"
+        points = ["on_tool_pre"]
+        budget = { ms = 50, fuel = 1000000 }
+    "#;
+
+    fn with_hooks(extra: &str) -> String {
+        format!("{V02}{extra}")
+    }
+
+    #[test]
+    fn a_hooks_component_parses_with_its_budget() {
+        let m = Manifest::parse(&with_hooks(HOOKS)).unwrap();
+        let h = m.components.hooks.unwrap();
+        assert_eq!(h.file, "hooks.wasm");
+        assert_eq!(h.scope, "installed");
+        assert_eq!(h.points, vec!["on_tool_pre"]);
+        assert_eq!(h.budget.ms, 50);
+        assert_eq!(h.budget.fuel, 1_000_000);
+    }
+
+    #[test]
+    fn a_hooks_budget_defaults_rather_than_being_unlimited() {
+        let src = with_hooks(
+            "
+[components.hooks]
+file = \"h.wasm\"
+points = [\"on_tool_pre\"]
+",
+        );
+        let h = Manifest::parse(&src).unwrap().components.hooks.unwrap();
+        assert!(
+            h.budget.ms > 0 && h.budget.fuel > 0,
+            "a hook is always bounded"
+        );
+        assert_eq!(h.scope, "active", "the safer default: a failure abstains");
+    }
+
+    /// A hook with no points would never run, which is a manifest mistake worth
+    /// naming rather than a module worth installing.
+    #[test]
+    fn hooks_with_no_points_are_rejected() {
+        let src = with_hooks(
+            "
+[components.hooks]
+file = \"h.wasm\"
+points = []
+",
+        );
+        assert!(Manifest::parse(&src).unwrap_err().contains("no points"));
+    }
+
+    #[test]
+    fn an_unknown_hook_point_is_rejected() {
+        let src = with_hooks(
+            "
+[components.hooks]
+file = \"h.wasm\"
+points = [\"on_everything\"]
+",
+        );
+        assert!(Manifest::parse(&src).unwrap_err().contains("not a point"));
+    }
+
+    /// A zero budget cannot complete any call. For an installed hook that would
+    /// mean a guard guaranteed to refuse everything.
+    #[test]
+    fn a_zero_budget_is_rejected() {
+        let src = with_hooks(
+            "
+[components.hooks]
+file = \"h.wasm\"
+points = [\"on_tool_pre\"]
+budget = { ms = 0, fuel = 1000 }
+",
+        );
+        assert!(Manifest::parse(&src).unwrap_err().contains("some time"));
+    }
+
+    #[test]
+    fn hooks_need_the_0_2_protocol() {
+        let src = with_hooks(HOOKS).replace("pack-protocol/0.2", "pack-protocol/0.1");
+        let err = Manifest::parse(&src).unwrap_err();
+        assert!(err.contains("components.hooks"), "{err}");
     }
 
     #[test]

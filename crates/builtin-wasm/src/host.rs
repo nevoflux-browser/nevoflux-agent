@@ -879,6 +879,69 @@ pub trait HostFunctions {
     /// Default no-op; the daemon appends `step/start` / `step/end`.
     fn record_step_boundary(&self, _turn: u32, _step: u32, _start: bool) {}
 
+    /// Let an active pack take over the system prompt (design spec 4.3.2).
+    ///
+    /// `mode` is `keep_kernel` (everything but the kernel sections) or `full`
+    /// (the whole body). Exclusive: while one pack holds the prompt another
+    /// gets an error rather than silently layering on top, because that would
+    /// make the first pack's discipline disappear without either noticing.
+    ///
+    /// The privacy invariant does not live in the prompt, so no mode can
+    /// remove it (invariant I5).
+    fn system_prompt_replace(
+        &self,
+        _content: &str,
+        _mode: &str,
+        _reason: &str,
+    ) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "system_prompt_replace not supported by this host".into(),
+        })
+    }
+
+    /// Give the system prompt back to the kernel.
+    fn system_prompt_restore(&self) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "system_prompt_restore not supported by this host".into(),
+        })
+    }
+
+    /// The replacement body in force, as (mode, content), if a pack holds one.
+    ///
+    /// Read while assembling the prompt, so a replacement takes effect from the
+    /// next request rather than mid-flight.
+    fn system_prompt_override(&self) -> Option<(String, String)> {
+        None
+    }
+
+    /// Activate a pack for this session, so its `active`-scope components take
+    /// effect (design spec 4.3).
+    ///
+    /// Several packs can be active at once with no primacy between them: they
+    /// answer different goals, and picking a winner would mean discarding one.
+    /// Returns a short confirmation for the model. Default: unsupported.
+    fn pack_activate(&self, _name: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "pack_activate not supported by this host".into(),
+        })
+    }
+
+    /// Drop a pack from this session.
+    fn pack_deactivate(&self, _name: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "pack_deactivate not supported by this host".into(),
+        })
+    }
+
+    /// Packs currently active in this session.
+    fn pack_list_active(&self) -> HostResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// Write a tool result that did not fit to disk, and say where it went.
     ///
     /// Called only when the result is about to be truncated, so the model can
@@ -1069,6 +1132,10 @@ pub struct MockHostFunctions {
     pub prompt_sections: std::cell::RefCell<Vec<PromptSectionText>>,
     /// Tool results the run spilled, as (tool_id, full byte length).
     pub spills: std::cell::RefCell<Vec<(String, usize)>>,
+    /// Packs this mock considers active.
+    pub active_packs: std::cell::RefCell<Vec<String>>,
+    /// A prompt override in force, as (mode, body).
+    pub prompt_override: std::cell::RefCell<Option<(String, String)>>,
 }
 
 #[cfg(test)]
@@ -1096,6 +1163,8 @@ impl MockHostFunctions {
             tool_read_calls: std::cell::Cell::new(0),
             prompt_sections: std::cell::RefCell::new(vec![]),
             spills: std::cell::RefCell::new(vec![]),
+            active_packs: std::cell::RefCell::new(vec![]),
+            prompt_override: std::cell::RefCell::new(None),
         }
     }
 
@@ -1140,6 +1209,39 @@ impl HostFunctions for MockHostFunctions {
         self.recorded_events
             .borrow_mut()
             .push(format!("result:{tool_name}:{tool_id}:dur={duration_ms}"));
+    }
+
+    fn system_prompt_replace(
+        &self,
+        content: &str,
+        mode: &str,
+        _reason: &str,
+    ) -> HostResult<String> {
+        *self.prompt_override.borrow_mut() = Some((mode.to_string(), content.to_string()));
+        Ok("replaced".into())
+    }
+
+    fn system_prompt_restore(&self) -> HostResult<String> {
+        *self.prompt_override.borrow_mut() = None;
+        Ok("restored".into())
+    }
+
+    fn system_prompt_override(&self) -> Option<(String, String)> {
+        self.prompt_override.borrow().clone()
+    }
+
+    fn pack_activate(&self, name: &str) -> HostResult<String> {
+        self.active_packs.borrow_mut().push(name.to_string());
+        Ok(format!("pack `{name}` is active for this session"))
+    }
+
+    fn pack_deactivate(&self, name: &str) -> HostResult<String> {
+        self.active_packs.borrow_mut().retain(|p| p != name);
+        Ok(format!("pack `{name}` is no longer active"))
+    }
+
+    fn pack_list_active(&self) -> HostResult<Vec<String>> {
+        Ok(self.active_packs.borrow().clone())
     }
 
     fn spill_tool_result(&self, tool_id: &str, content: &str) -> Option<String> {

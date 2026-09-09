@@ -214,6 +214,9 @@ pub struct DaemonHostFunctions {
     /// Site rules from installed packs, reloaded when the packs directory
     /// changes rather than re-parsed on every tool call.
     installed_rules: Arc<crate::tool_pipeline::site_policy::InstalledRules>,
+    /// Compiled pack hook modules, rebuilt on the same signal. Compiling per
+    /// tool call would be felt; each call still gets its own Store.
+    hook_registry: Arc<crate::tool_pipeline::pack_hook_stage::HookRegistry>,
     /// Token-budget accounting for in-flight streams, keyed by stream_id.
     /// Only populated when [`Self::token_budget`] is `Some`.
     stream_budget_data: Arc<Mutex<HashMap<u64, StreamBudgetData>>>,
@@ -297,6 +300,7 @@ impl DaemonHostFunctions {
             stream_event_data: Arc::new(Mutex::new(HashMap::new())),
             prompt_sections: Arc::new(Mutex::new(Vec::new())),
             installed_rules: Arc::new(Default::default()),
+            hook_registry: Arc::new(Default::default()),
             stream_budget_data: Arc::new(Mutex::new(HashMap::new())),
             model_override_provider: Arc::new(Mutex::new(None)),
             model_override_model: Arc::new(Mutex::new(None)),
@@ -1524,6 +1528,217 @@ impl HostFunctions for DaemonHostFunctions {
         );
     }
 
+    fn system_prompt_replace(&self, content: &str, mode: &str, reason: &str) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+
+        if !matches!(mode, "keep_kernel" | "full") {
+            return Err(HostError {
+                code: 4,
+                message: format!("MODE_UNKNOWN: `{mode}` (keep_kernel | full)"),
+            });
+        }
+
+        // Which active pack is asking? Provenance is not recorded yet -- a
+        // skill does not carry the pack it came from -- so attribution is only
+        // safe when exactly one active pack declared a replace mode. With
+        // several, refusing beats crediting the wrong pack in the audit trail.
+        let paths = crate::paths::resolve_from_daemon();
+        let active: Vec<String> = services
+            .active_packs
+            .read()
+            .map(|g| g.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        for name in &active {
+            let manifest_path = paths.packs_dir().join(name).join("pack.toml");
+            let Ok(src) = std::fs::read_to_string(&manifest_path) else {
+                continue;
+            };
+            let Ok(manifest) = nevoflux_pack::manifest::Manifest::parse(&src) else {
+                continue;
+            };
+            if let Some(pc) = &manifest.components.prompt {
+                if pc.replace != "none" {
+                    candidates.push((manifest.pack.name.clone(), pc.replace.clone()));
+                }
+            }
+        }
+
+        let (pack, declared) = match candidates.len() {
+            0 => {
+                return Err(HostError {
+                    code: 403,
+                    message: "PACK_NOT_AUTHORIZED: no active pack declares a prompt replace mode"
+                        .into(),
+                })
+            }
+            1 => candidates.remove(0),
+            _ => {
+                return Err(HostError {
+                    code: 409,
+                    message: format!(
+                        "PACK_AMBIGUOUS: {} active packs declare a replace mode, so this call cannot be attributed",
+                        candidates.len()
+                    ),
+                })
+            }
+        };
+
+        // A pack cannot exceed the ceiling it declared at install time -- that
+        // declaration is what the user was shown and agreed to.
+        if mode == "full" && declared != "full" {
+            return Err(HostError {
+                code: 403,
+                message: format!(
+                    "MODE_NOT_DECLARED: `{pack}` declared `{declared}`, so it may not replace the full prompt"
+                ),
+            });
+        }
+
+        // Exclusive. A second replacement would make the first pack's
+        // discipline vanish with neither pack aware of it.
+        if let Ok(guard) = services.prompt_override.read() {
+            if let Some((holder, _, _)) = guard.as_ref() {
+                if holder != &pack {
+                    return Err(HostError {
+                        code: 409,
+                        message: format!("PROMPT_HELD_BY: `{holder}` already replaced the prompt"),
+                    });
+                }
+            }
+        }
+
+        if let Ok(mut guard) = services.prompt_override.write() {
+            *guard = Some((pack.clone(), mode.to_string(), content.to_string()));
+        }
+
+        if let Some(writer) = self.event_writer() {
+            writer.append(
+                nevoflux_protocol::session_event::SessionEventPayload::PackPromptReplace {
+                    pack: pack.clone(),
+                    mode: mode.to_string(),
+                    reason: reason.to_string(),
+                    hash: nevoflux_protocol::session_event::content_hash(content),
+                },
+            );
+        }
+
+        Ok(format!(
+            "system prompt replaced by `{pack}` ({mode}); it takes effect from the next step"
+        ))
+    }
+
+    fn system_prompt_restore(&self) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+        let held = services
+            .prompt_override
+            .write()
+            .ok()
+            .and_then(|mut g| g.take());
+        match held {
+            Some((pack, _, _)) => {
+                if let Some(writer) = self.event_writer() {
+                    writer.append(
+                        nevoflux_protocol::session_event::SessionEventPayload::PackPromptRestore {
+                            pack: pack.clone(),
+                        },
+                    );
+                }
+                Ok(format!(
+                    "system prompt returned to the kernel (was `{pack}`)"
+                ))
+            }
+            None => Ok("the kernel already holds the system prompt".to_string()),
+        }
+    }
+
+    fn system_prompt_override(&self) -> Option<(String, String)> {
+        let services = self.services.as_ref()?;
+        let guard = services.prompt_override.read().ok()?;
+        guard
+            .as_ref()
+            .map(|(_, mode, content)| (mode.clone(), content.clone()))
+    }
+
+    fn pack_activate(&self, name: &str) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+
+        // Refuse a pack that is not installed, by name, rather than recording
+        // an activation that does nothing. A silent no-op here would leave the
+        // model believing it had gained abilities it does not have.
+        let paths = crate::paths::resolve_from_daemon();
+        let manifest_path = paths.packs_dir().join(name).join("pack.toml");
+        if !manifest_path.exists() {
+            return Err(HostError {
+                code: 4,
+                message: format!("pack `{name}` is not installed"),
+            });
+        }
+
+        let newly_added = services
+            .active_packs
+            .write()
+            .map(|mut g| g.insert(name.to_string()))
+            .unwrap_or(false);
+
+        if newly_added {
+            if let Some(writer) = self.event_writer() {
+                writer.append(
+                    nevoflux_protocol::session_event::SessionEventPayload::PackActivate {
+                        pack: name.to_string(),
+                    },
+                );
+            }
+        }
+        Ok(format!("pack `{name}` is active for this session"))
+    }
+
+    fn pack_deactivate(&self, name: &str) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+        let removed = services
+            .active_packs
+            .write()
+            .map(|mut g| g.remove(name))
+            .unwrap_or(false);
+        if removed {
+            if let Some(writer) = self.event_writer() {
+                writer.append(
+                    nevoflux_protocol::session_event::SessionEventPayload::PackDeactivate {
+                        pack: name.to_string(),
+                    },
+                );
+            }
+        }
+        Ok(format!("pack `{name}` is no longer active"))
+    }
+
+    fn pack_list_active(&self) -> HostResult<Vec<String>> {
+        let Some(services) = self.services.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut names: Vec<String> = services
+            .active_packs
+            .read()
+            .map(|g| g.iter().cloned().collect())
+            .unwrap_or_default();
+        // Stable order for the model and for tests; the set itself has none.
+        names.sort();
+        Ok(names)
+    }
+
     fn spill_tool_result(&self, tool_id: &str, content: &str) -> Option<String> {
         let services = self.services.as_ref()?;
         let session_id = self
@@ -1597,10 +1812,42 @@ impl HostFunctions for DaemonHostFunctions {
         // inside the host functions, where it knows the honest name of the
         // action and the resolved arguments. See `tool_pipeline`'s module docs.
         let packs_dir = crate::paths::resolve_from_daemon().packs_dir();
-        let rules = self.installed_rules.get(&packs_dir);
+        let mut rules = self.installed_rules.get(&packs_dir);
+        // Plus the `active`-scope rules of packs this session has activated.
+        // Read fresh rather than cached: activation changes within a session,
+        // which is the case the mtime cache cannot see.
+        if let Some(services) = self.services.as_ref() {
+            let active: Vec<String> = services
+                .active_packs
+                .read()
+                .map(|g| g.iter().cloned().collect())
+                .unwrap_or_default();
+            rules.extend(crate::tool_pipeline::site_policy::load_active_rules(
+                &packs_dir, &active,
+            ));
+        }
+        // Pack hooks run after the declarative rules: a rule is cheap and a
+        // module is not, so a call a rule already refuses never pays for one.
+        let active_for_hooks: Vec<String> = self
+            .services
+            .as_ref()
+            .and_then(|s| {
+                s.active_packs
+                    .read()
+                    .ok()
+                    .map(|g| g.iter().cloned().collect())
+            })
+            .unwrap_or_default();
+        let hooks = self
+            .hook_registry
+            .for_session(&packs_dir, &active_for_hooks);
+
         let pipeline = crate::tool_pipeline::Pipeline::new(vec![
             Box::new(crate::tool_pipeline::site_policy::SitePolicyStage::new(
                 rules,
+            )),
+            Box::new(crate::tool_pipeline::pack_hook_stage::PackHookStage::new(
+                hooks,
             )),
             Box::new(crate::tool_pipeline::allowlist::AllowlistStage),
         ]);
@@ -7130,6 +7377,7 @@ impl DaemonHostFunctions {
             stream_event_data: self.stream_event_data.clone(),
             prompt_sections: self.prompt_sections.clone(),
             installed_rules: self.installed_rules.clone(),
+            hook_registry: self.hook_registry.clone(),
             // Shared with the parent (like stream_trace_data): stream ids come
             // from the shared registry, so accounting must live in one map.
             stream_budget_data: self.stream_budget_data.clone(),

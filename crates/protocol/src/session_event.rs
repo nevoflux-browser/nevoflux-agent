@@ -220,6 +220,25 @@ pub enum SessionEventPayload {
         /// Pack name.
         pack: String,
     },
+    /// A pack replaced the system prompt.
+    #[serde(rename = "pack/prompt-replace")]
+    PackPromptReplace {
+        /// Pack that made the call.
+        pack: String,
+        /// `keep_kernel` or `full`.
+        mode: String,
+        /// Why the pack says it needed to.
+        reason: String,
+        /// Hash of the replacement body, so the log can show it changed
+        /// without carrying a second copy of the prompt.
+        hash: String,
+    },
+    /// A pack released the system prompt back to the kernel.
+    #[serde(rename = "pack/prompt-restore")]
+    PackPromptRestore {
+        /// Pack that held it.
+        pack: String,
+    },
     /// Context was compacted.
     #[serde(rename = "context/compact")]
     ContextCompact {
@@ -261,6 +280,8 @@ impl SessionEventPayload {
             Self::RequestHeader { .. } => "request/header",
             Self::PackActivate { .. } => "pack/activate",
             Self::PackDeactivate { .. } => "pack/deactivate",
+            Self::PackPromptReplace { .. } => "pack/prompt-replace",
+            Self::PackPromptRestore { .. } => "pack/prompt-restore",
             Self::ContextCompact { .. } => "context/compact",
             Self::ToolSpill { .. } => "tool/spill",
         }

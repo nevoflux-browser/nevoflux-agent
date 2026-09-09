@@ -3,6 +3,7 @@
 //! are added by their respective tasks (B2–B8).
 
 pub mod capability;
+pub mod checklist;
 pub mod error;
 pub mod host;
 pub mod lifecycle;

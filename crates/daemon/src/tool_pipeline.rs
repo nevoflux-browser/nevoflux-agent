@@ -23,6 +23,8 @@
 //! only partly met until those arrive.
 
 pub mod allowlist;
+pub mod canvas_gate;
+pub mod pack_hook_stage;
 pub mod site_policy;
 
 use nevoflux_builtin_wasm::{ToolCall, ToolContext, ToolDenial, ToolGate};
