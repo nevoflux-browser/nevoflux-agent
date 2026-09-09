@@ -582,6 +582,52 @@ pub struct BashResult {
     pub hint: Option<String>,
 }
 
+/// One addressable piece of the assembled system prompt (design spec §4.2).
+///
+/// The prompt is built as an ordered list rather than one string so that a
+/// section can be named, hashed, replaced, and used as a prefix-cache boundary.
+///
+/// # On the spec's `kernel/*` sections
+///
+/// Design spec §4.2 assumes a ~200-token kernel header made of
+/// `kernel/protocol`, `kernel/skill-protocol` and `kernel/privacy`. **That text
+/// does not exist.** The mode prompts (`chat.md`, `browser.md`, `agent.md`) are
+/// feature-organised documents — "Decision flow", "Memory", "Knowledge base" —
+/// with the tool-calling conventions and skill protocol woven through them.
+/// Extracting a kernel header means rewriting those prompts, which changes model
+/// behaviour and cannot be settled by a unit test, so it is left as its own task
+/// rather than faked by slicing markdown at headings. Until then `kernel` is
+/// true only for `skill/loaded`, which genuinely is a kernel-priority block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptSectionText {
+    /// Stable id, e.g. `base/browser`, `computer-use/guide`, `soul`.
+    pub id: String,
+    /// The section body.
+    pub body: String,
+    /// Whether this section must survive a `keep_kernel` prompt replacement.
+    pub kernel: bool,
+}
+
+impl PromptSectionText {
+    /// A replaceable section.
+    pub fn body(id: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            body: body.into(),
+            kernel: false,
+        }
+    }
+
+    /// A section a `keep_kernel` replacement must not remove.
+    pub fn kernel(id: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            body: body.into(),
+            kernel: true,
+        }
+    }
+}
+
 /// What the kernel knows about a tool call when it asks policy for a verdict.
 ///
 /// Carries the origin in the wire form design spec §3.2 fixes, so one policy can

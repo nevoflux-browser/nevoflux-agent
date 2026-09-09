@@ -207,6 +207,10 @@ pub struct DaemonHostFunctions {
     /// Session-log accumulation for in-flight streams, keyed by stream_id.
     /// Populated whenever there is a session to attribute events to.
     stream_event_data: Arc<Mutex<HashMap<u64, StreamEventData>>>,
+    /// Section ids + hashes of the prompt the current turn assembled, reported
+    /// by the agent before its first request so a `system/message` event can
+    /// name which section changed.
+    prompt_sections: Arc<Mutex<Vec<nevoflux_protocol::session_event::PromptSection>>>,
     /// Token-budget accounting for in-flight streams, keyed by stream_id.
     /// Only populated when [`Self::token_budget`] is `Some`.
     stream_budget_data: Arc<Mutex<HashMap<u64, StreamBudgetData>>>,
@@ -288,6 +292,7 @@ impl DaemonHostFunctions {
             current_iteration: AtomicU32::new(0),
             stream_trace_data: Arc::new(Mutex::new(HashMap::new())),
             stream_event_data: Arc::new(Mutex::new(HashMap::new())),
+            prompt_sections: Arc::new(Mutex::new(Vec::new())),
             stream_budget_data: Arc::new(Mutex::new(HashMap::new())),
             model_override_provider: Arc::new(Mutex::new(None)),
             model_override_model: Arc::new(Mutex::new(None)),
@@ -1417,6 +1422,21 @@ impl HostFunctions for DaemonHostFunctions {
         );
     }
 
+    fn record_prompt_sections(&self, sections: &[nevoflux_builtin_wasm::PromptSectionText]) {
+        let mapped: Vec<_> = sections
+            .iter()
+            .map(|s| nevoflux_protocol::session_event::PromptSection {
+                id: s.id.clone(),
+                // The hash, not the body: a section list has to stay small
+                // enough to sit on every system/message event.
+                hash: nevoflux_protocol::session_event::content_hash(&s.body),
+            })
+            .collect();
+        if let Ok(mut guard) = self.prompt_sections.lock() {
+            *guard = mapped;
+        }
+    }
+
     fn is_unattended(&self) -> bool {
         self.services
             .as_ref()
@@ -1644,7 +1664,12 @@ impl HostFunctions for DaemonHostFunctions {
         // request; logging above the match would only catch the compacted
         // branch, which is the rarer one.
         if let Some(writer) = self.event_writer() {
-            writer.record_request(&daemon_request, &provider_name, &model);
+            let sections = self
+                .prompt_sections
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            writer.record_request(&daemon_request, &provider_name, &model, &sections);
         }
 
         // Serialize the request for trace recording before it's consumed by execute_llm_chat
@@ -1978,7 +2003,12 @@ impl HostFunctions for DaemonHostFunctions {
 
         // Session event log (design spec §3.4) — same join point as `llm_chat`.
         if let Some(writer) = self.event_writer() {
-            writer.record_request(&daemon_request, &provider_name, &model);
+            let sections = self
+                .prompt_sections
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            writer.record_request(&daemon_request, &provider_name, &model, &sections);
         }
 
         // Serialize request for trace recording before it's consumed
@@ -6892,6 +6922,7 @@ impl DaemonHostFunctions {
             current_iteration: AtomicU32::new(self.current_iteration.load(Ordering::Relaxed)),
             stream_trace_data: self.stream_trace_data.clone(),
             stream_event_data: self.stream_event_data.clone(),
+            prompt_sections: self.prompt_sections.clone(),
             // Shared with the parent (like stream_trace_data): stream ids come
             // from the shared registry, so accounting must live in one map.
             stream_budget_data: self.stream_budget_data.clone(),
