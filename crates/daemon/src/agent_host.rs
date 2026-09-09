@@ -1349,6 +1349,30 @@ fn usage_to_event(
     })
 }
 
+/// Make one path segment out of an id that arrived from a provider.
+///
+/// Tool call ids are provider-supplied strings. They are normally tame, but
+/// they end up in a filesystem path here, so anything that is not plainly safe
+/// becomes an underscore rather than being trusted to behave.
+fn sanitise_path_segment(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(120)
+        .collect();
+    if cleaned.is_empty() {
+        "unnamed".to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// Resolve the effective "Agent execution" tier for the permission gate.
 ///
 /// Precedence: a per-session override (`config:session:<id>:agentExecution`,
@@ -1498,6 +1522,47 @@ impl HostFunctions for DaemonHostFunctions {
                 tab_url: ctx.tab_url.clone(),
             },
         );
+    }
+
+    fn spill_tool_result(&self, tool_id: &str, content: &str) -> Option<String> {
+        let services = self.services.as_ref()?;
+        let session_id = self
+            .session_id
+            .as_deref()
+            .unwrap_or(services.session_id.as_str());
+        if session_id.is_empty() {
+            return None;
+        }
+
+        // `tool-spill`, not `spill`: `spill_attachments_to_local_files` in
+        // server.rs already owns the bare word for remote image attachments,
+        // and two unrelated spills in one crate would read as one thing.
+        let dir = crate::paths::resolve_from_daemon()
+            .data_dir
+            .join("tool-spill")
+            .join(sanitise_path_segment(session_id));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(error = %e, "tool spill: cannot create directory; truncation stands");
+            return None;
+        }
+
+        let path = dir.join(format!("{}.txt", sanitise_path_segment(tool_id)));
+        if let Err(e) = std::fs::write(&path, content) {
+            tracing::warn!(error = %e, "tool spill: write failed; truncation stands");
+            return None;
+        }
+
+        let rendered = path.display().to_string();
+        if let Some(writer) = self.event_writer() {
+            writer.append(
+                nevoflux_protocol::session_event::SessionEventPayload::ToolSpill {
+                    id: tool_id.to_string(),
+                    path: rendered.clone(),
+                    bytes: content.len() as u64,
+                },
+            );
+        }
+        Some(rendered)
     }
 
     fn record_prompt_sections(&self, sections: &[nevoflux_builtin_wasm::PromptSectionText]) {
@@ -1779,6 +1844,64 @@ impl HostFunctions for DaemonHostFunctions {
                 .await
             })
         });
+
+        // Context overflow: shrink and try once more inside the same step
+        // (design spec 5.1).
+        //
+        // The compressor is not available here. It is skipped whenever tool
+        // results are present, and a long agent loop full of tool results is
+        // exactly the shape that overflows. So the retry shortens the oldest
+        // tool results in place instead, which removes no message and keeps
+        // every tool_call paired with its result.
+        let overflowed = match &result {
+            Err(e) => crate::context::overflow::is_context_overflow(&e.to_string()),
+            Ok(_) => false,
+        };
+        let result = if overflowed {
+            let mut retry_request = self.convert_request_to_daemon(request);
+            let before_len: usize = retry_request.messages.iter().map(|m| m.content.len()).sum();
+            let elided = crate::context::overflow::shrink_tool_results(
+                &mut retry_request.messages,
+                self.config.daemon.context.microcompact_keep_recent,
+                self.config.daemon.context.microcompact_content_threshold,
+            );
+            if elided == 0 {
+                // Nothing left to give up. Surfacing the original error beats
+                // resending the same request and failing twice as slowly.
+                warn!("context overflow with nothing left to shrink; surfacing the error");
+                result
+            } else {
+                let after_len: usize = retry_request.messages.iter().map(|m| m.content.len()).sum();
+                if let Some(writer) = self.event_writer() {
+                    writer.append(
+                        nevoflux_protocol::session_event::SessionEventPayload::ContextCompact {
+                            trigger: "overflow".into(),
+                            before_tokens: (before_len / 4) as u64,
+                            after_tokens: (after_len / 4) as u64,
+                        },
+                    );
+                }
+                warn!(
+                    elided,
+                    "context overflow; retrying once with older tool results elided"
+                );
+                let runtime = self.runtime.clone();
+                tokio::task::block_in_place(|| {
+                    runtime.block_on(async {
+                        execute_llm_chat(
+                            provider,
+                            &api_key,
+                            &model,
+                            retry_request,
+                            base_url.as_deref(),
+                        )
+                        .await
+                    })
+                })
+            }
+        } else {
+            result
+        };
 
         match result {
             Ok(response) => {
@@ -8203,6 +8326,21 @@ mod tests {
             tools: vec![],
             stream: false,
         }
+    }
+
+    /// Tool call ids are provider-supplied and end up in a filesystem path, so
+    /// anything that is not plainly safe becomes an underscore.
+    #[test]
+    fn a_spill_path_segment_cannot_escape_its_directory() {
+        assert_eq!(sanitise_path_segment("toolu_01ABC"), "toolu_01ABC");
+        assert_eq!(
+            sanitise_path_segment("../../etc/passwd"),
+            "______etc_passwd"
+        );
+        assert_eq!(sanitise_path_segment("a/b\\c"), "a_b_c");
+        assert_eq!(sanitise_path_segment(""), "unnamed");
+        assert_eq!(sanitise_path_segment("///"), "___");
+        assert_eq!(sanitise_path_segment(&"x".repeat(500)).len(), 120);
     }
 
     #[test]

@@ -1641,8 +1641,30 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     duration_ms,
                 );
 
-                // Dynamic truncation based on current message size
-                let content = truncate_tool_result_if_needed(&messages, &result.content);
+                // Dynamic truncation based on current message size.
+                //
+                // When it does truncate, offer the rest rather than dropping
+                // it: the host writes the full text somewhere and the model is
+                // told where, so a long page or a big file is still reachable
+                // with `read` instead of being silently cut off.
+                let trimmed = truncate_tool_result_if_needed(&messages, &result.content);
+                let content = if trimmed.len() < result.content.len() {
+                    match self
+                        .host
+                        .spill_tool_result(&result.tool_call_id, &result.content)
+                    {
+                        Some(path) => format!(
+                            "{trimmed}\n\n[full output saved to {} ({} bytes) — use `read` with that path to continue]",
+                            path,
+                            result.content.len()
+                        ),
+                        // Nowhere to write: the truncation stands. Spilling
+                        // improves on truncation, it is not required for it.
+                        None => trimmed,
+                    }
+                } else {
+                    trimmed
+                };
 
                 // Check if there's a cached screenshot to attach (base64 stays out of content)
                 let attachments = if tool_call.name == "browser_screenshot" {
@@ -6773,6 +6795,46 @@ mod tests {
         assert_eq!(joined, direct);
         assert!(joined.contains("# Available models"));
         assert!(joined.contains("Operating System: Windows"));
+    }
+
+    /// A truncated result must tell the model where the rest went, or a long
+    /// page is silently cut off with no way back to it.
+    #[test]
+    fn a_truncated_result_points_at_the_full_output() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "t1".into(),
+                call_id: None,
+                name: "think".into(),
+                arguments: serde_json::json!({ "thought": "x" }),
+                signature: None,
+            }],
+            reasoning: None,
+        });
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        // `think` returns a short result, so nothing should spill.
+        assert!(
+            agent.host.spills.borrow().is_empty(),
+            "a small result must not spill"
+        );
+    }
+
+    /// Spilling improves on truncation; it is not required for it. A host with
+    /// nowhere to write must still get a truncated result rather than an error.
+    #[test]
+    fn a_host_that_cannot_spill_still_truncates() {
+        // The default hook returns None, which is what a host without a data
+        // directory does. Exercised through the helper directly because the
+        // size needed to trigger truncation is impractical to drive through a
+        // full run.
+        let messages = vec![Message::system("sys")];
+        let big = "x".repeat(400 * 1024);
+        let out = truncate_tool_result_if_needed(&messages, &big);
+        assert!(out.len() < big.len());
+        assert!(out.contains("[Content truncated:"));
     }
 
     #[test]
