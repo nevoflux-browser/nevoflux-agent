@@ -1411,6 +1411,28 @@ impl HostFunctions for DaemonHostFunctions {
         );
     }
 
+    fn is_unattended(&self) -> bool {
+        self.services
+            .as_ref()
+            .map(|s| s.is_iteration)
+            .unwrap_or(false)
+    }
+
+    fn tool_pre(
+        &self,
+        call: &nevoflux_builtin_wasm::ToolCall,
+        ctx: &nevoflux_builtin_wasm::ToolContext,
+    ) -> nevoflux_builtin_wasm::ToolGate {
+        let pipeline = crate::tool_pipeline::Pipeline::new(vec![Box::new(
+            crate::tool_pipeline::allowlist::AllowlistStage,
+        )]);
+        // Nothing in this pipeline asks yet. The permission gate keeps its own
+        // dialog inside the host functions, where it knows the honest name of
+        // the action and the resolved arguments — see `tool_pipeline`'s module
+        // docs for why hoisting it here would make every dialog less accurate.
+        pipeline.run(call, ctx, &|_prompt: &str| false)
+    }
+
     fn record_turn_boundary(&self, turn: u32, start: bool) {
         let Some(writer) = self.event_writer() else {
             return;

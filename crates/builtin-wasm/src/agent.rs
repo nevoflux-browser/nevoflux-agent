@@ -1481,6 +1481,14 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     is_unattended: self.host.is_unattended(),
                     // The daemon knows the tab; the agent does not resolve URLs.
                     tab_url: None,
+                    // Only an Allow list constrains anything; `None` disables
+                    // every tool, which the tool set already reflects.
+                    allowed_tools: match &input.tools_config {
+                        Some(nevoflux_protocol::subagent::ToolsConfig::Allow(list)) => {
+                            Some(list.clone())
+                        }
+                        _ => None,
+                    },
                 };
 
                 let mut effective_call = tool_call.clone();

@@ -602,6 +602,15 @@ pub struct ToolContext {
     /// URL of the tab the call targets, when the call is tab-scoped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_url: Option<String>,
+    /// The tool allowlist this run was configured with, when it has one.
+    ///
+    /// Carried on the context because the data lives on `AgentInput`, not on
+    /// the host: an unattended run is limited by *not being told* about other
+    /// tools, and until now nothing refused a call for a tool that was never
+    /// offered. Supports the wildcard syntax
+    /// `nevoflux_protocol::subagent::is_tool_allowed` understands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 /// A structured refusal (invariant I4).
@@ -1326,6 +1335,7 @@ mod tests {
             mode: AgentMode::Agent,
             is_unattended: true,
             tab_url: Some("https://example.com/".into()),
+            allowed_tools: Some(vec!["browser_*".into()]),
         };
         let json = serde_json::to_value(&ctx).unwrap();
         assert_eq!(json["origin"], "loop:lp_9");
@@ -1333,5 +1343,6 @@ mod tests {
         let back: ToolContext = serde_json::from_value(json).unwrap();
         assert_eq!(back.origin, ctx.origin);
         assert_eq!(back.tab_url, ctx.tab_url);
+        assert_eq!(back.allowed_tools, ctx.allowed_tools);
     }
 }

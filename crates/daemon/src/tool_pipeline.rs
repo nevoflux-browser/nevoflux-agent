@@ -22,6 +22,8 @@
 //! that last one does not go through `HostFunctions` at all. Invariant I2 is
 //! only partly met until those arrive.
 
+pub mod allowlist;
+
 use nevoflux_builtin_wasm::{ToolCall, ToolContext, ToolDenial, ToolGate};
 
 /// What one stage decides about a call.
@@ -177,6 +179,7 @@ mod tests {
             mode: nevoflux_builtin_wasm::AgentMode::Browser,
             is_unattended: unattended,
             tab_url: Some("https://bank.example/transfer".into()),
+            allowed_tools: None,
         }
     }
 
