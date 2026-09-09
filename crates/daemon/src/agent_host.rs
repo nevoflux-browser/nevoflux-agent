@@ -1780,6 +1780,64 @@ impl HostFunctions for DaemonHostFunctions {
             })
         });
 
+        // Context overflow: shrink and try once more inside the same step
+        // (design spec 5.1).
+        //
+        // The compressor is not available here. It is skipped whenever tool
+        // results are present, and a long agent loop full of tool results is
+        // exactly the shape that overflows. So the retry shortens the oldest
+        // tool results in place instead, which removes no message and keeps
+        // every tool_call paired with its result.
+        let overflowed = match &result {
+            Err(e) => crate::context::overflow::is_context_overflow(&e.to_string()),
+            Ok(_) => false,
+        };
+        let result = if overflowed {
+            let mut retry_request = self.convert_request_to_daemon(request);
+            let before_len: usize = retry_request.messages.iter().map(|m| m.content.len()).sum();
+            let elided = crate::context::overflow::shrink_tool_results(
+                &mut retry_request.messages,
+                self.config.daemon.context.microcompact_keep_recent,
+                self.config.daemon.context.microcompact_content_threshold,
+            );
+            if elided == 0 {
+                // Nothing left to give up. Surfacing the original error beats
+                // resending the same request and failing twice as slowly.
+                warn!("context overflow with nothing left to shrink; surfacing the error");
+                result
+            } else {
+                let after_len: usize = retry_request.messages.iter().map(|m| m.content.len()).sum();
+                if let Some(writer) = self.event_writer() {
+                    writer.append(
+                        nevoflux_protocol::session_event::SessionEventPayload::ContextCompact {
+                            trigger: "overflow".into(),
+                            before_tokens: (before_len / 4) as u64,
+                            after_tokens: (after_len / 4) as u64,
+                        },
+                    );
+                }
+                warn!(
+                    elided,
+                    "context overflow; retrying once with older tool results elided"
+                );
+                let runtime = self.runtime.clone();
+                tokio::task::block_in_place(|| {
+                    runtime.block_on(async {
+                        execute_llm_chat(
+                            provider,
+                            &api_key,
+                            &model,
+                            retry_request,
+                            base_url.as_deref(),
+                        )
+                        .await
+                    })
+                })
+            }
+        } else {
+            result
+        };
+
         match result {
             Ok(response) => {
                 let duration_ms = llm_start.elapsed().as_millis() as u64;
