@@ -211,6 +211,9 @@ pub struct DaemonHostFunctions {
     /// by the agent before its first request so a `system/message` event can
     /// name which section changed.
     prompt_sections: Arc<Mutex<Vec<nevoflux_protocol::session_event::PromptSection>>>,
+    /// Site rules from installed packs, reloaded when the packs directory
+    /// changes rather than re-parsed on every tool call.
+    installed_rules: Arc<crate::tool_pipeline::site_policy::InstalledRules>,
     /// Token-budget accounting for in-flight streams, keyed by stream_id.
     /// Only populated when [`Self::token_budget`] is `Some`.
     stream_budget_data: Arc<Mutex<HashMap<u64, StreamBudgetData>>>,
@@ -293,6 +296,7 @@ impl DaemonHostFunctions {
             stream_trace_data: Arc::new(Mutex::new(HashMap::new())),
             stream_event_data: Arc::new(Mutex::new(HashMap::new())),
             prompt_sections: Arc::new(Mutex::new(Vec::new())),
+            installed_rules: Arc::new(Default::default()),
             stream_budget_data: Arc::new(Mutex::new(HashMap::new())),
             model_override_provider: Arc::new(Mutex::new(None)),
             model_override_model: Arc::new(Mutex::new(None)),
@@ -1207,6 +1211,80 @@ impl DaemonHostFunctions {
         }
     }
 
+    /// Put a yes/no question to the user and wait for the answer.
+    ///
+    /// Shares the request shape `check_tool_permission` uses, but deliberately
+    /// offers no "always allow": a site rule asks about *this* action here, and
+    /// a blanket yes would quietly turn a guard into a no-op.
+    ///
+    /// Returns false when there is nobody to ask or the dialog fails. A guard
+    /// that cannot get an answer must not assume yes (invariant I6).
+    fn ask_user_allow(&self, question: &str) -> bool {
+        let Some(services) = self.services.as_ref() else {
+            return false;
+        };
+        let Some(browser_ctx) = services.browser_context() else {
+            return false;
+        };
+
+        let sender = browser_ctx.sender.clone();
+        let runtime = self.runtime.clone();
+        let session_id = services.session_id.clone();
+        let question = question.to_string();
+        let client_identity = browser_ctx.client_identity.clone();
+        let proxy_id = browser_ctx.proxy_id.clone();
+
+        let answer: Result<String, String> = tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                use tokio::sync::oneshot;
+                let (response_tx, response_rx) = oneshot::channel();
+                let request = crate::wasm::services::BrowserRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    session_id,
+                    tab_id: None,
+                    action: nevoflux_protocol::BrowserToolAction::AskUser,
+                    params: serde_json::json!({
+                        "question": question,
+                        "description": question,
+                        "options": ["Allow", "Deny"],
+                        "allow_custom": false,
+                        "timeout_ms": 86400000
+                    }),
+                    timeout_ms: 86_400_000,
+                    client_identity,
+                    proxy_id,
+                };
+                sender
+                    .send((request, response_tx))
+                    .await
+                    .map_err(|_| "failed to send policy question".to_string())?;
+                let response =
+                    tokio::time::timeout(std::time::Duration::from_secs(86400), response_rx)
+                        .await
+                        .map_err(|_| "policy dialog timed out".to_string())?
+                        .map_err(|_| "policy response channel closed".to_string())?;
+                if response.success {
+                    response
+                        .result
+                        .as_ref()
+                        .and_then(|v| v.get("answer").and_then(|a| a.as_str()).map(String::from))
+                        .ok_or_else(|| "no answer in policy response".to_string())
+                } else {
+                    Err("policy dialog failed".to_string())
+                }
+            })
+        });
+
+        match answer.as_deref() {
+            Ok("Allow") => true,
+            Ok(_) => false,
+            Err(e) => {
+                tracing::warn!(error = %e, "site policy question unanswered; refusing");
+                false
+            }
+        }
+    }
+
     /// Build a session event writer for the current session, if there is one.
     ///
     /// Returns `None` when there are no services (unit tests) or no session id
@@ -1449,14 +1527,19 @@ impl HostFunctions for DaemonHostFunctions {
         call: &nevoflux_builtin_wasm::ToolCall,
         ctx: &nevoflux_builtin_wasm::ToolContext,
     ) -> nevoflux_builtin_wasm::ToolGate {
-        let pipeline = crate::tool_pipeline::Pipeline::new(vec![Box::new(
-            crate::tool_pipeline::allowlist::AllowlistStage,
-        )]);
-        // Nothing in this pipeline asks yet. The permission gate keeps its own
-        // dialog inside the host functions, where it knows the honest name of
-        // the action and the resolved arguments — see `tool_pipeline`'s module
-        // docs for why hoisting it here would make every dialog less accurate.
-        pipeline.run(call, ctx, &|_prompt: &str| false)
+        // Order is spec 4.1: installed pack policy, then the run allowlist.
+        // The permission gate is not here on purpose — it keeps its own dialog
+        // inside the host functions, where it knows the honest name of the
+        // action and the resolved arguments. See `tool_pipeline`'s module docs.
+        let packs_dir = crate::paths::resolve_from_daemon().packs_dir();
+        let rules = self.installed_rules.get(&packs_dir);
+        let pipeline = crate::tool_pipeline::Pipeline::new(vec![
+            Box::new(crate::tool_pipeline::site_policy::SitePolicyStage::new(
+                rules,
+            )),
+            Box::new(crate::tool_pipeline::allowlist::AllowlistStage),
+        ]);
+        pipeline.run(call, ctx, &|prompt: &str| self.ask_user_allow(prompt))
     }
 
     fn record_turn_boundary(&self, turn: u32, start: bool) {
@@ -6923,6 +7006,7 @@ impl DaemonHostFunctions {
             stream_trace_data: self.stream_trace_data.clone(),
             stream_event_data: self.stream_event_data.clone(),
             prompt_sections: self.prompt_sections.clone(),
+            installed_rules: self.installed_rules.clone(),
             // Shared with the parent (like stream_trace_data): stream ids come
             // from the shared registry, so accounting must live in one map.
             stream_budget_data: self.stream_budget_data.clone(),
