@@ -8,7 +8,7 @@ use crate::repositories::traces::TraceRepository;
 use crate::repositories::{
     ArtifactRepository, ConfigRepository, KnowledgeRepository, LearningMetricsRepository,
     LoopProposalRepository, LoopRepository, MessageRepository, PermissionRepository,
-    SessionRepository, SiteAdaptationRepository, ToolStatsRepository,
+    SessionEventRepository, SessionRepository, SiteAdaptationRepository, ToolStatsRepository,
 };
 
 /// Main storage facade providing access to all repositories.
@@ -63,6 +63,14 @@ impl Storage {
     /// Use this to store and retrieve configuration key-value pairs.
     pub fn config(&self) -> ConfigRepository<'_> {
         ConfigRepository::new(&self.db)
+    }
+
+    /// Get a session event repository.
+    ///
+    /// Use this to append to and read the append-only session event log that is
+    /// the session's source of truth (design spec §3).
+    pub fn session_events(&self) -> SessionEventRepository<'_> {
+        SessionEventRepository::new(&self.db)
     }
 
     /// Get a trace repository.

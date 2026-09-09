@@ -96,6 +96,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "028_loop_proposals",
         include_str!("migrations/028_loop_proposals.sql"),
     ),
+    (
+        "029_session_events",
+        include_str!("migrations/029_session_events.sql"),
+    ),
 ];
 
 /// Run all pending migrations on the given connection.
@@ -156,17 +160,30 @@ mod tests {
     fn test_migrations_idempotent() {
         let mut conn = Connection::open_in_memory().unwrap();
 
-        // Run migrations twice
-        run_all(&mut conn).unwrap();
-        run_all(&mut conn).unwrap();
+        let recorded = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
+                .unwrap()
+        };
 
-        // Should still work
-        let count: i32 = conn
-            .query_row("SELECT COUNT(*) FROM _migrations", [], |row| row.get(0))
-            .unwrap();
-        // 27 SQL migrations (001-012, 014, 015, 016, 017, 018, 019, 020, 021, 022, 023, 024, 025, 026, 027, 028) + 1
-        // Rust post-migration marker (016b_composition_assets_data) = 28.
-        assert_eq!(count, 28);
+        run_all(&mut conn).unwrap();
+        let after_first = recorded(&conn);
+        run_all(&mut conn).unwrap();
+        let after_second = recorded(&conn);
+
+        // What idempotency actually means: a second run records nothing new.
+        assert_eq!(
+            after_first, after_second,
+            "re-running migrations must not add rows to _migrations"
+        );
+        // And the first run really did apply everything. Counted against
+        // MIGRATIONS rather than a literal, so adding a migration does not
+        // require editing this test — the previous hard-coded total silently
+        // turned every new migration into a test failure.
+        assert!(
+            after_first as usize >= MIGRATIONS.len(),
+            "expected at least {} recorded migrations, found {after_first}",
+            MIGRATIONS.len()
+        );
     }
 
     #[test]
@@ -581,6 +598,20 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "Index {} should exist", idx);
         }
+    }
+
+    #[test]
+    fn migration_029_creates_session_events_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_all(&mut conn).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='session_events'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "session_events table must exist after migrations");
     }
 
     #[test]
