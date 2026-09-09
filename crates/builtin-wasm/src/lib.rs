@@ -41,7 +41,7 @@ pub use types::{
     AgentInput, AgentMode, AgentOutput, Attachment, BashResult, BashStatus, BrowserToolResult,
     GeneratedImage, GrepMatch, GrepResult, LlmChunk, LlmRequest, LlmResponse, MemoryChunk, Message,
     MessageRole, ReadResult, SkillContext, SkillSummary, SubagentInfo, TabInfo, ToolCall,
-    ToolDefinition, ToolResult, ToolSearchResult,
+    ToolContext, ToolDefinition, ToolDenial, ToolGate, ToolResult, ToolSearchResult,
 };
 
 /// Version of the builtin-wasm module.
