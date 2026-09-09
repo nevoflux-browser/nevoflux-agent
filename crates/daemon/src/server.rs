@@ -8587,6 +8587,8 @@ async fn handle_chat_message(
                 "pack.validate" => crate::pack::rpc::handle_pack_validate(&params).await,
                 "pack.inspect" => crate::pack::rpc::handle_pack_inspect(&params).await,
                 "pack.list" => crate::pack::rpc::handle_pack_list(&params),
+                // Canvas panels ask before they act (design spec 4.5).
+                "canvas.policy_check" => handle_canvas_policy_check(services, &params),
                 "pack.status" => crate::pack::rpc::handle_pack_status(&params),
                 "pack.install" => crate::pack::rpc::handle_pack_install(services, &params).await,
                 "pack.uninstall" => {
@@ -9001,9 +9003,7 @@ async fn handle_chat_message(
                         .unwrap_or("")
                         .to_string();
                     let removed = match crate::remote::start::control_deps() {
-                        Some(deps) => {
-                            crate::remote::start::unpair_device(deps, &channel).await
-                        }
+                        Some(deps) => crate::remote::start::unpair_device(deps, &channel).await,
                         None => false,
                     };
                     serde_json::json!({
@@ -11624,6 +11624,94 @@ async fn handle_skill_list(
 /// a pack install resolves against). The config/data dirs are resolved the same
 /// way the rest of the daemon resolves them, then aggregated by
 /// `crate::paths::build_resolved_paths`.
+/// `canvas.policy_check` — the verdict a Canvas panel asks for before acting.
+///
+/// The panel runs the action itself; this only answers whether it may. Routing
+/// the data path through the daemon would add a round trip to every panel
+/// action and rewrite a working mechanism, and asking first is enough for one
+/// policy to give one answer whoever is asking (invariant I2).
+fn handle_canvas_policy_check(
+    services: &crate::wasm::services::HostServices,
+    params: &serde_json::Value,
+) -> serde_json::Value {
+    use crate::tool_pipeline::canvas_gate::{check, CanvasRequest, CanvasVerdict};
+
+    let request_id = params
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let artifact_id = params
+        .get("artifact_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("");
+
+    // An unnamed panel or action cannot be judged, and guessing would mean
+    // answering a question nobody asked. Refuse rather than allow: this is the
+    // guard path.
+    if artifact_id.is_empty() || action.is_empty() {
+        return serde_json::json!({
+            "type": "system_response",
+            "payload": {
+                "request_id": request_id,
+                "command": "canvas.policy_check",
+                "success": true,
+                "data": {
+                    "allow": false,
+                    "code": "MALFORMED_REQUEST",
+                    "message": "policy_check needs artifact_id and action"
+                }
+            }
+        });
+    }
+
+    let active_packs: Vec<String> = services
+        .active_packs
+        .read()
+        .map(|g| g.iter().cloned().collect())
+        .unwrap_or_default();
+
+    let req = CanvasRequest {
+        artifact_id,
+        action,
+        params: params
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::json!({})),
+        tab_url: params
+            .get("tab_url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        session_id: params
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(services.session_id.as_str()),
+        active_packs,
+    };
+
+    let paths = crate::paths::resolve_from_daemon();
+    let data = match check(&paths.packs_dir(), &req) {
+        CanvasVerdict::Allow => serde_json::json!({ "allow": true }),
+        CanvasVerdict::Deny { code, message } => serde_json::json!({
+            "allow": false,
+            "code": code,
+            "message": message
+        }),
+    };
+
+    serde_json::json!({
+        "type": "system_response",
+        "payload": {
+            "request_id": request_id,
+            "command": "canvas.policy_check",
+            "success": true,
+            "data": data
+        }
+    })
+}
+
 fn handle_daemon_info(params: &serde_json::Value) -> serde_json::Value {
     let request_id = params
         .get("request_id")
