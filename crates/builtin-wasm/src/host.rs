@@ -879,6 +879,32 @@ pub trait HostFunctions {
     /// Default no-op; the daemon appends `step/start` / `step/end`.
     fn record_step_boundary(&self, _turn: u32, _step: u32, _start: bool) {}
 
+    /// Activate a pack for this session, so its `active`-scope components take
+    /// effect (design spec 4.3).
+    ///
+    /// Several packs can be active at once with no primacy between them: they
+    /// answer different goals, and picking a winner would mean discarding one.
+    /// Returns a short confirmation for the model. Default: unsupported.
+    fn pack_activate(&self, _name: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "pack_activate not supported by this host".into(),
+        })
+    }
+
+    /// Drop a pack from this session.
+    fn pack_deactivate(&self, _name: &str) -> HostResult<String> {
+        Err(HostError {
+            code: 5,
+            message: "pack_deactivate not supported by this host".into(),
+        })
+    }
+
+    /// Packs currently active in this session.
+    fn pack_list_active(&self) -> HostResult<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// Write a tool result that did not fit to disk, and say where it went.
     ///
     /// Called only when the result is about to be truncated, so the model can
@@ -1069,6 +1095,8 @@ pub struct MockHostFunctions {
     pub prompt_sections: std::cell::RefCell<Vec<PromptSectionText>>,
     /// Tool results the run spilled, as (tool_id, full byte length).
     pub spills: std::cell::RefCell<Vec<(String, usize)>>,
+    /// Packs this mock considers active.
+    pub active_packs: std::cell::RefCell<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -1096,6 +1124,7 @@ impl MockHostFunctions {
             tool_read_calls: std::cell::Cell::new(0),
             prompt_sections: std::cell::RefCell::new(vec![]),
             spills: std::cell::RefCell::new(vec![]),
+            active_packs: std::cell::RefCell::new(vec![]),
         }
     }
 
@@ -1140,6 +1169,20 @@ impl HostFunctions for MockHostFunctions {
         self.recorded_events
             .borrow_mut()
             .push(format!("result:{tool_name}:{tool_id}:dur={duration_ms}"));
+    }
+
+    fn pack_activate(&self, name: &str) -> HostResult<String> {
+        self.active_packs.borrow_mut().push(name.to_string());
+        Ok(format!("pack `{name}` is active for this session"))
+    }
+
+    fn pack_deactivate(&self, name: &str) -> HostResult<String> {
+        self.active_packs.borrow_mut().retain(|p| p != name);
+        Ok(format!("pack `{name}` is no longer active"))
+    }
+
+    fn pack_list_active(&self) -> HostResult<Vec<String>> {
+        Ok(self.active_packs.borrow().clone())
     }
 
     fn spill_tool_result(&self, tool_id: &str, content: &str) -> Option<String> {

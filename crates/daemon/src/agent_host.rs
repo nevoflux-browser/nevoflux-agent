@@ -1524,6 +1524,78 @@ impl HostFunctions for DaemonHostFunctions {
         );
     }
 
+    fn pack_activate(&self, name: &str) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+
+        // Refuse a pack that is not installed, by name, rather than recording
+        // an activation that does nothing. A silent no-op here would leave the
+        // model believing it had gained abilities it does not have.
+        let paths = crate::paths::resolve_from_daemon();
+        let manifest_path = paths.packs_dir().join(name).join("pack.toml");
+        if !manifest_path.exists() {
+            return Err(HostError {
+                code: 4,
+                message: format!("pack `{name}` is not installed"),
+            });
+        }
+
+        let newly_added = services
+            .active_packs
+            .write()
+            .map(|mut g| g.insert(name.to_string()))
+            .unwrap_or(false);
+
+        if newly_added {
+            if let Some(writer) = self.event_writer() {
+                writer.append(
+                    nevoflux_protocol::session_event::SessionEventPayload::PackActivate {
+                        pack: name.to_string(),
+                    },
+                );
+            }
+        }
+        Ok(format!("pack `{name}` is active for this session"))
+    }
+
+    fn pack_deactivate(&self, name: &str) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+        let removed = services
+            .active_packs
+            .write()
+            .map(|mut g| g.remove(name))
+            .unwrap_or(false);
+        if removed {
+            if let Some(writer) = self.event_writer() {
+                writer.append(
+                    nevoflux_protocol::session_event::SessionEventPayload::PackDeactivate {
+                        pack: name.to_string(),
+                    },
+                );
+            }
+        }
+        Ok(format!("pack `{name}` is no longer active"))
+    }
+
+    fn pack_list_active(&self) -> HostResult<Vec<String>> {
+        let Some(services) = self.services.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut names: Vec<String> = services
+            .active_packs
+            .read()
+            .map(|g| g.iter().cloned().collect())
+            .unwrap_or_default();
+        // Stable order for the model and for tests; the set itself has none.
+        names.sort();
+        Ok(names)
+    }
+
     fn spill_tool_result(&self, tool_id: &str, content: &str) -> Option<String> {
         let services = self.services.as_ref()?;
         let session_id = self
@@ -1597,7 +1669,20 @@ impl HostFunctions for DaemonHostFunctions {
         // inside the host functions, where it knows the honest name of the
         // action and the resolved arguments. See `tool_pipeline`'s module docs.
         let packs_dir = crate::paths::resolve_from_daemon().packs_dir();
-        let rules = self.installed_rules.get(&packs_dir);
+        let mut rules = self.installed_rules.get(&packs_dir);
+        // Plus the `active`-scope rules of packs this session has activated.
+        // Read fresh rather than cached: activation changes within a session,
+        // which is the case the mtime cache cannot see.
+        if let Some(services) = self.services.as_ref() {
+            let active: Vec<String> = services
+                .active_packs
+                .read()
+                .map(|g| g.iter().cloned().collect())
+                .unwrap_or_default();
+            rules.extend(crate::tool_pipeline::site_policy::load_active_rules(
+                &packs_dir, &active,
+            ));
+        }
         let pipeline = crate::tool_pipeline::Pipeline::new(vec![
             Box::new(crate::tool_pipeline::site_policy::SitePolicyStage::new(
                 rules,

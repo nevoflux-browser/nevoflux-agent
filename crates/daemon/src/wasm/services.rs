@@ -198,6 +198,13 @@ pub struct HostServices {
     pub session_id: String,
     /// Tools that user has approved "Always Allow" (shared across requests in the same daemon).
     pub always_allowed_tools: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    /// Packs the session has activated (design spec 4.3).
+    ///
+    /// Session-scoped and unordered: several packs can be active at once with
+    /// no primacy between them, because they answer different goals. Their
+    /// `active`-scope components take effect while they are in here; their
+    /// `installed`-scope components apply whether or not they are.
+    pub active_packs: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     /// True when this HostServices is the per-iteration clone owned by an
     /// `IterationExecutor`. The /loop skill's permission handler short-circuits
     /// dialogs in this mode: the loop's `allowed_tool_classes` is already the
@@ -375,6 +382,7 @@ impl HostServices {
             always_allowed_tools: Arc::new(
                 std::sync::RwLock::new(std::collections::HashSet::new()),
             ),
+            active_packs: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             is_iteration: false,
             iteration_loop_id: None,
             session_proxy_tracker: None,
@@ -425,6 +433,7 @@ impl HostServices {
             always_allowed_tools: Arc::new(
                 std::sync::RwLock::new(std::collections::HashSet::new()),
             ),
+            active_packs: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             is_iteration: false,
             iteration_loop_id: None,
             session_proxy_tracker: None,

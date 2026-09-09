@@ -2237,6 +2237,33 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 let entries = self.host.memory_view(limit)?;
                 serde_json::to_string_pretty(&entries).unwrap_or_default()
             }
+            "pack_activate" => {
+                let name = tool_call.arguments["name"].as_str().unwrap_or("");
+                if name.is_empty() {
+                    "pack_activate needs a `name`".to_string()
+                } else {
+                    match self.host.pack_activate(name) {
+                        Ok(msg) => msg,
+                        Err(e) => format!("Could not activate `{name}`: {}", e.message),
+                    }
+                }
+            }
+            "pack_deactivate" => {
+                let name = tool_call.arguments["name"].as_str().unwrap_or("");
+                if name.is_empty() {
+                    "pack_deactivate needs a `name`".to_string()
+                } else {
+                    match self.host.pack_deactivate(name) {
+                        Ok(msg) => msg,
+                        Err(e) => format!("Could not deactivate `{name}`: {}", e.message),
+                    }
+                }
+            }
+            "pack_list_active" => match self.host.pack_list_active() {
+                Ok(names) if names.is_empty() => "No packs are active.".to_string(),
+                Ok(names) => format!("Active packs: {}", names.join(", ")),
+                Err(e) => format!("Could not list active packs: {}", e.message),
+            },
             "skill_load" => {
                 let name = tool_call.arguments["name"].as_str().unwrap_or("");
                 // Prevent redundant re-loading of already loaded skills.
@@ -3630,6 +3657,42 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                             "description": "Maximum entries to return (default 20)"
                         }
                     }
+                }),
+            },
+            ToolDefinition {
+                name: "pack_activate".into(),
+                description: "Activate an installed pack for this session so its skills and rules apply. Activate one as soon as the user's goal matches what it is for -- a pack is scoped to a goal, and several can be active at once.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "The installed pack name"
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            },
+            ToolDefinition {
+                name: "pack_deactivate".into(),
+                description: "Drop a pack from this session once its goal is done.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "The pack name to deactivate"
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            },
+            ToolDefinition {
+                name: "pack_list_active".into(),
+                description: "List the packs currently active in this session.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
                 }),
             },
             ToolDefinition {
@@ -6835,6 +6898,72 @@ mod tests {
         let out = truncate_tool_result_if_needed(&messages, &big);
         assert!(out.len() < big.len());
         assert!(out.contains("[Content truncated:"));
+    }
+
+    fn a_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "t1".into(),
+            call_id: None,
+            name: name.into(),
+            arguments: args,
+            signature: None,
+        }
+    }
+
+    /// A pack is scoped to a goal, so the model activates one when the goal
+    /// matches. Several can be active at once with no primacy between them.
+    #[test]
+    fn several_packs_can_be_active_at_once() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![
+                a_tool_call("pack_activate", serde_json::json!({ "name": "jobhunt" })),
+                a_tool_call("pack_activate", serde_json::json!({ "name": "okf-export" })),
+            ],
+            reasoning: None,
+        });
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("help me")).unwrap();
+
+        assert_eq!(
+            *agent.host.active_packs.borrow(),
+            vec!["jobhunt".to_string(), "okf-export".to_string()]
+        );
+    }
+
+    #[test]
+    fn deactivating_leaves_the_other_packs_alone() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![
+                a_tool_call("pack_activate", serde_json::json!({ "name": "a" })),
+                a_tool_call("pack_activate", serde_json::json!({ "name": "b" })),
+                a_tool_call("pack_deactivate", serde_json::json!({ "name": "a" })),
+            ],
+            reasoning: None,
+        });
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert_eq!(*agent.host.active_packs.borrow(), vec!["b".to_string()]);
+    }
+
+    /// A call with no name must say so rather than activating something empty.
+    #[test]
+    fn activating_without_a_name_is_reported_not_silently_ignored() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![a_tool_call("pack_activate", serde_json::json!({}))],
+            reasoning: None,
+        });
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert!(
+            agent.host.active_packs.borrow().is_empty(),
+            "an empty name must not activate anything"
+        );
     }
 
     #[test]
