@@ -879,6 +879,16 @@ pub trait HostFunctions {
     /// Default no-op; the daemon appends `step/start` / `step/end`.
     fn record_step_boundary(&self, _turn: u32, _step: u32, _start: bool) {}
 
+    /// Write a tool result that did not fit to disk, and say where it went.
+    ///
+    /// Called only when the result is about to be truncated, so the model can
+    /// be told where to read the rest instead of losing it. Returns `None` when
+    /// the host has nowhere to write, in which case the truncation stands --
+    /// spilling is an improvement on truncation, not a precondition for it.
+    fn spill_tool_result(&self, _tool_id: &str, _content: &str) -> Option<String> {
+        None
+    }
+
     /// Report the section list the system prompt was assembled from.
     ///
     /// Called once per turn, before the first request. Default no-op; the daemon
@@ -1057,6 +1067,8 @@ pub struct MockHostFunctions {
     pub tool_read_calls: std::cell::Cell<usize>,
     /// The prompt sections the last run assembled.
     pub prompt_sections: std::cell::RefCell<Vec<PromptSectionText>>,
+    /// Tool results the run spilled, as (tool_id, full byte length).
+    pub spills: std::cell::RefCell<Vec<(String, usize)>>,
 }
 
 #[cfg(test)]
@@ -1083,6 +1095,7 @@ impl MockHostFunctions {
             tool_read_delay_ms: std::cell::Cell::new(0),
             tool_read_calls: std::cell::Cell::new(0),
             prompt_sections: std::cell::RefCell::new(vec![]),
+            spills: std::cell::RefCell::new(vec![]),
         }
     }
 
@@ -1127,6 +1140,13 @@ impl HostFunctions for MockHostFunctions {
         self.recorded_events
             .borrow_mut()
             .push(format!("result:{tool_name}:{tool_id}:dur={duration_ms}"));
+    }
+
+    fn spill_tool_result(&self, tool_id: &str, content: &str) -> Option<String> {
+        self.spills
+            .borrow_mut()
+            .push((tool_id.to_string(), content.len()));
+        Some(format!("/spill/{tool_id}.txt"))
     }
 
     fn record_prompt_sections(&self, sections: &[PromptSectionText]) {
