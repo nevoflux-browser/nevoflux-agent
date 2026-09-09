@@ -11,7 +11,6 @@
 //! Each *call* still gets a fresh `Store` (see [`crate::pack_hooks`]), so
 //! caching the compiled module does not let one call leave state for the next.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
