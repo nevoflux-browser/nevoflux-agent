@@ -1342,7 +1342,14 @@ impl HostFunctions for DaemonHostFunctions {
     /// continuation anchor can name what already happened (spec §4.1). Best
     /// effort: skips when no services/session, empty content, or the meta
     /// `think` tool (reasoning, not an observation).
-    fn record_tool_result(&self, tool_name: &str, tool_id: &str, content: &str, success: bool) {
+    fn record_tool_result(
+        &self,
+        tool_name: &str,
+        tool_id: &str,
+        content: &str,
+        success: bool,
+        duration_ms: u64,
+    ) {
         if content.trim().is_empty() || tool_name == "think" {
             return;
         }
@@ -1381,15 +1388,19 @@ impl HostFunctions for DaemonHostFunctions {
                     id: tool_id.to_string(),
                     content: content.to_string(),
                     is_error: !success,
-                    // Timing is measured in the tool pipeline P1 introduces;
-                    // 0 here means "not measured", not "instant".
-                    duration_ms: 0,
+                    duration_ms,
                 },
             );
         }
     }
 
-    fn record_tool_call(&self, tool_name: &str, tool_id: &str, args_json: &str) {
+    fn record_tool_call(
+        &self,
+        tool_name: &str,
+        tool_id: &str,
+        args_json: &str,
+        ctx: &nevoflux_builtin_wasm::ToolContext,
+    ) {
         let Some(writer) = self.event_writer() else {
             return;
         };
@@ -1398,12 +1409,34 @@ impl HostFunctions for DaemonHostFunctions {
                 id: tool_id.to_string(),
                 name: tool_name.to_string(),
                 args: serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null),
-                // P1 threads the real origin through `ToolContext`; every P0
-                // call site is the model's own loop.
-                origin: nevoflux_protocol::session_event::ToolOrigin::model(),
-                tab_url: None,
+                // The origin the gate judged, so the log and the policy agree
+                // on who asked.
+                origin: nevoflux_protocol::session_event::ToolOrigin::from_raw(ctx.origin.clone()),
+                tab_url: ctx.tab_url.clone(),
             },
         );
+    }
+
+    fn is_unattended(&self) -> bool {
+        self.services
+            .as_ref()
+            .map(|s| s.is_iteration)
+            .unwrap_or(false)
+    }
+
+    fn tool_pre(
+        &self,
+        call: &nevoflux_builtin_wasm::ToolCall,
+        ctx: &nevoflux_builtin_wasm::ToolContext,
+    ) -> nevoflux_builtin_wasm::ToolGate {
+        let pipeline = crate::tool_pipeline::Pipeline::new(vec![Box::new(
+            crate::tool_pipeline::allowlist::AllowlistStage,
+        )]);
+        // Nothing in this pipeline asks yet. The permission gate keeps its own
+        // dialog inside the host functions, where it knows the honest name of
+        // the action and the resolved arguments — see `tool_pipeline`'s module
+        // docs for why hoisting it here would make every dialog less accurate.
+        pipeline.run(call, ctx, &|_prompt: &str| false)
     }
 
     fn record_turn_boundary(&self, turn: u32, start: bool) {

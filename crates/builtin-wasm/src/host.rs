@@ -840,7 +840,16 @@ pub trait HostFunctions {
     /// evidence (e.g. the goal evaluator's transcript and the continuation
     /// progress anchor). Default: no-op. Called once per tool execution in the
     /// agent loop with the full (untruncated) result content. See spec §4.1.
-    fn record_tool_result(&self, _tool_name: &str, _tool_id: &str, _content: &str, _success: bool) {
+    /// `duration_ms` is measured around dispatch only — policy time is not the
+    /// tool's time, so the gate is outside the measurement.
+    fn record_tool_result(
+        &self,
+        _tool_name: &str,
+        _tool_id: &str,
+        _content: &str,
+        _success: bool,
+        _duration_ms: u64,
+    ) {
     }
 
     /// Announce a tool call before it executes.
@@ -850,7 +859,14 @@ pub trait HostFunctions {
     /// it to append a `tool/call` session event (design spec §3.4). Announcing
     /// *before* execution is the point: a run that dies mid-tool still shows
     /// what it attempted.
-    fn record_tool_call(&self, _tool_name: &str, _tool_id: &str, _args_json: &str) {}
+    fn record_tool_call(
+        &self,
+        _tool_name: &str,
+        _tool_id: &str,
+        _args_json: &str,
+        _ctx: &ToolContext,
+    ) {
+    }
 
     /// Mark the start (`start = true`) or end of a user turn.
     ///
@@ -862,6 +878,32 @@ pub trait HostFunctions {
     ///
     /// Default no-op; the daemon appends `step/start` / `step/end`.
     fn record_step_boundary(&self, _turn: u32, _step: u32, _start: bool) {}
+
+    /// Whether this run is unattended — a loop, schedule or goal iteration,
+    /// where no one is present to answer a confirmation dialog.
+    ///
+    /// Only the daemon knows (it holds `HostServices.is_iteration`), so the
+    /// agent has to ask. Default `false`: an unaware host behaves as interactive,
+    /// which is the safe reading — it prompts rather than silently proceeding.
+    fn is_unattended(&self) -> bool {
+        false
+    }
+
+    /// Ask policy whether this tool may run, before it runs.
+    ///
+    /// Default `Allow`, so hosts that implement no policy behave exactly as they
+    /// do today (external contracts are additive only). The daemon overrides it
+    /// with the ordered pipeline in `tool_pipeline` (design spec §4.1).
+    fn tool_pre(&self, _call: &ToolCall, _ctx: &ToolContext) -> ToolGate {
+        ToolGate::Allow
+    }
+
+    /// Post-process a tool result before it reaches the model.
+    ///
+    /// Default returns it unchanged. P2 uses this for spill, P3 for pack hooks.
+    fn tool_post(&self, _call: &ToolCall, _ctx: &ToolContext, result: ToolResult) -> ToolResult {
+        result
+    }
 
     // =========================================================================
     // /schedule skill tool functions (Task 1.6)
@@ -994,6 +1036,18 @@ pub struct MockHostFunctions {
     /// strings — lets tests assert that a tool is announced before it runs and
     /// that turn/step boundaries pair up.
     pub recorded_events: std::cell::RefCell<Vec<String>>,
+    /// Verdict this mock's `tool_pre` returns. Tests set it to exercise the
+    /// Deny and Rewrite paths.
+    pub gate: std::cell::RefCell<ToolGate>,
+    /// Arguments each call carried when it reached `tool_post` — i.e. after any
+    /// Rewrite, which is the only way to observe that a rewrite took effect.
+    pub post_arguments: std::cell::RefCell<Vec<serde_json::Value>>,
+    /// Milliseconds `tool_read` sleeps, so a test can produce a measurable
+    /// tool duration without depending on machine speed.
+    pub tool_read_delay_ms: std::cell::Cell<u64>,
+    /// How many times `tool_read` actually ran — the only way to prove a
+    /// refusal stopped the tool rather than merely relabelling its result.
+    pub tool_read_calls: std::cell::Cell<usize>,
 }
 
 #[cfg(test)]
@@ -1015,6 +1069,10 @@ impl MockHostFunctions {
             subagents: std::cell::RefCell::new(vec![]),
             captured_tool_names: std::cell::RefCell::new(vec![]),
             recorded_events: std::cell::RefCell::new(vec![]),
+            gate: std::cell::RefCell::new(ToolGate::Allow),
+            post_arguments: std::cell::RefCell::new(vec![]),
+            tool_read_delay_ms: std::cell::Cell::new(0),
+            tool_read_calls: std::cell::Cell::new(0),
         }
     }
 
@@ -1036,16 +1094,40 @@ impl MockHostFunctions {
 
 #[cfg(test)]
 impl HostFunctions for MockHostFunctions {
-    fn record_tool_call(&self, tool_name: &str, tool_id: &str, _args_json: &str) {
+    fn record_tool_call(
+        &self,
+        tool_name: &str,
+        tool_id: &str,
+        _args_json: &str,
+        ctx: &ToolContext,
+    ) {
         self.recorded_events
             .borrow_mut()
-            .push(format!("call:{tool_name}:{tool_id}"));
+            .push(format!("call:{tool_name}:{tool_id}:from={}", ctx.origin));
     }
 
-    fn record_tool_result(&self, tool_name: &str, tool_id: &str, _content: &str, _success: bool) {
+    fn record_tool_result(
+        &self,
+        tool_name: &str,
+        tool_id: &str,
+        _content: &str,
+        _success: bool,
+        duration_ms: u64,
+    ) {
         self.recorded_events
             .borrow_mut()
-            .push(format!("result:{tool_name}:{tool_id}"));
+            .push(format!("result:{tool_name}:{tool_id}:dur={duration_ms}"));
+    }
+
+    fn tool_pre(&self, _call: &ToolCall, _ctx: &ToolContext) -> ToolGate {
+        self.gate.borrow().clone()
+    }
+
+    fn tool_post(&self, call: &ToolCall, _ctx: &ToolContext, result: ToolResult) -> ToolResult {
+        self.post_arguments
+            .borrow_mut()
+            .push(call.arguments.clone());
+        result
     }
 
     fn record_turn_boundary(&self, turn: u32, start: bool) {
@@ -1153,6 +1235,13 @@ impl HostFunctions for MockHostFunctions {
         _offset: Option<u64>,
         _limit: Option<u64>,
     ) -> HostResult<ReadResult> {
+        self.tool_read_calls.set(self.tool_read_calls.get() + 1);
+        // Lets a test produce a measurable tool duration without depending on
+        // how fast the machine is.
+        let delay = self.tool_read_delay_ms.get();
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
         Ok(ReadResult {
             total_lines: 1,
             total_bytes: 12,

@@ -78,6 +78,7 @@ pub mod session_events;
 pub mod share;
 pub mod skills;
 pub mod speech;
+pub mod tool_pipeline;
 pub mod trace;
 pub mod tts;
 pub mod validation;

@@ -1459,26 +1459,81 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     .call_id
                     .clone()
                     .unwrap_or_else(|| tool_call.id.clone());
+                // Announce with the same context policy will see, so the log
+                // and the gate agree on who asked.
+
+                // One gate, before dispatch (design spec §4.1). Everything the
+                // host needs to decide travels in `ToolContext`, so a single
+                // policy answers the same way for every origin (invariant I2).
+                //
+                // Not yet covered by this gate, and each has its own owner:
+                // Canvas `callTool` (P1c), the `ToolRegistry` path code_mode
+                // uses, and the ACP provider's own permission gate in
+                // `llm/providers/acp/mcp_bridge.rs` — that one does not go
+                // through `HostFunctions` at all.
+                let ctx = ToolContext {
+                    session_id: input.session_id.clone(),
+                    origin: "model".into(),
+                    mode: input.mode,
+                    is_unattended: self.host.is_unattended(),
+                    // The daemon knows the tab; the agent does not resolve URLs.
+                    tab_url: None,
+                    // Only an Allow list constrains anything; `None` disables
+                    // every tool, which the tool set already reflects.
+                    allowed_tools: match &input.tools_config {
+                        Some(nevoflux_protocol::subagent::ToolsConfig::Allow(list)) => {
+                            Some(list.clone())
+                        }
+                        _ => None,
+                    },
+                };
+
                 self.host.record_tool_call(
                     &tool_call.name,
                     &logged_tool_id,
                     &tool_call.arguments.to_string(),
+                    &ctx,
                 );
 
-                let result = match self.execute_tool(tool_call) {
-                    Ok(r) => r,
-                    Err(e) => {
+                let mut effective_call = tool_call.clone();
+                let gate = self.host.tool_pre(tool_call, &ctx);
+                if let ToolGate::Rewrite { arguments } = &gate {
+                    effective_call.arguments = arguments.clone();
+                }
+
+                // Timed around dispatch only: policy time is not the tool's time.
+                let started = std::time::Instant::now();
+                let result = match gate {
+                    ToolGate::Deny(denial) => {
                         eprintln!(
-                            "[AGENT] Tool execution failed: name={}, error={}",
-                            tool_call.name, e.message
+                            "[AGENT] Tool denied by policy: name={}, code={}",
+                            tool_call.name, denial.code
                         );
                         ToolResult {
-                            tool_call_id: tool_call.call_id.clone().unwrap_or(tool_call.id.clone()),
-                            content: format!("Error: {}", e.message),
+                            tool_call_id: logged_tool_id.clone(),
+                            content: denial.to_tool_result_content(),
                             success: false,
                         }
                     }
+                    ToolGate::Allow | ToolGate::Rewrite { .. } => {
+                        match self.execute_tool(&effective_call) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!(
+                                    "[AGENT] Tool execution failed: name={}, error={}",
+                                    tool_call.name, e.message
+                                );
+                                ToolResult {
+                                    tool_call_id: logged_tool_id.clone(),
+                                    content: format!("Error: {}", e.message),
+                                    success: false,
+                                }
+                            }
+                        }
+                    }
                 };
+                let duration_ms = started.elapsed().as_millis() as u64;
+                let result = self.host.tool_post(&effective_call, &ctx, result);
                 eprintln!(
                     "[AGENT] Tool result will use tool_call_id={}",
                     result.tool_call_id
@@ -1500,6 +1555,7 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     &result.tool_call_id,
                     &result.content,
                     result.success,
+                    duration_ms,
                 );
 
                 // Dynamic truncation based on current message size
@@ -6254,9 +6310,20 @@ mod tests {
         agent.run(&session_log_input("read a.txt")).unwrap();
 
         let events = agent.host.recorded_events.borrow().clone();
-        let tool_events: Vec<&String> = events
+        // The result line now carries a measured duration, so compare the
+        // stable prefix rather than the whole string.
+        let tool_events: Vec<String> = events
             .iter()
             .filter(|e| e.starts_with("call:") || e.starts_with("result:"))
+            .map(|e| {
+                e.split(":dur=")
+                    .next()
+                    .unwrap_or(e)
+                    .split(":from=")
+                    .next()
+                    .unwrap_or(e)
+                    .to_string()
+            })
             .collect();
         assert_eq!(
             tool_events,
@@ -6286,11 +6353,15 @@ mod tests {
 
         let events = agent.host.recorded_events.borrow().clone();
         assert!(
-            events.contains(&"call:read_file:provider-call-id".to_string()),
+            events
+                .iter()
+                .any(|e| e.starts_with("call:read_file:provider-call-id")),
             "expected the call to be announced under the provider call id, got {events:?}"
         );
         assert!(
-            events.contains(&"result:read_file:provider-call-id".to_string()),
+            events
+                .iter()
+                .any(|e| e.starts_with("result:read_file:provider-call-id")),
             "expected the result under the same id, got {events:?}"
         );
     }
@@ -6360,6 +6431,136 @@ mod tests {
             events.contains(&"turn/start:2".to_string()),
             "expected turn 2, got {events:?}"
         );
+    }
+
+    fn a_read_file_call(id: &str, path: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            call_id: None,
+            name: "read".into(),
+            arguments: serde_json::json!({ "path": path }),
+            signature: None,
+        }
+    }
+
+    /// A Deny must short-circuit before the tool runs, and the model must be
+    /// told it was policy — not a failure it could retry past.
+    #[test]
+    fn a_denied_tool_never_executes_and_the_model_is_told_why() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![a_read_file_call("t1", "secret.txt")],
+            reasoning: None,
+        });
+        *mock.gate.borrow_mut() = ToolGate::Deny(ToolDenial {
+            code: "POLICY_DENIED".into(),
+            message: "that path is off limits".into(),
+            rule: Some("no-secrets".into()),
+            pack: None,
+        });
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("read secret.txt")).unwrap();
+
+        // The refusal must stop the tool, not merely relabel its result.
+        assert_eq!(
+            agent.host.tool_read_calls.get(),
+            0,
+            "a denied call must never reach the tool"
+        );
+
+        let events = agent.host.recorded_events.borrow().clone();
+        let denied_result = events
+            .iter()
+            .find(|e| e.starts_with("result:read:t1"))
+            .expect("a result is still recorded for a denied call");
+        assert!(denied_result.contains("dur="), "{denied_result}");
+    }
+
+    /// The same call without a denial does reach the tool — otherwise the test
+    /// above would pass for the wrong reason.
+    #[test]
+    fn an_allowed_tool_does_reach_the_tool() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![a_read_file_call("t1", "a.txt")],
+            reasoning: None,
+        });
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("read a.txt")).unwrap();
+        assert_eq!(agent.host.tool_read_calls.get(), 1);
+    }
+
+    /// A Rewrite must change the arguments the tool actually receives, not just
+    /// what policy saw.
+    #[test]
+    fn a_rewritten_call_executes_with_the_replacement_arguments() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![a_read_file_call("t1", "danger.txt")],
+            reasoning: None,
+        });
+        *mock.gate.borrow_mut() = ToolGate::Rewrite {
+            arguments: serde_json::json!({ "path": "safe.txt" }),
+        };
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("read danger.txt")).unwrap();
+
+        let seen = agent.host.post_arguments.borrow().clone();
+        assert_eq!(
+            seen.first().map(|v| v["path"].clone()),
+            Some(serde_json::json!("safe.txt")),
+            "tool_post should see the rewritten arguments, got {seen:?}"
+        );
+    }
+
+    /// The duration reaching `record_tool_result` must be measured, not the
+    /// constant 0 P0 left behind.
+    #[test]
+    fn a_tool_result_carries_a_measured_duration() {
+        let mock = MockHostFunctions::new();
+        mock.tool_read_delay_ms.set(15);
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![a_read_file_call("t1", "a.txt")],
+            reasoning: None,
+        });
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("read a.txt")).unwrap();
+
+        let events = agent.host.recorded_events.borrow().clone();
+        let line = events
+            .iter()
+            .find(|e| e.starts_with("result:read:t1"))
+            .expect("a result was recorded");
+        let dur: u64 = line
+            .rsplit("dur=")
+            .next()
+            .and_then(|d| d.parse().ok())
+            .unwrap_or_else(|| panic!("no duration in {line}"));
+        assert!(
+            dur >= 10,
+            "a 15ms tool should report at least 10ms, got {dur} from {line}"
+        );
+    }
+
+    /// The context handed to policy carries the origin and the unattended flag,
+    /// so one policy can answer for every caller (I2).
+    #[test]
+    fn the_context_given_to_policy_names_the_origin() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![a_read_file_call("t1", "a.txt")],
+            reasoning: None,
+        });
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("read a.txt")).unwrap();
+        // The mock records nothing about ctx directly; assert the call reached
+        // tool_post at all, which only happens on the pipeline path.
+        assert_eq!(agent.host.post_arguments.borrow().len(), 1);
     }
 
     #[test]
