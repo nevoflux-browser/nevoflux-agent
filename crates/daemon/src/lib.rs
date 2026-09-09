@@ -60,6 +60,7 @@ pub mod models;
 pub mod notify;
 pub mod openclaw_setup;
 pub mod pack;
+pub mod pack_hooks;
 pub mod paths;
 pub mod permission;
 pub mod profile;

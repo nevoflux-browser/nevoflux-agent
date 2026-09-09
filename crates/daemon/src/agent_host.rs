@@ -214,6 +214,9 @@ pub struct DaemonHostFunctions {
     /// Site rules from installed packs, reloaded when the packs directory
     /// changes rather than re-parsed on every tool call.
     installed_rules: Arc<crate::tool_pipeline::site_policy::InstalledRules>,
+    /// Compiled pack hook modules, rebuilt on the same signal. Compiling per
+    /// tool call would be felt; each call still gets its own Store.
+    hook_registry: Arc<crate::tool_pipeline::pack_hook_stage::HookRegistry>,
     /// Token-budget accounting for in-flight streams, keyed by stream_id.
     /// Only populated when [`Self::token_budget`] is `Some`.
     stream_budget_data: Arc<Mutex<HashMap<u64, StreamBudgetData>>>,
@@ -297,6 +300,7 @@ impl DaemonHostFunctions {
             stream_event_data: Arc::new(Mutex::new(HashMap::new())),
             prompt_sections: Arc::new(Mutex::new(Vec::new())),
             installed_rules: Arc::new(Default::default()),
+            hook_registry: Arc::new(Default::default()),
             stream_budget_data: Arc::new(Mutex::new(HashMap::new())),
             model_override_provider: Arc::new(Mutex::new(None)),
             model_override_model: Arc::new(Mutex::new(None)),
@@ -1822,9 +1826,28 @@ impl HostFunctions for DaemonHostFunctions {
                 &packs_dir, &active,
             ));
         }
+        // Pack hooks run after the declarative rules: a rule is cheap and a
+        // module is not, so a call a rule already refuses never pays for one.
+        let active_for_hooks: Vec<String> = self
+            .services
+            .as_ref()
+            .and_then(|s| {
+                s.active_packs
+                    .read()
+                    .ok()
+                    .map(|g| g.iter().cloned().collect())
+            })
+            .unwrap_or_default();
+        let hooks = self
+            .hook_registry
+            .for_session(&packs_dir, &active_for_hooks);
+
         let pipeline = crate::tool_pipeline::Pipeline::new(vec![
             Box::new(crate::tool_pipeline::site_policy::SitePolicyStage::new(
                 rules,
+            )),
+            Box::new(crate::tool_pipeline::pack_hook_stage::PackHookStage::new(
+                hooks,
             )),
             Box::new(crate::tool_pipeline::allowlist::AllowlistStage),
         ]);
@@ -7354,6 +7377,7 @@ impl DaemonHostFunctions {
             stream_event_data: self.stream_event_data.clone(),
             prompt_sections: self.prompt_sections.clone(),
             installed_rules: self.installed_rules.clone(),
+            hook_registry: self.hook_registry.clone(),
             // Shared with the parent (like stream_trace_data): stream ids come
             // from the shared registry, so accounting must live in one map.
             stream_budget_data: self.stream_budget_data.clone(),
