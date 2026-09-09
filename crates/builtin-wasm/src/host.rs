@@ -859,7 +859,14 @@ pub trait HostFunctions {
     /// it to append a `tool/call` session event (design spec §3.4). Announcing
     /// *before* execution is the point: a run that dies mid-tool still shows
     /// what it attempted.
-    fn record_tool_call(&self, _tool_name: &str, _tool_id: &str, _args_json: &str) {}
+    fn record_tool_call(
+        &self,
+        _tool_name: &str,
+        _tool_id: &str,
+        _args_json: &str,
+        _ctx: &ToolContext,
+    ) {
+    }
 
     /// Mark the start (`start = true`) or end of a user turn.
     ///
@@ -1038,6 +1045,9 @@ pub struct MockHostFunctions {
     /// Milliseconds `tool_read` sleeps, so a test can produce a measurable
     /// tool duration without depending on machine speed.
     pub tool_read_delay_ms: std::cell::Cell<u64>,
+    /// How many times `tool_read` actually ran — the only way to prove a
+    /// refusal stopped the tool rather than merely relabelling its result.
+    pub tool_read_calls: std::cell::Cell<usize>,
 }
 
 #[cfg(test)]
@@ -1062,6 +1072,7 @@ impl MockHostFunctions {
             gate: std::cell::RefCell::new(ToolGate::Allow),
             post_arguments: std::cell::RefCell::new(vec![]),
             tool_read_delay_ms: std::cell::Cell::new(0),
+            tool_read_calls: std::cell::Cell::new(0),
         }
     }
 
@@ -1083,10 +1094,16 @@ impl MockHostFunctions {
 
 #[cfg(test)]
 impl HostFunctions for MockHostFunctions {
-    fn record_tool_call(&self, tool_name: &str, tool_id: &str, _args_json: &str) {
+    fn record_tool_call(
+        &self,
+        tool_name: &str,
+        tool_id: &str,
+        _args_json: &str,
+        ctx: &ToolContext,
+    ) {
         self.recorded_events
             .borrow_mut()
-            .push(format!("call:{tool_name}:{tool_id}"));
+            .push(format!("call:{tool_name}:{tool_id}:from={}", ctx.origin));
     }
 
     fn record_tool_result(
@@ -1218,6 +1235,7 @@ impl HostFunctions for MockHostFunctions {
         _offset: Option<u64>,
         _limit: Option<u64>,
     ) -> HostResult<ReadResult> {
+        self.tool_read_calls.set(self.tool_read_calls.get() + 1);
         // Lets a test produce a measurable tool duration without depending on
         // how fast the machine is.
         let delay = self.tool_read_delay_ms.get();

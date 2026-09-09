@@ -1459,11 +1459,8 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     .call_id
                     .clone()
                     .unwrap_or_else(|| tool_call.id.clone());
-                self.host.record_tool_call(
-                    &tool_call.name,
-                    &logged_tool_id,
-                    &tool_call.arguments.to_string(),
-                );
+                // Announce with the same context policy will see, so the log
+                // and the gate agree on who asked.
 
                 // One gate, before dispatch (design spec §4.1). Everything the
                 // host needs to decide travels in `ToolContext`, so a single
@@ -1490,6 +1487,13 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                         _ => None,
                     },
                 };
+
+                self.host.record_tool_call(
+                    &tool_call.name,
+                    &logged_tool_id,
+                    &tool_call.arguments.to_string(),
+                    &ctx,
+                );
 
                 let mut effective_call = tool_call.clone();
                 let gate = self.host.tool_pre(tool_call, &ctx);
@@ -6311,7 +6315,15 @@ mod tests {
         let tool_events: Vec<String> = events
             .iter()
             .filter(|e| e.starts_with("call:") || e.starts_with("result:"))
-            .map(|e| e.split(":dur=").next().unwrap_or(e).to_string())
+            .map(|e| {
+                e.split(":dur=")
+                    .next()
+                    .unwrap_or(e)
+                    .split(":from=")
+                    .next()
+                    .unwrap_or(e)
+                    .to_string()
+            })
             .collect();
         assert_eq!(
             tool_events,
@@ -6341,7 +6353,9 @@ mod tests {
 
         let events = agent.host.recorded_events.borrow().clone();
         assert!(
-            events.contains(&"call:read_file:provider-call-id".to_string()),
+            events
+                .iter()
+                .any(|e| e.starts_with("call:read_file:provider-call-id")),
             "expected the call to be announced under the provider call id, got {events:?}"
         );
         assert!(
@@ -6448,14 +6462,34 @@ mod tests {
         let agent = session_log_agent(mock);
         agent.run(&session_log_input("read secret.txt")).unwrap();
 
-        // tool_post still sees the call (the pipeline observed it), but the
-        // tool itself never produced a read result.
+        // The refusal must stop the tool, not merely relabel its result.
+        assert_eq!(
+            agent.host.tool_read_calls.get(),
+            0,
+            "a denied call must never reach the tool"
+        );
+
         let events = agent.host.recorded_events.borrow().clone();
         let denied_result = events
             .iter()
             .find(|e| e.starts_with("result:read:t1"))
             .expect("a result is still recorded for a denied call");
         assert!(denied_result.contains("dur="), "{denied_result}");
+    }
+
+    /// The same call without a denial does reach the tool — otherwise the test
+    /// above would pass for the wrong reason.
+    #[test]
+    fn an_allowed_tool_does_reach_the_tool() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![a_read_file_call("t1", "a.txt")],
+            reasoning: None,
+        });
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("read a.txt")).unwrap();
+        assert_eq!(agent.host.tool_read_calls.get(), 1);
     }
 
     /// A Rewrite must change the arguments the tool actually receives, not just

@@ -1394,7 +1394,13 @@ impl HostFunctions for DaemonHostFunctions {
         }
     }
 
-    fn record_tool_call(&self, tool_name: &str, tool_id: &str, args_json: &str) {
+    fn record_tool_call(
+        &self,
+        tool_name: &str,
+        tool_id: &str,
+        args_json: &str,
+        ctx: &nevoflux_builtin_wasm::ToolContext,
+    ) {
         let Some(writer) = self.event_writer() else {
             return;
         };
@@ -1403,10 +1409,10 @@ impl HostFunctions for DaemonHostFunctions {
                 id: tool_id.to_string(),
                 name: tool_name.to_string(),
                 args: serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null),
-                // P1 threads the real origin through `ToolContext`; every P0
-                // call site is the model's own loop.
-                origin: nevoflux_protocol::session_event::ToolOrigin::model(),
-                tab_url: None,
+                // The origin the gate judged, so the log and the policy agree
+                // on who asked.
+                origin: nevoflux_protocol::session_event::ToolOrigin::from_raw(ctx.origin.clone()),
+                tab_url: ctx.tab_url.clone(),
             },
         );
     }
