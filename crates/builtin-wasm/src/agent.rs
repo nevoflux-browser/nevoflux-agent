@@ -656,16 +656,22 @@ impl<H: HostFunctions> Agent<H> {
 
         let mode = input.mode;
 
-        // Use custom system prompt if provided, otherwise use mode-based prompt
-        let base_prompt = match &input.custom_system_prompt {
-            Some(custom) => custom.clone(),
+        // The prompt is assembled as an ordered list of named sections
+        // (design spec §4.2), then rendered once. Naming the parts is what lets
+        // the event log say which section changed, and what gives P2 a stable
+        // prefix boundary to cache on.
+        let mut sections: Vec<PromptSectionText> = match &input.custom_system_prompt {
+            // A custom prompt replaces the whole body — subagents use this.
+            // One opaque section, honestly named: pretending to know its
+            // internal structure would make the log lie.
+            Some(custom) => vec![PromptSectionText::body("custom", custom.clone())],
             None => {
                 let skills = filter_skills(
                     self.host.skill_list().unwrap_or_default(),
                     input.skills_filter.as_deref(),
                 );
                 let cu_flags = self.computer_use_flags(mode);
-                Self::build_system_prompt(
+                Self::build_prompt_sections(
                     mode,
                     &skills,
                     &input.available_models,
@@ -675,56 +681,51 @@ impl<H: HostFunctions> Agent<H> {
             }
         };
 
-        // Append soul document context if available
-        let base_prompt = if let Some(ref soul) = input.soul_context {
-            format!("{}\n\n{}", base_prompt, soul)
-        } else {
-            base_prompt
-        };
+        if let Some(soul) = &input.soul_context {
+            sections.push(PromptSectionText::body("soul", soul.clone()));
+        }
 
-        // Prepend skill context with high priority if present
-        let system_prompt = match &input.skill_context {
-            Some(skill) => {
-                let files_section = if !skill.available_files.is_empty() {
-                    let file_list: String = skill
-                        .available_files
-                        .iter()
-                        .map(|f| format!("- {}", f))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    format!(
-                        r#"
+        // Prepended, not appended: an explicitly invoked skill outranks
+        // everything else in the prompt, and it is the one block a
+        // `keep_kernel` replacement must not remove.
+        if let Some(skill) = &input.skill_context {
+            let files_section = if skill.available_files.is_empty() {
+                String::new()
+            } else {
+                let file_list: String = skill
+                    .available_files
+                    .iter()
+                    .map(|f| format!("- {}", f))
+                    .collect::<Vec<_>>()
+                    .join(
+                        "
+",
+                    );
+                format!(
+                    r#"
 
 <available_files base_path="{}">
 {}
 </available_files>
 To read files listed above, use the `read` tool with just the filename (e.g., `resume.md`). Do NOT fabricate absolute paths."#,
-                        skill.base_path, file_list
-                    )
-                } else {
-                    String::new()
-                };
-
-                format!(
-                    r#"<CRITICAL_INSTRUCTIONS priority="highest">
+                    skill.base_path, file_list
+                )
+            };
+            let body = format!(
+                r#"<CRITICAL_INSTRUCTIONS priority="highest">
 The user EXPLICITLY invoked the "{}" skill by name — you are running that skill NOW. Carry out its instructions as an ACTION: if the skill says to call a tool (e.g. `run_flow`), you MUST call that tool. Do NOT answer from your own knowledge and do NOT treat the user's message as a general question to research — the user's message is the INPUT to this skill. These instructions MUST be followed exactly and take absolute priority over all other guidance.
 
 <skill name="{}" base_path="{}">
 {}
 </skill>{}
-</CRITICAL_INSTRUCTIONS>
+</CRITICAL_INSTRUCTIONS>"#,
+                skill.name, skill.name, skill.base_path, skill.content, files_section
+            );
+            sections.insert(0, PromptSectionText::kernel("skill/loaded", body));
+        }
 
-{}"#,
-                    skill.name,
-                    skill.name,
-                    skill.base_path,
-                    skill.content,
-                    files_section,
-                    base_prompt
-                )
-            }
-            None => base_prompt,
-        };
+        self.host.record_prompt_sections(&sections);
+        let system_prompt = Self::render_prompt_sections(&sections);
 
         let mut tools = if self.config.is_subagent {
             self.get_subagent_tools_for_mode(mode)
@@ -842,8 +843,127 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         }
     }
 
-    /// Build the full system prompt with dynamic sections appended.
-    /// Called once per session; result should be cached.
+    /// Build the system prompt as an ordered list of addressable sections
+    /// (design spec §4.2).
+    ///
+    /// Order is load-bearing twice over: it is what the model reads, and the
+    /// boundary between the stable head and the volatile tail is what P2's
+    /// prefix caching keys on. `skills/catalog`, `models` and `soul` change
+    /// often and therefore sit last.
+    fn build_prompt_sections(
+        mode: AgentMode,
+        skills: &[SkillSummary],
+        models: &[(String, String)],
+        computer_use: ComputerUseFlags,
+        os_platform: Option<&str>,
+    ) -> Vec<PromptSectionText> {
+        let mut out = vec![PromptSectionText::body(
+            format!("base/{}", Self::mode_slug(mode)),
+            Self::base_prompt_for_mode(mode),
+        )];
+
+        if let Some(os) = os_platform {
+            let shell_hint = match os {
+                "windows" => "Windows (PowerShell). Use PowerShell syntax for commands.",
+                "macos" => "macOS (zsh/bash). Use POSIX shell syntax for commands.",
+                _ => "Linux (bash). Use POSIX shell syntax for commands.",
+            };
+            out.push(PromptSectionText::body(
+                "platform",
+                format!(
+                    "# System Environment
+
+Operating System: {}
+",
+                    shell_hint
+                ),
+            ));
+        }
+
+        if computer_use.inject_overview {
+            out.push(PromptSectionText::body(
+                "computer-use/overview",
+                COMPUTER_USE_OVERVIEW,
+            ));
+        }
+        if computer_use.inject_guide {
+            out.push(PromptSectionText::body(
+                "computer-use/guide",
+                COMPUTER_USE_GUIDE,
+            ));
+        }
+        if computer_use.inject_examples {
+            out.push(PromptSectionText::body(
+                "computer-use/examples",
+                COMPUTER_USE_EXAMPLES,
+            ));
+        }
+
+        if !models.is_empty() {
+            let mut body = String::from(
+                "# Available models
+
+",
+            );
+            for (provider, model) in models {
+                body.push_str(&format!(
+                    "- {}: {}
+",
+                    provider, model
+                ));
+            }
+            out.push(PromptSectionText::body("models", body));
+        }
+
+        if !skills.is_empty() {
+            let mut body = String::from(
+                "# Skills
+
+",
+            );
+            body.push_str("The following skills are available. When a user's request matches a skill's description, you MUST use `skill_load(name)` to load the skill's full instructions BEFORE responding. Skills provide specialized workflows that produce better results than generic responses. Even a partial match (e.g., user asks to \"build a dashboard\" and a skill handles web apps) means you should load the skill.
+
+");
+            body.push_str(&format_skill_summaries(skills));
+            body.push_str("
+
+Users can also invoke skills explicitly with `/skill_name`. If the user's message starts with `/`, treat the first word as a skill name.");
+            out.push(PromptSectionText::body("skills/catalog", body));
+        }
+
+        out
+    }
+
+    /// Short mode name used in section ids.
+    fn mode_slug(mode: AgentMode) -> &'static str {
+        match mode {
+            AgentMode::Chat => "chat",
+            AgentMode::Browser => "browser",
+            AgentMode::Agent | AgentMode::Code => "agent",
+        }
+    }
+
+    /// Join sections into the string a provider receives.
+    ///
+    /// Blank line between sections, matching what the previous string-building
+    /// version produced, so this refactor does not move a single byte of the
+    /// prompt the model sees.
+    fn render_prompt_sections(sections: &[PromptSectionText]) -> String {
+        sections
+            .iter()
+            .map(|s| s.body.as_str())
+            .collect::<Vec<_>>()
+            .join(
+                "
+
+",
+            )
+    }
+
+    /// Build the full system prompt.
+    ///
+    /// Thin wrapper over [`Self::build_prompt_sections`] — kept because callers
+    /// and tests want the joined string, while the pipeline wants the parts.
     fn build_system_prompt(
         mode: AgentMode,
         skills: &[SkillSummary],
@@ -851,50 +971,13 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         computer_use: ComputerUseFlags,
         os_platform: Option<&str>,
     ) -> String {
-        let mut prompt = Self::base_prompt_for_mode(mode).to_string();
-
-        // Inject platform info so LLM uses correct shell syntax
-        if let Some(os) = os_platform {
-            let shell_hint = match os {
-                "windows" => "Windows (PowerShell). Use PowerShell syntax for commands.",
-                "macos" => "macOS (zsh/bash). Use POSIX shell syntax for commands.",
-                _ => "Linux (bash). Use POSIX shell syntax for commands.",
-            };
-            prompt.push_str(&format!(
-                "\n\n# System Environment\n\nOperating System: {}\n",
-                shell_hint
-            ));
-        }
-
-        // Append computer use prompt layers based on flags
-        if computer_use.inject_overview {
-            prompt.push_str("\n\n");
-            prompt.push_str(COMPUTER_USE_OVERVIEW);
-        }
-        if computer_use.inject_guide {
-            prompt.push_str("\n\n");
-            prompt.push_str(COMPUTER_USE_GUIDE);
-        }
-        if computer_use.inject_examples {
-            prompt.push_str("\n\n");
-            prompt.push_str(COMPUTER_USE_EXAMPLES);
-        }
-
-        if !models.is_empty() {
-            prompt.push_str("\n\n# Available models\n\n");
-            for (provider, model) in models {
-                prompt.push_str(&format!("- {}: {}\n", provider, model));
-            }
-        }
-
-        if !skills.is_empty() {
-            prompt.push_str("\n\n# Skills\n\n");
-            prompt.push_str("The following skills are available. When a user's request matches a skill's description, you MUST use `skill_load(name)` to load the skill's full instructions BEFORE responding. Skills provide specialized workflows that produce better results than generic responses. Even a partial match (e.g., user asks to \"build a dashboard\" and a skill handles web apps) means you should load the skill.\n\n");
-            prompt.push_str(&format_skill_summaries(skills));
-            prompt.push_str("\n\nUsers can also invoke skills explicitly with `/skill_name`. If the user's message starts with `/`, treat the first word as a skill name.");
-        }
-
-        prompt
+        Self::render_prompt_sections(&Self::build_prompt_sections(
+            mode,
+            skills,
+            models,
+            computer_use,
+            os_platform,
+        ))
     }
 
     /// Determine computer use flags based on mode and trigger state.
@@ -6561,6 +6644,135 @@ mod tests {
         // The mock records nothing about ctx directly; assert the call reached
         // tool_post at all, which only happens on the pipeline path.
         assert_eq!(agent.host.post_arguments.borrow().len(), 1);
+    }
+
+    /// The prompt is reported as named parts, in the order the model reads
+    /// them. Volatile sections must come last, because P2 caches the prefix
+    /// before them.
+    #[test]
+    fn the_assembled_prompt_names_its_sections_in_reading_order() {
+        let mock = MockHostFunctions::new();
+        mock.add_skill(SkillSummary {
+            name: "design".into(),
+            description: "make things".into(),
+            tags: vec![],
+        });
+        let agent = session_log_agent(mock);
+        let mut input = session_log_input("hi");
+        input.mode = AgentMode::Browser;
+        input.os_platform = Some("linux".into());
+        input.available_models = vec![("anthropic".into(), "claude-opus-5".into())];
+        agent.run(&input).unwrap();
+
+        let ids: Vec<String> = agent
+            .host
+            .prompt_sections
+            .borrow()
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "base/browser",
+                "platform",
+                "computer-use/overview",
+                "models",
+                "skills/catalog",
+            ]
+        );
+    }
+
+    /// An explicitly invoked skill outranks everything, so it leads — and it is
+    /// the one section a `keep_kernel` replacement must not remove.
+    #[test]
+    fn a_loaded_skill_leads_the_prompt_and_is_marked_kernel() {
+        let mock = MockHostFunctions::new();
+        let agent = session_log_agent(mock);
+        let mut input = session_log_input("run it");
+        input.skill_context = Some(SkillContext {
+            name: "design-md".into(),
+            base_path: "/skills/design-md".into(),
+            content: "do the thing".into(),
+            available_files: vec!["resume.md".into()],
+        });
+        input.soul_context = Some("I am a careful assistant.".into());
+        agent.run(&input).unwrap();
+
+        let sections = agent.host.prompt_sections.borrow().clone();
+        assert_eq!(
+            sections.first().map(|s| s.id.as_str()),
+            Some("skill/loaded")
+        );
+        assert!(sections[0].kernel, "the loaded skill is a kernel section");
+        assert!(
+            sections[0].body.contains("design-md"),
+            "{}",
+            sections[0].body
+        );
+        assert!(
+            sections[0].body.contains("resume.md"),
+            "available files must survive the refactor"
+        );
+        assert_eq!(
+            sections.last().map(|s| s.id.as_str()),
+            Some("soul"),
+            "soul is volatile, so it sits after the cacheable head"
+        );
+        assert!(!sections.last().unwrap().kernel);
+    }
+
+    /// A custom prompt replaces the body wholesale. Reporting it as one opaque
+    /// section is the honest description — claiming to know its structure would
+    /// make the log lie.
+    #[test]
+    fn a_custom_prompt_is_reported_as_one_opaque_section() {
+        let mock = MockHostFunctions::new();
+        let agent = session_log_agent(mock);
+        let mut input = session_log_input("go");
+        input.custom_system_prompt = Some("You are a focused sub-agent.".into());
+        agent.run(&input).unwrap();
+
+        let sections = agent.host.prompt_sections.borrow().clone();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].id, "custom");
+        assert_eq!(sections[0].body, "You are a focused sub-agent.");
+    }
+
+    /// Rendering must reproduce exactly what the string-building version
+    /// produced — this refactor is not allowed to move a byte of the prompt.
+    #[test]
+    fn rendering_sections_matches_the_joined_prompt() {
+        let cu = ComputerUseFlags {
+            inject_overview: true,
+            inject_guide: true,
+            inject_examples: false,
+        };
+        let skills = vec![SkillSummary {
+            name: "s".into(),
+            description: "d".into(),
+            tags: vec![],
+        }];
+        let models = vec![("p".to_string(), "m".to_string())];
+
+        let sections = Agent::<MockHostFunctions>::build_prompt_sections(
+            AgentMode::Agent,
+            &skills,
+            &models,
+            cu,
+            Some("windows"),
+        );
+        let joined = Agent::<MockHostFunctions>::render_prompt_sections(&sections);
+        let direct = Agent::<MockHostFunctions>::build_system_prompt(
+            AgentMode::Agent,
+            &skills,
+            &models,
+            cu,
+            Some("windows"),
+        );
+        assert_eq!(joined, direct);
+        assert!(joined.contains("# Available models"));
+        assert!(joined.contains("Operating System: Windows"));
     }
 
     #[test]

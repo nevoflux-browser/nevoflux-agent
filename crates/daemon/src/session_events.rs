@@ -14,7 +14,7 @@
 //! it audits is worse than one with a gap.
 
 use nevoflux_protocol::session_event::{
-    content_hash, tools_hash, LoggedToolCall, SessionEventPayload, TokenUsage,
+    content_hash, tools_hash, LoggedToolCall, PromptSection, SessionEventPayload, TokenUsage,
 };
 use std::sync::Arc;
 
@@ -43,11 +43,17 @@ impl SessionEventWriter {
     /// Emits `system/message` only when the prompt differs from the last one
     /// logged, `user/message` for the last user turn in the request, and
     /// `request/header` when provider, model or tool set changed.
-    pub fn record_request(&self, req: &LlmChatRequest, provider: &str, model: &str) {
+    pub fn record_request(
+        &self,
+        req: &LlmChatRequest,
+        provider: &str,
+        model: &str,
+        sections: &[PromptSection],
+    ) {
         if self.session_id.is_empty() {
             return;
         }
-        self.record_system(req);
+        self.record_system(req, sections);
         self.record_user(req);
         self.record_header(req, provider, model);
         self.assert_derivable(req);
@@ -90,7 +96,7 @@ impl SessionEventWriter {
         }
     }
 
-    fn record_system(&self, req: &LlmChatRequest) {
+    fn record_system(&self, req: &LlmChatRequest, sections: &[PromptSection]) {
         let Some(system) = req.system.as_deref() else {
             return;
         };
@@ -113,10 +119,14 @@ impl SessionEventWriter {
         }
         self.append(SessionEventPayload::SystemMessage {
             content: system.to_string(),
-            // P1 makes the prompt sectioned; until then there is nothing
-            // truthful to put here, and inventing ids would make the log lie.
-            sections: Vec::new(),
-            origin: "kernel".into(),
+            sections: sections.to_vec(),
+            // `custom` means a caller replaced the body wholesale — a subagent
+            // today, a pack once P1b's system_prompt_replace lands.
+            origin: if sections.iter().any(|s| s.id == "custom") {
+                "custom".into()
+            } else {
+                "kernel".into()
+            },
         });
     }
 
@@ -241,6 +251,13 @@ impl SessionEventWriter {
     /// Release builds skip the derivability check entirely.
     #[cfg(not(debug_assertions))]
     fn assert_derivable(&self, _req: &LlmChatRequest) {}
+
+    /// `record_request` with no sections, for tests that only exercise the
+    /// user/header paths.
+    #[cfg(test)]
+    fn record_request_for_test(&self, req: &LlmChatRequest, provider: &str, model: &str) {
+        self.record_request(req, provider, model, &[]);
+    }
 }
 
 #[cfg(test)]
@@ -280,7 +297,7 @@ mod tests {
     fn a_first_request_logs_system_user_and_header() {
         let storage = Storage::open_in_memory().unwrap();
         let w = writer(&storage, "s1");
-        w.record_request(&req(Some("SYS"), "hello"), "anthropic", "claude-opus-5");
+        w.record_request_for_test(&req(Some("SYS"), "hello"), "anthropic", "claude-opus-5");
 
         let types: Vec<&str> = storage
             .session_events()
@@ -299,8 +316,8 @@ mod tests {
     fn an_unchanged_system_prompt_is_not_logged_twice() {
         let storage = Storage::open_in_memory().unwrap();
         let w = writer(&storage, "s1");
-        w.record_request(&req(Some("SYS"), "one"), "anthropic", "m");
-        w.record_request(&req(Some("SYS"), "two"), "anthropic", "m");
+        w.record_request_for_test(&req(Some("SYS"), "one"), "anthropic", "m");
+        w.record_request_for_test(&req(Some("SYS"), "two"), "anthropic", "m");
 
         let evs = storage.session_events().list("s1").unwrap();
         let sys = evs
@@ -319,8 +336,8 @@ mod tests {
     fn a_changed_system_prompt_is_logged_again() {
         let storage = Storage::open_in_memory().unwrap();
         let w = writer(&storage, "s1");
-        w.record_request(&req(Some("SYS-A"), "one"), "anthropic", "m");
-        w.record_request(&req(Some("SYS-B"), "two"), "anthropic", "m");
+        w.record_request_for_test(&req(Some("SYS-A"), "one"), "anthropic", "m");
+        w.record_request_for_test(&req(Some("SYS-B"), "two"), "anthropic", "m");
 
         let sys: Vec<String> = storage
             .session_events()
@@ -339,9 +356,9 @@ mod tests {
     fn an_unchanged_header_is_not_logged_twice_but_a_model_change_is() {
         let storage = Storage::open_in_memory().unwrap();
         let w = writer(&storage, "s1");
-        w.record_request(&req(Some("SYS"), "one"), "anthropic", "m1");
-        w.record_request(&req(Some("SYS"), "two"), "anthropic", "m1");
-        w.record_request(&req(Some("SYS"), "three"), "anthropic", "m2");
+        w.record_request_for_test(&req(Some("SYS"), "one"), "anthropic", "m1");
+        w.record_request_for_test(&req(Some("SYS"), "two"), "anthropic", "m1");
+        w.record_request_for_test(&req(Some("SYS"), "three"), "anthropic", "m2");
 
         let headers: Vec<(String, String)> = storage
             .session_events()
@@ -372,7 +389,7 @@ mod tests {
         r.messages.push(msg("assistant", "ack"));
         r.messages
             .push(msg("user", "NEW with injected tab context"));
-        w.record_request(&r, "anthropic", "m");
+        w.record_request_for_test(&r, "anthropic", "m");
 
         let found = storage
             .session_events()
@@ -393,7 +410,7 @@ mod tests {
         // request — and an empty session id has nowhere to log to.
         let storage = Storage::open_in_memory().unwrap();
         let w = writer(&storage, "");
-        w.record_request(&req(Some("SYS"), "hello"), "anthropic", "m");
+        w.record_request_for_test(&req(Some("SYS"), "hello"), "anthropic", "m");
         assert!(storage.session_events().list("").unwrap().is_empty());
     }
 
@@ -409,7 +426,7 @@ mod tests {
             description: String::new(),
             parameters: serde_json::json!({}),
         }]);
-        w.record_request(&r, "anthropic", "m");
+        w.record_request_for_test(&r, "anthropic", "m");
 
         r.tools = Some(vec![
             LlmToolDefinition {
@@ -423,7 +440,7 @@ mod tests {
                 parameters: serde_json::json!({}),
             },
         ]);
-        w.record_request(&r, "anthropic", "m");
+        w.record_request_for_test(&r, "anthropic", "m");
 
         let reasons: Vec<String> = storage
             .session_events()
@@ -439,6 +456,68 @@ mod tests {
             reasons,
             vec!["initial".to_string(), "tools_changed".to_string()]
         );
+    }
+
+    /// A `system/message` carries the section list, so a later reader can see
+    /// *which* part of the prompt changed rather than only that it did.
+    #[test]
+    fn a_system_message_carries_the_section_ids_and_hashes() {
+        let storage = Storage::open_in_memory().unwrap();
+        let w = writer(&storage, "s1");
+        let sections = vec![
+            PromptSection {
+                id: "base/browser".into(),
+                hash: "aaaa".into(),
+            },
+            PromptSection {
+                id: "soul".into(),
+                hash: "bbbb".into(),
+            },
+        ];
+        w.record_request(&req(Some("SYS"), "hi"), "anthropic", "m", &sections);
+
+        let found = storage
+            .session_events()
+            .list("s1")
+            .unwrap()
+            .into_iter()
+            .find_map(|e| match e.payload {
+                SessionEventPayload::SystemMessage {
+                    sections, origin, ..
+                } => Some((sections, origin)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            found.0.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["base/browser", "soul"]
+        );
+        assert_eq!(found.1, "kernel");
+    }
+
+    /// A wholesale replacement is logged as such, so a reader can tell a
+    /// subagent's own prompt from the kernel's.
+    #[test]
+    fn a_custom_prompt_is_logged_with_a_custom_origin() {
+        let storage = Storage::open_in_memory().unwrap();
+        let w = writer(&storage, "s1");
+        let sections = vec![PromptSection {
+            id: "custom".into(),
+            hash: "cccc".into(),
+        }];
+        w.record_request(&req(Some("SUB"), "hi"), "anthropic", "m", &sections);
+
+        let origin = storage
+            .session_events()
+            .list("s1")
+            .unwrap()
+            .into_iter()
+            .find_map(|e| match e.payload {
+                SessionEventPayload::SystemMessage { origin, .. } => Some(origin),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(origin, "custom");
     }
 
     #[test]
@@ -488,7 +567,7 @@ mod tests {
         let storage = Storage::open_in_memory().unwrap();
         let w = writer(&storage, "s1");
         let r = req(Some("SYS"), "hello");
-        w.record_request(&r, "anthropic", "m");
+        w.record_request_for_test(&r, "anthropic", "m");
 
         let events = storage.session_events().list("s1").unwrap();
         let derived = crate::replay::derive_agent_input(&events).unwrap();

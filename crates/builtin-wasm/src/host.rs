@@ -879,6 +879,13 @@ pub trait HostFunctions {
     /// Default no-op; the daemon appends `step/start` / `step/end`.
     fn record_step_boundary(&self, _turn: u32, _step: u32, _start: bool) {}
 
+    /// Report the section list the system prompt was assembled from.
+    ///
+    /// Called once per turn, before the first request. Default no-op; the daemon
+    /// records id+hash pairs so a `system/message` event can say which section
+    /// changed rather than only that the prompt did (design spec §3.2, §4.2).
+    fn record_prompt_sections(&self, _sections: &[PromptSectionText]) {}
+
     /// Whether this run is unattended — a loop, schedule or goal iteration,
     /// where no one is present to answer a confirmation dialog.
     ///
@@ -1048,6 +1055,8 @@ pub struct MockHostFunctions {
     /// How many times `tool_read` actually ran — the only way to prove a
     /// refusal stopped the tool rather than merely relabelling its result.
     pub tool_read_calls: std::cell::Cell<usize>,
+    /// The prompt sections the last run assembled.
+    pub prompt_sections: std::cell::RefCell<Vec<PromptSectionText>>,
 }
 
 #[cfg(test)]
@@ -1073,6 +1082,7 @@ impl MockHostFunctions {
             post_arguments: std::cell::RefCell::new(vec![]),
             tool_read_delay_ms: std::cell::Cell::new(0),
             tool_read_calls: std::cell::Cell::new(0),
+            prompt_sections: std::cell::RefCell::new(vec![]),
         }
     }
 
@@ -1117,6 +1127,10 @@ impl HostFunctions for MockHostFunctions {
         self.recorded_events
             .borrow_mut()
             .push(format!("result:{tool_name}:{tool_id}:dur={duration_ms}"));
+    }
+
+    fn record_prompt_sections(&self, sections: &[PromptSectionText]) {
+        *self.prompt_sections.borrow_mut() = sections.to_vec();
     }
 
     fn tool_pre(&self, _call: &ToolCall, _ctx: &ToolContext) -> ToolGate {
