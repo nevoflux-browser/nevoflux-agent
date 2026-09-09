@@ -724,6 +724,22 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             sections.insert(0, PromptSectionText::kernel("skill/loaded", body));
         }
 
+        // A pack holding the prompt replaces the body from here (design spec
+        // 4.3.2). Applied after `skill/loaded` is in place, so `keep_kernel`
+        // has something to keep.
+        //
+        // The privacy invariant is not in the prompt, so no mode can remove it
+        // (invariant I5): it lives in the permission gate and the tool
+        // pipeline, both of which run regardless of what the prompt says.
+        if let Some((mode, body)) = self.host.system_prompt_override() {
+            sections = if mode == "keep_kernel" {
+                sections.into_iter().filter(|s| s.kernel).collect()
+            } else {
+                Vec::new()
+            };
+            sections.push(PromptSectionText::body("pack/replacement", body));
+        }
+
         self.host.record_prompt_sections(&sections);
         let system_prompt = Self::render_prompt_sections(&sections);
 
@@ -2237,6 +2253,25 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 let entries = self.host.memory_view(limit)?;
                 serde_json::to_string_pretty(&entries).unwrap_or_default()
             }
+            "system_prompt_replace" => {
+                let content = tool_call.arguments["content"].as_str().unwrap_or("");
+                let mode = tool_call.arguments["mode"]
+                    .as_str()
+                    .unwrap_or("keep_kernel");
+                let reason = tool_call.arguments["reason"].as_str().unwrap_or("");
+                if content.is_empty() {
+                    "system_prompt_replace needs `content`".to_string()
+                } else {
+                    match self.host.system_prompt_replace(content, mode, reason) {
+                        Ok(msg) => msg,
+                        Err(e) => format!("Could not replace the system prompt: {}", e.message),
+                    }
+                }
+            }
+            "system_prompt_restore" => match self.host.system_prompt_restore() {
+                Ok(msg) => msg,
+                Err(e) => format!("Could not restore the system prompt: {}", e.message),
+            },
             "pack_activate" => {
                 let name = tool_call.arguments["name"].as_str().unwrap_or("");
                 if name.is_empty() {
@@ -3658,6 +3693,28 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                         }
                     }
                 }),
+            },
+            ToolDefinition {
+                name: "system_prompt_replace".into(),
+                description: "Replace your own system prompt on behalf of the active pack. Only available when an activated pack declared that it may. `keep_kernel` keeps the kernel sections and replaces the rest; `full` replaces the whole body. Takes effect from the next step.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string", "description": "The replacement prompt body" },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["keep_kernel", "full"],
+                            "description": "How much to replace"
+                        },
+                        "reason": { "type": "string", "description": "Why this pack needs to replace it" }
+                    },
+                    "required": ["content", "mode", "reason"]
+                }),
+            },
+            ToolDefinition {
+                name: "system_prompt_restore".into(),
+                description: "Give the system prompt back to the kernel.".into(),
+                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
             },
             ToolDefinition {
                 name: "pack_activate".into(),
@@ -6963,6 +7020,91 @@ mod tests {
         assert!(
             agent.host.active_packs.borrow().is_empty(),
             "an empty name must not activate anything"
+        );
+    }
+
+    fn a_skill_context() -> SkillContext {
+        SkillContext {
+            name: "jobhunt".into(),
+            base_path: "/skills/jobhunt".into(),
+            content: "apply carefully".into(),
+            available_files: vec![],
+        }
+    }
+
+    /// `keep_kernel` keeps the kernel sections and replaces the rest. Today
+    /// that means the loaded skill survives and everything else goes.
+    #[test]
+    fn keep_kernel_keeps_the_kernel_sections_and_drops_the_body() {
+        let mock = MockHostFunctions::new();
+        *mock.prompt_override.borrow_mut() = Some(("keep_kernel".into(), "PACK BODY".into()));
+        let agent = session_log_agent(mock);
+        let mut input = session_log_input("go");
+        input.skill_context = Some(a_skill_context());
+        input.soul_context = Some("a soul".into());
+        agent.run(&input).unwrap();
+
+        let ids: Vec<String> = agent
+            .host
+            .prompt_sections
+            .borrow()
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["skill/loaded", "pack/replacement"]);
+    }
+
+    /// `full` replaces the whole body, kernel sections included.
+    #[test]
+    fn full_replaces_everything() {
+        let mock = MockHostFunctions::new();
+        *mock.prompt_override.borrow_mut() = Some(("full".into(), "ONLY THIS".into()));
+        let agent = session_log_agent(mock);
+        let mut input = session_log_input("go");
+        input.skill_context = Some(a_skill_context());
+        agent.run(&input).unwrap();
+
+        let sections = agent.host.prompt_sections.borrow().clone();
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].id, "pack/replacement");
+        assert_eq!(sections[0].body, "ONLY THIS");
+    }
+
+    /// With no pack holding the prompt, assembly is untouched.
+    #[test]
+    fn no_override_leaves_the_prompt_alone() {
+        let mock = MockHostFunctions::new();
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        let ids: Vec<String> = agent
+            .host
+            .prompt_sections
+            .borrow()
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        assert!(
+            ids.iter().any(|i| i.starts_with("base/")),
+            "the mode prompt should still be there: {ids:?}"
+        );
+        assert!(!ids.iter().any(|i| i == "pack/replacement"));
+    }
+
+    /// Restoring hands the prompt back, and the next turn is assembled normally.
+    #[test]
+    fn restoring_brings_the_kernel_prompt_back() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![a_tool_call("system_prompt_restore", serde_json::json!({}))],
+            reasoning: None,
+        });
+        *mock.prompt_override.borrow_mut() = Some(("full".into(), "PACK".into()));
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("go")).unwrap();
+        assert!(
+            agent.host.prompt_override.borrow().is_none(),
+            "restore should release the prompt"
         );
     }
 

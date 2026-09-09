@@ -1524,6 +1524,145 @@ impl HostFunctions for DaemonHostFunctions {
         );
     }
 
+    fn system_prompt_replace(&self, content: &str, mode: &str, reason: &str) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+
+        if !matches!(mode, "keep_kernel" | "full") {
+            return Err(HostError {
+                code: 4,
+                message: format!("MODE_UNKNOWN: `{mode}` (keep_kernel | full)"),
+            });
+        }
+
+        // Which active pack is asking? Provenance is not recorded yet -- a
+        // skill does not carry the pack it came from -- so attribution is only
+        // safe when exactly one active pack declared a replace mode. With
+        // several, refusing beats crediting the wrong pack in the audit trail.
+        let paths = crate::paths::resolve_from_daemon();
+        let active: Vec<String> = services
+            .active_packs
+            .read()
+            .map(|g| g.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        for name in &active {
+            let manifest_path = paths.packs_dir().join(name).join("pack.toml");
+            let Ok(src) = std::fs::read_to_string(&manifest_path) else {
+                continue;
+            };
+            let Ok(manifest) = nevoflux_pack::manifest::Manifest::parse(&src) else {
+                continue;
+            };
+            if let Some(pc) = &manifest.components.prompt {
+                if pc.replace != "none" {
+                    candidates.push((manifest.pack.name.clone(), pc.replace.clone()));
+                }
+            }
+        }
+
+        let (pack, declared) = match candidates.len() {
+            0 => {
+                return Err(HostError {
+                    code: 403,
+                    message: "PACK_NOT_AUTHORIZED: no active pack declares a prompt replace mode"
+                        .into(),
+                })
+            }
+            1 => candidates.remove(0),
+            _ => {
+                return Err(HostError {
+                    code: 409,
+                    message: format!(
+                        "PACK_AMBIGUOUS: {} active packs declare a replace mode, so this call cannot be attributed",
+                        candidates.len()
+                    ),
+                })
+            }
+        };
+
+        // A pack cannot exceed the ceiling it declared at install time -- that
+        // declaration is what the user was shown and agreed to.
+        if mode == "full" && declared != "full" {
+            return Err(HostError {
+                code: 403,
+                message: format!(
+                    "MODE_NOT_DECLARED: `{pack}` declared `{declared}`, so it may not replace the full prompt"
+                ),
+            });
+        }
+
+        // Exclusive. A second replacement would make the first pack's
+        // discipline vanish with neither pack aware of it.
+        if let Ok(guard) = services.prompt_override.read() {
+            if let Some((holder, _, _)) = guard.as_ref() {
+                if holder != &pack {
+                    return Err(HostError {
+                        code: 409,
+                        message: format!("PROMPT_HELD_BY: `{holder}` already replaced the prompt"),
+                    });
+                }
+            }
+        }
+
+        if let Ok(mut guard) = services.prompt_override.write() {
+            *guard = Some((pack.clone(), mode.to_string(), content.to_string()));
+        }
+
+        if let Some(writer) = self.event_writer() {
+            writer.append(
+                nevoflux_protocol::session_event::SessionEventPayload::PackPromptReplace {
+                    pack: pack.clone(),
+                    mode: mode.to_string(),
+                    reason: reason.to_string(),
+                    hash: nevoflux_protocol::session_event::content_hash(content),
+                },
+            );
+        }
+
+        Ok(format!(
+            "system prompt replaced by `{pack}` ({mode}); it takes effect from the next step"
+        ))
+    }
+
+    fn system_prompt_restore(&self) -> HostResult<String> {
+        let services = self.services.as_ref().ok_or_else(|| HostError {
+            code: 1,
+            message: "Services not available".into(),
+        })?;
+        let held = services
+            .prompt_override
+            .write()
+            .ok()
+            .and_then(|mut g| g.take());
+        match held {
+            Some((pack, _, _)) => {
+                if let Some(writer) = self.event_writer() {
+                    writer.append(
+                        nevoflux_protocol::session_event::SessionEventPayload::PackPromptRestore {
+                            pack: pack.clone(),
+                        },
+                    );
+                }
+                Ok(format!(
+                    "system prompt returned to the kernel (was `{pack}`)"
+                ))
+            }
+            None => Ok("the kernel already holds the system prompt".to_string()),
+        }
+    }
+
+    fn system_prompt_override(&self) -> Option<(String, String)> {
+        let services = self.services.as_ref()?;
+        let guard = services.prompt_override.read().ok()?;
+        guard
+            .as_ref()
+            .map(|(_, mode, content)| (mode.clone(), content.clone()))
+    }
+
     fn pack_activate(&self, name: &str) -> HostResult<String> {
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,

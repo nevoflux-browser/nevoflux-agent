@@ -205,6 +205,13 @@ pub struct HostServices {
     /// `active`-scope components take effect while they are in here; their
     /// `installed`-scope components apply whether or not they are.
     pub active_packs: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    /// The system prompt a pack has taken over, if one has (design spec 4.3.2).
+    ///
+    /// Exclusive on purpose: a second pack replacing the prompt would make the
+    /// first pack's discipline vanish without either of them knowing. Held as
+    /// (pack, mode, body) and cleared when the pack releases it or the session
+    /// ends -- it never outlives the session.
+    pub prompt_override: Arc<std::sync::RwLock<Option<(String, String, String)>>>,
     /// True when this HostServices is the per-iteration clone owned by an
     /// `IterationExecutor`. The /loop skill's permission handler short-circuits
     /// dialogs in this mode: the loop's `allowed_tool_classes` is already the
@@ -383,6 +390,7 @@ impl HostServices {
                 std::sync::RwLock::new(std::collections::HashSet::new()),
             ),
             active_packs: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+            prompt_override: Arc::new(std::sync::RwLock::new(None)),
             is_iteration: false,
             iteration_loop_id: None,
             session_proxy_tracker: None,
@@ -434,6 +442,7 @@ impl HostServices {
                 std::sync::RwLock::new(std::collections::HashSet::new()),
             ),
             active_packs: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+            prompt_override: Arc::new(std::sync::RwLock::new(None)),
             is_iteration: false,
             iteration_loop_id: None,
             session_proxy_tracker: None,
