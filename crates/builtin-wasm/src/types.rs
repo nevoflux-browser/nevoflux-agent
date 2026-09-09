@@ -582,6 +582,90 @@ pub struct BashResult {
     pub hint: Option<String>,
 }
 
+/// What the kernel knows about a tool call when it asks policy for a verdict.
+///
+/// Carries the origin in the wire form design spec §3.2 fixes, so one policy can
+/// answer the same way for a model call, a Canvas panel call, an MCP call, a
+/// subagent call and a loop iteration (invariant I2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolContext {
+    /// Session the call belongs to.
+    pub session_id: String,
+    /// Who initiated it: `model`, `canvas:<artifact_id>`, `mcp:<client>`,
+    /// `subagent:<id>` or `loop:<id>`.
+    pub origin: String,
+    /// Mode the agent is running in.
+    pub mode: AgentMode,
+    /// True for loop, schedule and goal iterations — where no one is present to
+    /// answer a confirmation dialog, so an `Ask` has to settle as a refusal.
+    pub is_unattended: bool,
+    /// URL of the tab the call targets, when the call is tab-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_url: Option<String>,
+}
+
+/// A structured refusal (invariant I4).
+///
+/// Deliberately distinct from a tool failure: a model that reads "error" retries
+/// or routes around it, while a model that reads "policy" stops asking. That
+/// difference is the whole point of returning a typed refusal instead of an
+/// error string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDenial {
+    /// Machine-readable reason, e.g. `POLICY_DENIED`, `NOT_IN_ALLOWLIST`,
+    /// `REPEATED_CALL`.
+    pub code: String,
+    /// Human-readable explanation shown to the model.
+    pub message: String,
+    /// The specific rule that matched, when a rule engine produced this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// The pack that contributed the rule, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack: Option<String>,
+}
+
+impl ToolDenial {
+    /// Render for the model's tool-result slot.
+    ///
+    /// Names the code, the reason and the rule that produced it, and says
+    /// outright that retrying will not help — without which a capable model
+    /// spends its next several steps trying variations.
+    pub fn to_tool_result_content(&self) -> String {
+        let mut s = format!("[{}] {}", self.code, self.message);
+        match (&self.pack, &self.rule) {
+            (Some(p), Some(r)) => s.push_str(&format!(" (policy from pack `{p}`, rule `{r}`)")),
+            (Some(p), None) => s.push_str(&format!(" (policy from pack `{p}`)")),
+            (None, Some(r)) => s.push_str(&format!(" (rule `{r}`)")),
+            (None, None) => {}
+        }
+        s.push_str(
+            "
+This is a policy decision, not a tool failure. Do not retry this call.",
+        );
+        s
+    }
+}
+
+/// The verdict the kernel acts on.
+///
+/// `Ask` is deliberately absent. Resolving one needs UI, which lives in the
+/// daemon; the pipeline asks the user itself and returns the settled answer, so
+/// the agent loop never has to know a dialog happened.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub enum ToolGate {
+    /// Run it.
+    #[default]
+    Allow,
+    /// Refuse, with a reason the model can act on.
+    Deny(ToolDenial),
+    /// Run it, but with these arguments instead.
+    Rewrite {
+        /// Replacement arguments.
+        arguments: serde_json::Value,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1179,5 +1263,75 @@ mod tests {
             parsed.reasoning.as_deref(),
             Some("I should fetch the page first.")
         );
+    }
+
+    /// I4: a policy refusal must be structured, and must read as policy rather
+    /// than as a tool failure. A refusal that looks like a failure makes the
+    /// model retry or route around it — the exact behaviour the gate exists to
+    /// prevent.
+    #[test]
+    fn a_denial_renders_as_policy_not_as_failure() {
+        let d = ToolDenial {
+            code: "POLICY_DENIED".into(),
+            message: "banking sites are read-only".into(),
+            rule: Some("no-writes-on-bank".into()),
+            pack: Some("bank-guard".into()),
+        };
+        let rendered = d.to_tool_result_content();
+        assert!(rendered.contains("POLICY_DENIED"), "{rendered}");
+        assert!(rendered.contains("bank-guard"), "{rendered}");
+        assert!(rendered.contains("no-writes-on-bank"), "{rendered}");
+        assert!(
+            rendered.contains("banking sites are read-only"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.to_lowercase().contains("error"),
+            "a denial must not read as a failure: {rendered}"
+        );
+        assert!(
+            rendered.contains("Do not retry"),
+            "the model needs to be told retrying will not help: {rendered}"
+        );
+    }
+
+    /// A denial with no pack still names its rule.
+    #[test]
+    fn a_kernel_denial_without_a_pack_still_names_its_rule() {
+        let d = ToolDenial {
+            code: "NOT_IN_ALLOWLIST".into(),
+            message: "this loop may not call browser_click".into(),
+            rule: Some("allowed_tool_classes".into()),
+            pack: None,
+        };
+        let rendered = d.to_tool_result_content();
+        assert!(rendered.contains("allowed_tool_classes"), "{rendered}");
+        assert!(!rendered.contains("pack"), "{rendered}");
+    }
+
+    /// External contracts are additive only: a host that does not implement
+    /// `tool_pre` must behave exactly as it does today.
+    #[test]
+    fn a_gate_defaults_to_allow_so_an_unaware_host_changes_nothing() {
+        assert!(matches!(ToolGate::default(), ToolGate::Allow));
+    }
+
+    /// The context carries the origin in the spec's wire form, so one policy
+    /// answers the same way for every caller (I2).
+    #[test]
+    fn a_tool_context_round_trips_through_serde_with_its_origin_intact() {
+        let ctx = ToolContext {
+            session_id: "s1".into(),
+            origin: "loop:lp_9".into(),
+            mode: AgentMode::Agent,
+            is_unattended: true,
+            tab_url: Some("https://example.com/".into()),
+        };
+        let json = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(json["origin"], "loop:lp_9");
+        assert_eq!(json["is_unattended"], true);
+        let back: ToolContext = serde_json::from_value(json).unwrap();
+        assert_eq!(back.origin, ctx.origin);
+        assert_eq!(back.tab_url, ctx.tab_url);
     }
 }

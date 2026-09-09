@@ -863,6 +863,32 @@ pub trait HostFunctions {
     /// Default no-op; the daemon appends `step/start` / `step/end`.
     fn record_step_boundary(&self, _turn: u32, _step: u32, _start: bool) {}
 
+    /// Whether this run is unattended — a loop, schedule or goal iteration,
+    /// where no one is present to answer a confirmation dialog.
+    ///
+    /// Only the daemon knows (it holds `HostServices.is_iteration`), so the
+    /// agent has to ask. Default `false`: an unaware host behaves as interactive,
+    /// which is the safe reading — it prompts rather than silently proceeding.
+    fn is_unattended(&self) -> bool {
+        false
+    }
+
+    /// Ask policy whether this tool may run, before it runs.
+    ///
+    /// Default `Allow`, so hosts that implement no policy behave exactly as they
+    /// do today (external contracts are additive only). The daemon overrides it
+    /// with the ordered pipeline in `tool_pipeline` (design spec §4.1).
+    fn tool_pre(&self, _call: &ToolCall, _ctx: &ToolContext) -> ToolGate {
+        ToolGate::Allow
+    }
+
+    /// Post-process a tool result before it reaches the model.
+    ///
+    /// Default returns it unchanged. P2 uses this for spill, P3 for pack hooks.
+    fn tool_post(&self, _call: &ToolCall, _ctx: &ToolContext, result: ToolResult) -> ToolResult {
+        result
+    }
+
     // =========================================================================
     // /schedule skill tool functions (Task 1.6)
     // =========================================================================
