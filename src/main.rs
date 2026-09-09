@@ -16,7 +16,7 @@ mod mcp_backend;
 
 use clap::Parser;
 use cli::PackAction;
-use cli::{AccountAction, Cli, Commands, ConfigAction};
+use cli::{AccountAction, Cli, Commands, ConfigAction, SessionAction};
 use fs2::FileExt;
 use nevoflux_storage::Storage;
 use std::fs::File;
@@ -944,7 +944,10 @@ async fn run_daemon(
             if let Some(addr) = anthropic_addr {
                 let app = http::router::anthropic_routes().with_state(state.clone());
                 tokio::spawn(async move {
-                    tracing::info!("Anthropic Messages listening on {} (POST /v1/messages)", addr);
+                    tracing::info!(
+                        "Anthropic Messages listening on {} (POST /v1/messages)",
+                        addr
+                    );
                     if let Err(e) = http::router::serve(addr, app).await {
                         tracing::error!("Anthropic server error: {}", e);
                     }
@@ -1301,6 +1304,60 @@ fn run_setup() {
 }
 
 /// Handle config subcommands.
+/// Handle `nevoflux-agent session ...`.
+///
+/// Export writes one JSON object per line, `seq` ascending — the shape dsh
+/// writes, so a session can move between the local kernel and dsh-cloud
+/// (design spec ADR A3). Replay prints the tool sequence the log implies
+/// without contacting any provider.
+fn handle_session_command(action: SessionAction) -> Result<(), String> {
+    let db_path = get_data_dir().join("nevoflux.db");
+    if !db_path.exists() {
+        return Err(format!("no database at {}", db_path.display()));
+    }
+    let storage = nevoflux_storage::Storage::open(&db_path)
+        .map_err(|e| format!("open {}: {e}", db_path.display()))?;
+
+    match action {
+        SessionAction::Export { session_id, out } => {
+            let events = storage
+                .session_events()
+                .list(&session_id)
+                .map_err(|e| format!("read events: {e}"))?;
+            if events.is_empty() {
+                return Err(format!("no events for session {session_id}"));
+            }
+            let buf =
+                nevoflux_daemon::replay::to_jsonl(&events).map_err(|e| format!("encode: {e}"))?;
+            match out {
+                Some(path) => {
+                    std::fs::write(&path, buf).map_err(|e| format!("write {path}: {e}"))?;
+                    eprintln!("exported {} events to {path}", events.len());
+                }
+                // stdout carries the native-messaging protocol only in proxy
+                // mode; a subcommand run returns before that starts, so writing
+                // the export here cannot corrupt a protocol stream.
+                None => print!("{buf}"),
+            }
+            Ok(())
+        }
+        SessionAction::Replay { session_id, until } => {
+            let events = match until {
+                Some(seq) => storage.session_events().list_until(&session_id, seq),
+                None => storage.session_events().list(&session_id),
+            }
+            .map_err(|e| format!("read events: {e}"))?;
+            if events.is_empty() {
+                return Err(format!("no events for session {session_id}"));
+            }
+            for line in nevoflux_daemon::replay::tool_sequence(&events) {
+                eprintln!("{line}");
+            }
+            Ok(())
+        }
+    }
+}
+
 fn handle_config_command(action: ConfigAction) {
     match action {
         ConfigAction::Show => run_config_show(),
@@ -1593,6 +1650,13 @@ async fn main() {
             Commands::Account { action } => {
                 if let Err(e) = handle_account_command(action).await {
                     eprintln!("account: {e}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+            Commands::Session { action } => {
+                if let Err(e) = handle_session_command(action) {
+                    eprintln!("session: {e}");
                     std::process::exit(1);
                 }
                 return;

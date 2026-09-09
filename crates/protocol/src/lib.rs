@@ -37,6 +37,7 @@ pub mod execution_tier;
 pub mod extract;
 pub mod json_repair;
 pub mod mcp;
+pub mod session_event;
 pub mod speech;
 pub mod subagent;
 pub mod tools;

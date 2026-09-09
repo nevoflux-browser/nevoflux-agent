@@ -365,7 +365,6 @@ pub trait HostFunctions {
         tab_id: Option<i64>,
     ) -> HostResult<BrowserToolResult>;
 
-
     /// Take a screenshot of the page.
     fn browser_screenshot(
         &self,
@@ -844,6 +843,26 @@ pub trait HostFunctions {
     fn record_tool_result(&self, _tool_name: &str, _tool_id: &str, _content: &str, _success: bool) {
     }
 
+    /// Announce a tool call before it executes.
+    ///
+    /// Paired with [`HostFunctions::record_tool_result`] through `tool_id`.
+    /// Default is a no-op so existing hosts keep compiling; the daemon overrides
+    /// it to append a `tool/call` session event (design spec §3.4). Announcing
+    /// *before* execution is the point: a run that dies mid-tool still shows
+    /// what it attempted.
+    fn record_tool_call(&self, _tool_name: &str, _tool_id: &str, _args_json: &str) {}
+
+    /// Mark the start (`start = true`) or end of a user turn.
+    ///
+    /// Default no-op; the daemon appends `turn/start` / `turn/end`.
+    fn record_turn_boundary(&self, _turn: u32, _start: bool) {}
+
+    /// Mark the start or end of one step — a single LLM request plus the tool
+    /// calls it triggered.
+    ///
+    /// Default no-op; the daemon appends `step/start` / `step/end`.
+    fn record_step_boundary(&self, _turn: u32, _step: u32, _start: bool) {}
+
     // =========================================================================
     // /schedule skill tool functions (Task 1.6)
     // =========================================================================
@@ -971,6 +990,10 @@ pub struct MockHostFunctions {
     /// Tool names passed to each `llm_chat` call, in order — lets tests assert
     /// which tools were advertised on each iteration (e.g. the canvas gate).
     pub captured_tool_names: std::cell::RefCell<Vec<Vec<String>>>,
+    /// Session-log hook calls in the order they were made, rendered as short
+    /// strings — lets tests assert that a tool is announced before it runs and
+    /// that turn/step boundaries pair up.
+    pub recorded_events: std::cell::RefCell<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -991,6 +1014,7 @@ impl MockHostFunctions {
             next_subagent_id: std::cell::Cell::new(1),
             subagents: std::cell::RefCell::new(vec![]),
             captured_tool_names: std::cell::RefCell::new(vec![]),
+            recorded_events: std::cell::RefCell::new(vec![]),
         }
     }
 
@@ -1012,6 +1036,32 @@ impl MockHostFunctions {
 
 #[cfg(test)]
 impl HostFunctions for MockHostFunctions {
+    fn record_tool_call(&self, tool_name: &str, tool_id: &str, _args_json: &str) {
+        self.recorded_events
+            .borrow_mut()
+            .push(format!("call:{tool_name}:{tool_id}"));
+    }
+
+    fn record_tool_result(&self, tool_name: &str, tool_id: &str, _content: &str, _success: bool) {
+        self.recorded_events
+            .borrow_mut()
+            .push(format!("result:{tool_name}:{tool_id}"));
+    }
+
+    fn record_turn_boundary(&self, turn: u32, start: bool) {
+        let edge = if start { "start" } else { "end" };
+        self.recorded_events
+            .borrow_mut()
+            .push(format!("turn/{edge}:{turn}"));
+    }
+
+    fn record_step_boundary(&self, turn: u32, step: u32, start: bool) {
+        let edge = if start { "start" } else { "end" };
+        self.recorded_events
+            .borrow_mut()
+            .push(format!("step/{edge}:{turn}/{step}"));
+    }
+
     fn llm_chat(&self, request: &LlmRequest) -> HostResult<LlmResponse> {
         self.captured_tool_names
             .borrow_mut()
@@ -1419,7 +1469,9 @@ impl HostFunctions for MockHostFunctions {
         on: bool,
         _tab_id: Option<i64>,
     ) -> HostResult<BrowserToolResult> {
-        Ok(BrowserToolResult::success(serde_json::json!({ "active": on })))
+        Ok(BrowserToolResult::success(
+            serde_json::json!({ "active": on }),
+        ))
     }
 
     fn browser_network_requests(
@@ -1436,7 +1488,6 @@ impl HostFunctions for MockHostFunctions {
             "message": "capture not enabled this turn"
         })))
     }
-
 
     fn browser_screenshot(
         &self,

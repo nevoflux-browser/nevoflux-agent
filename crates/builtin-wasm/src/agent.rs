@@ -448,6 +448,24 @@ fn build_elements_summary(elements: &[CachedElement]) -> String {
 }
 
 /// The built-in agent.
+/// Emits `step/end` when a step's scope ends, however it ends.
+///
+/// The agent loop breaks out of a step from several places (interrupt, no tool
+/// calls, iteration cap, a pending plan or artifact). Pairing the boundary
+/// events by hand would drop the end event on exactly the paths worth
+/// debugging, so the end is tied to scope exit instead.
+struct StepGuard<'h, H: HostFunctions> {
+    host: &'h H,
+    turn: u32,
+    step: u32,
+}
+
+impl<H: HostFunctions> Drop for StepGuard<'_, H> {
+    fn drop(&mut self) {
+        self.host.record_step_boundary(self.turn, self.step, false);
+    }
+}
+
 pub struct Agent<H: HostFunctions> {
     /// Host functions interface.
     host: H,
@@ -747,7 +765,27 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             }
         }
 
-        self.run_loop(input, &system_prompt, &tools)
+        // Turn boundaries wrap the whole loop so they pair no matter how it
+        // exits (design spec §3.2).
+        let turn = Self::derive_turn(input);
+        self.host.record_turn_boundary(turn, true);
+        let out = self.run_loop(input, &system_prompt, &tools);
+        self.host.record_turn_boundary(turn, false);
+        out
+    }
+
+    /// Derive a turn number for the session event log.
+    ///
+    /// `AgentInput` carries no turn counter, so count the user messages already
+    /// in history and add the one being handled. This is a derived value, not an
+    /// authoritative counter — P1 introduces a real one and replaces this.
+    fn derive_turn(input: &AgentInput) -> u32 {
+        input
+            .history
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .count() as u32
+            + 1
     }
 
     /// Get tools for a specific mode. Public so daemon-side callers (e.g.
@@ -1088,11 +1126,8 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
     ///
     /// `tts_transcribe` is deliberately not here — audio in, text out works
     /// anywhere and has nothing to do with playback.
-    const SPEECH_OUTPUT_TOOLS: &'static [&'static str] = &[
-        "tts_synthesize_local",
-        "tts_synthesize_api",
-        "tts_voices",
-    ];
+    const SPEECH_OUTPUT_TOOLS: &'static [&'static str] =
+        &["tts_synthesize_local", "tts_synthesize_api", "tts_voices"];
 
     /// Tools whose execution creates/opens an artifact. Running any of them
     /// unlocks `CANVAS_OPERATE_TOOLS` for the rest of the turn, so a same-turn
@@ -1137,8 +1172,7 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
     /// Network capture does not happen by default; it is switched on for the
     /// one turn whose prompt writes the tool's name out (see the spec). A tool
     /// that only works when named should not be paid for on every request.
-    const NAMED_ONLY_TOOLS: &'static [&'static str] =
-        &[
+    const NAMED_ONLY_TOOLS: &'static [&'static str] = &[
         "browser_network_requests",
         "browser_network_capture_stop",
         "browser_console_messages",
@@ -1319,12 +1353,24 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         let mut final_text = String::new();
         let mut all_tool_calls = Vec::new();
 
+        let turn = Self::derive_turn(input);
+
         loop {
             iterations += 1;
             let _ = self.host.set_iteration(iterations as u32);
             if iterations > self.config.max_iterations {
                 break;
             }
+
+            // One step = one LLM request plus the tool calls it triggers.
+            // `iterations` is 1-based; the log's step counter is 0-based.
+            let step = (iterations - 1) as u32;
+            self.host.record_step_boundary(turn, step, true);
+            let _step_guard = StepGuard {
+                host: &self.host,
+                turn,
+                step,
+            };
 
             // Check for interrupt signal from sidebar
             if self.host.is_interrupted()? {
@@ -1405,6 +1451,20 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     "[AGENT] Executing tool: name={}, id={}, call_id={:?}, args={}",
                     tool_call.name, tool_call.id, tool_call.call_id, tool_call.arguments
                 );
+                // Announce before executing, so a run that dies mid-tool still
+                // shows what it attempted. The id must be the one the result
+                // will carry (`call_id` when the provider supplied one) or the
+                // two events would not pair up in the log.
+                let logged_tool_id = tool_call
+                    .call_id
+                    .clone()
+                    .unwrap_or_else(|| tool_call.id.clone());
+                self.host.record_tool_call(
+                    &tool_call.name,
+                    &logged_tool_id,
+                    &tool_call.arguments.to_string(),
+                );
+
                 let result = match self.execute_tool(tool_call) {
                     Ok(r) => r,
                     Err(e) => {
@@ -2280,7 +2340,9 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                let result = self.host.browser_network_requests(only_failed, types, tab_id)?;
+                let result = self
+                    .host
+                    .browser_network_requests(only_failed, types, tab_id)?;
                 serde_json::to_string(&result).unwrap_or_default()
             }
             "browser_screenshot" => {
@@ -5869,11 +5931,7 @@ mod tests {
         let empty: Vec<Message> = Vec::new();
         let huge = "y".repeat(640 * 1024);
         let out = truncate_tool_result_if_needed(&empty, &huge);
-        assert!(
-            out.len() < 40 * 1024,
-            "空会话里仍放进了 {} 字节",
-            out.len()
-        );
+        assert!(out.len() < 40 * 1024, "空会话里仍放进了 {} 字节", out.len());
         assert!(out.contains("[Content truncated"));
     }
 
@@ -6041,10 +6099,7 @@ mod tests {
         let gated = Agent::<MockHostFunctions>::gate_speech_tools(&all, false);
 
         for name in Agent::<MockHostFunctions>::SPEECH_OUTPUT_TOOLS {
-            assert!(
-                !gated.iter().any(|t| &t.name == name),
-                "{name} 仍在请求里"
-            );
+            assert!(!gated.iter().any(|t| &t.name == name), "{name} 仍在请求里");
         }
         // 转写不受影响:音频进、文本出,与播放无关。
         assert!(
@@ -6155,6 +6210,156 @@ mod tests {
         // Should run successfully with custom prompt
         let output = agent.run(&input).unwrap();
         assert!(!output.continue_loop);
+    }
+
+    /// Build an agent whose LLM path is the non-streaming one, so the mock's
+    /// scripted responses are what drive the loop.
+    fn session_log_agent(mock: MockHostFunctions) -> Agent<MockHostFunctions> {
+        Agent::with_config(
+            mock,
+            AgentConfig {
+                use_streaming: false,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn session_log_input(user_message: &str) -> AgentInput {
+        AgentInput {
+            session_id: "sess-log".into(),
+            mode: AgentMode::Agent,
+            user_message: user_message.into(),
+            ..Default::default()
+        }
+    }
+
+    /// `tool/call` must be recorded *before* the tool runs, and must carry the
+    /// id the result will carry. Without this, a run that dies mid-tool shows
+    /// nothing about what it attempted — which is the run worth debugging.
+    #[test]
+    fn every_executed_tool_is_announced_before_it_runs() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "t1".into(),
+                call_id: None,
+                name: "read_file".into(),
+                arguments: serde_json::json!({ "path": "a.txt" }),
+                signature: None,
+            }],
+            reasoning: None,
+        });
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("read a.txt")).unwrap();
+
+        let events = agent.host.recorded_events.borrow().clone();
+        let tool_events: Vec<&String> = events
+            .iter()
+            .filter(|e| e.starts_with("call:") || e.starts_with("result:"))
+            .collect();
+        assert_eq!(
+            tool_events,
+            vec!["call:read_file:t1", "result:read_file:t1"],
+            "full event stream was {events:?}"
+        );
+    }
+
+    /// The pairing id is `call_id` when the provider supplied one, because that
+    /// is what the tool result carries.
+    #[test]
+    fn an_announced_tool_uses_the_same_id_the_result_will_use() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "internal".into(),
+                call_id: Some("provider-call-id".into()),
+                name: "read_file".into(),
+                arguments: serde_json::json!({ "path": "a.txt" }),
+                signature: None,
+            }],
+            reasoning: None,
+        });
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("read a.txt")).unwrap();
+
+        let events = agent.host.recorded_events.borrow().clone();
+        assert!(
+            events.contains(&"call:read_file:provider-call-id".to_string()),
+            "expected the call to be announced under the provider call id, got {events:?}"
+        );
+        assert!(
+            events.contains(&"result:read_file:provider-call-id".to_string()),
+            "expected the result under the same id, got {events:?}"
+        );
+    }
+
+    /// Turn and step boundaries must pair, including on the iteration that
+    /// breaks out of the loop — that is what the drop guard is for.
+    #[test]
+    fn a_run_emits_paired_turn_and_step_boundaries() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "t1".into(),
+                call_id: None,
+                name: "read_file".into(),
+                arguments: serde_json::json!({ "path": "a.txt" }),
+                signature: None,
+            }],
+            reasoning: None,
+        });
+        let agent = session_log_agent(mock);
+        agent.run(&session_log_input("read a.txt")).unwrap();
+
+        let events = agent.host.recorded_events.borrow().clone();
+        let boundaries: Vec<&String> = events
+            .iter()
+            .filter(|e| e.starts_with("turn/") || e.starts_with("step/"))
+            .collect();
+
+        assert_eq!(boundaries.first().map(|s| s.as_str()), Some("turn/start:1"));
+        assert_eq!(boundaries.last().map(|s| s.as_str()), Some("turn/end:1"));
+
+        let starts = boundaries.iter().filter(|e| e.contains("/start:")).count();
+        let ends = boundaries.iter().filter(|e| e.contains("/end:")).count();
+        assert_eq!(starts, ends, "unbalanced boundaries: {boundaries:?}");
+
+        // Two steps: the one that asked for the tool, and the one that saw its
+        // result and finished.
+        let step_starts: Vec<&&String> = boundaries
+            .iter()
+            .filter(|e| e.starts_with("step/start:"))
+            .collect();
+        assert_eq!(
+            step_starts,
+            vec![
+                &&"step/start:1/0".to_string(),
+                &&"step/start:1/1".to_string()
+            ],
+            "full boundary stream was {boundaries:?}"
+        );
+    }
+
+    /// The derived turn number counts the user messages already in history.
+    #[test]
+    fn a_second_turn_is_numbered_from_the_history_it_carries() {
+        let mock = MockHostFunctions::new();
+        let agent = session_log_agent(mock);
+        let mut input = session_log_input("and again");
+        input.history = vec![
+            Message::user("first ask"),
+            Message::assistant("first answer"),
+        ];
+        agent.run(&input).unwrap();
+
+        let events = agent.host.recorded_events.borrow().clone();
+        assert!(
+            events.contains(&"turn/start:2".to_string()),
+            "expected turn 2, got {events:?}"
+        );
     }
 
     #[test]

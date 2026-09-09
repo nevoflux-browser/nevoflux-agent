@@ -1,0 +1,9 @@
+{"seq":1,"ts":1757000000000,"type":"turn/start","turn":1}
+{"seq":2,"ts":1757000000001,"type":"system/message","content":"SYS","sections":[],"origin":"kernel"}
+{"seq":3,"ts":1757000000002,"type":"user/message","content":"read a.txt","attachments":[],"origin":"user"}
+{"seq":4,"ts":1757000000003,"type":"request/header","provider":"anthropic","model":"claude-opus-5","tools_hash":"0000000000000000","reason":"initial"}
+{"seq":5,"ts":1757000000004,"type":"step/start","step":0,"turn":1}
+{"seq":6,"ts":1757000000005,"type":"tool/call","id":"t1","name":"read_file","args":{"path":"a.txt"},"origin":"model"}
+{"seq":7,"ts":1757000000006,"type":"tool/result","id":"t1","content":"hello","is_error":false,"duration_ms":3}
+{"seq":8,"ts":1757000000007,"type":"step/end","step":0,"turn":1}
+{"seq":9,"ts":1757000000008,"type":"turn/end","turn":1}

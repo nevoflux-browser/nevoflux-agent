@@ -120,6 +120,26 @@ struct StreamTraceData {
     accumulated_tool_calls: Vec<crate::wasm::llm::LlmToolCall>,
 }
 
+/// What a streaming response needs to become one `assistant/message` event.
+///
+/// Kept separate from [`StreamTraceData`] on purpose: trace data exists only
+/// when a trace collector is attached, but `AgentConfig` defaults to
+/// `use_streaming: true`, so streaming is the common path and the session log
+/// has to cover it unconditionally or invariant I1 holds only for the rare
+/// non-streaming case.
+struct StreamEventData {
+    /// Provider that served the stream.
+    provider: String,
+    /// Model that served the stream.
+    model: String,
+    /// Text accumulated across chunks.
+    text: String,
+    /// Tool calls accumulated across chunks.
+    tool_calls: Vec<crate::wasm::llm::LlmToolCall>,
+    /// Usage from the terminal chunk, when the provider sent any.
+    usage: Option<crate::wasm::llm::LlmUsage>,
+}
+
 /// Per-stream spend accounting for a run [`crate::agent_exec::TokenBudget`].
 ///
 /// Created in `llm_stream_start` only when the host carries a budget; updated
@@ -184,6 +204,9 @@ pub struct DaemonHostFunctions {
     current_iteration: AtomicU32,
     /// Trace metadata for in-flight streaming LLM calls, keyed by stream_id.
     stream_trace_data: Arc<Mutex<HashMap<u64, StreamTraceData>>>,
+    /// Session-log accumulation for in-flight streams, keyed by stream_id.
+    /// Populated whenever there is a session to attribute events to.
+    stream_event_data: Arc<Mutex<HashMap<u64, StreamEventData>>>,
     /// Token-budget accounting for in-flight streams, keyed by stream_id.
     /// Only populated when [`Self::token_budget`] is `Some`.
     stream_budget_data: Arc<Mutex<HashMap<u64, StreamBudgetData>>>,
@@ -264,6 +287,7 @@ impl DaemonHostFunctions {
             trace_collector: None,
             current_iteration: AtomicU32::new(0),
             stream_trace_data: Arc::new(Mutex::new(HashMap::new())),
+            stream_event_data: Arc::new(Mutex::new(HashMap::new())),
             stream_budget_data: Arc::new(Mutex::new(HashMap::new())),
             model_override_provider: Arc::new(Mutex::new(None)),
             model_override_model: Arc::new(Mutex::new(None)),
@@ -1177,6 +1201,69 @@ impl DaemonHostFunctions {
             }),
         }
     }
+
+    /// Build a session event writer for the current session, if there is one.
+    ///
+    /// Returns `None` when there are no services (unit tests) or no session id
+    /// to attribute events to — logging is best-effort and must never be the
+    /// reason a request fails (design spec §3.4).
+    fn event_writer(&self) -> Option<crate::session_events::SessionEventWriter> {
+        let services = self.services.as_ref()?;
+        let session_id = self
+            .session_id
+            .as_deref()
+            .unwrap_or(services.session_id.as_str());
+        if session_id.is_empty() {
+            return None;
+        }
+        Some(crate::session_events::SessionEventWriter::new(
+            services.database.clone(),
+            session_id.to_string(),
+        ))
+    }
+
+    /// Log a compaction, so the log explains why what the model was shown
+    /// suddenly shrank (invariant I1: a compaction changes model-visible
+    /// content, so it has to be derivable from the log).
+    ///
+    /// `saved` is the compressor's own estimate; `after` is measured the same
+    /// way the compressor measures (chars/4), so the two numbers are consistent
+    /// with each other. Neither is a provider token count.
+    fn record_compaction(&self, trigger: &str, final_messages: &[ContextMessage], saved: u32) {
+        let Some(writer) = self.event_writer() else {
+            return;
+        };
+        let after_tokens = (final_messages
+            .iter()
+            .map(|m| m.content.len())
+            .sum::<usize>()
+            / 4) as u64;
+        writer.append(
+            nevoflux_protocol::session_event::SessionEventPayload::ContextCompact {
+                trigger: trigger.to_string(),
+                before_tokens: after_tokens + saved as u64,
+                after_tokens,
+            },
+        );
+    }
+}
+
+/// Map a provider's reported usage onto the session log's `TokenUsage`.
+///
+/// The cache fields stay `None` here because `LlmUsage` does not carry them
+/// yet — P2 (prefix caching) is what makes them meaningful and will widen
+/// `LlmUsage` to match. Recording an invented zero would make the log claim a
+/// cache miss that was never measured.
+fn usage_to_event(
+    usage: Option<&crate::wasm::llm::LlmUsage>,
+) -> Option<nevoflux_protocol::session_event::TokenUsage> {
+    let u = usage?;
+    Some(nevoflux_protocol::session_event::TokenUsage {
+        input_tokens: Some(u.prompt_tokens as u64),
+        output_tokens: Some(u.completion_tokens as u64),
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+    })
 }
 
 /// Resolve the effective "Agent execution" tier for the permission gate.
@@ -1255,7 +1342,7 @@ impl HostFunctions for DaemonHostFunctions {
     /// continuation anchor can name what already happened (spec §4.1). Best
     /// effort: skips when no services/session, empty content, or the meta
     /// `think` tool (reasoning, not an observation).
-    fn record_tool_result(&self, tool_name: &str, tool_id: &str, content: &str, _success: bool) {
+    fn record_tool_result(&self, tool_name: &str, tool_id: &str, content: &str, success: bool) {
         if content.trim().is_empty() || tool_name == "think" {
             return;
         }
@@ -1284,6 +1371,61 @@ impl HostFunctions for DaemonHostFunctions {
         {
             tracing::warn!(tool = tool_name, error = %e, "record_tool_result: persist failed");
         }
+
+        // Session event log, alongside the message row above rather than
+        // instead of it: P0 only adds a channel, it does not move the UI's
+        // read path (design spec §3.3).
+        if let Some(writer) = self.event_writer() {
+            writer.append(
+                nevoflux_protocol::session_event::SessionEventPayload::ToolResult {
+                    id: tool_id.to_string(),
+                    content: content.to_string(),
+                    is_error: !success,
+                    // Timing is measured in the tool pipeline P1 introduces;
+                    // 0 here means "not measured", not "instant".
+                    duration_ms: 0,
+                },
+            );
+        }
+    }
+
+    fn record_tool_call(&self, tool_name: &str, tool_id: &str, args_json: &str) {
+        let Some(writer) = self.event_writer() else {
+            return;
+        };
+        writer.append(
+            nevoflux_protocol::session_event::SessionEventPayload::ToolCall {
+                id: tool_id.to_string(),
+                name: tool_name.to_string(),
+                args: serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null),
+                // P1 threads the real origin through `ToolContext`; every P0
+                // call site is the model's own loop.
+                origin: nevoflux_protocol::session_event::ToolOrigin::model(),
+                tab_url: None,
+            },
+        );
+    }
+
+    fn record_turn_boundary(&self, turn: u32, start: bool) {
+        let Some(writer) = self.event_writer() else {
+            return;
+        };
+        writer.append(if start {
+            nevoflux_protocol::session_event::SessionEventPayload::TurnStart { turn }
+        } else {
+            nevoflux_protocol::session_event::SessionEventPayload::TurnEnd { turn }
+        });
+    }
+
+    fn record_step_boundary(&self, turn: u32, step: u32, start: bool) {
+        let Some(writer) = self.event_writer() else {
+            return;
+        };
+        writer.append(if start {
+            nevoflux_protocol::session_event::SessionEventPayload::StepStart { step, turn }
+        } else {
+            nevoflux_protocol::session_event::SessionEventPayload::StepEnd { step, turn }
+        });
     }
 
     fn llm_chat(&self, request: &LlmRequest) -> HostResult<LlmResponse> {
@@ -1452,6 +1594,7 @@ impl HostFunctions for DaemonHostFunctions {
                 }
 
                 final_messages.extend(recent);
+                self.record_compaction("pressure", &final_messages, saved);
                 // Use convert_request_with_messages for compressed messages
                 // Note: This will lose tool_calls - compression and tool calling are incompatible
                 self.convert_request_with_messages(request, &final_messages)
@@ -1462,6 +1605,14 @@ impl HostFunctions for DaemonHostFunctions {
                 self.convert_request_to_daemon(request)
             }
         };
+
+        // Session event log (design spec §3.4). Both conversion branches join
+        // on `daemon_request`, so this is the one place that sees every
+        // request; logging above the match would only catch the compacted
+        // branch, which is the rarer one.
+        if let Some(writer) = self.event_writer() {
+            writer.record_request(&daemon_request, &provider_name, &model);
+        }
 
         // Serialize the request for trace recording before it's consumed by execute_llm_chat
         let trace_request_value = if self.trace_collector.is_some() {
@@ -1537,6 +1688,30 @@ impl HostFunctions for DaemonHostFunctions {
                             budget.add(estimated);
                         }
                     }
+                }
+
+                // Session event log: one assistant/message per successful
+                // response, with the provider's own usage numbers when it
+                // reported them (design spec §3.2).
+                if let Some(writer) = self.event_writer() {
+                    let logged_calls = response
+                        .tool_calls
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|tc| nevoflux_protocol::session_event::LoggedToolCall {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            args: tc.arguments.clone(),
+                        })
+                        .collect();
+                    writer.record_assistant(
+                        &response.content,
+                        logged_calls,
+                        usage_to_event(response.usage.as_ref()),
+                        &provider_name,
+                        &model,
+                    );
                 }
 
                 // Convert tool calls, preserving call_id for OpenAI Responses API compatibility
@@ -1760,12 +1935,18 @@ impl HostFunctions for DaemonHostFunctions {
                 }
 
                 final_messages.extend(recent);
+                self.record_compaction("pressure", &final_messages, saved);
                 self.convert_request_with_messages(&mutable_request, &final_messages)
             }
             CompressionResult::NotNeeded | CompressionResult::Skipped { .. } => {
                 self.convert_request_to_daemon(&mutable_request)
             }
         };
+
+        // Session event log (design spec §3.4) — same join point as `llm_chat`.
+        if let Some(writer) = self.event_writer() {
+            writer.record_request(&daemon_request, &provider_name, &model);
+        }
 
         // Serialize request for trace recording before it's consumed
         let trace_request_value = self
@@ -1877,6 +2058,21 @@ impl HostFunctions for DaemonHostFunctions {
             stream_id
         };
 
+        // Open session-log accumulation for this stream. Unconditional (given a
+        // session), unlike the trace data below.
+        if self.event_writer().is_some() {
+            self.stream_event_data.lock().unwrap().insert(
+                stream_id,
+                StreamEventData {
+                    provider: provider_name.clone(),
+                    model: model.clone(),
+                    text: String::new(),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                },
+            );
+        }
+
         // Store trace data for this stream
         if self.trace_collector.is_some() {
             self.stream_trace_data.lock().unwrap().insert(
@@ -1916,6 +2112,19 @@ impl HostFunctions for DaemonHostFunctions {
     ) -> HostResult<Option<nevoflux_builtin_wasm::LlmChunk>> {
         match self.stream_registry.next_chunk(stream_id) {
             Ok(Some(chunk)) => {
+                // Accumulate for the session event log.
+                if let Ok(mut event_map) = self.stream_event_data.lock() {
+                    if let Some(data) = event_map.get_mut(&stream_id) {
+                        if let Some(ref text) = chunk.text {
+                            data.text.push_str(text);
+                        }
+                        data.tool_calls.extend(chunk.tool_calls.clone());
+                        if let Some(ref usage) = chunk.usage {
+                            data.usage = Some(usage.clone());
+                        }
+                    }
+                }
+
                 // Accumulate for trace recording
                 if self.trace_collector.is_some() {
                     if let Ok(mut trace_map) = self.stream_trace_data.lock() {
@@ -2038,6 +2247,28 @@ impl HostFunctions for DaemonHostFunctions {
             if let Some(data) = leftover {
                 self.settle_stream_budget(stream_id, data);
             }
+        }
+
+        // One assistant/message per stream, emitted on close so it lands
+        // exactly once however the stream ended (done chunk, interrupt, abort).
+        let event_data = self.stream_event_data.lock().unwrap().remove(&stream_id);
+        if let (Some(data), Some(writer)) = (event_data, self.event_writer()) {
+            let logged_calls = data
+                .tool_calls
+                .iter()
+                .map(|tc| nevoflux_protocol::session_event::LoggedToolCall {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    args: tc.arguments.clone(),
+                })
+                .collect();
+            writer.record_assistant(
+                &data.text,
+                logged_calls,
+                usage_to_event(data.usage.as_ref()),
+                &data.provider,
+                &data.model,
+            );
         }
 
         // End any open thinking block before closing the stream
@@ -6627,6 +6858,7 @@ impl DaemonHostFunctions {
             trace_collector: self.trace_collector.clone(),
             current_iteration: AtomicU32::new(self.current_iteration.load(Ordering::Relaxed)),
             stream_trace_data: self.stream_trace_data.clone(),
+            stream_event_data: self.stream_event_data.clone(),
             // Shared with the parent (like stream_trace_data): stream ids come
             // from the shared registry, so accounting must live in one map.
             stream_budget_data: self.stream_budget_data.clone(),
