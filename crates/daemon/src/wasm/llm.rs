@@ -4317,6 +4317,58 @@ enum AcpAttempt {
     ContextLengthRetry,
 }
 
+/// Log a tool the ACP agent ran inside its own process.
+///
+/// These never reach `execute_mcp_tool`: the agent executes Bash/Read/Edit and
+/// friends itself and NevoFlux only sees the finished result on the update
+/// stream. That has two consequences worth being explicit about.
+///
+/// **They cannot be gated.** By the time this notification arrives the tool has
+/// already run in another process. `tool_pipeline` can refuse a NevoFlux tool;
+/// it has nothing to refuse here. A pack rule that denies `create_artifact`
+/// therefore stops the artifact but not an agent that writes the same HTML to
+/// disk with its own editor — observed, not hypothesised.
+///
+/// **They still have to be logged.** The model saw these results, so leaving
+/// them out would break the one thing the log promises (invariant I1). The
+/// `origin` says `acp` rather than `model` precisely so a reader can tell a
+/// call that passed the gate from one that was only ever watched.
+///
+/// The pair is minted here because the stream carries no call id, and
+/// `AcpUpdate` has no ToolCall variant at all — only the terminal result — so
+/// `args` is null and the duration is unknown rather than guessed.
+fn log_native_acp_tool(
+    services: &crate::wasm::services::HostServices,
+    tool_name: &str,
+    content: &str,
+) {
+    let writer = crate::session_events::SessionEventWriter::new(
+        services.database.clone(),
+        services.session_id.clone(),
+    );
+    let id = format!("acp-{}", uuid::Uuid::new_v4());
+    writer.append(
+        nevoflux_protocol::session_event::SessionEventPayload::ToolCall {
+            id: id.clone(),
+            name: tool_name.to_string(),
+            args: serde_json::Value::Null,
+            origin: nevoflux_protocol::session_event::ToolOrigin::from_raw("acp"),
+            tab_url: None,
+        },
+    );
+    writer.append(
+        nevoflux_protocol::session_event::SessionEventPayload::ToolResult {
+            id,
+            content: content.to_string(),
+            // The stream reports a terminal status but not a verdict we can
+            // map to success, and guessing from the text would be worse than
+            // saying nothing.
+            is_error: false,
+            duration_ms: 0,
+        },
+    );
+}
+
 /// Send one prompt and consume its streamed updates, forwarding text/thought/
 /// tool-result chunks to `tx` exactly as the inline loop did. Returns
 /// `Completed` on `Complete`/clean close, `ContextLengthRetry` on a
@@ -4372,6 +4424,7 @@ async fn drive_acp_prompt(
                     crate::wasm::mcp_tool_executor::record_acp_tool_result(
                         services, &tool_name, &content,
                     );
+                    log_native_acp_tool(services, &tool_name, &content);
                 }
             }
             AcpUpdate::Complete(_) => {

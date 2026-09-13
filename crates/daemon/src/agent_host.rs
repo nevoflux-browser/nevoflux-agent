@@ -211,12 +211,6 @@ pub struct DaemonHostFunctions {
     /// by the agent before its first request so a `system/message` event can
     /// name which section changed.
     prompt_sections: Arc<Mutex<Vec<nevoflux_protocol::session_event::PromptSection>>>,
-    /// Site rules from installed packs, reloaded when the packs directory
-    /// changes rather than re-parsed on every tool call.
-    installed_rules: Arc<crate::tool_pipeline::site_policy::InstalledRules>,
-    /// Compiled pack hook modules, rebuilt on the same signal. Compiling per
-    /// tool call would be felt; each call still gets its own Store.
-    hook_registry: Arc<crate::tool_pipeline::pack_hook_stage::HookRegistry>,
     /// Token-budget accounting for in-flight streams, keyed by stream_id.
     /// Only populated when [`Self::token_budget`] is `Some`.
     stream_budget_data: Arc<Mutex<HashMap<u64, StreamBudgetData>>>,
@@ -299,8 +293,6 @@ impl DaemonHostFunctions {
             stream_trace_data: Arc::new(Mutex::new(HashMap::new())),
             stream_event_data: Arc::new(Mutex::new(HashMap::new())),
             prompt_sections: Arc::new(Mutex::new(Vec::new())),
-            installed_rules: Arc::new(Default::default()),
-            hook_registry: Arc::new(Default::default()),
             stream_budget_data: Arc::new(Mutex::new(HashMap::new())),
             model_override_provider: Arc::new(Mutex::new(None)),
             model_override_model: Arc::new(Mutex::new(None)),
@@ -1289,6 +1281,51 @@ impl DaemonHostFunctions {
         }
     }
 
+    /// Active packs that declared a prompt replace mode, as (pack, declared).
+    ///
+    /// Provenance is not recorded yet -- a skill does not carry the pack it
+    /// came from -- so this manifest scan is the only attribution available.
+    /// It is safe only when it yields exactly one candidate; both callers treat
+    /// anything else as unattributable and refuse, because crediting the wrong
+    /// pack in the audit trail is worse than refusing a call.
+    fn prompt_replace_candidates(&self) -> Vec<(String, String)> {
+        let Some(services) = self.services.as_ref() else {
+            return Vec::new();
+        };
+        let paths = crate::paths::resolve_from_daemon();
+        let active: Vec<String> = services
+            .active_packs
+            .read()
+            .map(|g| g.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        for name in &active {
+            let manifest_path = paths.packs_dir().join(name).join("pack.toml");
+            let Ok(src) = std::fs::read_to_string(&manifest_path) else {
+                continue;
+            };
+            let Ok(manifest) = nevoflux_pack::manifest::Manifest::parse(&src) else {
+                continue;
+            };
+            if let Some(pc) = &manifest.components.prompt {
+                if pc.replace != "none" {
+                    candidates.push((manifest.pack.name.clone(), pc.replace.clone()));
+                }
+            }
+        }
+        candidates
+    }
+
+    /// The pack a prompt call can be attributed to, when exactly one can be.
+    fn prompt_replacing_pack(&self) -> Option<String> {
+        let mut c = self.prompt_replace_candidates();
+        match c.len() {
+            1 => Some(c.remove(0).0),
+            _ => None,
+        }
+    }
+
     /// Build a session event writer for the current session, if there is one.
     ///
     /// Returns `None` when there are no services (unit tests) or no session id
@@ -1447,12 +1484,59 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 static NETWORK_CAPTURE_ARMED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether a pack may be taken out of the session, asking the user when it is
+/// carrying guards.
+///
+/// See also [`DaemonHostFunctions::prompt_replacing_pack`], which answers the
+/// neighbouring question of who is allowed to speak through the prompt.
+///
+/// Split out of [`DaemonHostFunctions::pack_deactivate`] so the decision can be
+/// tested against a packs directory a test controls. `ask` is the question
+/// channel; it answers false when there is nobody to ask, which is what makes
+/// an unattended run refuse instead of hanging.
+///
+/// Returns the refusal text on `Err`, already phrased for the model.
+fn consent_to_deactivate(
+    packs_dir: &std::path::Path,
+    name: &str,
+    is_active: bool,
+    ask: &dyn Fn(&str) -> bool,
+) -> Result<(), String> {
+    if !is_active {
+        return Ok(());
+    }
+    let guards =
+        crate::tool_pipeline::site_policy::load_active_rules(packs_dir, &[name.to_string()]);
+    if guards.is_empty() {
+        // Skills, prompt, seed content: nothing is being lifted, so nothing to
+        // ask about.
+        return Ok(());
+    }
+    let question = format!(
+        "The assistant wants to deactivate the pack `{name}`, which is currently \
+         restricting what it may do ({} rule(s)). Deactivating removes those \
+         restrictions for the rest of this session.",
+        guards.len()
+    );
+    if ask(&question) {
+        return Ok(());
+    }
+    Err(format!(
+        "[POLICY_DENIED] `{name}` is enforcing rules on this session and was not \
+         deactivated.\nThis is a policy decision, not a tool failure. Do not retry \
+         this call."
+    ))
+}
+
 impl HostFunctions for DaemonHostFunctions {
-    /// Persist a completed tool's result as a `tool_result` message so the goal
-    /// evaluator reads the raw observation (not the model's paraphrase) and the
-    /// continuation anchor can name what already happened (spec §4.1). Best
-    /// effort: skips when no services/session, empty content, or the meta
-    /// `think` tool (reasoning, not an observation).
+    /// Log the result, and persist it as a `tool_result` message.
+    ///
+    /// Two sinks with different rules, on purpose. The session event is written
+    /// for every call, because `tool/call` was; the message row is the goal
+    /// evaluator's raw observation (not the model's paraphrase) and the
+    /// continuation anchor's evidence (spec §4.1), so it skips what is not an
+    /// observation: empty content, and the meta `think` tool. Both are best
+    /// effort and neither can fail the call.
     fn record_tool_result(
         &self,
         tool_name: &str,
@@ -1461,6 +1545,21 @@ impl HostFunctions for DaemonHostFunctions {
         success: bool,
         duration_ms: u64,
     ) {
+        // Logged before the skips below, and for every call: `tool/call` is
+        // written unconditionally, so a result the log drops leaves a call
+        // that never ends (invariant I1). The message row is a different
+        // thing with different rules — see below.
+        if let Some(writer) = self.event_writer() {
+            writer.append(
+                nevoflux_protocol::session_event::SessionEventPayload::ToolResult {
+                    id: tool_id.to_string(),
+                    content: content.to_string(),
+                    is_error: !success,
+                    duration_ms,
+                },
+            );
+        }
+
         if content.trim().is_empty() || tool_name == "think" {
             return;
         }
@@ -1488,20 +1587,6 @@ impl HostFunctions for DaemonHostFunctions {
             .create(params)
         {
             tracing::warn!(tool = tool_name, error = %e, "record_tool_result: persist failed");
-        }
-
-        // Session event log, alongside the message row above rather than
-        // instead of it: P0 only adds a channel, it does not move the UI's
-        // read path (design spec §3.3).
-        if let Some(writer) = self.event_writer() {
-            writer.append(
-                nevoflux_protocol::session_event::SessionEventPayload::ToolResult {
-                    id: tool_id.to_string(),
-                    content: content.to_string(),
-                    is_error: !success,
-                    duration_ms,
-                },
-            );
         }
     }
 
@@ -1541,32 +1626,7 @@ impl HostFunctions for DaemonHostFunctions {
             });
         }
 
-        // Which active pack is asking? Provenance is not recorded yet -- a
-        // skill does not carry the pack it came from -- so attribution is only
-        // safe when exactly one active pack declared a replace mode. With
-        // several, refusing beats crediting the wrong pack in the audit trail.
-        let paths = crate::paths::resolve_from_daemon();
-        let active: Vec<String> = services
-            .active_packs
-            .read()
-            .map(|g| g.iter().cloned().collect())
-            .unwrap_or_default();
-
-        let mut candidates: Vec<(String, String)> = Vec::new();
-        for name in &active {
-            let manifest_path = paths.packs_dir().join(name).join("pack.toml");
-            let Ok(src) = std::fs::read_to_string(&manifest_path) else {
-                continue;
-            };
-            let Ok(manifest) = nevoflux_pack::manifest::Manifest::parse(&src) else {
-                continue;
-            };
-            if let Some(pc) = &manifest.components.prompt {
-                if pc.replace != "none" {
-                    candidates.push((manifest.pack.name.clone(), pc.replace.clone()));
-                }
-            }
-        }
+        let mut candidates = self.prompt_replace_candidates();
 
         let (pack, declared) = match candidates.len() {
             0 => {
@@ -1632,11 +1692,42 @@ impl HostFunctions for DaemonHostFunctions {
         ))
     }
 
+    /// Hand the system prompt back to the kernel.
+    ///
+    /// Only the pack holding it may do this. `system_prompt_replace` is already
+    /// exclusive so that one pack cannot make another's discipline vanish
+    /// (spec A8); without the same check here the exclusivity was only half
+    /// enforced, and a second pack could drop the first one's prompt through
+    /// `restore` instead of through `replace`.
+    ///
+    /// The attribution is the same best-effort one `replace` uses -- the single
+    /// active pack declaring a replace mode -- because a skill still does not
+    /// carry the pack it came from. When that cannot name the holder the call
+    /// is refused rather than guessed at.
     fn system_prompt_restore(&self) -> HostResult<String> {
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
             message: "Services not available".into(),
         })?;
+
+        let holder = services
+            .prompt_override
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|(pack, _, _)| pack.clone()));
+        if let Some(holder) = holder {
+            let caller = self.prompt_replacing_pack();
+            if caller.as_deref() != Some(holder.as_str()) {
+                return Err(HostError {
+                    code: 409,
+                    message: format!(
+                        "PROMPT_HELD_BY: `{holder}` replaced the prompt and is the only one \
+                         that may restore it"
+                    ),
+                });
+            }
+        }
+
         let held = services
             .prompt_override
             .write()
@@ -1703,11 +1794,36 @@ impl HostFunctions for DaemonHostFunctions {
         Ok(format!("pack `{name}` is active for this session"))
     }
 
+    /// Take a pack out of this session.
+    ///
+    /// Asks first when the pack is carrying guards. A pack whose `active`-scope
+    /// `tool_policy` is in force is restraining the very model making this
+    /// call, and letting that model lift the restraint on its own would make a
+    /// session guard loosen mid-session — the opposite of what a guard is for.
+    /// Only a person can lift it, and since nothing else in the product can
+    /// deactivate a pack (there is no RPC and no UI for it), this dialog *is*
+    /// how they do it.
+    ///
+    /// Deliberately narrow: packs that contribute only skills, prompt or seed
+    /// content are taken out without a word, because nothing is being lifted.
+    /// And an unattended run refuses rather than asking — `ask_user_allow`
+    /// already answers no when there is nobody to ask (invariant I6), so a
+    /// `/loop` cannot free itself by deactivating what constrains it.
     fn pack_deactivate(&self, name: &str) -> HostResult<String> {
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
             message: "Services not available".into(),
         })?;
+
+        let is_active = services
+            .active_packs
+            .read()
+            .map(|g| g.contains(name))
+            .unwrap_or(false);
+        let packs_dir = crate::paths::resolve_from_daemon().packs_dir();
+        consent_to_deactivate(&packs_dir, name, is_active, &|q| self.ask_user_allow(q))
+            .map_err(|message| HostError { code: 4, message })?;
+
         let removed = services
             .active_packs
             .write()
@@ -1720,6 +1836,31 @@ impl HostFunctions for DaemonHostFunctions {
                         pack: name.to_string(),
                     },
                 );
+            }
+
+            // A pack that is no longer in the session does not get to keep
+            // speaking through the prompt. Spec 4.3.2 names this as one of the
+            // three ways a replacement ends; without it a deactivated pack's
+            // instructions stayed in force with nothing left to attribute them
+            // to -- and `system_prompt_restore` would then refuse, because the
+            // holder was no longer active to be named.
+            let released = services
+                .prompt_override
+                .write()
+                .ok()
+                .and_then(|mut g| match g.as_ref() {
+                    Some((holder, _, _)) if holder == name => g.take(),
+                    _ => None,
+                })
+                .is_some();
+            if released {
+                if let Some(writer) = self.event_writer() {
+                    writer.append(
+                        nevoflux_protocol::session_event::SessionEventPayload::PackPromptRestore {
+                            pack: name.to_string(),
+                        },
+                    );
+                }
             }
         }
         Ok(format!("pack `{name}` is no longer active"))
@@ -1807,28 +1948,15 @@ impl HostFunctions for DaemonHostFunctions {
         call: &nevoflux_builtin_wasm::ToolCall,
         ctx: &nevoflux_builtin_wasm::ToolContext,
     ) -> nevoflux_builtin_wasm::ToolGate {
-        // Order is spec 4.1: installed pack policy, then the run allowlist.
+        // The stage order lives in `tool_pipeline::default_pipeline`, shared
+        // with the MCP dispatcher so both entry points judge a call the same
+        // way (invariant I2).
+        //
         // The permission gate is not here on purpose — it keeps its own dialog
         // inside the host functions, where it knows the honest name of the
         // action and the resolved arguments. See `tool_pipeline`'s module docs.
         let packs_dir = crate::paths::resolve_from_daemon().packs_dir();
-        let mut rules = self.installed_rules.get(&packs_dir);
-        // Plus the `active`-scope rules of packs this session has activated.
-        // Read fresh rather than cached: activation changes within a session,
-        // which is the case the mtime cache cannot see.
-        if let Some(services) = self.services.as_ref() {
-            let active: Vec<String> = services
-                .active_packs
-                .read()
-                .map(|g| g.iter().cloned().collect())
-                .unwrap_or_default();
-            rules.extend(crate::tool_pipeline::site_policy::load_active_rules(
-                &packs_dir, &active,
-            ));
-        }
-        // Pack hooks run after the declarative rules: a rule is cheap and a
-        // module is not, so a call a rule already refuses never pays for one.
-        let active_for_hooks: Vec<String> = self
+        let active: Vec<String> = self
             .services
             .as_ref()
             .and_then(|s| {
@@ -1838,20 +1966,11 @@ impl HostFunctions for DaemonHostFunctions {
                     .map(|g| g.iter().cloned().collect())
             })
             .unwrap_or_default();
-        let hooks = self
-            .hook_registry
-            .for_session(&packs_dir, &active_for_hooks);
-
-        let pipeline = crate::tool_pipeline::Pipeline::new(vec![
-            Box::new(crate::tool_pipeline::site_policy::SitePolicyStage::new(
-                rules,
-            )),
-            Box::new(crate::tool_pipeline::pack_hook_stage::PackHookStage::new(
-                hooks,
-            )),
-            Box::new(crate::tool_pipeline::allowlist::AllowlistStage),
-        ]);
-        pipeline.run(call, ctx, &|prompt: &str| self.ask_user_allow(prompt))
+        crate::tool_pipeline::default_pipeline(&packs_dir, &active).run(
+            call,
+            ctx,
+            &|prompt: &str| self.ask_user_allow(prompt),
+        )
     }
 
     fn record_turn_boundary(&self, turn: u32, start: bool) {
@@ -7376,8 +7495,6 @@ impl DaemonHostFunctions {
             stream_trace_data: self.stream_trace_data.clone(),
             stream_event_data: self.stream_event_data.clone(),
             prompt_sections: self.prompt_sections.clone(),
-            installed_rules: self.installed_rules.clone(),
-            hook_registry: self.hook_registry.clone(),
             // Shared with the parent (like stream_trace_data): stream ids come
             // from the shared registry, so accounting must live in one map.
             stream_budget_data: self.stream_budget_data.clone(),
@@ -8424,6 +8541,192 @@ async fn write_audio_to_composition(
 
 #[cfg(test)]
 mod tests {
+    // ------------------------------------------------------------------
+    // Taking a pack out of a session. A pack whose rules are in force is
+    // restraining the model making the call, so the model does not get to
+    // lift it alone -- and with no RPC or UI for deactivation anywhere else
+    // in the product, the dialog is the only way a person can.
+    // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // Who may hand the system prompt back. `system_prompt_replace` is exclusive
+    // so one pack cannot erase another's discipline (spec A8); `restore` has to
+    // be too, or the same erasure just takes the other door. And a pack that is
+    // no longer in the session does not get to keep speaking through the
+    // prompt -- spec 4.3.2 lists deactivation as one of the three ways a
+    // replacement ends.
+    // ------------------------------------------------------------------
+
+    fn host_with_prompt_held_by(pack: &str) -> super::DaemonHostFunctions {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let services = crate::wasm::services::HostServices::new(db).with_own_session_state();
+        *services.prompt_override.write().unwrap() = Some((
+            pack.to_string(),
+            "keep_kernel".to_string(),
+            "be terse".to_string(),
+        ));
+        super::DaemonHostFunctions::new(
+            std::sync::Arc::new(crate::config::AgentConfig::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .with_services(services)
+    }
+
+    #[tokio::test]
+    async fn a_prompt_cannot_be_restored_by_a_pack_that_did_not_take_it() {
+        use nevoflux_builtin_wasm::HostFunctions;
+        // No pack is active, so nothing can be attributed -- which is the same
+        // situation as a *different* pack asking, and is refused for the same
+        // reason: crediting the wrong pack is worse than refusing.
+        let host = host_with_prompt_held_by("focus");
+        let err = host.system_prompt_restore().unwrap_err();
+        assert_eq!(err.code, 409);
+        assert!(
+            err.message.contains("PROMPT_HELD_BY"),
+            "got: {}",
+            err.message
+        );
+        assert!(
+            host.services
+                .as_ref()
+                .unwrap()
+                .prompt_override
+                .read()
+                .unwrap()
+                .is_some(),
+            "the refusal has to leave the prompt where it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn deactivating_the_holder_gives_the_prompt_back() {
+        use nevoflux_builtin_wasm::HostFunctions;
+        let host = host_with_prompt_held_by("focus");
+        let services = host.services.as_ref().unwrap().clone();
+        services
+            .active_packs
+            .write()
+            .unwrap()
+            .insert("focus".into());
+
+        // No `active`-scope rules on disk for this name, so no question is
+        // asked -- the prompt is simply handed back.
+        host.pack_deactivate("focus").unwrap();
+
+        assert!(
+            services.prompt_override.read().unwrap().is_none(),
+            "a deactivated pack kept speaking through the prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn deactivating_someone_else_leaves_the_prompt_alone() {
+        use nevoflux_builtin_wasm::HostFunctions;
+        let host = host_with_prompt_held_by("focus");
+        let services = host.services.as_ref().unwrap().clone();
+        services
+            .active_packs
+            .write()
+            .unwrap()
+            .insert("other".into());
+
+        host.pack_deactivate("other").unwrap();
+
+        assert!(services.prompt_override.read().unwrap().is_some());
+    }
+
+    fn guard_pack_dir(tag: &str, scope: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nf-deact-{tag}-{}", std::process::id()));
+        let pd = dir.join("bank-guard");
+        std::fs::create_dir_all(&pd).unwrap();
+        std::fs::write(
+            pd.join("pack.toml"),
+            format!(
+                r#"
+[pack]
+name = "bank-guard"
+version = "1.0.0"
+protocol = "pack-protocol/0.2"
+min_nevoflux = "0.0.1"
+
+[[components.tool_policy]]
+scope = "{scope}"
+deny = ["browser_click"]
+message = "not here"
+"#
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_pack_carrying_guards_is_not_deactivated_when_the_user_says_no() {
+        let dir = guard_pack_dir("no", "active");
+        let asked = std::cell::Cell::new(0);
+        let err = super::consent_to_deactivate(&dir, "bank-guard", true, &|_| {
+            asked.set(asked.get() + 1);
+            false
+        })
+        .unwrap_err();
+        assert_eq!(asked.get(), 1, "the user has to actually be asked");
+        assert!(err.contains("POLICY_DENIED"), "got: {err}");
+        // A refusal the model reads as an error would be retried; this one has
+        // to read as a decision.
+        assert!(err.contains("Do not retry"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_user_can_still_lift_it() {
+        let dir = guard_pack_dir("yes", "active");
+        assert!(super::consent_to_deactivate(&dir, "bank-guard", true, &|_| true).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unattended run has nobody to ask, and `ask_user_allow` answers false
+    /// in exactly that case -- so a `/loop` cannot free itself (invariant I6).
+    #[test]
+    fn an_unattended_run_cannot_free_itself() {
+        let dir = guard_pack_dir("unattended", "active");
+        assert!(super::consent_to_deactivate(&dir, "bank-guard", true, &|_| false).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pack_with_nothing_to_lift_goes_quietly() {
+        // `installed` rules survive deactivation, so taking the pack out lifts
+        // nothing and there is nothing to ask about. Same for a pack that only
+        // ships skills or prompt -- represented here by the absence of any
+        // `active` rule.
+        let dir = guard_pack_dir("installed", "installed");
+        let asked = std::cell::Cell::new(0);
+        assert!(
+            super::consent_to_deactivate(&dir, "bank-guard", true, &|_| {
+                asked.set(asked.get() + 1);
+                false
+            })
+            .is_ok()
+        );
+        assert_eq!(asked.get(), 0, "nothing was being lifted; do not nag");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pack_that_was_never_active_is_not_worth_a_question() {
+        let dir = guard_pack_dir("inactive", "active");
+        let asked = std::cell::Cell::new(0);
+        assert!(
+            super::consent_to_deactivate(&dir, "bank-guard", false, &|_| {
+                asked.set(asked.get() + 1);
+                false
+            })
+            .is_ok()
+        );
+        assert_eq!(asked.get(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use nevoflux_skills::{LoaderConfig, Skill, SkillMetadata, SkillRegistry};
     use nevoflux_storage::Database;

@@ -203,7 +203,13 @@ pub async fn run_agent_once(
         .cloned()
         .ok_or_else(|| "HostServices has no runtime_handle — bug at server boot".to_string())?;
 
-    let mut services_for_run = services.clone();
+    // A run is a task of its own, so it gets its own activated packs and
+    // prompt holder rather than the daemon-wide template's -- otherwise two
+    // loop iterations, and every chat, would be sharing one (spec 4.3.2).
+    // Subagents are the deliberate exception and do not come through here:
+    // they clone their parent's services, which is how `active` components
+    // reach them (spec 4.3).
+    let mut services_for_run = services.clone().with_own_session_state();
     services_for_run.session_id = req.session_id.clone();
     // Mark this clone as unattended so permission handlers in
     // `wasm::mcp_tool_executor` and `agent_host` short-circuit dialogs (there

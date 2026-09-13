@@ -196,6 +196,14 @@ pub struct HostServices {
     pub proxy_id: String,
     /// Current session ID for artifact creation and other session-scoped operations.
     pub session_id: String,
+    /// Who the tool calls dispatched through these services come from, in the
+    /// `ToolContext.origin` vocabulary (`model`, `mcp:<client>`, ...).
+    ///
+    /// The MCP dispatcher serves two callers that look identical from inside
+    /// it: an ACP provider relaying the model's own calls, and an external MCP
+    /// client calling our tools directly. The gate and the session log both
+    /// record who asked, so the difference has to survive the trip.
+    pub tool_origin: String,
     /// Tools that user has approved "Always Allow" (shared across requests in the same daemon).
     pub always_allowed_tools: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     /// Packs the session has activated (design spec 4.3).
@@ -209,8 +217,13 @@ pub struct HostServices {
     ///
     /// Exclusive on purpose: a second pack replacing the prompt would make the
     /// first pack's discipline vanish without either of them knowing. Held as
-    /// (pack, mode, body) and cleared when the pack releases it or the session
-    /// ends -- it never outlives the session.
+    /// (pack, mode, body).
+    ///
+    /// Released three ways, which are the three ways the task it belongs to can
+    /// end (spec 4.3.2): the holder calls `system_prompt_restore`, the holder is
+    /// deactivated, or the session ends. The last one is why
+    /// [`Self::with_own_session_state`] exists -- a session gets its own Arc, so
+    /// "ends" means something.
     pub prompt_override: Arc<std::sync::RwLock<Option<(String, String, String)>>>,
     /// True when this HostServices is the per-iteration clone owned by an
     /// `IterationExecutor`. The /loop skill's permission handler short-circuits
@@ -386,6 +399,8 @@ impl HostServices {
             client_identity: Vec::new(),
             proxy_id: String::new(),
             session_id: String::new(),
+            // The common case: an agent run, relaying what the model asked for.
+            tool_origin: "model".to_string(),
             always_allowed_tools: Arc::new(
                 std::sync::RwLock::new(std::collections::HashSet::new()),
             ),
@@ -438,6 +453,8 @@ impl HostServices {
             client_identity: Vec::new(),
             proxy_id: String::new(),
             session_id: String::new(),
+            // The common case: an agent run, relaying what the model asked for.
+            tool_origin: "model".to_string(),
             always_allowed_tools: Arc::new(
                 std::sync::RwLock::new(std::collections::HashSet::new()),
             ),
@@ -829,6 +846,27 @@ impl HostServices {
         self
     }
 
+    /// Give this copy its own activation state instead of the daemon-wide
+    /// template's.
+    ///
+    /// `HostServices` is `Clone` and Arc-backed, which is what lets a chat, its
+    /// subagents and its loop iterations share one set of managers. Two fields
+    /// must not be shared that widely: which packs a session activated, and
+    /// which pack has taken the system prompt. Both belong to one task (design
+    /// spec 4.3: a Pack lives from the start of a task to its end), and sharing
+    /// the template's Arc made them outlive it -- a pack's prompt replacement
+    /// stayed in force for every later conversation in the same daemon, which
+    /// is exactly what the spec's "不跨会话残留" forbids.
+    ///
+    /// Call this once where a chat session starts. Everything cloned from the
+    /// result keeps sharing *its* state, so a subagent still inherits the
+    /// session's active packs, as the spec intends.
+    pub fn with_own_session_state(mut self) -> Self {
+        self.active_packs = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+        self.prompt_override = Arc::new(std::sync::RwLock::new(None));
+        self
+    }
+
     /// Attach the daemon-global session→proxy tracker so `/loop` iterations
     /// can borrow a connected sidebar's proxy_id to fulfill `browser_*` tools.
     pub fn with_session_proxy_tracker(
@@ -1072,6 +1110,61 @@ impl std::fmt::Debug for HostServices {
 
 #[cfg(test)]
 mod tests {
+    // ------------------------------------------------------------------
+    // Session state. `HostServices` is Arc-backed and cloned everywhere, which
+    // is right for managers and wrong for the two fields that belong to one
+    // task: the packs a session activated, and who holds its prompt. Sharing
+    // the daemon-wide template's Arc made a pack's prompt replacement outlive
+    // the conversation that asked for it (spec 4.3.2: 不跨会话残留).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn two_chats_do_not_share_what_a_pack_took_over() {
+        let db = std::sync::Arc::new(super::Database::open_in_memory().unwrap());
+        let template = super::HostServices::new(db);
+
+        let first = template.clone().with_own_session_state();
+        *first.prompt_override.write().unwrap() =
+            Some(("focus".into(), "keep_kernel".into(), "be terse".into()));
+
+        let second = template.clone().with_own_session_state();
+        assert!(
+            second.prompt_override.read().unwrap().is_none(),
+            "a later conversation inherited a pack's prompt replacement"
+        );
+        // And the template itself is untouched, so a third chat starts clean
+        // whatever the first two did.
+        assert!(template.prompt_override.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn two_chats_do_not_share_activated_packs() {
+        let db = std::sync::Arc::new(super::Database::open_in_memory().unwrap());
+        let template = super::HostServices::new(db);
+
+        let first = template.clone().with_own_session_state();
+        first.active_packs.write().unwrap().insert("focus".into());
+
+        let second = template.clone().with_own_session_state();
+        assert!(second.active_packs.read().unwrap().is_empty());
+    }
+
+    /// Subagents and loop iterations clone the *session's* services rather than
+    /// the template's, and the spec has `active` components pass to a subagent
+    /// by default -- so an ordinary clone must keep sharing.
+    #[test]
+    fn a_clone_of_a_session_still_shares_its_state() {
+        let db = std::sync::Arc::new(super::Database::open_in_memory().unwrap());
+        let session = super::HostServices::new(db).with_own_session_state();
+        let child = session.clone().with_session_id("subagent-1".into());
+
+        session.active_packs.write().unwrap().insert("focus".into());
+        assert!(
+            child.active_packs.read().unwrap().contains("focus"),
+            "a subagent stopped inheriting the session's active packs"
+        );
+    }
+
     use super::*;
 
     #[test]

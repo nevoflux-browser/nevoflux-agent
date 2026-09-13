@@ -84,8 +84,48 @@ pub fn is_read_only_action(action: &str) -> bool {
     )
 }
 
+/// What a pack's panel is allowed to reach, if the artifact belongs to a pack.
+///
+/// Returns `None` when no installed pack owns this artifact — a canvas the user
+/// or a session created is not a pack panel, so there is no declaration to
+/// enforce. It is still bound by site rules; it just has no capability list.
+fn declared_capabilities(packs_dir: &std::path::Path, artifact_id: &str) -> Option<Vec<String>> {
+    let entries = std::fs::read_dir(packs_dir).ok()?;
+    for entry in entries.flatten() {
+        let Ok(src) = std::fs::read_to_string(entry.path().join("pack.toml")) else {
+            continue;
+        };
+        let Ok(manifest) = nevoflux_pack::manifest::Manifest::parse(&src) else {
+            continue;
+        };
+        if let Some(d) = &manifest.components.dashboard {
+            if d.artifact_id == artifact_id {
+                return Some(d.capabilities.call_tool.clone());
+            }
+        }
+    }
+    None
+}
+
 /// Run a panel's request through the same pipeline the model's calls use.
+///
+/// A pack panel is checked against its declared capabilities first. Declaring
+/// nothing means reaching nothing: a panel should have to say what it needs, so
+/// that reviewing a pack tells you what its panel can do without reading its
+/// code.
 pub fn check(packs_dir: &std::path::Path, req: &CanvasRequest<'_>) -> CanvasVerdict {
+    if let Some(declared) = declared_capabilities(packs_dir, req.artifact_id) {
+        if !declared.iter().any(|a| a == req.action) {
+            return CanvasVerdict::Deny {
+                code: "CAPABILITY_NOT_DECLARED".into(),
+                message: format!(
+                    "this panel did not declare `{}` in dashboard.capabilities.call_tool",
+                    req.action
+                ),
+            };
+        }
+    }
+
     let call = ToolCall {
         id: format!("canvas-{}", req.artifact_id),
         call_id: None,
@@ -241,6 +281,114 @@ message = "no automation on banking sites"
             check(&dir, &req("click", Some("https://www.bank.com/x"))),
             CanvasVerdict::Allow
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_panel_pack(dir: &std::path::Path, caps: &str) {
+        let pd = dir.join("okf");
+        std::fs::create_dir_all(&pd).unwrap();
+        std::fs::write(
+            pd.join("pack.toml"),
+            format!(
+                r#"
+[pack]
+name = "okf"
+version = "1.0.0"
+protocol = "pack-protocol/0.2"
+min_nevoflux = "0.3.0"
+
+[components.dashboard]
+artifact_id  = "okf-dashboard"
+content_type = "text/html"
+files_from   = "panel"
+entry        = "index.html"
+capabilities = {{ call_tool = [{caps}], invoke = [] }}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn panel_req<'a>(artifact: &'a str, action: &'a str) -> CanvasRequest<'a> {
+        CanvasRequest {
+            artifact_id: artifact,
+            action,
+            params: serde_json::json!({}),
+            tab_url: Some("https://example.com/".into()),
+            session_id: "s1",
+            active_packs: vec![],
+        }
+    }
+
+    /// Declaring nothing means reaching nothing: reviewing a pack should tell
+    /// you what its panel can do without reading its code.
+    #[test]
+    fn a_panel_that_declared_nothing_reaches_nothing() {
+        let dir = tmp("nocaps");
+        write_panel_pack(&dir, "");
+        match check(&dir, &panel_req("okf-dashboard", "get_content")) {
+            CanvasVerdict::Deny { code, .. } => assert_eq!(code, "CAPABILITY_NOT_DECLARED"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_panel_reaches_exactly_what_it_declared() {
+        let dir = tmp("caps");
+        write_panel_pack(&dir, "\"get_content\", \"navigate\"");
+
+        assert_eq!(
+            check(&dir, &panel_req("okf-dashboard", "get_content")),
+            CanvasVerdict::Allow
+        );
+        match check(&dir, &panel_req("okf-dashboard", "click")) {
+            CanvasVerdict::Deny { code, message } => {
+                assert_eq!(code, "CAPABILITY_NOT_DECLARED");
+                assert!(message.contains("click"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A canvas the user or a session made is not a pack panel, so there is no
+    /// declaration to enforce -- but site rules still bind it.
+    #[test]
+    fn a_canvas_no_pack_owns_has_no_capability_list_but_still_obeys_rules() {
+        let dir = tmp("usercanvas");
+        write_panel_pack(&dir, "\"get_content\"");
+        write_bank_pack(&dir, "installed");
+
+        // Not owned by any pack: capability gate does not apply.
+        assert_eq!(
+            check(&dir, &panel_req("scratch-notes", "click")),
+            CanvasVerdict::Allow
+        );
+
+        // ...but the site rule still refuses it on a matching site.
+        let mut r = panel_req("scratch-notes", "click");
+        r.tab_url = Some("https://www.bank.com/transfer".into());
+        assert!(matches!(check(&dir, &r), CanvasVerdict::Deny { .. }));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The capability check runs before site rules, so a panel reaching for
+    /// something it never declared is told that, rather than being told about a
+    /// site rule it was never going to reach.
+    #[test]
+    fn an_undeclared_action_is_named_as_such_even_on_a_restricted_site() {
+        let dir = tmp("order");
+        write_panel_pack(&dir, "\"get_content\"");
+        write_bank_pack(&dir, "installed");
+
+        let mut r = panel_req("okf-dashboard", "click");
+        r.tab_url = Some("https://www.bank.com/transfer".into());
+        match check(&dir, &r) {
+            CanvasVerdict::Deny { code, .. } => assert_eq!(code, "CAPABILITY_NOT_DECLARED"),
+            other => panic!("expected the capability refusal, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

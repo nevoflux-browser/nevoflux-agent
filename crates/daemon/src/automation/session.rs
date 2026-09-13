@@ -170,8 +170,10 @@ pub async fn execute_task_attempt(
         return run_headless_script(&services, &script_path, task, script_call);
     }
 
+    // Own session state for the same reason a chat gets one: this is a task,
+    // and the template's copy is shared by the whole process.
     let host = DaemonHostFunctions::new(agent_config, runtime_handle)
-        .with_services(services)
+        .with_services(services.with_own_session_state())
         .with_session_id(session_id.clone());
     let agent = nevoflux_builtin_wasm::Agent::new(host);
 

@@ -6526,8 +6526,12 @@ async fn handle_chat_message_streaming(
 
     // Create host functions with streaming support
     // Set client context on services so browser tool requests can be routed back
+    // A chat gets its own activated packs and its own prompt holder. Cloning
+    // the daemon-wide template outright would share both with every other
+    // conversation in the process (spec 4.3.2: 不跨会话残留).
     let mut services_with_context = services
         .clone()
+        .with_own_session_state()
         .with_client_context(identity.clone(), proxy_id.clone())
         .with_session_id(session_id.clone());
 
@@ -6591,6 +6595,11 @@ async fn handle_chat_message_streaming(
     )
     .await
     .map(Arc::new);
+
+    // Kept so a plan re-run later in this function can continue the same task
+    // rather than starting from the template's (empty) state. Shares the Arcs,
+    // so activating a pack mid-chat is visible to the re-run.
+    let session_services = services_with_context.clone();
 
     let mut host = DaemonHostFunctions::new(config.clone(), runtime.clone())
         .with_active_soul(active_soul.clone())
@@ -7184,8 +7193,11 @@ async fn handle_chat_message_streaming(
                         let (rerun_stream_tx, mut rerun_stream_rx) =
                             tokio::sync::mpsc::unbounded_channel::<SidebarStreamChunk>();
 
-                        // Create new host functions
-                        let rerun_services = services
+                        // Create new host functions. Cloned from this session's
+                        // services, not the template: a re-run is the same task
+                        // continuing, so it keeps the packs the session activated
+                        // and whatever holds its prompt.
+                        let rerun_services = session_services
                             .clone()
                             .with_client_context(identity.clone(), proxy_id.clone());
                         let rerun_host = DaemonHostFunctions::new(config.clone(), runtime.clone())
@@ -8355,10 +8367,14 @@ async fn handle_chat_message(
             .await
             .map(Arc::new);
 
+            // Its own activated packs and prompt holder, like the
+            // streaming handler above -- this is the other way a conversation
+            // starts, and sharing the template's would leak both across every
+            // chat in the process.
             let mut host = DaemonHostFunctions::new(config.clone(), runtime)
                 .with_active_soul(active_soul.clone())
                 .with_active_container(&container)
-                .with_services(services.clone())
+                .with_services(services.clone().with_own_session_state())
                 .with_session_id(session_id.clone())
                 .with_canvas_video_service(canvas_video_service.clone());
 
