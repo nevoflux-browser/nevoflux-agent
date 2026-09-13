@@ -15,12 +15,29 @@
 //! carries only Allow / Deny / Rewrite and the agent loop never has to know a
 //! dialog happened.
 //!
+//! # Who runs it
+//!
+//! Two entry points, because there are two ways a tool call reaches the daemon
+//! and neither goes through the other: the builtin-wasm agent loop
+//! (`DaemonHostFunctions::tool_pre`), and the MCP dispatcher that ACP-bridge
+//! providers and external MCP clients share
+//! (`wasm::mcp_tool_executor::execute_mcp_tool`). Both build their pipeline
+//! with [`default_pipeline`] so there is still only one order.
+//!
 //! # What this gate does not cover
 //!
-//! Canvas `callTool` (P1c), the `ToolRegistry` path `code_mode` uses, and the
-//! ACP provider's own permission gate in `llm::providers::acp::mcp_bridge` —
-//! that last one does not go through `HostFunctions` at all. Invariant I2 is
-//! only partly met until those arrive.
+//! Canvas `callTool` has its own gate ([`canvas_gate`]) because the browser
+//! settles tab ownership before the daemon is asked. The `ToolRegistry` path
+//! `code_mode` uses is still outside.
+//!
+//! An ACP agent's **own** tools — claude-code's Bash, antigravity's file
+//! editor — are outside and cannot be brought in: they run in that agent's
+//! process and NevoFlux sees only the finished result on the update stream.
+//! A rule that denies a NevoFlux tool does not stop an agent from reaching the
+//! same end with its own; denying `create_artifact` stops the artifact, not an
+//! agent that writes the HTML to a file instead. Those results are logged with
+//! `origin: acp` so the log distinguishes what was gated from what was merely
+//! watched — see `wasm::llm::log_native_acp_tool`.
 
 pub mod allowlist;
 pub mod canvas_gate;
@@ -28,6 +45,51 @@ pub mod pack_hook_stage;
 pub mod site_policy;
 
 use nevoflux_builtin_wasm::{ToolCall, ToolContext, ToolDenial, ToolGate};
+
+/// Site rules from installed packs, cached against the packs directory's mtime.
+///
+/// Process-wide rather than per-caller. A second cache would not be *wrong* —
+/// both are keyed on the same mtime — but compiling a hook module is the
+/// expensive half, and a private copy means each entry point pays for it
+/// separately the first time a pack is used. One cache also means both entry
+/// points start honouring a newly installed pack at the same moment instead of
+/// whenever each happens to notice.
+fn shared_rules() -> &'static site_policy::InstalledRules {
+    static RULES: std::sync::OnceLock<site_policy::InstalledRules> = std::sync::OnceLock::new();
+    RULES.get_or_init(Default::default)
+}
+
+/// Compiled pack hook modules, cached on the same signal as [`shared_rules`].
+fn shared_hooks() -> &'static pack_hook_stage::HookRegistry {
+    static HOOKS: std::sync::OnceLock<pack_hook_stage::HookRegistry> = std::sync::OnceLock::new();
+    HOOKS.get_or_init(Default::default)
+}
+
+/// The kernel's gate, in the one order it has (design spec 4.1).
+///
+/// Entry points call this instead of listing stages themselves. Two lists are
+/// two policies the moment someone edits one of them, and I2 is precisely the
+/// claim that a call is judged the same way whoever asked.
+///
+/// `active_packs` are the packs this session has activated: their `installed`
+/// -scope rules apply either way, their `active`-scope rules only while they
+/// are in here.
+pub fn default_pipeline(packs_dir: &std::path::Path, active_packs: &[String]) -> Pipeline {
+    // Read `active`-scope rules fresh rather than from the cache: activation
+    // changes within a session, which is the one change an mtime cannot see.
+    let mut rules = shared_rules().get(packs_dir);
+    rules.extend(site_policy::load_active_rules(packs_dir, active_packs));
+
+    // Hooks run after the declarative rules: a rule is cheap and a module is
+    // not, so a call a rule already refuses never pays for one.
+    let hooks = shared_hooks().for_session(packs_dir, active_packs);
+
+    Pipeline::new(vec![
+        Box::new(site_policy::SitePolicyStage::new(rules)),
+        Box::new(pack_hook_stage::PackHookStage::new(hooks)),
+        Box::new(allowlist::AllowlistStage),
+    ])
+}
 
 /// What one stage decides about a call.
 #[derive(Debug, Clone)]
@@ -326,6 +388,26 @@ mod tests {
             p.run(&a_call(), &a_context(false), &never_asked),
             ToolGate::Allow
         ));
+    }
+
+    /// The order the kernel actually ships, pinned separately from the
+    /// synthetic pipelines above.
+    ///
+    /// Both entry points — the agent loop and the MCP dispatcher — build from
+    /// `default_pipeline`, so this list *is* what every installed pack's
+    /// policy means. Reordering it changes that silently: hooks ahead of rules
+    /// would make a pack pay to compile a module for a call a rule already
+    /// refuses, and the allowlist ahead of either would report
+    /// `NOT_IN_ALLOWLIST` for calls a pack had a better answer for.
+    #[test]
+    fn the_shipped_pipeline_runs_rules_then_hooks_then_allowlist() {
+        // A directory that does not exist yields no rules and no hooks, which
+        // is all this assertion needs: the stages are present either way.
+        let no_packs = std::path::Path::new("this-directory-does-not-exist");
+        assert_eq!(
+            default_pipeline(no_packs, &[]).stage_names(),
+            vec!["site_policy", "pack_hooks", "allowlist"],
+        );
     }
 
     #[test]

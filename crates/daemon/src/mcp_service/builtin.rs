@@ -160,7 +160,7 @@ impl ToolSource for BuiltinSource {
         // `BrowserSender` channel, so demanding a registry entry here would
         // refuse every call on the grounds that a browser nobody needs is
         // missing.
-        let services = if needs_browser(name) && !self.in_process_browser {
+        let mut services = if needs_browser(name) && !self.in_process_browser {
             let entry = self.browsers.single().map_err(|e| {
                 format!("Tool '{name}' needs a connected browser, but none is usable: {e}")
             })?;
@@ -171,6 +171,10 @@ impl ToolSource for BuiltinSource {
         } else {
             self.services.clone()
         };
+        // An MCP client is not the model. The gate records who asked and so
+        // does the session log, and leaving the default here would attribute
+        // an outside caller's tool call to the model that never made it.
+        services.tool_origin = "mcp".to_string();
 
         crate::wasm::mcp_tool_executor::execute_mcp_tool(
             executor_name,

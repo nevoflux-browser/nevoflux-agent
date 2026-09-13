@@ -211,12 +211,6 @@ pub struct DaemonHostFunctions {
     /// by the agent before its first request so a `system/message` event can
     /// name which section changed.
     prompt_sections: Arc<Mutex<Vec<nevoflux_protocol::session_event::PromptSection>>>,
-    /// Site rules from installed packs, reloaded when the packs directory
-    /// changes rather than re-parsed on every tool call.
-    installed_rules: Arc<crate::tool_pipeline::site_policy::InstalledRules>,
-    /// Compiled pack hook modules, rebuilt on the same signal. Compiling per
-    /// tool call would be felt; each call still gets its own Store.
-    hook_registry: Arc<crate::tool_pipeline::pack_hook_stage::HookRegistry>,
     /// Token-budget accounting for in-flight streams, keyed by stream_id.
     /// Only populated when [`Self::token_budget`] is `Some`.
     stream_budget_data: Arc<Mutex<HashMap<u64, StreamBudgetData>>>,
@@ -299,8 +293,6 @@ impl DaemonHostFunctions {
             stream_trace_data: Arc::new(Mutex::new(HashMap::new())),
             stream_event_data: Arc::new(Mutex::new(HashMap::new())),
             prompt_sections: Arc::new(Mutex::new(Vec::new())),
-            installed_rules: Arc::new(Default::default()),
-            hook_registry: Arc::new(Default::default()),
             stream_budget_data: Arc::new(Mutex::new(HashMap::new())),
             model_override_provider: Arc::new(Mutex::new(None)),
             model_override_model: Arc::new(Mutex::new(None)),
@@ -1447,12 +1439,56 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 static NETWORK_CAPTURE_ARMED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether a pack may be taken out of the session, asking the user when it is
+/// carrying guards.
+///
+/// Split out of [`DaemonHostFunctions::pack_deactivate`] so the decision can be
+/// tested against a packs directory a test controls. `ask` is the question
+/// channel; it answers false when there is nobody to ask, which is what makes
+/// an unattended run refuse instead of hanging.
+///
+/// Returns the refusal text on `Err`, already phrased for the model.
+fn consent_to_deactivate(
+    packs_dir: &std::path::Path,
+    name: &str,
+    is_active: bool,
+    ask: &dyn Fn(&str) -> bool,
+) -> Result<(), String> {
+    if !is_active {
+        return Ok(());
+    }
+    let guards =
+        crate::tool_pipeline::site_policy::load_active_rules(packs_dir, &[name.to_string()]);
+    if guards.is_empty() {
+        // Skills, prompt, seed content: nothing is being lifted, so nothing to
+        // ask about.
+        return Ok(());
+    }
+    let question = format!(
+        "The assistant wants to deactivate the pack `{name}`, which is currently \
+         restricting what it may do ({} rule(s)). Deactivating removes those \
+         restrictions for the rest of this session.",
+        guards.len()
+    );
+    if ask(&question) {
+        return Ok(());
+    }
+    Err(format!(
+        "[POLICY_DENIED] `{name}` is enforcing rules on this session and was not \
+         deactivated.\nThis is a policy decision, not a tool failure. Do not retry \
+         this call."
+    ))
+}
+
 impl HostFunctions for DaemonHostFunctions {
-    /// Persist a completed tool's result as a `tool_result` message so the goal
-    /// evaluator reads the raw observation (not the model's paraphrase) and the
-    /// continuation anchor can name what already happened (spec §4.1). Best
-    /// effort: skips when no services/session, empty content, or the meta
-    /// `think` tool (reasoning, not an observation).
+    /// Log the result, and persist it as a `tool_result` message.
+    ///
+    /// Two sinks with different rules, on purpose. The session event is written
+    /// for every call, because `tool/call` was; the message row is the goal
+    /// evaluator's raw observation (not the model's paraphrase) and the
+    /// continuation anchor's evidence (spec §4.1), so it skips what is not an
+    /// observation: empty content, and the meta `think` tool. Both are best
+    /// effort and neither can fail the call.
     fn record_tool_result(
         &self,
         tool_name: &str,
@@ -1461,6 +1497,21 @@ impl HostFunctions for DaemonHostFunctions {
         success: bool,
         duration_ms: u64,
     ) {
+        // Logged before the skips below, and for every call: `tool/call` is
+        // written unconditionally, so a result the log drops leaves a call
+        // that never ends (invariant I1). The message row is a different
+        // thing with different rules — see below.
+        if let Some(writer) = self.event_writer() {
+            writer.append(
+                nevoflux_protocol::session_event::SessionEventPayload::ToolResult {
+                    id: tool_id.to_string(),
+                    content: content.to_string(),
+                    is_error: !success,
+                    duration_ms,
+                },
+            );
+        }
+
         if content.trim().is_empty() || tool_name == "think" {
             return;
         }
@@ -1488,20 +1539,6 @@ impl HostFunctions for DaemonHostFunctions {
             .create(params)
         {
             tracing::warn!(tool = tool_name, error = %e, "record_tool_result: persist failed");
-        }
-
-        // Session event log, alongside the message row above rather than
-        // instead of it: P0 only adds a channel, it does not move the UI's
-        // read path (design spec §3.3).
-        if let Some(writer) = self.event_writer() {
-            writer.append(
-                nevoflux_protocol::session_event::SessionEventPayload::ToolResult {
-                    id: tool_id.to_string(),
-                    content: content.to_string(),
-                    is_error: !success,
-                    duration_ms,
-                },
-            );
         }
     }
 
@@ -1703,11 +1740,36 @@ impl HostFunctions for DaemonHostFunctions {
         Ok(format!("pack `{name}` is active for this session"))
     }
 
+    /// Take a pack out of this session.
+    ///
+    /// Asks first when the pack is carrying guards. A pack whose `active`-scope
+    /// `tool_policy` is in force is restraining the very model making this
+    /// call, and letting that model lift the restraint on its own would make a
+    /// session guard loosen mid-session — the opposite of what a guard is for.
+    /// Only a person can lift it, and since nothing else in the product can
+    /// deactivate a pack (there is no RPC and no UI for it), this dialog *is*
+    /// how they do it.
+    ///
+    /// Deliberately narrow: packs that contribute only skills, prompt or seed
+    /// content are taken out without a word, because nothing is being lifted.
+    /// And an unattended run refuses rather than asking — `ask_user_allow`
+    /// already answers no when there is nobody to ask (invariant I6), so a
+    /// `/loop` cannot free itself by deactivating what constrains it.
     fn pack_deactivate(&self, name: &str) -> HostResult<String> {
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
             message: "Services not available".into(),
         })?;
+
+        let is_active = services
+            .active_packs
+            .read()
+            .map(|g| g.contains(name))
+            .unwrap_or(false);
+        let packs_dir = crate::paths::resolve_from_daemon().packs_dir();
+        consent_to_deactivate(&packs_dir, name, is_active, &|q| self.ask_user_allow(q))
+            .map_err(|message| HostError { code: 4, message })?;
+
         let removed = services
             .active_packs
             .write()
@@ -1807,28 +1869,15 @@ impl HostFunctions for DaemonHostFunctions {
         call: &nevoflux_builtin_wasm::ToolCall,
         ctx: &nevoflux_builtin_wasm::ToolContext,
     ) -> nevoflux_builtin_wasm::ToolGate {
-        // Order is spec 4.1: installed pack policy, then the run allowlist.
+        // The stage order lives in `tool_pipeline::default_pipeline`, shared
+        // with the MCP dispatcher so both entry points judge a call the same
+        // way (invariant I2).
+        //
         // The permission gate is not here on purpose — it keeps its own dialog
         // inside the host functions, where it knows the honest name of the
         // action and the resolved arguments. See `tool_pipeline`'s module docs.
         let packs_dir = crate::paths::resolve_from_daemon().packs_dir();
-        let mut rules = self.installed_rules.get(&packs_dir);
-        // Plus the `active`-scope rules of packs this session has activated.
-        // Read fresh rather than cached: activation changes within a session,
-        // which is the case the mtime cache cannot see.
-        if let Some(services) = self.services.as_ref() {
-            let active: Vec<String> = services
-                .active_packs
-                .read()
-                .map(|g| g.iter().cloned().collect())
-                .unwrap_or_default();
-            rules.extend(crate::tool_pipeline::site_policy::load_active_rules(
-                &packs_dir, &active,
-            ));
-        }
-        // Pack hooks run after the declarative rules: a rule is cheap and a
-        // module is not, so a call a rule already refuses never pays for one.
-        let active_for_hooks: Vec<String> = self
+        let active: Vec<String> = self
             .services
             .as_ref()
             .and_then(|s| {
@@ -1838,20 +1887,11 @@ impl HostFunctions for DaemonHostFunctions {
                     .map(|g| g.iter().cloned().collect())
             })
             .unwrap_or_default();
-        let hooks = self
-            .hook_registry
-            .for_session(&packs_dir, &active_for_hooks);
-
-        let pipeline = crate::tool_pipeline::Pipeline::new(vec![
-            Box::new(crate::tool_pipeline::site_policy::SitePolicyStage::new(
-                rules,
-            )),
-            Box::new(crate::tool_pipeline::pack_hook_stage::PackHookStage::new(
-                hooks,
-            )),
-            Box::new(crate::tool_pipeline::allowlist::AllowlistStage),
-        ]);
-        pipeline.run(call, ctx, &|prompt: &str| self.ask_user_allow(prompt))
+        crate::tool_pipeline::default_pipeline(&packs_dir, &active).run(
+            call,
+            ctx,
+            &|prompt: &str| self.ask_user_allow(prompt),
+        )
     }
 
     fn record_turn_boundary(&self, turn: u32, start: bool) {
@@ -7376,8 +7416,6 @@ impl DaemonHostFunctions {
             stream_trace_data: self.stream_trace_data.clone(),
             stream_event_data: self.stream_event_data.clone(),
             prompt_sections: self.prompt_sections.clone(),
-            installed_rules: self.installed_rules.clone(),
-            hook_registry: self.hook_registry.clone(),
             // Shared with the parent (like stream_trace_data): stream ids come
             // from the shared registry, so accounting must live in one map.
             stream_budget_data: self.stream_budget_data.clone(),
@@ -8424,6 +8462,105 @@ async fn write_audio_to_composition(
 
 #[cfg(test)]
 mod tests {
+    // ------------------------------------------------------------------
+    // Taking a pack out of a session. A pack whose rules are in force is
+    // restraining the model making the call, so the model does not get to
+    // lift it alone -- and with no RPC or UI for deactivation anywhere else
+    // in the product, the dialog is the only way a person can.
+    // ------------------------------------------------------------------
+
+    fn guard_pack_dir(tag: &str, scope: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nf-deact-{tag}-{}", std::process::id()));
+        let pd = dir.join("bank-guard");
+        std::fs::create_dir_all(&pd).unwrap();
+        std::fs::write(
+            pd.join("pack.toml"),
+            format!(
+                r#"
+[pack]
+name = "bank-guard"
+version = "1.0.0"
+protocol = "pack-protocol/0.2"
+min_nevoflux = "0.0.1"
+
+[[components.tool_policy]]
+scope = "{scope}"
+deny = ["browser_click"]
+message = "not here"
+"#
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_pack_carrying_guards_is_not_deactivated_when_the_user_says_no() {
+        let dir = guard_pack_dir("no", "active");
+        let asked = std::cell::Cell::new(0);
+        let err = super::consent_to_deactivate(&dir, "bank-guard", true, &|_| {
+            asked.set(asked.get() + 1);
+            false
+        })
+        .unwrap_err();
+        assert_eq!(asked.get(), 1, "the user has to actually be asked");
+        assert!(err.contains("POLICY_DENIED"), "got: {err}");
+        // A refusal the model reads as an error would be retried; this one has
+        // to read as a decision.
+        assert!(err.contains("Do not retry"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_user_can_still_lift_it() {
+        let dir = guard_pack_dir("yes", "active");
+        assert!(super::consent_to_deactivate(&dir, "bank-guard", true, &|_| true).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unattended run has nobody to ask, and `ask_user_allow` answers false
+    /// in exactly that case -- so a `/loop` cannot free itself (invariant I6).
+    #[test]
+    fn an_unattended_run_cannot_free_itself() {
+        let dir = guard_pack_dir("unattended", "active");
+        assert!(super::consent_to_deactivate(&dir, "bank-guard", true, &|_| false).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pack_with_nothing_to_lift_goes_quietly() {
+        // `installed` rules survive deactivation, so taking the pack out lifts
+        // nothing and there is nothing to ask about. Same for a pack that only
+        // ships skills or prompt -- represented here by the absence of any
+        // `active` rule.
+        let dir = guard_pack_dir("installed", "installed");
+        let asked = std::cell::Cell::new(0);
+        assert!(
+            super::consent_to_deactivate(&dir, "bank-guard", true, &|_| {
+                asked.set(asked.get() + 1);
+                false
+            })
+            .is_ok()
+        );
+        assert_eq!(asked.get(), 0, "nothing was being lifted; do not nag");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pack_that_was_never_active_is_not_worth_a_question() {
+        let dir = guard_pack_dir("inactive", "active");
+        let asked = std::cell::Cell::new(0);
+        assert!(
+            super::consent_to_deactivate(&dir, "bank-guard", false, &|_| {
+                asked.set(asked.get() + 1);
+                false
+            })
+            .is_ok()
+        );
+        assert_eq!(asked.get(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use nevoflux_skills::{LoaderConfig, Skill, SkillMetadata, SkillRegistry};
     use nevoflux_storage::Database;

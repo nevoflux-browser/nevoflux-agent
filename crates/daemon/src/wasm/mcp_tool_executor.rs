@@ -357,22 +357,160 @@ pub(crate) fn record_acp_tool_result(services: &HostServices, tool_name: &str, c
     }
 }
 
+/// The context the gate and the log judge an MCP-dispatched call by.
+///
+/// Two fields are deliberately empty rather than guessed:
+///
+/// - `mode`: no stage reads it, and this dispatcher is never told one — an ACP
+///   provider has no NevoFlux mode of its own. A guess here would read as fact
+///   in a hook's request payload.
+/// - `tab_url`: this dispatcher never learns which tab a browser tool will land
+///   on. Rules that name a URL still match on the call's own `url` argument,
+///   which is also all the agent loop supplies.
+fn mcp_tool_context(services: &HostServices) -> nevoflux_builtin_wasm::ToolContext {
+    nevoflux_builtin_wasm::ToolContext {
+        session_id: services.session_id.clone(),
+        origin: services.tool_origin.clone(),
+        mode: nevoflux_builtin_wasm::AgentMode::default(),
+        is_unattended: services.is_iteration,
+        tab_url: None,
+        // A /loop iteration is limited upstream by its `allowed_tool_classes`;
+        // nothing narrower travels this far.
+        allowed_tools: None,
+    }
+}
+
+/// Put a site rule's question to the user from inside the async dispatcher.
+///
+/// [`crate::tool_pipeline::Pipeline::run`] is synchronous because the agent
+/// loop that calls it is, so reaching a dialog from here means parking this
+/// task. `block_in_place` moves it off the poll thread, which is what keeps
+/// the rest of the runtime going while the dialog is open.
+///
+/// Returns false when there is nobody to ask. A guard that cannot get an
+/// answer must not assume yes (invariant I6).
+fn ask_user_allow_blocking(services: &HostServices, question: &str) -> bool {
+    let Some(browser_ctx) = services.browser_context() else {
+        return false;
+    };
+    // No "always allow": a site rule asks about *this* action here, and a
+    // blanket yes would quietly turn a pack's guard into a no-op.
+    let options = vec!["Allow".to_string(), "Deny".to_string()];
+    let answer = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(async { execute_ask_user(question, question, &options, &browser_ctx).await })
+    });
+    answer.as_deref() == Some("Allow")
+}
+
 /// Execute a single MCP tool call, routing to the correct category.
 ///
-/// Thin wrapper around [`execute_mcp_tool_inner`] that records a successful
-/// result to the `messages` table via [`record_acp_tool_result`] before
-/// returning it unchanged — see that function's docs for why. Errors are not
-/// recorded (a failed tool call is not an observation to match against).
+/// This is the second of the kernel's two tool entry points — the one ACP-bridge
+/// providers (antigravity, claude-code, kimi-agent) and external MCP clients
+/// share. It is not reachable from the builtin-wasm agent loop and does not
+/// reach it, so everything that loop does around a call has to happen here too:
+///
+/// 1. **the gate** — [`crate::tool_pipeline::default_pipeline`], the same
+///    stages in the same order the loop uses (invariant I2). Without it an
+///    installed pack's site rules and hooks simply did not apply to the
+///    providers most sessions actually run on;
+/// 2. **the log** — a `tool/call` before and a `tool/result` after, so what the
+///    model was shown stays derivable from the log (invariant I1);
+/// 3. **the message row** — [`record_acp_tool_result`], which the goal
+///    evaluator and `/loop` verify read; see that function for why it is a
+///    separate thing from the log.
+///
+/// A refusal comes back as `Err` carrying the denial's own text, so the model
+/// reads a policy decision rather than a failure worth retrying — the same
+/// rendering the agent loop gives it.
+///
+/// `tool_call_dynamic` re-enters here with the tool it wraps, so a dynamic call
+/// is gated and logged twice — once as the wrapper, once as what it actually
+/// ran. That nesting is wanted, not a leak: a rule naming the inner tool has to
+/// catch it whether or not something wrapped it, and the log should say both
+/// things happened.
 pub async fn execute_mcp_tool(
     name: &str,
     arguments: &serde_json::Value,
     services: &HostServices,
     tool_bridge: &Arc<McpToolBridge>,
 ) -> Result<String, String> {
-    let result = execute_mcp_tool_inner(name, arguments, services, tool_bridge).await;
+    // One id ties the pair together in the log. Minted here because this path
+    // has none to reuse: the ACP bridge reports its tool results with an empty
+    // id, which is also why `record_acp_tool_result` stores `tool_id: ""`.
+    let tool_id = format!("mcp-{}", uuid::Uuid::new_v4());
+    let ctx = mcp_tool_context(services);
+    let call = nevoflux_builtin_wasm::ToolCall {
+        id: tool_id.clone(),
+        call_id: None,
+        name: name.to_string(),
+        arguments: arguments.clone(),
+        signature: None,
+    };
+
+    // Announced before the gate runs, with the context the gate will see, so
+    // the log and the policy agree on who asked — and so a refused call is
+    // still a call that happened.
+    let writer = crate::session_events::SessionEventWriter::new(
+        services.database.clone(),
+        services.session_id.clone(),
+    );
+    writer.append(
+        nevoflux_protocol::session_event::SessionEventPayload::ToolCall {
+            id: tool_id.clone(),
+            name: name.to_string(),
+            args: arguments.clone(),
+            origin: nevoflux_protocol::session_event::ToolOrigin::from_raw(ctx.origin.clone()),
+            tab_url: ctx.tab_url.clone(),
+        },
+    );
+
+    let packs_dir = crate::paths::resolve_from_daemon().packs_dir();
+    let active: Vec<String> = services
+        .active_packs
+        .read()
+        .map(|g| g.iter().cloned().collect())
+        .unwrap_or_default();
+    let gate = crate::tool_pipeline::default_pipeline(&packs_dir, &active).run(
+        &call,
+        &ctx,
+        &|prompt: &str| ask_user_allow_blocking(services, prompt),
+    );
+
+    // Timed around dispatch only: policy time is not the tool's time.
+    let started = std::time::Instant::now();
+    let result = match gate {
+        nevoflux_builtin_wasm::ToolGate::Deny(denial) => {
+            tracing::info!(tool = name, code = %denial.code, "MCP tool denied by policy");
+            Err(denial.to_tool_result_content())
+        }
+        nevoflux_builtin_wasm::ToolGate::Allow => {
+            execute_mcp_tool_inner(name, arguments, services, tool_bridge).await
+        }
+        // A stage rewrote the arguments, so what runs is what the later stages
+        // judged, not what was asked for.
+        nevoflux_builtin_wasm::ToolGate::Rewrite { arguments } => {
+            execute_mcp_tool_inner(name, &arguments, services, tool_bridge).await
+        }
+    };
+    let duration_ms = started.elapsed().as_millis() as u64;
+
     if let Ok(ref content) = result {
         record_acp_tool_result(services, name, content);
     }
+    let (content, is_error) = match &result {
+        Ok(c) => (c.clone(), false),
+        Err(e) => (e.clone(), true),
+    };
+    writer.append(
+        nevoflux_protocol::session_event::SessionEventPayload::ToolResult {
+            id: tool_id,
+            content,
+            is_error,
+            duration_ms,
+        },
+    );
+
     result
 }
 
@@ -3304,6 +3442,114 @@ mod tests {
             &bridge,
         ));
         assert_eq!(result, Ok("Plan submitted for review.".to_string()));
+    }
+
+    // ------------------------------------------------------------------
+    // The session log on the MCP path. ACP-bridge providers execute their
+    // tool calls here rather than in the builtin-wasm agent loop, so without
+    // these events a real session's log has turns and messages but no record
+    // of a single tool call (invariant I1).
+    // ------------------------------------------------------------------
+
+    fn events_of(db: &nevoflux_storage::Database, session_id: &str) -> Vec<serde_json::Value> {
+        nevoflux_storage::repositories::SessionEventRepository::new(db)
+            .list(session_id)
+            .unwrap()
+            .into_iter()
+            .map(|e| serde_json::to_value(&e).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_dispatched_tool_logs_a_call_and_a_matching_result() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        seed_session(&db, "sess-ev");
+        let services = HostServices::new(db.clone()).with_session_id("sess-ev".to_string());
+        let bridge = make_test_bridge();
+
+        let result = rt.block_on(execute_mcp_tool(
+            "create_plan",
+            &serde_json::json!({ "note": "hello" }),
+            &services,
+            &bridge,
+        ));
+        assert!(result.is_ok(), "got: {result:?}");
+
+        let events = events_of(&db, "sess-ev");
+        let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(types, vec!["tool/call", "tool/result"]);
+
+        // The pair has to be joinable, or a replay cannot tell which result
+        // belongs to which call.
+        assert_eq!(events[0]["id"], events[1]["id"]);
+        assert_eq!(events[0]["name"], "create_plan");
+        assert_eq!(events[0]["args"]["note"], "hello");
+        assert_eq!(events[1]["is_error"], false);
+    }
+
+    #[test]
+    fn a_failed_tool_is_logged_as_a_result_that_errored() {
+        // The old ACP recording skipped failures entirely — a tool that failed
+        // left no trace on either channel, which is the shape that makes a
+        // session impossible to reconstruct afterwards.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        seed_session(&db, "sess-err");
+        let services = HostServices::new(db.clone()).with_session_id("sess-err".to_string());
+        let bridge = make_test_bridge();
+
+        let result = rt.block_on(execute_mcp_tool(
+            "nonexistent_tool",
+            &serde_json::json!({}),
+            &services,
+            &bridge,
+        ));
+        assert!(result.is_err());
+
+        let events = events_of(&db, "sess-err");
+        assert_eq!(events.len(), 2, "a failed call is still a call: {events:?}");
+        assert_eq!(events[1]["type"], "tool/result");
+        assert_eq!(events[1]["is_error"], true);
+        assert!(events[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("unknown tool"));
+    }
+
+    #[test]
+    fn the_log_records_who_asked_rather_than_assuming_the_model() {
+        // An external MCP client's call is not the model's. `BuiltinSource`
+        // sets `tool_origin` for exactly this reason; the dispatcher must
+        // carry it through instead of hardcoding "model".
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        seed_session(&db, "sess-who");
+        let mut services = HostServices::new(db.clone()).with_session_id("sess-who".to_string());
+        services.tool_origin = "mcp".to_string();
+        let bridge = make_test_bridge();
+
+        let _ = rt.block_on(execute_mcp_tool(
+            "create_plan",
+            &serde_json::json!({}),
+            &services,
+            &bridge,
+        ));
+
+        let events = events_of(&db, "sess-who");
+        assert_eq!(events[0]["origin"], "mcp");
+    }
+
+    #[test]
+    fn an_unattended_run_is_marked_so_an_ask_can_settle_as_a_refusal() {
+        // `Pipeline::run` turns an `Ask` into a refusal when nobody is there to
+        // answer (invariant I6). It reads that from the context, so the
+        // dispatcher has to set it — a /loop iteration otherwise looks
+        // interactive and waits on a dialog no one will ever see.
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let mut services = HostServices::new(db);
+        services.is_iteration = true;
+        assert!(mcp_tool_context(&services).is_unattended);
     }
 
     #[test]

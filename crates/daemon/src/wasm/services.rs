@@ -196,6 +196,14 @@ pub struct HostServices {
     pub proxy_id: String,
     /// Current session ID for artifact creation and other session-scoped operations.
     pub session_id: String,
+    /// Who the tool calls dispatched through these services come from, in the
+    /// `ToolContext.origin` vocabulary (`model`, `mcp:<client>`, ...).
+    ///
+    /// The MCP dispatcher serves two callers that look identical from inside
+    /// it: an ACP provider relaying the model's own calls, and an external MCP
+    /// client calling our tools directly. The gate and the session log both
+    /// record who asked, so the difference has to survive the trip.
+    pub tool_origin: String,
     /// Tools that user has approved "Always Allow" (shared across requests in the same daemon).
     pub always_allowed_tools: Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     /// Packs the session has activated (design spec 4.3).
@@ -386,6 +394,8 @@ impl HostServices {
             client_identity: Vec::new(),
             proxy_id: String::new(),
             session_id: String::new(),
+            // The common case: an agent run, relaying what the model asked for.
+            tool_origin: "model".to_string(),
             always_allowed_tools: Arc::new(
                 std::sync::RwLock::new(std::collections::HashSet::new()),
             ),
@@ -438,6 +448,8 @@ impl HostServices {
             client_identity: Vec::new(),
             proxy_id: String::new(),
             session_id: String::new(),
+            // The common case: an agent run, relaying what the model asked for.
+            tool_origin: "model".to_string(),
             always_allowed_tools: Arc::new(
                 std::sync::RwLock::new(std::collections::HashSet::new()),
             ),
