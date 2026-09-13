@@ -1281,6 +1281,51 @@ impl DaemonHostFunctions {
         }
     }
 
+    /// Active packs that declared a prompt replace mode, as (pack, declared).
+    ///
+    /// Provenance is not recorded yet -- a skill does not carry the pack it
+    /// came from -- so this manifest scan is the only attribution available.
+    /// It is safe only when it yields exactly one candidate; both callers treat
+    /// anything else as unattributable and refuse, because crediting the wrong
+    /// pack in the audit trail is worse than refusing a call.
+    fn prompt_replace_candidates(&self) -> Vec<(String, String)> {
+        let Some(services) = self.services.as_ref() else {
+            return Vec::new();
+        };
+        let paths = crate::paths::resolve_from_daemon();
+        let active: Vec<String> = services
+            .active_packs
+            .read()
+            .map(|g| g.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        for name in &active {
+            let manifest_path = paths.packs_dir().join(name).join("pack.toml");
+            let Ok(src) = std::fs::read_to_string(&manifest_path) else {
+                continue;
+            };
+            let Ok(manifest) = nevoflux_pack::manifest::Manifest::parse(&src) else {
+                continue;
+            };
+            if let Some(pc) = &manifest.components.prompt {
+                if pc.replace != "none" {
+                    candidates.push((manifest.pack.name.clone(), pc.replace.clone()));
+                }
+            }
+        }
+        candidates
+    }
+
+    /// The pack a prompt call can be attributed to, when exactly one can be.
+    fn prompt_replacing_pack(&self) -> Option<String> {
+        let mut c = self.prompt_replace_candidates();
+        match c.len() {
+            1 => Some(c.remove(0).0),
+            _ => None,
+        }
+    }
+
     /// Build a session event writer for the current session, if there is one.
     ///
     /// Returns `None` when there are no services (unit tests) or no session id
@@ -1442,6 +1487,9 @@ static NETWORK_CAPTURE_ARMED: std::sync::atomic::AtomicBool =
 /// Whether a pack may be taken out of the session, asking the user when it is
 /// carrying guards.
 ///
+/// See also [`DaemonHostFunctions::prompt_replacing_pack`], which answers the
+/// neighbouring question of who is allowed to speak through the prompt.
+///
 /// Split out of [`DaemonHostFunctions::pack_deactivate`] so the decision can be
 /// tested against a packs directory a test controls. `ask` is the question
 /// channel; it answers false when there is nobody to ask, which is what makes
@@ -1578,32 +1626,7 @@ impl HostFunctions for DaemonHostFunctions {
             });
         }
 
-        // Which active pack is asking? Provenance is not recorded yet -- a
-        // skill does not carry the pack it came from -- so attribution is only
-        // safe when exactly one active pack declared a replace mode. With
-        // several, refusing beats crediting the wrong pack in the audit trail.
-        let paths = crate::paths::resolve_from_daemon();
-        let active: Vec<String> = services
-            .active_packs
-            .read()
-            .map(|g| g.iter().cloned().collect())
-            .unwrap_or_default();
-
-        let mut candidates: Vec<(String, String)> = Vec::new();
-        for name in &active {
-            let manifest_path = paths.packs_dir().join(name).join("pack.toml");
-            let Ok(src) = std::fs::read_to_string(&manifest_path) else {
-                continue;
-            };
-            let Ok(manifest) = nevoflux_pack::manifest::Manifest::parse(&src) else {
-                continue;
-            };
-            if let Some(pc) = &manifest.components.prompt {
-                if pc.replace != "none" {
-                    candidates.push((manifest.pack.name.clone(), pc.replace.clone()));
-                }
-            }
-        }
+        let mut candidates = self.prompt_replace_candidates();
 
         let (pack, declared) = match candidates.len() {
             0 => {
@@ -1669,11 +1692,42 @@ impl HostFunctions for DaemonHostFunctions {
         ))
     }
 
+    /// Hand the system prompt back to the kernel.
+    ///
+    /// Only the pack holding it may do this. `system_prompt_replace` is already
+    /// exclusive so that one pack cannot make another's discipline vanish
+    /// (spec A8); without the same check here the exclusivity was only half
+    /// enforced, and a second pack could drop the first one's prompt through
+    /// `restore` instead of through `replace`.
+    ///
+    /// The attribution is the same best-effort one `replace` uses -- the single
+    /// active pack declaring a replace mode -- because a skill still does not
+    /// carry the pack it came from. When that cannot name the holder the call
+    /// is refused rather than guessed at.
     fn system_prompt_restore(&self) -> HostResult<String> {
         let services = self.services.as_ref().ok_or_else(|| HostError {
             code: 1,
             message: "Services not available".into(),
         })?;
+
+        let holder = services
+            .prompt_override
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|(pack, _, _)| pack.clone()));
+        if let Some(holder) = holder {
+            let caller = self.prompt_replacing_pack();
+            if caller.as_deref() != Some(holder.as_str()) {
+                return Err(HostError {
+                    code: 409,
+                    message: format!(
+                        "PROMPT_HELD_BY: `{holder}` replaced the prompt and is the only one \
+                         that may restore it"
+                    ),
+                });
+            }
+        }
+
         let held = services
             .prompt_override
             .write()
@@ -1782,6 +1836,31 @@ impl HostFunctions for DaemonHostFunctions {
                         pack: name.to_string(),
                     },
                 );
+            }
+
+            // A pack that is no longer in the session does not get to keep
+            // speaking through the prompt. Spec 4.3.2 names this as one of the
+            // three ways a replacement ends; without it a deactivated pack's
+            // instructions stayed in force with nothing left to attribute them
+            // to -- and `system_prompt_restore` would then refuse, because the
+            // holder was no longer active to be named.
+            let released = services
+                .prompt_override
+                .write()
+                .ok()
+                .and_then(|mut g| match g.as_ref() {
+                    Some((holder, _, _)) if holder == name => g.take(),
+                    _ => None,
+                })
+                .is_some();
+            if released {
+                if let Some(writer) = self.event_writer() {
+                    writer.append(
+                        nevoflux_protocol::session_event::SessionEventPayload::PackPromptRestore {
+                            pack: name.to_string(),
+                        },
+                    );
+                }
             }
         }
         Ok(format!("pack `{name}` is no longer active"))
@@ -8468,6 +8547,93 @@ mod tests {
     // lift it alone -- and with no RPC or UI for deactivation anywhere else
     // in the product, the dialog is the only way a person can.
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // Who may hand the system prompt back. `system_prompt_replace` is exclusive
+    // so one pack cannot erase another's discipline (spec A8); `restore` has to
+    // be too, or the same erasure just takes the other door. And a pack that is
+    // no longer in the session does not get to keep speaking through the
+    // prompt -- spec 4.3.2 lists deactivation as one of the three ways a
+    // replacement ends.
+    // ------------------------------------------------------------------
+
+    fn host_with_prompt_held_by(pack: &str) -> super::DaemonHostFunctions {
+        let db = std::sync::Arc::new(nevoflux_storage::Database::open_in_memory().unwrap());
+        let services = crate::wasm::services::HostServices::new(db).with_own_session_state();
+        *services.prompt_override.write().unwrap() = Some((
+            pack.to_string(),
+            "keep_kernel".to_string(),
+            "be terse".to_string(),
+        ));
+        super::DaemonHostFunctions::new(
+            std::sync::Arc::new(crate::config::AgentConfig::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .with_services(services)
+    }
+
+    #[tokio::test]
+    async fn a_prompt_cannot_be_restored_by_a_pack_that_did_not_take_it() {
+        use nevoflux_builtin_wasm::HostFunctions;
+        // No pack is active, so nothing can be attributed -- which is the same
+        // situation as a *different* pack asking, and is refused for the same
+        // reason: crediting the wrong pack is worse than refusing.
+        let host = host_with_prompt_held_by("focus");
+        let err = host.system_prompt_restore().unwrap_err();
+        assert_eq!(err.code, 409);
+        assert!(
+            err.message.contains("PROMPT_HELD_BY"),
+            "got: {}",
+            err.message
+        );
+        assert!(
+            host.services
+                .as_ref()
+                .unwrap()
+                .prompt_override
+                .read()
+                .unwrap()
+                .is_some(),
+            "the refusal has to leave the prompt where it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn deactivating_the_holder_gives_the_prompt_back() {
+        use nevoflux_builtin_wasm::HostFunctions;
+        let host = host_with_prompt_held_by("focus");
+        let services = host.services.as_ref().unwrap().clone();
+        services
+            .active_packs
+            .write()
+            .unwrap()
+            .insert("focus".into());
+
+        // No `active`-scope rules on disk for this name, so no question is
+        // asked -- the prompt is simply handed back.
+        host.pack_deactivate("focus").unwrap();
+
+        assert!(
+            services.prompt_override.read().unwrap().is_none(),
+            "a deactivated pack kept speaking through the prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn deactivating_someone_else_leaves_the_prompt_alone() {
+        use nevoflux_builtin_wasm::HostFunctions;
+        let host = host_with_prompt_held_by("focus");
+        let services = host.services.as_ref().unwrap().clone();
+        services
+            .active_packs
+            .write()
+            .unwrap()
+            .insert("other".into());
+
+        host.pack_deactivate("other").unwrap();
+
+        assert!(services.prompt_override.read().unwrap().is_some());
+    }
 
     fn guard_pack_dir(tag: &str, scope: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("nf-deact-{tag}-{}", std::process::id()));
