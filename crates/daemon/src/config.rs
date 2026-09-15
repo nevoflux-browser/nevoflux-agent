@@ -1167,8 +1167,17 @@ impl LlmConfig {
     }
 
     /// Get the model for the active provider.
+    ///
+    /// `local` has no [`ProviderConfig`] — its model lives on
+    /// [`LlmConfig::local`] instead (see that field's doc comment) — so it
+    /// is special-cased here rather than falling through to
+    /// `default_model`, which would silently hand a cloud model name to the
+    /// on-device engine.
     pub fn active_model(&self) -> Option<&str> {
         let id = self.active_provider()?;
+        if self.resolve_wire(id) == Some(nevoflux_llm::ProviderType::Local) {
+            return Some(self.local.model.as_str());
+        }
         match self.provider_config(id) {
             Some(pc) => pc.model.as_deref(),
             None => self.default_model.as_deref(),
@@ -1176,7 +1185,13 @@ impl LlmConfig {
     }
 
     /// Get the configured model for a specific provider name.
+    ///
+    /// Special-cases `local` the same way [`LlmConfig::active_model`] does
+    /// — see that method's doc comment.
     pub fn model_for_provider(&self, provider: &str) -> Option<&str> {
+        if self.resolve_wire(provider) == Some(nevoflux_llm::ProviderType::Local) {
+            return Some(self.local.model.as_str());
+        }
         self.provider_config(provider)?.model.as_deref()
     }
 
@@ -2555,6 +2570,27 @@ base_url = "https://x.test"
         );
         assert_eq!(cfg.llm.active_api_key(), Some("local-engine"));
         assert!(cfg.llm.is_provider_configured("local"));
+    }
+
+    /// `active_model` (and `model_for_provider`) must read `[llm.local]`'s
+    /// `model` field for the local provider rather than falling through to
+    /// the legacy `default_model` — see the R18 fix's doc comment on
+    /// `LlmConfig::active_model`.
+    #[test]
+    fn local_provider_active_model_reads_llm_local_model() {
+        let cfg: AgentConfig = toml::from_str(
+            "[llm]\nprovider = \"local\"\ndefault_model = \"claude-3\"\n[llm.local]\nenabled = true\nmodel = \"qwen3-4b-instruct-2507\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.llm.active_model(),
+            Some("qwen3-4b-instruct-2507"),
+            "must not fall through to default_model"
+        );
+        assert_eq!(
+            cfg.llm.model_for_provider("local"),
+            Some("qwen3-4b-instruct-2507")
+        );
     }
 
     #[test]
