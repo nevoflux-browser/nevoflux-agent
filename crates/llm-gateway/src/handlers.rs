@@ -193,15 +193,16 @@ impl AppState {
         // R30: identical timeout shapes, but with system-proxy honoring
         // disabled outright — used instead of the two clients above
         // whenever the current upstream is loopback (see `pick_client`).
-        let nonstream_http_no_proxy = reqwest::Client::builder()
-            .connect_timeout(config.upstream_connect_timeout)
-            .timeout(config.upstream_request_timeout)
-            .no_proxy()
-            .build()?;
-        let stream_http_no_proxy = reqwest::Client::builder()
-            .connect_timeout(config.upstream_connect_timeout)
-            .no_proxy()
-            .build()?;
+        let nonstream_http_no_proxy = apply_local_http_policy(
+            reqwest::Client::builder()
+                .connect_timeout(config.upstream_connect_timeout)
+                .timeout(config.upstream_request_timeout),
+        )
+        .build()?;
+        let stream_http_no_proxy = apply_local_http_policy(
+            reqwest::Client::builder().connect_timeout(config.upstream_connect_timeout),
+        )
+        .build()?;
 
         let acp = config
             .acp_config
@@ -466,6 +467,26 @@ pub(crate) async fn embeddings() -> (StatusCode, Json<serde_json::Value>) {
             }
         })),
     )
+}
+
+/// Apply the local-engine HTTP policy to a builder: unconditionally
+/// strips any proxy configuration — whether inherited from
+/// `HTTP_PROXY`/`ALL_PROXY` or set explicitly via `.proxy(...)` earlier
+/// on the same builder — on top of whatever timeouts the caller already
+/// configured. Used to build [`AppState`]'s `*_no_proxy` client pair
+/// (fix round 1 follow-up item B / R33; mirrors
+/// `crate::wasm::local_llm::apply_local_http_policy` in the daemon
+/// crate, which this crate can't depend on).
+///
+/// Factored out specifically so it's testable without mutating the
+/// process's real `HTTP_PROXY` env var (which would race any other test
+/// in the crate building a plain client concurrently): start from a
+/// builder with an *explicit* proxy set, run it through here, and
+/// confirm a real request still reaches its target directly — see
+/// `apply_local_http_policy_clears_an_explicit_proxy` in this module's
+/// tests.
+pub(crate) fn apply_local_http_policy(b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    b.no_proxy()
 }
 
 /// Whether `url`'s host is loopback: `127.0.0.0/8`, `[::1]`, or
@@ -1337,5 +1358,43 @@ mod tests {
 
         let cloud_nonstream = pick_client(&state, "https://api.anthropic.com", false);
         assert!(std::ptr::eq(cloud_nonstream, &state.nonstream_http));
+    }
+
+    /// Fix round 1 follow-up item B (R33): `apply_local_http_policy` must
+    /// clear even an *explicit* proxy set on the builder, not just avoid
+    /// reading proxy env vars. Deterministic — no env mutation, so it
+    /// can't race any other test in the crate building a plain client
+    /// concurrently: start from a builder explicitly proxying everything
+    /// through `127.0.0.1:9` (nothing listens there — the "discard"
+    /// port), run it through `apply_local_http_policy`, and confirm the
+    /// built client still reaches a real local server directly. If the
+    /// policy failed to clear the proxy, the request would instead try
+    /// to speak HTTP-proxy protocol to `:9` and fail.
+    #[tokio::test]
+    async fn apply_local_http_policy_clears_an_explicit_proxy() {
+        use axum::{routing::get, Router};
+
+        let app = Router::new().route("/", get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake target");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("fake target serve");
+        });
+
+        let builder = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").expect("valid proxy url"));
+        let client = apply_local_http_policy(builder)
+            .build()
+            .expect("client should build");
+
+        let resp = client.get(format!("http://{addr}/")).send().await;
+        assert!(
+            resp.is_ok(),
+            "apply_local_http_policy must clear the explicit proxy so the request reaches \
+             the target directly; got {:?}",
+            resp.err()
+        );
     }
 }
