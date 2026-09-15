@@ -396,6 +396,8 @@ pub async fn execute_llm_chat(
     request: LlmChatRequest,
     base_url: Option<&str>,
 ) -> Result<LlmChatResponse> {
+    crate::local::latch::egress_guard(provider, base_url)
+        .map_err(|e| DaemonError::PermissionDenied(e.to_string()))?;
     match provider {
         ProviderType::Anthropic => {
             execute_anthropic_chat(api_key, model, request, provider, base_url).await
@@ -439,10 +441,7 @@ pub async fn execute_llm_chat(
         ProviderType::KimiAgent => {
             execute_kimi_agent_chat(api_key, model, request, provider, base_url).await
         }
-        // TODO(Task 1.4): route to the on-device engine supervisor once it exists.
-        ProviderType::Local => Err(DaemonError::InternalError(
-            "on-device engine not running".to_string(),
-        )),
+        ProviderType::Local => crate::wasm::local_llm::execute_local_chat(request).await,
     }
 }
 
@@ -975,7 +974,11 @@ fn build_openai_request_body(model: &str, request: &LlmChatRequest) -> serde_jso
 /// (which splits Reasoning + ToolCall into two wire messages and drops
 /// the reasoning_content from the tool-call message) is the whole point
 /// of having this function.
-fn build_deepseek_request_body(
+///
+/// `pub(crate)`: also the base body builder for `local_llm::local_request_body`
+/// — the on-device engine speaks the same OpenAI-compatible +
+/// `reasoning_content` dialect as DeepSeek's thinking mode.
+pub(crate) fn build_deepseek_request_body(
     model: &str,
     request: &LlmChatRequest,
     stream: bool,
@@ -2578,6 +2581,8 @@ async fn execute_llm_stream_inner(
     base_url: Option<&str>,
     _host_services: Option<crate::wasm::services::HostServices>,
 ) -> Result<()> {
+    crate::local::latch::egress_guard(provider, base_url)
+        .map_err(|e| DaemonError::PermissionDenied(e.to_string()))?;
     match provider {
         ProviderType::Anthropic => {
             stream_anthropic(api_key, model, request, tx, provider, base_url).await
@@ -2632,10 +2637,7 @@ async fn execute_llm_stream_inner(
             "Streaming not supported for provider {:?}",
             provider
         ))),
-        // TODO(Task 1.4): route to the on-device engine supervisor once it exists.
-        ProviderType::Local => Err(DaemonError::InternalError(
-            "on-device engine not running".to_string(),
-        )),
+        ProviderType::Local => crate::wasm::local_llm::stream_local(request, tx).await,
     }
 }
 

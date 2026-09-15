@@ -8,6 +8,7 @@ pub mod instance;
 pub mod json_normalizing_client;
 pub mod linker;
 pub mod llm;
+pub mod local_llm;
 pub mod mcp_http_server;
 pub mod mcp_tool_executor;
 pub mod openai_sse;

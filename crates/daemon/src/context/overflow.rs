@@ -35,6 +35,8 @@ const OVERFLOW_PHRASES: &[&str] = &[
     "context window",
     "too many tokens",
     "maximum context",
+    // Local (llama.cpp-server-style) engines
+    "exceeds the available context size",
 ];
 
 /// Whether this error says the request was too large to fit.
@@ -101,6 +103,8 @@ mod tests {
             // Compatible endpoints
             "Error: context window exceeded for this model",
             "too many tokens in request",
+            // Local (llama.cpp-server-style) engines
+            "the request exceeds the available context size. try increasing the context size or enable context shift",
         ] {
             assert!(is_context_overflow(msg), "not recognised: {msg}");
         }
