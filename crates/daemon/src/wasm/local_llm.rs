@@ -36,6 +36,18 @@ async fn admission_hook() -> Result<()> {
     Ok(())
 }
 
+/// Truncate an error-response body to at most 500 *characters* for use in an
+/// error message.
+///
+/// `&text[..500]` (byte-slicing) panics whenever byte offset 500 doesn't
+/// land on a UTF-8 character boundary — entirely possible for a body that
+/// contains any multibyte character (e.g. a non-ASCII error message from
+/// the engine). Truncating by `chars()` instead is always a valid slice,
+/// whatever the byte layout.
+fn truncate_for_error(text: &str) -> String {
+    text.chars().take(500).collect()
+}
+
 /// Build the request body sent to the on-device engine.
 ///
 /// `build_deepseek_request_body` supplies the base shape (and the
@@ -94,7 +106,7 @@ pub async fn execute_local_chat(request: LlmChatRequest) -> Result<LlmChatRespon
         return Err(DaemonError::InternalError(format!(
             "Local engine HTTP {}: {}",
             status,
-            &text[..text.len().min(500)]
+            truncate_for_error(&text)
         )));
     }
 
@@ -182,7 +194,7 @@ pub async fn stream_local(request: LlmChatRequest, tx: mpsc::Sender<LlmStreamChu
         return Err(DaemonError::InternalError(format!(
             "Local engine stream HTTP {}: {}",
             status,
-            &text[..text.len().min(500)]
+            truncate_for_error(&text)
         )));
     }
 
@@ -305,71 +317,93 @@ mod tests {
         haystack.windows(needle.len()).position(|w| w == needle)
     }
 
-    /// Minimal hand-rolled HTTP/1.1 SSE server for testing the raw-HTTP
-    /// local provider without a mocking dependency.
+    /// Read a full HTTP/1.1 request (headers + body) off `socket`, using
+    /// `Content-Length` to know when the body is complete. Returns the raw
+    /// bytes read (headers included, exactly as sent).
+    async fn read_full_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut header_end = None;
+        let mut content_length = 0usize;
+        loop {
+            let n = socket.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if header_end.is_none() {
+                if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+                    header_end = Some(pos + 4);
+                    let header_text = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
+                    content_length = header_text
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                }
+            }
+            if let Some(he) = header_end {
+                if buf.len() >= he + content_length {
+                    break;
+                }
+            }
+        }
+        buf
+    }
+
+    /// Minimal hand-rolled HTTP/1.1 server for testing the raw-HTTP local
+    /// provider without a mocking dependency.
     ///
-    /// Accepts exactly one connection, reads the full request (headers +
-    /// body, using `Content-Length` to know when the body is complete),
-    /// writes `lines` back as `data: ...` SSE events (connection-close
-    /// delimited — no `Content-Length`/`Transfer-Encoding` on the
-    /// response, which is a legal HTTP/1.1 framing per RFC 7230 §3.3.3
-    /// rule 7 and exactly how a real streaming server behaves), then closes
-    /// the socket.
+    /// Accepts exactly one connection, reads the full request via
+    /// [`read_full_request`], writes back `head` (the status line plus any
+    /// extra header lines, `\r\n`-joined, no trailing blank line) followed
+    /// by `body` — connection-close delimited (no `Content-Length` /
+    /// `Transfer-Encoding` on the response, which is a legal HTTP/1.1
+    /// framing per RFC 7230 §3.3.3 rule 7 and exactly how a real streaming
+    /// server behaves) — then closes the socket.
     ///
     /// Returns the endpoint URL and a receiver for the captured request
     /// text, lower-cased — so a caller doesn't have to guess whether the
     /// HTTP stack sent `Authorization: Bearer …` or `authorization: Bearer
     /// …` on the wire.
-    async fn fake_sse_server(lines: Vec<&str>) -> (String, tokio::sync::oneshot::Receiver<String>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn fake_http_server(
+        head: &str,
+        body: Vec<u8>,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (req_tx, req_rx) = tokio::sync::oneshot::channel();
-        let body: String = lines.into_iter().map(|l| format!("{l}\n\n")).collect();
+        let head = head.to_string();
 
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            let mut header_end = None;
-            let mut content_length = 0usize;
-            loop {
-                let n = socket.read(&mut chunk).await.unwrap();
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if header_end.is_none() {
-                    if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
-                        header_end = Some(pos + 4);
-                        let header_text = String::from_utf8_lossy(&buf[..pos]).to_ascii_lowercase();
-                        content_length = header_text
-                            .lines()
-                            .find_map(|l| l.strip_prefix("content-length:"))
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                            .unwrap_or(0);
-                    }
-                }
-                if let Some(he) = header_end {
-                    if buf.len() >= he + content_length {
-                        break;
-                    }
-                }
-            }
-
+            let buf = read_full_request(&mut socket).await;
             let _ = req_tx.send(String::from_utf8_lossy(&buf).to_ascii_lowercase());
 
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
-            );
-            let _ = socket.write_all(response.as_bytes()).await;
+            let mut response = format!("{head}\r\nConnection: close\r\n\r\n").into_bytes();
+            response.extend_from_slice(&body);
+            let _ = socket.write_all(&response).await;
             let _ = socket.shutdown().await;
         });
 
         (format!("http://{addr}"), req_rx)
+    }
+
+    /// SSE-flavored sibling of [`fake_http_server`]: joins `lines` with
+    /// blank-line separators (`data: ...\n\n`) and serves them as a
+    /// `200 OK text/event-stream` body.
+    async fn fake_sse_server(lines: Vec<&str>) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let body: String = lines.into_iter().map(|l| format!("{l}\n\n")).collect();
+        fake_http_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream",
+            body.into_bytes(),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -430,6 +464,7 @@ mod tests {
         let req = captured.await.unwrap();
         assert!(req.contains("authorization: bearer k"));
         assert!(req.contains("\"enable_thinking\":false"));
+        assert!(req.contains("\"include_usage\":true"));
     }
 
     #[tokio::test]
@@ -449,5 +484,120 @@ mod tests {
             r,
             Err(crate::error::DaemonError::PermissionDenied(_))
         ));
+    }
+
+    #[test]
+    fn local_request_body_includes_stream_options_only_when_streaming() {
+        let ep = LocalEndpoint {
+            base_url: "http://127.0.0.1:1".into(),
+            api_key: "k".into(),
+            n_ctx: 16384,
+            model_id: "m".into(),
+            thinking_hybrid: false,
+        };
+        let req = LlmChatRequest::default();
+
+        let streaming = local_request_body(&ep, &req, true);
+        assert_eq!(
+            streaming["stream_options"],
+            serde_json::json!({"include_usage": true})
+        );
+
+        let non_streaming = local_request_body(&ep, &req, false);
+        assert!(
+            non_streaming.get("stream_options").is_none(),
+            "non-stream body must not carry stream_options: {non_streaming}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_2xx_response_over_500_bytes_with_split_multibyte_char_does_not_panic() {
+        let _g = crate::local::latch::test_serial();
+        let _reset = EndpointGuard;
+
+        // 498 ASCII bytes, then a 3-byte CJK character (bytes 498-500), then
+        // more filler. Byte offset 500 lands on that character's last
+        // continuation byte — not a char boundary — which is exactly what
+        // made the old `&text[..500]` byte-slice panic.
+        let mut body = "x".repeat(498);
+        body.push('\u{597d}'); // 好, 3 bytes: E5 A5 BD
+        body.push_str("yyyyyyyyyy");
+        assert!(body.len() > 500, "test body must exceed 500 bytes");
+        assert!(
+            !body.is_char_boundary(500),
+            "test body must straddle byte 500"
+        );
+
+        let (url, _captured) =
+            fake_http_server("HTTP/1.1 500 Internal Server Error", body.into_bytes()).await;
+        endpoint::publish(Some(LocalEndpoint {
+            base_url: url,
+            api_key: "k".into(),
+            n_ctx: 16384,
+            model_id: "m".into(),
+            thinking_hybrid: false,
+        }));
+
+        let err = execute_local_chat(LlmChatRequest::default())
+            .await
+            .expect_err("a non-2xx response must be an Err, not a panic");
+        assert!(
+            err.to_string().contains("500"),
+            "error should mention the HTTP status: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_local_chat_sends_bearer_and_parses_content_tools_and_usage() {
+        let _g = crate::local::latch::test_serial();
+        let _reset = EndpointGuard;
+
+        let body = serde_json::json!({
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "done",
+                    "tool_calls": [{
+                        "id": "t1",
+                        "function": {
+                            "name": "read",
+                            "arguments": "{\"path\":\"x\"}"
+                        }
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+        })
+        .to_string();
+
+        let (url, captured) = fake_http_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json",
+            body.into_bytes(),
+        )
+        .await;
+        endpoint::publish(Some(LocalEndpoint {
+            base_url: url,
+            api_key: "k".into(),
+            n_ctx: 16384,
+            model_id: "m".into(),
+            thinking_hybrid: false,
+        }));
+
+        let resp = execute_local_chat(LlmChatRequest {
+            messages: vec![LlmMessage::user("hi")],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(resp.content, "done");
+        let tools = resp.tool_calls.expect("tool_calls must be parsed");
+        assert_eq!(tools[0].name, "read");
+        assert_eq!(tools[0].arguments, serde_json::json!({"path": "x"}));
+        let usage = resp.usage.expect("usage must be parsed");
+        assert_eq!(usage.total_tokens, 7);
+
+        let req = captured.await.unwrap();
+        assert!(req.contains("authorization: bearer k"));
     }
 }

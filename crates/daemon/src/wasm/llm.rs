@@ -50,6 +50,8 @@ pub fn acp_providers() -> &'static Arc<TokioMutex<HashMap<String, AcpProvider>>>
 /// Errors when the provider is not already connected (e.g. in unit tests), so
 /// the goal evaluator fails safe rather than blocking on process startup.
 pub async fn acp_oneshot(provider: ProviderType, _model: &str, prompt: &str) -> Result<String> {
+    crate::local::latch::egress_guard(provider, None)
+        .map_err(|e| DaemonError::PermissionDenied(e.to_string()))?;
     let provider_key = format!("{:?}", provider);
     let providers = acp_providers().lock().await;
     let acp = providers
@@ -6144,6 +6146,29 @@ mod tests {
         }
     }
     use super::*;
+
+    /// Resets the global LocalOnly latch on drop, so a test that sets it
+    /// can't leak into a later test even if an assertion panics first.
+    struct LatchResetGuard;
+    impl Drop for LatchResetGuard {
+        fn drop(&mut self) {
+            crate::local::latch::set(false);
+        }
+    }
+
+    /// `acp_oneshot` is LLM egress too (spec §4.3 route B, goal evaluator) —
+    /// it must be refused while the LocalOnly latch is on, same as
+    /// `execute_llm_chat` / `execute_llm_stream_inner`. The guard runs
+    /// before the ACP provider registry is even locked, so this never
+    /// touches a provider (there isn't one registered in this test anyway).
+    #[tokio::test]
+    async fn acp_oneshot_is_refused_while_latched() {
+        let _g = crate::local::latch::test_serial();
+        let _reset = LatchResetGuard;
+        crate::local::latch::set(true);
+        let r = acp_oneshot(ProviderType::ClaudeCode, "m", "hi").await;
+        assert!(matches!(r, Err(DaemonError::PermissionDenied(_))));
+    }
 
     #[test]
     fn cap_acp_content_leaves_small_prompt_untouched() {
