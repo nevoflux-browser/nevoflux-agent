@@ -1,0 +1,217 @@
+//! The LocalOnly latch and its egress guard.
+//!
+//! When on-device inference is the active, enabled provider, the latch is
+//! "on" and every non-loopback network request an LLM call would otherwise
+//! make is refused before it leaves the process — see [`egress_guard`].
+//! [`refresh_from_config`] is the only writer during normal operation; it is
+//! called whenever the config changes (startup, `config.set`, config-file
+//! watch reload) so the latch always tracks the current `[llm]` section
+//! rather than a snapshot taken at startup.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use nevoflux_llm::ProviderType;
+
+/// Global on/off state. `SeqCst` throughout: this is touched rarely (config
+/// changes) and read on every LLM call, so there is no throughput reason to
+/// weaken the ordering, and a stray egress check racing a `refresh` is
+/// exactly the kind of bug a stronger-than-necessary ordering is cheap
+/// insurance against.
+static LATCH: AtomicBool = AtomicBool::new(false);
+
+/// Whether the LocalOnly latch is currently on.
+pub fn is_on() -> bool {
+    LATCH.load(Ordering::SeqCst)
+}
+
+/// Set the latch, returning its previous value.
+pub fn set(on: bool) -> bool {
+    LATCH.swap(on, Ordering::SeqCst)
+}
+
+/// Recompute the latch from `cfg` and apply it if it changed.
+///
+/// The latch is on iff the active provider resolves to
+/// [`ProviderType::Local`] (which also accepts the `"on-device"` /
+/// `"ondevice"` aliases, since resolution goes through
+/// [`nevoflux_llm::ProviderType::from_str`] rather than a literal string
+/// compare) **and** `[llm.local].enabled` is true. Returns `Some(new)` iff
+/// the latch's value changed, `None` if it was already at the computed
+/// value — so callers can log/broadcast only on an actual transition.
+pub fn refresh_from_config(cfg: &crate::config::AgentConfig) -> Option<bool> {
+    let new_on = cfg
+        .llm
+        .active_provider()
+        .and_then(|p| cfg.llm.resolve_wire(p))
+        == Some(ProviderType::Local)
+        && cfg.llm.local.enabled;
+    let prev = set(new_on);
+    (prev != new_on).then_some(new_on)
+}
+
+/// A network request was refused because the LocalOnly latch is on.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("On-device mode is on: requests to `{provider}` are blocked so conversation content stays on this device")]
+pub struct LocalOnlyRefused {
+    pub provider: String,
+}
+
+/// Providers that shell out to their own CLI rather than have this process
+/// make the HTTP request.
+///
+/// A subprocess is never loopback-exempt: the daemon does not control what
+/// host the CLI itself talks to (and for `ClaudeCode` / `GeminiCli` /
+/// `OpenClaw` / `Antigravity` it is always the vendor's cloud), so a
+/// `base_url` pointing at loopback proves nothing about where the CLI's own
+/// traffic goes.
+fn is_subprocess_provider(provider: ProviderType) -> bool {
+    use ProviderType::*;
+    matches!(
+        provider,
+        ClaudeCode | GeminiCli | KimiAgent | OpenClaw | Antigravity
+    )
+}
+
+/// Decide whether a request to `provider` is allowed given latch state
+/// `latched`. Pure — no global state — so it is exhaustively unit-testable;
+/// [`egress_guard`] is the thin wrapper that reads the actual latch.
+pub fn egress_decision(
+    latched: bool,
+    provider: ProviderType,
+    base_url: Option<&str>,
+) -> Result<(), LocalOnlyRefused> {
+    if !latched || provider == ProviderType::Local {
+        return Ok(());
+    }
+    if !is_subprocess_provider(provider) {
+        if let Some(url) = base_url {
+            if is_loopback_url(url) {
+                return Ok(());
+            }
+        }
+    }
+    Err(LocalOnlyRefused {
+        provider: format!("{provider:?}"),
+    })
+}
+
+/// Refuse a request to `provider` if the LocalOnly latch is on and the
+/// request isn't exempt (see [`egress_decision`]).
+pub fn egress_guard(
+    provider: ProviderType,
+    base_url: Option<&str>,
+) -> Result<(), LocalOnlyRefused> {
+    egress_decision(is_on(), provider, base_url)
+}
+
+/// Whether `url`'s host is loopback: `127.0.0.0/8`, `[::1]`, or `localhost`.
+///
+/// An unparseable URL or missing host is treated as not loopback (the
+/// conservative answer — [`egress_decision`] then refuses it).
+pub fn is_loopback_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // `Url::host_str` brackets an IPv6 literal (e.g. "[::1]"); strip that
+    // before handing it to `IpAddr::parse`, which doesn't accept brackets.
+    let candidate = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    candidate
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Serialize tests that touch the process-global [`LATCH`].
+///
+/// `cargo test` runs `#[test]` functions on multiple threads by default, so
+/// without this, `refresh_tracks_active_provider_and_enabled` and
+/// `refresh_tracks_provider_alias` would race each other's `set` calls.
+#[cfg(test)]
+pub fn test_serial() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nevoflux_llm::ProviderType::*;
+
+    /// Keeps [`ProviderType`] exhaustive here: a new variant fails this
+    /// function to compile until `only_local_or_loopback_passes_when_latched`
+    /// below is updated to cover it too.
+    #[allow(dead_code)]
+    fn _exhaustive(p: nevoflux_llm::ProviderType) {
+        match p {
+            Anthropic | OpenAi | OpenRouter | DeepSeek | Qwen | Gemini | Groq | Ollama
+            | Mistral | XAi | Cohere | Perplexity | Together | ClaudeCode | GeminiCli
+            | KimiAgent | OpenClaw | Antigravity | Local => {}
+        }
+    }
+
+    #[test]
+    fn only_local_or_loopback_passes_when_latched() {
+        use nevoflux_llm::ProviderType::*;
+        let all = [
+            Anthropic,
+            OpenAi,
+            OpenRouter,
+            DeepSeek,
+            Qwen,
+            Gemini,
+            Groq,
+            Ollama,
+            Mistral,
+            XAi,
+            Cohere,
+            Perplexity,
+            Together,
+            ClaudeCode,
+            GeminiCli,
+            KimiAgent,
+            OpenClaw,
+            Antigravity,
+            Local,
+        ];
+        for p in all {
+            let r = egress_decision(true, p, None);
+            assert_eq!(r.is_ok(), p == Local, "{p:?} with no base_url");
+            assert!(egress_decision(false, p, None).is_ok());
+        }
+        // OpenAI-wire custom endpoint on loopback (user's own Ollama) is allowed
+        assert!(egress_decision(true, OpenAi, Some("http://127.0.0.1:11434/v1")).is_ok());
+        assert!(egress_decision(true, OpenAi, Some("http://localhost:8080")).is_ok());
+        // ACP providers are never loopback-exempt: their CLI talks to the cloud itself
+        assert!(egress_decision(true, ClaudeCode, Some("http://127.0.0.1:1")).is_err());
+        assert!(egress_decision(true, OpenAi, Some("https://api.openai.com/v1")).is_err());
+        assert!(egress_decision(true, OpenAi, Some("http://127.0.0.1.evil.com/v1")).is_err());
+    }
+
+    #[test]
+    fn refresh_tracks_active_provider_and_enabled() {
+        let _g = test_serial();
+        let mut cfg = crate::config::AgentConfig::default();
+        set(false);
+        cfg.llm.provider = Some("local".into());
+        assert_eq!(refresh_from_config(&cfg), None); // not enabled -> stays off
+        cfg.llm.local.enabled = true;
+        assert_eq!(refresh_from_config(&cfg), Some(true));
+        assert!(is_on());
+        cfg.llm.provider = Some("anthropic".into());
+        assert_eq!(refresh_from_config(&cfg), Some(false));
+        // "on-device" is an accepted alias for "local" (ProviderType::from_str)
+        cfg.llm.provider = Some("on-device".into());
+        assert_eq!(refresh_from_config(&cfg), Some(true));
+        set(false);
+    }
+}
