@@ -135,6 +135,21 @@ impl<'a> GoalRepository<'a> {
         })
     }
 
+    /// Stamp `last_reason` (and `updated_at`) WITHOUT touching `turns_used`.
+    ///
+    /// Distinct from [`increment_turns`](Self::increment_turns): used by the
+    /// LocalOnly-latch "paused" path in `GoalManager::after_turn`, which must
+    /// persist a reason for a check-less goal it is NOT counting as a turn.
+    pub fn set_last_reason(&self, id: &str, reason: &str, now: i64) -> Result<()> {
+        self.db.with_connection(|conn| {
+            conn.execute(
+                "UPDATE goals SET last_reason = ?1, updated_at = ?2 WHERE id = ?3",
+                params![reason, now, id],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Transition a goal's status, stamping `achieved_at` when moving to
     /// `Achieved`.
     pub fn set_status(&self, id: &str, status: GoalStatus, now: i64) -> Result<()> {
@@ -312,6 +327,22 @@ mod tests {
             Some("still waiting on the merge")
         );
         assert_eq!(got.updated_at, 1_700_000_100);
+    }
+
+    #[test]
+    fn set_last_reason_updates_reason_without_touching_turns() {
+        let db = test_db();
+        seed_session(&db, "sess-1");
+        let repo = GoalRepository::new(&db);
+        repo.create(&sample("goal00001", "sess-1")).unwrap();
+
+        repo.set_last_reason("goal00001", "paused: on-device mode", 1_700_000_050)
+            .unwrap();
+
+        let got = repo.get("goal00001").unwrap().unwrap();
+        assert_eq!(got.last_reason.as_deref(), Some("paused: on-device mode"));
+        assert_eq!(got.turns_used, 0, "must not increment turns_used");
+        assert_eq!(got.updated_at, 1_700_000_050);
     }
 
     #[test]

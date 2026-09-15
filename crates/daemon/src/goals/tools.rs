@@ -50,16 +50,35 @@ async fn goal_set(args: &Value, session_id: &str, mgr: &GoalManager) -> Result<V
         .and_then(|v| v.as_str())
         .ok_or("condition (string) required")?
         .to_string();
-    let evaluator_provider = args
-        .get("evaluator_provider")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let evaluator_model = args
-        .get("evaluator_model")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let max_turns = args.get("max_turns").and_then(|v| v.as_i64());
     let check = crate::goals::check::parse_check(args)?;
+
+    // LocalOnly latch: an on-device goal can only complete via a
+    // programmatic check — there is no model-judged evaluator route while
+    // conversation content must stay on the device. A check-less goal is
+    // refused outright (rather than silently paused forever), and any
+    // explicit evaluator hint is ignored so it never gets stored and later
+    // mistaken for a usable evaluator once the latch turns off.
+    let latched = crate::local::latch::is_on();
+    if latched && check.is_none() {
+        return Err(
+            "In on-device mode, goals need a programmatic check (the `check` argument). \
+             Model-judged goals are unavailable."
+                .to_string(),
+        );
+    }
+    let (evaluator_provider, evaluator_model) = if latched {
+        (None, None)
+    } else {
+        (
+            args.get("evaluator_provider")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            args.get("evaluator_model")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        )
+    };
+    let max_turns = args.get("max_turns").and_then(|v| v.as_i64());
 
     mgr.set_checked(
         session_id,
@@ -295,5 +314,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, json!({ "status": "none" }));
+    }
+
+    /// While the LocalOnly latch is on, a goal can only complete via a
+    /// programmatic check — a check-less `goal_set` is refused with an
+    /// actionable message; a checked one still succeeds.
+    #[tokio::test]
+    async fn goal_set_without_check_is_refused_when_latched() {
+        let _g = crate::local::latch::test_serial();
+        struct ResetLatch;
+        impl Drop for ResetLatch {
+            fn drop(&mut self) {
+                crate::local::latch::set(false);
+            }
+        }
+        let _reset = ResetLatch;
+        crate::local::latch::set(true);
+
+        let (_db, mgr) = mgr_with_session("sess-1");
+
+        let err = execute_goal_tool(
+            "goal_set",
+            &json!({ "condition": "x" }),
+            "sess-1",
+            false,
+            &mgr,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("programmatic check"),
+            "unexpected error: {err}"
+        );
+
+        let result = execute_goal_tool(
+            "goal_set",
+            &json!({ "condition": "x", "check": { "matches": "ok" } }),
+            "sess-1",
+            false,
+            &mgr,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "a check-only goal must still be settable while latched: {result:?}"
+        );
     }
 }

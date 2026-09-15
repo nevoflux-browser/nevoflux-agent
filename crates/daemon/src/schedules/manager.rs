@@ -897,7 +897,7 @@ fn boot_recover(inner: &Arc<Inner>) -> BootPlan {
 async fn tick_loop(inner: Arc<Inner>, mut run_rx: mpsc::Receiver<DispatchRequest>, boot: BootPlan) {
     // Deferred boot emissions (start_with_bus is synchronous).
     for (id, name, fire_was_at) in boot.missed {
-        inner.events.missed(&id, &name, fire_was_at).await;
+        inner.events.missed(&id, &name, fire_was_at, None).await;
     }
     for (id, name, prev, new) in boot.state_changes {
         inner
@@ -917,19 +917,7 @@ async fn tick_loop(inner: Arc<Inner>, mut run_rx: mpsc::Receiver<DispatchRequest
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                // Defer coalesce: if a browser is now available, re-fire the
-                // parked (live+defer) schedules once each. Runs BEFORE the due
-                // sweep; `run_one`'s concurrency gate + live-status recheck make
-                // a schedule that also lands in `list_due` a single fire.
-                for id in inner.take_deferred_if_available() {
-                    inner.spawn_run(id, "scheduled".to_string());
-                }
-                let now = current_timestamp();
-                if let Ok(due) = ScheduleRepository::new(&inner.db).list_due(now) {
-                    for rec in due {
-                        inner.spawn_run(rec.id, "scheduled".to_string());
-                    }
-                }
+                tick_once(&inner, current_timestamp()).await;
             }
             maybe = run_rx.recv() => {
                 match maybe {
@@ -939,6 +927,71 @@ async fn tick_loop(inner: Arc<Inner>, mut run_rx: mpsc::Receiver<DispatchRequest
                 }
             }
         }
+    }
+}
+
+/// The single due-tick body: defer-coalesce, then dispatch every due
+/// schedule. `now` is a parameter (rather than read internally) so tests can
+/// drive this deterministically without waiting on the real ticker.
+///
+/// While the LocalOnly latch is on, due schedules are never dispatched — a
+/// run would need to call an LLM off-device — so each is instead recorded
+/// missed and advanced past exactly like `boot_recover`'s non-catch-up
+/// branch (~L848-882: `record_missed`, `set_last_run_status("missed")`,
+/// rearm a cron's `next_fire_at` or retire a one-off), and a
+/// `system:schedule:missed` event carries `reason: "local_mode"`. No
+/// catch-up is ever queued for a latched miss, unlike a normal boot-recovery
+/// miss with `catch_up` set.
+async fn tick_once(inner: &Arc<Inner>, now: i64) {
+    // Defer coalesce: if a browser is now available, re-fire the parked
+    // (live+defer) schedules once each. Runs BEFORE the due sweep; `run_one`'s
+    // concurrency gate + live-status recheck make a schedule that also lands
+    // in `list_due` a single fire.
+    for id in inner.take_deferred_if_available() {
+        inner.spawn_run(id, "scheduled".to_string());
+    }
+
+    let due = match ScheduleRepository::new(&inner.db).list_due(now) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    if crate::local::latch::is_on() {
+        let repo = ScheduleRepository::new(&inner.db);
+        for rec in due {
+            let fire_was_at = rec.next_fire_at.unwrap_or(now);
+            let _ = repo.record_missed(&rec.id, fire_was_at, now);
+            let _ = repo.set_last_run_status(&rec.id, "missed", now);
+            if let Some(expr) = &rec.cron_expr {
+                // Recurring: rearm to the next occurrence after now (stays
+                // Active — no pending_work change, matching every other
+                // cron-fire outcome).
+                let next = cron::next_after(expr, now).ok();
+                let _ = repo.update_next_fire(&rec.id, next, now);
+            } else {
+                // One-off: the moment is gone — retire it (mirrors
+                // `finish_fire`'s one-off retirement, including the
+                // pending_work decrement: unlike `boot_recover`, this runs in
+                // steady state where the counter is already live-tracked).
+                let _ = repo.update_next_fire(&rec.id, None, now);
+                if repo.retire_one_off(&rec.id, now).unwrap_or(false) {
+                    inner.pending_work.fetch_sub(1, Ordering::SeqCst);
+                    inner
+                        .events
+                        .state_changed(&rec.id, &rec.name, "ran", "active", None)
+                        .await;
+                }
+            }
+            inner
+                .events
+                .missed(&rec.id, &rec.name, fire_was_at, Some("local_mode"))
+                .await;
+        }
+        return;
+    }
+
+    for rec in due {
+        inner.spawn_run(rec.id, "scheduled".to_string());
     }
 }
 
@@ -1133,6 +1186,56 @@ mod tests {
         assert!(!mgr.has_pending_work());
         let runs = mgr.runs("sch00009", 10).await.unwrap();
         assert!(runs.iter().any(|r| r.status == ScheduleRunStatus::Missed));
+        mgr.shutdown().await;
+    }
+
+    /// LocalOnly latch: a schedule already due when a tick runs must be
+    /// recorded missed and rearmed (never actually run) while the latch is
+    /// on, and never queued as a catch-up even with `catch_up: true`.
+    #[tokio::test]
+    async fn due_schedule_is_recorded_missed_not_run_while_latched() {
+        let _g = crate::local::latch::test_serial();
+        struct ResetLatch;
+        impl Drop for ResetLatch {
+            fn drop(&mut self) {
+                crate::local::latch::set(false);
+            }
+        }
+        let _reset = ResetLatch;
+
+        let db = Database::open_in_memory().unwrap();
+        let mgr = ScheduleManager::start_with_bus(db.clone(), None, None);
+        let now = current_timestamp();
+
+        // Insert the due row AFTER boot (boot_recover already ran and never
+        // saw it), so `tick_once` alone is under test.
+        let mut rec = seed("sch-latch", Some("0 9 * * *"), None, Some(now - 10));
+        rec.catch_up = true;
+        ScheduleRepository::new(&db).create(&rec).unwrap();
+
+        crate::local::latch::set(true);
+        tick_once(&mgr.inner, now).await;
+
+        let runs = mgr.runs("sch-latch", 10).await.unwrap();
+        assert_eq!(
+            runs.len(),
+            1,
+            "exactly one run row (missed) — no catchup was queued: {runs:?}"
+        );
+        assert_eq!(runs[0].status, ScheduleRunStatus::Missed);
+
+        let updated = ScheduleRepository::new(&db)
+            .get("sch-latch")
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, ScheduleStatus::Active, "cron stays active");
+        assert_eq!(updated.last_run_status.as_deref(), Some("missed"));
+        assert!(
+            updated.next_fire_at.unwrap() > now,
+            "next_fire_at must be rearmed into the future, got {:?}",
+            updated.next_fire_at
+        );
+
         mgr.shutdown().await;
     }
 

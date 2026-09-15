@@ -192,22 +192,35 @@ pub async fn extract_session_memories(
     let active_model = config.llm.active_model().unwrap_or("gpt-4o-mini");
     let (provider, api_key) = crate::context::get_summarization_provider(&config, active_model)?;
 
-    let active_provider = config
-        .llm
-        .active_provider()
-        .and_then(|p| config.llm.resolve_wire(p));
-    let is_fallback = active_provider.map(|ap| ap != provider).unwrap_or(false);
-    let model = if is_fallback {
-        nevoflux_llm::default_model_for(provider)
-    } else {
-        active_model
-    };
-    let base_url = if is_fallback {
-        // Don't use active provider's base_url when falling back
-        None
-    } else {
-        config.llm.active_base_url()
-    };
+    // LocalOnly latch: `get_summarization_provider` returns `Local` whenever
+    // the latch is on, so route model/base_url resolution to the on-device
+    // engine's own endpoint rather than the active/fallback-provider logic
+    // below (which would otherwise hand it a cloud model name and base_url).
+    let (model, base_url): (String, Option<String>) =
+        if provider == nevoflux_llm::ProviderType::Local {
+            let model = crate::local::endpoint::current()
+                .map(|e| e.model_id)
+                .unwrap_or_else(|| config.llm.local.model.clone());
+            (model, None)
+        } else {
+            let active_provider = config
+                .llm
+                .active_provider()
+                .and_then(|p| config.llm.resolve_wire(p));
+            let is_fallback = active_provider.map(|ap| ap != provider).unwrap_or(false);
+            let model = if is_fallback {
+                nevoflux_llm::default_model_for(provider).to_string()
+            } else {
+                active_model.to_string()
+            };
+            let base_url = if is_fallback {
+                // Don't use active provider's base_url when falling back
+                None
+            } else {
+                config.llm.active_base_url().map(|s| s.to_string())
+            };
+            (model, base_url)
+        };
 
     // Gather existing hot knowledge to avoid duplicates
     let knowledge_repo = KnowledgeRepository::new(&database);
@@ -241,8 +254,14 @@ pub async fn extract_session_memories(
         model, provider
     );
 
-    let response =
-        crate::wasm::llm::execute_llm_chat(provider, &api_key, model, request, base_url).await?;
+    let response = crate::wasm::llm::execute_llm_chat(
+        provider,
+        &api_key,
+        &model,
+        request,
+        base_url.as_deref(),
+    )
+    .await?;
 
     // Parse response
     let items = parse_extraction_response(&response.content);
