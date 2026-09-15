@@ -1039,6 +1039,14 @@ pub async fn start_server(
     // handle was published, before gbrain spawned), so this only affects
     // the LATER calls from the four `config.llm.*` handlers below.
     let _ = crate::local::sync::CURRENT_DB.set(db.clone());
+    // R32: now that the event bus + DB both exist, publish the CURRENT
+    // latch state unconditionally — not gated on a transition, unlike
+    // `on_config_changed`'s own publish — so a daemon that boots already
+    // latched still gives a sticky event to any subscriber (e.g. the
+    // sidebar's on-device indicator, v3 I3) that connects after boot. The
+    // earlier boot-time `on_config_changed` call already applied the
+    // gateway upstream; this only handles the broadcast.
+    crate::local::publish_current_latch_state().await;
 
     // Initialize MCP manager (empty) and tool search index.
     // Actual connections happen in a background task so the daemon starts fast.

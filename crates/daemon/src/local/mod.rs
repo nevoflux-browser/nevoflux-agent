@@ -16,4 +16,4 @@ pub mod endpoint;
 pub mod latch;
 pub mod sync;
 pub use config::*;
-pub use sync::{apply_gateway_upstream_for_latch, on_config_changed};
+pub use sync::{apply_gateway_upstream_for_latch, on_config_changed, publish_current_latch_state};

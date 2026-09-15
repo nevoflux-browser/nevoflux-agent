@@ -53,6 +53,27 @@
 //! `GatewayControl` / `Database` / `EventBus` instances and never touch
 //! the process globals at all, so they're immune to what any other test
 //! in the binary does with them, run order included.
+//!
+//! ## Boot-time publish (fix round 1 follow-up, R32)
+//!
+//! [`on_config_changed`]'s publish is gated on an actual latch *transition*
+//! (`refresh_from_config`'s `Some`). A daemon that boots already latched —
+//! `[llm].provider` was on-device before the process even started — never
+//! transitions during boot: the latch goes straight from its `false`
+//! default to its correct value inside the very first `refresh_from_config`
+//! call, and that call runs (fix round 1, item 6) before the event bus
+//! exists, so nothing is there to receive it anyway. Without a separate
+//! mechanism, a client that subscribes to [`TOPIC_LATCH`] after boot (e.g.
+//! the sidebar's on-device indicator, v3 I3) would see no sticky event to
+//! replay until the *next* real transition — potentially never, if the
+//! user never changes providers again.
+//!
+//! [`publish_current_latch_state`] closes that gap: called once at boot,
+//! after the event bus + DB exist (`server.rs`, right after `CURRENT_DB`
+//! is published), it publishes the CURRENT latch state unconditionally —
+//! not gated on a transition — so a sticky replay is always available.
+//! Runtime config changes still only publish on an actual transition
+//! (unchanged from fix round 1) — this is purely a boot-time addition.
 
 use std::sync::OnceLock;
 
@@ -123,6 +144,39 @@ async fn on_config_changed_with(
             db.map(paused_counts).unwrap_or((0, 0, 0));
         publish_latch_changed(bus, on, paused_loops, paused_schedules, paused_goals).await;
     }
+}
+
+/// Publish the CURRENT latch state (+ paused counts) unconditionally,
+/// regardless of whether it just transitioned — see the module docs'
+/// "Boot-time publish" section (R32). Called once at boot, after the
+/// event bus + DB exist.
+///
+/// Reads its dependencies from process globals and delegates to
+/// [`publish_current_latch_state_with`] — see the module docs'
+/// Testability section.
+pub async fn publish_current_latch_state() {
+    let db = CURRENT_DB.get();
+    let bus = crate::kb_wizard::CURRENT_EVENT_BUS
+        .get()
+        .map(|b| b.as_ref());
+    publish_current_latch_state_with(db, bus).await;
+}
+
+/// Core of [`publish_current_latch_state`], parameterized over its
+/// dependencies so tests can inject their own instead of touching process
+/// globals (same rationale as [`on_config_changed_with`]).
+async fn publish_current_latch_state_with(db: Option<&Database>, bus: Option<&EventBus>) {
+    // Read under SYNC_MUTEX for the same reason every other latch read
+    // that feeds something externally-visible does — see the module
+    // docs' Concurrency section. This call never writes the upstream
+    // itself, so it doesn't need `apply_gateway_upstream_for_latch_locked`,
+    // just a consistent read.
+    let on = {
+        let _guard = SYNC_MUTEX.lock().await;
+        latch::is_on()
+    };
+    let (paused_loops, paused_schedules, paused_goals) = db.map(paused_counts).unwrap_or((0, 0, 0));
+    publish_latch_changed(bus, on, paused_loops, paused_schedules, paused_goals).await;
 }
 
 /// Re-apply the gateway's upstream for the current latch state: the
@@ -316,6 +370,67 @@ mod tests {
         // Must not panic when no bus is available (module docs' "publish
         // without failing" contract).
         publish_latch_changed(None, true, 0, 0, 0).await;
+    }
+
+    // ------------------------------------------------------------------
+    // publish_current_latch_state_with — R32: boot-time unconditional
+    // publish. Dependency-injected (own Database/EventBus); touches the
+    // real global latch (via `latch::is_on()` under SYNC_MUTEX), so holds
+    // `test_serial()`.
+    // ------------------------------------------------------------------
+
+    /// R32's own acceptance test: "boot-style call with latch already on
+    /// and 'no change' still publishes exactly one sticky event." Sets
+    /// the REAL global latch to `true` directly (no transition happens —
+    /// nothing calls `refresh_from_config` here), then calls
+    /// `publish_current_latch_state_with` and confirms exactly one sticky
+    /// event with the current (already-on) state arrives.
+    #[tokio::test]
+    async fn publish_current_latch_state_with_publishes_once_even_with_no_transition() {
+        let _latch_guard = latch::test_serial();
+        latch::set_global_for_test(true);
+
+        let db = Database::open_in_memory().expect("in-memory db");
+        seed_rows(&db);
+        let bus = EventBus::new();
+        let mut sub = bus
+            .subscribe(
+                TopicPattern::exact(TOPIC_LATCH),
+                SubscriberIdentity::Internal,
+                BackpressurePolicy::DropNewest,
+                8,
+            )
+            .expect("subscribe should succeed");
+
+        publish_current_latch_state_with(Some(&db), Some(&bus)).await;
+
+        let evt = tokio::time::timeout(Duration::from_secs(2), sub.rx.recv())
+            .await
+            .expect("event within timeout")
+            .expect("channel open");
+        assert_eq!(evt.topic, TOPIC_LATCH);
+        assert_eq!(evt.payload["on"], json!(true));
+        assert_eq!(evt.payload["paused_loops"], json!(1));
+        assert_eq!(evt.payload["paused_schedules"], json!(1));
+        assert_eq!(evt.payload["paused_goals"], json!(1));
+
+        // Exactly one — no second event queued.
+        let no_second = tokio::time::timeout(Duration::from_millis(200), sub.rx.recv()).await;
+        assert!(
+            no_second.is_err(),
+            "publish_current_latch_state_with must publish exactly once per call"
+        );
+
+        latch::set_global_for_test(false);
+    }
+
+    #[tokio::test]
+    async fn publish_current_latch_state_with_is_a_no_op_without_a_bus() {
+        let _latch_guard = latch::test_serial();
+        latch::set_global_for_test(false);
+        // Must not panic when no bus is available.
+        publish_current_latch_state_with(None, None).await;
+        latch::set_global_for_test(false);
     }
 
     // ------------------------------------------------------------------
