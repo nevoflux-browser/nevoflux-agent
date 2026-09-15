@@ -99,6 +99,16 @@ fn internal_maps_to_500() {
 }
 
 #[test]
+fn local_engine_unavailable_maps_to_503() {
+    // Fix round 1, item 5: latched with no on-device engine published yet
+    // short-circuits with 503 instead of attempting a network call.
+    let e = GatewayError::LocalEngineUnavailable;
+    assert_eq!(e.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = e.to_openai_body();
+    assert_eq!(body["error"]["type"], "local_engine_unavailable");
+}
+
+#[test]
 fn openai_body_includes_error_type_and_message() {
     let e = GatewayError::RateLimited {
         retry_after: Some(Duration::from_secs(3)),
@@ -151,6 +161,10 @@ fn openai_body_kinds_match_variants() {
         (
             GatewayError::Internal { detail: "x".into() },
             "internal_error",
+        ),
+        (
+            GatewayError::LocalEngineUnavailable,
+            "local_engine_unavailable",
         ),
     ];
     for (e, expected_kind) in cases {

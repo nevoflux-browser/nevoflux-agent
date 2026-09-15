@@ -7,14 +7,49 @@
 //! the gateway's own bind address and bearer token never change.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use axum::{routing::post, Json, Router};
-use nevoflux_llm_gateway::{serve, GatewayConfig, UpstreamProtocol, UpstreamUpdate};
+use nevoflux_llm_gateway::{
+    serve, AcpProviderConfig, GatewayConfig, UpstreamProtocol, UpstreamUpdate,
+};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 const BEARER: &str = "upstream-swap-test-token";
+
+/// Build an [`UpstreamUpdate`] with every field explicit but the common
+/// case (no ACP, available) defaulted, so each test only spells out what
+/// it's actually exercising.
+fn upstream_update(base_url: String, protocol: UpstreamProtocol) -> UpstreamUpdate {
+    UpstreamUpdate {
+        base_url,
+        api_key: String::new(),
+        model_override: String::new(),
+        protocol,
+        acp_config: None,
+        unavailable: false,
+    }
+}
+
+/// An `AcpProviderConfig` that will never successfully spawn (bogus
+/// command), for tests that only need to prove a request gets *past* the
+/// "no acp_config" gateway guard — not that a live ACP session succeeds.
+fn unreachable_acp_config() -> AcpProviderConfig {
+    AcpProviderConfig {
+        command: PathBuf::from("definitely-not-a-real-binary-xyz"),
+        args: vec![],
+        env: vec![],
+        env_remove: vec![],
+        work_dir: std::env::temp_dir(),
+        session_mode: "code".into(),
+        use_mcp_bridge: false,
+        inject_mcp_url: false,
+        gate_tool_calls: false,
+        config_options: vec![],
+    }
+}
 
 /// Spin up a tiny OpenAI-protocol fake upstream that always answers
 /// `/v1/chat/completions` with the same canned `content` string, wrapped
@@ -108,12 +143,10 @@ async fn set_upstream_swaps_which_backend_serves_the_next_request() {
 
     // Hot-swap to fake upstream B.
     handle
-        .set_upstream(UpstreamUpdate {
-            base_url: format!("http://{addr_b}"),
-            api_key: String::new(),
-            model_override: String::new(),
-            protocol: UpstreamProtocol::OpenAi,
-        })
+        .set_upstream(upstream_update(
+            format!("http://{addr_b}"),
+            UpstreamProtocol::OpenAi,
+        ))
         .await;
 
     // The very next request goes to B instead, with no restart / re-bind.
@@ -152,12 +185,10 @@ async fn control_handle_can_swap_upstream_without_the_owning_gateway_handle() {
     assert_eq!(body_a["choices"][0]["message"]["content"], "A");
 
     control
-        .set_upstream(UpstreamUpdate {
-            base_url: format!("http://{addr_b}"),
-            api_key: String::new(),
-            model_override: String::new(),
-            protocol: UpstreamProtocol::OpenAi,
-        })
+        .set_upstream(upstream_update(
+            format!("http://{addr_b}"),
+            UpstreamProtocol::OpenAi,
+        ))
         .await;
 
     let body_b = send_chat_request(&client, &url).await;
@@ -165,6 +196,153 @@ async fn control_handle_can_swap_upstream_without_the_owning_gateway_handle() {
 
     let snapshot = control.upstream_snapshot().await;
     assert_eq!(snapshot.base_url, format!("http://{addr_b}"));
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn set_upstream_to_acp_builds_a_client_on_demand_when_boot_was_not_acp() {
+    // Fix round 1, item 1: the gateway boots on a plain OpenAI upstream
+    // (no `acp_config`, so `AppState::new` never builds an `AcpUpstream`).
+    // Switching the active provider to an ACP one at runtime must not
+    // permanently 500 with "no acp_config was supplied" — the gateway
+    // should build the client from the `UpstreamUpdate`'s `acp_config` on
+    // demand.
+    let addr_a = spawn_fake_upstream("A").await;
+    let handle = serve(base_config(format!("http://{addr_a}")))
+        .await
+        .expect("gateway should start");
+
+    handle
+        .set_upstream(UpstreamUpdate {
+            base_url: String::new(),
+            api_key: String::new(),
+            model_override: String::new(),
+            protocol: UpstreamProtocol::Acp,
+            acp_config: Some(unreachable_acp_config()),
+            unavailable: false,
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/chat/completions", handle.url());
+    let resp = tokio::time::timeout(
+        Duration::from_secs(15),
+        client
+            .post(&url)
+            .bearer_auth(BEARER)
+            .json(&json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]}))
+            .send(),
+    )
+    .await
+    .expect("gateway must respond, not hang")
+    .expect("request to gateway should succeed at the HTTP layer");
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    // The bogus binary will fail to spawn — some OTHER error is expected —
+    // but it must not be the "no acp_config was supplied" guard, which
+    // would mean the on-demand client was never built.
+    assert!(
+        !body_text.contains("no acp_config was supplied"),
+        "expected to get past the missing-acp_config guard; got {status} {body_text}"
+    );
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn acp_then_openai_then_acp_reuses_the_same_acp_client() {
+    // Fix round 1, item 1: boot WITH acp_config, so `AppState::new`
+    // already builds one `AcpUpstream`. Swapping away to OpenAI and back
+    // to Acp — this time with `acp_config: None` in the update — must
+    // still get past the guard, proving the ORIGINAL client (built once,
+    // at boot) survived the round trip rather than being dropped and
+    // needing to be re-supplied.
+    let mut config = base_config("https://unused.example".to_string());
+    config.upstream_protocol = UpstreamProtocol::Acp;
+    config.acp_config = Some(unreachable_acp_config());
+    let handle = serve(config).await.expect("gateway should start");
+
+    let addr_openai = spawn_fake_upstream("openai-leg").await;
+    handle
+        .set_upstream(upstream_update(
+            format!("http://{addr_openai}"),
+            UpstreamProtocol::OpenAi,
+        ))
+        .await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/chat/completions", handle.url());
+    let body = send_chat_request(&client, &url).await;
+    assert_eq!(body["choices"][0]["message"]["content"], "openai-leg");
+
+    // Swap back to Acp WITHOUT re-supplying acp_config.
+    handle
+        .set_upstream(UpstreamUpdate {
+            base_url: String::new(),
+            api_key: String::new(),
+            model_override: String::new(),
+            protocol: UpstreamProtocol::Acp,
+            acp_config: None,
+            unavailable: false,
+        })
+        .await;
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(15),
+        client
+            .post(&url)
+            .bearer_auth(BEARER)
+            .json(&json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]}))
+            .send(),
+    )
+    .await
+    .expect("gateway must respond, not hang")
+    .expect("request to gateway should succeed at the HTTP layer");
+    let body_text = resp.text().await.unwrap_or_default();
+    assert!(
+        !body_text.contains("no acp_config was supplied"),
+        "the boot-time ACP client must have been reused, got: {body_text}"
+    );
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn set_upstream_unavailable_short_circuits_with_503_and_no_network_call() {
+    // Fix round 1, item 5: latched with no on-device engine published yet
+    // must fail immediately with 503, without ever attempting a network
+    // call — proven here by pointing `base_url` at a real fake upstream
+    // that would otherwise happily answer, and confirming it's never hit.
+    let addr = spawn_fake_upstream("should-never-be-reached").await;
+    let handle = serve(base_config(format!("http://{addr}")))
+        .await
+        .expect("gateway should start");
+
+    handle
+        .set_upstream(UpstreamUpdate {
+            base_url: format!("http://{addr}"),
+            api_key: String::new(),
+            model_override: String::new(),
+            protocol: UpstreamProtocol::OpenAi,
+            acp_config: None,
+            unavailable: true,
+        })
+        .await;
+
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/chat/completions", handle.url());
+    let resp = client
+        .post(&url)
+        .bearer_auth(BEARER)
+        .json(&json!({"model": "x", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .expect("request to gateway should succeed at the HTTP layer");
+    assert_eq!(resp.status().as_u16(), 503);
+    let body: Value = resp.json().await.expect("error body should be JSON");
+    assert_eq!(body["error"]["type"], "local_engine_unavailable");
 
     handle.shutdown().await;
 }

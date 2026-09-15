@@ -57,6 +57,15 @@ pub enum GatewayError {
     /// failure, etc.). Surfaces as `500` so it doesn't get confused with
     /// an upstream-flavored `5xx`.
     Internal { detail: String },
+
+    /// The on-device engine isn't running: the LocalOnly latch is on but
+    /// no `LocalEndpoint` is published yet (never started, or unloaded).
+    /// Surfaced immediately as `503`, without attempting any network call
+    /// — see `Upstream::unavailable` (Task 1.6 fix round 1, item 5). The
+    /// previous design pointed the upstream at a closed loopback port
+    /// instead, which could hang if something else happened to be
+    /// listening there.
+    LocalEngineUnavailable,
 }
 
 /// Which phase of the upstream request was in flight when our timeout
@@ -91,6 +100,7 @@ impl GatewayError {
             GatewayError::UpstreamUnreachable { .. } => StatusCode::BAD_GATEWAY,
             GatewayError::UpstreamTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
             GatewayError::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            GatewayError::LocalEngineUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -129,6 +139,10 @@ impl GatewayError {
                 ("upstream_timeout", format!("phase={phase:?}"))
             }
             GatewayError::Internal { detail } => ("internal_error", detail.clone()),
+            GatewayError::LocalEngineUnavailable => (
+                "local_engine_unavailable",
+                "on-device engine is not running".to_string(),
+            ),
         };
         serde_json::json!({
             "error": {

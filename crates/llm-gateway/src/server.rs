@@ -239,16 +239,48 @@ fn env_duration_secs(name: &str, default: Duration) -> Duration {
 }
 
 /// A hot-swappable upstream routing update (Task 1.6). Replaces every
-/// field of [`crate::handlers::Upstream`] except `acp` (see that field's
-/// doc comment) — [`GatewayHandle::set_upstream`] applies this atomically
-/// under one write-lock so no in-flight request can observe a torn mix
-/// of the old and new values.
-#[derive(Clone, Debug)]
+/// field of [`crate::handlers::Upstream`] except the live `acp` client
+/// itself — [`GatewayHandle::set_upstream`] applies this atomically under
+/// one write-lock so no in-flight request can observe a torn mix of the
+/// old and new values.
+#[derive(Clone)]
 pub struct UpstreamUpdate {
     pub base_url: String,
     pub api_key: String,
     pub model_override: String,
     pub protocol: UpstreamProtocol,
+    /// ACP agent config to build an ACP client from **on demand**, if
+    /// `protocol == Acp` and no ACP client exists yet (fix round 1, item
+    /// 1). Ignored when an ACP client is already present — see
+    /// [`crate::handlers::Upstream::apply_update`] — so a hot swap away
+    /// from and back to ACP always reuses the same lazily-connected
+    /// client rather than rebuilding it (and losing a live subprocess).
+    pub acp_config: Option<AcpProviderConfig>,
+    /// When `true`, `/v1/chat/completions` short-circuits with an
+    /// immediate `503` (see [`crate::error::GatewayError::LocalEngineUnavailable`])
+    /// instead of dispatching on `protocol` at all — used while the
+    /// LocalOnly latch is on but no on-device engine is published yet
+    /// (fix round 1, item 5). Every other field is meaningless when this
+    /// is `true`.
+    pub unavailable: bool,
+}
+
+impl std::fmt::Debug for UpstreamUpdate {
+    /// Hand-written so `api_key` (and any secret riding `acp_config`'s
+    /// `env`) never lands in a log line via `{:?}` (fix round 1, item 7).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamUpdate")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .field("model_override", &self.model_override)
+            .field("protocol", &self.protocol)
+            .field(
+                "acp_config",
+                &self.acp_config.as_ref().map(|_| "<redacted>"),
+            )
+            .field("unavailable", &self.unavailable)
+            .finish()
+    }
 }
 
 /// A cheap, `Clone`-able handle onto a running gateway's hot-swappable
