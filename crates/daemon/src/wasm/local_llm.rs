@@ -36,6 +36,20 @@ async fn admission_hook() -> Result<()> {
     Ok(())
 }
 
+/// Base HTTP client builder for on-device engine calls: always disables
+/// system-proxy honoring outright.
+///
+/// The engine is loopback-only, so routing its traffic through a
+/// misconfigured (or malicious) `HTTP_PROXY`/`ALL_PROXY` would leak
+/// LocalOnly-latched prompt content off the machine — exactly what the
+/// latch exists to prevent (R30). `reqwest` otherwise honors those env
+/// vars for every request regardless of host; `.no_proxy()` opts a client
+/// out unconditionally rather than relying on `NO_PROXY` covering
+/// `127.0.0.1`/`localhost`.
+fn local_engine_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().no_proxy()
+}
+
 /// Truncate an error-response body to at most 500 *characters* for use in an
 /// error message.
 ///
@@ -86,7 +100,7 @@ pub async fn execute_local_chat(request: LlmChatRequest) -> Result<LlmChatRespon
 
     tracing::debug!(base_url = %ep.base_url, model = %ep.model_id, "local engine chat POST");
 
-    let client = reqwest::Client::builder()
+    let client = local_engine_client_builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(600))
         .build()
@@ -173,7 +187,7 @@ pub async fn stream_local(request: LlmChatRequest, tx: mpsc::Sender<LlmStreamChu
 
     tracing::debug!(base_url = %ep.base_url, model = %ep.model_id, "local engine stream POST");
 
-    let client = reqwest::Client::builder()
+    let client = local_engine_client_builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| DaemonError::InternalError(format!("Failed to build HTTP client: {e}")))?;
@@ -599,5 +613,78 @@ mod tests {
 
         let req = captured.await.unwrap();
         assert!(req.contains("authorization: bearer k"));
+    }
+
+    /// Mutex serializing this file's tests that mutate process-wide proxy
+    /// env vars — same rationale as `llm_gateway::tests::ENV_MUTEX`. Only
+    /// protects tests *in this file* from each other; running the whole
+    /// crate's suite unfiltered still has a small window where an
+    /// unrelated test elsewhere that builds a plain (non-`no_proxy`)
+    /// `reqwest::Client` and immediately fires a request could observe
+    /// `HTTP_PROXY`. Kept as small as possible (set right before the
+    /// call, cleared right after) to minimize that.
+    static PROXY_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A TCP listener that accepts connections and immediately closes them
+    /// without responding — standing in for a broken/malicious HTTP proxy.
+    /// If the local-engine client routed through this (i.e. `.no_proxy()`
+    /// were missing from `local_engine_client_builder`), the request would
+    /// fail against it; a correctly-configured client instead goes
+    /// straight to the real fake engine and never touches this listener.
+    async fn spawn_connection_reset_proxy() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
+        addr
+    }
+
+    /// R30 (fix round 1, item 4): the local-engine HTTP client must never
+    /// honor `HTTP_PROXY`, since prompt content must not leave the machine
+    /// via a misconfigured or malicious proxy while the LocalOnly latch is
+    /// on. Point `HTTP_PROXY` at a listener that accepts and immediately
+    /// closes without ever answering — if the client routed through it,
+    /// the request would fail; `local_engine_client_builder`'s
+    /// `.no_proxy()` must instead reach the real fake engine directly.
+    #[tokio::test]
+    async fn execute_local_chat_bypasses_http_proxy_env_var() {
+        let _g = crate::local::latch::test_serial();
+        let _reset = EndpointGuard;
+        let _env_guard = PROXY_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+        let body = serde_json::json!({
+            "choices": [{"finish_reason": "stop", "message": {"content": "direct"}}]
+        })
+        .to_string();
+        let (url, _captured) = fake_http_server(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json",
+            body.into_bytes(),
+        )
+        .await;
+
+        let bogus_proxy = spawn_connection_reset_proxy().await;
+        endpoint::publish(Some(LocalEndpoint {
+            base_url: url,
+            api_key: "k".into(),
+            n_ctx: 16384,
+            model_id: "m".into(),
+            thinking_hybrid: false,
+        }));
+
+        std::env::set_var("HTTP_PROXY", format!("http://{bogus_proxy}"));
+        let result = execute_local_chat(LlmChatRequest {
+            messages: vec![LlmMessage::user("hi")],
+            ..Default::default()
+        })
+        .await;
+        std::env::remove_var("HTTP_PROXY");
+
+        let resp = result.expect(
+            "a no_proxy() client must reach the fake engine directly, bypassing HTTP_PROXY",
+        );
+        assert_eq!(resp.content, "direct");
     }
 }

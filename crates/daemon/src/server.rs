@@ -889,6 +889,18 @@ pub async fn start_server(
     if let Some(handle) = gateway_handle.as_ref() {
         crate::llm_gateway::set_gateway_control(handle.control());
     }
+    // Fix round 1, item 6: run the latch's config-change hook RIGHT HERE
+    // — as soon as the gateway control handle exists, before gbrain (or
+    // anything else) gets a chance to spawn and start sending real chat
+    // traffic through the gateway. `CURRENT_DB` / `CURRENT_EVENT_BUS`
+    // aren't published yet at this point in boot, so this call's "publish
+    // the paused-work counts" step is a no-op (gracefully degrading, per
+    // the module docs) — that's fine: what matters here is that a daemon
+    // that boots already latched (on-device provider active + enabled)
+    // never serves a single request against the cloud first. Uses the
+    // plain (not-yet-`SharedAgentConfig`-wrapped) `agent_config` in scope,
+    // since that wrapping only happens further down.
+    crate::local::on_config_changed(&agent_config).await;
 
     // Boot the gbrain integration (M3-3) OFF the critical boot path.
     //
@@ -1022,21 +1034,11 @@ pub async fn start_server(
     }
     // Task 1.6: the DB handle `crate::local::on_config_changed` queries for
     // the paused loop/schedule/goal counts it broadcasts on a latch
-    // transition.
+    // transition. The boot-time call to `on_config_changed` itself already
+    // ran earlier (fix round 1, item 6 — right after the gateway control
+    // handle was published, before gbrain spawned), so this only affects
+    // the LATER calls from the four `config.llm.*` handlers below.
     let _ = crate::local::sync::CURRENT_DB.set(db.clone());
-
-    // Task 1.6: run the LocalOnly latch's config-change hook once at boot
-    // — AFTER the gateway control handle + event bus + DB are all
-    // published above, BEFORE the loop/schedule/goal managers are
-    // constructed below, so a daemon that boots already latched (on-device
-    // provider active + enabled) never lets those managers run a single
-    // unattended cloud turn before the gateway is repointed. Later calls
-    // happen from the four `config.llm.*` handlers below on every
-    // provider change.
-    {
-        let cfg_snapshot = agent_config.read().unwrap().clone();
-        crate::local::on_config_changed(&cfg_snapshot).await;
-    }
 
     // Initialize MCP manager (empty) and tool search index.
     // Actual connections happen in a background task so the daemon starts fast.
@@ -14711,6 +14713,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_start_and_shutdown() {
+        // Fix round 1, item 3: `start_server` boots the in-process
+        // llm-gateway and runs `crate::local::on_config_changed` on it
+        // (Task 1.6), which touches the REAL global LocalOnly latch via
+        // `latch::refresh_from_config` — that always writes the real
+        // global even in test builds (see `local::latch`'s module docs),
+        // so this test must hold `test_serial()` for its duration like
+        // every other test that exercises that path, or it can race
+        // `local::sync`'s own tests over the same global.
+        let _latch_guard = crate::local::latch::test_serial();
+
         // Inject an isolated agent config instead of loading the developer's
         // real config.toml: a real config may enable gbrain (whose spawn
         // contends on the shared ~/.gbrain PGLite lock with any live daemon

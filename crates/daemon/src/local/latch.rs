@@ -49,7 +49,9 @@ use nevoflux_llm::ProviderType;
 ///
 /// Defined here (R2) rather than in `crate::local::sync` so a later task
 /// that needs the topic string doesn't have to know which submodule
-/// implements the publish; re-exported at `crate::local` for callers.
+/// implements the publish. Reachable as `crate::local::latch::TOPIC_LATCH`;
+/// no `crate::local`-level re-export exists yet (left for whichever task
+/// actually needs one — see `local/mod.rs`'s module doc).
 pub const TOPIC_LATCH: &str = "system:local:latch_changed";
 
 /// Global on/off state. `SeqCst` throughout: this is touched rarely (config

@@ -25,11 +25,40 @@
 //! `kb_wizard::CURRENT_EVENT_BUS`) before the first call — but a caller
 //! that hasn't wired them (unit tests, an early crash path) must not bring
 //! the config-change handler down with it.
+//!
+//! ## Concurrency (fix round 1, item 2)
+//!
+//! [`SYNC_MUTEX`] serializes "read the latch, decide the upstream, write
+//! it" as one section across every caller — [`on_config_changed`] (which
+//! also writes the latch, via `refresh_from_config`) and
+//! [`apply_gateway_upstream_for_latch`] both take it before touching
+//! `latch::is_on()`. Without this, two nearly-simultaneous calls (e.g. two
+//! `config.llm.*` RPCs) could interleave: call A reads the latch as ON,
+//! call B flips it OFF and writes the cloud upstream, then A's stale
+//! local/unavailable write lands *after* B's — leaving a gateway pointed
+//! at the wrong upstream for the now-current latch state. With the mutex,
+//! whichever call is logically last to run the whole section always wins,
+//! and its write matches what it read.
+//!
+//! ## Testability (fix round 1, item 3)
+//!
+//! The public, no-argument [`on_config_changed`] / [`apply_gateway_upstream_for_latch`]
+//! read real process globals (`crate::llm_gateway::gateway_control`,
+//! [`CURRENT_DB`], `crate::kb_wizard::CURRENT_EVENT_BUS`) — but `server.rs`'s
+//! own `start_server` (exercised by `server::tests::test_server_start_and_shutdown`)
+//! ALSO sets those same globals during boot, so a test can't assume it's
+//! the exclusive setter. Both public functions are thin wrappers around
+//! `_with`-suffixed inner functions that take every dependency as an
+//! explicit parameter; tests call those directly with their own
+//! `GatewayControl` / `Database` / `EventBus` instances and never touch
+//! the process globals at all, so they're immune to what any other test
+//! in the binary does with them, run order included.
 
 use std::sync::OnceLock;
 
 use serde_json::json;
 
+use nevoflux_llm_gateway::GatewayControl;
 use nevoflux_storage::connection::Database;
 
 use crate::config::AgentConfig;
@@ -41,45 +70,87 @@ use crate::local::latch::{self, TOPIC_LATCH};
 /// a latch transition. Set once at boot (`server.rs`).
 pub(crate) static CURRENT_DB: OnceLock<Database> = OnceLock::new();
 
+/// Serializes "read the latch, decide the upstream, apply it" across
+/// every caller of [`on_config_changed`] / [`apply_gateway_upstream_for_latch`]
+/// — see the module docs' Concurrency section (fix round 1, item 2).
+static SYNC_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// React to a config change: refresh the latch, re-apply the gateway's
 /// upstream, and — only on an actual latch transition — publish
 /// `system:local:latch_changed`.
 ///
 /// Called after every `*shared_config.write() = Arc::new(config)` in
-/// `server.rs`'s four `config.llm.*` handlers, and once at boot (after the
-/// gateway starts, before the loop/schedule/goal managers are built, so a
-/// latched boot never lets unattended work run against the cloud first).
+/// `server.rs`'s four `config.llm.*` handlers, and once at boot (right
+/// after the gateway starts and its control handle is published, before
+/// gbrain is spawned or the loop/schedule/goal managers are built, so a
+/// latched boot never lets unattended work run against the cloud first —
+/// fix round 1, item 6).
+///
+/// Reads its dependencies from process globals and delegates to
+/// [`on_config_changed_with`] — see the module docs' Testability section.
 pub async fn on_config_changed(cfg: &AgentConfig) {
-    let changed = latch::refresh_from_config(cfg);
+    let control = crate::llm_gateway::gateway_control();
+    let db = CURRENT_DB.get().cloned();
+    let bus = crate::kb_wizard::CURRENT_EVENT_BUS.get().cloned();
+    on_config_changed_with(cfg, control.as_ref(), db.as_ref(), bus.as_deref()).await;
+}
 
-    // Re-resolve — not just re-read the boot snapshot — on every call: the
-    // active cloud provider may have changed since the gateway booted,
-    // even on a call where the latch itself doesn't flip.
-    let cloud = crate::llm_gateway::resolve_upstream_config(&cfg.knowledge_base.gateway, cfg);
-    crate::llm_gateway::set_cloud_upstream(cloud);
-
-    apply_gateway_upstream_for_latch().await;
+/// Core of [`on_config_changed`], parameterized over its dependencies so
+/// tests can inject their own instances instead of touching process
+/// globals (fix round 1, item 3).
+async fn on_config_changed_with(
+    cfg: &AgentConfig,
+    control: Option<&GatewayControl>,
+    db: Option<&Database>,
+    bus: Option<&EventBus>,
+) {
+    let changed = {
+        let _guard = SYNC_MUTEX.lock().await;
+        let changed = latch::refresh_from_config(cfg);
+        // Re-resolve — not just re-read the boot snapshot — on every
+        // call: the active cloud provider may have changed since the
+        // gateway booted, even on a call where the latch itself doesn't
+        // flip.
+        let cloud = crate::llm_gateway::resolve_upstream_config(&cfg.knowledge_base.gateway, cfg);
+        crate::llm_gateway::set_cloud_upstream(cloud);
+        apply_gateway_upstream_for_latch_locked(control).await;
+        changed
+        // `_guard` drops here — publishing below doesn't need the lock.
+    };
 
     if let Some(on) = changed {
         let (paused_loops, paused_schedules, paused_goals) =
-            CURRENT_DB.get().map(paused_counts).unwrap_or((0, 0, 0));
-        let bus = crate::kb_wizard::CURRENT_EVENT_BUS
-            .get()
-            .map(|b| b.as_ref());
+            db.map(paused_counts).unwrap_or((0, 0, 0));
         publish_latch_changed(bus, on, paused_loops, paused_schedules, paused_goals).await;
     }
 }
 
 /// Re-apply the gateway's upstream for the current latch state: the
-/// on-device endpoint (or the closed loopback, if none is published yet)
-/// while latched, or the last-resolved cloud upstream while not.
+/// on-device endpoint (or `unavailable`, if none is published yet) while
+/// latched, or the last-resolved cloud upstream while not.
 ///
 /// Exposed standalone — not just reachable via [`on_config_changed`] — so
 /// the on-device engine supervisor (Task 2.9) can call it directly when a
 /// local endpoint is published or cleared; that's an engine lifecycle
 /// event, not a config change, so it has no `AgentConfig` in hand.
+///
+/// Reads its dependency from the process global and delegates to
+/// [`apply_gateway_upstream_for_latch_locked`], taking [`SYNC_MUTEX`]
+/// itself first (unlike that inner function, which assumes the caller —
+/// here, or [`on_config_changed_with`] — already holds it).
 pub async fn apply_gateway_upstream_for_latch() {
-    let Some(control) = crate::llm_gateway::gateway_control() else {
+    let control = crate::llm_gateway::gateway_control();
+    let _guard = SYNC_MUTEX.lock().await;
+    apply_gateway_upstream_for_latch_locked(control.as_ref()).await;
+}
+
+/// Core of [`apply_gateway_upstream_for_latch`] — assumes [`SYNC_MUTEX`]
+/// is already held by the caller. Reads `latch::is_on()` and writes the
+/// resulting upstream as one atomic step from the mutex's point of view,
+/// closing the read-latch/await-write race described in the module docs'
+/// Concurrency section.
+async fn apply_gateway_upstream_for_latch_locked(control: Option<&GatewayControl>) {
+    let Some(control) = control else {
         // No gateway (it failed to bind at boot, or this ran before boot
         // wired the global) — nothing to point anywhere.
         return;
@@ -153,6 +224,7 @@ async fn publish_latch_changed(
 mod tests {
     use super::*;
     use crate::event_bus::{BackpressurePolicy, Delivery, SubscriberIdentity, TopicPattern};
+    use crate::llm_gateway::tests::{clear_resolver_env, ENV_MUTEX};
     use nevoflux_llm_gateway::{GatewayConfig, UpstreamProtocol};
     use std::time::Duration;
 
@@ -247,104 +319,22 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // on_config_changed / apply_gateway_upstream_for_latch — full wiring.
+    // on_config_changed_with / apply_gateway_upstream_for_latch_locked —
+    // full logic, but via dependency injection: every test here builds
+    // its OWN GatewayControl / Database / EventBus and never touches a
+    // process global, so none of them can race `start_server`'s boot
+    // (which sets the same globals) or each other, regardless of run
+    // order (fix round 1, item 3). They still touch the REAL global
+    // LocalOnly latch (via `refresh_from_config`, which always bypasses
+    // the thread-local test override — see `latch`'s module docs) and so
+    // hold `test_serial()` for their duration, same as that module's own
+    // `refresh_tracks_*` tests.
     //
-    // This is the ONLY test in the crate that calls
-    // `llm_gateway::set_gateway_control` / `CURRENT_DB.set` — both are
-    // `OnceLock`s new to Task 1.6 and touched nowhere else, so there is no
-    // other test to race for "first setter wins". It also touches the
-    // REAL global LocalOnly latch (via `on_config_changed` ->
-    // `refresh_from_config`, which always bypasses the thread-local test
-    // override — see `latch`'s module docs), so it holds `test_serial()`
-    // for its entire duration like that module's own `refresh_tracks_*`
-    // tests. `CURRENT_EVENT_BUS` may already be set by an unrelated test
-    // elsewhere in this binary; that's fine — this test subscribes to
-    // whichever bus instance is globally registered and filters on the
-    // latch topic, which nothing else in the crate ever publishes to.
-    #[tokio::test]
-    async fn on_config_changed_wires_gateway_upstream_and_publishes_on_transitions() {
-        let _guard = latch::test_serial();
-        latch::set_global_for_test(false);
-
-        let handle = nevoflux_llm_gateway::serve(test_gateway_config())
-            .await
-            .expect("gateway should start");
-        crate::llm_gateway::set_gateway_control(handle.control());
-
-        let db = Database::open_in_memory().expect("in-memory db");
-        seed_rows(&db);
-        let _ = CURRENT_DB.set(db);
-
-        let bus = crate::kb_wizard::CURRENT_EVENT_BUS
-            .get_or_init(|| std::sync::Arc::new(EventBus::new()))
-            .clone();
-        let mut sub = bus
-            .subscribe(
-                TopicPattern::exact(TOPIC_LATCH),
-                SubscriberIdentity::Internal,
-                BackpressurePolicy::DropNewest,
-                8,
-            )
-            .expect("subscribe should succeed");
-
-        // --- latch OFF -> ON: switch to the local provider. ---
-        let mut cfg = AgentConfig::default();
-        cfg.llm.provider = Some("local".into());
-        cfg.llm.local.enabled = true;
-        on_config_changed(&cfg).await;
-
-        assert!(latch::is_on(), "latch must be on after switching to local");
-        // No engine published yet -> the closed loopback.
-        let snap = handle.upstream_snapshot().await;
-        assert_eq!(snap.base_url, crate::llm_gateway::CLOSED_LOOPBACK_UPSTREAM);
-
-        let evt = tokio::time::timeout(Duration::from_secs(2), sub.rx.recv())
-            .await
-            .expect("latch_changed event within timeout")
-            .expect("channel open");
-        assert_eq!(evt.topic, TOPIC_LATCH);
-        assert_eq!(evt.payload["on"], json!(true));
-        assert_eq!(evt.payload["paused_loops"], json!(1));
-        assert_eq!(evt.payload["paused_schedules"], json!(1));
-        assert_eq!(evt.payload["paused_goals"], json!(1));
-
-        // --- latch ON -> OFF: switch back to a cloud provider. ---
-        cfg.llm.provider = Some("anthropic".into());
-        cfg.llm.anthropic.api_key = Some("cloud-key".into());
-        cfg.llm.anthropic.base_url = Some("https://cloud.example".into());
-        on_config_changed(&cfg).await;
-
-        assert!(
-            !latch::is_on(),
-            "latch must be off after switching to anthropic"
-        );
-        let snap2 = handle.upstream_snapshot().await;
-        assert_eq!(snap2.base_url, "https://cloud.example");
-        assert_eq!(snap2.api_key, "cloud-key");
-        assert_eq!(snap2.protocol, UpstreamProtocol::Anthropic);
-
-        let evt2 = tokio::time::timeout(Duration::from_secs(2), sub.rx.recv())
-            .await
-            .expect("second latch_changed event within timeout")
-            .expect("channel open");
-        assert_eq!(evt2.payload["on"], json!(false));
-
-        // --- a config change that does NOT flip the latch must not republish. ---
-        cfg.llm.anthropic.model = Some("claude-updated".into());
-        on_config_changed(&cfg).await;
-        let no_third = tokio::time::timeout(Duration::from_millis(200), sub.rx.recv()).await;
-        assert!(
-            no_third.is_err(),
-            "no latch_changed event when the latch didn't change"
-        );
-        // The gateway still tracks the live config even without a latch
-        // flip (Task 1.6's "re-resolve on every call" requirement).
-        let snap3 = handle.upstream_snapshot().await;
-        assert_eq!(snap3.model_override, "claude-updated");
-
-        latch::set_global_for_test(false);
-        handle.shutdown().await;
-    }
+    // Config resolution reads env-var fallbacks
+    // (`NEVOFLUX_LLM_GATEWAY_UPSTREAM_*`), so every test here also holds
+    // `llm_gateway::tests::ENV_MUTEX` — shared with that module's own env
+    // var tests — for its duration.
+    // ------------------------------------------------------------------
 
     fn test_gateway_config() -> GatewayConfig {
         GatewayConfig {
@@ -363,5 +353,157 @@ mod tests {
             upstream_protocol: UpstreamProtocol::Anthropic,
             acp_config: None,
         }
+    }
+
+    #[tokio::test]
+    async fn on_config_changed_with_wires_gateway_upstream_and_publishes_on_transitions() {
+        let _latch_guard = latch::test_serial();
+        let _env_guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_resolver_env();
+        latch::set_global_for_test(false);
+
+        let handle = nevoflux_llm_gateway::serve(test_gateway_config())
+            .await
+            .expect("gateway should start");
+        let control = handle.control();
+
+        let db = Database::open_in_memory().expect("in-memory db");
+        seed_rows(&db);
+
+        let bus = EventBus::new();
+        let mut sub = bus
+            .subscribe(
+                TopicPattern::exact(TOPIC_LATCH),
+                SubscriberIdentity::Internal,
+                BackpressurePolicy::DropNewest,
+                8,
+            )
+            .expect("subscribe should succeed");
+
+        // --- latch OFF -> ON: switch to the local provider. ---
+        let mut cfg = AgentConfig::default();
+        cfg.llm.provider = Some("local".into());
+        cfg.llm.local.enabled = true;
+        on_config_changed_with(&cfg, Some(&control), Some(&db), Some(&bus)).await;
+
+        assert!(latch::is_on(), "latch must be on after switching to local");
+        // No engine published yet -> unavailable (fix round 1, item 5).
+        let snap = control.upstream_snapshot().await;
+        assert!(snap.unavailable);
+
+        let evt = tokio::time::timeout(Duration::from_secs(2), sub.rx.recv())
+            .await
+            .expect("latch_changed event within timeout")
+            .expect("channel open");
+        assert_eq!(evt.topic, TOPIC_LATCH);
+        assert_eq!(evt.payload["on"], json!(true));
+        assert_eq!(evt.payload["paused_loops"], json!(1));
+        assert_eq!(evt.payload["paused_schedules"], json!(1));
+        assert_eq!(evt.payload["paused_goals"], json!(1));
+
+        // --- latch ON -> OFF: switch back to a cloud provider. ---
+        cfg.llm.provider = Some("anthropic".into());
+        cfg.llm.anthropic.api_key = Some("cloud-key".into());
+        cfg.llm.anthropic.base_url = Some("https://cloud.example".into());
+        on_config_changed_with(&cfg, Some(&control), Some(&db), Some(&bus)).await;
+
+        assert!(
+            !latch::is_on(),
+            "latch must be off after switching to anthropic"
+        );
+        let snap2 = control.upstream_snapshot().await;
+        assert_eq!(snap2.base_url, "https://cloud.example");
+        assert_eq!(snap2.api_key, "cloud-key");
+        assert_eq!(snap2.protocol, UpstreamProtocol::Anthropic);
+        assert!(!snap2.unavailable);
+
+        let evt2 = tokio::time::timeout(Duration::from_secs(2), sub.rx.recv())
+            .await
+            .expect("second latch_changed event within timeout")
+            .expect("channel open");
+        assert_eq!(evt2.payload["on"], json!(false));
+
+        // --- a config change that does NOT flip the latch must not republish. ---
+        cfg.llm.anthropic.model = Some("claude-updated".into());
+        on_config_changed_with(&cfg, Some(&control), Some(&db), Some(&bus)).await;
+        let no_third = tokio::time::timeout(Duration::from_millis(200), sub.rx.recv()).await;
+        assert!(
+            no_third.is_err(),
+            "no latch_changed event when the latch didn't change"
+        );
+        // The gateway still tracks the live config even without a latch
+        // flip (Task 1.6's "re-resolve on every call" requirement).
+        let snap3 = control.upstream_snapshot().await;
+        assert_eq!(snap3.model_override, "claude-updated");
+
+        latch::set_global_for_test(false);
+        clear_resolver_env();
+        handle.shutdown().await;
+    }
+
+    /// Fix round 1, item 2: fire many `on_config_changed_with` calls that
+    /// alternate between latching on (local) and off (cloud) concurrently.
+    /// Whatever the LAST one to actually complete its `SYNC_MUTEX`
+    /// section decided the latch to be, the gateway's upstream must match
+    /// it — never a stale write from an earlier call landing after a
+    /// later one already moved the latch on. Entirely dependency-injected
+    /// (own `GatewayControl`), so this can run alongside every other test
+    /// in the binary — only the real global latch is shared, hence
+    /// `test_serial()`.
+    #[tokio::test]
+    async fn concurrent_alternating_latch_toggles_leave_upstream_matching_final_latch_state() {
+        let _latch_guard = latch::test_serial();
+        let _env_guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        clear_resolver_env();
+        latch::set_global_for_test(false);
+
+        let handle = nevoflux_llm_gateway::serve(test_gateway_config())
+            .await
+            .expect("gateway should start");
+        let control = handle.control();
+
+        let mut local_cfg = AgentConfig::default();
+        local_cfg.llm.provider = Some("local".into());
+        local_cfg.llm.local.enabled = true;
+
+        let mut cloud_cfg = AgentConfig::default();
+        cloud_cfg.llm.provider = Some("anthropic".into());
+        cloud_cfg.llm.anthropic.api_key = Some("cloud-key".into());
+        cloud_cfg.llm.anthropic.base_url = Some("https://cloud.example".into());
+
+        let mut tasks = Vec::new();
+        for i in 0..40u32 {
+            let cfg = if i % 2 == 0 {
+                local_cfg.clone()
+            } else {
+                cloud_cfg.clone()
+            };
+            let control = control.clone();
+            tasks.push(tokio::spawn(async move {
+                on_config_changed_with(&cfg, Some(&control), None, None).await;
+            }));
+        }
+        for t in tasks {
+            t.await.expect("task should not panic");
+        }
+
+        // Whatever the latch ended up as, the upstream must agree with it
+        // — this is the property that would break under the pre-fix race.
+        let final_latched = latch::is_on();
+        let snap = control.upstream_snapshot().await;
+        if final_latched {
+            assert!(
+                snap.unavailable,
+                "latched with no endpoint published must leave the upstream unavailable"
+            );
+        } else {
+            assert_eq!(snap.base_url, "https://cloud.example");
+            assert_eq!(snap.protocol, UpstreamProtocol::Anthropic);
+            assert!(!snap.unavailable);
+        }
+
+        latch::set_global_for_test(false);
+        clear_resolver_env();
+        handle.shutdown().await;
     }
 }
