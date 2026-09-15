@@ -25,21 +25,35 @@ use std::collections::BTreeMap;
 /// Buffers raw SSE byte chunks into complete lines and yields `data: ...`
 /// payloads (without the prefix), skipping the terminal `[DONE]` sentinel
 /// and any non-`data:` line (blank separator lines, `event:` lines, etc.).
+///
+/// Buffers raw bytes rather than decoding eagerly: `bytes_stream` chunk
+/// boundaries are arbitrary and can land in the middle of a multibyte UTF-8
+/// character (an SSE payload can carry non-ASCII content, e.g. CJK text).
+/// Decoding each chunk independently with `from_utf8_lossy` — as an earlier
+/// version of this buffer did — replaces the half of a split character that
+/// landed in the first chunk with U+FFFD before the rest of its bytes ever
+/// arrive, corrupting the reassembled line even though every byte was
+/// eventually received. Decoding is deferred until a complete line (a full
+/// `\n`-terminated byte span) is in hand.
 #[derive(Default)]
 pub struct SseLineBuffer {
-    buf: String,
+    buf: Vec<u8>,
 }
 
 impl SseLineBuffer {
     /// Feed raw bytes; returns complete `data:` payloads found so far. Bytes
     /// that don't yet complete a line stay buffered for the next call.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<String> {
-        self.buf.push_str(&String::from_utf8_lossy(bytes));
+        self.buf.extend_from_slice(bytes);
 
         let mut out = Vec::new();
-        while let Some(nl_pos) = self.buf.find('\n') {
-            let line = self.buf[..nl_pos].trim_end_matches('\r').to_string();
-            self.buf.drain(..=nl_pos);
+        while let Some(nl_pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let mut line_bytes: Vec<u8> = self.buf.drain(..=nl_pos).collect();
+            line_bytes.pop(); // trailing '\n'
+            if line_bytes.last() == Some(&b'\r') {
+                line_bytes.pop();
+            }
+            let line = String::from_utf8_lossy(&line_bytes);
 
             if let Some(data) = line.strip_prefix("data: ") {
                 if data != "[DONE]" {
@@ -235,5 +249,27 @@ mod tests {
         let mut b = SseLineBuffer::default();
         let out = b.push(b"event: ping\n\ndata: {\"a\":1}\n");
         assert_eq!(out, vec!["{\"a\":1}".to_string()]);
+    }
+
+    /// A multibyte UTF-8 character split across two `push` calls at an
+    /// arbitrary byte boundary must not corrupt the decoded line — see the
+    /// `SseLineBuffer` doc comment for why this used to be a bug: decoding
+    /// each chunk independently with `from_utf8_lossy` replaces the
+    /// truncated half of the character with U+FFFD before its remaining
+    /// bytes ever arrive.
+    #[test]
+    fn multibyte_utf8_split_mid_character_across_chunks_is_not_corrupted() {
+        let full = "data: {\"content\":\"\u{4f60}\u{597d}\"}\n"
+            .as_bytes()
+            .to_vec();
+        // Split inside the first CJK character's 3-byte UTF-8 encoding
+        // (E4 BD A0), after the first two bytes.
+        let e4_pos = full.iter().position(|&b| b == 0xE4).unwrap();
+        let split_at = e4_pos + 2;
+
+        let mut b = SseLineBuffer::default();
+        assert!(b.push(&full[..split_at]).is_empty());
+        let out = b.push(&full[split_at..]);
+        assert_eq!(out, vec!["{\"content\":\"\u{4f60}\u{597d}\"}".to_string()]);
     }
 }
