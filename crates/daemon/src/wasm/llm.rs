@@ -6,6 +6,7 @@
 use crate::error::{DaemonError, Result};
 use crate::wasm::antigravity_session;
 use crate::wasm::json_normalizing_client::JsonNormalizingClient;
+use crate::wasm::openai_sse::{delta_events, DeltaEvent, SseLineBuffer, ToolCallAccumulator};
 use futures::StreamExt;
 use nevoflux_llm::providers::acp::context::compress_history;
 use nevoflux_llm::providers::acp::tools::{
@@ -15,7 +16,7 @@ use nevoflux_llm::providers::acp::{AcpProvider, AcpUpdate, ContentBlock, TextCon
 use nevoflux_llm::providers::kimi_agent::KimiAgentClient;
 use nevoflux_llm::providers::qwen::QwenClient;
 use nevoflux_llm::ProviderType;
-use nevoflux_protocol::json_repair::parse_tool_arguments_json;
+use nevoflux_protocol::json_repair::{parse_tool_arguments_json, tool_arguments_or_marker};
 use rig::client::CompletionClient;
 use rig::client::Nothing;
 use rig::completion::{CompletionModel, ToolDefinition};
@@ -1410,9 +1411,8 @@ async fn execute_deepseek_chat_raw(
                 let id = tc["id"].as_str()?.to_string();
                 let function = tc.get("function")?;
                 let name = function["name"].as_str()?.to_string();
-                let args_raw = function["arguments"].as_str().unwrap_or("{}");
-                let arguments: serde_json::Value = serde_json::from_str(args_raw)
-                    .unwrap_or(serde_json::Value::Object(Default::default()));
+                let args_raw = function["arguments"].as_str().unwrap_or("");
+                let arguments = tool_arguments_or_marker(args_raw);
                 Some(LlmToolCall {
                     id: id.clone(),
                     call_id: Some(id),
@@ -2898,25 +2898,16 @@ async fn stream_qwen(
     }
 
     let mut byte_stream = response.bytes_stream();
-    // Accumulate streaming tool call deltas (arguments come in fragments)
-    struct ToolCallAccum {
-        id: String,
-        name: String,
-        arguments: String,
-    }
-    let mut accumulated_tool_calls: HashMap<i64, ToolCallAccum> = HashMap::new();
+    // SSE lines may be split across byte chunks — buffer until we see a newline.
+    let mut line_buf = SseLineBuffer::default();
+    // Accumulate streaming tool call deltas (arguments come in fragments).
+    let mut accumulated_tool_calls = ToolCallAccumulator::default();
 
     while let Some(result) = byte_stream.next().await {
         match result {
             Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes);
-                for line in text.lines() {
-                    let data = match line.strip_prefix("data: ") {
-                        Some(d) if d != "[DONE]" => d,
-                        _ => continue,
-                    };
-
-                    let chunk: serde_json::Value = match serde_json::from_str(data) {
+                for data in line_buf.push(&bytes) {
+                    let chunk: serde_json::Value = match serde_json::from_str(&data) {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
@@ -2927,63 +2918,36 @@ async fn stream_qwen(
                     };
                     let delta = &choice["delta"];
 
-                    // Handle text content
-                    if let Some(content) = delta["content"].as_str() {
-                        if !content.is_empty() {
-                            let _ = tx
-                                .send(LlmStreamChunk {
-                                    usage: None,
-                                    text: Some(content.to_string()),
-                                    tool_calls: vec![],
-                                    done: false,
-                                    reasoning: None,
-                                    images: vec![],
-                                })
-                                .await;
-                        }
-                    }
-
-                    // Handle tool calls in delta
-                    if let Some(tool_calls) = delta["tool_calls"].as_array() {
-                        for tc in tool_calls {
-                            let index = tc["index"].as_i64().unwrap_or(0);
-                            let entry = accumulated_tool_calls.entry(index).or_insert_with(|| {
-                                ToolCallAccum {
-                                    id: String::new(),
-                                    name: String::new(),
-                                    arguments: String::new(),
-                                }
-                            });
-
-                            if let Some(id) = tc["id"].as_str() {
-                                entry.id = id.to_string();
+                    for event in delta_events(delta) {
+                        match event {
+                            DeltaEvent::Text(text) => {
+                                let _ = tx
+                                    .send(LlmStreamChunk {
+                                        usage: None,
+                                        text: Some(text),
+                                        tool_calls: vec![],
+                                        done: false,
+                                        reasoning: None,
+                                        images: vec![],
+                                    })
+                                    .await;
                             }
-                            if let Some(func) = tc.get("function") {
-                                if let Some(name) = func["name"].as_str() {
-                                    entry.name = name.to_string();
-                                }
-                                if let Some(args) = func["arguments"].as_str() {
-                                    entry.arguments.push_str(args);
-                                }
+                            DeltaEvent::Reasoning(reasoning) => {
+                                let _ = tx
+                                    .send(LlmStreamChunk {
+                                        usage: None,
+                                        text: None,
+                                        tool_calls: vec![],
+                                        done: false,
+                                        reasoning: Some(reasoning),
+                                        images: vec![],
+                                    })
+                                    .await;
                             }
                         }
                     }
 
-                    // Handle reasoning/thinking content
-                    if let Some(reasoning) = delta["reasoning_content"].as_str() {
-                        if !reasoning.is_empty() {
-                            let _ = tx
-                                .send(LlmStreamChunk {
-                                    usage: None,
-                                    text: None,
-                                    tool_calls: vec![],
-                                    done: false,
-                                    reasoning: Some(reasoning.to_string()),
-                                    images: vec![],
-                                })
-                                .await;
-                        }
-                    }
+                    accumulated_tool_calls.apply(delta);
                 }
             }
             Err(e) => {
@@ -2995,23 +2959,11 @@ async fn stream_qwen(
 
     // Send accumulated tool calls if any
     if !accumulated_tool_calls.is_empty() {
-        let mut tool_calls: Vec<LlmToolCall> = accumulated_tool_calls
-            .into_values()
-            .map(|tc| LlmToolCall {
-                id: tc.id.clone(),
-                call_id: Some(tc.id),
-                name: tc.name,
-                arguments: serde_json::from_str(&tc.arguments)
-                    .unwrap_or(serde_json::Value::Object(Default::default())),
-                signature: None,
-            })
-            .collect();
-        tool_calls.sort_by_key(|tc| tc.id.clone());
         let _ = tx
             .send(LlmStreamChunk {
                 usage: None,
                 text: None,
-                tool_calls,
+                tool_calls: accumulated_tool_calls.finish(),
                 done: false,
                 reasoning: None,
                 images: vec![],
@@ -3090,30 +3042,16 @@ async fn stream_deepseek_raw(
     }
 
     // Accumulate streaming tool call deltas (arguments come in fragments).
-    struct ToolCallAccum {
-        id: String,
-        name: String,
-        arguments: String,
-    }
-    let mut accumulated_tool_calls: HashMap<i64, ToolCallAccum> = HashMap::new();
+    let mut accumulated_tool_calls = ToolCallAccumulator::default();
 
     // SSE lines may be split across byte chunks — buffer until we see a newline.
     let mut byte_stream = response.bytes_stream();
-    let mut line_buf = String::new();
+    let mut line_buf = SseLineBuffer::default();
 
     while let Some(result) = byte_stream.next().await {
         match result {
             Ok(bytes) => {
-                line_buf.push_str(&String::from_utf8_lossy(&bytes));
-                while let Some(nl_pos) = line_buf.find('\n') {
-                    let line = line_buf[..nl_pos].trim_end_matches('\r').to_string();
-                    line_buf.drain(..=nl_pos);
-
-                    let data = match line.strip_prefix("data: ") {
-                        Some(d) if d != "[DONE]" => d.to_string(),
-                        _ => continue,
-                    };
-
+                for data in line_buf.push(&bytes) {
                     let chunk: serde_json::Value = match serde_json::from_str(&data) {
                         Ok(v) => v,
                         Err(_) => continue,
@@ -3124,62 +3062,37 @@ async fn stream_deepseek_raw(
                     };
                     let delta = &choice["delta"];
 
-                    // Text content delta.
-                    if let Some(content) = delta["content"].as_str() {
-                        if !content.is_empty() {
-                            let _ = tx
-                                .send(LlmStreamChunk {
-                                    usage: None,
-                                    text: Some(content.to_string()),
-                                    tool_calls: vec![],
-                                    done: false,
-                                    reasoning: None,
-                                    images: vec![],
-                                })
-                                .await;
-                        }
-                    }
-
-                    // Reasoning_content delta — surfaced as `reasoning` on the chunk.
-                    if let Some(r) = delta["reasoning_content"].as_str() {
-                        if !r.is_empty() {
-                            let _ = tx
-                                .send(LlmStreamChunk {
-                                    usage: None,
-                                    text: None,
-                                    tool_calls: vec![],
-                                    done: false,
-                                    reasoning: Some(r.to_string()),
-                                    images: vec![],
-                                })
-                                .await;
+                    for event in delta_events(delta) {
+                        match event {
+                            DeltaEvent::Text(text) => {
+                                let _ = tx
+                                    .send(LlmStreamChunk {
+                                        usage: None,
+                                        text: Some(text),
+                                        tool_calls: vec![],
+                                        done: false,
+                                        reasoning: None,
+                                        images: vec![],
+                                    })
+                                    .await;
+                            }
+                            DeltaEvent::Reasoning(reasoning) => {
+                                let _ = tx
+                                    .send(LlmStreamChunk {
+                                        usage: None,
+                                        text: None,
+                                        tool_calls: vec![],
+                                        done: false,
+                                        reasoning: Some(reasoning),
+                                        images: vec![],
+                                    })
+                                    .await;
+                            }
                         }
                     }
 
                     // Tool-call deltas — accumulate by index, finalize at end.
-                    if let Some(tcs) = delta["tool_calls"].as_array() {
-                        for tc in tcs {
-                            let index = tc["index"].as_i64().unwrap_or(0);
-                            let entry = accumulated_tool_calls.entry(index).or_insert_with(|| {
-                                ToolCallAccum {
-                                    id: String::new(),
-                                    name: String::new(),
-                                    arguments: String::new(),
-                                }
-                            });
-                            if let Some(id) = tc["id"].as_str() {
-                                entry.id = id.to_string();
-                            }
-                            if let Some(func) = tc.get("function") {
-                                if let Some(name) = func["name"].as_str() {
-                                    entry.name = name.to_string();
-                                }
-                                if let Some(args) = func["arguments"].as_str() {
-                                    entry.arguments.push_str(args);
-                                }
-                            }
-                        }
-                    }
+                    accumulated_tool_calls.apply(delta);
                 }
             }
             Err(e) => {
@@ -3191,23 +3104,11 @@ async fn stream_deepseek_raw(
 
     // Emit accumulated tool calls in a single chunk before `done`.
     if !accumulated_tool_calls.is_empty() {
-        let mut tool_calls: Vec<LlmToolCall> = accumulated_tool_calls
-            .into_values()
-            .map(|tc| LlmToolCall {
-                id: tc.id.clone(),
-                call_id: Some(tc.id),
-                name: tc.name,
-                arguments: serde_json::from_str(&tc.arguments)
-                    .unwrap_or(serde_json::Value::Object(Default::default())),
-                signature: None,
-            })
-            .collect();
-        tool_calls.sort_by_key(|tc| tc.id.clone());
         let _ = tx
             .send(LlmStreamChunk {
                 usage: None,
                 text: None,
-                tool_calls,
+                tool_calls: accumulated_tool_calls.finish(),
                 done: false,
                 reasoning: None,
                 images: vec![],

@@ -10,6 +10,7 @@ pub mod linker;
 pub mod llm;
 pub mod mcp_http_server;
 pub mod mcp_tool_executor;
+pub mod openai_sse;
 pub mod runtime;
 pub mod services;
 pub mod subagent;

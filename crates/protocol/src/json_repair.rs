@@ -9,6 +9,14 @@
 //! 2. Fix invalid escape sequences, retry
 //! 3. Lenient field extraction using structural boundary detection
 
+/// Marker key stored in place of a tool call's `arguments` object when the
+/// raw argument text could not be recovered as JSON at all. Callers that
+/// execute tools MUST check for this key and refuse to run the tool rather
+/// than silently proceeding with an empty (`{}`) argument object — an empty
+/// object is a plausible, valid no-op for some tools (e.g. "think"), so it
+/// cannot double as an error signal.
+pub const INVALID_ARGUMENTS_KEY: &str = "__nevoflux_invalid_arguments";
+
 /// Parse a JSON string of tool arguments with fallback recovery.
 ///
 /// Attempts standard JSON parsing first, then fixes invalid escape sequences,
@@ -47,6 +55,63 @@ pub fn parse_tool_arguments_json(s: &str) -> serde_json::Value {
 
     // If all parsing fails, wrap the raw string so callers can still access it.
     serde_json::json!({ "_raw": s })
+}
+
+/// Repair-then-parse tool call arguments, same recovery tiers as
+/// [`parse_tool_arguments_json`], but `Err` instead of a silent `{}` (or
+/// `{"_raw": s}`) when the text can't be recovered as a JSON object.
+///
+/// `Ok` only for a JSON *object* — tool call arguments are always an object
+/// per every provider's wire format, so a bare scalar/array that happens to
+/// parse is still treated as unrecoverable. `Err` carries the original text
+/// unchanged, for the caller to report or truncate as needed.
+pub fn parse_tool_arguments_strict(s: &str) -> Result<serde_json::Value, String> {
+    if s.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
+        if v.is_object() {
+            return Ok(v);
+        }
+        return Err(s.to_string());
+    }
+
+    let fixed = fix_invalid_json_escapes(s);
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&fixed) {
+        if v.is_object() {
+            return Ok(v);
+        }
+        return Err(s.to_string());
+    }
+
+    if let Some(v) = lenient_extract_json_field(s, "code") {
+        return Ok(v);
+    }
+
+    if let Some(v) = repair_truncated_json(s) {
+        if v.is_object() {
+            return Ok(v);
+        }
+    }
+
+    if let Some(v) = repair_truncated_json(&fixed) {
+        if v.is_object() {
+            return Ok(v);
+        }
+    }
+
+    Err(s.to_string())
+}
+
+/// For wire code that must return a `Value` rather than a `Result`: the
+/// parsed object on success, or `{INVALID_ARGUMENTS_KEY: <raw text>}`
+/// otherwise. See [`parse_tool_arguments_strict`] for the recovery tiers.
+pub fn tool_arguments_or_marker(s: &str) -> serde_json::Value {
+    match parse_tool_arguments_strict(s) {
+        Ok(v) => v,
+        Err(raw) => serde_json::json!({ INVALID_ARGUMENTS_KEY: raw }),
+    }
 }
 
 /// Fix invalid JSON escape sequences produced by LLMs.
@@ -368,5 +433,46 @@ mod tests {
         let complete = r#"{"title": "Page"}"#;
         let result = parse_tool_arguments_json(complete);
         assert_eq!(result["title"].as_str().unwrap(), "Page");
+    }
+
+    #[test]
+    fn strict_parse_accepts_a_valid_object() {
+        let result = parse_tool_arguments_strict(r#"{"path":"a.txt"}"#).unwrap();
+        assert_eq!(result, serde_json::json!({"path": "a.txt"}));
+    }
+
+    #[test]
+    fn strict_parse_accepts_empty_string_as_empty_object() {
+        let result = parse_tool_arguments_strict("").unwrap();
+        assert_eq!(result, serde_json::json!({}));
+    }
+
+    #[test]
+    fn strict_parse_repairs_recoverable_json_like_the_lenient_parser() {
+        // Same invalid-escape-sequence case the lenient parser recovers from.
+        let result = parse_tool_arguments_strict(r#"{"code": "re.match(\d+, s)"}"#).unwrap();
+        assert!(result["code"].as_str().is_some());
+    }
+
+    #[test]
+    fn strict_parse_errors_with_raw_text_for_unrecoverable_input() {
+        let err = parse_tool_arguments_strict("not json at all").unwrap_err();
+        assert_eq!(err, "not json at all");
+    }
+
+    #[test]
+    fn marker_wraps_unrecoverable_text_under_the_invalid_arguments_key() {
+        let v = tool_arguments_or_marker("not json at all");
+        assert_eq!(
+            v[INVALID_ARGUMENTS_KEY].as_str().unwrap(),
+            "not json at all"
+        );
+    }
+
+    #[test]
+    fn marker_returns_the_parsed_object_when_valid() {
+        let v = tool_arguments_or_marker(r#"{"path":"a.txt"}"#);
+        assert_eq!(v, serde_json::json!({"path": "a.txt"}));
+        assert!(v.get(INVALID_ARGUMENTS_KEY).is_none());
     }
 }

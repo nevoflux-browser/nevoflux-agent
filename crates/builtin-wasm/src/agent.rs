@@ -8,6 +8,7 @@
 
 use crate::host::{HostFunctions, HostResult};
 use crate::types::*;
+use nevoflux_protocol::json_repair::INVALID_ARGUMENTS_KEY;
 use nevoflux_protocol::{Artifact, LocalFileRef, PlanProposal, PlanStep};
 use std::cell::{Cell, RefCell};
 
@@ -2013,6 +2014,34 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
     /// Execute a single tool call.
     fn execute_tool(&self, tool_call: &ToolCall) -> HostResult<ToolResult> {
         let normalized_name = Self::normalize_tool_name(&tool_call.name);
+
+        // Arguments that couldn't be parsed as JSON were wrapped by the LLM
+        // client into `{INVALID_ARGUMENTS_KEY: <raw text>}` instead of being
+        // silently defaulted to `{}` (which would let the tool run with
+        // wrong/no arguments). Refuse to run it at all and report why.
+        // Trigger on the key's mere presence, not just a string value — a
+        // future producer of this marker shouldn't be able to sneak past
+        // the check by putting a non-string under the key.
+        if let Some(marker) = tool_call.arguments.get(INVALID_ARGUMENTS_KEY) {
+            let raw = marker
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| marker.to_string());
+            let truncated: String = raw.chars().take(300).collect();
+            let tool_call_id = tool_call
+                .call_id
+                .clone()
+                .unwrap_or_else(|| tool_call.id.clone());
+            return Ok(ToolResult {
+                tool_call_id,
+                content: format!(
+                    "Error: the arguments for `{}` were not valid JSON, so the tool did not run. Received: {}",
+                    tool_call.name, truncated
+                ),
+                success: false,
+            });
+        }
+
         let content = match normalized_name {
             "think" => {
                 // Think tool: no side effects, just returns acknowledgment.
@@ -7965,6 +7994,21 @@ mod tests {
 
         let result = agent.execute_tool(&tool_call).unwrap();
         assert!(result.content.contains("Unknown tool"));
+    }
+
+    #[test]
+    fn invalid_arguments_marker_is_reported_not_executed() {
+        let agent = Agent::new(MockHostFunctions::new());
+        let call = ToolCall {
+            id: "c".into(),
+            call_id: None,
+            name: "read".into(),
+            arguments: serde_json::json!({ nevoflux_protocol::json_repair::INVALID_ARGUMENTS_KEY: "{oops" }),
+            signature: None,
+        };
+        let r = agent.execute_tool(&call).unwrap();
+        assert!(r.content.contains("not valid JSON"));
+        assert_eq!(agent.host.tool_read_calls.get(), 0);
     }
 
     #[test]
