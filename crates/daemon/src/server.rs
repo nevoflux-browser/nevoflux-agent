@@ -11814,6 +11814,10 @@ struct ProviderMeta {
     provider_type: &'static str,
     /// Embedded icon bytes (WebP, 128x128)
     icon_bytes: &'static [u8],
+    /// Excluded from `config.llm.list`'s `providers` array, so it never
+    /// renders as a card in the settings UI's cloud-provider grid. Used for
+    /// entries (like "local") that have their own dedicated UI elsewhere.
+    hidden: bool,
 }
 
 /// Encode icon bytes as a base64 data URI (image/webp).
@@ -11829,102 +11833,129 @@ const PROVIDER_METAS: &[ProviderMeta] = &[
         display_name: "Anthropic",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/anthropic.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "openai",
         display_name: "OpenAI",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/openai.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "deepseek",
         display_name: "DeepSeek",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/deepseek.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "qwen",
         display_name: "Qwen",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/qwen.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "gemini",
         display_name: "Google Gemini",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/gemini.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "groq",
         display_name: "Groq",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/groq.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "openrouter",
         display_name: "OpenRouter",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/openrouter.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "mistral",
         display_name: "Mistral",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/mistral.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "xai",
         display_name: "XAI (Grok)",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/xai.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "cohere",
         display_name: "Cohere",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/cohere.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "perplexity",
         display_name: "Perplexity",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/perplexity.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "together",
         display_name: "Together AI",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/together.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "ollama",
         display_name: "Ollama",
         provider_type: "local",
         icon_bytes: include_bytes!("../../../assets/icons/providers/ollama.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "claude-code",
         display_name: "Claude Code",
         provider_type: "cli",
         icon_bytes: include_bytes!("../../../assets/icons/providers/anthropic.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "antigravity",
         display_name: "Antigravity",
         provider_type: "cli",
         icon_bytes: include_bytes!("../../../assets/icons/providers/antigravity.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "kimi-agent",
         display_name: "Kimi Agent",
         provider_type: "cli",
         icon_bytes: include_bytes!("../../../assets/icons/providers/kimi.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "openclaw",
         display_name: "OpenClaw",
         provider_type: "agent",
         icon_bytes: include_bytes!("../../../assets/icons/providers/openclaw.webp"),
+        hidden: false,
+    },
+    ProviderMeta {
+        id: "local",
+        display_name: "On-device",
+        provider_type: "local",
+        // Never rendered — `hidden: true` filters this out of the settings
+        // UI's cloud-provider grid before `icon_data_uri` would run on it.
+        // It gets its own dedicated on-device inference UI in a later task.
+        icon_bytes: &[],
+        hidden: true,
     },
 ];
 
@@ -11947,6 +11978,7 @@ async fn handle_config_llm_list(params: &serde_json::Value) -> serde_json::Value
 
     let mut providers: Vec<serde_json::Value> = PROVIDER_METAS
         .iter()
+        .filter(|meta| !meta.hidden)
         .map(|meta| {
             let provider_config = config.llm.provider_config(meta.id);
             let configured = config.llm.is_provider_configured(meta.id);

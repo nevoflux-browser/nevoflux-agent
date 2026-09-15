@@ -577,6 +577,7 @@ impl AgentConfig {
         merge_provider(&mut self.llm.perplexity, &other.llm.perplexity);
         merge_provider(&mut self.llm.together, &other.llm.together);
         merge_provider(&mut self.llm.kimi_agent, &other.llm.kimi_agent);
+        merge_local(&mut self.llm.local, &other.llm.local);
 
         // Merge storage config
         if other.storage.data_dir.is_some() {
@@ -644,6 +645,38 @@ fn merge_provider(target: &mut ProviderConfig, other: &ProviderConfig) {
     }
     if other.use_streaming.is_some() {
         target.use_streaming = other.use_streaming;
+    }
+}
+
+/// Merge a local-inference config, preferring non-default values from `other`.
+fn merge_local(target: &mut crate::local::LocalConfig, other: &crate::local::LocalConfig) {
+    let default = crate::local::LocalConfig::default();
+    if other.enabled != default.enabled {
+        target.enabled = other.enabled;
+    }
+    if other.model != default.model {
+        target.model = other.model.clone();
+    }
+    if other.quant != default.quant {
+        target.quant = other.quant.clone();
+    }
+    if other.backend != default.backend {
+        target.backend = other.backend;
+    }
+    if other.gpu_layers != default.gpu_layers {
+        target.gpu_layers = other.gpu_layers;
+    }
+    if other.ctx_size != default.ctx_size {
+        target.ctx_size = other.ctx_size;
+    }
+    if other.kv_cache_type != default.kv_cache_type {
+        target.kv_cache_type = other.kv_cache_type;
+    }
+    if other.parallel != default.parallel {
+        target.parallel = other.parallel;
+    }
+    if other.idle_unload_secs != default.idle_unload_secs {
+        target.idle_unload_secs = other.idle_unload_secs;
     }
 }
 
@@ -733,6 +766,14 @@ pub struct LlmConfig {
     /// OpenClaw ACP-specific configuration.
     #[serde(default)]
     pub openclaw: ProviderConfig,
+
+    /// On-device (local) inference engine configuration.
+    ///
+    /// Unlike the other provider fields this is not a [`ProviderConfig`] —
+    /// there is no API key or base URL to store, since the engine is a
+    /// locally-launched process. See [`crate::local::LocalConfig`].
+    #[serde(default)]
+    pub local: crate::local::LocalConfig,
 
     /// User-defined providers, keyed by the stable id that follows `custom:`
     /// in [`LlmConfig::provider`]. See [`CustomProviderConfig`].
@@ -890,6 +931,7 @@ pub fn keyless_placeholder(id: &str) -> Option<&'static str> {
         "ollama" => Some("ollama-local"),
         "kimi-agent" | "kimi_agent" | "kimi" => Some("kimi-agent-cli"),
         "openclaw" | "open_claw" | "open-claw" => Some("openclaw-acp"),
+        "local" | "on-device" | "ondevice" => Some("local-engine"),
         _ => None,
     }
 }
@@ -918,6 +960,7 @@ pub const BUILTIN_PROVIDER_IDS: &[&str] = &[
     "together",
     "kimi-agent",
     "openclaw",
+    "local",
 ];
 
 impl LlmConfig {
@@ -963,6 +1006,10 @@ impl LlmConfig {
             "antigravity" | "antigravity-cli" | "antigravity_cli" => Some(&self.antigravity),
             "kimi-agent" | "kimi_agent" | "kimi" => Some(&self.kimi_agent),
             "openclaw" | "open_claw" | "open-claw" => Some(&self.openclaw),
+            // "local" has no `ProviderConfig` — it's a `LocalConfig` (see
+            // `LlmConfig::local`), which has no api_key/base_url shape to hand
+            // back here. `is_provider_configured` and `active_api_key`
+            // special-case "local" directly instead of going through this.
             _ => None,
         }
     }
@@ -992,6 +1039,7 @@ impl LlmConfig {
             "antigravity" | "antigravity-cli" | "antigravity_cli" => Some(&mut self.antigravity),
             "kimi-agent" | "kimi_agent" | "kimi" => Some(&mut self.kimi_agent),
             "openclaw" | "open_claw" | "open-claw" => Some(&mut self.openclaw),
+            // See the comment in `provider_config` — "local" has no `ProviderConfig`.
             _ => None,
         }
     }
@@ -1023,6 +1071,9 @@ impl LlmConfig {
     /// `base_url` — its key is optional, because a local OpenAI-compatible
     /// server commonly has no auth at all.
     pub fn is_provider_configured(&self, id: &str) -> bool {
+        if id == "local" {
+            return self.local.enabled;
+        }
         let Some(pc) = self.provider_config(id) else {
             return false;
         };
@@ -1105,6 +1156,9 @@ impl LlmConfig {
     /// builder an empty string.
     pub fn active_api_key(&self) -> Option<&str> {
         let id = self.active_provider()?;
+        if id == "local" {
+            return keyless_placeholder(id);
+        }
         let pc = self.provider_config(id)?;
         pc.api_key
             .as_deref()
@@ -1230,6 +1284,7 @@ impl Default for LlmConfig {
             together: ProviderConfig::default(),
             kimi_agent: ProviderConfig::default(),
             openclaw: ProviderConfig::default(),
+            local: crate::local::LocalConfig::default(),
             custom: std::collections::BTreeMap::new(),
             max_tokens: default_max_tokens(),
             temperature: default_temperature(),
@@ -2488,6 +2543,18 @@ base_url = "https://x.test"
         );
         assert_eq!(cfg.resolve_wire("custom:missing"), None);
         assert_eq!(cfg.resolve_wire("nope"), None);
+    }
+
+    #[test]
+    fn local_section_parses_and_resolves_wire() {
+        let cfg: AgentConfig =
+            toml::from_str("[llm]\nprovider = \"local\"\n[llm.local]\nenabled = true\n").unwrap();
+        assert_eq!(
+            cfg.llm.resolve_wire("local"),
+            Some(nevoflux_llm::ProviderType::Local)
+        );
+        assert_eq!(cfg.llm.active_api_key(), Some("local-engine"));
+        assert!(cfg.llm.is_provider_configured("local"));
     }
 
     #[test]

@@ -35,6 +35,7 @@ fn has_api_key(provider: ProviderType) -> Option<String> {
         ProviderType::KimiAgent => "MOONSHOT_API_KEY",
         ProviderType::OpenClaw => "OPENCLAW_API_KEY",
         ProviderType::Antigravity => "ANTIGRAVITY_API_KEY",
+        ProviderType::Local => "NEVOFLUX_LOCAL_API_KEY",
     };
 
     std::env::var(env_var).ok().filter(|k| !k.is_empty())

@@ -438,6 +438,10 @@ pub async fn execute_llm_chat(
         ProviderType::KimiAgent => {
             execute_kimi_agent_chat(api_key, model, request, provider, base_url).await
         }
+        // TODO(Task 1.4): route to the on-device engine supervisor once it exists.
+        ProviderType::Local => Err(DaemonError::InternalError(
+            "on-device engine not running".to_string(),
+        )),
     }
 }
 
@@ -2628,6 +2632,10 @@ async fn execute_llm_stream_inner(
             "Streaming not supported for provider {:?}",
             provider
         ))),
+        // TODO(Task 1.4): route to the on-device engine supervisor once it exists.
+        ProviderType::Local => Err(DaemonError::InternalError(
+            "on-device engine not running".to_string(),
+        )),
     }
 }
 
