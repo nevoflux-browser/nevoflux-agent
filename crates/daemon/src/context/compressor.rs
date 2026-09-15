@@ -635,12 +635,19 @@ mod tests {
     #[test]
     fn summarization_uses_local_and_never_falls_back_when_latched() {
         let _g = crate::local::latch::test_serial();
+        struct ResetLatch;
+        impl Drop for ResetLatch {
+            fn drop(&mut self) {
+                crate::local::latch::set(false);
+            }
+        }
+        let _reset = ResetLatch;
+
         crate::local::latch::set(true);
         let mut config = AgentConfig::default();
         config.llm.provider = Some("claude-code".into()); // ACP would normally fall back
         config.llm.anthropic.api_key = Some("sk".into());
         let r = get_summarization_provider(&config, "");
-        crate::local::latch::set(false);
         assert_eq!(r.unwrap().0, ProviderType::Local);
     }
 }

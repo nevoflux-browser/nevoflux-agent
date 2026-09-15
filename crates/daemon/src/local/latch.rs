@@ -7,6 +7,36 @@
 //! called whenever the config changes (startup, `config.set`, config-file
 //! watch reload) so the latch always tracks the current `[llm]` section
 //! rather than a snapshot taken at startup.
+//!
+//! ## Test isolation (R26)
+//!
+//! In production [`is_on`] / [`set`] read and write one process-global
+//! [`LATCH`]. Under `cfg(test)`, dozens of call sites across the daemon
+//! crate now read [`is_on`] (goal/loop/schedule dispatch, summarization,
+//! model-override validation, …) — far more than when [`LATCH`] had only its
+//! own two direct tests — so a bare global would make any test that flips it
+//! race every *other*, unrelated test running concurrently in `cargo test`'s
+//! default multi-threaded harness, even one that never touches this module.
+//!
+//! The fix: in test builds, [`set`] writes a **thread-local** override
+//! ([`TEST_LATCH`]) instead of the real global, and [`is_on`] prefers that
+//! override when present, falling back to the real global only when the
+//! calling thread has never called [`set`]. `#[tokio::test]`'s default
+//! `current_thread` flavor runs a test function and everything it
+//! `tokio::spawn`s on the SAME OS thread, so a dispatcher/tick task spawned
+//! inside a latch test still observes that test's override — do not switch
+//! a latch-sensitive test to `flavor = "multi_thread"`, which would move
+//! spawned work to a different thread with no override of its own.
+//!
+//! [`refresh_from_config`] is the one production caller whose effect must be
+//! visible to every thread (a config change), so it always writes the real
+//! global via [`set_global`], bypassing the thread-local even in test
+//! builds. The handful of tests that must exercise that real-global path
+//! (currently just this module's own `refresh_tracks_*` tests) use
+//! [`set_global_for_test`] instead of [`set`], and keep holding
+//! [`test_serial`] for the duration exactly as before thread-local isolation
+//! existed — every other latch-touching test in the crate no longer needs
+//! to worry about racing them.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -19,14 +49,67 @@ use nevoflux_llm::ProviderType;
 /// insurance against.
 static LATCH: AtomicBool = AtomicBool::new(false);
 
-/// Whether the LocalOnly latch is currently on.
+/// Test-only per-thread override for [`is_on`]/[`set`] — see the module
+/// docs' "Test isolation" section. `None` means "no override on this
+/// thread": fall through to the real [`LATCH`].
+#[cfg(test)]
+thread_local! {
+    static TEST_LATCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn test_override() -> Option<bool> {
+    TEST_LATCH.with(|c| c.get())
+}
+
+#[cfg(not(test))]
+fn test_override() -> Option<bool> {
+    None
+}
+
+/// Whether the LocalOnly latch is currently on: the calling thread's test
+/// override if one is set (test builds only), else the real global.
 pub fn is_on() -> bool {
+    if let Some(v) = test_override() {
+        return v;
+    }
     LATCH.load(Ordering::SeqCst)
 }
 
-/// Set the latch, returning its previous value.
-pub fn set(on: bool) -> bool {
+/// The raw global swap, bypassing the test thread-local override. The only
+/// production caller is [`refresh_from_config`], whose effect must be
+/// visible to every thread; [`set_global_for_test`] exposes this to the
+/// handful of tests that need the same.
+fn set_global(on: bool) -> bool {
     LATCH.swap(on, Ordering::SeqCst)
+}
+
+/// Set the latch, returning its previous EFFECTIVE value (what [`is_on`]
+/// would have returned just before this call).
+///
+/// In test builds this writes ONLY the calling thread's override — see the
+/// module docs — never the real global, so unrelated concurrently-running
+/// tests can't observe it. Production builds swap the real global directly.
+#[cfg(not(test))]
+pub fn set(on: bool) -> bool {
+    set_global(on)
+}
+
+#[cfg(test)]
+pub fn set(on: bool) -> bool {
+    let prev = is_on();
+    TEST_LATCH.with(|c| c.set(Some(on)));
+    prev
+}
+
+/// Test-only escape hatch that drives the REAL global latch rather than the
+/// calling thread's override — for the few tests (see module docs) that
+/// specifically exercise global-visibility behavior, e.g.
+/// [`refresh_from_config`]. Callers must hold [`test_serial`] for the
+/// duration.
+#[cfg(test)]
+pub fn set_global_for_test(on: bool) -> bool {
+    set_global(on)
 }
 
 /// Recompute the latch from `cfg` and apply it if it changed.
@@ -38,6 +121,10 @@ pub fn set(on: bool) -> bool {
 /// compare) **and** `[llm.local].enabled` is true. Returns `Some(new)` iff
 /// the latch's value changed, `None` if it was already at the computed
 /// value — so callers can log/broadcast only on an actual transition.
+///
+/// Always writes the real global (via [`set_global`]) even in test builds —
+/// a config change must be visible process-wide, not just to the calling
+/// thread. See the module docs' "Test isolation" section.
 pub fn refresh_from_config(cfg: &crate::config::AgentConfig) -> Option<bool> {
     let new_on = cfg
         .llm
@@ -45,7 +132,7 @@ pub fn refresh_from_config(cfg: &crate::config::AgentConfig) -> Option<bool> {
         .and_then(|p| cfg.llm.resolve_wire(p))
         == Some(ProviderType::Local)
         && cfg.llm.local.enabled;
-    let prev = set(new_on);
+    let prev = set_global(new_on);
     (prev != new_on).then_some(new_on)
 }
 
@@ -129,11 +216,12 @@ pub fn is_loopback_url(url: &str) -> bool {
         .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Serialize tests that touch the process-global [`LATCH`].
-///
-/// `cargo test` runs `#[test]` functions on multiple threads by default, so
-/// without this, `refresh_tracks_active_provider_and_enabled` and
-/// `refresh_tracks_provider_alias` would race each other's `set` calls.
+/// Serialize tests that touch the process-global [`LATCH`] directly (via
+/// [`set_global_for_test`] / [`refresh_from_config`]) rather than through the
+/// per-thread [`set`]/[`is_on`] override — currently just this module's own
+/// `refresh_tracks_*` tests. `cargo test` runs `#[test]` functions on
+/// multiple threads by default, so without this they would race each
+/// other's global writes.
 #[cfg(test)]
 pub fn test_serial() -> std::sync::MutexGuard<'static, ()> {
     static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -197,11 +285,15 @@ mod tests {
         assert!(egress_decision(true, OpenAi, Some("http://127.0.0.1.evil.com/v1")).is_err());
     }
 
+    /// Exercises `refresh_from_config`'s real-global write path — uses
+    /// `set_global_for_test` (never the thread-local `set`) throughout so
+    /// `is_on()` reads through to the same global `refresh_from_config`
+    /// touches, under `test_serial()` per the module docs.
     #[test]
     fn refresh_tracks_active_provider_and_enabled() {
         let _g = test_serial();
         let mut cfg = crate::config::AgentConfig::default();
-        set(false);
+        set_global_for_test(false);
         cfg.llm.provider = Some("local".into());
         assert_eq!(refresh_from_config(&cfg), None); // not enabled -> stays off
         cfg.llm.local.enabled = true;
@@ -212,6 +304,26 @@ mod tests {
         // "on-device" is an accepted alias for "local" (ProviderType::from_str)
         cfg.llm.provider = Some("on-device".into());
         assert_eq!(refresh_from_config(&cfg), Some(true));
+        set_global_for_test(false);
+    }
+
+    /// The thread-local override ([`set`]/[`is_on`]) is invisible to
+    /// [`set_global_for_test`]/[`refresh_from_config`]'s real-global path —
+    /// this is exactly what makes the two safe to run concurrently with
+    /// every other latch-touching test in the crate (R26).
+    #[test]
+    fn thread_local_override_does_not_leak_into_the_real_global() {
+        let _g = test_serial();
+        set_global_for_test(false);
+
+        set(true); // thread-local only
+        assert!(is_on());
+        assert!(
+            !LATCH.load(Ordering::SeqCst),
+            "the real global must be untouched by the thread-local override"
+        );
+
         set(false);
+        set_global_for_test(false);
     }
 }
