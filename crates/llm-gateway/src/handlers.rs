@@ -43,15 +43,68 @@ use crate::translate::{
     OpenAIChatRequest, StreamTranslator,
 };
 
+/// Mutable upstream routing state, hot-swappable at runtime (Task 1.6).
+///
+/// Grouping these fields behind one `RwLock` (see [`AppState::upstream`])
+/// lets [`crate::server::GatewayHandle::set_upstream`] replace all of
+/// them atomically — a request that reads the snapshot before a swap
+/// never sees a mix of the old `base_url` with the new `api_key`, say.
+/// Every handler that needs upstream routing reads exactly one snapshot
+/// clone at the top of the request (see `chat_completions` / `models`)
+/// rather than re-reading the lock field-by-field.
+#[derive(Clone)]
+pub(crate) struct Upstream {
+    pub(crate) base_url: String,
+    pub(crate) api_key: String,
+    /// If non-empty, overrides the `model` field of every incoming
+    /// chat-completions request before hitting upstream. See 附录 B 决策 #25.
+    pub(crate) model_override: String,
+    /// Protocol the upstream LLM endpoint speaks (M4-2.6). Dispatched on
+    /// inside `chat_completions` to pick between the Anthropic translator
+    /// path and the OpenAI passthrough path.
+    pub(crate) protocol: UpstreamProtocol,
+    /// Lazy ACP holder, present only when the gateway was booted with an
+    /// `acp_config` (i.e. `protocol == Acp` at [`AppState::new`] time).
+    /// The outer `Mutex` serializes the lazy connect so the subprocess is
+    /// spawned exactly once across concurrent first-requests.
+    ///
+    /// Deliberately NOT part of [`crate::server::UpstreamUpdate`] and
+    /// never touched by [`Upstream::apply_update`]: a hot swap only ever
+    /// moves between the boot-time cloud protocol and the on-device
+    /// OpenAI-compatible endpoint, so the same lazily-connected
+    /// `AcpUpstream` (if any) is simply left alone across swaps —
+    /// unreachable while `protocol != Acp`, ready to lazily connect again
+    /// the moment `protocol` swaps back to `Acp`.
+    pub(crate) acp: Option<Arc<tokio::sync::Mutex<AcpUpstream>>>,
+}
+
+impl Upstream {
+    /// Apply a [`crate::server::UpstreamUpdate`] in place, leaving `acp`
+    /// untouched (see its doc comment).
+    pub(crate) fn apply_update(&mut self, up: crate::server::UpstreamUpdate) {
+        self.base_url = up.base_url;
+        self.api_key = up.api_key;
+        self.model_override = up.model_override;
+        self.protocol = up.protocol;
+    }
+
+    /// Snapshot the swappable fields into a [`crate::server::UpstreamUpdate`].
+    pub(crate) fn snapshot(&self) -> crate::server::UpstreamUpdate {
+        crate::server::UpstreamUpdate {
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            model_override: self.model_override.clone(),
+            protocol: self.protocol,
+        }
+    }
+}
+
 /// Shared application state.
 pub(crate) struct AppState {
     pub(crate) bearer_token: String,
     pub(crate) chat_request_count: AtomicU64,
-    pub(crate) upstream_base_url: String,
-    pub(crate) upstream_api_key: String,
-    /// If non-empty, overrides the `model` field of every incoming
-    /// chat-completions request before hitting upstream. See 附录 B 决策 #25.
-    pub(crate) upstream_model_override: String,
+    /// Hot-swappable upstream routing (Task 1.6) — see [`Upstream`].
+    pub(crate) upstream: tokio::sync::RwLock<Upstream>,
     pub(crate) anthropic_version: String,
     /// Client used for non-stream upstream calls. Has both
     /// `connect_timeout` and `timeout()` set so a stuck request fails
@@ -75,18 +128,10 @@ pub(crate) struct AppState {
     pub(crate) embedder: OnceCell<Arc<FastEmbedProvider>>,
     /// Models advertised by `GET /v1/models` (M2-1). The handler falls
     /// back to a single-entry list synthesized from
-    /// `upstream_model_override` (or the sentinel `"default"`) when this
-    /// is empty, so naive clients calling list-models on a freshly-booted
-    /// gateway always get a valid response.
+    /// [`Upstream::model_override`] (or the sentinel `"default"`) when
+    /// this is empty, so naive clients calling list-models on a
+    /// freshly-booted gateway always get a valid response.
     pub(crate) advertised_models: Vec<String>,
-    /// Protocol the upstream LLM endpoint speaks (M4-2.6). Dispatched on
-    /// inside `chat_completions` to pick between the Anthropic translator
-    /// path and the OpenAI passthrough path.
-    pub(crate) upstream_protocol: UpstreamProtocol,
-    /// Lazy ACP holder, present only when `upstream_protocol == Acp`.
-    /// The outer `Mutex` serializes the lazy connect so the subprocess
-    /// is spawned exactly once across concurrent first-requests.
-    pub(crate) acp: Option<Arc<tokio::sync::Mutex<AcpUpstream>>>,
 }
 
 impl AppState {
@@ -119,12 +164,18 @@ impl AppState {
             .clone()
             .map(|cfg| Arc::new(tokio::sync::Mutex::new(AcpUpstream::new(cfg))));
 
+        let upstream = Upstream {
+            base_url: config.upstream_base_url,
+            api_key: config.upstream_api_key,
+            model_override: config.upstream_model_remap.unwrap_or_default(),
+            protocol: config.upstream_protocol,
+            acp,
+        };
+
         Ok(Self {
             bearer_token: config.bearer_token,
             chat_request_count: AtomicU64::new(0),
-            upstream_base_url: config.upstream_base_url,
-            upstream_api_key: config.upstream_api_key,
-            upstream_model_override: config.upstream_model_remap.unwrap_or_default(),
+            upstream: tokio::sync::RwLock::new(upstream),
             anthropic_version: config.anthropic_version,
             nonstream_http,
             stream_http,
@@ -133,8 +184,6 @@ impl AppState {
             #[cfg(feature = "embedding")]
             embedder: OnceCell::new(),
             advertised_models: config.advertised_models,
-            upstream_protocol: config.upstream_protocol,
-            acp,
         })
     }
 
@@ -383,18 +432,23 @@ pub(crate) async fn chat_completions(
     let req_idx = state.chat_request_count.fetch_add(1, Ordering::Relaxed) + 1;
     let stream = req.stream.unwrap_or(false);
 
+    // Task 1.6: snapshot the hot-swappable upstream once per request, so a
+    // concurrent `set_upstream` mid-flight can't hand this request a mix
+    // of the old and new routing fields.
+    let up = state.upstream.read().await.clone();
+
     // M4-2.6: dispatch on the upstream protocol. The Anthropic path is
     // the existing M2 translator; the OpenAI path is a thin passthrough
     // that swaps auth + applies the optional model remap and reuses the
     // same M2-3 retry/timeout/error-classification helpers.
-    let result = match state.upstream_protocol {
+    let result = match up.protocol {
         UpstreamProtocol::Anthropic => {
-            do_chat_completions_anthropic(state.clone(), req, req_idx, stream).await
+            do_chat_completions_anthropic(state.clone(), up, req, req_idx, stream).await
         }
         UpstreamProtocol::OpenAi => {
-            do_chat_completions_openai(state.clone(), req, req_idx, stream).await
+            do_chat_completions_openai(state.clone(), up, req, req_idx, stream).await
         }
-        UpstreamProtocol::Acp => match state.acp.clone() {
+        UpstreamProtocol::Acp => match up.acp {
             Some(acp) => acp_upstream::do_chat_completions_acp(acp, req, req_idx, stream).await,
             None => Err(GatewayError::Internal {
                 detail: "upstream_protocol=Acp but no acp_config was supplied to the gateway"
@@ -427,6 +481,7 @@ pub(crate) async fn chat_completions(
 /// upstream via [`post_upstream`], then translates the response back.
 async fn do_chat_completions_anthropic(
     state: Arc<AppState>,
+    up: Upstream,
     req: OpenAIChatRequest,
     req_idx: u64,
     stream: bool,
@@ -440,17 +495,17 @@ async fn do_chat_completions_anthropic(
     // Model remap (附录 B 决策 #25): some upstreams accept only a single
     // model name. The gateway is the abstraction layer where that mapping
     // happens. Driven by env var; empty = passthrough.
-    if !state.upstream_model_override.is_empty() && anthr.model != state.upstream_model_override {
+    if !up.model_override.is_empty() && anthr.model != up.model_override {
         tracing::debug!(
             req_idx,
             "remapping model {} -> {}",
             anthr.model,
-            state.upstream_model_override
+            up.model_override
         );
-        anthr.model = state.upstream_model_override.clone();
+        anthr.model = up.model_override.clone();
     }
 
-    let url = format!("{}/v1/messages", state.upstream_base_url);
+    let url = format!("{}/v1/messages", up.base_url);
     tracing::info!(
         req_idx,
         stream,
@@ -475,7 +530,7 @@ async fn do_chat_completions_anthropic(
     };
 
     let mut anthropic_headers = reqwest::header::HeaderMap::new();
-    if let Ok(hv) = reqwest::header::HeaderValue::from_str(&state.upstream_api_key) {
+    if let Ok(hv) = reqwest::header::HeaderValue::from_str(&up.api_key) {
         anthropic_headers.insert("x-api-key", hv);
     }
     if let Ok(hv) = reqwest::header::HeaderValue::from_str(&state.anthropic_version) {
@@ -527,14 +582,15 @@ async fn do_chat_completions_anthropic(
 /// Inner chat-completions implementation for the OpenAI passthrough
 /// path (M4-2.6). Forwards the client request unchanged except for:
 ///
-/// - applying [`AppState::upstream_model_override`] to the `model` field;
-/// - swapping auth to `Authorization: Bearer <upstream_api_key>`;
+/// - applying [`Upstream::model_override`] to the `model` field;
+/// - swapping auth to `Authorization: Bearer <api_key>`;
 /// - reusing M2-3's [`post_upstream`] for 429-retry + timeout + error
 ///   classification;
 /// - re-emitting the upstream SSE stream verbatim (with per-chunk idle
 ///   timeout) instead of running the Anthropic translator.
 async fn do_chat_completions_openai(
     state: Arc<AppState>,
+    up: Upstream,
     mut req: OpenAIChatRequest,
     req_idx: u64,
     stream: bool,
@@ -543,20 +599,17 @@ async fn do_chat_completions_openai(
 
     // Model remap — same semantics as the Anthropic path, just applied
     // directly to the OpenAI request body before we forward it.
-    if !state.upstream_model_override.is_empty() && req.model != state.upstream_model_override {
+    if !up.model_override.is_empty() && req.model != up.model_override {
         tracing::debug!(
             req_idx,
             "remapping model {} -> {}",
             req.model,
-            state.upstream_model_override
+            up.model_override
         );
-        req.model = state.upstream_model_override.clone();
+        req.model = up.model_override.clone();
     }
 
-    let url = format!(
-        "{}/v1/chat/completions",
-        state.upstream_base_url.trim_end_matches('/')
-    );
+    let url = format!("{}/v1/chat/completions", up.base_url.trim_end_matches('/'));
     tracing::info!(
         req_idx,
         stream,
@@ -578,9 +631,7 @@ async fn do_chat_completions_openai(
     };
 
     let mut openai_headers = reqwest::header::HeaderMap::new();
-    if let Ok(hv) =
-        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", state.upstream_api_key))
-    {
+    if let Ok(hv) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", up.api_key)) {
         openai_headers.insert(reqwest::header::AUTHORIZATION, hv);
     }
     openai_headers.insert(
@@ -1102,7 +1153,7 @@ pub(crate) struct ModelEntry {
 ///
 /// Returns the list configured via [`AppState::advertised_models`]. If
 /// empty, returns a single entry derived from
-/// [`AppState::upstream_model_override`] (if set), otherwise a sentinel
+/// [`Upstream::model_override`] (if set), otherwise a sentinel
 /// `"default"` placeholder so naive clients calling list-models on a
 /// freshly-booted gateway always get a valid response.
 ///
@@ -1114,10 +1165,13 @@ pub(crate) async fn models(State(state): State<Arc<AppState>>) -> Json<ModelsLis
     /// clients caching by `(id, created)` see the same value.
     const EPOCH: u64 = 1_729_600_000;
 
+    // Task 1.6: snapshot the hot-swappable upstream so this reflects the
+    // currently-active model_override, not a boot-time copy.
+    let model_override = state.upstream.read().await.model_override.clone();
     let models: Vec<String> = if !state.advertised_models.is_empty() {
         state.advertised_models.clone()
-    } else if !state.upstream_model_override.is_empty() {
-        vec![state.upstream_model_override.clone()]
+    } else if !model_override.is_empty() {
+        vec![model_override]
     } else {
         vec!["default".to_string()]
     };
