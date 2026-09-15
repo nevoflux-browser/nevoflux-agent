@@ -7829,6 +7829,37 @@ mod tests {
         assert!(mouse_move.description.contains("without clicking"));
     }
 
+    /// Writes each mode's tool schemas as JSON for offline model evaluation.
+    /// Run with `NEVOFLUX_DUMP_TOOLS_DIR=<dir> cargo test -p nevoflux-builtin-wasm --lib dump_tool_schemas -- --ignored`.
+    #[test]
+    #[ignore]
+    fn dump_tool_schemas() {
+        let Ok(dir) = std::env::var("NEVOFLUX_DUMP_TOOLS_DIR") else {
+            return;
+        };
+        let agent = Agent::new(MockHostFunctions::new());
+        std::fs::create_dir_all(&dir).unwrap();
+        for (slug, mode) in [
+            ("chat", AgentMode::Chat),
+            ("browser", AgentMode::Browser),
+            ("agent", AgentMode::Agent),
+        ] {
+            let tools: Vec<serde_json::Value> = agent
+                .get_tools_for_mode(mode)
+                .into_iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.input_schema,
+                    })
+                })
+                .collect();
+            let path = std::path::Path::new(&dir).join(format!("{slug}.json"));
+            std::fs::write(path, serde_json::to_string_pretty(&tools).unwrap()).unwrap();
+        }
+    }
+
     #[test]
     fn chat_mode_exposes_tool_search() {
         let mock = MockHostFunctions::new();
