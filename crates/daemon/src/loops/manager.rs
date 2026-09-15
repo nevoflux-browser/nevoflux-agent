@@ -959,6 +959,28 @@ mod tests {
     use std::time::Duration;
 
     fn fresh() -> Storage {
+        // R35 root-cause fix: the dispatcher task spawned by `LoopManager::start`/
+        // `start_with_bus` below checks `crate::local::latch::is_on()` (see
+        // this file's own dispatch loop) before firing an iteration. In test
+        // builds `is_on()` prefers a thread-local override and only falls
+        // through to the REAL process-global latch when the calling thread
+        // never set one (see `local::latch`'s module docs, R26) — and
+        // `#[tokio::test]`'s current-thread flavor runs a spawned dispatcher
+        // on the SAME thread as the test that spawned it. None of this
+        // file's tests call `latch::set` themselves (except
+        // `fires_are_skipped_while_latched`, which explicitly wants the
+        // latched behavior), so their dispatcher's `is_on()` check used to
+        // silently read whatever the REAL global happened to be — safe only
+        // as long as nothing else in the binary ever touched it. Task 1.6's
+        // own latch tests do (deliberately, to exercise that behavior),
+        // running concurrently on other harness threads, which could flip
+        // an unrelated loop test's dispatcher into skip-and-count-as-latched
+        // mode mid-run, at random, depending on scheduling — the actual
+        // mechanism behind this file's own flaky failures once Task 1.6
+        // landed. Pinning the thread-local override to `false` here for
+        // every test makes each one immune to that, regardless of what any
+        // other concurrently-running test does to the real global.
+        crate::local::latch::set(false);
         let s = Storage::open_in_memory().unwrap();
         s.sessions()
             .create(CreateSessionParams::new().with_id("s1").with_title("t"))

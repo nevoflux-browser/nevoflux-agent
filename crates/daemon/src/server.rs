@@ -14721,15 +14721,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_start_and_shutdown() {
-        // Fix round 1, item 3: `start_server` boots the in-process
+        // Fix round 1, item 3 / R35: `start_server` boots the in-process
         // llm-gateway and runs `crate::local::on_config_changed` on it
         // (Task 1.6), which touches the REAL global LocalOnly latch via
-        // `latch::refresh_from_config` — that always writes the real
-        // global even in test builds (see `local::latch`'s module docs),
-        // so this test must hold `test_serial()` for its duration like
-        // every other test that exercises that path, or it can race
-        // `local::sync`'s own tests over the same global.
-        let _latch_guard = crate::local::latch::test_serial();
+        // `latch::refresh_from_config` (always writes the real global
+        // even in test builds — see `local::latch`'s module docs) as a
+        // boot side effect. Other tests (`local::sync`'s) assert on
+        // specific real-global values across their own multi-step async
+        // bodies, so this test's boot-time write needs to be excluded
+        // from THEIR critical sections too, for the whole duration of
+        // `start_server(...).await` (not just the moment of the write,
+        // buried inside that call where this test has no separate hook
+        // to scope a lock around). `test_serial_async()` — a tokio mutex,
+        // not `test_serial()`'s std one — is safe to hold for that whole
+        // span: a contended lock yields the task back to the scheduler
+        // instead of blocking the OS thread, so it can't starve unrelated
+        // timing-sensitive tests the way holding a std mutex here would.
+        let _latch_guard = crate::local::latch::test_serial_async().await;
 
         // Inject an isolated agent config instead of loading the developer's
         // real config.toml: a real config may enable gbrain (whose spawn

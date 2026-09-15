@@ -54,6 +54,24 @@
 //! the process globals at all, so they're immune to what any other test
 //! in the binary does with them, run order included.
 //!
+//! ## `test_serial()` discipline (R35)
+//!
+//! [`crate::local::latch::test_serial`] returns a guard over a plain
+//! `std::sync::Mutex` — never a `.await`-safe (tokio) one. Every test in
+//! this module's own `mod tests` that needs it (because it calls
+//! `set_global_for_test`, which — like `refresh_from_config` — always
+//! writes the REAL global, bypassing the R26 thread-local override) scopes
+//! the guard to a `{ }` block around only that synchronous call, and never
+//! holds it across an `.await`. Holding a std mutex across await points on
+//! the default current-thread test runtime blocks the executor for
+//! however long the awaited work takes, which starves *every other*
+//! timing-sensitive test scheduled on that same OS thread by the test
+//! harness — observed in practice as unrelated `/loop` dispatcher test
+//! flakiness (they use real sleeps) whenever this module's tests held the
+//! guard across their `on_config_changed_with(...).await` calls. The same
+//! rule applies to `llm_gateway::tests::ENV_MUTEX`, shared with these
+//! tests for env-var resolution.
+//!
 //! ## Boot-time publish (fix round 1 follow-up, R32)
 //!
 //! [`on_config_changed`]'s publish is gated on an actual latch *transition*
@@ -375,8 +393,21 @@ mod tests {
     // ------------------------------------------------------------------
     // publish_current_latch_state_with — R32: boot-time unconditional
     // publish. Dependency-injected (own Database/EventBus); touches the
-    // real global latch (via `latch::is_on()` under SYNC_MUTEX), so holds
-    // `test_serial()`.
+    // real global latch (via `latch::is_on()` under SYNC_MUTEX — the
+    // async, `.await`-safe mutex, not a test lock).
+    //
+    // R35: this test needs the REAL global latch to stay exactly what it
+    // set it to for its whole body (it asserts the published payload
+    // reflects that value) — a `test_serial()` guard scoped to just the
+    // `set_global_for_test` call is NOT enough for that (another
+    // concurrently-running real-global test could flip it in the gap
+    // before `publish_current_latch_state_with` reads it back; this was
+    // observed empirically as a real, not theoretical, failure). So this
+    // holds [`latch::test_serial_async`] — the `.await`-safe sibling of
+    // `test_serial()` — for its whole body instead: unlike a std mutex,
+    // a contended tokio mutex yields the task back to the scheduler
+    // rather than blocking the OS thread, so holding it across awaits
+    // can't starve unrelated tests the way `test_serial()` would.
     // ------------------------------------------------------------------
 
     /// R32's own acceptance test: "boot-style call with latch already on
@@ -387,7 +418,7 @@ mod tests {
     /// event with the current (already-on) state arrives.
     #[tokio::test]
     async fn publish_current_latch_state_with_publishes_once_even_with_no_transition() {
-        let _latch_guard = latch::test_serial();
+        let _g = latch::test_serial_async().await;
         latch::set_global_for_test(true);
 
         let db = Database::open_in_memory().expect("in-memory db");
@@ -414,8 +445,18 @@ mod tests {
         assert_eq!(evt.payload["paused_schedules"], json!(1));
         assert_eq!(evt.payload["paused_goals"], json!(1));
 
-        // Exactly one — no second event queued.
-        let no_second = tokio::time::timeout(Duration::from_millis(200), sub.rx.recv()).await;
+        // Exactly one — no second event queued. `EventBus::publish`
+        // delivers to `DropNewest`/`DropOldest` subscribers synchronously
+        // within the call (a plain `mpsc::Sender::try_send`, not a
+        // background task — see `EventBus::deliver`), so by the time
+        // `publish_current_latch_state_with(...).await` above returned,
+        // any second message would already be sitting in the channel.
+        // `try_recv()` (immediate, no real-time wait) is therefore just
+        // as reliable as speculatively sleeping and cuts this test's
+        // wall-clock footprint — a fixed real-time wait here was found
+        // (R35 bisection) to be the direct cause of unrelated `/loop`
+        // dispatcher test flakiness under full-suite load.
+        let no_second = sub.rx.try_recv();
         assert!(
             no_second.is_err(),
             "publish_current_latch_state_with must publish exactly once per call"
@@ -426,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_current_latch_state_with_is_a_no_op_without_a_bus() {
-        let _latch_guard = latch::test_serial();
+        let _g = latch::test_serial_async().await;
         latch::set_global_for_test(false);
         // Must not panic when no bus is available.
         publish_current_latch_state_with(None, None).await;
@@ -441,14 +482,24 @@ mod tests {
     // (which sets the same globals) or each other, regardless of run
     // order (fix round 1, item 3). They still touch the REAL global
     // LocalOnly latch (via `refresh_from_config`, which always bypasses
-    // the thread-local test override — see `latch`'s module docs) and so
-    // hold `test_serial()` for their duration, same as that module's own
-    // `refresh_tracks_*` tests.
+    // the thread-local test override — see `latch`'s module docs) and
+    // config resolution reads env-var fallbacks
+    // (`NEVOFLUX_LLM_GATEWAY_UPSTREAM_*`).
     //
-    // Config resolution reads env-var fallbacks
-    // (`NEVOFLUX_LLM_GATEWAY_UPSTREAM_*`), so every test here also holds
-    // `llm_gateway::tests::ENV_MUTEX` — shared with that module's own env
-    // var tests — for its duration.
+    // R35: hold [`latch::test_serial_async`] (the `.await`-safe sibling
+    // of `test_serial()`) for the WHOLE test body — these tests do
+    // several sequential `on_config_changed_with(...).await` calls and
+    // assert on `latch::is_on()` immediately after each one, so a lock
+    // scoped to only the synchronous `set_global_for_test` setup/teardown
+    // is not enough: another concurrently-running real-global test could
+    // flip the latch in the gap before the assertion runs (this was
+    // observed empirically, not just theoretically, on
+    // `publish_current_latch_state_with_publishes_once_even_with_no_transition`
+    // when these two tests were the ones scoped that way). `ENV_MUTEX`
+    // (shared with `llm_gateway.rs`'s own — synchronous — env var tests)
+    // stays scoped to just the synchronous `clear_resolver_env()` calls,
+    // since it's a std mutex with no async sibling here and its
+    // contention window empirically did not reproduce a failure.
     // ------------------------------------------------------------------
 
     fn test_gateway_config() -> GatewayConfig {
@@ -472,9 +523,11 @@ mod tests {
 
     #[tokio::test]
     async fn on_config_changed_with_wires_gateway_upstream_and_publishes_on_transitions() {
-        let _latch_guard = latch::test_serial();
-        let _env_guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        clear_resolver_env();
+        let _latch_guard = latch::test_serial_async().await;
+        {
+            let _env_guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            clear_resolver_env();
+        }
         latch::set_global_for_test(false);
 
         let handle = nevoflux_llm_gateway::serve(test_gateway_config())
@@ -541,7 +594,13 @@ mod tests {
         // --- a config change that does NOT flip the latch must not republish. ---
         cfg.llm.anthropic.model = Some("claude-updated".into());
         on_config_changed_with(&cfg, Some(&control), Some(&db), Some(&bus)).await;
-        let no_third = tokio::time::timeout(Duration::from_millis(200), sub.rx.recv()).await;
+        // No real-time wait needed — see the same reasoning in
+        // `publish_current_latch_state_with_publishes_once_...` (R35
+        // bisection): `on_config_changed_with(...).await` above has
+        // already returned, and `EventBus::publish` delivers
+        // synchronously within its own call, so any event it would have
+        // sent is already sitting in the channel by now.
+        let no_third = sub.rx.try_recv();
         assert!(
             no_third.is_err(),
             "no latch_changed event when the latch didn't change"
@@ -552,8 +611,13 @@ mod tests {
         assert_eq!(snap3.model_override, "claude-updated");
 
         latch::set_global_for_test(false);
-        clear_resolver_env();
+        {
+            let _env_guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            clear_resolver_env();
+        }
         handle.shutdown().await;
+        // `_latch_guard` (held for this whole test — see the group doc
+        // comment above) drops here, at function end.
     }
 
     /// Fix round 1, item 2: fire many `on_config_changed_with` calls that
@@ -562,14 +626,19 @@ mod tests {
     /// section decided the latch to be, the gateway's upstream must match
     /// it — never a stale write from an earlier call landing after a
     /// later one already moved the latch on. Entirely dependency-injected
-    /// (own `GatewayControl`), so this can run alongside every other test
-    /// in the binary — only the real global latch is shared, hence
-    /// `test_serial()`.
+    /// (own `GatewayControl`) as far as the 40 spawned sub-tasks go — they
+    /// don't need to independently acquire anything, they're part of this
+    /// one test's unit of work — but the real global latch itself is
+    /// shared with every OTHER test in the binary, hence
+    /// `test_serial_async()` held for the whole body (R35 — see the group
+    /// doc comment above `on_config_changed_with_wires_...`).
     #[tokio::test]
     async fn concurrent_alternating_latch_toggles_leave_upstream_matching_final_latch_state() {
-        let _latch_guard = latch::test_serial();
-        let _env_guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        clear_resolver_env();
+        let _latch_guard = latch::test_serial_async().await;
+        {
+            let _env_guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            clear_resolver_env();
+        }
         latch::set_global_for_test(false);
 
         let handle = nevoflux_llm_gateway::serve(test_gateway_config())
@@ -618,7 +687,11 @@ mod tests {
         }
 
         latch::set_global_for_test(false);
-        clear_resolver_env();
+        {
+            let _env_guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            clear_resolver_env();
+        }
         handle.shutdown().await;
+        // `_latch_guard` drops here, at function end.
     }
 }

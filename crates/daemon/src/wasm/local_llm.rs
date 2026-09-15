@@ -326,6 +326,15 @@ mod tests {
 
     /// Resets the global endpoint registry on drop, so a test's `publish`
     /// can't leak into a later test even if an assertion panics first.
+    ///
+    /// Every test that constructs one holds
+    /// [`crate::local::endpoint::test_serial_async`] for its whole body
+    /// (R35 — a lock scoped to the `endpoint` registry specifically, not
+    /// shared with `crate::local::latch`'s real-global tests, so the two
+    /// domains don't serialize behind each other for no reason), so by
+    /// the time this guard drops (still inside that same critical section
+    /// — see declaration order in each test), the cleanup write is
+    /// already exclusive; no separate lock needed here.
     struct EndpointGuard;
     impl Drop for EndpointGuard {
         fn drop(&mut self) {
@@ -437,7 +446,20 @@ mod tests {
 
     #[tokio::test]
     async fn stream_local_sends_bearer_and_parses_text_reasoning_and_tools() {
-        let _g = crate::local::latch::test_serial();
+        // R35: this test needs exclusive use of the shared `endpoint`
+        // registry for its WHOLE body (publish, then read it back via
+        // `stream_local`'s internal `endpoint::ensure`) — a lock scoped to
+        // just the `endpoint::publish` write is not enough, since another
+        // concurrently-running endpoint test could overwrite the registry
+        // in the gap before the read (observed empirically, not just
+        // theoretically). `test_serial_async()` is `.await`-safe (a tokio
+        // mutex, not `test_serial()`'s std one), so holding it for the
+        // whole body can't starve unrelated timing-sensitive tests. Uses
+        // `endpoint::test_serial_async` — scoped to this registry only,
+        // not shared with `latch`'s real-global tests (fix round 1
+        // follow-up tuning: sharing one lock across both domains
+        // serialized them into one needlessly long chain).
+        let _g = crate::local::endpoint::test_serial_async().await;
         let _reset = EndpointGuard;
 
         let (url, captured) = fake_sse_server(vec![
@@ -498,7 +520,10 @@ mod tests {
 
     #[tokio::test]
     async fn cloud_call_is_refused_while_latched() {
-        let _g = crate::local::latch::test_serial();
+        // R35 / R26: `set`/`is_on` are thread-local overrides in test
+        // builds (never touch the real global), so this test needs no
+        // `test_serial()` at all — the thread-local is invisible to every
+        // other concurrently-running test.
         let _reset = LatchGuard;
         crate::local::latch::set(true);
         let r = crate::wasm::llm::execute_llm_chat(
@@ -541,7 +566,8 @@ mod tests {
 
     #[tokio::test]
     async fn non_2xx_response_over_500_bytes_with_split_multibyte_char_does_not_panic() {
-        let _g = crate::local::latch::test_serial();
+        // R35: see `stream_local_sends_bearer_...`'s comment above.
+        let _g = crate::local::endpoint::test_serial_async().await;
         let _reset = EndpointGuard;
 
         // 498 ASCII bytes, then a 3-byte CJK character (bytes 498-500), then
@@ -578,7 +604,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_local_chat_sends_bearer_and_parses_content_tools_and_usage() {
-        let _g = crate::local::latch::test_serial();
+        // R35: see `stream_local_sends_bearer_...`'s comment above.
+        let _g = crate::local::endpoint::test_serial_async().await;
         let _reset = EndpointGuard;
 
         let body = serde_json::json!({

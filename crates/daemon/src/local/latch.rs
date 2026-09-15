@@ -117,8 +117,10 @@ pub fn set(on: bool) -> bool {
 /// Test-only escape hatch that drives the REAL global latch rather than the
 /// calling thread's override — for the few tests (see module docs) that
 /// specifically exercise global-visibility behavior, e.g.
-/// [`refresh_from_config`]. Callers must hold [`test_serial`] for the
-/// duration.
+/// [`refresh_from_config`]. Callers must hold [`test_serial`] (purely
+/// synchronous tests) or [`test_serial_async`] (`#[tokio::test]`s that
+/// need the real global to stay stable across their own `.await`s — see
+/// R35) for the duration.
 #[cfg(test)]
 pub fn set_global_for_test(on: bool) -> bool {
     set_global(on)
@@ -234,12 +236,50 @@ pub fn is_loopback_url(url: &str) -> bool {
 /// `refresh_tracks_*` tests. `cargo test` runs `#[test]` functions on
 /// multiple threads by default, so without this they would race each
 /// other's global writes.
+///
+/// **R35: never hold this guard across an `.await`.** It wraps a plain
+/// `std::sync::Mutex`; holding it across an await point in an async test
+/// blocks the OS thread the test harness assigned that test for however
+/// long the awaited work takes, which starves unrelated timing-sensitive
+/// tests elsewhere in the binary (observed in practice: `/loop`'s
+/// dispatcher tests, which use real sleeps, flaked whenever a
+/// `#[tokio::test]` here held this guard across an `.await`). A purely
+/// synchronous `#[test]` (this module's own `refresh_tracks_*` tests) is
+/// fine — there is no await to hold it across. An async test that needs
+/// exclusivity for its whole body wants [`test_serial_async`] instead;
+/// one that only needs a single synchronous mutation (e.g.
+/// `set_global_for_test`) should scope this guard to a `{ }` block around
+/// just that call.
 #[cfg(test)]
 pub fn test_serial() -> std::sync::MutexGuard<'static, ()> {
     static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
     TEST_MUTEX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Async-safe sibling of [`test_serial`], for `#[tokio::test]` functions
+/// that need exclusive access to shared test-only global state — the
+/// real [`LATCH`], the `endpoint` registry, ... — for their WHOLE async
+/// body, not just a single synchronous mutation (R35).
+///
+/// A `tokio::sync::Mutex`, unlike [`test_serial`]'s `std::sync::Mutex`,
+/// is designed to be held across `.await` points: a contended lock
+/// suspends (yields) the current task back to the runtime's scheduler
+/// instead of blocking the underlying OS thread, so holding it for a
+/// test's whole duration can't starve unrelated tests the way holding a
+/// std mutex that long would.
+///
+/// Deliberately a *separate* mutex from [`test_serial`]'s, not a
+/// std/tokio-flavored view onto the same one (the two primitives can't
+/// share a single lock object) — tests that need whole-body exclusivity
+/// should use this one consistently rather than mixing it with
+/// [`test_serial`] for the same resource, or the two groups won't
+/// actually exclude each other.
+#[cfg(test)]
+pub async fn test_serial_async() -> tokio::sync::MutexGuard<'static, ()> {
+    static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    TEST_MUTEX.lock().await
 }
 
 #[cfg(test)]

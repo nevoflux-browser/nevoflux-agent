@@ -88,6 +88,23 @@ pub async fn ensure() -> Result<LocalEndpoint, String> {
     }
 }
 
+/// Async-safe test-serialization mutex for this module's shared registry
+/// — the `endpoint` sibling of [`crate::local::latch::test_serial_async`],
+/// deliberately a *separate* lock from that one (fix round 1 follow-up,
+/// R35 tuning): a test that only touches `publish`/`current`/`ensure`
+/// doesn't need to also wait its turn behind every test that instead
+/// touches the real `LocalOnly` latch (a completely different resource),
+/// and vice versa — sharing one lock across both domains was measured to
+/// serialize the two test groups into one long chain for no correctness
+/// benefit, which is exactly the kind of added contention R35 exists to
+/// avoid. See [`crate::local::latch::test_serial_async`]'s own doc
+/// comment for why a tokio (not std) mutex.
+#[cfg(test)]
+pub(crate) async fn test_serial_async() -> tokio::sync::MutexGuard<'static, ()> {
+    static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    TEST_MUTEX.lock().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,9 +119,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn publish_and_current_round_trip() {
-        let _g = crate::local::latch::test_serial();
+    // `#[tokio::test]`, not `#[test]`, purely so this can take the async
+    // `test_serial_async()` — the body itself has no real `.await` work,
+    // so this costs essentially nothing, but it closes the residual race
+    // a plain sync test (unable to hold the same lock as its async
+    // siblings below) would otherwise have against them.
+    #[tokio::test]
+    async fn publish_and_current_round_trip() {
+        let _g = test_serial_async().await;
         assert_eq!(current(), None);
         publish(Some(ep("a")));
         assert_eq!(current(), Some(ep("a")));
@@ -114,7 +136,16 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_returns_current_without_consulting_the_hook() {
-        let _g = crate::local::latch::test_serial();
+        // R35 (fix round 1 follow-up tuning): this test needs the shared
+        // `endpoint` registry to stay exactly what it published for its
+        // whole body (another concurrently-running endpoint test could
+        // otherwise overwrite it in the gap before `ensure().await` reads
+        // it back — observed empirically as a real failure, not just
+        // theoretical), so it holds [`test_serial_async`] — a tokio
+        // mutex scoped to JUST this module's registry (not
+        // `crate::local::latch`'s), so this doesn't serialize behind
+        // unrelated real-latch tests too.
+        let _g = test_serial_async().await;
         publish(Some(ep("b")));
         assert_eq!(ensure().await, Ok(ep("b")));
         publish(None);
@@ -122,7 +153,9 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_falls_back_to_the_installed_hook_when_nothing_is_published() {
-        let _g = crate::local::latch::test_serial();
+        // R35: see `ensure_returns_current_without_consulting_the_hook`'s
+        // comment above.
+        let _g = test_serial_async().await;
         publish(None);
         install_ensure(Arc::new(|| Box::pin(async { Ok(ep("cold-started")) })));
         assert_eq!(ensure().await, Ok(ep("cold-started")));
