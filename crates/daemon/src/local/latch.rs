@@ -42,6 +42,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use nevoflux_llm::ProviderType;
 
+/// EventBus topic a latch *transition* (not every refresh — see
+/// [`refresh_from_config`]'s `Some`/`None` return) is published on, sticky,
+/// by [`crate::local::on_config_changed`]. Payload:
+/// `{on, paused_loops, paused_schedules, paused_goals}`.
+///
+/// Defined here (R2) rather than in `crate::local::sync` so a later task
+/// that needs the topic string doesn't have to know which submodule
+/// implements the publish; re-exported at `crate::local` for callers.
+pub const TOPIC_LATCH: &str = "system:local:latch_changed";
+
 /// Global on/off state. `SeqCst` throughout: this is touched rarely (config
 /// changes) and read on every LLM call, so there is no throughput reason to
 /// weaken the ordering, and a stray egress check racing a `refresh` is

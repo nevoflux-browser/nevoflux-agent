@@ -881,6 +881,14 @@ pub async fn start_server(
         Some(boot) => (Some(boot.handle), Some(boot.snapshot)),
         None => (None, None),
     };
+    // Task 1.6: publish a cheap, `Clone`-able control handle onto the
+    // gateway's hot-swappable upstream so the LocalOnly latch's
+    // config-change hook (`crate::local::on_config_changed`, called from
+    // the free-function `config.llm.*` handlers below — they don't hold a
+    // `&Server`) can re-point the gateway without owning it.
+    if let Some(handle) = gateway_handle.as_ref() {
+        crate::llm_gateway::set_gateway_control(handle.control());
+    }
 
     // Boot the gbrain integration (M3-3) OFF the critical boot path.
     //
@@ -1011,6 +1019,23 @@ pub async fn start_server(
     let _ = crate::kb_wizard::CURRENT_EVENT_BUS.set(event_bus.clone());
     if let Some(snap) = gateway_snapshot.as_ref() {
         let _ = crate::kb_wizard::CURRENT_GATEWAY_SNAPSHOT.set(snap.clone());
+    }
+    // Task 1.6: the DB handle `crate::local::on_config_changed` queries for
+    // the paused loop/schedule/goal counts it broadcasts on a latch
+    // transition.
+    let _ = crate::local::sync::CURRENT_DB.set(db.clone());
+
+    // Task 1.6: run the LocalOnly latch's config-change hook once at boot
+    // — AFTER the gateway control handle + event bus + DB are all
+    // published above, BEFORE the loop/schedule/goal managers are
+    // constructed below, so a daemon that boots already latched (on-device
+    // provider active + enabled) never lets those managers run a single
+    // unattended cloud turn before the gateway is repointed. Later calls
+    // happen from the four `config.llm.*` handlers below on every
+    // provider change.
+    {
+        let cfg_snapshot = agent_config.read().unwrap().clone();
+        crate::local::on_config_changed(&cfg_snapshot).await;
     }
 
     // Initialize MCP manager (empty) and tool search index.
@@ -12266,6 +12291,13 @@ async fn handle_config_llm_set(
             let is_active = config.llm.provider.as_deref() == Some(provider_id);
             // Update the in-memory runtime config so changes take effect immediately
             *shared_config.write().unwrap() = Arc::new(config);
+            // Task 1.6: re-derive the LocalOnly latch from the new config,
+            // re-point the gateway's upstream accordingly, and broadcast
+            // `system:local:latch_changed` if the latch actually flipped.
+            {
+                let cfg_snapshot = shared_config.read().unwrap().clone();
+                crate::local::on_config_changed(&cfg_snapshot).await;
+            }
             // ACP providers bake their config (model via env/args) into the
             // subprocess at spawn. Drop the cached instance so the next chat
             // respawns with the just-saved settings — generic on purpose:
@@ -12496,6 +12528,10 @@ async fn handle_config_llm_custom_create(
         Ok(()) => {
             let active = config.llm.provider.as_deref() == Some(wire_id.as_str());
             *shared_config.write().unwrap() = Arc::new(config);
+            {
+                let cfg_snapshot = shared_config.read().unwrap().clone();
+                crate::local::on_config_changed(&cfg_snapshot).await;
+            }
             info!("config.llm.custom.create: created {wire_id} (active={active})");
             custom_response(
                 request_id,
@@ -12583,6 +12619,10 @@ async fn handle_config_llm_custom_update(
         Ok(()) => {
             let active = config.llm.provider.as_deref() == Some(wire_id.as_str());
             *shared_config.write().unwrap() = Arc::new(config);
+            {
+                let cfg_snapshot = shared_config.read().unwrap().clone();
+                crate::local::on_config_changed(&cfg_snapshot).await;
+            }
             info!("config.llm.custom.update: updated {wire_id} (active={active})");
             custom_response(
                 request_id,
@@ -12669,6 +12709,10 @@ async fn handle_config_llm_custom_delete(
     match config.save() {
         Ok(()) => {
             *shared_config.write().unwrap() = Arc::new(config);
+            {
+                let cfg_snapshot = shared_config.read().unwrap().clone();
+                crate::local::on_config_changed(&cfg_snapshot).await;
+            }
             info!(
                 "config.llm.custom.delete: removed {wire_id} (was_active={was_active}, fell_back_to={fell_back_to:?})"
             );
