@@ -34,9 +34,10 @@
 //! builds. The handful of tests that must exercise that real-global path
 //! (currently just this module's own `refresh_tracks_*` tests) use
 //! [`set_global_for_test`] instead of [`set`], and keep holding
-//! [`test_serial`] for the duration exactly as before thread-local isolation
-//! existed — every other latch-touching test in the crate no longer needs
-//! to worry about racing them.
+//! [`test_serial_async`] for the duration (R39: both are `#[tokio::test]`s
+//! now, not the purely-synchronous `#[test]`s they were before thread-local
+//! isolation existed) — every other latch-touching test in the crate no
+//! longer needs to worry about racing them.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -230,12 +231,18 @@ pub fn is_loopback_url(url: &str) -> bool {
         .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Serialize tests that touch the process-global [`LATCH`] directly (via
-/// [`set_global_for_test`] / [`refresh_from_config`]) rather than through the
-/// per-thread [`set`]/[`is_on`] override — currently just this module's own
-/// `refresh_tracks_*` tests. `cargo test` runs `#[test]` functions on
-/// multiple threads by default, so without this they would race each
-/// other's global writes.
+/// Serialize a test against every OTHER test that also needs exclusive
+/// access to some process-global it touches directly. This module's own
+/// `refresh_tracks_*` tests are the ones that touch [`LATCH`] directly (via
+/// [`set_global_for_test`] / [`refresh_from_config`], bypassing the
+/// per-thread [`set`]/[`is_on`] override) — but they hold
+/// [`test_serial_async`] for that, not this function (R39: they are
+/// `#[tokio::test]`s). `test_serial` itself is a general-purpose
+/// synchronous-test lock with 11 callers spread across the crate (see e.g.
+/// `agent_host.rs`, `schedules/manager.rs`, `wasm/llm.rs`), each serializing
+/// their own module's global-touching tests the same way; `cargo test` runs
+/// `#[test]` functions on multiple threads by default, so without holding
+/// this guard those tests would race each other's global writes.
 ///
 /// **R35: never hold this guard across an `.await`.** It wraps a plain
 /// `std::sync::Mutex`; holding it across an await point in an async test
@@ -244,10 +251,10 @@ pub fn is_loopback_url(url: &str) -> bool {
 /// tests elsewhere in the binary (observed in practice: `/loop`'s
 /// dispatcher tests, which use real sleeps, flaked whenever a
 /// `#[tokio::test]` here held this guard across an `.await`). A purely
-/// synchronous `#[test]` (this module's own `refresh_tracks_*` tests) is
-/// fine — there is no await to hold it across. An async test that needs
-/// exclusivity for its whole body wants [`test_serial_async`] instead;
-/// one that only needs a single synchronous mutation (e.g.
+/// synchronous `#[test]` with no await to hold it across is fine. An async
+/// test that needs exclusivity for its whole body wants
+/// [`test_serial_async`] instead (as this module's own `refresh_tracks_*`
+/// tests do); one that only needs a single synchronous mutation (e.g.
 /// `set_global_for_test`) should scope this guard to a `{ }` block around
 /// just that call.
 #[cfg(test)]

@@ -15,10 +15,14 @@
 //! [`hardware::probe`] of this host's NVIDIA/Vulkan/cudart/RAM situation,
 //! never run at daemon startup, plus the pure [`hardware::fallback_chain`]
 //! that turns a probe + backend preference into the ordered list of
-//! [`hardware::InstallKind`]s to try. A later task adds the engine
-//! supervisor that publishes to the endpoint registry, calls
-//! [`apply_gateway_upstream_for_latch`] when it does, and uses `catalog`
-//! + `memory` + `hardware` to decide what to install/launch and how.
+//! [`hardware::InstallKind`]s to try. Task 2.3 adds `release`: the pinned
+//! table of what the engine release's downloadable archives actually ARE
+//! (name, size, sha256, mirror/original download sources), generated from a
+//! verified staging manifest by `scripts/engine-release/gen_release_rs.py`.
+//! A later task adds the engine supervisor that publishes to the endpoint
+//! registry, calls [`apply_gateway_upstream_for_latch`] when it does, and
+//! uses `catalog` + `memory` + `hardware` + `release` to decide what to
+//! install/launch and how.
 
 pub mod catalog;
 pub mod config;
@@ -27,6 +31,7 @@ pub mod gguf;
 pub mod hardware;
 pub mod latch;
 pub mod memory;
+pub mod release;
 pub mod sync;
 pub use config::*;
 pub use sync::{apply_gateway_upstream_for_latch, on_config_changed, publish_current_latch_state};

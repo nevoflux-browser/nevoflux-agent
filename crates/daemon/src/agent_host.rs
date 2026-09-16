@@ -8850,8 +8850,19 @@ message = "not here"
     fn get_api_key_for_provider_covers_every_builtin() {
         // The old hand-written match listed only seven providers, so the rest
         // silently fell through to the environment.
+        //
+        // R42: "local" is builtin (Task 1.1) but deliberately has no
+        // `ProviderConfig` slot -- see `LlmConfig::provider_config`'s own
+        // comment: it's a `LocalConfig`, not a `ProviderConfig`, so
+        // `provider_config_mut("local")` is `None` by design.
+        // `get_api_key_for_provider` resolves it through
+        // `keyless_placeholder` instead, so it's set up and asserted
+        // separately from the config-backed builtins below.
         let mut cfg = AgentConfig::default();
         for id in crate::config::BUILTIN_PROVIDER_IDS {
+            if *id == "local" {
+                continue;
+            }
             cfg.llm
                 .provider_config_mut(id)
                 .unwrap_or_else(|| panic!("no config slot for builtin {id}"))
@@ -8860,6 +8871,14 @@ message = "not here"
         let rt = tokio::runtime::Runtime::new().unwrap();
         let host = DaemonHostFunctions::new(Arc::new(cfg), rt.handle().clone());
         for id in crate::config::BUILTIN_PROVIDER_IDS {
+            if *id == "local" {
+                assert_eq!(
+                    host.get_api_key_for_provider(id).unwrap(),
+                    "local-engine",
+                    "\"local\" has no config slot; it must resolve via keyless_placeholder"
+                );
+                continue;
+            }
             assert_eq!(
                 host.get_api_key_for_provider(id).unwrap(),
                 format!("key-{id}"),
