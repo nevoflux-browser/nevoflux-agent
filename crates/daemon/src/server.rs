@@ -450,6 +450,14 @@ impl Server {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(()).await;
         }
+        // The on-device engine goes down first, before anything else gets a
+        // chance to wedge this path: it is a separate process holding
+        // several GB of VRAM and a machine-wide lock file, and on Windows
+        // the only other thing that would ever reap it is the daemon's
+        // kill-on-close Job Object — which fires at process exit, after the
+        // watchdog's force-exit, i.e. too late for a clean stop. A no-op
+        // when no engine is running.
+        crate::local::engine::supervisor().stop().await;
         // Brain goes down before the gateway: gbrain talks TO the
         // gateway, not the other way around, so we want gbrain to stop
         // making upstream calls before we tear down the listener.
@@ -1047,6 +1055,14 @@ pub async fn start_server(
     // earlier boot-time `on_config_changed` call already applied the
     // gateway upstream; this only handles the broadcast.
     crate::local::publish_current_latch_state().await;
+
+    // Task 2.9: point the engine supervisor at this daemon's data directory
+    // (where `engine.lock`/`engine.pid` live), register the cold-start hook
+    // `local::endpoint::ensure` falls back to, and start the idle-unload
+    // timer. Deliberately probes nothing and spawns nothing: the whole
+    // on-device pipeline is demand-driven, so a daemon whose user never
+    // touches local inference pays nothing for this call.
+    crate::local::engine::init(&config.data_dir.clone().unwrap_or_else(resolve_data_dir));
 
     // Initialize MCP manager (empty) and tool search index.
     // Actual connections happen in a background task so the daemon starts fast.

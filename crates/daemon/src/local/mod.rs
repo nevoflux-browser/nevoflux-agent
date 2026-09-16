@@ -45,12 +45,13 @@
 //! retry budget instead of losing its work, and a background caller never
 //! cold-starts the engine.
 //!
-//! A later task (2.9) adds the engine supervisor that publishes to the
-//! endpoint registry, calls [`apply_gateway_upstream_for_latch`] when it
-//! does, uses `catalog` + `memory` + `hardware` + `release` + `install` +
-//! `harden` + `integrity` + `marker`'s policy functions to decide what to
-//! install/launch and how, spawns engines through `guard` on Unix, calls
-//! [`admission::Admission::set_capacity_tokens`] with the real `n_ctx`
+//! Task 2.9 adds `engine`: the supervisor that assembles all of the above
+//! into one running process. It publishes to the endpoint registry (and
+//! registers the cold-start hook `endpoint::ensure` falls back to), uses
+//! `catalog` + `memory` + `hardware` + `release` + `install` + `harden` +
+//! `integrity` + `marker`'s policy functions to decide what to launch and
+//! how, spawns engines through `guard` on Unix, calls
+//! [`admission::Admission::set_capacity_tokens`] with the real context pool
 //! once launch confirms it (see that function's doc comment), and
 //! re-exports [`admission::admission`] for convenience.
 
@@ -58,6 +59,7 @@ pub mod admission;
 pub mod catalog;
 pub mod config;
 pub mod endpoint;
+pub mod engine;
 pub mod gguf;
 pub mod guard;
 pub mod harden;
