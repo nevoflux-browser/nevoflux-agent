@@ -92,12 +92,17 @@ python scripts/engine-release/publish_mirror.py \
     --tag engine-<fork-tag>
 ```
 
-**Dry-run by default.** Without `--execute`, this script never calls `gh
-release create`/`gh release upload` — it only prints the commands it would
-run (plus two read-only `gh` calls reporting whether the repo/release
-already exist, skippable with `--offline`). Pass `--execute` only once
-publishing is actually authorized (Task 5.1) — it needs `gh` authenticated
-with write access to `--repo`.
+**Dry-run by default, and fully offline by default.** Without `--execute`,
+this script never calls `gh release create`/`gh release upload`, and by
+default it makes no `gh` calls at all (not even read-only ones) — it just
+prints the commands it would run for both possible cases (release exists /
+doesn't exist yet), so it's safe to run with no network access. Pass
+`--check-remote` to additionally run two read-only `gh` calls (`gh repo
+view` / `gh release view`) that narrow the output down to the one case that
+actually applies. Pass `--execute` only once publishing is actually
+authorized (Task 5.1) — it needs `gh` authenticated with write access to
+`--repo`, and always runs the same read-only check first (it needs to know
+whether to create or upload `--clobber`).
 
 The mirror tag is `engine-<fork-tag>` (e.g. `engine-b10909-mix-bea84f7`),
 matching what `local::release::mirror_sources` constructs when building the
@@ -108,10 +113,12 @@ All 28 staged assets are uploaded, including `llama-prebuilt-manifest.json`
 build metadata with no matching field), but the mirror stays byte-faithful
 with the fork's own release regardless.
 
-## Four asset-naming schemes
+## Five recognized asset-name patterns
 
-`gen_release_rs.py` recognizes exactly four asset-name shapes; anything else
-is a hard generation error (never a silently-dropped asset):
+`gen_release_rs.py` recognizes exactly five asset-name shapes (four map to
+a field of `EngineRelease`; the fifth is a deliberate skip, not a mapping —
+see ruling R43 below); anything else is a hard generation error (never a
+silently-dropped asset):
 
 | Pattern | Maps to |
 | --- | --- |

@@ -8851,13 +8851,17 @@ message = "not here"
         // The old hand-written match listed only seven providers, so the rest
         // silently fell through to the environment.
         //
-        // R42: "local" is builtin (Task 1.1) but deliberately has no
-        // `ProviderConfig` slot -- see `LlmConfig::provider_config`'s own
+        // R42 (ratified as R50, controller review round 2): "local" is
+        // builtin (Task 1.1) but runs on-device and needs no API key at
+        // all, so it is exempt from the "every builtin has a key" invariant
+        // this test otherwise checks -- it deliberately has no
+        // `ProviderConfig` slot (see `LlmConfig::provider_config`'s own
         // comment: it's a `LocalConfig`, not a `ProviderConfig`, so
-        // `provider_config_mut("local")` is `None` by design.
+        // `provider_config_mut("local")` is `None` by design, not a bug).
         // `get_api_key_for_provider` resolves it through
         // `keyless_placeholder` instead, so it's set up and asserted
-        // separately from the config-backed builtins below.
+        // separately from the config-backed builtins below -- this is a
+        // deliberate carve-out with a reason, not a silenced failure.
         let mut cfg = AgentConfig::default();
         for id in crate::config::BUILTIN_PROVIDER_IDS {
             if *id == "local" {

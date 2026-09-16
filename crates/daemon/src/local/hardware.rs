@@ -587,14 +587,22 @@ fn cuda_bucket(compute_cap: Option<(u32, u32)>) -> CudaBucket {
 /// was compiled against, per the pinned engine release's `BUILD_INFO.txt`.
 /// Only `cuda13-older` — this machine's own selection — has been measured
 /// against a real archive so far (task-2.2-brief.md's verified facts); the
-/// rest are filled in once Task 2.3 generates `release.rs` from every
-/// archive's own `BUILD_INFO.txt` and can supersede this table.
+/// rest of this table is intentionally left incomplete (see below).
 ///
-/// **Contract:** `None` here means "not yet measured", never "no cudart
-/// needed" — per v3 §4.3, every real Windows CUDA archive requires a
-/// paired cudart archive. Tasks 2.3/2.4 MUST treat a Windows
-/// `Backend::Cuda` [`InstallKind`] whose `cudart` is `None` as *unusable*
-/// (skip to the next tier), not as "nothing to pair".
+/// **Superseded for archive selection (controller review round 2, Task
+/// 2.3):** `crate::local::release::archive_for` is now the authority for
+/// pairing a Windows CUDA archive with its cudart runtime — it derives the
+/// pairing straight from the *matched archive's own* `cuda12`/`cuda13`
+/// variant prefix against the pinned release's real cudart table, not from
+/// this function or from [`InstallKind::cudart`]. A Windows `Backend::Cuda`
+/// [`InstallKind`] whose `cudart` is `None` (true of every variant but
+/// `cuda13-older`, precisely because this table is incomplete) is **not**
+/// unusable — `archive_for` still resolves it correctly today. Do not gate
+/// an install/launch decision on this function's `Some`/`None`, and do not
+/// "fill in the rest" of this table as a prerequisite for a variant to
+/// work — that already isn't true. [`InstallKind::cudart`] itself remains
+/// informational/roundtrip-only (see its own doc comment: it survives a
+/// `marker.json` serialize/deserialize round trip).
 fn known_cudart_version(variant: &str) -> Option<&'static str> {
     match variant {
         "cuda13-older" => Some("13.3"),

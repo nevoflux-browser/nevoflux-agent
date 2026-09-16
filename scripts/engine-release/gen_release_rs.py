@@ -17,7 +17,8 @@ about the current release is hand-typed into this script.
       ...
     }
 
-Four asset-naming schemes are recognized:
+Five asset-name patterns are recognized (four map to a field of
+EngineRelease; the fifth is a deliberate skip, not a mapping):
   - `app-<tag>-<platform>-<backend>.tar.gz|.zip`            -> EngineArchive
   - `llama-<tag>-bin-macos-<arch>.tar.gz`                   -> EngineArchive (Metal)
   - `cudart-llama-bin-win-cuda-<ver>-x64.zip`                -> CudartArchive
@@ -314,6 +315,27 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "InstallKind.cudart claims")]
+    fn archive_for_debug_asserts_when_install_kind_cudart_disagrees_with_the_derived_pairing() {
+        // Controller review round 2, Minor #4: archive_for ignores
+        // kind.cudart for SELECTION (it derives the pairing from the
+        // matched archive's own variant prefix instead -- see its doc
+        // comment), but a debug-only consistency check must still fire
+        // when kind.cudart actively contradicts what's derived, to surface
+        // a hardware.rs selector bug rather than silently mask it. This
+        // test only runs meaningfully with debug_assertions on, which is
+        // the default for both the `dev` and `test` cargo profiles here
+        // (no `[profile.dev]`/`[profile.test]` override in this repo).
+        let kind = InstallKind {
+            platform: "windows-x64".to_string(),
+            backend: Backend::Cuda,
+            variant: Some("cuda13-older".to_string()),
+            cudart: Some("12.4".to_string()), // wrong on purpose: cuda13-older pairs with 13.3
+        };
+        let _ = archive_for(&ENGINE_PINNED, &kind);
+    }
+
+    #[test]
     fn pinned_tag_matches_the_verified_staging_manifest() {
         assert_eq!(ENGINE_PINNED.tag, @@TAG_LIT@@);
         assert_eq!(ENGINE_PINNED.upstream_tag, @@UPSTREAM_TAG_LIT@@);
@@ -370,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn mirror_sources_env_override_replaces_only_the_first_two_sources() {
+    fn mirror_sources_env_override_replaces_only_the_first_source() {
         // Shares `llm_gateway::tests::ENV_MUTEX` (the crate's established
         // env-var test-isolation lock -- see `local::sync`'s tests for
         // another non-llm_gateway user of the same lock) rather than
@@ -390,16 +412,66 @@ mod tests {
         std::env::set_var("NEVOFLUX_ENGINE_MIRROR_BASE", "https://example.test/mirror");
 
         let asset = "cudart-llama-bin-win-cuda-13.3-x64.zip";
-        let [ghfast, github, original] = mirror_sources(ENGINE_PINNED.tag, asset);
-        let expected_direct = format!("https://example.test/mirror/@@TAG@@/{asset}");
-        assert_eq!(ghfast, expected_direct);
-        assert_eq!(github, expected_direct);
-        // The original upstream URL is untouched by the override.
+        let [direct, github, original] = mirror_sources(ENGINE_PINNED.tag, asset);
+        assert_eq!(direct, format!("https://example.test/mirror/@@TAG@@/{asset}"));
+        // The mirror repo's own GitHub release and the original upstream
+        // URL are both untouched by the override (controller review round
+        // 2, Minor #3: previously the first TWO entries were both the
+        // override, so a caller trying them in order retried an identical
+        // URL before ever reaching a real fallback).
+        assert_eq!(
+            github,
+            format!("https://github.com/{MIRROR_REPO}/releases/download/engine-@@TAG@@/{asset}")
+        );
         assert_eq!(
             original,
             format!(
                 "https://github.com/ggml-org/llama.cpp/releases/download/@@UPSTREAM_TAG@@/{asset}"
             )
+        );
+        assert_ne!(direct, github, "all three sources must be distinct");
+        assert_ne!(github, original, "all three sources must be distinct");
+        assert_ne!(direct, original, "all three sources must be distinct");
+    }
+
+    #[test]
+    fn upstream_tag_for_uses_the_authoritative_field_not_a_naive_tag_split() {
+        // Regression for controller review round 2, Important #1: a fork
+        // tag like "b10909-mix-bea84f7" naively splits (on "-mix-") to
+        // "b10909", but nothing guarantees the paired upstream cudart tag
+        // equals that -- v3 §4.1's own size table records a case where it
+        // doesn't (a b10909 fork line paired with upstream b10809, not
+        // b10909). A synthetic release makes that disagreement concrete,
+        // rather than relying on the real pinned tag, where the split and
+        // the authoritative field happen to coincide.
+        let synthetic = EngineRelease {
+            tag: "b10909-mix-deadbeef",
+            upstream_tag: "b10809",
+            archives: &[],
+            cudart: &[],
+            source: EngineAsset { name: "x", bytes: 0, sha256: "x" },
+        };
+        assert_eq!(
+            upstream_tag_for(synthetic.tag, &synthetic, &[]),
+            "b10809",
+            "must use the authoritative upstream_tag field, not tag.split(\\"-mix-\\")"
+        );
+
+        // The real pinned release still resolves correctly (here the split
+        // and the field happen to agree, which is exactly why the
+        // synthetic case above is the one that actually locks this down).
+        assert_eq!(
+            upstream_tag_for(ENGINE_PINNED.tag, &ENGINE_PINNED, ENGINE_COMPATIBLE),
+            ENGINE_PINNED.upstream_tag
+        );
+
+        // A tag matching neither the pinned nor any compatible release
+        // falls back to the best-effort split -- documented as possibly
+        // wrong for a real release, but the only option left for an
+        // unrecognized tag.
+        assert_eq!(
+            upstream_tag_for("totally-unknown-mix-tag", &ENGINE_PINNED, ENGINE_COMPATIBLE),
+            "totally-unknown"
         );
     }
 
@@ -490,10 +562,20 @@ mod tests {
             }
         }
 
-        assert!(
-            kinds.len() >= 10,
-            "expected a rich set of distinct install kinds from the probe matrix, got {}: {kinds:#?}",
-            kinds.len()
+        // Exact, not a loose floor (controller review round 2, Minor #2):
+        // the probe matrix reaches exactly one distinct InstallKind per
+        // pinned archive (24 today) -- a `>= 10` floor would still pass if
+        // an entire CUDA major line (8 kinds) silently dropped out of
+        // `fallback_chain`, leaving 16, and would never notice that
+        // `cuda12-portable` -- the exact variant R45 exists to protect --
+        // stopped being reachable.
+        assert_eq!(
+            kinds.len(),
+            ENGINE_PINNED.archives.len(),
+            "expected exactly one distinct InstallKind per pinned archive from the probe matrix, \\
+             got {} kinds for {} archives: {kinds:#?}",
+            kinds.len(),
+            ENGINE_PINNED.archives.len()
         );
 
         for kind in &kinds {
@@ -615,35 +697,64 @@ pub const ENGINE_COMPATIBLE: &[EngineRelease] = &[];
 /// The three URLs to try, in order, for `asset` of release `tag`: the
 /// ghfast.top-fronted mirror, the mirror repo's own GitHub release, then
 /// the original fork (or, for a `cudart-`-prefixed asset, upstream) release
-/// it was staged from.
+/// it was staged from. All three are always genuinely distinct — a caller
+/// trying them in order never retries an identical URL.
 ///
-/// `NEVOFLUX_ENGINE_MIRROR_BASE` (tests/dev only), when set, replaces the
-/// first two sources with `<base>/<tag>/<asset>` — the original source is
-/// untouched by the override, since a dev mirror stand-in is not itself
+/// `NEVOFLUX_ENGINE_MIRROR_BASE` (tests/dev only), when set, replaces ONLY
+/// the first (ghfast-fronted) source with `<base>/<tag>/<asset>` — the
+/// mirror repo's own GitHub release and the original fork/upstream source
+/// are left real and untouched, since a dev mirror stand-in is not itself
 /// authoritative for where the real upstream/fork lives.
 pub fn mirror_sources(tag: &str, asset: &str) -> [String; 3] {
-    if let Ok(base) = std::env::var("NEVOFLUX_ENGINE_MIRROR_BASE") {
-        let direct = format!("{}/{tag}/{asset}", base.trim_end_matches('/'));
-        return [direct.clone(), direct, original_source_url(tag, asset)];
-    }
     let github = format!(
         "https://github.com/{MIRROR_REPO}/releases/download/engine-{tag}/{asset}"
     );
+    let original = original_source_url(tag, asset);
+    if let Ok(base) = std::env::var("NEVOFLUX_ENGINE_MIRROR_BASE") {
+        let direct = format!("{}/{tag}/{asset}", base.trim_end_matches('/'));
+        return [direct, github, original];
+    }
     let ghfast = format!("https://ghfast.top/{github}");
-    [ghfast, github, original_source_url(tag, asset)]
+    [ghfast, github, original]
 }
 
-/// The URL `asset` was originally staged from: `UPSTREAM_REPO` (deriving
-/// its tag from `tag` by keeping only the part before `-mix-`, the fork's
-/// own tag-naming convention — see `mirror_stage.py`) for a `cudart-`
-/// asset, `FORK_REPO`/`tag` for everything else.
+/// The URL `asset` was originally staged from: `UPSTREAM_REPO` at
+/// [`upstream_tag_for`]'s resolved tag for a `cudart-` asset,
+/// `FORK_REPO`/`tag` for everything else (cudart archives are an upstream
+/// `ggml-org/llama.cpp` artifact — v3 §4.3 — the fork release never
+/// contains them).
 fn original_source_url(tag: &str, asset: &str) -> String {
     if asset.starts_with("cudart-") {
-        let upstream_tag = tag.split("-mix-").next().unwrap_or(tag);
+        let upstream_tag = upstream_tag_for(tag, &ENGINE_PINNED, ENGINE_COMPATIBLE);
         format!("https://github.com/{UPSTREAM_REPO}/releases/download/{upstream_tag}/{asset}")
     } else {
         format!("https://github.com/{FORK_REPO}/releases/download/{tag}/{asset}")
     }
+}
+
+/// Resolves `tag`'s paired upstream cudart tag: `pinned.upstream_tag` when
+/// `tag` is the pinned release's own tag, else the matching entry's
+/// `upstream_tag` in `compatible`, else — only when `tag` matches neither,
+/// e.g. a caller probing an unknown/hypothetical tag — a best-effort
+/// fallback of the part of `tag` before `-mix-` (the fork's own
+/// tag-naming convention, per `mirror_stage.py`).
+///
+/// **Controller review round 2, Important #1:** that fallback is NOT
+/// guaranteed to equal the true upstream tag for a real release — v3 §4.1's
+/// own size table records a case where it doesn't (a `b10909` fork line
+/// paired with upstream `b10809`, not `b10909`). Always prefer the
+/// authoritative `upstream_tag` field (extracted by the generator from the
+/// cudart assets' own `source_url`s, not guessed) over re-deriving it by
+/// string-splitting; this function exists so nothing downstream of
+/// `EngineRelease` ever needs to.
+fn upstream_tag_for(tag: &str, pinned: &EngineRelease, compatible: &[EngineRelease]) -> String {
+    if tag == pinned.tag {
+        return pinned.upstream_tag.to_string();
+    }
+    if let Some(rel) = compatible.iter().find(|r| r.tag == tag) {
+        return rel.upstream_tag.to_string();
+    }
+    tag.split("-mix-").next().unwrap_or(tag).to_string()
 }
 
 /// Resolve `kind` against `rel`'s pinned archive table: the matching
@@ -651,12 +762,16 @@ fn original_source_url(tag: &str, asset: &str) -> String {
 /// Windows CUDA variant.
 ///
 /// Matches on `(platform, backend, variant)` only — [`InstallKind::cudart`]
-/// itself is not consulted. The cudart pairing is instead derived straight
-/// from the *matched archive's own* variant string (its `cuda12`/`cuda13`
-/// prefix): `local::hardware::known_cudart_version` is deliberately
-/// incomplete today (only `cuda13-older` is filled in), and this function
-/// must stay authoritative regardless, so that every variant this release
-/// actually ships resolves here even before that table catches up.
+/// is **not** consulted for archive selection; it is informational/
+/// roundtrip-only (see its own doc comment). The cudart pairing is instead
+/// derived straight from the *matched archive's own* variant string (its
+/// `cuda12`/`cuda13` prefix): `local::hardware::known_cudart_version` is
+/// deliberately incomplete today (only `cuda13-older` is filled in), and
+/// this function must stay authoritative regardless, so that every variant
+/// this release actually ships resolves here even before that table
+/// catches up. A debug-only consistency check still fires if `kind.cudart`
+/// actively contradicts what's derived here — not to change the result,
+/// but to surface a `hardware.rs` selector bug producing a false claim.
 pub fn archive_for(
     rel: &EngineRelease,
     kind: &InstallKind,
@@ -678,6 +793,20 @@ pub fn archive_for(
     } else {
         None
     };
+
+    debug_assert!(
+        match (&kind.cudart, cudart) {
+            (Some(claimed), Some(derived)) => claimed.as_str() == derived.runtime,
+            _ => true,
+        },
+        "InstallKind.cudart claims {:?} but archive_for derived {:?} for {:?} -- archive_for's \
+         derivation from the archive's own variant prefix is authoritative (see its doc comment); \
+         this debug_assert exists only to surface a hardware.rs selector bug producing a \
+         contradictory claim, and does not itself change archive_for's result",
+        kind.cudart,
+        cudart.map(|c| c.runtime),
+        kind
+    );
 
     Some((archive, cudart))
 }
