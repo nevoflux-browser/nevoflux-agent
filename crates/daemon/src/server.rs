@@ -1652,7 +1652,10 @@ pub async fn start_server(
                         let cons_config = agent_config_clone.read().unwrap().clone();
                         let cons_db = std::sync::Arc::new(shared_storage_clone.database().clone());
                         let cons_category = category.clone();
-                        tokio::spawn(async move {
+                        // Background (P1, Task 2.7): consolidation must
+                        // never contend with interactive chat for the local
+                        // engine's admission budget ahead of it.
+                        tokio::spawn(crate::local::admission::background(async move {
                             match crate::learning::consolidator::consolidate_category(
                                 cons_config,
                                 cons_db,
@@ -1674,7 +1677,7 @@ pub async fn start_server(
                                     );
                                 }
                             }
-                        });
+                        }));
                     }
                 }
             }
@@ -7708,7 +7711,10 @@ async fn handle_chat_message_streaming(
                         content: final_text.clone(),
                     });
                 }
-                tokio::spawn(async move {
+                // Background (P1, Task 2.7): session memory extraction must
+                // never contend with interactive chat for the local
+                // engine's admission budget ahead of it.
+                tokio::spawn(crate::local::admission::background(async move {
                     match crate::learning::session_extractor::extract_session_memories(
                         ext_config,
                         ext_db,
@@ -7732,7 +7738,7 @@ async fn handle_chat_message_streaming(
                         }
                         _ => {}
                     }
-                });
+                }));
             }
 
             // Save tool calls to session history
