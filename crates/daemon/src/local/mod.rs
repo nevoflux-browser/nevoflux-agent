@@ -54,6 +54,21 @@
 //! [`admission::Admission::set_capacity_tokens`] with the real context pool
 //! once launch confirms it (see that function's doc comment), and
 //! re-exports [`admission::admission`] for convenience.
+//!
+//! Task 2.10 adds `rpc`: the `local.*` RPC commands the browser calls
+//! (status/probe/models/plan/install/cancel/set_default/update_engine/
+//! repair_engine/retry_backend/set_config), dispatched from `server.rs`
+//! next to the `models.*` arms. It fills the one gap `engine` deliberately
+//! leaves open -- `EngineSupervisor::cold_start` only ever launches an
+//! install that already exists on disk -- by downloading the engine archive
+//! (via `install::install`) and the model GGUF (its own
+//! `rpc::download_model`, mirroring `crate::models::download_asset`) before
+//! handing off to `EngineSupervisor::ensure_started`. Also re-exports
+//! [`rpc::local_models_dir`], the accessor Task 2.10's ruling R53 adds for
+//! where this task's downloaded model weights live (shared with
+//! `tts::asr`/`tts::kokoro`'s models via the same
+//! `NEVOFLUX_LOCAL_CACHE_DIR` override `install::engine_root` already
+//! honours, without touching `models::models_dir()` itself).
 
 pub mod admission;
 pub mod catalog;
@@ -70,7 +85,9 @@ pub mod latch;
 pub mod marker;
 pub mod memory;
 pub mod release;
+pub mod rpc;
 pub mod state;
 pub mod sync;
 pub use config::*;
+pub use rpc::local_models_dir;
 pub use sync::{apply_gateway_upstream_for_latch, on_config_changed, publish_current_latch_state};

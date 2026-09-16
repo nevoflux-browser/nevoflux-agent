@@ -8739,6 +8739,29 @@ async fn handle_chat_message(
                 "models.status" => crate::models::rpc::handle_status(&params).await,
                 "models.download" => crate::models::rpc::handle_download(&params).await,
                 "models.cancel" => crate::models::rpc::handle_cancel(&params).await,
+                // On-device (local) inference control surface (Task 2.10).
+                // `install`/`update_engine`/`repair_engine` return as soon
+                // as they've started; progress streams on
+                // `system:local:progress`, state on `system:local:state`.
+                "local.status" => crate::local::rpc::handle_status(&params, shared_config).await,
+                "local.probe" => crate::local::rpc::handle_probe(&params).await,
+                "local.models" => crate::local::rpc::handle_models(&params).await,
+                "local.plan" => crate::local::rpc::handle_plan(&params).await,
+                "local.install" => crate::local::rpc::handle_install(&params, shared_config).await,
+                "local.cancel" => crate::local::rpc::handle_cancel(&params).await,
+                "local.set_default" => {
+                    crate::local::rpc::handle_set_default(&params, shared_config).await
+                }
+                "local.update_engine" => {
+                    crate::local::rpc::handle_update_engine(&params, shared_config).await
+                }
+                "local.repair_engine" => {
+                    crate::local::rpc::handle_repair_engine(&params, shared_config).await
+                }
+                "local.retry_backend" => crate::local::rpc::handle_retry_backend(&params).await,
+                "local.set_config" => {
+                    crate::local::rpc::handle_set_config(&params, shared_config).await
+                }
                 "kb.wizard.status" => crate::kb_wizard::handle_status(&params).await,
                 "kb.wizard.install_bun" => crate::kb_wizard::handle_install_bun(&params).await,
                 "kb.wizard.install_gbrain" => {

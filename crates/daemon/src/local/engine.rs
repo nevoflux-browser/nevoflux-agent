@@ -805,7 +805,16 @@ impl EngineSupervisor {
     }
 
     /// Records `state` and publishes it on [`crate::local::state::TOPIC_STATE`].
-    fn set_state(&self, state: LocalState) {
+    ///
+    /// `pub(crate)` rather than private (Task 2.10): the pre-install phases
+    /// (`DownloadingEngine`, `InstallingEngine`, `VerifyingEngine`,
+    /// `DownloadingModel`) never occur inside [`Self::cold_start`] itself --
+    /// nothing here downloads or installs anything, it only launches what is
+    /// already on disk -- so `crate::local::rpc`'s install pipeline drives
+    /// them through this SAME supervisor instance instead of a second state
+    /// slot that could drift out of sync with it. `local.status` then has
+    /// exactly one place to read [`LocalState`] from: [`Self::state`].
+    pub(crate) fn set_state(&self, state: LocalState) {
         publish_state(&state);
         self.lock().state = state;
     }

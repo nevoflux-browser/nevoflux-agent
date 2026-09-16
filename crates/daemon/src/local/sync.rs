@@ -278,7 +278,14 @@ async fn apply_gateway_upstream_for_latch_locked(control: Option<&GatewayControl
 /// "paused" by the latch the same way, since W5-style verify goals don't
 /// themselves make LLM calls between checks). Zero on any DB error —
 /// best-effort, a broken count must not block the latch broadcast.
-fn paused_counts(db: &Database) -> (i64, i64, i64) {
+///
+/// `pub(crate)` rather than private: `crate::local::rpc::handle_set_default`
+/// (Task 2.10) returns these same three counts in its own RPC response
+/// (`local.set_default`'s contract needs them synchronously, not just as a
+/// side effect of the sticky `TOPIC_LATCH` broadcast this module already
+/// publishes), so it reuses this query rather than a second copy of the
+/// same three `SELECT`s.
+pub(crate) fn paused_counts(db: &Database) -> (i64, i64, i64) {
     let loops = count(
         db,
         "SELECT COUNT(*) FROM loops WHERE state NOT IN ('cancelled','failed')",
