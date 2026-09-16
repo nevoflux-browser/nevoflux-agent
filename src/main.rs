@@ -1681,18 +1681,24 @@ async fn handle_account_command(action: AccountAction) -> Result<(), Box<dyn std
     }
 }
 
-#[tokio::main]
-async fn main() {
-    // Dispatched before Cli::parse() because this is a separate, tiny
-    // watchdog process (see `nevoflux_daemon::local::guard`), not a normal
-    // CLI invocation — it never returns. `#[tokio::main]` has already built
-    // a runtime by the time we get here, but `guard::run` is plain
-    // synchronous std code that never awaits or touches it before
-    // diverging, so nothing tokio-scheduled ever actually runs.
+/// Plain sync entry point, checked *before* any tokio runtime exists.
+///
+/// `--engine-guard` (see `nevoflux_daemon::local::guard`) is a separate,
+/// tiny watchdog subprocess, not a normal CLI invocation — it never
+/// returns. It must not carry a tokio runtime (worker threads it has no use
+/// for, alive for the engine's whole lifetime), so this check has to happen
+/// ahead of `#[tokio::main]`, which builds its runtime before an
+/// `async fn main()`'s body ever runs. The ordinary CLI path falls through
+/// to `async_main`, where `#[tokio::main]` is applied instead.
+fn main() {
     if std::env::args().nth(1).as_deref() == Some("--engine-guard") {
         nevoflux_daemon::local::guard::run(std::env::args().skip(2).collect())
     }
+    async_main()
+}
 
+#[tokio::main]
+async fn async_main() {
     let cli = Cli::parse();
 
     // Handle subcommands first (they don't require async)

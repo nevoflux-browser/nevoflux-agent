@@ -139,7 +139,7 @@ mod engine_guard {
     /// the child's process group within the guard's 3s grace window.
     #[test]
     fn kills_child_group_when_parent_stdin_closes() {
-        let bin = assert_cmd::cargo::cargo_bin("nevoflux-agent");
+        let bin = assert_cmd::cargo::cargo_bin!("nevoflux-agent");
         let mut guard = Command::new(bin)
             .args(["--engine-guard", "--", "sleep", "300"])
             .stdin(Stdio::piped())
@@ -181,17 +181,39 @@ mod engine_guard {
     /// guard must relay its exact exit code rather than swallow it.
     #[test]
     fn relays_child_exit_code() {
-        let bin = assert_cmd::cargo::cargo_bin("nevoflux-agent");
-        let status = Command::new(bin)
+        let bin = assert_cmd::cargo::cargo_bin!("nevoflux-agent");
+        let mut guard = Command::new(bin)
             .args(["--engine-guard", "--", "sh", "-c", "exit 3"])
-            // Left open (piped, never closed) for the guard's whole run so
-            // only the "child exited" path can fire, not the parent-gone
-            // one — isolates exactly the behavior this test is about.
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .expect("run nevoflux-agent --engine-guard");
+            .spawn()
+            .expect("spawn nevoflux-agent --engine-guard");
+
+        // Hold the write end open ourselves, independent of `Child::wait`,
+        // which closes `child.stdin` as its very first action ("The stdin
+        // handle to the child process, if any, will be closed before
+        // waiting" — std docs). Using `status()`/`wait()` here would race
+        // the guard's own stdin-EOF watch against `sh` actually running:
+        // the guard could observe EOF and SIGTERM the group before
+        // `exit 3` ever executes, exercising the *kill* path (exit 143)
+        // instead of the "child exited on its own" path this test is
+        // about. Polling `try_wait()` instead keeps the write end alive
+        // until the guard has genuinely already exited by itself.
+        let _stdin = guard.stdin.take();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = guard.try_wait().expect("try_wait on the guard") {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "guard did not exit within 5s over `sh -c \"exit 3\"`"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        drop(_stdin);
 
         assert_eq!(status.code(), Some(3));
     }

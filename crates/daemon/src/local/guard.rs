@@ -24,11 +24,27 @@
 //! to 3 seconds, then SIGKILLs it. If the engine exits on its own first
 //! (normal stop, crash), the guard simply relays its exit code and exits.
 //!
-//! `PR_SET_PDEATHSIG(SIGKILL)` is set on the guard itself as a Linux-only
-//! backstop for the guard process's own survival (see [`run`]'s Linux
-//! branch) — belt and braces on top of the stdin-EOF watch, which is the
-//! primary, cross-Unix mechanism and works even on macOS, where `prctl`
-//! does not exist.
+//! Only the child's stdin is redirected (to `/dev/null`) — its stdout and
+//! stderr are inherited from the guard as-is. **Whatever spawns the guard
+//! must therefore give it a non-protocol stdout/stderr**: this repo's
+//! native-messaging channel uses the daemon's real stdout for protocol
+//! bytes, and `llama-server` is chatty, so a spawn site that hands the
+//! guard an inherited protocol stdout would corrupt that channel with
+//! engine logs.
+//!
+//! Deliberately **not** using `PR_SET_PDEATHSIG` (Linux's `prctl` parent-death
+//! signal) as a backstop for the guard's own survival, even though it looks
+//! like a natural fit: the kernel arms it against the *thread* that called
+//! `prctl`, not the parent *process* — so if a future caller ever spawns the
+//! guard from a thread that can itself exit before the daemon does (a tokio
+//! `spawn_blocking` worker, retired after a short idle window, is exactly
+//! such a thread), the guard would be SIGKILLed out from under a perfectly
+//! healthy daemon and engine. The engine, alone in its own process group
+//! with no other watcher, would then be orphaned permanently — precisely
+//! the D10 failure this module exists to prevent. The stdin-EOF watch below
+//! has no such hazard (a process's file descriptors close when it dies, by
+//! any means, unconditionally on the *process*, never the caller's thread),
+//! so it is the only mechanism used here. Do not re-add `prctl`.
 //!
 //! Not started at daemon startup; a later task (the engine supervisor)
 //! decides when to spawn this.
@@ -37,19 +53,20 @@
 /// process group, then blocks reading stdin; EOF (parent gone) or read error → SIGTERM the group,
 /// 3s, SIGKILL. Exits with the child's code when the child exits first. On Windows: exit 2.
 ///
-/// This dispatcher itself has no `#[cfg(unix)]` so `nevoflux-agent`'s `main()` can call it
-/// unconditionally on every platform (see `src/main.rs`, right before `Cli::parse()`). The real
-/// implementation lives in [`run_unix`], which is Unix-only; non-Unix targets get
-/// [`run_unsupported`].
+/// `nevoflux-agent`'s `main()` calls this unconditionally on every platform (see `src/main.rs`,
+/// right before `Cli::parse()`), so it exists in two complete, separately cfg'd definitions rather
+/// than one body with a cfg'd block inside it — each definition is then an ordinary function whose
+/// only statement is a plain tail call to a `-> !` function, with no attribute-on-block-statement
+/// subtlety for the `-> !` return type to be inferred through.
+#[cfg(unix)]
 pub fn run(args: Vec<String>) -> ! {
-    #[cfg(unix)]
-    {
-        run_unix(args)
-    }
-    #[cfg(not(unix))]
-    {
-        run_unsupported(args)
-    }
+    run_unix(args)
+}
+
+/// Non-Unix counterpart of the `#[cfg(unix)]` `run` above — see its doc comment.
+#[cfg(not(unix))]
+pub fn run(args: Vec<String>) -> ! {
+    run_unsupported(args)
 }
 
 #[cfg(not(unix))]
@@ -105,22 +122,9 @@ fn run_unix(args: Vec<String>) -> ! {
         std::process::exit(2);
     };
 
-    // Belt-and-braces backstop for the guard process itself: if this
-    // process's own parent (the daemon) dies, ask the kernel to SIGKILL us
-    // directly. `PR_SET_PDEATHSIG` is Linux-only — `nix::sys::prctl` does
-    // not exist on macOS (there is no direct equivalent there), so this is
-    // gated stricter than the rest of this function. The stdin-EOF watch
-    // below is the actual, cross-Unix mechanism that protects the *engine*
-    // child; this only protects the guard from being orphaned itself.
-    #[cfg(target_os = "linux")]
-    {
-        if let Err(e) = nix::sys::prctl::set_pdeathsig(nix::sys::signal::Signal::SIGKILL) {
-            eprintln!(
-                "nevoflux-agent --engine-guard: prctl(PR_SET_PDEATHSIG) failed: {e} \
-                 (continuing; the stdin-EOF watch is still active)"
-            );
-        }
-    }
+    // No `PR_SET_PDEATHSIG` here — see the module header for why it would be
+    // a hazard rather than a backstop (it tracks the calling *thread*, not
+    // the daemon process). The stdin-EOF watch below is the sole mechanism.
 
     let mut cmd = std::process::Command::new(program);
     cmd.args(prog_args);
@@ -146,20 +150,46 @@ fn run_unix(args: Vec<String>) -> ! {
 
     let (tx, rx) = std::sync::mpsc::channel::<Event>();
 
+    // Set by the waiter thread the moment it has reaped the child, i.e.
+    // before `pgid` can mean anything else (pid reuse). Checked before every
+    // `kill_group` call below so a `StdinClosed` event that loses a race
+    // against a just-finished `wait()` doesn't signal a recycled pgid.
+    let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Waiter thread: blocks on the child's exit. Plain std::thread, not
     // tokio — the guard must not start an async runtime.
     {
         let tx = tx.clone();
-        std::thread::spawn(move || {
-            if let Ok(status) = child.wait() {
+        let reaped = reaped.clone();
+        std::thread::spawn(move || match child.wait() {
+            Ok(status) => {
+                reaped.store(true, std::sync::atomic::Ordering::SeqCst);
                 let _ = tx.send(Event::ChildExited(status));
+            }
+            Err(e) => {
+                // Near-impossible (std retries EINTR internally for us), but
+                // silently dropping this would leave `rx.recv()` blocking
+                // forever with a possibly-still-live, unwatched engine.
+                // Synthesize a generic-failure status so the dispatch below
+                // still has something to act on.
+                eprintln!(
+                    "nevoflux-agent --engine-guard: wait() on the child failed: {e} \
+                     (treating it as exited)"
+                );
+                use std::os::unix::process::ExitStatusExt;
+                let _ = tx.send(Event::ChildExited(std::process::ExitStatus::from_raw(
+                    1 << 8,
+                )));
             }
         });
     }
 
     // Stdin watcher: blocks reading the daemon's liveness pipe. EOF (daemon
-    // closed its end, e.g. it died) or any read error both mean "the parent
-    // is gone" — either way we stop reading and report once.
+    // closed its end, e.g. it died) means the parent is gone. A benign
+    // `EINTR` is not that — `std::io::Stdin::read` does not retry it for us,
+    // so treating every `Err` as "parent gone" would let a stray signal
+    // SIGTERM+SIGKILL a perfectly healthy engine. Any other read error is
+    // treated the same as EOF.
     {
         let tx = tx.clone();
         std::thread::spawn(move || {
@@ -170,6 +200,7 @@ fn run_unix(args: Vec<String>) -> ! {
                 match stdin.read(&mut buf) {
                     Ok(0) => break,
                     Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
             }
@@ -187,14 +218,24 @@ fn run_unix(args: Vec<String>) -> ! {
         Ok(Event::ChildExited(status)) => std::process::exit(exit_code_of(status)),
 
         // The parent is gone. Escalate: SIGTERM the group, give it 3s,
-        // SIGKILL if it's still around.
+        // SIGKILL if it's still around. Each `kill_group` call is guarded by
+        // `reaped`: if the waiter already reaped the child (this event lost
+        // the race against a `ChildExited` that hasn't been dequeued yet),
+        // `pgid` no longer names our child's group and, after pid wraparound,
+        // could in principle name someone else's — skip the signal rather
+        // than risk that.
         Ok(Event::StdinClosed) => {
             use nix::sys::signal::Signal;
-            kill_group(pgid, Signal::SIGTERM);
+            use std::sync::atomic::Ordering;
+            if !reaped.load(Ordering::SeqCst) {
+                kill_group(pgid, Signal::SIGTERM);
+            }
             match rx.recv_timeout(std::time::Duration::from_secs(3)) {
                 Ok(Event::ChildExited(status)) => std::process::exit(exit_code_of(status)),
                 _ => {
-                    kill_group(pgid, Signal::SIGKILL);
+                    if !reaped.load(Ordering::SeqCst) {
+                        kill_group(pgid, Signal::SIGKILL);
+                    }
                     // SIGKILL cannot be caught or blocked, so the waiter
                     // thread will report almost immediately; still fall
                     // back to a signal-convention exit code if it somehow
