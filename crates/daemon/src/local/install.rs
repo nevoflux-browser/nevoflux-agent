@@ -133,13 +133,30 @@ fn now_unix() -> i64 {
 /// -> check `sentinels_ok` -> hash every extracted file into a manifest ->
 /// atomically rename the tmp dir into its final [`install_dir`] location ->
 /// write the [`crate::local::marker::Marker`] -> delete the staged archive
-/// files. Any failure from extraction onward removes the shared tmp dir,
-/// which covers both archives in a Windows CUDA group since they share it.
-/// A target directory that already holds a *valid* marker for this exact
-/// (tag, kind) is treated as an already-completed install (Task 2.4 review
-/// finding M2): the freshly built tmp dir is discarded and `Ok(final_dir)`
-/// is returned, rather than attempting a rename onto a non-empty
-/// destination that can only ever fail.
+/// files. A target directory that already holds a *valid* marker for this
+/// exact (tag, kind) is treated as an already-completed install (Task 2.4
+/// review finding M2): the freshly built tmp dir is discarded and
+/// `Ok(final_dir)` is returned, rather than attempting a rename onto a
+/// non-empty destination that can only ever fail.
+///
+/// **Cleanup rule (Task 2.4 review finding M2(b), stated once so it does
+/// not have to be re-derived from the arms):** every terminal `Err` return
+/// in this function first calls [`cleanup_staging`] on whatever this
+/// attempt has put under `.staging/` so far -- the shared extraction
+/// directory (`tmp_dir`, or, once past the rename step, `final_dir` itself,
+/// which by then holds the same not-yet-trusted content under a different
+/// name) AND every archive staged so far in this attempt. This applies
+/// uniformly, including failure points before any archive has downloaded
+/// (where it is a harmless no-op) -- deliberately not selective, because
+/// arm-by-arm reasoning is exactly what produced the original gap (the
+/// rename-failure arm removed `tmp_dir` but not `staged_paths`, and the
+/// mid-group download-failure arm removed neither). `.staging/` promises
+/// no resume guarantee ACROSS `install()` attempts (v3 §6: `临时，可随时清空`)
+/// -- deleting a verified archive on failure means a retry re-downloads it,
+/// which is the correct trade-off here; a silent multi-hundred-MB leak is
+/// worse. This is distinct from, and does not touch,
+/// `models::fetch::fetch_to`'s own `.part` resume mechanism, which operates
+/// WITHIN a single archive's download and stays intentional.
 pub async fn install(
     rel: &EngineRelease,
     kind: &InstallKind,
@@ -147,6 +164,17 @@ pub async fn install(
     cancel: &CancellationToken,
     on_progress: &mut (dyn FnMut(InstallProgress) + Send),
 ) -> Result<PathBuf, LocalError> {
+    // Computed up front (before anything can fail) so every arm below,
+    // including the earliest ones, can uniformly call `cleanup_staging`.
+    let final_dir = install_dir(root, rel.tag, kind);
+    let dir_name = final_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "engine".to_string());
+    let staging = root.join(".staging");
+    let tmp_dir = staging.join(format!("{dir_name}.tmp"));
+    let mut staged_paths: Vec<PathBuf> = Vec::new();
+
     let (archive, cudart) =
         release::archive_for(rel, kind).ok_or_else(|| LocalError::DownloadFailed {
             detail: format!("no pinned archive for install kind {kind:?}"),
@@ -169,7 +197,6 @@ pub async fn install(
         return Err(LocalError::NoSpace { needed, available });
     }
 
-    let staging = root.join(".staging");
     tokio::fs::create_dir_all(&staging)
         .await
         .map_err(|e| LocalError::DownloadFailed {
@@ -189,7 +216,6 @@ pub async fn install(
     // climbing across both rather than resetting to zero at the second.
     let total_download_bytes: u64 = archive_bytes.iter().sum();
     let mut completed_before: u64 = 0;
-    let mut staged_paths = Vec::new();
     for (asset, asset_bytes) in std::iter::once(&archive.asset)
         .chain(cudart.map(|c| &c.asset))
         .zip(archive_bytes.iter().copied())
@@ -201,17 +227,17 @@ pub async fn install(
                 total: total_download_bytes,
             });
         };
-        fetch_asset(&client, rel.tag, asset, &dest, cancel, &mut progress).await?;
+        if let Err(e) = fetch_asset(&client, rel.tag, asset, &dest, cancel, &mut progress).await {
+            // Task 2.4 review finding M2(b): a Windows CUDA group's SECOND
+            // archive failing must not leave the FIRST one's already-staged
+            // (and sha-verified) file behind.
+            cleanup_staging(&tmp_dir, &staged_paths).await;
+            return Err(e);
+        }
         completed_before = completed_before.saturating_add(asset_bytes);
         staged_paths.push(dest);
     }
 
-    let final_dir = install_dir(root, rel.tag, kind);
-    let dir_name = final_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "engine".to_string());
-    let tmp_dir = staging.join(format!("{dir_name}.tmp"));
     // Clear any leftover from a previous crashed attempt before we start --
     // extraction below merges every archive into this one directory, so a
     // stale partial extraction here would silently mix with fresh files.
@@ -221,14 +247,14 @@ pub async fn install(
     for staged in &staged_paths {
         if let Err(detail) = extract_archive(staged, &tmp_dir) {
             tracing::warn!(archive = %staged.display(), %detail, "engine archive failed to extract");
-            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+            cleanup_staging(&tmp_dir, &staged_paths).await;
             return Err(LocalError::ArchiveCorrupt);
         }
     }
 
     on_progress(InstallProgress::Verifying);
     if let Err(missing) = sentinels_ok(&tmp_dir, kind) {
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+        cleanup_staging(&tmp_dir, &staged_paths).await;
         return Err(LocalError::SentinelMissing { missing });
     }
 
@@ -237,12 +263,12 @@ pub async fn install(
         Ok(Ok(files)) => files,
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "engine manifest build failed");
-            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+            cleanup_staging(&tmp_dir, &staged_paths).await;
             return Err(LocalError::ArchiveCorrupt);
         }
         Err(e) => {
             tracing::warn!(error = %e, "engine manifest build task panicked");
-            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+            cleanup_staging(&tmp_dir, &staged_paths).await;
             return Err(LocalError::ArchiveCorrupt);
         }
     };
@@ -256,14 +282,12 @@ pub async fn install(
             // ENOTEMPTY), so attempting it would turn a routine re-install
             // into a permanent `ArchiveCorrupt` dead stop with a false
             // diagnosis. The freshly built (and identical, sha-pinned) tmp
-            // dir and staged archives are simply discarded; the existing
-            // install's marker and files are left untouched rather than
-            // risk deleting files a running engine process may still have
-            // open.
-            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
-            for staged in &staged_paths {
-                let _ = tokio::fs::remove_file(staged).await;
-            }
+            // dir and staged archives are simply discarded (same cleanup
+            // as a failure, even though this is a success outcome); the
+            // existing install's marker and files are left untouched
+            // rather than risk deleting files a running engine process may
+            // still have open.
+            cleanup_staging(&tmp_dir, &staged_paths).await;
             return Ok(final_dir);
         }
         // No marker -- a stale or foreign directory occupying our target
@@ -273,10 +297,7 @@ pub async fn install(
 
     if let Err(e) = tokio::fs::rename(&tmp_dir, &final_dir).await {
         tracing::warn!(error = %e, from = %tmp_dir.display(), to = %final_dir.display(), "engine install could not be finalized");
-        // Task 2.4 review finding M2 (leak half): a failed rename must not
-        // leave the whole extracted tree (hundreds of MB) behind in
-        // `.staging/` indefinitely.
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+        cleanup_staging(&tmp_dir, &staged_paths).await;
         return Err(LocalError::ArchiveCorrupt);
     }
 
@@ -292,16 +313,36 @@ pub async fn install(
         last_used_at: now,
         bad: None,
     };
-    marker::write_marker(&final_dir, &installed_marker).map_err(|e| {
+    if let Err(e) = marker::write_marker(&final_dir, &installed_marker) {
         tracing::warn!(error = %e, "engine marker write failed");
-        LocalError::ArchiveCorrupt
-    })?;
+        // `tmp_dir` no longer exists -- it was just renamed into
+        // `final_dir`, which is therefore what needs scrubbing here
+        // instead: a fully extracted but now permanently unmarked (hence
+        // untrusted, per `read_marker`) tree is exactly the kind of
+        // orphan this cleanup rule exists to prevent.
+        cleanup_staging(&final_dir, &staged_paths).await;
+        return Err(LocalError::ArchiveCorrupt);
+    }
 
     for staged in &staged_paths {
         let _ = tokio::fs::remove_file(staged).await;
     }
 
     Ok(final_dir)
+}
+
+/// Removes everything one `install()` attempt may have put under
+/// `.staging/`: `extra_dir` (`tmp_dir` for every arm but one -- see
+/// [`install`]'s own doc comment for the one exception, the post-rename
+/// marker-write failure, which passes `final_dir` instead) and every
+/// archive in `staged_paths`. Every removal is best-effort (`let _ =`):
+/// this runs on a failure path already, and a stray leftover file failing
+/// to delete must not mask or replace the real error being returned.
+async fn cleanup_staging(extra_dir: &Path, staged_paths: &[PathBuf]) {
+    let _ = tokio::fs::remove_dir_all(extra_dir).await;
+    for staged in staged_paths {
+        let _ = tokio::fs::remove_file(staged).await;
+    }
 }
 
 /// Fetches one asset, trying `release::mirror_sources` in order.
@@ -1618,5 +1659,76 @@ mod tests {
         );
         let final_dir = install_dir(root_dir.path(), rel.tag, &kind);
         assert!(!final_dir.exists());
+    }
+
+    /// Task 2.4 re-review finding M2(b): every terminal failure must clean
+    /// up BOTH the extraction directory and every staged archive, not just
+    /// one. This exercises a failure that happens AFTER a successful,
+    /// sha-verified download (unlike the sha-mismatch test above, where no
+    /// staged archive or tmp dir ever exists at all) -- a zip that
+    /// downloads and extracts fine but contains no `llama-server.exe`, so
+    /// `sentinels_ok` fails with a fully staged archive AND a populated
+    /// `tmp_dir` both present at the moment of failure. `.staging/` must
+    /// end up completely empty afterward: no leftover archive, no `.tmp`.
+    #[tokio::test]
+    async fn install_leaves_the_staging_dir_empty_after_a_sentinel_failure() {
+        let _guard = crate::llm_gateway::tests::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let zip_bytes = build_zip(&[("pkg/not-the-engine-binary.txt", b"nope")]);
+        let sha = sha256_hex(&zip_bytes);
+        let mut files = HashMap::new();
+        files.insert("test-cpu-sentinel-fail.zip".to_string(), zip_bytes.clone());
+        let base_url = spawn_fake_mirror(files).await;
+        std::env::set_var("NEVOFLUX_ENGINE_MIRROR_BASE", &base_url);
+        let _restore = EnvVarGuard("NEVOFLUX_ENGINE_MIRROR_BASE");
+
+        let archive = release::EngineArchive {
+            platform: "windows-x64",
+            backend: Backend::Cpu,
+            variant: None,
+            asset: EngineAsset {
+                name: "test-cpu-sentinel-fail.zip",
+                bytes: zip_bytes.len() as u64,
+                sha256: leak_str(sha),
+            },
+        };
+        let rel = EngineRelease {
+            tag: "test-tag-sentinel-fail",
+            upstream_tag: "test-tag-sentinel-fail",
+            archives: leak_archives(vec![archive]),
+            cudart: &[],
+            source: EngineAsset {
+                name: "src",
+                bytes: 0,
+                sha256: dummy_sha256(),
+            },
+        };
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let kind = InstallKind {
+            platform: "windows-x64".to_string(),
+            backend: Backend::Cpu,
+            variant: None,
+            cudart: None,
+        };
+        let result = install(&rel, &kind, root_dir.path(), &cancel, &mut |_| {}).await;
+        assert!(
+            matches!(result, Err(LocalError::SentinelMissing { .. })),
+            "{result:?}"
+        );
+
+        let staging = root_dir.path().join(".staging");
+        let remaining: Vec<_> = std::fs::read_dir(&staging)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            remaining.is_empty(),
+            "staging dir must be empty after a failed install, found: {remaining:?}"
+        );
     }
 }
