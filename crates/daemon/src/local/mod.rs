@@ -29,16 +29,23 @@
 //! or MCP attachment), `integrity` (a cold-start full re-hash of an
 //! installed directory against its marker's manifest), and grows `marker`
 //! with the upgrade/GC policy (`marker::tag_status`, `marker::should_gc`).
+//! Task 2.6 adds `guard`: the `--engine-guard` subcommand that on Unix
+//! directly parents a spawned engine process so it cannot outlive the
+//! daemon that launched it (Windows gets this from the daemon's
+//! kill-on-close Job Object instead; see `assign_self_to_kill_on_close_job`
+//! in `src/main.rs`).
+//!
 //! A later task adds the engine supervisor that publishes to the endpoint
 //! registry, calls [`apply_gateway_upstream_for_latch`] when it does, and
 //! uses `catalog` + `memory` + `hardware` + `release` + `install` +
 //! `harden` + `integrity` + `marker`'s policy functions to decide what to
-//! install/launch and how.
+//! install/launch and how -- and spawns engines through `guard` on Unix.
 
 pub mod catalog;
 pub mod config;
 pub mod endpoint;
 pub mod gguf;
+pub mod guard;
 pub mod harden;
 pub mod hardware;
 pub mod install;
