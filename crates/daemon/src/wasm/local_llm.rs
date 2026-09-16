@@ -73,6 +73,17 @@ async fn endpoint_for_priority() -> Result<LocalEndpoint> {
 /// rather than resetting it on every preemption. `AdmissionError::TooLarge`
 /// is never retried, from either source -- no amount of waiting changes
 /// whether a request fits the whole context pool.
+///
+/// **Contract for `do_work`:** re-queueing re-invokes the SAME closure
+/// against whatever state it closed over (e.g. `stream_local`'s `tx`), so
+/// `do_work` must only ever report `DaemonError::Admission(_)` (the
+/// retryable signal) up to the point it has produced no side effect a
+/// retry couldn't cleanly redo from scratch. `execute_local_chat` can
+/// always retry cleanly (no response has gone anywhere until the whole
+/// call succeeds). `stream_local` cannot once it has sent a chunk on
+/// `tx` -- it tracks that and reports a terminal `DaemonError::InternalError`
+/// instead once anything has been streamed, precisely so a re-queue can
+/// never replay a prefix to an already-partially-served client.
 async fn run_admitted<T, F, Fut>(req: &LlmChatRequest, do_work: F) -> Result<T>
 where
     F: Fn(admission::Permit) -> Fut,
@@ -340,6 +351,20 @@ pub async fn stream_local(request: LlmChatRequest, tx: mpsc::Sender<LlmStreamChu
         .build()
         .map_err(|e| DaemonError::InternalError(format!("Failed to build HTTP client: {e}")))?;
 
+        // Tracks whether ANY chunk has actually reached `tx` yet. A
+        // preempted stream must not re-queue once this is true: `run_admitted`'s
+        // retry re-invokes this whole closure against the SAME `tx`, and a
+        // client that already received a prefix has no way to tell a
+        // replay from more of the same stream -- prefix-then-full-output
+        // plus a duplicate `done: true`. A client that gets nothing at all
+        // can at least tell the call failed. An `AtomicBool`, not a
+        // `Cell`: both `select!` arms below run on this one task and never
+        // race each other, but this whole future still needs to stay
+        // `Send` (it is `tokio::spawn`ed elsewhere via `wasm::llm`'s
+        // dispatch), and a `&Cell<bool>` held across an `.await` isn't
+        // `Send` (`Cell` is deliberately `!Sync`) the way `&AtomicBool` is.
+        let sent_any = std::sync::atomic::AtomicBool::new(false);
+
         // See the matching comment in `execute_local_chat`: raced against
         // `permit.cancel`, `biased` with the stream branch listed first.
         let do_stream = async {
@@ -391,6 +416,7 @@ pub async fn stream_local(request: LlmChatRequest, tx: mpsc::Sender<LlmStreamChu
                             let delta = &choice["delta"];
 
                             for event in delta_events(delta) {
+                                sent_any.store(true, std::sync::atomic::Ordering::Relaxed);
                                 match event {
                                     DeltaEvent::Text(text) => {
                                         let _ = tx
@@ -430,6 +456,7 @@ pub async fn stream_local(request: LlmChatRequest, tx: mpsc::Sender<LlmStreamChu
             }
 
             if !accumulated_tool_calls.is_empty() {
+                sent_any.store(true, std::sync::atomic::Ordering::Relaxed);
                 let _ = tx
                     .send(LlmStreamChunk {
                         usage: None,
@@ -459,7 +486,22 @@ pub async fn stream_local(request: LlmChatRequest, tx: mpsc::Sender<LlmStreamChu
         tokio::select! {
             biased;
             result = do_stream => result,
-            _ = permit.cancel.cancelled() => Err(DaemonError::Admission(admission::AdmissionError::Preempted)),
+            _ = permit.cancel.cancelled() => {
+                if sent_any.load(std::sync::atomic::Ordering::Relaxed) {
+                    // A re-queue would re-invoke this closure against the
+                    // SAME `tx` and replay from the top -- the client
+                    // already has a prefix, so surface a terminal failure
+                    // instead of `run_admitted`'s retryable
+                    // `DaemonError::Admission(Preempted)`. A stream that
+                    // ends abruptly is recoverable by the caller; one that
+                    // silently duplicates its prefix is not.
+                    Err(DaemonError::InternalError(
+                        admission::AdmissionError::Preempted.to_string(),
+                    ))
+                } else {
+                    Err(DaemonError::Admission(admission::AdmissionError::Preempted))
+                }
+            }
         }
     })
     .await
@@ -590,19 +632,23 @@ mod tests {
         .await
     }
 
-    /// Serves TWO connections in sequence, both with `head`+`body`: the
-    /// first only after sleeping `slow_delay` (real wall-clock time, same
-    /// as the rest of this fixture harness) after reading its request --
-    /// long enough to keep a caller's `.send().await` genuinely pending for
-    /// a controlled window -- the second immediately. Used to force a real
-    /// mid-flight preemption on the first attempt (its connection is
-    /// dropped when the caller gives up, so the slow response, once it
-    /// finally arrives, lands on nobody) and then observe a *re-queued*
-    /// retry succeed against the second.
+    /// Serves TWO connections in sequence, with DIFFERENT bodies: the first
+    /// (`first_body`) only after sleeping `slow_delay` (real wall-clock
+    /// time, same as the rest of this fixture harness) after reading its
+    /// request -- long enough to keep a caller's `.send().await` genuinely
+    /// pending for a controlled window -- the second (`second_body`)
+    /// immediately. Used to force a real mid-flight preemption on the
+    /// first attempt (its connection is dropped when the caller gives up,
+    /// so the slow response, once it finally arrives, lands on nobody) and
+    /// then let a caller assert the eventual result came specifically from
+    /// the SECOND response -- not merely that the call returned `Ok` at
+    /// all, which the first response alone could also produce if no
+    /// preemption happened (a silently vacuous pass).
     async fn fake_http_server_slow_then_fast(
         slow_delay: std::time::Duration,
         head: &str,
-        body: Vec<u8>,
+        first_body: Vec<u8>,
+        second_body: Vec<u8>,
     ) -> String {
         use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
@@ -612,7 +658,7 @@ mod tests {
         let head = head.to_string();
 
         tokio::spawn(async move {
-            for (i, delay) in [Some(slow_delay), None].into_iter().enumerate() {
+            for (delay, body) in [(Some(slow_delay), first_body), (None, second_body)] {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
                 };
@@ -624,9 +670,7 @@ mod tests {
                 response.extend_from_slice(&body);
                 // The first connection's write commonly fails (the caller
                 // already dropped it on preemption) -- expected, not a
-                // fixture bug, so ignored just like the second (i unused
-                // beyond documenting which attempt this is).
-                let _ = i;
+                // fixture bug, so ignored just like the second.
                 let _ = socket.write_all(&response).await;
                 let _ = socket.shutdown().await;
             }
@@ -669,10 +713,22 @@ mod tests {
         let _g = crate::local::endpoint::test_serial_async().await;
         let _reset = EndpointGuard;
 
+        // The two responses carry DIFFERENT content markers specifically so
+        // the assertion below can tell which one actually answered the
+        // call -- not just that SOME response did, which the slow one
+        // alone could also produce if no preemption happened at all (a
+        // silently vacuous pass: skewed timing, a scheduler quirk, or a
+        // future regression that stops the aggressor from preempting
+        // anything would leave this test green for the wrong reason).
+        const STALE_MARKER: &str = "stale-should-never-be-observed";
+        const REQUEUED_MARKER: &str = "requeued-after-preemption";
         let url = fake_http_server_slow_then_fast(
             std::time::Duration::from_millis(500),
             "HTTP/1.1 200 OK\r\nContent-Type: application/json",
-            serde_json::json!({"choices": [{"message": {"content": "ok"}}]})
+            serde_json::json!({"choices": [{"message": {"content": STALE_MARKER}}]})
+                .to_string()
+                .into_bytes(),
+            serde_json::json!({"choices": [{"message": {"content": REQUEUED_MARKER}}]})
                 .to_string()
                 .into_bytes(),
         )
@@ -714,10 +770,17 @@ mod tests {
         drop(p0);
 
         let result = victim.await.expect("victim task did not panic");
-        result.expect(
+        let response = result.expect(
             "the re-queued retry must succeed against the fixture's second (fast) response \
              once the aggressor releases -- Preempted must not be terminal for a background \
              caller (§17.2.4)",
+        );
+        assert_eq!(
+            response.content, REQUEUED_MARKER,
+            "the response must come from the re-queued SECOND attempt, not the first -- an \
+             `Ok` alone doesn't prove the preemption-and-requeue path actually ran (it would \
+             pass identically if the aggressor never preempted anything and the first, slow \
+             response just answered the only attempt)"
         );
     }
 

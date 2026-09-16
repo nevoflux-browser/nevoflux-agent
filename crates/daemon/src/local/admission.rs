@@ -1047,12 +1047,25 @@ mod tests {
     }
 
     #[test]
-    fn admission_singleton_is_reachable_and_stable() {
-        let a = admission();
-        let b = admission();
+    fn admission_clones_share_the_same_underlying_instance() {
+        // Deliberately does NOT call the real `admission()` -- doing so
+        // would initialize the process-global singleton inside a test,
+        // which every other test in this module avoids (see the module
+        // docs' "Test isolation" section), and this project has already
+        // lost fix rounds to exactly that pattern elsewhere. `admission()`'s
+        // own repeated-call identity guarantee comes for free from
+        // `OnceLock::get_or_init`'s documented semantics -- not something
+        // this crate needs to independently verify. What this module DOES
+        // need to get right is `Admission`'s `Clone` impl: it must be a
+        // shared handle (same `Inner`), not a deep copy, since every live
+        // `Permit` and every `&'static Admission` reference has to keep
+        // observing the same budget/queue state -- exercised here on a
+        // fully local, hermetic instance instead.
+        let a = Admission::new(1000, 4);
+        let b = a.clone();
         assert!(
-            std::ptr::eq(a, b),
-            "admission() must return the same instance every call"
+            Arc::ptr_eq(&a.inner, &b.inner),
+            "Admission::clone() must be a shared handle, not a deep copy"
         );
     }
 }
