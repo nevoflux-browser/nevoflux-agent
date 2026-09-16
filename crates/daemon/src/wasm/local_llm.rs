@@ -15,6 +15,7 @@
 //! guard applies to every provider, not just this one.
 
 use crate::error::{DaemonError, Result};
+use crate::local::admission;
 use crate::local::endpoint::{self, LocalEndpoint};
 use crate::wasm::llm::{
     build_deepseek_request_body, LlmChatRequest, LlmChatResponse, LlmStreamChunk, LlmToolCall,
@@ -24,71 +25,131 @@ use crate::wasm::openai_sse::{
 };
 use futures::StreamExt;
 use nevoflux_protocol::json_repair::tool_arguments_or_marker;
+use std::future::Future;
 use tokio::sync::mpsc;
 
-/// Acquire this request's slot in the local engine's token-budget admission
-/// controller (Task 2.7, `crate::local::admission`), returning the
-/// [`admission::Permit`] the caller must hold for the duration of its HTTP
-/// call and `select!` against (see [`admission::Permit::cancel`]).
+/// Resolve the endpoint to actually talk to, once an [`admission::Permit`]
+/// is already held.
 ///
-/// Interactive (P0, chat) requests wait FIFO for as long as it takes and are
-/// never refused for the engine being unready -- readiness only gates
-/// background work, which a P0 request may itself cold-start via
-/// `endpoint::ensure()` right after this returns. If the token budget is
-/// too tight, a waiting P0 request preempts the newest running background
-/// permits instead of waiting behind them.
+/// Interactive (P0) requests may cold-start the engine via
+/// `endpoint::ensure()`. Background (P1) requests must not (§17.2.1's "P1
+/// 不冷启动引擎"): for them this only ever reads what's already published
+/// (`endpoint::current()` -- a plain sync `RwLock` read that structurally
+/// cannot itself start anything), returning [`admission::AdmissionError::Deferred`]
+/// if nothing is published yet. That also keeps a preempted background
+/// caller's cancellation meaningful: with nothing slow to wait through
+/// here, `run_admitted`'s `select!` against `permit.cancel` is never blind
+/// to an in-progress cold start the way it would be if this called
+/// `ensure()` for P1 too (a cold start can take up to 120s and does not
+/// itself observe a `Permit`'s cancellation).
+async fn endpoint_for_priority() -> Result<LocalEndpoint> {
+    if admission::current_priority() == admission::Priority::Background {
+        endpoint::current().ok_or(DaemonError::Admission(admission::AdmissionError::Deferred))
+    } else {
+        endpoint::ensure().await.map_err(DaemonError::InternalError)
+    }
+}
+
+/// Run `do_work` (the admitted HTTP round-trip / stream -- it resolves its
+/// own endpoint via [`endpoint_for_priority`] and races itself against
+/// `permit.cancel` internally) under the local engine's token-budget
+/// admission controller (Task 2.7, `crate::local::admission`).
+///
+/// Interactive (P0, chat) requests acquire once: `Admission::acquire`
+/// already waits FIFO with no timeout, so there is nothing here worth
+/// retrying, and an interactive permit is never preempted.
 ///
 /// Background (P1, memory extraction / knowledge consolidation -- see
-/// `admission::background`) requests instead retry a transient rejection
-/// (anything but `AdmissionError::TooLarge`) up to 3 times with a 30s
-/// backoff, then give up and `warn!` -- a stuck background job must not
-/// retry forever the way interactive chat, which the user is actively
-/// waiting on, is allowed to.
-async fn admission_hook(
-    req: &LlmChatRequest,
-    engine_ready: bool,
-) -> Result<crate::local::admission::Permit> {
-    use crate::local::admission::{self, AdmissionError, Priority};
-
+/// `admission::background`) requests retry across BOTH failure modes under
+/// ONE shared attempt budget -- 3 attempts, 30s backoff between them, then
+/// `warn!` and give up. That is §17.2.4's "N 次后放弃并记日志" and the
+/// brief's "Background callers retry up to 3 times with 30s backoff",
+/// which is the SAME sentence covering both: a rejection at `acquire`
+/// (`Deferred`/`QueueFull`) counts as an attempt, and so does an
+/// `AdmissionError` (typically `Preempted`) coming back from `do_work`
+/// AFTER admission -- a P0 arrival that cuts a P1 off mid-flight must
+/// re-queue the P1's work (§17.2.4's "重新排队"), not drop it, and
+/// re-queueing shares the same N-attempt ceiling as an outright rejection
+/// rather than resetting it on every preemption. `AdmissionError::TooLarge`
+/// is never retried, from either source -- no amount of waiting changes
+/// whether a request fits the whole context pool.
+async fn run_admitted<T, F, Fut>(req: &LlmChatRequest, do_work: F) -> Result<T>
+where
+    F: Fn(admission::Permit) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
     let prio = admission::current_priority();
     let tokens = admission::estimate_request_tokens(req);
 
-    if prio == Priority::Interactive {
-        return admission::admission()
+    if prio == admission::Priority::Interactive {
+        let engine_ready = endpoint::current().is_some();
+        let permit = admission::admission()
             .acquire(prio, tokens, engine_ready)
-            .await
-            .map_err(|e| DaemonError::InternalError(e.to_string()));
+            .await?;
+        return do_work(permit).await;
     }
 
     const MAX_ATTEMPTS: u32 = 3;
-    const BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
-    let mut last_err: Option<AdmissionError> = None;
+    // Real 30s in production (§17.2.4 / the brief); cut to a few
+    // milliseconds under `cfg(test)` so a test exercising this retry loop
+    // -- e.g. re-queueing after a real preemption -- doesn't cost up to a
+    // minute of actual wall-clock time. `cfg!(test)` is a compile-time
+    // constant, and `Duration::from_millis`/`from_secs` are `const fn`, so
+    // this has zero effect on the shipped binary.
+    const BACKOFF: std::time::Duration = if cfg!(test) {
+        std::time::Duration::from_millis(20)
+    } else {
+        std::time::Duration::from_secs(30)
+    };
+    let mut last_err: Option<admission::AdmissionError> = None;
+
     for attempt in 1..=MAX_ATTEMPTS {
-        match admission::admission()
+        // Re-sampled on every attempt, not captured once before the loop:
+        // a stale `engine_ready` would make this retry provably useless
+        // whenever the engine wasn't ready at entry (every attempt would
+        // see the same stale `false` and never observe the supervisor
+        // publishing) -- exactly the condition this retry exists to wait
+        // out (§17.2.1's "延后（不失败）").
+        let engine_ready = endpoint::current().is_some();
+        let permit = match admission::admission()
             .acquire(prio, tokens, engine_ready)
             .await
         {
-            Ok(permit) => return Ok(permit),
-            Err(AdmissionError::TooLarge) => {
-                return Err(DaemonError::InternalError(
-                    AdmissionError::TooLarge.to_string(),
-                ));
+            Ok(permit) => permit,
+            Err(admission::AdmissionError::TooLarge) => {
+                return Err(DaemonError::Admission(admission::AdmissionError::TooLarge));
             }
             Err(e) => {
                 last_err = Some(e);
                 if attempt < MAX_ATTEMPTS {
                     tokio::time::sleep(BACKOFF).await;
                 }
+                continue;
             }
+        };
+
+        match do_work(permit).await {
+            Ok(v) => return Ok(v),
+            Err(DaemonError::Admission(admission::AdmissionError::TooLarge)) => {
+                return Err(DaemonError::Admission(admission::AdmissionError::TooLarge));
+            }
+            Err(DaemonError::Admission(e)) => {
+                last_err = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(BACKOFF).await;
+                }
+            }
+            Err(e) => return Err(e),
         }
     }
+
     let last_err = last_err.expect("loop runs at least once and always records an error");
     tracing::warn!(
         error = %last_err,
         attempts = MAX_ATTEMPTS,
         "background local-engine admission gave up"
     );
-    Err(DaemonError::InternalError(last_err.to_string()))
+    Err(DaemonError::Admission(last_err))
 }
 
 /// Apply the local-engine HTTP policy to a builder: unconditionally
@@ -157,97 +218,101 @@ pub fn local_request_body(
 
 /// Non-streaming on-device chat completion.
 pub async fn execute_local_chat(request: LlmChatRequest) -> Result<LlmChatResponse> {
-    let engine_ready = endpoint::current().is_some();
-    let permit = admission_hook(&request, engine_ready).await?;
-    let ep = endpoint::ensure()
-        .await
-        .map_err(DaemonError::InternalError)?;
+    let request = &request;
+    run_admitted(request, |permit| async move {
+        let ep = endpoint_for_priority().await?;
+        let body = local_request_body(&ep, request, false);
+        let url = format!("{}/chat/completions", ep.base_url.trim_end_matches('/'));
 
-    let body = local_request_body(&ep, &request, false);
-    let url = format!("{}/chat/completions", ep.base_url.trim_end_matches('/'));
+        tracing::debug!(base_url = %ep.base_url, model = %ep.model_id, "local engine chat POST");
 
-    tracing::debug!(base_url = %ep.base_url, model = %ep.model_id, "local engine chat POST");
+        let client = apply_local_http_policy(
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(600)),
+        )
+        .build()
+        .map_err(|e| DaemonError::InternalError(format!("Failed to build HTTP client: {e}")))?;
 
-    let client = apply_local_http_policy(
-        reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(600)),
-    )
-    .build()
-    .map_err(|e| DaemonError::InternalError(format!("Failed to build HTTP client: {e}")))?;
+        // The actual round-trip, raced against `permit.cancel`: a P0
+        // arrival short on token budget can preempt this in-flight P1
+        // request (see `admission::Admission::acquire`). `select!` dropping
+        // the losing branch drops this whole in-progress request/response
+        // with it. `biased`, with the request branch listed first: an
+        // unbiased `select!` can still report `Preempted` for a request
+        // that finished in the very same poll as the cancellation,
+        // discarding an already-arrived response -- `biased` only lets
+        // cancellation win when the request genuinely has not finished.
+        let do_request = async {
+            let response = client
+                .post(&url)
+                .bearer_auth(&ep.api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| {
+                    DaemonError::InternalError(format!("Local engine request failed: {e}"))
+                })?;
 
-    // The actual round-trip, raced against `permit.cancel`: a P0 arrival
-    // short on token budget can preempt this in-flight P1 request (see
-    // `admission::Admission::acquire`). `select!` dropping the losing
-    // branch drops this whole in-progress request/response with it.
-    let do_request = async {
-        let response = client
-            .post(&url)
-            .bearer_auth(&ep.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| DaemonError::InternalError(format!("Local engine request failed: {e}")))?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                return Err(DaemonError::InternalError(format!(
+                    "Local engine HTTP {}: {}",
+                    status,
+                    truncate_for_error(&text)
+                )));
+            }
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(DaemonError::InternalError(format!(
-                "Local engine HTTP {}: {}",
-                status,
-                truncate_for_error(&text)
-            )));
-        }
+            let raw: serde_json::Value = response.json().await.map_err(|e| {
+                DaemonError::InternalError(format!("Failed to parse response: {e}"))
+            })?;
 
-        let raw: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| DaemonError::InternalError(format!("Failed to parse response: {e}")))?;
+            let choice = raw["choices"].get(0).ok_or_else(|| {
+                DaemonError::InternalError("No choices in local engine response".to_string())
+            })?;
+            let message = &choice["message"];
+            let content = message["content"].as_str().unwrap_or("").to_string();
+            let finish_reason = choice["finish_reason"]
+                .as_str()
+                .unwrap_or("stop")
+                .to_string();
 
-        let choice = raw["choices"].get(0).ok_or_else(|| {
-            DaemonError::InternalError("No choices in local engine response".to_string())
-        })?;
-        let message = &choice["message"];
-        let content = message["content"].as_str().unwrap_or("").to_string();
-        let finish_reason = choice["finish_reason"]
-            .as_str()
-            .unwrap_or("stop")
-            .to_string();
-
-        let tool_calls = message["tool_calls"].as_array().map(|arr| {
-            arr.iter()
-                .filter_map(|tc| {
-                    let id = tc["id"].as_str()?.to_string();
-                    let function = tc.get("function")?;
-                    let name = function["name"].as_str()?.to_string();
-                    let args_raw = function["arguments"].as_str().unwrap_or("");
-                    let arguments = tool_arguments_or_marker(args_raw);
-                    Some(LlmToolCall {
-                        id: id.clone(),
-                        call_id: Some(id),
-                        name,
-                        arguments,
-                        signature: None,
+            let tool_calls = message["tool_calls"].as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|tc| {
+                        let id = tc["id"].as_str()?.to_string();
+                        let function = tc.get("function")?;
+                        let name = function["name"].as_str()?.to_string();
+                        let args_raw = function["arguments"].as_str().unwrap_or("");
+                        let arguments = tool_arguments_or_marker(args_raw);
+                        Some(LlmToolCall {
+                            id: id.clone(),
+                            call_id: Some(id),
+                            name,
+                            arguments,
+                            signature: None,
+                        })
                     })
-                })
-                .collect::<Vec<_>>()
-        });
+                    .collect::<Vec<_>>()
+            });
 
-        Ok(LlmChatResponse {
-            content,
-            finish_reason,
-            tool_calls,
-            usage: usage_from(&raw),
-            images: vec![],
-        })
-    };
+            Ok(LlmChatResponse {
+                content,
+                finish_reason,
+                tool_calls,
+                usage: usage_from(&raw),
+                images: vec![],
+            })
+        };
 
-    tokio::select! {
-        _ = permit.cancel.cancelled() => Err(DaemonError::InternalError(
-            crate::local::admission::AdmissionError::Preempted.to_string(),
-        )),
-        result = do_request => result,
-    }
+        tokio::select! {
+            biased;
+            result = do_request => result,
+            _ = permit.cancel.cancelled() => Err(DaemonError::Admission(admission::AdmissionError::Preempted)),
+        }
+    })
+    .await
 }
 
 /// Streaming on-device chat completion.
@@ -260,146 +325,144 @@ pub async fn execute_local_chat(request: LlmChatRequest) -> Result<LlmChatRespon
 /// `local_request_body` sets `stream_options.include_usage`) — attached to
 /// the final `done: true` chunk, per `LlmStreamChunk::usage`'s contract.
 pub async fn stream_local(request: LlmChatRequest, tx: mpsc::Sender<LlmStreamChunk>) -> Result<()> {
-    let engine_ready = endpoint::current().is_some();
-    let permit = admission_hook(&request, engine_ready).await?;
-    let ep = endpoint::ensure()
-        .await
-        .map_err(DaemonError::InternalError)?;
+    let request = &request;
+    let tx = &tx;
+    run_admitted(request, |permit| async move {
+        let ep = endpoint_for_priority().await?;
+        let body = local_request_body(&ep, request, true);
+        let url = format!("{}/chat/completions", ep.base_url.trim_end_matches('/'));
 
-    let body = local_request_body(&ep, &request, true);
-    let url = format!("{}/chat/completions", ep.base_url.trim_end_matches('/'));
+        tracing::debug!(base_url = %ep.base_url, model = %ep.model_id, "local engine stream POST");
 
-    tracing::debug!(base_url = %ep.base_url, model = %ep.model_id, "local engine stream POST");
+        let client = apply_local_http_policy(
+            reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(10)),
+        )
+        .build()
+        .map_err(|e| DaemonError::InternalError(format!("Failed to build HTTP client: {e}")))?;
 
-    let client = apply_local_http_policy(
-        reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(10)),
-    )
-    .build()
-    .map_err(|e| DaemonError::InternalError(format!("Failed to build HTTP client: {e}")))?;
+        // See the matching comment in `execute_local_chat`: raced against
+        // `permit.cancel`, `biased` with the stream branch listed first.
+        let do_stream = async {
+            let response = client
+                .post(&url)
+                .bearer_auth(&ep.api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| {
+                    DaemonError::InternalError(format!("Local engine stream request failed: {e}"))
+                })?;
 
-    // The whole connect-and-stream loop, raced against `permit.cancel`: a
-    // P0 arrival short on token budget can preempt this in-flight P1
-    // stream (see `admission::Admission::acquire`). `select!` dropping the
-    // losing branch tears down the in-progress response/stream with it.
-    let do_stream = async {
-        let response = client
-            .post(&url)
-            .bearer_auth(&ep.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                DaemonError::InternalError(format!("Local engine stream request failed: {e}"))
-            })?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.unwrap_or_default();
+                return Err(DaemonError::InternalError(format!(
+                    "Local engine stream HTTP {}: {}",
+                    status,
+                    truncate_for_error(&text)
+                )));
+            }
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(DaemonError::InternalError(format!(
-                "Local engine stream HTTP {}: {}",
-                status,
-                truncate_for_error(&text)
-            )));
-        }
+            let mut byte_stream = response.bytes_stream();
+            let mut line_buf = SseLineBuffer::default();
+            let mut accumulated_tool_calls = ToolCallAccumulator::default();
+            let mut usage = None;
 
-        let mut byte_stream = response.bytes_stream();
-        let mut line_buf = SseLineBuffer::default();
-        let mut accumulated_tool_calls = ToolCallAccumulator::default();
-        let mut usage = None;
+            while let Some(result) = byte_stream.next().await {
+                match result {
+                    Ok(bytes) => {
+                        for data in line_buf.push(&bytes) {
+                            let chunk: serde_json::Value = match serde_json::from_str(&data) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
 
-        while let Some(result) = byte_stream.next().await {
-            match result {
-                Ok(bytes) => {
-                    for data in line_buf.push(&bytes) {
-                        let chunk: serde_json::Value = match serde_json::from_str(&data) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
+                            // Usage may ride a chunk with an empty `choices`
+                            // array (the terminal event), so this must run
+                            // before the `choices[0]` lookup below rather
+                            // than after it.
+                            if let Some(u) = usage_from(&chunk) {
+                                usage = Some(u);
+                            }
 
-                        // Usage may ride a chunk with an empty `choices` array
-                        // (the terminal event), so this must run before the
-                        // `choices[0]` lookup below rather than after it.
-                        if let Some(u) = usage_from(&chunk) {
-                            usage = Some(u);
-                        }
+                            let Some(choice) = chunk["choices"].get(0) else {
+                                continue;
+                            };
+                            let delta = &choice["delta"];
 
-                        let Some(choice) = chunk["choices"].get(0) else {
-                            continue;
-                        };
-                        let delta = &choice["delta"];
-
-                        for event in delta_events(delta) {
-                            match event {
-                                DeltaEvent::Text(text) => {
-                                    let _ = tx
-                                        .send(LlmStreamChunk {
-                                            usage: None,
-                                            text: Some(text),
-                                            tool_calls: vec![],
-                                            done: false,
-                                            reasoning: None,
-                                            images: vec![],
-                                        })
-                                        .await;
-                                }
-                                DeltaEvent::Reasoning(reasoning) => {
-                                    let _ = tx
-                                        .send(LlmStreamChunk {
-                                            usage: None,
-                                            text: None,
-                                            tool_calls: vec![],
-                                            done: false,
-                                            reasoning: Some(reasoning),
-                                            images: vec![],
-                                        })
-                                        .await;
+                            for event in delta_events(delta) {
+                                match event {
+                                    DeltaEvent::Text(text) => {
+                                        let _ = tx
+                                            .send(LlmStreamChunk {
+                                                usage: None,
+                                                text: Some(text),
+                                                tool_calls: vec![],
+                                                done: false,
+                                                reasoning: None,
+                                                images: vec![],
+                                            })
+                                            .await;
+                                    }
+                                    DeltaEvent::Reasoning(reasoning) => {
+                                        let _ = tx
+                                            .send(LlmStreamChunk {
+                                                usage: None,
+                                                text: None,
+                                                tool_calls: vec![],
+                                                done: false,
+                                                reasoning: Some(reasoning),
+                                                images: vec![],
+                                            })
+                                            .await;
+                                    }
                                 }
                             }
-                        }
 
-                        accumulated_tool_calls.apply(delta);
+                            accumulated_tool_calls.apply(delta);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Local engine stream chunk error: {}", e);
+                        break;
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Local engine stream chunk error: {}", e);
-                    break;
-                }
             }
-        }
 
-        if !accumulated_tool_calls.is_empty() {
+            if !accumulated_tool_calls.is_empty() {
+                let _ = tx
+                    .send(LlmStreamChunk {
+                        usage: None,
+                        text: None,
+                        tool_calls: accumulated_tool_calls.finish(),
+                        done: false,
+                        reasoning: None,
+                        images: vec![],
+                    })
+                    .await;
+            }
+
             let _ = tx
                 .send(LlmStreamChunk {
-                    usage: None,
+                    usage,
                     text: None,
-                    tool_calls: accumulated_tool_calls.finish(),
-                    done: false,
+                    tool_calls: vec![],
+                    done: true,
                     reasoning: None,
                     images: vec![],
                 })
                 .await;
+
+            Ok(())
+        };
+
+        tokio::select! {
+            biased;
+            result = do_stream => result,
+            _ = permit.cancel.cancelled() => Err(DaemonError::Admission(admission::AdmissionError::Preempted)),
         }
-
-        let _ = tx
-            .send(LlmStreamChunk {
-                usage,
-                text: None,
-                tool_calls: vec![],
-                done: true,
-                reasoning: None,
-                images: vec![],
-            })
-            .await;
-
-        Ok(())
-    };
-
-    tokio::select! {
-        _ = permit.cancel.cancelled() => Err(DaemonError::InternalError(
-            crate::local::admission::AdmissionError::Preempted.to_string(),
-        )),
-        result = do_stream => result,
-    }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -525,6 +588,137 @@ mod tests {
             body.into_bytes(),
         )
         .await
+    }
+
+    /// Serves TWO connections in sequence, both with `head`+`body`: the
+    /// first only after sleeping `slow_delay` (real wall-clock time, same
+    /// as the rest of this fixture harness) after reading its request --
+    /// long enough to keep a caller's `.send().await` genuinely pending for
+    /// a controlled window -- the second immediately. Used to force a real
+    /// mid-flight preemption on the first attempt (its connection is
+    /// dropped when the caller gives up, so the slow response, once it
+    /// finally arrives, lands on nobody) and then observe a *re-queued*
+    /// retry succeed against the second.
+    async fn fake_http_server_slow_then_fast(
+        slow_delay: std::time::Duration,
+        head: &str,
+        body: Vec<u8>,
+    ) -> String {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let head = head.to_string();
+
+        tokio::spawn(async move {
+            for (i, delay) in [Some(slow_delay), None].into_iter().enumerate() {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let _ = read_full_request(&mut socket).await;
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
+                let mut response = format!("{head}\r\nConnection: close\r\n\r\n").into_bytes();
+                response.extend_from_slice(&body);
+                // The first connection's write commonly fails (the caller
+                // already dropped it on preemption) -- expected, not a
+                // fixture bug, so ignored just like the second (i unused
+                // beyond documenting which attempt this is).
+                let _ = i;
+                let _ = socket.write_all(&response).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// Exercises the `select!` + re-queue wiring in `execute_local_chat`
+    /// itself (not `Admission` in isolation, which all the other
+    /// admission-related tests in `local::admission` do): a background
+    /// request's first attempt is kept genuinely in flight by a slow
+    /// fixture response, a real interactive `acquire` against the SAME
+    /// production singleton forces it to preempt out, and -- once the
+    /// aggressor releases -- `run_admitted`'s re-queue must retry and
+    /// succeed against the fixture's second (fast) response. This closes
+    /// the coverage gap the review found -- the wiring landed with zero
+    /// tests through the code that actually uses it.
+    ///
+    /// The aggressor permit is dropped BEFORE awaiting the victim, not
+    /// after: `run_admitted`'s retry re-`acquire`s, which for a background
+    /// request waits for no interactive permit to be in flight -- awaiting
+    /// the victim first while still holding the aggressor would deadlock
+    /// the retry against this very test.
+    ///
+    /// Deliberately drives the real global [`crate::local::admission::admission`]
+    /// singleton rather than a local `Admission` (which `execute_local_chat`
+    /// has no way to accept instead) -- unlike the `local::admission` unit
+    /// tests, this is NOT hermetic against unrelated concurrently-running
+    /// tests in the same process, by necessity. That's judged acceptable
+    /// here specifically because: the aggressor only preempts BACKGROUND
+    /// permits (this crate's only other background-priority caller in a
+    /// test is this same test), it can never evict an unrelated
+    /// INTERACTIVE permit belonging to another test, and it has no
+    /// timeout -- so at worst a concurrently-running unrelated test's own
+    /// interactive request waits briefly longer, never fails or hangs.
+    #[tokio::test]
+    async fn execute_local_chat_re_queues_after_a_p0_arrival_forces_it_out() {
+        // R35: see `stream_local_sends_bearer_...`'s comment above.
+        let _g = crate::local::endpoint::test_serial_async().await;
+        let _reset = EndpointGuard;
+
+        let url = fake_http_server_slow_then_fast(
+            std::time::Duration::from_millis(500),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json",
+            serde_json::json!({"choices": [{"message": {"content": "ok"}}]})
+                .to_string()
+                .into_bytes(),
+        )
+        .await;
+        endpoint::publish(Some(LocalEndpoint {
+            base_url: url,
+            api_key: "k".into(),
+            n_ctx: 16384,
+            model_id: "m".into(),
+            thinking_hybrid: false,
+        }));
+
+        // The victim: a small background (P1) request whose first attempt's
+        // HTTP round-trip is still pending (blocked on the fixture's
+        // artificial delay) when the aggressor below arrives.
+        let victim = tokio::spawn(admission::background(async move {
+            execute_local_chat(LlmChatRequest {
+                max_tokens: Some(50),
+                ..Default::default()
+            })
+            .await
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // The aggressor: a real interactive `acquire` against the same
+        // production singleton the victim went through, sized so that
+        // admitting it must preempt the victim (the only P1 in flight).
+        let hog_tokens = crate::local::config::CTX_FLOOR - 20;
+        let p0 = admission::admission()
+            .acquire(admission::Priority::Interactive, hog_tokens, true)
+            .await
+            .expect("the interactive aggressor admits by preempting the victim's permit");
+
+        // Give the victim's `select!` a moment to actually observe the
+        // cancellation before releasing the aggressor -- then release it
+        // BEFORE awaiting the victim (see the test's doc comment for why
+        // the other order deadlocks the re-queued retry against itself).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(p0);
+
+        let result = victim.await.expect("victim task did not panic");
+        result.expect(
+            "the re-queued retry must succeed against the fixture's second (fast) response \
+             once the aggressor releases -- Preempted must not be terminal for a background \
+             caller (§17.2.4)",
+        );
     }
 
     #[tokio::test]

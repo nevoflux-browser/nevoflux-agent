@@ -36,17 +36,23 @@
 //! in `src/main.rs`). Task 2.7 adds `admission`: the P0 (interactive)
 //! /P1 (background) token-budget admission controller
 //! ([`admission::Admission`]) that gates every local-engine call through
-//! [`crate::wasm::local_llm::admission_hook`], plus the [`admission::PRIORITY`]
+//! `crate::wasm::local_llm::run_admitted`, plus the [`admission::PRIORITY`]
 //! task-local / [`admission::background`] a caller uses to mark a
-//! `tokio::spawn`ed job as P1.
+//! `tokio::spawn`ed job as P1. A fix round hardened this further: the
+//! budget is runtime-reconfigurable ([`admission::Admission::set_capacity_tokens`] /
+//! [`admission::Admission::set_queue_depth`]) rather than a boot-time
+//! constant, a preempted background caller re-queues under the same
+//! retry budget instead of losing its work, and a background caller never
+//! cold-starts the engine.
 //!
 //! A later task (2.9) adds the engine supervisor that publishes to the
 //! endpoint registry, calls [`apply_gateway_upstream_for_latch`] when it
 //! does, uses `catalog` + `memory` + `hardware` + `release` + `install` +
 //! `harden` + `integrity` + `marker`'s policy functions to decide what to
-//! install/launch and how, spawns engines through `guard` on Unix, and
-//! re-exports [`admission::admission`] with the real per-install
-//! capacity/queue-depth wired in (see that function's doc comment).
+//! install/launch and how, spawns engines through `guard` on Unix, calls
+//! [`admission::Admission::set_capacity_tokens`] with the real `n_ctx`
+//! once launch confirms it (see that function's doc comment), and
+//! re-exports [`admission::admission`] for convenience.
 
 pub mod admission;
 pub mod catalog;

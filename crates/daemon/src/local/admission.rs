@@ -24,15 +24,17 @@
 //! are per-task, and `spawn` starts a brand new task) -- a caller that
 //! spawns background work must wrap the *spawned future's own body* in
 //! [`background`], not just call it around the `spawn` site itself. See
-//! `background_scopes_priority_for_the_call_but_not_across_spawn` below,
+//! `background_scopes_priority_inline_but_not_across_a_bare_spawn` below,
 //! and the two `tokio::spawn` call sites this task wires in `server.rs`
 //! (`consolidate_category`, `extract_session_memories`).
 //!
 //! ## Test isolation
 //!
 //! [`admission`] is a process-wide `OnceLock` singleton -- production
-//! wiring only ([`crate::wasm::local_llm::admission_hook`] is its one
-//! caller). Unit tests here construct their own [`Admission::new`] instance
+//! wiring only (`crate::wasm::local_llm::run_admitted` is its one caller,
+//! via `endpoint_for_priority` and the two `select!`s in
+//! `execute_local_chat`/`stream_local`). Unit tests here construct their
+//! own [`Admission::new`] instance
 //! and exercise that directly instead, so they can never race each other
 //! (or any other test in the crate) over shared global state -- this
 //! module deliberately does not add a test-serialization mutex, because
@@ -166,6 +168,15 @@ struct Entry {
 
 #[derive(Default)]
 struct State {
+    /// The whole KV-cache token budget shared across every in-flight
+    /// request. Lives here, not on `Inner`, so [`Admission::set_capacity_tokens`]
+    /// can change it under the same lock every admission decision already
+    /// reads `in_flight` under -- no second synchronisation domain, no
+    /// capacity-vs-usage torn read.
+    capacity_tokens: u32,
+    /// Per-priority cap on how many `acquire` calls may wait to be admitted
+    /// at once before further arrivals get [`AdmissionError::QueueFull`].
+    queue_depth: usize,
     next_id: u64,
     next_ticket: u64,
     in_flight: Vec<Entry>,
@@ -186,15 +197,33 @@ fn in_flight_tokens(st: &State) -> u32 {
 }
 
 /// Cancel the newest not-yet-cancelled background (P1) permits, in
-/// descending id order, until their combined tokens would (once actually
-/// released) cover `need` -- or until there are none left to cancel.
+/// descending id order, until their combined tokens -- together with any
+/// P1 permits already cancelled but not yet released -- would (once
+/// actually released) cover `need`, or until there are none left to
+/// cancel.
 ///
 /// Only *signals* cancellation; the tokens themselves are freed later, when
 /// each preempted caller notices [`Permit::cancel`] and drops its `Permit`.
-/// Idempotent across repeated calls with the same still-short state
-/// (already-cancelled entries are skipped), so the acquire loop can call
-/// this on every iteration it remains short without over-cancelling.
-fn preempt_newest_background(st: &mut State, mut need: u32) {
+/// `need` is nominally recomputed by the caller from `in_flight_tokens` on
+/// every wakeup -- and that still counts an already-cancelled-but-
+/// unreleased permit's tokens as "in flight", so its shortfall looks
+/// unchanged until the caller actually drops it. This function nets out
+/// exactly that (`pending`, below) before choosing further victims: without
+/// it, every unrelated wakeup while a preempted permit is still unreleased
+/// (another `Permit` drop anywhere calls `notify_waiters()`, same as a
+/// successful admission or a given-up `TicketGuard` does) would see the
+/// same apparent shortfall, find the already-cancelled entry excluded from
+/// the candidate list, and cancel a FRESH tranche on top of it. With the
+/// netting, a repeated call against unchanged state cancels nothing further
+/// -- which is what makes this genuinely idempotent, not merely documented
+/// as such.
+fn preempt_newest_background(st: &mut State, need: u32) {
+    let pending: u32 = st
+        .in_flight
+        .iter()
+        .filter(|e| e.prio == Priority::Background && e.cancel.is_cancelled())
+        .fold(0u32, |acc, e| acc.saturating_add(e.tokens));
+    let mut need = need.saturating_sub(pending);
     if need == 0 {
         return;
     }
@@ -217,8 +246,6 @@ fn preempt_newest_background(st: &mut State, mut need: u32) {
 }
 
 struct Inner {
-    capacity_tokens: u32,
-    queue_depth: usize,
     state: Mutex<State>,
     notify: Notify,
 }
@@ -254,13 +281,20 @@ impl Admission {
     /// every in-flight request; `queue_depth` caps how many requests of a
     /// given priority may wait to be admitted at once (the plan's
     /// `max(16*parallel, 64)`) before further arrivals get
-    /// [`AdmissionError::QueueFull`].
+    /// [`AdmissionError::QueueFull`]. Both are runtime-adjustable
+    /// afterward -- see [`Admission::set_capacity_tokens`] /
+    /// [`Admission::set_queue_depth`] -- since neither is really a boot-time
+    /// constant: the engine supervisor only learns the real `n_ctx` after
+    /// launch, a backend downgrade or `local.set_config` can change it
+    /// again, and a model switch is an unload/reload with a different one.
     pub fn new(capacity_tokens: u32, queue_depth: usize) -> Self {
         Admission {
             inner: Arc::new(Inner {
-                capacity_tokens,
-                queue_depth,
-                state: Mutex::new(State::default()),
+                state: Mutex::new(State {
+                    capacity_tokens,
+                    queue_depth,
+                    ..State::default()
+                }),
                 notify: Notify::new(),
             }),
         }
@@ -281,6 +315,44 @@ impl Admission {
         !st.p0_queue.is_empty() || st.in_flight.iter().any(|e| e.prio == Priority::Interactive)
     }
 
+    /// Change the shared KV-cache token budget at runtime -- e.g. once the
+    /// engine supervisor learns the real `n_ctx` from `/props` after
+    /// launch, on a backend downgrade that re-runs the fit, or after a
+    /// `local.set_config` resize.
+    ///
+    /// Never evicts to enforce a shrink ("drain, don't evict"): existing
+    /// permits, including interactive ones, are left exactly as they are --
+    /// cancelling an interactive permit to force compliance would kill the
+    /// user's live turn, and preemption is authorised only in service of a
+    /// *waiting* interactive request, never to enforce a capacity change by
+    /// itself. An over-subscribed budget simply admits nothing new until
+    /// enough releases bring it back under the new capacity on their own.
+    ///
+    /// Wakes every waiter so a queued interactive request can immediately
+    /// notice a capacity *increase* rather than sleeping until the next
+    /// unrelated release, and so it can immediately re-evaluate (and return
+    /// [`AdmissionError::TooLarge`], rather than hang forever at the FIFO
+    /// head -- P0 has no timeout by spec) if a *shrink* just made its
+    /// request permanently unsatisfiable.
+    pub fn set_capacity_tokens(&self, tokens: u32) {
+        {
+            let mut st = self.inner.lock();
+            st.capacity_tokens = tokens;
+        }
+        self.inner.notify.notify_waiters();
+    }
+
+    /// Change the per-priority waiting-queue depth cap at runtime. Only
+    /// ever affects new arrivals -- a shrink never evicts a request that is
+    /// already queued.
+    pub fn set_queue_depth(&self, depth: usize) {
+        {
+            let mut st = self.inner.lock();
+            st.queue_depth = depth;
+        }
+        self.inner.notify.notify_waiters();
+    }
+
     /// Acquire an admission slot for `tokens`, at priority `prio`, given
     /// whether the engine is currently ready (`engine_ready` gates only
     /// [`Priority::Background`] -- see [`AdmissionError::Deferred`]).
@@ -288,14 +360,16 @@ impl Admission {
     /// Resolves once admitted; an interactive request waits as long as it
     /// takes (FIFO, no timeout) rather than ever returning a transient
     /// error, short of [`AdmissionError::TooLarge`] or
-    /// [`AdmissionError::QueueFull`] (both permanent for this call).
+    /// [`AdmissionError::QueueFull`] (both permanent for this call --
+    /// though `TooLarge` is re-tested on every wakeup while queued, in case
+    /// a capacity shrink makes an already-queued request newly too large).
     pub async fn acquire(
         &self,
         prio: Priority,
         tokens: u32,
         engine_ready: bool,
     ) -> Result<Permit, AdmissionError> {
-        if tokens > self.inner.capacity_tokens {
+        if tokens > self.inner.lock().capacity_tokens {
             return Err(AdmissionError::TooLarge);
         }
         if prio == Priority::Background && !engine_ready {
@@ -311,7 +385,7 @@ impl Admission {
     async fn acquire_interactive(&self, tokens: u32) -> Result<Permit, AdmissionError> {
         let ticket = {
             let mut st = self.inner.lock();
-            if st.p0_queue.len() >= self.inner.queue_depth {
+            if st.p0_queue.len() >= st.queue_depth {
                 return Err(AdmissionError::QueueFull);
             }
             let ticket = st.next_ticket;
@@ -355,9 +429,18 @@ impl Admission {
             let notified = self.inner.notify.notified();
             {
                 let mut st = self.inner.lock();
+                // Re-tested on every wakeup, regardless of queue position:
+                // a capacity shrink (`set_capacity_tokens`) can make an
+                // already-queued request permanently unsatisfiable, and P0
+                // has no timeout by spec -- without this, such a request
+                // would hang forever at (or behind) the FIFO head, blocking
+                // every interactive arrival behind it too.
+                if tokens > st.capacity_tokens {
+                    return Err(AdmissionError::TooLarge);
+                }
                 if st.p0_queue.front() == Some(&ticket) {
                     let used = in_flight_tokens(&st);
-                    if used.saturating_add(tokens) <= self.inner.capacity_tokens {
+                    if used.saturating_add(tokens) <= st.capacity_tokens {
                         st.p0_queue.pop_front();
                         let id = st.next_id;
                         st.next_id += 1;
@@ -380,7 +463,7 @@ impl Admission {
                             cancel,
                         });
                     }
-                    let need = used.saturating_add(tokens) - self.inner.capacity_tokens;
+                    let need = used.saturating_add(tokens) - st.capacity_tokens;
                     preempt_newest_background(&mut st, need);
                 }
             }
@@ -391,7 +474,7 @@ impl Admission {
     async fn acquire_background(&self, tokens: u32) -> Result<Permit, AdmissionError> {
         {
             let mut st = self.inner.lock();
-            if st.waiting_p1 >= self.inner.queue_depth {
+            if st.waiting_p1 >= st.queue_depth {
                 return Err(AdmissionError::QueueFull);
             }
             st.waiting_p1 += 1;
@@ -413,12 +496,18 @@ impl Admission {
             let notified = self.inner.notify.notified();
             {
                 let mut st = self.inner.lock();
+                // See the matching comment in `acquire_interactive` -- a
+                // capacity shrink can make a queued background request
+                // newly impossible too. Background has no FIFO head to
+                // guard, so this can't block anyone else, but it still
+                // must not wait forever for a budget that will never come.
+                if tokens > st.capacity_tokens {
+                    return Err(AdmissionError::TooLarge);
+                }
                 let no_p0_waiting_or_in_flight = st.p0_queue.is_empty()
                     && !st.in_flight.iter().any(|e| e.prio == Priority::Interactive);
                 let used = in_flight_tokens(&st);
-                if no_p0_waiting_or_in_flight
-                    && used.saturating_add(tokens) <= self.inner.capacity_tokens
-                {
+                if no_p0_waiting_or_in_flight && used.saturating_add(tokens) <= st.capacity_tokens {
                     let id = st.next_id;
                     st.next_id += 1;
                     let cancel = CancellationToken::new();
@@ -442,16 +531,22 @@ impl Admission {
 
 /// Process-wide [`Admission`] singleton for the local engine.
 ///
-/// `capacity_tokens`/`queue_depth` here are a conservative placeholder,
-/// not a real reading of the running engine: [`crate::local::config::CTX_FLOOR`]
-/// is the minimum context size any local install is allowed to run at
-/// (real installs may run larger), and `queue_depth` applies the plan's
+/// The `OnceLock` here is for *identity* only -- every live [`Permit`]'s
+/// `Arc<Inner>` and every `&'static Admission` handle must keep pointing at
+/// the same instance, so this can only ever be constructed once. The
+/// *budget* it starts with is not the real one: [`crate::local::config::CTX_FLOOR`]
+/// is the minimum context size any local install is allowed to run at (real
+/// installs may run larger), and `queue_depth` applies the plan's
 /// `max(16*parallel, 64)` at [`crate::local::config::LocalConfig`]'s
-/// default `parallel` (2). Both real values are only known once an engine
-/// is actually installed and launched -- this module has no dependency on
-/// that (Task 2.9's engine supervisor does) and a `OnceLock` can only be
-/// initialized once, so reconciling this with the real per-install numbers
-/// is left to whoever wires the supervisor up to this singleton.
+/// default `parallel` (2) -- both are only known once an engine is actually
+/// installed and launched, which this module has no dependency on. Task
+/// 2.9's engine supervisor is expected to call
+/// [`Admission::set_capacity_tokens`] with the real `n_ctx` (from
+/// `self_check`/`/props`) right after launch, and again on every
+/// restart/downgrade/model-switch; Task 2.10 calls it again after a
+/// successful `local.set_config`. Until the first such call, admission
+/// conservatively meters against the floor -- under-admitting is safe,
+/// over-admitting is what makes the engine kill colliding slots.
 pub fn admission() -> &'static Admission {
     static ADMISSION: OnceLock<Admission> = OnceLock::new();
     ADMISSION.get_or_init(|| {
@@ -612,6 +707,159 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_second_wakeup_before_the_preempted_permit_releases_does_not_over_cancel() {
+        let a = Admission::new(300, 4);
+        let old_a = a.acquire(Priority::Background, 100, true).await.unwrap();
+        let old_b = a.acquire(Priority::Background, 100, true).await.unwrap();
+        let newest_c = a.acquire(Priority::Background, 50, true).await.unwrap();
+        assert_eq!(a.in_flight(), 3); // used = 250
+
+        let a2 = a.clone();
+        let p0_task =
+            tokio::spawn(async move { a2.acquire(Priority::Interactive, 100, true).await });
+        settle().await;
+        assert!(
+            newest_c.cancel.is_cancelled(),
+            "the newest permit alone (50) covers the 50-token shortfall"
+        );
+        assert!(!old_b.cancel.is_cancelled());
+        assert!(!old_a.cancel.is_cancelled());
+
+        // Trigger a SECOND wakeup of the P0 head while `newest_c` is still
+        // held, unrelated to it: a second interactive arrival that gives up
+        // before winning admission. `TicketGuard::drop` calls
+        // `notify_waiters()`, same as a `Permit` release does -- before the
+        // fix, this re-ran preemption against the same unchanged shortfall
+        // (the cancelled-but-unreleased `newest_c` still counted as "in
+        // flight") and cancelled a fresh victim (`old_b`) on top.
+        let a3 = a.clone();
+        let extra = tokio::spawn(async move { a3.acquire(Priority::Interactive, 1, true).await });
+        settle().await;
+        extra.abort();
+        settle().await;
+
+        assert!(
+            !old_b.cancel.is_cancelled(),
+            "a second wakeup while the first preempted permit is still unreleased must not \
+             cancel a second victim -- the newest permit's tokens already cover the shortfall \
+             once actually released"
+        );
+        assert!(!old_a.cancel.is_cancelled());
+
+        drop(newest_c);
+        let p0 = p0_task
+            .await
+            .unwrap()
+            .expect("admits once the preempted permit actually releases");
+        assert_eq!(a.in_flight(), 3); // old_a + old_b + p0
+        drop(old_a);
+        drop(old_b);
+        drop(p0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interactive_arrival_preempts_two_background_permits_when_the_newest_alone_is_not_enough(
+    ) {
+        let a = Admission::new(300, 4);
+        let bg_old = a.acquire(Priority::Background, 100, true).await.unwrap();
+        let bg_mid = a.acquire(Priority::Background, 80, true).await.unwrap();
+        let bg_new = a.acquire(Priority::Background, 30, true).await.unwrap();
+        assert_eq!(a.in_flight(), 3);
+
+        let a2 = a.clone();
+        let p0_task =
+            tokio::spawn(async move { a2.acquire(Priority::Interactive, 140, true).await });
+        settle().await;
+
+        assert!(
+            bg_new.cancel.is_cancelled(),
+            "the newest permit must be preempted first"
+        );
+        assert!(
+            bg_mid.cancel.is_cancelled(),
+            "the newest alone (30) cannot cover the 50-token shortfall (used 210 + 140 - 300), \
+             so the second-newest must also be preempted"
+        );
+        assert!(
+            !bg_old.cancel.is_cancelled(),
+            "the oldest permit must be left alone once the two newer ones together free \
+             enough budget"
+        );
+
+        drop(bg_new);
+        drop(bg_mid);
+        let p0 = p0_task
+            .await
+            .unwrap()
+            .expect("admits once both preempted permits are actually released");
+        assert_eq!(a.in_flight(), 2); // bg_old + p0
+        drop(bg_old);
+        drop(p0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interactive_arrival_waits_for_other_interactive_to_drain_after_exhausting_all_background_victims(
+    ) {
+        let a = Admission::new(300, 4);
+        // p1_b must be acquired BEFORE p0_a: background admission requires
+        // no interactive request in flight, so acquiring it after would
+        // hang forever (see `background_waits_while_interactive_is_in_flight`).
+        // Interactive admission has no such restriction the other way.
+        let p1_b = a.acquire(Priority::Background, 50, true).await.unwrap();
+        let p0_a = a.acquire(Priority::Interactive, 200, true).await.unwrap();
+
+        let a2 = a.clone();
+        let p0_c_task =
+            tokio::spawn(async move { a2.acquire(Priority::Interactive, 150, true).await });
+        settle().await;
+
+        assert!(
+            p1_b.cancel.is_cancelled(),
+            "the only background permit must be cancelled, even though cancelling it alone \
+             cannot free enough budget"
+        );
+        assert!(
+            !p0_c_task.is_finished(),
+            "must keep waiting -- cancelling every P1 still leaves it short, and P0 is never \
+             preempted for P0"
+        );
+
+        drop(p1_b);
+        settle().await;
+        assert!(
+            !p0_c_task.is_finished(),
+            "still short: only the background permit's 50 tokens freed, the other interactive \
+             permit's 200 still holds the rest"
+        );
+
+        drop(p0_a);
+        let p0_c = p0_c_task
+            .await
+            .unwrap()
+            .expect("admitted once the other interactive permit also drains -- not deadlocked");
+        drop(p0_c);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_queue_full_is_rejected_without_disturbing_the_existing_waiter() {
+        let a = Admission::new(10, 1);
+        let held = a.acquire(Priority::Background, 10, true).await.unwrap();
+
+        let a2 = a.clone();
+        let waiter = tokio::spawn(async move { a2.acquire(Priority::Background, 10, true).await });
+        settle().await;
+
+        let err = a.acquire(Priority::Background, 10, true).await.unwrap_err();
+        assert_eq!(err, AdmissionError::QueueFull);
+
+        drop(held);
+        waiter
+            .await
+            .unwrap()
+            .expect("the original waiter is unaffected by the later rejected arrival");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn interactive_queue_full_is_rejected_without_disturbing_the_existing_waiter() {
         let a = Admission::new(10, 1);
         let held = a.acquire(Priority::Interactive, 10, true).await.unwrap();
@@ -631,6 +879,104 @@ mod tests {
             .await
             .unwrap()
             .expect("the original waiter is unaffected by the later rejected arrival");
+    }
+
+    #[tokio::test]
+    async fn shrinking_capacity_below_current_usage_drains_rather_than_evicts() {
+        let a = Admission::new(100, 4);
+        let held = a.acquire(Priority::Interactive, 100, true).await.unwrap();
+
+        a.set_capacity_tokens(10); // now way over-subscribed
+
+        assert_eq!(
+            a.in_flight(),
+            1,
+            "an existing permit must never be evicted by a shrink"
+        );
+        assert!(
+            !held.cancel.is_cancelled(),
+            "a shrink must never cancel an interactive permit to force compliance"
+        );
+
+        drop(held);
+        assert_eq!(a.in_flight(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_capacity_shrink_below_a_queued_requests_size_resolves_it_as_too_large_instead_of_hanging(
+    ) {
+        let a = Admission::new(100, 4);
+        let held = a.acquire(Priority::Interactive, 100, true).await.unwrap();
+
+        let a2 = a.clone();
+        let waiter = tokio::spawn(async move { a2.acquire(Priority::Interactive, 80, true).await });
+        settle().await;
+        assert!(!waiter.is_finished());
+
+        // Shrink capacity below the queued request's size: it can now
+        // never be admitted no matter how long it waits, and P0 has no
+        // timeout by spec -- without a re-check inside the wait loop this
+        // would hang forever at the FIFO head instead of resolving.
+        a.set_capacity_tokens(50);
+        settle().await;
+
+        let err = waiter.await.unwrap().unwrap_err();
+        assert_eq!(err, AdmissionError::TooLarge);
+
+        drop(held); // still counted against the OLD capacity -- drain, don't evict
+        assert_eq!(a.in_flight(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn increasing_capacity_wakes_a_waiting_interactive_request_immediately() {
+        // Capacity (90) must comfortably exceed the waiter's own request
+        // (80) -- this test is about waiting on current USAGE, not tripping
+        // the entry-level `tokens > capacity` check.
+        let a = Admission::new(90, 4);
+        let held = a.acquire(Priority::Interactive, 50, true).await.unwrap();
+
+        let a2 = a.clone();
+        let waiter = tokio::spawn(async move { a2.acquire(Priority::Interactive, 80, true).await });
+        settle().await;
+        assert!(!waiter.is_finished());
+
+        // Grows enough for both, without `held` ever releasing -- the
+        // waiter must notice via `notify_waiters()`, not by sleeping until
+        // some unrelated release happens to wake it.
+        a.set_capacity_tokens(200);
+        settle().await;
+
+        let permit = waiter
+            .await
+            .unwrap()
+            .expect("admitted once capacity grows enough, without waiting on `held`");
+        drop(held);
+        drop(permit);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shrinking_queue_depth_only_refuses_new_arrivals_not_existing_waiters() {
+        let a = Admission::new(10, 2);
+        let held = a.acquire(Priority::Interactive, 10, true).await.unwrap();
+
+        let a2 = a.clone();
+        let waiter = tokio::spawn(async move { a2.acquire(Priority::Interactive, 10, true).await });
+        settle().await;
+        assert!(!waiter.is_finished());
+
+        a.set_queue_depth(1); // already at/over depth for a NEW arrival now
+
+        let err = a
+            .acquire(Priority::Interactive, 10, true)
+            .await
+            .unwrap_err();
+        assert_eq!(err, AdmissionError::QueueFull);
+
+        drop(held);
+        waiter
+            .await
+            .unwrap()
+            .expect("the existing waiter, queued before the shrink, is unaffected by it");
     }
 
     #[tokio::test]

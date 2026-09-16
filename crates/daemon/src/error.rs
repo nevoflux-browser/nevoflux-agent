@@ -89,6 +89,15 @@ pub enum DaemonError {
     #[error("lint timeout for composition {composition_id}")]
     LintTimeout { composition_id: String },
 
+    /// Local-engine admission was refused or interrupted (Task 2.7,
+    /// `crate::local::admission`). Kept structured rather than flattened
+    /// into `InternalError` so a caller near the RPC surface (Task 2.10)
+    /// can tell "engine starting" (`Deferred`), "shrink the request"
+    /// (`TooLarge`), "back off" (`QueueFull`) and "retried and lost"
+    /// (`Preempted`) apart without string-matching an error message.
+    #[error("Admission error: {0}")]
+    Admission(#[from] crate::local::admission::AdmissionError),
+
     /// Template substitution failed.
     #[error("template substitution failed for '{template}': missing placeholders {missing:?}")]
     TemplateSubstitutionFailed {
