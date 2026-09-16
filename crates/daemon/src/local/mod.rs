@@ -7,13 +7,21 @@
 //! `crate::local::sync`: the latch's config-change hook, which keeps the
 //! llm-gateway's upstream (`crate::llm_gateway::apply_latch`) and a
 //! `system:local:latch_changed` broadcast (topic:
-//! `crate::local::latch::TOPIC_LATCH`) in sync with the latch. A later
-//! task adds the engine supervisor that publishes to the endpoint
-//! registry and calls [`apply_gateway_upstream_for_latch`] when it does.
+//! `crate::local::latch::TOPIC_LATCH`) in sync with the latch. Task 2.1
+//! adds three pure-logic modules with no engine-process dependency:
+//! `gguf` (a hand-rolled GGUF header reader), `catalog` (the known models
+//! and their download sources), and `memory` (KV-cache/compute size
+//! estimation and GPU/CPU fit selection). A later task adds the engine
+//! supervisor that publishes to the endpoint registry, calls
+//! [`apply_gateway_upstream_for_latch`] when it does, and uses `catalog`
+//! + `memory` to decide what to launch and how.
 
+pub mod catalog;
 pub mod config;
 pub mod endpoint;
+pub mod gguf;
 pub mod latch;
+pub mod memory;
 pub mod sync;
 pub use config::*;
 pub use sync::{apply_gateway_upstream_for_latch, on_config_changed, publish_current_latch_state};
