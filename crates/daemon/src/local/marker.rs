@@ -140,9 +140,24 @@ pub enum TagStatus {
 /// anything but the pinned tag until a future daemon update adds compatible
 /// entries.
 pub fn tag_status(tag: &str) -> TagStatus {
-    if tag == release::ENGINE_PINNED.tag {
+    tag_status_in(tag, &release::ENGINE_PINNED, release::ENGINE_COMPATIBLE)
+}
+
+/// [`tag_status`], parameterized over the pinned/compatible release lists
+/// instead of reading `release::ENGINE_PINNED`/`release::ENGINE_COMPATIBLE`
+/// directly -- so a test can exercise the [`TagStatus::Compatible`] branch
+/// against a synthetic list without waiting for the real, currently-empty
+/// `ENGINE_COMPATIBLE` to gain an entry (Task 2.5 review finding 3). Mirrors
+/// the same shape `release::upstream_tag_for(tag, pinned, compatible)`
+/// already uses in this codebase for the identical problem.
+fn tag_status_in(
+    tag: &str,
+    pinned: &release::EngineRelease,
+    compatible: &[release::EngineRelease],
+) -> TagStatus {
+    if tag == pinned.tag {
         TagStatus::Pinned
-    } else if release::ENGINE_COMPATIBLE.iter().any(|r| r.tag == tag) {
+    } else if compatible.iter().any(|r| r.tag == tag) {
         TagStatus::Compatible
     } else {
         TagStatus::Unsupported
@@ -294,6 +309,47 @@ mod tests {
         // through to Unsupported -- not a special case, just what an empty
         // list naturally produces.
         assert_eq!(tag_status("totally-unknown-tag"), TagStatus::Unsupported);
+    }
+
+    /// `tag_status` itself can't exercise `TagStatus::Compatible` today --
+    /// `release::ENGINE_COMPATIBLE` is `&[]` (the pinned tag is the first
+    /// ever pinned release). `tag_status_in` (Task 2.5 review finding 3)
+    /// makes the same classification testable against a synthetic list, the
+    /// same way `release::upstream_tag_for`'s own tests already do for an
+    /// analogous pinned/compatible lookup.
+    #[test]
+    fn tag_status_in_recognizes_a_synthetic_compatible_tag() {
+        use crate::local::release::{EngineAsset, EngineRelease};
+
+        fn synthetic(tag: &'static str) -> EngineRelease {
+            EngineRelease {
+                tag,
+                upstream_tag: "irrelevant",
+                archives: &[],
+                cudart: &[],
+                source: EngineAsset {
+                    name: "x",
+                    bytes: 0,
+                    sha256: "x",
+                },
+            }
+        }
+
+        let pinned = synthetic("pinned-tag");
+        let compatible = [synthetic("old-compatible-tag")];
+
+        assert_eq!(
+            tag_status_in("old-compatible-tag", &pinned, &compatible),
+            TagStatus::Compatible
+        );
+        assert_eq!(
+            tag_status_in("pinned-tag", &pinned, &compatible),
+            TagStatus::Pinned
+        );
+        assert_eq!(
+            tag_status_in("neither-tag", &pinned, &compatible),
+            TagStatus::Unsupported
+        );
     }
 
     // --- should_gc -----------------------------------------------------------
