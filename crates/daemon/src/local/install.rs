@@ -779,7 +779,13 @@ fn check_present(dir: &Path, pattern: &str) -> Result<(), String> {
     }
 }
 
-fn sha256_file_sync(path: &Path) -> std::io::Result<String> {
+/// Hashes one file's contents as sha256, streaming in fixed-size chunks
+/// rather than reading it whole into memory (an engine archive's largest
+/// extracted file can be several hundred MB). `pub(crate)` rather than
+/// private: `crate::local::integrity::verify_manifest` (Task 2.5) reuses
+/// this exact routine for its cold-start file-by-file re-hash against the
+/// install marker's manifest, rather than duplicating it.
+pub(crate) fn sha256_file_sync(path: &Path) -> std::io::Result<String> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();

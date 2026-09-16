@@ -23,18 +23,26 @@
 //! atomically installing one release's archives for a given `InstallKind`,
 //! plus `marker` (the on-disk record of a completed install) and `state`
 //! (today, just the shared `LocalError` type `install` returns -- Task 2.8
-//! grows this into the full state/event model). A later task adds the
-//! engine supervisor that publishes to the endpoint registry, calls
-//! [`apply_gateway_upstream_for_latch`] when it does, and uses `catalog` +
-//! `memory` + `hardware` + `release` + `install` to decide what to
+//! grows this into the full state/event model). Task 2.5 adds `harden`
+//! (the exact argv/env an engine launch is allowed, so the process
+//! Task 2.9 spawns can never expose `llama-server`'s web UI, agent tools,
+//! or MCP attachment), `integrity` (a cold-start full re-hash of an
+//! installed directory against its marker's manifest), and grows `marker`
+//! with the upgrade/GC policy (`marker::tag_status`, `marker::should_gc`).
+//! A later task adds the engine supervisor that publishes to the endpoint
+//! registry, calls [`apply_gateway_upstream_for_latch`] when it does, and
+//! uses `catalog` + `memory` + `hardware` + `release` + `install` +
+//! `harden` + `integrity` + `marker`'s policy functions to decide what to
 //! install/launch and how.
 
 pub mod catalog;
 pub mod config;
 pub mod endpoint;
 pub mod gguf;
+pub mod harden;
 pub mod hardware;
 pub mod install;
+pub mod integrity;
 pub mod latch;
 pub mod marker;
 pub mod memory;

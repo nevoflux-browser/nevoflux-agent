@@ -1,4 +1,5 @@
-//! The on-disk marker that records a completed engine install.
+//! The on-disk marker that records a completed engine install, plus the
+//! upgrade/GC policy decided purely from it.
 //!
 //! `crate::local::install::install` writes one of these into an install
 //! directory once every archive has downloaded, verified, and extracted
@@ -7,8 +8,18 @@
 //! later run (the engine supervisor, Task 2.9) reads it back to decide
 //! whether an already-installed directory can be trusted without
 //! redownloading anything.
+//!
+//! Task 2.5 adds the policy functions that read a [`Marker`] without
+//! writing one: [`tag_status`] classifies a release tag against
+//! `crate::local::release::ENGINE_PINNED`/`ENGINE_COMPATIBLE`, and
+//! [`should_gc`] decides whether an old install directory is safe to
+//! delete. Neither touches disk -- both are pure decisions over data the
+//! caller (Task 2.9) already has in hand, so they can be unit tested
+//! without a filesystem.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use crate::local::release;
 
 pub const MARKER_FILE: &str = "marker.json";
 
@@ -100,6 +111,70 @@ pub fn write_marker(dir: &Path, m: &Marker) -> std::io::Result<()> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp_path, &final_path)
+}
+
+/// How a release tag relates to what this daemon build currently knows how
+/// to run, per [`tag_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagStatus {
+    /// `crate::local::release::ENGINE_PINNED`'s own tag -- the release this
+    /// daemon build installs fresh today.
+    Pinned,
+    /// One of `crate::local::release::ENGINE_COMPATIBLE`'s tags -- an older
+    /// pinned release this build still knows how to run, kept so a machine
+    /// already running it isn't forced to redownload on every daemon
+    /// update.
+    Compatible,
+    /// Neither -- a tag this build has no archive table entry for at all
+    /// (e.g. left over from a much older daemon version, or a foreign
+    /// directory). [`should_gc`] treats this the same as a stale
+    /// `Compatible` install: eligible once old and unused, never protected
+    /// just because it happens to still be on disk.
+    Unsupported,
+}
+
+/// Classifies `tag` against this build's known releases. `ENGINE_COMPATIBLE`
+/// is empty today (`b10909-mix-bea84f7` is the first pinned tag, per its own
+/// doc comment) -- that isn't special-cased here; an empty list simply never
+/// matches, and `tag_status` returns [`TagStatus::Unsupported`] for
+/// anything but the pinned tag until a future daemon update adds compatible
+/// entries.
+pub fn tag_status(tag: &str) -> TagStatus {
+    if tag == release::ENGINE_PINNED.tag {
+        TagStatus::Pinned
+    } else if release::ENGINE_COMPATIBLE.iter().any(|r| r.tag == tag) {
+        TagStatus::Compatible
+    } else {
+        TagStatus::Unsupported
+    }
+}
+
+/// How long an unpinned, unused install is kept around before it becomes
+/// eligible for garbage collection.
+const GC_AGE_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// Whether the install directory `dir` (recorded by `m`) may be deleted:
+/// `m`'s tag is neither [`TagStatus::Pinned`] nor [`TagStatus::Compatible`]
+/// (both are kept forever, however old or idle), `now - m.last_used_at` is
+/// STRICTLY greater than 30 days (exactly 30 days is not yet eligible), and
+/// `dir` is not one of `in_use_dirs` (e.g. the install an already-running
+/// engine process has open) -- a directory a live process still has files
+/// open in must never be deleted regardless of how old its marker's
+/// `last_used_at` is.
+pub fn should_gc(m: &Marker, now: i64, in_use_dirs: &[PathBuf], dir: &Path) -> bool {
+    if matches!(
+        tag_status(&m.tag),
+        TagStatus::Pinned | TagStatus::Compatible
+    ) {
+        return false;
+    }
+    if now.saturating_sub(m.last_used_at) <= GC_AGE_SECS {
+        return false;
+    }
+    if in_use_dirs.iter().any(|d| d == dir) {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -198,5 +273,87 @@ mod tests {
         m.tag = "some-other-tag".to_string(); // the dir name no longer starts with "{tag}-"
         write_marker(&dir, &m).unwrap();
         assert_eq!(read_marker(&dir), None);
+    }
+
+    // --- tag_status --------------------------------------------------------
+
+    #[test]
+    fn tag_status_recognizes_the_pinned_tag() {
+        // sample_marker()'s tag ("b10909-mix-bea84f7") is deliberately the
+        // real ENGINE_PINNED tag, not a fixture string -- see sample_marker.
+        assert_eq!(
+            tag_status(crate::local::release::ENGINE_PINNED.tag),
+            TagStatus::Pinned
+        );
+    }
+
+    #[test]
+    fn tag_status_is_unsupported_for_an_unrecognized_tag() {
+        // ENGINE_COMPATIBLE is empty today (the pinned tag is the first
+        // ever pinned release), so every non-pinned tag currently falls
+        // through to Unsupported -- not a special case, just what an empty
+        // list naturally produces.
+        assert_eq!(tag_status("totally-unknown-tag"), TagStatus::Unsupported);
+    }
+
+    // --- should_gc -----------------------------------------------------------
+
+    /// A marker with `tag`/`last_used_at` overridden from `sample_marker()`,
+    /// so each `should_gc` test only has to state what it's actually
+    /// varying.
+    fn marker_with(tag: &str, last_used_at: i64) -> Marker {
+        let mut m = sample_marker();
+        m.tag = tag.to_string();
+        m.last_used_at = last_used_at;
+        m
+    }
+
+    #[test]
+    fn should_gc_protects_the_pinned_tag_even_when_old_and_unused() {
+        let now = 2_000_000_000;
+        let m = marker_with(release::ENGINE_PINNED.tag, now - GC_AGE_SECS - 1);
+        assert!(!should_gc(&m, now, &[], Path::new("/installs/x")));
+    }
+
+    #[test]
+    fn should_gc_protects_a_directory_that_is_in_use_regardless_of_age() {
+        let now = 2_000_000_000;
+        let m = marker_with("some-other-tag", now - GC_AGE_SECS - 1);
+        let dir = PathBuf::from("/installs/x");
+        assert!(!should_gc(&m, now, &[dir.clone()], &dir));
+    }
+
+    #[test]
+    fn should_gc_is_false_exactly_at_the_30_day_boundary() {
+        let now = 2_000_000_000;
+        let m = marker_with("some-other-tag", now - GC_AGE_SECS);
+        assert!(
+            !should_gc(&m, now, &[], Path::new("/installs/x")),
+            "exactly 30 days old must not yet be eligible"
+        );
+    }
+
+    #[test]
+    fn should_gc_is_true_one_second_past_the_30_day_boundary() {
+        let now = 2_000_000_000;
+        let m = marker_with("some-other-tag", now - GC_AGE_SECS - 1);
+        assert!(should_gc(&m, now, &[], Path::new("/installs/x")));
+    }
+
+    #[test]
+    fn should_gc_is_false_for_a_recently_used_unpinned_tag() {
+        let now = 2_000_000_000;
+        let m = marker_with("some-other-tag", now - 1_000);
+        assert!(!should_gc(&m, now, &[], Path::new("/installs/x")));
+    }
+
+    #[test]
+    fn should_gc_is_false_for_an_unsupported_but_still_in_use_directory_even_when_ancient() {
+        // Unsupported (not just Compatible) still isn't enough to override
+        // the in-use guard.
+        let now = 2_000_000_000;
+        let m = marker_with("ancient-unknown-tag", 0);
+        let dir = PathBuf::from("/installs/ancient");
+        assert!(!should_gc(&m, now, &[dir.clone()], &dir));
     }
 }
