@@ -10,7 +10,7 @@
 //! it returns the ordered list of [`InstallKind`]s to try, most-preferred
 //! first.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::local::config::BackendPref;
@@ -81,9 +81,19 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// and macOS adds two more (`sysctl`, `sw_vers`), so a per-invocation-only
 /// [`PROBE_TIMEOUT`] could total 25s in the worst case. [`probe`] instead
 /// wraps the whole gathering sequence in one `tokio::time::timeout` at
-/// this budget and returns a bare os/arch fingerprint (everything else
-/// defaulted) if it fires.
-const PROBE_TOTAL_BUDGET: Duration = Duration::from_secs(5);
+/// this budget.
+///
+/// Kept strictly above [`PROBE_TIMEOUT`] (controller ruling R47): a total
+/// budget equal to a single probe's own timeout would let one
+/// slow-but-working call consume the *entire* budget and starve every
+/// probe scheduled after it — stricter than the per-call scheme this
+/// replaced, not looser. `probe_inner` writes each field into a shared
+/// slot as soon as it is gathered (see [`probe`]), so a budget cutoff
+/// returns whatever completed before the cutoff — with a `tracing::warn!`
+/// — rather than discarding the whole probe: a GPU found by the first,
+/// fast step is not erased just because a later, slower step (e.g.
+/// macOS's `sysctl`/`sw_vers`) ran out of budget.
+const PROBE_TOTAL_BUDGET: Duration = Duration::from_secs(10);
 
 static CACHED: Mutex<Option<HardwareProbe>> = Mutex::new(None);
 
@@ -91,34 +101,46 @@ static CACHED: Mutex<Option<HardwareProbe>> = Mutex::new(None);
 /// startup (v3 §10) — only on demand, by whichever later task needs to
 /// decide what to install/launch. Updates [`cached`]'s value. Bounded end
 /// to end by [`PROBE_TOTAL_BUDGET`], regardless of how many subprocesses
-/// or filesystem probes it runs internally.
+/// or filesystem probes it runs internally — and, if that budget is
+/// exceeded, returns whatever fields [`probe_inner`] had already written
+/// to `partial` rather than discarding the whole probe (see
+/// [`PROBE_TOTAL_BUDGET`]'s doc comment).
 pub async fn probe() -> HardwareProbe {
     let os = std::env::consts::OS.to_string();
     let arch = std::env::consts::ARCH.to_string();
 
-    let result = match tokio::time::timeout(
+    let partial = Arc::new(Mutex::new(HardwareProbe {
+        os: os.clone(),
+        arch: arch.clone(),
+        ..Default::default()
+    }));
+
+    let timed_out = tokio::time::timeout(
         PROBE_TOTAL_BUDGET,
-        probe_inner(os.clone(), arch.clone()),
+        probe_inner(Arc::clone(&partial), os.clone()),
     )
     .await
-    {
-        Ok(result) => result,
-        Err(_) => {
-            tracing::warn!(
-                budget_secs = PROBE_TOTAL_BUDGET.as_secs(),
-                %os,
-                %arch,
-                "local::hardware::probe exceeded its total time budget; returning a bare os/arch fingerprint with everything else defaulted"
-            );
-            HardwareProbe {
-                os,
-                arch,
-                ..Default::default()
-            }
-        }
-    };
+    .is_err();
 
-    tracing::debug!(?result, "local::hardware::probe complete");
+    let result = partial
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or(HardwareProbe {
+            os: os.clone(),
+            arch: arch.clone(),
+            ..Default::default()
+        });
+
+    if timed_out {
+        tracing::warn!(
+            budget_secs = PROBE_TOTAL_BUDGET.as_secs(),
+            %os,
+            %arch,
+            "local::hardware::probe exceeded its total time budget; returning whatever fields were gathered before the cutoff, not a bare fingerprint"
+        );
+    }
+
+    tracing::debug!(?result, timed_out, "local::hardware::probe complete");
 
     if let Ok(mut guard) = CACHED.lock() {
         *guard = Some(result.clone());
@@ -128,13 +150,23 @@ pub async fn probe() -> HardwareProbe {
 }
 
 /// The actual gathering sequence, factored out of [`probe`] so the latter
-/// can wrap it in one [`PROBE_TOTAL_BUDGET`]-wide timeout.
-async fn probe_inner(os: String, arch: String) -> HardwareProbe {
+/// can wrap it in one [`PROBE_TOTAL_BUDGET`]-wide timeout. Writes each
+/// field into `partial` as soon as it is available (rather than only
+/// assembling one `HardwareProbe` at the very end) so that if the outer
+/// timeout fires and drops this future mid-flight, whatever had already
+/// been written survives in the shared slot for `probe` to return.
+async fn probe_inner(partial: Arc<Mutex<HardwareProbe>>, os: String) {
     let (nvidia_gpus, driver_cuda_version) = probe_nvidia().await;
     let has_physical_nvidia = !nvidia_gpus.is_empty();
     let cuda_visible_devices = std::env::var("CUDA_VISIBLE_DEVICES").ok();
     let has_usable_nvidia =
         has_physical_nvidia && !visible_devices_hide_all(cuda_visible_devices.as_deref());
+    if let Ok(mut g) = partial.lock() {
+        g.nvidia_gpus = nvidia_gpus;
+        g.has_physical_nvidia = has_physical_nvidia;
+        g.has_usable_nvidia = has_usable_nvidia;
+        g.driver_cuda_version = driver_cuda_version;
+    }
 
     // Both do synchronous filesystem globbing (up to eight `glob::glob`
     // walks on Linux: 2 cudart majors + Vulkan loader + Vulkan ICD, each
@@ -146,26 +178,28 @@ async fn probe_inner(os: String, arch: String) -> HardwareProbe {
             .await
             .unwrap_or_default()
     };
+    if let Ok(mut g) = partial.lock() {
+        g.cuda_runtime_lines = cuda_runtime_lines;
+    }
+
     let vulkan_available = {
         let os = os.clone();
         tokio::task::spawn_blocking(move || probe_vulkan_available(&os))
             .await
             .unwrap_or(false)
     };
-    let ram_bytes = probe_ram_bytes(&os).await;
-    let macos_version = probe_macos_version(&os).await;
+    if let Ok(mut g) = partial.lock() {
+        g.vulkan_available = vulkan_available;
+    }
 
-    HardwareProbe {
-        os,
-        arch,
-        nvidia_gpus,
-        has_physical_nvidia,
-        has_usable_nvidia,
-        driver_cuda_version,
-        cuda_runtime_lines,
-        vulkan_available,
-        ram_bytes,
-        macos_version,
+    let ram_bytes = probe_ram_bytes(&os).await;
+    if let Ok(mut g) = partial.lock() {
+        g.ram_bytes = ram_bytes;
+    }
+
+    let macos_version = probe_macos_version(&os).await;
+    if let Ok(mut g) = partial.lock() {
+        g.macos_version = macos_version;
     }
 }
 
