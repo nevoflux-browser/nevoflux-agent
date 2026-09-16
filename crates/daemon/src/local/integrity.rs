@@ -51,7 +51,10 @@ pub enum IntegrityError {
     HashMismatch(String),
     /// A file exists in the install directory that the manifest never
     /// recorded -- added post-install (e.g. a planted DLL), not merely
-    /// missing or altered.
+    /// missing or altered. Also reported for a symlink found anywhere in
+    /// the tree (never followed): Task 2.4's extractor never creates one,
+    /// so its mere presence means the directory was tampered with after
+    /// install (Task 2.5 review round 2, finding 2).
     Unexpected(String),
     /// The check itself could not complete: a real I/O error (permissions,
     /// a failing disk, a directory that could not be listed) distinct from
@@ -149,6 +152,23 @@ fn resolve(dir: &Path, rel: &str) -> PathBuf {
 /// itself cannot be walked -- a check that could not even enumerate the
 /// directory has learned nothing, which is not the same as "nothing extra
 /// was found".
+///
+/// A symlink (to a file OR a directory) fails immediately as
+/// [`IntegrityError::Unexpected`] rather than being silently skipped or
+/// followed (Task 2.5 review round 2, finding 2). `DirEntry::file_type`
+/// does not follow symlinks -- it reports the entry's OWN type -- so
+/// without an explicit `is_symlink()` check, a symlink is neither `is_dir()`
+/// nor `is_file()` and the original version of this function fell through
+/// both branches and simply never saw it: invisible to the exact-set check
+/// this function exists to run. `crate::local::install::extract_tar_gz`
+/// already documents that Task 2.4's extractor skips symlink/hardlink tar
+/// entries outright ("Whitelist, not blacklist... no engine archive needs
+/// one"), so a correctly-extracted install can never legitimately contain
+/// one; any symlink found here was planted after the fact. It must not be
+/// followed either: a symlinked directory recursed into could point
+/// anywhere else on disk, and a symlinked file's target is exactly the
+/// "malicious DLL elsewhere, loaded via `cwd`-relative resolution" attack
+/// this whole check exists to catch.
 fn list_files_relative(
     root: &Path,
     current: &Path,
@@ -162,11 +182,18 @@ fn list_files_relative(
         let file_type = entry
             .file_type()
             .map_err(|e| IntegrityError::Io(format!("{}: {e}", path.display())))?;
-        if file_type.is_dir() {
+        let rel = || {
+            path.strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+        if file_type.is_symlink() {
+            return Err(IntegrityError::Unexpected(rel()));
+        } else if file_type.is_dir() {
             list_files_relative(root, &path, out)?;
         } else if file_type.is_file() {
-            let rel = path.strip_prefix(root).unwrap_or(&path);
-            out.push(rel.to_string_lossy().replace('\\', "/"));
+            out.push(rel());
         }
     }
     Ok(())
@@ -337,6 +364,67 @@ mod tests {
             sha256: sha256_hex(b"binary-content"),
         }];
         assert_eq!(verify_manifest(dir.path(), &files), Ok(()));
+    }
+
+    // --- symlinks (Task 2.5 review round 2, finding 2) -----------------------
+    //
+    // Symlink creation on Windows normally requires elevated privileges or
+    // Developer Mode, so these are `#[cfg(unix)]`-only and do not run on
+    // this development machine -- the production code path
+    // (`FileType::is_symlink()`) is cross-platform and applies identically
+    // on Windows, but is exercised here only on Unix. This joins the set of
+    // platform-gated tests Task 5.4 must declare as not run on this host
+    // (alongside the pre-existing Linux/macOS-only tests in `install.rs`).
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_file_inside_the_install_directory_is_flagged_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("llama-server"), b"binary-content").unwrap();
+
+        // Points at a file entirely outside the install directory -- the
+        // real attack shape (a malicious .so elsewhere on disk), not merely
+        // a symlink to something harmless inside the same directory.
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("evil.so"), b"payload").unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("evil.so"),
+            dir.path().join("libggml-cuda.so"),
+        )
+        .unwrap();
+
+        let files = vec![FileEntry {
+            path: "llama-server".to_string(),
+            size: b"binary-content".len() as u64,
+            sha256: sha256_hex(b"binary-content"),
+        }];
+        assert_eq!(
+            verify_manifest(dir.path(), &files),
+            Err(IntegrityError::Unexpected("libggml-cuda.so".to_string()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_inside_the_install_directory_is_flagged_not_recursed_into() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("llama-server"), b"binary-content").unwrap();
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("inner"), b"z").unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("linked")).unwrap();
+
+        let files = vec![FileEntry {
+            path: "llama-server".to_string(),
+            size: b"binary-content".len() as u64,
+            sha256: sha256_hex(b"binary-content"),
+        }];
+        // Reports the symlink itself, "linked" -- never descends into it to
+        // find (or miss) "inner".
+        assert_eq!(
+            verify_manifest(dir.path(), &files),
+            Err(IntegrityError::Unexpected("linked".to_string()))
+        );
     }
 
     // --- Io vs Missing (Task 2.5 review finding 6) ---------------------------

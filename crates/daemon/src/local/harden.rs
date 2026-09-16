@@ -32,14 +32,16 @@
 //!   can reach the child.
 //!
 //! That second layer only holds if the child process's environment is
-//! actually *replaced* by `SpawnSpec.env`, not merged onto whatever the
-//! daemon process itself inherited -- `Command::envs(spec.env)` alone
-//! compiles fine and does the wrong thing. [`SpawnSpec::to_command`] is the
-//! only supported way to turn a [`SpawnSpec`] into a runnable
-//! `std::process::Command`: it calls `env_clear()` internally before
-//! applying `spec.env`, so that step is enforced by the API shape rather
-//! than by a comment Task 2.9 has to remember to honor (Task 2.5 review
-//! finding 2).
+//! actually *replaced* by the env this module computed, not merged onto
+//! whatever the daemon process itself inherited. Task 2.5 review round 2
+//! made this a compile-time guarantee, not just a documented one:
+//! [`SpawnSpec`]'s fields are private, so `Command::new(spec.program)
+//! .envs(spec.env)` does not compile at all -- there is no field to reach
+//! for. [`SpawnSpec::to_command`] is the ONLY way to obtain a runnable
+//! `std::process::Command`; it calls `env_clear()` internally before
+//! applying the environment, so a Task 2.9 author who never read this
+//! review cannot accidentally write the unsafe spelling -- the natural,
+//! lazy way to spawn is the safe one.
 //!
 //! The API key itself never appears in argv (`--api-key`/`--api-key-file`
 //! are themselves in [`FORBIDDEN_FLAGS]` for exactly this reason): it
@@ -55,20 +57,52 @@ use std::process::Command;
 use crate::local::config::{KvCacheType, CTX_FLOOR};
 
 /// The exact argv, environment, program, and working directory an engine
-/// launch spawns with. Turn this into a runnable process only via
-/// [`SpawnSpec::to_command`] -- never by hand-assembling a
-/// `std::process::Command` from these public fields, which would compile
-/// but silently merge `env` onto the daemon's own inherited environment
-/// instead of replacing it (see the module doc comment).
+/// launch spawns with. Every field is **private** (Task 2.5 review round 2,
+/// finding 1): the only way to obtain a runnable process is
+/// [`SpawnSpec::to_command`], which calls `env_clear()` before applying the
+/// environment this module computed. Making the fields private is the
+/// point, not an implementation detail -- a future Task 2.9 author who
+/// never read this review otherwise has a compiling, obvious-looking
+/// spelling (`Command::new(spec.program).envs(spec.env)`) that silently
+/// merges onto the daemon's own inherited environment instead of replacing
+/// it, and nothing (no test, no lint) would catch it.
+///
+/// [`SpawnSpec::program`], [`SpawnSpec::args`], and [`SpawnSpec::cwd`] are
+/// exposed read-only, for logging/assertions -- reading them back out
+/// creates no way to bypass `to_command`. `env` deliberately has **no**
+/// public accessor: anything that hands `env` back in a shape usable with
+/// `.envs()` directly (a `&[(String, String)]`, an iterator of `(&str,
+/// &str)`, etc.) recreates exactly the hole this privacy change exists to
+/// close, so there is nothing to expose beyond what `to_command` already
+/// does with it. (Tests inside this module's own `tests` submodule can
+/// still construct a `SpawnSpec` literal and read `.env` directly -- that
+/// is ordinary Rust private-field visibility for a descendant module, not
+/// a separate accessor, and grants no such access to anything outside this
+/// file.)
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpawnSpec {
-    pub program: PathBuf,
-    pub args: Vec<String>,
-    pub env: Vec<(String, String)>,
-    pub cwd: PathBuf,
+    program: PathBuf,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    cwd: PathBuf,
 }
 
 impl SpawnSpec {
+    /// The program path this spec spawns.
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// The argv this spec spawns with (excluding the program itself).
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    /// The working directory this spec spawns in.
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
     /// The only supported way to turn this [`SpawnSpec`] into a runnable
     /// `std::process::Command`. Calls `env_clear()` before applying
     /// `self.env` -- v3 §16.1 row 2 treats this as part of the LocalOnly
