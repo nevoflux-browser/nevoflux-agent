@@ -194,12 +194,11 @@ impl<R: Read> Reader<R> {
                 // size before looping — a corrupted count (e.g. near
                 // `u64::MAX`) would otherwise spin through this loop
                 // billions of times before `skip_value` eventually errors
-                // out from real EOF. `checked_mul` treats an overflowing
-                // "minimum bytes needed" as unconditionally too large
-                // (`u64::MAX`), which always fails `ensure_remaining`.
-                let min_needed = count
-                    .checked_mul(elem_type.min_encoded_size())
-                    .unwrap_or(u64::MAX);
+                // out from real EOF. `saturating_mul` treats an
+                // overflowing "minimum bytes needed" as unconditionally
+                // too large (`u64::MAX`), which always fails
+                // `ensure_remaining`.
+                let min_needed = count.saturating_mul(elem_type.min_encoded_size());
                 self.ensure_remaining(min_needed)?;
                 for _ in 0..count {
                     self.skip_value(elem_type)?;
