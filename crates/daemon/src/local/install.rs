@@ -41,19 +41,29 @@ pub fn engine_root() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("nevoflux").join("engine"))
 }
 
+/// The `<platform>-<backend>[-<variant>]` identity string for `kind` --
+/// shared by [`install_dir`] (as the tail of the directory name) and
+/// [`install`]'s `Marker.kind` (the whole string), so the two can never
+/// drift apart. `crate::local::marker::read_marker` relies on that
+/// equality to verify a marker matches the directory it was found in
+/// (controller ruling on Task 2.4 review finding M4).
+fn kind_suffix(kind: &InstallKind) -> String {
+    let mut s = format!("{}-{}", kind.platform, backend_slug(kind.backend));
+    if let Some(variant) = &kind.variant {
+        s.push('-');
+        s.push_str(variant);
+    }
+    s
+}
+
 /// The directory one specific (release tag, install kind) installs into:
-/// `<tag>-<platform>-<backend>[-<variant>]`. Deterministic and collision-free
-/// across every kind a single pinned release ships (see
+/// `<tag>-<kind_suffix>`. Deterministic and collision-free across every
+/// kind a single pinned release ships (see
 /// `local::release::tests::every_hardware_probe_install_kind_resolves_to_a_pinned_archive`
 /// for why `(platform, backend, variant)` alone already uniquely identifies
 /// an archive).
 pub fn install_dir(root: &Path, tag: &str, kind: &InstallKind) -> PathBuf {
-    let mut name = format!("{tag}-{}-{}", kind.platform, backend_slug(kind.backend));
-    if let Some(variant) = &kind.variant {
-        name.push('-');
-        name.push_str(variant);
-    }
-    root.join(name)
+    root.join(format!("{tag}-{}", kind_suffix(kind)))
 }
 
 fn backend_slug(backend: Backend) -> &'static str {
@@ -85,9 +95,15 @@ pub fn available_bytes(path: &Path) -> std::io::Result<u64> {
 }
 
 /// Progress reported by [`install`] as it moves through its phases.
-/// `Downloading` may fire many times per archive (once per received chunk);
-/// `Extracting` and `Verifying` each fire once, marking the start of that
-/// phase across every archive in this install.
+/// `Downloading{done, total}` is aggregated across every archive in this
+/// install (Task 2.4 review finding M3): `total` is the combined size of
+/// every archive the group needs (the main platform/backend archive, plus
+/// a Windows CUDA cudart archive when one is paired in), and `done` is
+/// monotonically non-decreasing across the whole download phase -- a
+/// per-archive reset back to zero partway through a Windows CUDA install
+/// would make a progress bar driven off this jump backwards. `Extracting`
+/// and `Verifying` each fire once, marking the start of that phase across
+/// every archive in the group.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum InstallProgress {
@@ -108,15 +124,22 @@ fn now_unix() -> i64 {
 /// `root`. Returns the final install directory on success.
 ///
 /// Steps: disk precheck -> fetch every archive into `root/.staging/<name>`
-/// (trying `release::mirror_sources` in order) -> extract each into a
-/// shared `root/.staging/<dir>.tmp/` (a Windows CUDA app archive and its
-/// cudart archive merge into the SAME tmp dir, since the cudart DLLs need
-/// to sit alongside `llama-server.exe`) -> check `sentinels_ok` -> hash
-/// every extracted file into a manifest -> atomically rename the tmp dir
-/// into its final [`install_dir`] location -> write the
-/// [`crate::local::marker::Marker`] -> delete the staged archive files.
-/// Any failure from extraction onward removes the shared tmp dir, which
-/// covers both archives in a Windows CUDA group since they share it.
+/// (trying `release::mirror_sources` in order; a source whose bytes fail
+/// the pinned sha256 is deleted, never left on disk to be resumed forever
+/// -- `models::fetch::fetch_to`'s own behavior, reused here rather than
+/// reimplemented) -> extract each into a shared `root/.staging/<dir>.tmp/`
+/// (a Windows CUDA app archive and its cudart archive merge into the SAME
+/// tmp dir, since the cudart DLLs need to sit alongside `llama-server.exe`)
+/// -> check `sentinels_ok` -> hash every extracted file into a manifest ->
+/// atomically rename the tmp dir into its final [`install_dir`] location ->
+/// write the [`crate::local::marker::Marker`] -> delete the staged archive
+/// files. Any failure from extraction onward removes the shared tmp dir,
+/// which covers both archives in a Windows CUDA group since they share it.
+/// A target directory that already holds a *valid* marker for this exact
+/// (tag, kind) is treated as an already-completed install (Task 2.4 review
+/// finding M2): the freshly built tmp dir is discarded and `Ok(final_dir)`
+/// is returned, rather than attempting a rename onto a non-empty
+/// destination that can only ever fail.
 pub async fn install(
     rel: &EngineRelease,
     kind: &InstallKind,
@@ -161,13 +184,25 @@ pub async fn install(
             detail: format!("http client: {e}"),
         })?;
 
+    // Aggregated across the whole group (Task 2.4 review finding M3): a
+    // Windows CUDA install fetches two archives, and `done` must keep
+    // climbing across both rather than resetting to zero at the second.
+    let total_download_bytes: u64 = archive_bytes.iter().sum();
+    let mut completed_before: u64 = 0;
     let mut staged_paths = Vec::new();
-    for asset in std::iter::once(&archive.asset).chain(cudart.map(|c| &c.asset)) {
+    for (asset, asset_bytes) in std::iter::once(&archive.asset)
+        .chain(cudart.map(|c| &c.asset))
+        .zip(archive_bytes.iter().copied())
+    {
         let dest = staging.join(asset.name);
-        let mut progress = |done: u64, total: u64| {
-            on_progress(InstallProgress::Downloading { done, total });
+        let mut progress = |done: u64, _total: u64| {
+            on_progress(InstallProgress::Downloading {
+                done: completed_before.saturating_add(done),
+                total: total_download_bytes,
+            });
         };
         fetch_asset(&client, rel.tag, asset, &dest, cancel, &mut progress).await?;
+        completed_before = completed_before.saturating_add(asset_bytes);
         staged_paths.push(dest);
     }
 
@@ -213,28 +248,42 @@ pub async fn install(
     };
 
     if let Ok(true) = tokio::fs::try_exists(&final_dir).await {
-        if marker::read_marker(&final_dir).is_none() {
-            // No marker -- a stale or foreign directory occupying our
-            // target path, not a completed install. Safe to clear before
-            // the atomic swap.
-            let _ = tokio::fs::remove_dir_all(&final_dir).await;
+        if marker::read_marker(&final_dir).is_some() {
+            // Already installed at this exact (tag, kind): the ordinary
+            // case for a repeated install, not a failure (Task 2.4 review
+            // finding M2). A rename onto this non-empty destination is
+            // guaranteed to fail (Windows refuses it; Unix gives
+            // ENOTEMPTY), so attempting it would turn a routine re-install
+            // into a permanent `ArchiveCorrupt` dead stop with a false
+            // diagnosis. The freshly built (and identical, sha-pinned) tmp
+            // dir and staged archives are simply discarded; the existing
+            // install's marker and files are left untouched rather than
+            // risk deleting files a running engine process may still have
+            // open.
+            let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+            for staged in &staged_paths {
+                let _ = tokio::fs::remove_file(staged).await;
+            }
+            return Ok(final_dir);
         }
-        // A directory WITH a marker already there is a previously completed
-        // install at this exact (tag, kind). Leaving it alone rather than
-        // deleting it protects against clobbering files a running engine
-        // process may still have open; the rename below is left to fail
-        // naturally in that case.
+        // No marker -- a stale or foreign directory occupying our target
+        // path, not a completed install. Safe to clear before the swap.
+        let _ = tokio::fs::remove_dir_all(&final_dir).await;
     }
 
-    tokio::fs::rename(&tmp_dir, &final_dir).await.map_err(|e| {
+    if let Err(e) = tokio::fs::rename(&tmp_dir, &final_dir).await {
         tracing::warn!(error = %e, from = %tmp_dir.display(), to = %final_dir.display(), "engine install could not be finalized");
-        LocalError::ArchiveCorrupt
-    })?;
+        // Task 2.4 review finding M2 (leak half): a failed rename must not
+        // leave the whole extracted tree (hundreds of MB) behind in
+        // `.staging/` indefinitely.
+        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+        return Err(LocalError::ArchiveCorrupt);
+    }
 
     let now = now_unix();
     let installed_marker = Marker {
         tag: rel.tag.to_string(),
-        kind: kind.clone(),
+        kind: kind_suffix(kind),
         archive_sha256: std::iter::once(archive.asset.sha256.to_string())
             .chain(cudart.map(|c| c.asset.sha256.to_string()))
             .collect(),
@@ -266,6 +315,11 @@ pub async fn install(
 /// returns anything other than success -- so this function stops after the
 /// first source whenever the override is active, and tries all three only
 /// in production (override unset).
+///
+/// A source whose bytes fail the pinned sha256 is deleted by
+/// `models::fetch::fetch_to` itself (never left on disk to be resumed
+/// forever against the same wrong pin) before this function even sees the
+/// error -- that deletion is not reimplemented here.
 async fn fetch_asset(
     client: &reqwest::Client,
     tag: &str,
@@ -417,6 +471,11 @@ fn extract_zip(archive_path: &Path, dest: &Path) -> Result<(), String> {
 
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| format!("zip entry {i}: {e}"))?;
+        // `rel_paths` was built in the same 0..zip.len() order just above
+        // and zip's `by_index` is stable/random-access (unlike tar's
+        // streaming reader, no re-decode happens between the two loops),
+        // so `rel_paths[i]` is safe here -- see `extract_tar_gz` for the
+        // corresponding guarded lookup where that guarantee does not hold.
         let Some(rel) = flatten(&rel_paths[i], &top) else {
             continue;
         };
@@ -438,6 +497,11 @@ fn extract_zip(archive_path: &Path, dest: &Path) -> Result<(), String> {
             .map_err(|e| format!("{}: {e}", out_path.display()))?;
         drop(out_file);
 
+        // Every pinned `.zip` asset in `local::release::ENGINE_PINNED` is
+        // Windows-only (linux/macos archives are all `.tar.gz`), so this
+        // branch is currently dead weight rather than a live risk -- kept
+        // for correctness if that ever changes, and because `zip::ZipFile`
+        // exposes the bit for free.
         #[cfg(unix)]
         {
             if let Some(mode) = entry.unix_mode() {
@@ -486,7 +550,19 @@ fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<(), String> {
         .map_err(|e| format!("{}: {e}", archive_path.display()))?
     {
         let mut entry = entry.map_err(|e| format!("{}: {e}", archive_path.display()))?;
-        let rel_owned = rel_paths[idx].clone();
+        // Task 2.4 review finding m5: the first pass decoded the same file
+        // from a fresh reader, so counts match in every observed case, but
+        // an out-of-range index must fail gracefully rather than panic --
+        // this project has already shipped two parse/slice panics on
+        // exactly this class of "should always match" assumption (GGUF
+        // unvalidated `u64` length; `&text[..500]` char boundary).
+        let Some(rel_owned) = rel_paths.get(idx).cloned() else {
+            return Err(format!(
+                "{}: tar entry {idx} has no matching path from the first pass ({} collected)",
+                archive_path.display(),
+                rel_paths.len()
+            ));
+        };
         idx += 1;
         let Some(rel) = flatten(&rel_owned, &top) else {
             continue;
@@ -531,24 +607,84 @@ fn extract_tar_gz(archive_path: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn check_present(dir: &Path, name: &str) -> Result<(), String> {
-    if dir.join(name).is_file() {
-        Ok(())
+/// One row of v3 §7.4's sentinel table: which `(platform, backend)`
+/// combinations it applies to (a glob pattern matched against
+/// `"<platform>-<backend_slug>"`, e.g. `"linux-*-cpu"`,
+/// `"windows-x64-cuda*"`, `"macos-*"` -- the row keys are patterns
+/// themselves, not exact strings, so matching a kind to its row is a glob
+/// match too), and the file patterns that row requires. A file pattern may
+/// contain the literal placeholder `{X}`, substituted with the CUDA major
+/// version derived from the kind's own `cuda12*`/`cuda13*` variant prefix
+/// (the same derivation `release::archive_for` uses to pair an archive
+/// with its cudart runtime) -- never hard-coded, so a `cuda12-*` install
+/// correctly expects `cudart64_12.dll`, not `cudart64_13.dll`.
+struct SentinelRow {
+    platform_backend_pattern: &'static str,
+    files: &'static [&'static str],
+}
+
+const SENTINEL_TABLE: &[SentinelRow] = &[
+    SentinelRow {
+        platform_backend_pattern: "linux-*-cpu",
+        files: &["libllama.so*", "libggml-base.so*", "libggml-cpu*.so*"],
+    },
+    SentinelRow {
+        platform_backend_pattern: "linux-*-vulkan",
+        files: &["libllama.so*", "libggml-base.so*", "libggml-cpu*.so*"],
+    },
+    SentinelRow {
+        platform_backend_pattern: "linux-*-cuda*",
+        files: &[
+            "libllama.so*",
+            "libggml-base.so*",
+            "libggml-cpu*.so*",
+            "libggml-cuda.so",
+        ],
+    },
+    SentinelRow {
+        platform_backend_pattern: "windows-x64-cuda*",
+        files: &[
+            "cublas64_{X}.dll",
+            "cublasLt64_{X}.dll",
+            "llama.dll",
+            "ggml-cuda.dll",
+            "cudart64_{X}.dll",
+        ],
+    },
+    SentinelRow {
+        platform_backend_pattern: "macos-*",
+        files: &["libllama*.dylib", "libggml*.dylib"],
+    },
+];
+
+/// The CUDA major version (`"12"` or `"13"`) a Windows/Linux CUDA `kind`
+/// was built against, derived from its variant's own `cuda12*`/`cuda13*`
+/// prefix -- the same rule `release::archive_for` already uses to pair an
+/// archive with its cudart runtime. `None` for a non-CUDA kind, or a CUDA
+/// kind with no recognizable variant prefix (should not happen for any
+/// kind `hardware::fallback_chain` can actually produce).
+fn cuda_major(kind: &InstallKind) -> Option<&'static str> {
+    if kind.backend != Backend::Cuda {
+        return None;
+    }
+    let variant = kind.variant.as_deref().unwrap_or("");
+    if variant.starts_with("cuda13") {
+        Some("13")
+    } else if variant.starts_with("cuda12") {
+        Some("12")
     } else {
-        Err(format!("missing {name}"))
+        None
     }
 }
 
 /// Checks that the files an installed `kind` needs to actually run are
-/// present in `dir`. The engine binary itself, always; on a Windows CUDA
-/// install, additionally the cublas/cublasLt DLLs for the archive's own
-/// CUDA major version (12 or 13, from the `cuda12*`/`cuda13*` variant
-/// prefix -- the same derivation `release::archive_for` uses for cudart
-/// pairing). Linux CUDA needs no extra sentinel: those archives link
-/// against the system's own libcudart rather than bundling one (see
-/// `hardware::select_cuda_kind`'s doc comment), which is exactly what
-/// `hardware::probe`'s `cuda_runtime_lines` check already gates on before
-/// this kind is ever selected.
+/// present in `dir`, per v3 §7.4's sentinel table ([`SENTINEL_TABLE`]):
+/// the engine binary always, plus every row whose pattern matches
+/// `"<platform>-<backend_slug>"`. `check_present` glob-matches against the
+/// directory's actual entries (not an exact-name `is_file` check), since
+/// several of the table's own patterns need it (`libllama.so*`,
+/// `libggml-cpu*.so*`, `libggml*.dylib`, `cudart64_{X}.dll` after `{X}`
+/// substitution).
 pub fn sentinels_ok(dir: &Path, kind: &InstallKind) -> Result<(), String> {
     let binary = if kind.platform.starts_with("windows") {
         "llama-server.exe"
@@ -557,18 +693,49 @@ pub fn sentinels_ok(dir: &Path, kind: &InstallKind) -> Result<(), String> {
     };
     check_present(dir, binary)?;
 
-    if kind.backend == Backend::Cuda && kind.platform.starts_with("windows") {
-        let variant = kind.variant.as_deref().unwrap_or("");
-        let major = if variant.starts_with("cuda13") {
-            "13"
-        } else {
-            "12"
-        };
-        check_present(dir, &format!("cublas64_{major}.dll"))?;
-        check_present(dir, &format!("cublasLt64_{major}.dll"))?;
+    let subject = format!("{}-{}", kind.platform, backend_slug(kind.backend));
+    let major = cuda_major(kind);
+
+    for row in SENTINEL_TABLE {
+        let row_pattern = glob::Pattern::new(row.platform_backend_pattern).map_err(|e| {
+            format!(
+                "invalid sentinel row pattern {:?}: {e}",
+                row.platform_backend_pattern
+            )
+        })?;
+        if !row_pattern.matches(&subject) {
+            continue;
+        }
+        for file_pattern in row.files {
+            let resolved = match major {
+                Some(x) => file_pattern.replace("{X}", x),
+                None => file_pattern.to_string(),
+            };
+            check_present(dir, &resolved)?;
+        }
     }
 
     Ok(())
+}
+
+/// Whether some entry directly inside `dir` matches glob `pattern` (e.g.
+/// `"libllama.so*"`, or an exact name like `"llama-server.exe"`, which a
+/// pattern with no wildcard characters matches literally).
+fn check_present(dir: &Path, pattern: &str) -> Result<(), String> {
+    let compiled = glob::Pattern::new(pattern)
+        .map_err(|e| format!("invalid sentinel pattern {pattern:?}: {e}"))?;
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let found = entries.filter_map(|e| e.ok()).any(|e| {
+        e.file_name()
+            .to_str()
+            .map(|name| compiled.matches(name))
+            .unwrap_or(false)
+    });
+    if found {
+        Ok(())
+    } else {
+        Err(format!("missing {pattern}"))
+    }
 }
 
 fn sha256_file_sync(path: &Path) -> std::io::Result<String> {
@@ -640,6 +807,16 @@ mod tests {
         Box::leak(v.into_boxed_slice())
     }
 
+    /// Removes one process-global env var on drop, so a panic mid-test
+    /// can't leak an override into every later test in the process (Task
+    /// 2.4 review finding m7).
+    struct EnvVarGuard(&'static str);
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.0);
+        }
+    }
+
     // --- required_bytes ------------------------------------------------
 
     #[test]
@@ -664,8 +841,8 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("NEVOFLUX_LOCAL_CACHE_DIR", tmp.path());
+        let _restore = EnvVarGuard("NEVOFLUX_LOCAL_CACHE_DIR");
         let root = engine_root().unwrap();
-        std::env::remove_var("NEVOFLUX_LOCAL_CACHE_DIR");
         assert_eq!(root, tmp.path().join("engine"));
     }
 
@@ -695,14 +872,182 @@ mod tests {
         );
     }
 
+    /// Controller ruling on Task 2.4 review finding M4: `Marker.kind` is a
+    /// string, lossless across `kind_suffix -> parse_kind_suffix ->
+    /// InstallKind`, over every kind `hardware::fallback_chain` can
+    /// actually produce (not a hand-picked list). `cudart` is not encoded
+    /// in the string at all; it round-trips because the parse side
+    /// re-derives it via `hardware::known_cudart_version(variant)`, the
+    /// exact same rule `hardware::select_cuda_kind` used to set it in the
+    /// first place.
+    #[test]
+    fn kind_suffix_round_trips_through_every_kind_the_hardware_guard_can_produce() {
+        use crate::local::config::BackendPref;
+        use crate::local::hardware::{fallback_chain, GpuInfo, HardwareProbe};
+        use std::collections::HashSet;
+
+        fn parse_kind_suffix(s: &str) -> Option<InstallKind> {
+            const PLATFORMS: &[&str] = &[
+                "windows-x64",
+                "windows-arm64",
+                "linux-x64",
+                "linux-arm64",
+                "macos-x64",
+                "macos-arm64",
+            ];
+            let platform = *PLATFORMS
+                .iter()
+                .find(|p| s.starts_with(**p) && s[p.len()..].starts_with('-'))?;
+            let rest = &s[platform.len() + 1..];
+
+            const BACKENDS: &[(&str, Backend)] = &[
+                ("cpu", Backend::Cpu),
+                ("vulkan", Backend::Vulkan),
+                ("cuda", Backend::Cuda),
+                ("metal", Backend::Metal),
+            ];
+            let (slug, backend) = BACKENDS
+                .iter()
+                .find(|(slug, _)| rest == *slug || rest.starts_with(&format!("{slug}-")))?;
+            let remainder = &rest[slug.len()..];
+            let variant = if remainder.is_empty() {
+                None
+            } else {
+                Some(remainder.trim_start_matches('-').to_string())
+            };
+            let cudart = if *backend == Backend::Cuda {
+                variant
+                    .as_deref()
+                    .and_then(crate::local::hardware::known_cudart_version)
+                    .map(str::to_string)
+            } else {
+                None
+            };
+
+            Some(InstallKind {
+                platform: platform.to_string(),
+                backend: *backend,
+                variant,
+                cudart,
+            })
+        }
+
+        let gib = crate::local::memory::GIB;
+        struct PlatformCase {
+            os: &'static str,
+            arch: &'static str,
+        }
+        let platforms = [
+            PlatformCase {
+                os: "linux",
+                arch: "x86_64",
+            },
+            PlatformCase {
+                os: "linux",
+                arch: "aarch64",
+            },
+            PlatformCase {
+                os: "windows",
+                arch: "x86_64",
+            },
+            PlatformCase {
+                os: "windows",
+                arch: "aarch64",
+            },
+            PlatformCase {
+                os: "macos",
+                arch: "x86_64",
+            },
+            PlatformCase {
+                os: "macos",
+                arch: "aarch64",
+            },
+        ];
+        let caps = [
+            (6, 1),
+            (7, 5),
+            (8, 0),
+            (8, 6),
+            (8, 9),
+            (9, 0),
+            (10, 0),
+            (12, 0),
+            (8, 7),
+            (7, 0),
+        ];
+
+        let mut kinds: HashSet<InstallKind> = HashSet::new();
+        for pc in &platforms {
+            let no_gpu = HardwareProbe {
+                os: pc.os.to_string(),
+                arch: pc.arch.to_string(),
+                vulkan_available: true,
+                ram_bytes: 16 * gib,
+                ..Default::default()
+            };
+            for kind in fallback_chain(&no_gpu, BackendPref::Auto) {
+                kinds.insert(kind);
+            }
+            for cap in caps {
+                for driver_major in [12u32, 13u32] {
+                    let cuda_runtime_lines = if pc.os == "linux" {
+                        vec![12, 13]
+                    } else {
+                        vec![]
+                    };
+                    let p = HardwareProbe {
+                        os: pc.os.to_string(),
+                        arch: pc.arch.to_string(),
+                        nvidia_gpus: vec![GpuInfo {
+                            name: "test-gpu".to_string(),
+                            vram_bytes: 8 * gib,
+                            compute_cap: Some(cap),
+                        }],
+                        has_physical_nvidia: true,
+                        has_usable_nvidia: true,
+                        driver_cuda_version: Some((driver_major, 0)),
+                        cuda_runtime_lines,
+                        vulkan_available: true,
+                        ram_bytes: 16 * gib,
+                        macos_version: None,
+                    };
+                    for kind in fallback_chain(&p, BackendPref::Auto) {
+                        kinds.insert(kind);
+                    }
+                }
+            }
+        }
+
+        assert!(
+            kinds.len() >= 20,
+            "expected a broad set of kinds, got {}",
+            kinds.len()
+        );
+        for kind in &kinds {
+            let s = kind_suffix(kind);
+            let parsed =
+                parse_kind_suffix(&s).unwrap_or_else(|| panic!("failed to parse {s:?} back"));
+            assert_eq!(&parsed, kind, "round trip mismatch for {s:?}");
+        }
+    }
+
     // --- sentinels_ok ----------------------------------------------------
 
-    fn cuda_kind() -> InstallKind {
+    fn cuda_kind(platform: &str, variant: &str) -> InstallKind {
         InstallKind {
-            platform: "windows-x64".to_string(),
+            platform: platform.to_string(),
             backend: Backend::Cuda,
-            variant: Some("cuda13-older".to_string()),
-            cudart: Some("13.3".to_string()),
+            variant: Some(variant.to_string()),
+            cudart: None,
+        }
+    }
+
+    fn plain_kind(platform: &str, backend: Backend) -> InstallKind {
+        InstallKind {
+            platform: platform.to_string(),
+            backend,
+            variant: None,
+            cudart: None,
         }
     }
 
@@ -711,30 +1056,110 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("llama-server.exe"), b"x").unwrap();
         std::fs::write(dir.path().join("cublas64_13.dll"), b"x").unwrap();
+        std::fs::write(dir.path().join("llama.dll"), b"x").unwrap();
+        std::fs::write(dir.path().join("ggml-cuda.dll"), b"x").unwrap();
+        std::fs::write(dir.path().join("cudart64_13.dll"), b"x").unwrap();
         // cublasLt64_13.dll is missing.
-        let err = sentinels_ok(dir.path(), &cuda_kind()).unwrap_err();
+        let err = sentinels_ok(dir.path(), &cuda_kind("windows-x64", "cuda13-older")).unwrap_err();
         assert!(err.contains("cublasLt64_13.dll"), "{err}");
     }
 
     #[test]
-    fn sentinels_ok_passes_when_every_windows_cuda_file_is_present() {
+    fn sentinels_ok_passes_when_every_windows_cuda13_file_is_present() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("llama-server.exe"), b"x").unwrap();
-        std::fs::write(dir.path().join("cublas64_13.dll"), b"x").unwrap();
-        std::fs::write(dir.path().join("cublasLt64_13.dll"), b"x").unwrap();
-        assert!(sentinels_ok(dir.path(), &cuda_kind()).is_ok());
+        for name in [
+            "llama-server.exe",
+            "cublas64_13.dll",
+            "cublasLt64_13.dll",
+            "llama.dll",
+            "ggml-cuda.dll",
+            "cudart64_13.dll",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        assert!(sentinels_ok(dir.path(), &cuda_kind("windows-x64", "cuda13-older")).is_ok());
+    }
+
+    /// Coordinator clarification: `{X}` must come from the kind's own
+    /// variant, never hard-coded -- a cuda12 install expects the cuda12
+    /// DLL names, not cuda13's.
+    #[test]
+    fn sentinels_ok_derives_the_cuda_major_from_the_variant_not_a_constant() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "llama-server.exe",
+            "cublas64_12.dll",
+            "cublasLt64_12.dll",
+            "llama.dll",
+            "ggml-cuda.dll",
+            "cudart64_12.dll",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let kind = cuda_kind("windows-x64", "cuda12-legacy");
+        assert!(
+            sentinels_ok(dir.path(), &kind).is_ok(),
+            "cuda12 files must satisfy a cuda12 kind"
+        );
+
+        // The cuda13-named files are NOT present, so a cuda13 kind must
+        // fail against this same directory.
+        let cuda13_kind = cuda_kind("windows-x64", "cuda13-older");
+        assert!(sentinels_ok(dir.path(), &cuda13_kind).is_err());
     }
 
     #[test]
-    fn sentinels_ok_only_needs_the_binary_on_cpu() {
+    fn sentinels_ok_requires_shared_libraries_on_linux_cpu_and_vulkan() {
+        for backend in [Backend::Cpu, Backend::Vulkan] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("llama-server"), b"x").unwrap();
+            let kind = plain_kind("linux-x64", backend);
+            let err = sentinels_ok(dir.path(), &kind).unwrap_err();
+            assert!(err.contains("libllama.so"), "{err}");
+
+            std::fs::write(dir.path().join("libllama.so.1"), b"x").unwrap();
+            std::fs::write(dir.path().join("libggml-base.so"), b"x").unwrap();
+            std::fs::write(dir.path().join("libggml-cpu-avx2.so"), b"x").unwrap();
+            assert!(sentinels_ok(dir.path(), &kind).is_ok(), "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn sentinels_ok_requires_libggml_cuda_on_linux_cuda_in_addition_to_the_base_libs() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("llama-server"), b"x").unwrap();
-        let kind = InstallKind {
-            platform: "linux-x64".to_string(),
-            backend: Backend::Cpu,
-            variant: None,
-            cudart: None,
-        };
+        std::fs::write(dir.path().join("libllama.so"), b"x").unwrap();
+        std::fs::write(dir.path().join("libggml-base.so"), b"x").unwrap();
+        std::fs::write(dir.path().join("libggml-cpu.so"), b"x").unwrap();
+        let kind = cuda_kind("linux-x64", "cuda13-older");
+        let err = sentinels_ok(dir.path(), &kind).unwrap_err();
+        assert!(err.contains("libggml-cuda.so"), "{err}");
+
+        std::fs::write(dir.path().join("libggml-cuda.so"), b"x").unwrap();
+        assert!(sentinels_ok(dir.path(), &kind).is_ok());
+    }
+
+    #[test]
+    fn sentinels_ok_requires_dylibs_on_macos() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("llama-server"), b"x").unwrap();
+        let kind = plain_kind("macos-arm64", Backend::Metal);
+        assert!(sentinels_ok(dir.path(), &kind).is_err());
+
+        std::fs::write(dir.path().join("libllama.dylib"), b"x").unwrap();
+        std::fs::write(dir.path().join("libggml-base.dylib"), b"x").unwrap();
+        assert!(sentinels_ok(dir.path(), &kind).is_ok());
+    }
+
+    #[test]
+    fn sentinels_ok_only_needs_the_binary_on_windows_cpu() {
+        // windows-x64-cpu matches no row in the sentinel table (only
+        // windows-x64-cuda* carries DLL requirements), so the binary alone
+        // is sufficient -- unlike linux-x64-cpu, which now also requires
+        // the shared-library row.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("llama-server.exe"), b"x").unwrap();
+        let kind = plain_kind("windows-x64", Backend::Cpu);
         assert!(sentinels_ok(dir.path(), &kind).is_ok());
     }
 
@@ -840,6 +1265,14 @@ mod tests {
         assert!(dest.path().join("README").is_file());
     }
 
+    // Task 2.4 review finding m8: this test has never executed on this
+    // Windows development machine (the daemon repo has no Linux/macOS CI
+    // run yet for this branch) -- kept, not deleted, pending one. There is
+    // no equivalent zip-side test because it would be vacuous: every
+    // pinned `.zip` asset in `local::release::ENGINE_PINNED` is
+    // Windows-only (all linux/macos assets are `.tar.gz`), so the zip
+    // extractor's own `unix_mode()` handling in `extract_zip` never runs
+    // against a real archive on a unix host either.
     #[cfg(unix)]
     #[test]
     fn tar_gz_extraction_preserves_the_executable_bit() {
@@ -882,13 +1315,6 @@ mod tests {
 
     // --- end-to-end install() ----------------------------------------------
 
-    struct MirrorBaseGuard;
-    impl Drop for MirrorBaseGuard {
-        fn drop(&mut self) {
-            std::env::remove_var("NEVOFLUX_ENGINE_MIRROR_BASE");
-        }
-    }
-
     async fn spawn_fake_mirror(files: HashMap<String, Vec<u8>>) -> String {
         use axum::extract::{Path as AxumPath, State};
         use axum::http::StatusCode;
@@ -918,6 +1344,45 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Like [`spawn_fake_mirror`], but streams its (single, fixed) body
+    /// back after a short delay, regardless of which asset was requested.
+    /// Only used by the cancellation test: a pre-cancelled token needs a
+    /// genuine window where `models::fetch::fetch_to`'s internal
+    /// `tokio::select!` is still waiting on the network so cancellation
+    /// can win deterministically -- without the delay, a small in-memory
+    /// body can arrive in the very first poll, same as the
+    /// already-resolved cancellation future, making the outcome a coin
+    /// flip between the two ready branches.
+    async fn spawn_delayed_fake_mirror(bytes: Vec<u8>) -> String {
+        use axum::body::Body;
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        use axum::Router;
+        use futures::stream;
+
+        let bytes = Arc::new(bytes);
+        let app = Router::new().route(
+            "/:tag/:asset",
+            get(move |_path: axum::extract::Path<(String, String)>| {
+                let bytes = bytes.clone();
+                async move {
+                    let body_bytes = (*bytes).clone();
+                    let s = stream::once(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        Ok::<_, std::io::Error>(::bytes::Bytes::from(body_bytes))
+                    });
+                    Body::from_stream(s).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
     fn dummy_sha256() -> &'static str {
         leak_str("0".repeat(64))
     }
@@ -939,7 +1404,7 @@ mod tests {
         files.insert("test-cpu-ok.zip".to_string(), zip_bytes.clone());
         let base_url = spawn_fake_mirror(files).await;
         std::env::set_var("NEVOFLUX_ENGINE_MIRROR_BASE", &base_url);
-        let _restore = MirrorBaseGuard;
+        let _restore = EnvVarGuard("NEVOFLUX_ENGINE_MIRROR_BASE");
 
         let archive = release::EngineArchive {
             platform: "windows-x64",
@@ -984,6 +1449,7 @@ mod tests {
         );
         let m = marker::read_marker(&final_dir).expect("marker.json must exist");
         assert_eq!(m.tag, "test-tag-ok");
+        assert_eq!(m.kind, "windows-x64-cpu");
         assert_eq!(m.archive_sha256.len(), 1);
         for f in &m.files {
             let bytes = std::fs::read(final_dir.join(&f.path)).unwrap();
@@ -1003,6 +1469,21 @@ mod tests {
         assert!(phases
             .iter()
             .any(|p| matches!(p, InstallProgress::Verifying)));
+
+        // Task 2.4 review finding M2: re-running install() for the exact
+        // same (tag, kind, root) must succeed as the ordinary
+        // already-installed case, not clobber or duplicate the marker.
+        let mut original = marker::read_marker(&final_dir).unwrap();
+        original.installed_at = 999_999; // a sentinel value nothing else produces
+        marker::write_marker(&final_dir, &original).unwrap();
+
+        let second_run = install(&rel, &kind, root_dir.path(), &cancel, &mut |_| {}).await;
+        assert_eq!(second_run.as_deref(), Ok(final_dir.as_path()));
+        let after = marker::read_marker(&final_dir).unwrap();
+        assert_eq!(
+            after.installed_at, 999_999,
+            "an already-installed re-run must leave the existing marker untouched, not rewrite it"
+        );
     }
 
     #[tokio::test]
@@ -1016,7 +1497,7 @@ mod tests {
         files.insert("test-cpu-bad.zip".to_string(), zip_bytes.clone());
         let base_url = spawn_fake_mirror(files).await;
         std::env::set_var("NEVOFLUX_ENGINE_MIRROR_BASE", &base_url);
-        let _restore = MirrorBaseGuard;
+        let _restore = EnvVarGuard("NEVOFLUX_ENGINE_MIRROR_BASE");
 
         let archive = release::EngineArchive {
             platform: "windows-x64",
@@ -1061,5 +1542,81 @@ mod tests {
             !final_dir.exists(),
             "no final dir may exist after a checksum mismatch"
         );
+
+        // Coordinator clarification: v3 §7.4 step 2 requires a failed sha
+        // check to DELETE the bad archive, not merely reject and leave it
+        // on disk to be resumed forever against the same wrong pin.
+        // `models::fetch::fetch_to` already deletes its `.part` on a
+        // digest mismatch (`fetch.rs:254-259`) before ever renaming to the
+        // final staged path, so neither should exist here.
+        let staged = root_dir.path().join(".staging").join("test-cpu-bad.zip");
+        assert!(!staged.exists(), "the bad archive must not survive");
+        let staged_part = root_dir
+            .path()
+            .join(".staging")
+            .join("test-cpu-bad.zip.part");
+        assert!(
+            !staged_part.exists(),
+            "the failed .part download must not survive either"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_stops_promptly_when_the_token_is_already_cancelled() {
+        let _guard = crate::llm_gateway::tests::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let zip_bytes = build_zip(&[("pkg/llama-server.exe", b"fake-engine-binary")]);
+        let sha = sha256_hex(&zip_bytes);
+        let base_url = spawn_delayed_fake_mirror(zip_bytes.clone()).await;
+        std::env::set_var("NEVOFLUX_ENGINE_MIRROR_BASE", &base_url);
+        let _restore = EnvVarGuard("NEVOFLUX_ENGINE_MIRROR_BASE");
+
+        let archive = release::EngineArchive {
+            platform: "windows-x64",
+            backend: Backend::Cpu,
+            variant: None,
+            asset: EngineAsset {
+                name: "test-cpu-cancel.zip",
+                bytes: zip_bytes.len() as u64,
+                sha256: leak_str(sha),
+            },
+        };
+        let rel = EngineRelease {
+            tag: "test-tag-cancel",
+            upstream_tag: "test-tag-cancel",
+            archives: leak_archives(vec![archive]),
+            cudart: &[],
+            source: EngineAsset {
+                name: "src",
+                bytes: 0,
+                sha256: dummy_sha256(),
+            },
+        };
+
+        let root_dir = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // already cancelled before install() even starts
+        let kind = InstallKind {
+            platform: "windows-x64".to_string(),
+            backend: Backend::Cpu,
+            variant: None,
+            cudart: None,
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            install(&rel, &kind, root_dir.path(), &cancel, &mut |_| {}),
+        )
+        .await
+        .expect("install must return promptly rather than hang when cancelled");
+
+        assert!(
+            result.is_err(),
+            "a cancelled install must not succeed: {result:?}"
+        );
+        let final_dir = install_dir(root_dir.path(), rel.tag, &kind);
+        assert!(!final_dir.exists());
     }
 }

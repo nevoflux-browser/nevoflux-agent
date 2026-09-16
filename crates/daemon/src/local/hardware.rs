@@ -603,7 +603,7 @@ fn cuda_bucket(compute_cap: Option<(u32, u32)>) -> CudaBucket {
 /// work — that already isn't true. [`InstallKind::cudart`] itself remains
 /// informational/roundtrip-only (see its own doc comment: it survives a
 /// `marker.json` serialize/deserialize round trip).
-fn known_cudart_version(variant: &str) -> Option<&'static str> {
+pub(crate) fn known_cudart_version(variant: &str) -> Option<&'static str> {
     match variant {
         "cuda13-older" => Some("13.3"),
         _ => None,
