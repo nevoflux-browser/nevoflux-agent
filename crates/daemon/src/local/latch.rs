@@ -364,10 +364,21 @@ mod tests {
     /// Exercises `refresh_from_config`'s real-global write path — uses
     /// `set_global_for_test` (never the thread-local `set`) throughout so
     /// `is_on()` reads through to the same global `refresh_from_config`
-    /// touches, under `test_serial()` per the module docs.
-    #[test]
-    fn refresh_tracks_active_provider_and_enabled() {
-        let _g = test_serial();
+    /// touches.
+    ///
+    /// `#[tokio::test]` + [`test_serial_async`], not `#[test]` +
+    /// [`test_serial`] (R39, fix round 1): every OTHER test touching the
+    /// real `LATCH` global — `local::sync`'s async tests — holds
+    /// [`test_serial_async`]'s tokio `Mutex`, a *different lock object*
+    /// from [`test_serial`]'s std `Mutex`. Two different mutexes don't
+    /// exclude each other, so a sync test holding the std one could still
+    /// run concurrently with an async test holding the tokio one and race
+    /// on the same global (observed in practice as an intermittent
+    /// `assert_eq!(left: Some(false), right: None)` failure here). This
+    /// test has no real `.await` work, so the switch costs nothing.
+    #[tokio::test]
+    async fn refresh_tracks_active_provider_and_enabled() {
+        let _g = test_serial_async().await;
         let mut cfg = crate::config::AgentConfig::default();
         set_global_for_test(false);
         cfg.llm.provider = Some("local".into());
@@ -387,9 +398,14 @@ mod tests {
     /// [`set_global_for_test`]/[`refresh_from_config`]'s real-global path —
     /// this is exactly what makes the two safe to run concurrently with
     /// every other latch-touching test in the crate (R26).
-    #[test]
-    fn thread_local_override_does_not_leak_into_the_real_global() {
-        let _g = test_serial();
+    ///
+    /// `#[tokio::test]` + [`test_serial_async`] (R39, fix round 1) — see
+    /// `refresh_tracks_active_provider_and_enabled`'s doc comment for why
+    /// [`test_serial`] can't exclude this from `local::sync`'s async tests,
+    /// which also touch the real `LATCH` global.
+    #[tokio::test]
+    async fn thread_local_override_does_not_leak_into_the_real_global() {
+        let _g = test_serial_async().await;
         set_global_for_test(false);
 
         set(true); // thread-local only

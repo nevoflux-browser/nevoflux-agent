@@ -70,20 +70,80 @@ impl ValueType {
             other => return Err(format!("unknown GGUF metadata value type {other}")),
         })
     }
+
+    /// The minimum encoded size of a value of this type: exact for every
+    /// fixed-width scalar, and the size of an *empty* instance for the two
+    /// variable-length types (an empty string is still an 8-byte length
+    /// prefix; a zero-element array is still a 4-byte element-type tag plus
+    /// an 8-byte count). Used to sanity-check an array's declared element
+    /// count against the file's remaining size before looping over it.
+    fn min_encoded_size(self) -> u64 {
+        match self {
+            Self::U8 | Self::I8 | Self::Bool => 1,
+            Self::U16 | Self::I16 => 2,
+            Self::U32 | Self::I32 | Self::F32 => 4,
+            Self::U64 | Self::I64 | Self::F64 => 8,
+            Self::String => 8,
+            Self::Array => 12,
+        }
+    }
 }
 
+/// Upper bound on a single length-prefixed read (a metadata string, or an
+/// array's backing bytes). Real GGUF metadata values are at most a few
+/// KiB — this reader never reads tensor data, which is the only part of a
+/// GGUF file that legitimately gets large — so anything claiming more is
+/// almost certainly a corrupted length field, not a real file. Checked
+/// before any allocation.
+const MAX_SINGLE_READ_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Thin reader over any `Read` that knows the GGUF primitive encodings.
+///
+/// Tracks `remaining`, the count of unconsumed bytes left in the file, so
+/// every length or element-count read from file data — never trustworthy,
+/// since it can be an arbitrary `u64`/`u32` from a corrupted or truncated
+/// file — is validated against both the file's actual remaining size and
+/// [`MAX_SINGLE_READ_BYTES`] *before* anything is allocated. Without this,
+/// a single flipped bit near `u64::MAX` in a length field would attempt a
+/// multi-exabyte allocation: a capacity overflow or allocator abort that
+/// `Result<_, String>` can't catch, i.e. exactly the kind of input this
+/// reader must treat as untrusted (it's parsing a downloaded file).
 struct Reader<R: Read> {
     inner: R,
+    remaining: u64,
 }
 
 impl<R: Read> Reader<R> {
     fn read_bytes(&mut self, n: usize) -> Result<Vec<u8>, String> {
+        let n64 = n as u64;
+        if n64 > MAX_SINGLE_READ_BYTES {
+            return Err(format!(
+                "GGUF metadata declares a {n} byte value, over the \
+                 {MAX_SINGLE_READ_BYTES} byte sanity ceiling for a single value \
+                 (likely a corrupted length field)"
+            ));
+        }
+        self.ensure_remaining(n64)?;
         let mut buf = vec![0u8; n];
         self.inner
             .read_exact(&mut buf)
             .map_err(|e| format!("unexpected end of GGUF file: {e}"))?;
+        self.remaining -= n64;
         Ok(buf)
+    }
+
+    /// Reject `needed` up front (before allocating or looping) if the file
+    /// doesn't have that many bytes left, per this struct's doc comment.
+    fn ensure_remaining(&self, needed: u64) -> Result<(), String> {
+        if needed > self.remaining {
+            Err(format!(
+                "GGUF metadata declares a length/count needing {needed} bytes \
+                 but only {} bytes remain in the file",
+                self.remaining
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn read_u32(&mut self) -> Result<u32, String> {
@@ -130,6 +190,17 @@ impl<R: Read> Reader<R> {
             ValueType::Array => {
                 let elem_type = self.read_value_type()?;
                 let count = self.read_u64()?;
+                // Bound the declared count against the file's remaining
+                // size before looping — a corrupted count (e.g. near
+                // `u64::MAX`) would otherwise spin through this loop
+                // billions of times before `skip_value` eventually errors
+                // out from real EOF. `checked_mul` treats an overflowing
+                // "minimum bytes needed" as unconditionally too large
+                // (`u64::MAX`), which always fails `ensure_remaining`.
+                let min_needed = count
+                    .checked_mul(elem_type.min_encoded_size())
+                    .unwrap_or(u64::MAX);
+                self.ensure_remaining(min_needed)?;
                 for _ in 0..count {
                     self.skip_value(elem_type)?;
                 }
@@ -170,8 +241,13 @@ impl<R: Read> Reader<R> {
 /// never read.
 pub fn read_header(path: &Path) -> Result<GgufHeader, String> {
     let file = File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let total_len = file
+        .metadata()
+        .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
+        .len();
     let mut r = Reader {
         inner: BufReader::new(file),
+        remaining: total_len,
     };
 
     let magic = r.read_bytes(4)?;
@@ -233,11 +309,21 @@ pub fn read_header(path: &Path) -> Result<GgufHeader, String> {
     let head_count_kv = numeric_key("attention.head_count_kv")?;
     let key_length = match numeric.get(&format!("{architecture}.attention.key_length")) {
         Some(v) => *v as u32,
-        None if head_count > 0 => embedding_length / head_count,
+        // `embedding_length / head_count` is only a valid stand-in for
+        // per-head key size under true multi-head attention, where every
+        // head has its own K/V projection. Under grouped-query attention
+        // (head_count_kv < head_count) it silently computes the wrong
+        // number — e.g. qwen3-4b-instruct-2507's real key_length is 128,
+        // but embedding_length(2560)/head_count(32) is 80 — so only take
+        // this fallback when head_count == head_count_kv; otherwise there
+        // is no way to infer key_length from the other fields, and we
+        // must error rather than return a plausible-looking wrong value.
+        None if head_count > 0 && head_count == head_count_kv => embedding_length / head_count,
         None => {
             return Err(format!(
-                "missing GGUF metadata key {architecture}.attention.key_length \
-                 and can't fall back to embedding_length/head_count with head_count=0"
+                "{architecture}.attention.key_length missing and cannot be inferred \
+                 for grouped-query attention (head_count={head_count}, \
+                 head_count_kv={head_count_kv})"
             ));
         }
     };
@@ -322,18 +408,43 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_embedding_over_head_count_when_key_length_is_absent() {
+    fn falls_back_to_embedding_over_head_count_under_true_mha() {
+        // head_count == head_count_kv: true multi-head attention, where
+        // embedding_length/head_count is a valid stand-in for key_length.
         let mut body = Vec::new();
         push_string_kv(&mut body, "general.architecture", "qwen3");
         push_u32_kv(&mut body, "qwen3.block_count", 28);
         push_u32_kv(&mut body, "qwen3.embedding_length", 2048);
         push_u32_kv(&mut body, "qwen3.attention.head_count", 16);
-        push_u32_kv(&mut body, "qwen3.attention.head_count_kv", 8);
+        push_u32_kv(&mut body, "qwen3.attention.head_count_kv", 16);
         push_u32_kv(&mut body, "qwen3.context_length", 40960);
 
         let f = write_temp_gguf(6, &body);
         let header = read_header(f.path()).unwrap();
         assert_eq!(header.key_length, 2048 / 16);
+    }
+
+    #[test]
+    fn errors_on_missing_key_length_under_grouped_query_attention() {
+        // head_count (32) != head_count_kv (8): grouped-query attention,
+        // as in the real qwen3-4b-instruct-2507 (embedding_length 2560,
+        // head_count 32, real key_length 128). embedding_length/head_count
+        // would silently compute 80 here — wrong — so this must error
+        // instead of falling back.
+        let mut body = Vec::new();
+        push_string_kv(&mut body, "general.architecture", "qwen3");
+        push_u32_kv(&mut body, "qwen3.block_count", 36);
+        push_u32_kv(&mut body, "qwen3.embedding_length", 2560);
+        push_u32_kv(&mut body, "qwen3.attention.head_count", 32);
+        push_u32_kv(&mut body, "qwen3.attention.head_count_kv", 8);
+        push_u32_kv(&mut body, "qwen3.context_length", 262144);
+
+        let f = write_temp_gguf(6, &body);
+        let err = read_header(f.path()).unwrap_err();
+        assert!(
+            err.contains("grouped-query attention"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -392,5 +503,54 @@ mod tests {
         let f = write_temp_gguf(0, &[]);
         let err = read_header(f.path()).unwrap_err();
         assert!(err.contains("general.architecture"));
+    }
+
+    #[test]
+    fn rejects_a_corrupted_string_length_of_u64_max_without_panicking() {
+        // A single flipped bit near u64::MAX in a string's length prefix
+        // must not reach `vec![0u8; n]` at all — this must return `Err`,
+        // not panic with a capacity overflow or abort in the allocator.
+        let mut body = Vec::new();
+        push_u64(&mut body, "general.architecture".len() as u64);
+        body.extend_from_slice(b"general.architecture");
+        push_u32(&mut body, 8); // ValueType::String
+        push_u64(&mut body, u64::MAX); // corrupted length — no bytes follow
+
+        let f = write_temp_gguf(1, &body);
+        let err = read_header(f.path()).unwrap_err();
+        assert!(
+            err.contains("sanity ceiling") || err.contains("bytes remain"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_array_count_that_could_not_possibly_fit_in_the_file() {
+        // The declared count (1 billion u32s = ~4 GB) vastly exceeds this
+        // handful-of-bytes file — must error immediately, not spin through
+        // the count in a loop before eventually hitting real EOF.
+        let mut body = Vec::new();
+        push_string_kv(&mut body, "general.architecture", "qwen3");
+        push_u64(&mut body, "tokenizer.ggml.tokens".len() as u64);
+        body.extend_from_slice(b"tokenizer.ggml.tokens");
+        push_u32(&mut body, 9); // ValueType::Array
+        push_u32(&mut body, 4); // element type: U32
+        push_u64(&mut body, 1_000_000_000); // declared count
+
+        let f = write_temp_gguf(2, &body);
+        let err = read_header(f.path()).unwrap_err();
+        assert!(err.contains("bytes remain"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_a_file_truncated_mid_value() {
+        let mut body = Vec::new();
+        push_u64(&mut body, "qwen3.block_count".len() as u64);
+        body.extend_from_slice(b"qwen3.block_count");
+        push_u32(&mut body, 4); // ValueType::U32
+                                // Missing: the 4-byte u32 value itself — the file ends here.
+
+        let f = write_temp_gguf(1, &body);
+        assert!(read_header(f.path()).is_err());
     }
 }
