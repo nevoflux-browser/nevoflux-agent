@@ -328,6 +328,41 @@ pub fn server_spec_with_parent_env(p: &ServerParams, parent_env: &[(String, Stri
     }
 }
 
+/// Wraps `inner` in the `--engine-guard` watchdog: the same launch, spawned
+/// as `nevoflux-agent --engine-guard -- <program> <args…>`.
+///
+/// Unix only in practice — `crate::local::guard::run` exits 2 on Windows,
+/// which gets orphan prevention from the daemon's kill-on-close Job Object
+/// instead. The guard directly parents the engine in its own process group
+/// and blocks reading its own stdin; when the daemon dies by ANY means, that
+/// pipe closes and the guard SIGTERMs the engine's group, waits 3s, then
+/// SIGKILLs it. That is the D10 orphan prevention v3 §16.2 mandates and the
+/// reason Task 2.6 built the subcommand — `crate::local::engine` is its only
+/// caller.
+///
+/// Built here rather than in that caller because [`SpawnSpec`]'s fields are
+/// private on purpose (see the type's own doc comment). Wrapping therefore
+/// cannot widen what the engine inherits: the guard's environment IS
+/// `inner`'s — the allowlisted set [`server_spec_with_parent_env`] already
+/// computed — and [`SpawnSpec::to_command`] still `env_clear()`s before
+/// applying it. The argv shape (`--engine-guard`, then `--`, then the
+/// program and its arguments) is what `guard::run`'s own `parse_args`
+/// expects after `src/main.rs` strips the first two elements.
+pub fn guard_spec(guard_exe: &Path, inner: &SpawnSpec) -> SpawnSpec {
+    let mut args = vec![
+        "--engine-guard".to_string(),
+        "--".to_string(),
+        inner.program.display().to_string(),
+    ];
+    args.extend(inner.args.iter().cloned());
+    SpawnSpec {
+        program: guard_exe.to_path_buf(),
+        args,
+        env: inner.env.clone(),
+        cwd: inner.cwd.clone(),
+    }
+}
+
 /// Generates a fresh 32-byte (64 hex char) API key for one engine launch,
 /// via `rand::thread_rng` -- the same construction
 /// `crate::llm_gateway::generate_random_token` already uses for the
@@ -752,6 +787,60 @@ mod tests {
             text.contains("LLAMA_API_KEY=should-survive"),
             "an explicitly-set env var must still reach the child"
         );
+    }
+
+    // --- guard_spec (Task 2.9 review C1) -----------------------------------
+
+    #[test]
+    fn guard_spec_wraps_the_launch_in_the_engine_guard_subcommand() {
+        // The exact argv `crate::local::guard::parse_args` expects to find
+        // after `src/main.rs` strips `<exe> --engine-guard`: a `--`
+        // separator, then the program, then its own arguments unchanged.
+        let engine_dir = PathBuf::from("/engine");
+        let model_path = PathBuf::from("/models/m.gguf");
+        let p = sample_params(&engine_dir, &model_path, "secret", "linux-x64");
+        let inner = server_spec(&p);
+        let guard_exe = PathBuf::from("/opt/nevoflux/nevoflux-agent");
+
+        let wrapped = guard_spec(&guard_exe, &inner);
+
+        assert_eq!(wrapped.program, guard_exe);
+        assert_eq!(wrapped.args[0], "--engine-guard");
+        assert_eq!(wrapped.args[1], "--");
+        assert_eq!(wrapped.args[2], inner.program.display().to_string());
+        assert_eq!(
+            &wrapped.args[3..],
+            inner.args.as_slice(),
+            "the engine's own argv must pass through untouched"
+        );
+        assert_eq!(wrapped.cwd, inner.cwd);
+    }
+
+    #[test]
+    fn guard_spec_carries_the_inner_environment_verbatim_and_widens_nothing() {
+        // Wrapping must not become a way back in for the parent environment:
+        // the guard runs with exactly the allowlisted set the engine would
+        // have had, and `to_command` still clears before applying it.
+        let engine_dir = PathBuf::from("/engine");
+        let model_path = PathBuf::from("/models/m.gguf");
+        let p = sample_params(&engine_dir, &model_path, "secret", "linux-x64");
+        let parent = vec![
+            ("LLAMA_ARG_AGENT".to_string(), "1".to_string()),
+            ("HF_TOKEN".to_string(), "secret-token".to_string()),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+        ];
+        let inner = server_spec_with_parent_env(&p, &parent);
+
+        let wrapped = guard_spec(Path::new("/opt/nevoflux/nevoflux-agent"), &inner);
+
+        assert_eq!(wrapped.env, inner.env);
+        for (k, _) in &wrapped.env {
+            assert!(
+                !k.starts_with("LLAMA_") || k == "LLAMA_API_KEY",
+                "wrapping leaked a LLAMA_-prefixed variable: {k}"
+            );
+        }
+        assert!(wrapped.env.iter().all(|(k, _)| k != "HF_TOKEN"));
     }
 
     #[test]

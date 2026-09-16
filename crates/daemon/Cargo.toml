@@ -272,7 +272,15 @@ nix = { version = "0.29", features = ["signal", "process"] }
 # `[target.'cfg(windows)'.dependencies]` entry so both unify to one
 # resolved version instead of pulling two.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_System_SystemInformation",
+    # `local::engine`'s three-way `engine.pid` identity check (v3 §16.2):
+    # process creation time via `GetProcessTimes` and the full image path via
+    # `QueryFullProcessImageNameW`, so a recycled pid can never be mistaken
+    # for the engine this daemon spawned and killed in its place.
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -1056,13 +1056,16 @@ pub async fn start_server(
     // gateway upstream; this only handles the broadcast.
     crate::local::publish_current_latch_state().await;
 
-    // Task 2.9: point the engine supervisor at this daemon's data directory
-    // (where `engine.lock`/`engine.pid` live), register the cold-start hook
-    // `local::endpoint::ensure` falls back to, and start the idle-unload
+    // Task 2.9: register the engine supervisor's cold-start hook (the one
+    // `local::endpoint::ensure` falls back to) and start its idle-unload
     // timer. Deliberately probes nothing and spawns nothing: the whole
     // on-device pipeline is demand-driven, so a daemon whose user never
-    // touches local inference pays nothing for this call.
-    crate::local::engine::init(&config.data_dir.clone().unwrap_or_else(resolve_data_dir));
+    // touches local inference pays nothing for this call. Takes no path —
+    // `engine.lock`, `engine.pid` and the installs themselves all live under
+    // the shared engine cache root (v3 §6), NOT this daemon's data
+    // directory, which is what makes "one engine per machine" hold even
+    // across daemons configured with different data directories.
+    crate::local::engine::init();
 
     // Initialize MCP manager (empty) and tool search index.
     // Actual connections happen in a background task so the daemon starts fast.
