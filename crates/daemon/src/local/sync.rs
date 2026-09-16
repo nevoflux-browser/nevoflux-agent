@@ -54,23 +54,52 @@
 //! the process globals at all, so they're immune to what any other test
 //! in the binary does with them, run order included.
 //!
-//! ## `test_serial()` discipline (R35)
+//! ## `test_serial_async()` discipline (R35, updated fix round 3)
 //!
 //! [`crate::local::latch::test_serial`] returns a guard over a plain
-//! `std::sync::Mutex` — never a `.await`-safe (tokio) one. Every test in
-//! this module's own `mod tests` that needs it (because it calls
-//! `set_global_for_test`, which — like `refresh_from_config` — always
-//! writes the REAL global, bypassing the R26 thread-local override) scopes
-//! the guard to a `{ }` block around only that synchronous call, and never
-//! holds it across an `.await`. Holding a std mutex across await points on
-//! the default current-thread test runtime blocks the executor for
+//! `std::sync::Mutex` — never a `.await`-safe (tokio) one — and this
+//! module's own tests that need whole-body exclusivity over the real
+//! global latch use [`latch::test_serial_async`] instead (a tokio mutex,
+//! safe to hold across `.await`): `on_config_changed_with_wires_gateway_upstream_and_publishes_on_transitions`
+//! and `concurrent_alternating_latch_toggles_leave_upstream_matching_final_latch_state`
+//! each hold it for their ENTIRE body, not just around the synchronous
+//! `set_global_for_test`/`refresh_from_config` calls. An earlier attempt
+//! scoped the guard to just those synchronous mutations, on the theory
+//! that only the mutation itself needed protecting — that was wrong in
+//! practice: both tests also assert on `latch::is_on()` and on the
+//! gateway's resulting upstream *after* an `.await`, and a concurrently
+//! running real-global test could flip the latch in that gap before the
+//! assertion ran (observed empirically as a real, reproducible failure,
+//! not just a theoretical race).
+//!
+//! Both of those same two tests ALSO hold
+//! [`endpoint::test_serial_async`][crate::local::endpoint::test_serial_async]
+//! for their whole body, acquired *after* the latch guard (fix round 3):
+//! while latched, `apply_gateway_upstream_for_latch_locked` below reads
+//! the shared endpoint registry (`endpoint::current()`) to decide the
+//! upstream, and without also holding that lock, a concurrently-running
+//! endpoint-only test (e.g. in `wasm::local_llm`) could publish or clear
+//! an endpoint in the gap and flip an `unavailable`/base-URL assertion
+//! out from under this module's test. See
+//! [`crate::local::latch::test_serial_async`]'s doc comment for the full
+//! rationale and the required global acquisition order (latch, then
+//! endpoint) — every test in the binary that needs both locks must follow
+//! that same order.
+//!
+//! Holding a **std** mutex (as opposed to a tokio one) across await points
+//! on the default current-thread test runtime blocks the executor for
 //! however long the awaited work takes, which starves *every other*
 //! timing-sensitive test scheduled on that same OS thread by the test
-//! harness — observed in practice as unrelated `/loop` dispatcher test
-//! flakiness (they use real sleeps) whenever this module's tests held the
-//! guard across their `on_config_changed_with(...).await` calls. The same
-//! rule applies to `llm_gateway::tests::ENV_MUTEX`, shared with these
-//! tests for env-var resolution.
+//! harness — this was observed in practice as unrelated `/loop` dispatcher
+//! test flakiness (real sleeps) once this module's tests started doing
+//! several sequential `.await`s while holding a lock; using the tokio
+//! `test_serial_async()` guards instead avoids that class of problem
+//! entirely, since a contended tokio mutex yields the task rather than
+//! blocking the OS thread. `ENV_MUTEX` (shared with
+//! `llm_gateway::tests::ENV_MUTEX` for env-var resolution) stays a
+//! synchronous std mutex, scoped to just the synchronous
+//! `clear_resolver_env()` calls, since its contention window is
+//! synchronous-only and empirically does not reproduce a failure.
 //!
 //! ## Boot-time publish (fix round 1 follow-up, R32)
 //!
@@ -500,6 +529,17 @@ mod tests {
     // stays scoped to just the synchronous `clear_resolver_env()` calls,
     // since it's a std mutex with no async sibling here and its
     // contention window empirically did not reproduce a failure.
+    //
+    // Fix round 3: both tests below ALSO hold
+    // `endpoint::test_serial_async()` for their whole body, acquired
+    // immediately after the latch guard (this order is mandatory — see
+    // `latch::test_serial_async`'s doc comment). While latched,
+    // `apply_gateway_upstream_for_latch_locked` reads the shared endpoint
+    // registry (`endpoint::current()`) to decide the upstream those tests
+    // assert on; without also holding `endpoint`'s lock, a concurrently
+    // running endpoint-only test (e.g. in `wasm::local_llm`) could
+    // publish/clear an endpoint in that window and flip the
+    // `snap.unavailable` assertions below.
     // ------------------------------------------------------------------
 
     fn test_gateway_config() -> GatewayConfig {
@@ -524,6 +564,7 @@ mod tests {
     #[tokio::test]
     async fn on_config_changed_with_wires_gateway_upstream_and_publishes_on_transitions() {
         let _latch_guard = latch::test_serial_async().await;
+        let _endpoint_guard = endpoint::test_serial_async().await;
         {
             let _env_guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             clear_resolver_env();
@@ -616,8 +657,9 @@ mod tests {
             clear_resolver_env();
         }
         handle.shutdown().await;
-        // `_latch_guard` (held for this whole test — see the group doc
-        // comment above) drops here, at function end.
+        // `_latch_guard` and `_endpoint_guard` (both held for this whole
+        // test, latch first — see the group doc comment above) drop here,
+        // at function end.
     }
 
     /// Fix round 1, item 2: fire many `on_config_changed_with` calls that
@@ -630,11 +672,16 @@ mod tests {
     /// don't need to independently acquire anything, they're part of this
     /// one test's unit of work — but the real global latch itself is
     /// shared with every OTHER test in the binary, hence
-    /// `test_serial_async()` held for the whole body (R35 — see the group
-    /// doc comment above `on_config_changed_with_wires_...`).
+    /// `latch::test_serial_async()` held for the whole body (R35 — see the
+    /// group doc comment above `on_config_changed_with_wires_...`). It also
+    /// holds `endpoint::test_serial_async()`, acquired second (fix round
+    /// 3, same reasoning and mandatory order as that other test), since
+    /// the "latched with no endpoint published" assertion below depends on
+    /// the shared endpoint registry staying empty for the whole run.
     #[tokio::test]
     async fn concurrent_alternating_latch_toggles_leave_upstream_matching_final_latch_state() {
         let _latch_guard = latch::test_serial_async().await;
+        let _endpoint_guard = endpoint::test_serial_async().await;
         {
             let _env_guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
             clear_resolver_env();
@@ -692,6 +739,6 @@ mod tests {
             clear_resolver_env();
         }
         handle.shutdown().await;
-        // `_latch_guard` drops here, at function end.
+        // `_latch_guard` and `_endpoint_guard` drop here, at function end.
     }
 }

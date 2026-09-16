@@ -276,6 +276,30 @@ pub fn test_serial() -> std::sync::MutexGuard<'static, ()> {
 /// should use this one consistently rather than mixing it with
 /// [`test_serial`] for the same resource, or the two groups won't
 /// actually exclude each other.
+///
+/// ## Global lock order when a test needs this AND `endpoint`'s (fix round 3)
+///
+/// This mutex and `crate::local::endpoint::test_serial_async`'s guard the
+/// latch and the `endpoint` registry respectively — two independent
+/// resources, split apart (see that function's doc comment) so tests that
+/// only touch one don't serialize behind tests that only touch the other.
+/// But some tests legitimately touch *both* in one body: anything that
+/// drives the latch on and then lets production code read the endpoint
+/// registry to decide the resulting upstream (`local::sync`'s
+/// `apply_gateway_upstream_for_latch_locked` calls
+/// `crate::llm_gateway::upstream_for_local(endpoint::current().as_ref())`
+/// while latched) needs both locks held for its whole body, or a
+/// concurrently-running endpoint-only test can publish/clear an endpoint
+/// in the gap and flip that read out from under it.
+///
+/// Every such test MUST acquire **this lock first, then `endpoint`'s**
+/// (`local::sync`'s `on_config_changed_with_wires_gateway_upstream_and_publishes_on_transitions`
+/// and `concurrent_alternating_latch_toggles_leave_upstream_matching_final_latch_state`
+/// do this). Acquiring both is fine — they're independent mutexes with no
+/// cyclic wait — as long as *every* test that needs both follows the same
+/// order; picking a single global order here rules out a deadlock between
+/// two such tests by construction. Do not introduce a test that takes
+/// `endpoint`'s guard first and this one second.
 #[cfg(test)]
 pub async fn test_serial_async() -> tokio::sync::MutexGuard<'static, ()> {
     static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

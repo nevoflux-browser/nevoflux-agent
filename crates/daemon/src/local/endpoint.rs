@@ -99,6 +99,17 @@ pub async fn ensure() -> Result<LocalEndpoint, String> {
 /// benefit, which is exactly the kind of added contention R35 exists to
 /// avoid. See [`crate::local::latch::test_serial_async`]'s own doc
 /// comment for why a tokio (not std) mutex.
+///
+/// ## Global lock order with `latch::test_serial_async` (fix round 3)
+///
+/// A test that needs both this lock and [`crate::local::latch::test_serial_async`]'s
+/// (because it drives the latch on and then exercises production code that
+/// reads the endpoint registry to decide the resulting upstream — see
+/// `local::sync::apply_gateway_upstream_for_latch_locked`) MUST acquire
+/// `latch`'s guard first and this one second, for its whole body. See the
+/// full explanation and rationale on `latch::test_serial_async`'s doc
+/// comment; the order is documented once, there, as the single source of
+/// truth, so it can't drift between the two modules.
 #[cfg(test)]
 pub(crate) async fn test_serial_async() -> tokio::sync::MutexGuard<'static, ()> {
     static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
