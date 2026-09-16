@@ -11,15 +11,20 @@
 //! adds three pure-logic modules with no engine-process dependency:
 //! `gguf` (a hand-rolled GGUF header reader), `catalog` (the known models
 //! and their download sources), and `memory` (KV-cache/compute size
-//! estimation and GPU/CPU fit selection). A later task adds the engine
+//! estimation and GPU/CPU fit selection). Task 2.2 adds `hardware`: a
+//! [`hardware::probe`] of this host's NVIDIA/Vulkan/cudart/RAM situation,
+//! never run at daemon startup, plus the pure [`hardware::fallback_chain`]
+//! that turns a probe + backend preference into the ordered list of
+//! [`hardware::InstallKind`]s to try. A later task adds the engine
 //! supervisor that publishes to the endpoint registry, calls
 //! [`apply_gateway_upstream_for_latch`] when it does, and uses `catalog`
-//! + `memory` to decide what to launch and how.
+//! + `memory` + `hardware` to decide what to install/launch and how.
 
 pub mod catalog;
 pub mod config;
 pub mod endpoint;
 pub mod gguf;
+pub mod hardware;
 pub mod latch;
 pub mod memory;
 pub mod sync;
