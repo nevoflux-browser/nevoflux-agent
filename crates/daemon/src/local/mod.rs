@@ -63,12 +63,10 @@
 //! install that already exists on disk -- by downloading the engine archive
 //! (via `install::install`) and the model GGUF (its own
 //! `rpc::download_model`, mirroring `crate::models::download_asset`) before
-//! handing off to `EngineSupervisor::ensure_started`. Also re-exports
-//! [`rpc::local_models_dir`], the accessor Task 2.10's ruling R53 adds for
-//! where this task's downloaded model weights live (shared with
-//! `tts::asr`/`tts::kokoro`'s models via the same
-//! `NEVOFLUX_LOCAL_CACHE_DIR` override `install::engine_root` already
-//! honours, without touching `models::models_dir()` itself).
+//! handing off to `EngineSupervisor::ensure_started`. Task 2.10's ruling R53
+//! accessor for where downloaded model weights live lives beside its
+//! `NEVOFLUX_LOCAL_CACHE_DIR` sibling instead: [`install::local_models_dir`],
+//! re-exported below (fix round 1, Minor 11).
 
 pub mod admission;
 pub mod catalog;
@@ -89,5 +87,5 @@ pub mod rpc;
 pub mod state;
 pub mod sync;
 pub use config::*;
-pub use rpc::local_models_dir;
+pub use install::local_models_dir;
 pub use sync::{apply_gateway_upstream_for_latch, on_config_changed, publish_current_latch_state};

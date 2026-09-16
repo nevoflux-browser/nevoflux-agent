@@ -70,7 +70,7 @@ use crate::config::AgentConfig;
 use crate::event_bus::{BusEvent, EventBus, PublisherIdentity};
 use crate::kb_wizard::{err_response, ok_response, CURRENT_EVENT_BUS};
 use crate::local::catalog;
-use crate::local::config::{BackendPref, CtxPref, KvCacheType, LocalConfig, CTX_PREFERRED};
+use crate::local::config::{BackendPref, CtxPref, KvCacheType, LocalConfig, CTX_FLOOR};
 use crate::local::engine::{self, EngineSupervisor};
 use crate::local::hardware::{self, Backend, HardwareProbe, InstallKind};
 use crate::local::install::{self, InstallProgress};
@@ -82,26 +82,6 @@ use crate::local::state::{LocalError, LocalState};
 use crate::local::sync;
 use crate::models::fetch;
 use crate::server::SharedAgentConfig;
-
-/// `NEVOFLUX_LOCAL_CACHE_DIR/models` when set (tests/dev), else
-/// `crate::models::models_dir()`.
-///
-/// Production behaviour is byte-identical to v3 §6's shared
-/// `$CACHE/nevoflux/models/` layout, used by `tts::asr`/`tts::kokoro` too
-/// (ruling R53: this task does not touch `models::models_dir()` itself,
-/// since changing it would reach into those unrelated speech features) —
-/// the override exists so a test (and Task 5.2's end-to-end test) can
-/// redirect the engine root ([`crate::local::install::engine_root`]) and the
-/// model dir with the SAME one variable, without touching speech models or
-/// the user's real cache.
-pub fn local_models_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("NEVOFLUX_LOCAL_CACHE_DIR") {
-        if !dir.is_empty() {
-            return Some(PathBuf::from(dir).join("models"));
-        }
-    }
-    crate::models::models_dir()
-}
 
 fn request_id(params: &serde_json::Value) -> String {
     params
@@ -262,7 +242,7 @@ pub async fn handle_status(
         None => hardware::probe().await,
     });
     let root = install::engine_root().unwrap_or_else(|| PathBuf::from("."));
-    let models_dir = local_models_dir();
+    let models_dir = install::local_models_dir();
     let data = status_with(
         &cfg,
         engine::supervisor(),
@@ -298,12 +278,22 @@ pub async fn handle_probe(params: &serde_json::Value) -> serde_json::Value {
 
 // ── local.models ─────────────────────────────────────────────────────
 
-/// `fit`/`estimate` are computed at [`CTX_PREFERRED`] with the default KV
-/// cache type for every catalog model uniformly — deliberately NOT the
-/// currently-configured model's own (possibly `Fixed` to something smaller)
-/// `ctx_size`/`kv_cache_type`, so the model-picker screen compares models on
-/// the same basis rather than skewing toward whichever one happens to be
-/// active right now.
+/// `fit`/`estimate` are computed at ONE shared basis for every catalog
+/// model: `Q8_0` KV cache, and a ctx derived from `fit`'s own auto-ladder
+/// resolution (`choose_ctx(..., CtxPref::Auto, ...)`: `CTX_PREFERRED`
+/// (32768) if the model fits fully on the GPU, else `CTX_FLOOR` (16384), or
+/// `CTX_FLOOR` again for `Fit::Insufficient`, which carries no ctx of its
+/// own — that is the size whose non-fit produced the verdict, and the
+/// number the "try a smaller model" copy is implicitly about). Deliberately
+/// NOT the currently-configured model's own (possibly `Fixed` to something
+/// smaller) `ctx_size`, so the model-picker screen compares models on the
+/// same basis rather than skewing toward whichever one happens to be active
+/// right now (§11.1/§11.2/§12.2: the picker verdict is a property of
+/// model × hardware via the auto ladder, not of the user's configured
+/// `ctx_size`). `estimate` is computed at `fit`'s OWN resolved ctx (fix
+/// round 1, Important 2) — an earlier version computed it at a fixed
+/// `CTX_PREFERRED` regardless of what `fit` actually resolved to, so the
+/// two fields in one card could describe different context sizes.
 fn models_with(probe: Option<&HardwareProbe>, models_dir: Option<&Path>) -> serde_json::Value {
     let vram = probe
         .and_then(|p| p.nvidia_gpus.first())
@@ -327,9 +317,19 @@ fn models_with(probe: Option<&HardwareProbe>, models_dir: Option<&Path>) -> serd
                     })
                 })
                 .collect();
+            // `m.quants[0]`: every catalog model has exactly one quant
+            // today (`local/catalog.rs`), so this is lossless; a second
+            // quant added later would need its own fit, not just inherit
+            // the first's.
             let q0 = &m.quants[0];
             let fit = memory::choose_ctx(m, q0, CtxPref::Auto, KvCacheType::Q8_0, vram, ram);
-            let estimate = memory::estimate(m, q0, CTX_PREFERRED, KvCacheType::Q8_0, vram);
+            let ctx = match &fit {
+                memory::Fit::FullGpu { ctx }
+                | memory::Fit::PartialGpu { ctx, .. }
+                | memory::Fit::CpuOnly { ctx } => *ctx,
+                memory::Fit::Insufficient { .. } => CTX_FLOOR,
+            };
+            let estimate = memory::estimate(m, q0, ctx, KvCacheType::Q8_0, vram);
             serde_json::json!({
                 "id": m.id,
                 "display_name": m.display_name,
@@ -348,7 +348,7 @@ pub async fn handle_models(params: &serde_json::Value) -> serde_json::Value {
         Some(p) => p,
         None => hardware::probe().await,
     });
-    let models_dir = local_models_dir();
+    let models_dir = install::local_models_dir();
     let data = models_with(probe.as_ref(), models_dir.as_deref());
     ok_response(&id, "local.models", data)
 }
@@ -544,6 +544,43 @@ fn install_error_retryable(e: &LocalError) -> bool {
     !matches!(e, LocalError::NoSpace { .. })
 }
 
+/// If `cancel` has fired, reset to [`LocalState::Idle`] and publish a
+/// `{"phase":"cancelled"}` frame instead of a failure (ruling R57) — the
+/// check every error branch AND phase-boundary checkpoint in `run_install`/
+/// `run_engine_only` shares. Returns whether it fired, so a caller can
+/// `return` immediately rather than fall through to writing config or
+/// launching (fix round 1, Minor 7: a cancel that lands between two phases,
+/// not just mid-transfer, must still be honoured).
+fn handle_if_cancelled(
+    supervisor: &EngineSupervisor,
+    bus: &Arc<EventBus>,
+    cancel: &CancellationToken,
+) -> bool {
+    if cancel.is_cancelled() {
+        supervisor.set_state(LocalState::Idle);
+        publish_progress(bus, "cancelled", 0, 0);
+        true
+    } else {
+        false
+    }
+}
+
+/// Releases [`CURRENT_INSTALL`] when dropped — including when the task
+/// holding it panics (a panicking `tokio::spawn`ed task still unwinds and
+/// drops its locals; it does not abort the process). Without this, a bug
+/// elsewhere in the install pipeline could permanently wedge every future
+/// `local.install`/`update_engine`/`repair_engine` behind
+/// `{"reason":"already_running"}` with no way to clear it short of a daemon
+/// restart, and `local.cancel` would report `true` for a token nothing is
+/// listening to (fix round 1, Minor 8).
+struct InstallGuard;
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        finish_install();
+    }
+}
+
 /// Downloads `quant`'s GGUF into `dir`, trying its pinned sources in order —
 /// this module's counterpart to `crate::models::download_asset`, mirrored
 /// closely (same already-present short-circuit, same first-source-that-
@@ -691,15 +728,21 @@ async fn run_install(
     }
 
     if let Err(e) = install_engine_only(&kind, &root, &supervisor, &bus, &cancel).await {
-        if cancel.is_cancelled() {
-            supervisor.set_state(LocalState::Idle);
-            publish_progress(&bus, "cancelled", 0, 0);
-        } else {
-            supervisor.set_state(LocalState::Failed {
-                retryable: install_error_retryable(&e),
-                error: e,
-            });
+        if handle_if_cancelled(&supervisor, &bus, &cancel) {
+            return;
         }
+        supervisor.set_state(LocalState::Failed {
+            retryable: install_error_retryable(&e),
+            error: e,
+        });
+        return;
+    }
+    // Checkpoint between phases (fix round 1, Minor 7): without this, a
+    // cancel that lands in the gap between the engine finishing and the
+    // model download starting is never observed, and the model download
+    // proceeds regardless of `local.cancel` having already answered
+    // `{cancelled: true}`.
+    if handle_if_cancelled(&supervisor, &bus, &cancel) {
         return;
     }
 
@@ -730,15 +773,20 @@ async fn run_install(
     .await;
 
     if let Err(e) = model_result {
-        if cancel.is_cancelled() {
-            supervisor.set_state(LocalState::Idle);
-            publish_progress(&bus, "cancelled", 0, 0);
-        } else {
-            supervisor.set_state(LocalState::Failed {
-                retryable: install_error_retryable(&e),
-                error: e,
-            });
+        if handle_if_cancelled(&supervisor, &bus, &cancel) {
+            return;
         }
+        supervisor.set_state(LocalState::Failed {
+            retryable: install_error_retryable(&e),
+            error: e,
+        });
+        return;
+    }
+    // Checkpoint after the model download's LAST byte but before writing
+    // config/launching (fix round 1, Minor 7): a cancel that lands as the
+    // final chunk arrives must not still enable+launch on-device inference
+    // the user just asked to abandon.
+    if handle_if_cancelled(&supervisor, &bus, &cancel) {
         return;
     }
 
@@ -851,10 +899,11 @@ pub async fn handle_install(
     };
 
     let root = install::engine_root().unwrap_or_else(|| PathBuf::from("."));
-    let models_dir = local_models_dir();
+    let models_dir = install::local_models_dir();
     let supervisor = engine::supervisor().clone();
     let shared_config = shared_config.clone();
     tokio::spawn(async move {
+        let _guard = InstallGuard;
         run_install(
             model,
             quant,
@@ -868,7 +917,6 @@ pub async fn handle_install(
             models_dir,
         )
         .await;
-        finish_install();
     });
 
     ok_response(&id, "local.install", serde_json::json!({"started": true}))
@@ -910,12 +958,35 @@ async fn run_engine_only(
     };
 
     if repair {
+        // Release any handle a resident engine holds on the install's own
+        // files FIRST -- on Windows especially, a running process keeps
+        // `llama-server.exe` open, and removing the directory underneath it
+        // fails silently into the arm below (fix round 1, Important 4).
+        supervisor.stop().await;
+
         // `install::install` treats a directory with a parseable, matching
         // marker as an already-completed install without re-verifying its
         // contents -- a "repair" has to remove that marker first, or a
         // corrupted install would short-circuit right back to itself.
         let dir = install::install_dir(&root, ENGINE_PINNED.tag, &kind);
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                // A removal failure must not fall through to `install()`
+                // finding the surviving (still-damaged) marker and
+                // reporting "already installed" as a successful repair
+                // (fix round 1, Important 4).
+                supervisor.set_state(LocalState::Failed {
+                    error: LocalError::EngineCorrupt {
+                        detail: format!(
+                            "could not remove the damaged install at {}: {e}",
+                            dir.display()
+                        ),
+                    },
+                    retryable: true,
+                });
+                return;
+            }
+        }
     }
 
     match install_engine_only(&kind, &root, &supervisor, &bus, &cancel).await {
@@ -925,15 +996,13 @@ async fn run_engine_only(
             supervisor.stop().await;
         }
         Err(e) => {
-            if cancel.is_cancelled() {
-                supervisor.set_state(LocalState::Idle);
-                publish_progress(&bus, "cancelled", 0, 0);
-            } else {
-                supervisor.set_state(LocalState::Failed {
-                    retryable: install_error_retryable(&e),
-                    error: e,
-                });
+            if handle_if_cancelled(&supervisor, &bus, &cancel) {
+                return;
             }
+            supervisor.set_state(LocalState::Failed {
+                retryable: install_error_retryable(&e),
+                error: e,
+            });
         }
     }
 }
@@ -964,8 +1033,8 @@ async fn handle_engine_only(
     let root = install::engine_root().unwrap_or_else(|| PathBuf::from("."));
     let supervisor = engine::supervisor().clone();
     tokio::spawn(async move {
+        let _guard = InstallGuard;
         run_engine_only(repair, supervisor, bus, cancel, root, backend_pref).await;
-        finish_install();
     });
     ok_response(&id, cmd, serde_json::json!({"started": true}))
 }
@@ -1035,7 +1104,13 @@ async fn set_default_with(
     };
 
     if on {
+        // The latch requires BOTH the active provider resolving to Local
+        // AND `[llm.local].enabled` (`latch::refresh_from_config`) -- write
+        // both here so this call can never report success while silently
+        // leaving on-device the active provider with no latch and no
+        // engine (fix round 1, Important 1).
         config.llm.provider = Some("local".to_string());
+        config.llm.local.enabled = true;
     } else {
         let provider = params
             .get("provider")
@@ -1059,6 +1134,21 @@ async fn set_default_with(
                 );
             }
             Some(_) => {}
+        }
+        // Refuse to release the latch onto a provider with no API
+        // key/base URL -- that would leave the user with no working
+        // provider at all, one step removed from the outcome this
+        // requirement exists to prevent (fix round 1, Minor 10).
+        if !config.llm.is_provider_configured(provider) {
+            return err_response(
+                &id,
+                "local.set_default",
+                "provider_not_configured",
+                format!(
+                    "{provider} has no API key (or, for a custom provider, base URL) \
+                     configured; releasing the latch onto it would leave no working provider"
+                ),
+            );
         }
         config.llm.provider = Some(provider.to_string());
     }
@@ -1108,6 +1198,17 @@ pub async fn handle_set_default(
 
 // ── local.set_config ─────────────────────────────────────────────────
 
+/// Whether `after` differs from `before` in a field the engine's launch
+/// actually bakes in (argv / `n_ctx`). `idle_unload_secs` is deliberately
+/// excluded: the idle timer reads it live on every tick, and it never
+/// affects an already-running process, so a request that only changes it
+/// must not pay for a multi-GB reload (fix round 1, Important 5).
+fn launch_relevant_changed(before: &LocalConfig, after: &LocalConfig) -> bool {
+    before.ctx_size != after.ctx_size
+        || before.backend != after.backend
+        || before.parallel != after.parallel
+}
+
 async fn set_config_with(
     params: &serde_json::Value,
     shared_config: &SharedAgentConfig,
@@ -1126,6 +1227,10 @@ async fn set_config_with(
             )
         }
     };
+    // Snapshot before any param is applied, so the launch-relevant fields
+    // can be compared against what actually changed (see the conditional
+    // `stop` below, fix round 1, Important 5).
+    let before = config.llm.local.clone();
 
     if let Some(v) = params.get("ctx_size") {
         match serde_json::from_value::<CtxPref>(v.clone()) {
@@ -1153,16 +1258,50 @@ async fn set_config_with(
             }
         }
     }
-    if let Some(v) = params.get("parallel").and_then(|v| v.as_u64()) {
-        config.llm.local.parallel = v as u32;
+    // `ctx_size`/`backend` above return typed errors for bad input; these
+    // two now match (fix round 1, Important 3) -- `as_u64()` alone silently
+    // accepted a string/float/negative number by doing nothing, and the
+    // bare `as u32` truncated anything past `u32::MAX` into a
+    // plausible-looking small value instead of erroring.
+    if let Some(v) = params.get("parallel") {
+        match v.as_u64().and_then(|n| u32::try_from(n).ok()) {
+            Some(p) if p >= 1 => config.llm.local.parallel = p,
+            _ => {
+                return err_response(
+                    &id,
+                    "local.set_config",
+                    "bad_parallel",
+                    "expected a positive integer",
+                )
+            }
+        }
     }
-    if let Some(v) = params.get("idle_unload_secs").and_then(|v| v.as_u64()) {
-        config.llm.local.idle_unload_secs = v;
+    if let Some(v) = params.get("idle_unload_secs") {
+        match v.as_u64() {
+            Some(secs) => config.llm.local.idle_unload_secs = secs,
+            None => {
+                return err_response(
+                    &id,
+                    "local.set_config",
+                    "bad_idle_unload_secs",
+                    "expected a non-negative integer",
+                )
+            }
+        }
     }
 
     if let Err(msg) = config.llm.local.validated_ctx() {
         return err_response(&id, "local.set_config", "bad_ctx", msg);
     }
+
+    // Only `ctx_size`/`backend`/`parallel` are baked into the engine's
+    // launch (argv/n_ctx); `idle_unload_secs` is read live by the idle
+    // timer and never affects an already-running process, so it must NOT
+    // force a multi-GB reload on its own (fix round 1, Important 5 --
+    // "restarts engine on next demand" describes the effect of a changed
+    // launch-relevant setting, not a mandate to tear down a resident
+    // process on every call, including one that changed nothing at all).
+    let launch_changed = launch_relevant_changed(&before, &config.llm.local);
 
     if let Err(e) = config.save_to_path(&config_path.to_path_buf()) {
         return err_response(
@@ -1174,10 +1313,9 @@ async fn set_config_with(
     }
     *shared_config.write().unwrap() = Arc::new(config.clone());
     crate::local::on_config_changed(&config).await;
-    // Launch-relevant fields (ctx/backend/parallel) may have changed; force
-    // a fresh cold start on next demand rather than let a resident process
-    // keep serving the old ones.
-    supervisor.stop().await;
+    if launch_changed {
+        supervisor.stop().await;
+    }
 
     ok_response(
         &id,
@@ -1241,6 +1379,46 @@ mod tests {
         }
     }
 
+    /// A machine with no usable GPU at all -- `BackendPref::Cpu` resolves
+    /// to exactly one, hardware-independent `InstallKind` regardless of any
+    /// of these fields, which is what makes `status_with`'s installed-marker
+    /// test reproducible on any machine running the suite.
+    fn cpu_only_probe() -> HardwareProbe {
+        HardwareProbe {
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            nvidia_gpus: vec![],
+            has_physical_nvidia: false,
+            has_usable_nvidia: false,
+            driver_cuda_version: None,
+            cuda_runtime_lines: vec![],
+            vulkan_available: false,
+            ram_bytes: 8 * memory::GIB,
+            macos_version: None,
+        }
+    }
+
+    /// Enough VRAM/RAM that every catalog model fits fully on the GPU at
+    /// 32768 ctx (the largest, qwen3-8b, needs roughly 8GiB total there).
+    fn generous_gpu_probe() -> HardwareProbe {
+        HardwareProbe {
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            nvidia_gpus: vec![hardware::GpuInfo {
+                name: "Big GPU".to_string(),
+                vram_bytes: 64 * memory::GIB,
+                compute_cap: Some((8, 9)),
+            }],
+            has_physical_nvidia: true,
+            has_usable_nvidia: true,
+            driver_cuda_version: Some((12, 4)),
+            cuda_runtime_lines: vec![12],
+            vulkan_available: false,
+            ram_bytes: 128 * memory::GIB,
+            macos_version: None,
+        }
+    }
+
     // ------------------------------------------------------------------
     // local.plan
     // ------------------------------------------------------------------
@@ -1298,6 +1476,176 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // local.status / local.models -- status_with / models_with
+    // ------------------------------------------------------------------
+
+    /// `status_with` touches the real global LocalOnly latch (via
+    /// `latch::is_on()`, with no injection point of its own), so this holds
+    /// `latch::test_serial_async` like every other real-global-touching test
+    /// in this module.
+    #[tokio::test]
+    async fn status_with_reports_no_engine_and_a_missing_model_when_nothing_is_installed() {
+        let _guard = latch::test_serial_async().await;
+        latch::set_global_for_test(false);
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine_root = dir.path().join("engine");
+        let supervisor = EngineSupervisor::new(engine_root.clone());
+        let cfg = LocalConfig::default();
+
+        let v = status_with(
+            &cfg,
+            &supervisor,
+            Some(&cpu_only_probe()),
+            &engine_root,
+            None,
+        );
+        assert_eq!(v["state"]["state"], "idle");
+        assert_eq!(v["latched"], false);
+        // No install directory has ever been created -- `engine` really is
+        // absent.
+        assert_eq!(v["engine"], serde_json::Value::Null);
+        // The CONFIGURED model/quant still resolves in the catalog even
+        // with no `models_dir` to check on disk -- `model` reports it as
+        // "missing", not `null` (that only happens for an unknown
+        // model/quant id in config, exercised separately below).
+        assert_eq!(v["model"]["id"], "qwen3-4b-instruct-2507");
+        assert_eq!(v["model"]["state"], "missing");
+        assert_eq!(v["model"]["have"], 0);
+
+        latch::set_global_for_test(false);
+    }
+
+    #[test]
+    fn status_with_reports_a_null_model_for_an_unknown_configured_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine_root = dir.path().join("engine");
+        let supervisor = EngineSupervisor::new(engine_root.clone());
+        let cfg = LocalConfig {
+            model: "no-such-model".to_string(),
+            ..LocalConfig::default()
+        };
+
+        let v = status_with(
+            &cfg,
+            &supervisor,
+            Some(&cpu_only_probe()),
+            &engine_root,
+            None,
+        );
+        assert_eq!(v["model"], serde_json::Value::Null);
+    }
+
+    /// Writes a real `marker.json` (no other files -- `marker::read_marker`
+    /// never checks the manifest against the filesystem, only
+    /// `install::integrity::verify_manifest` does, and that is
+    /// `EngineSupervisor::cold_start`'s job, not `status_with`'s) into the
+    /// exact directory `install::install_dir` would use for a CPU install,
+    /// so `installed_engine`'s walk finds it the same way it would in
+    /// production.
+    #[test]
+    fn status_with_reports_the_installed_engine_and_a_partial_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine_root = dir.path().join("engine");
+        let probe = cpu_only_probe();
+        let cfg = LocalConfig {
+            backend: BackendPref::Cpu,
+            ..LocalConfig::default()
+        };
+
+        let chain = hardware::fallback_chain(&probe, cfg.backend);
+        let kind = chain.first().expect("cpu chain is never empty").clone();
+        let install_dir = install::install_dir(&engine_root, ENGINE_PINNED.tag, &kind);
+        std::fs::create_dir_all(&install_dir).unwrap();
+        marker::write_marker(
+            &install_dir,
+            &marker::Marker {
+                tag: ENGINE_PINNED.tag.to_string(),
+                kind: kind_label(&kind),
+                archive_sha256: vec![],
+                files: vec![marker::FileEntry {
+                    path: "llama-server".to_string(),
+                    size: 12345,
+                    sha256: "a".repeat(64),
+                }],
+                installed_at: 0,
+                last_used_at: 0,
+                bad: None,
+            },
+        )
+        .unwrap();
+
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let model = catalog::model(&cfg.model).unwrap();
+        let quant = catalog::quant(model, &cfg.quant).unwrap();
+        std::fs::write(
+            models_dir.join(format!("{}.part", quant.file)),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+
+        let supervisor = EngineSupervisor::new(engine_root.clone());
+        let v = status_with(
+            &cfg,
+            &supervisor,
+            Some(&probe),
+            &engine_root,
+            Some(&models_dir),
+        );
+
+        assert_eq!(v["engine"]["tag"], ENGINE_PINNED.tag);
+        assert_eq!(v["engine"]["kind"], kind_label(&kind));
+        assert_eq!(v["engine"]["bytes"], 12345);
+        assert_eq!(v["engine"]["update"], "none");
+
+        assert_eq!(v["model"]["id"], model.id);
+        assert_eq!(v["model"]["state"], "partial");
+        assert_eq!(v["model"]["have"], 4096);
+        assert_eq!(v["model"]["bytes"], quant.bytes);
+    }
+
+    #[test]
+    fn models_with_reports_missing_quants_without_a_models_dir() {
+        let v = models_with(None, None);
+        let list = v.as_array().unwrap();
+        assert_eq!(list.len(), catalog::MODELS.len());
+        for entry in list {
+            for q in entry["quants"].as_array().unwrap() {
+                assert_eq!(q["state"], "missing", "{entry}");
+                assert_eq!(q["have"], 0, "{entry}");
+            }
+        }
+    }
+
+    /// Regression test for fix round 1, Important 2: `fit` and `estimate`
+    /// must describe the SAME context size. On generous hardware every
+    /// catalog model fits fully on the GPU at the preferred 32K ctx.
+    #[test]
+    fn models_with_shares_one_ctx_between_fit_and_estimate_when_full_gpu() {
+        let probe = generous_gpu_probe();
+        let v = models_with(Some(&probe), None);
+        for entry in v.as_array().unwrap() {
+            assert_eq!(entry["fit"]["fit"], "full_gpu", "{entry}");
+            assert_eq!(entry["fit"]["ctx"], 32768, "{entry}");
+            assert_eq!(entry["estimate"]["ctx"], 32768, "{entry}");
+        }
+    }
+
+    /// Same regression, at the other end: no probe at all means nothing
+    /// fits even CPU-only (`vram=None`, `ram=0`), and `estimate` must then
+    /// use `CTX_FLOOR` -- the ctx whose non-fit produced the verdict --
+    /// rather than the un-implemented fixed `CTX_PREFERRED` this replaced.
+    #[test]
+    fn models_with_estimates_at_ctx_floor_when_insufficient() {
+        let v = models_with(None, None);
+        for entry in v.as_array().unwrap() {
+            assert_eq!(entry["fit"]["fit"], "insufficient", "{entry}");
+            assert_eq!(entry["estimate"]["ctx"], CTX_FLOOR, "{entry}");
+        }
+    }
+
+    // ------------------------------------------------------------------
     // local.set_default
     // ------------------------------------------------------------------
 
@@ -1307,6 +1655,12 @@ mod tests {
     /// override on purpose -- see `latch`'s module docs) -- so this holds
     /// `latch::test_serial_async` for its whole body, exactly like
     /// `crate::local::sync`'s own `on_config_changed_with_...` tests do.
+    ///
+    /// Deliberately does NOT pre-seed `llm.local.enabled = true` (fix round
+    /// 1, Important 1's regression test): `on:true` must set it itself, or
+    /// this reports `latched: true`/success while the latch actually stays
+    /// off -- exactly the bug this fix closes. Also asserts `enabled` is
+    /// `true` afterward, not just that the latch flipped.
     #[tokio::test]
     async fn set_default_with_flips_and_releases_the_latch() {
         let _guard = latch::test_serial_async().await;
@@ -1315,7 +1669,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let mut seed = AgentConfig::default();
-        seed.llm.local.enabled = true;
+        // `on:false` now requires the release provider to be configured
+        // (Minor 10) -- give "anthropic" a key so the second call below
+        // exercises the latch release, not that separate refusal.
+        seed.llm.anthropic.api_key = Some("test-key".to_string());
         seed.save_to_path(&config_path).unwrap();
 
         let shared_config = shared(seed);
@@ -1330,13 +1687,9 @@ mod tests {
         assert!(ok(&v), "{v}");
         assert_eq!(payload(&v)["data"]["latched"], true);
         assert!(latch::is_on());
-        assert_eq!(
-            AgentConfig::load_from_path(&config_path)
-                .unwrap()
-                .llm
-                .provider,
-            Some("local".to_string())
-        );
+        let after_on = AgentConfig::load_from_path(&config_path).unwrap();
+        assert_eq!(after_on.llm.provider, Some("local".to_string()));
+        assert!(after_on.llm.local.enabled, "on:true must enable local");
 
         let v2 = set_default_with(
             &serde_json::json!({"request_id": "r2", "on": false, "provider": "anthropic"}),
@@ -1357,6 +1710,25 @@ mod tests {
         );
 
         latch::set_global_for_test(false);
+    }
+
+    #[tokio::test]
+    async fn set_default_with_on_false_rejects_an_unconfigured_provider() {
+        // "openai" resolves fine but has no api_key in a default config --
+        // releasing onto it would leave the user with no working provider.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let shared_config = shared(AgentConfig::default());
+
+        let v = set_default_with(
+            &serde_json::json!({"request_id": "r", "on": false, "provider": "openai"}),
+            &shared_config,
+            &config_path,
+            None,
+        )
+        .await;
+        assert!(!ok(&v), "{v}");
+        assert_eq!(payload(&v)["error"]["code"], "provider_not_configured");
     }
 
     #[tokio::test]
@@ -1475,6 +1847,99 @@ mod tests {
         assert_eq!(payload(&v)["error"]["code"], "bad_backend");
     }
 
+    /// Regression test for fix round 1, Important 3: `parallel` used to
+    /// silently accept anything `as_u64()` couldn't parse (doing nothing)
+    /// and truncate anything above `u32::MAX`; it must now error like
+    /// `ctx_size`/`backend` do.
+    #[tokio::test]
+    async fn set_config_with_rejects_a_non_positive_or_oversized_parallel() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let shared_config = shared(AgentConfig::default());
+        let supervisor = EngineSupervisor::new(dir.path().join("engine"));
+
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("two"),
+            serde_json::json!(4.5),
+            serde_json::json!(u64::from(u32::MAX) + 1),
+        ] {
+            let v = set_config_with(
+                &serde_json::json!({"request_id": "r", "parallel": bad}),
+                &shared_config,
+                &config_path,
+                &supervisor,
+            )
+            .await;
+            assert!(!ok(&v), "{bad} -> {v}");
+            assert_eq!(payload(&v)["error"]["code"], "bad_parallel", "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn set_config_with_rejects_a_non_integer_idle_unload_secs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let shared_config = shared(AgentConfig::default());
+        let supervisor = EngineSupervisor::new(dir.path().join("engine"));
+
+        let v = set_config_with(
+            &serde_json::json!({"request_id": "r", "idle_unload_secs": -5}),
+            &shared_config,
+            &config_path,
+            &supervisor,
+        )
+        .await;
+        assert!(!ok(&v), "{v}");
+        assert_eq!(payload(&v)["error"]["code"], "bad_idle_unload_secs");
+    }
+
+    #[tokio::test]
+    async fn set_config_with_accepts_idle_unload_secs_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let shared_config = shared(AgentConfig::default());
+        let supervisor = EngineSupervisor::new(dir.path().join("engine"));
+
+        let v = set_config_with(
+            &serde_json::json!({"request_id": "r", "idle_unload_secs": 60}),
+            &shared_config,
+            &config_path,
+            &supervisor,
+        )
+        .await;
+        assert!(ok(&v), "{v}");
+        assert_eq!(payload(&v)["data"]["idle_unload_secs"], 60);
+    }
+
+    /// Direct test of the pure comparison behind fix round 1, Important 5
+    /// (`set_config` must not unconditionally stop the engine): only
+    /// `ctx_size`/`backend`/`parallel` count as launch-relevant;
+    /// `idle_unload_secs` alone must not.
+    #[test]
+    fn launch_relevant_changed_ignores_idle_unload_secs_alone() {
+        let before = LocalConfig::default();
+
+        let mut idle_only = before.clone();
+        idle_only.idle_unload_secs += 60;
+        assert!(!launch_relevant_changed(&before, &idle_only));
+
+        let mut parallel_changed = before.clone();
+        parallel_changed.parallel += 1;
+        assert!(launch_relevant_changed(&before, &parallel_changed));
+
+        let mut ctx_changed = before.clone();
+        ctx_changed.ctx_size = CtxPref::Fixed(32768);
+        assert!(launch_relevant_changed(&before, &ctx_changed));
+
+        let mut backend_changed = before.clone();
+        backend_changed.backend = BackendPref::Cuda;
+        assert!(launch_relevant_changed(&before, &backend_changed));
+
+        assert!(!launch_relevant_changed(&before, &before.clone()));
+    }
+
     // ------------------------------------------------------------------
     // Validation-only paths for the remaining commands -- these return
     // before touching the EventBus/engine singleton/real config path, so
@@ -1532,15 +1997,6 @@ mod tests {
         let v = handle_cancel(&serde_json::json!({"request_id": "r"})).await;
         assert!(ok(&v), "{v}");
         assert_eq!(payload(&v)["data"]["cancelled"], false);
-    }
-
-    #[test]
-    fn local_models_dir_matches_the_shared_speech_models_dir_without_an_override() {
-        // Only meaningful when the override isn't set in this process --
-        // true in CI/dev by default, and this test never sets it itself.
-        if std::env::var("NEVOFLUX_LOCAL_CACHE_DIR").is_err() {
-            assert_eq!(local_models_dir(), crate::models::models_dir());
-        }
     }
 
     #[test]

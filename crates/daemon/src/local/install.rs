@@ -27,10 +27,9 @@ use crate::models::fetch::{self, FetchError};
 
 /// Where installed engines live: `NEVOFLUX_LOCAL_CACHE_DIR/engine` when the
 /// override is set (tests and Task 5.2's `#[ignore]` e2e test redirect both
-/// this and `crate::models::models_dir()`'s sibling with the SAME
-/// variable -- see that function's own doc comment for why they are not
-/// currently wired together), else `dirs::cache_dir()/nevoflux/engine`,
-/// matching the override-then-`cache_dir()` shape already used by
+/// this and [`local_models_dir`], its sibling below, with the SAME
+/// variable), else `dirs::cache_dir()/nevoflux/engine`, matching the
+/// override-then-`cache_dir()` shape already used by
 /// `crate::tts::asr::whisper`.
 pub fn engine_root() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("NEVOFLUX_LOCAL_CACHE_DIR") {
@@ -39,6 +38,26 @@ pub fn engine_root() -> Option<PathBuf> {
         }
     }
     dirs::cache_dir().map(|d| d.join("nevoflux").join("engine"))
+}
+
+/// Where downloaded model weights (GGUF files) live:
+/// `NEVOFLUX_LOCAL_CACHE_DIR/models` when the override is set, else
+/// `crate::models::models_dir()` — the SAME shared `$CACHE/nevoflux/models/`
+/// directory `tts::asr`/`tts::kokoro` already use (v3 §6; ruling R53: this
+/// does not touch `models::models_dir()` itself, since changing it would
+/// reach into those unrelated speech features). Colocated with
+/// [`engine_root`] (fix round 1, Minor 11) rather than living in
+/// `local::rpc` — the module that actually consumes it — because both honor
+/// the SAME `NEVOFLUX_LOCAL_CACHE_DIR` override and Task 5.2's end-to-end
+/// test redirects both together; a reader chasing that variable should find
+/// both accessors in one place.
+pub fn local_models_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("NEVOFLUX_LOCAL_CACHE_DIR") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir).join("models"));
+        }
+    }
+    crate::models::models_dir()
 }
 
 /// The `<platform>-<backend>[-<variant>]` identity string for `kind` --
@@ -891,6 +910,27 @@ mod tests {
         let _restore = EnvVarGuard("NEVOFLUX_LOCAL_CACHE_DIR");
         let root = engine_root().unwrap();
         assert_eq!(root, tmp.path().join("engine"));
+    }
+
+    #[test]
+    fn local_models_dir_honours_the_same_cache_dir_override() {
+        let _guard = crate::llm_gateway::tests::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("NEVOFLUX_LOCAL_CACHE_DIR", tmp.path());
+        let _restore = EnvVarGuard("NEVOFLUX_LOCAL_CACHE_DIR");
+        let dir = local_models_dir().unwrap();
+        assert_eq!(dir, tmp.path().join("models"));
+    }
+
+    #[test]
+    fn local_models_dir_falls_back_to_the_shared_speech_models_dir_without_an_override() {
+        let _guard = crate::llm_gateway::tests::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("NEVOFLUX_LOCAL_CACHE_DIR");
+        assert_eq!(local_models_dir(), crate::models::models_dir());
     }
 
     #[test]
