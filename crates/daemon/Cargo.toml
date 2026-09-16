@@ -230,6 +230,16 @@ zstd = "0.13"
 # Pack GitHub install — gunzip GitHub codeload tarballs (tempfile already a dep).
 flate2 = "1"
 
+# Local-inference engine installer (`local::install`): extracting the
+# prebuilt llama-server archives. Pinned to the SAME spec as
+# `crates/tts/Cargo.toml`'s existing `zip` dependency so both crates unify
+# on one resolved version (2.4.2) instead of adding a second `zip` major
+# (the lockfile also carries an unrelated 8.x from another dependency).
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Free-disk-space check before downloading engine archives (`local::install`).
+fs2 = "0.4"
+
 # Native file dialog
 rfd = "0.15"
 

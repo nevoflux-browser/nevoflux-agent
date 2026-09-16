@@ -19,9 +19,14 @@
 //! table of what the engine release's downloadable archives actually ARE
 //! (name, size, sha256, mirror/original download sources), generated from a
 //! verified staging manifest by `scripts/engine-release/gen_release_rs.py`.
-//! A later task adds the engine supervisor that publishes to the endpoint
-//! registry, calls [`apply_gateway_upstream_for_latch`] when it does, and
-//! uses `catalog` + `memory` + `hardware` + `release` to decide what to
+//! Task 2.4 adds `install`: downloading, extracting, verifying and
+//! atomically installing one release's archives for a given `InstallKind`,
+//! plus `marker` (the on-disk record of a completed install) and `state`
+//! (today, just the shared `LocalError` type `install` returns -- Task 2.8
+//! grows this into the full state/event model). A later task adds the
+//! engine supervisor that publishes to the endpoint registry, calls
+//! [`apply_gateway_upstream_for_latch`] when it does, and uses `catalog` +
+//! `memory` + `hardware` + `release` + `install` to decide what to
 //! install/launch and how.
 
 pub mod catalog;
@@ -29,9 +34,12 @@ pub mod config;
 pub mod endpoint;
 pub mod gguf;
 pub mod hardware;
+pub mod install;
 pub mod latch;
+pub mod marker;
 pub mod memory;
 pub mod release;
+pub mod state;
 pub mod sync;
 pub use config::*;
 pub use sync::{apply_gateway_upstream_for_latch, on_config_changed, publish_current_latch_state};
