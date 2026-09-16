@@ -67,31 +67,95 @@ pub struct InstallKind {
     pub cudart: Option<String>,
 }
 
-/// Subprocess probes (`nvidia-smi`, `sysctl`) never wait longer than this —
-/// a hung or missing binary must not stall whoever calls [`probe`].
+/// Per-subprocess-call cap (`nvidia-smi`, `sysctl`, `sw_vers`) — a hung or
+/// missing binary must not stall an individual call past this. Because
+/// [`probe_nvidia`] alone can invoke `nvidia-smi` up to three times, this
+/// is a secondary safety net; [`PROBE_TOTAL_BUDGET`] is what actually
+/// bounds one [`probe`] call end to end.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Total wall-clock budget for one entire [`probe`] call, covering every
+/// subprocess it may spawn internally. A per-call-only cap does not bound
+/// the whole probe: `nvidia-smi` is invoked up to three times (the
+/// `compute_cap` query, its cap-less retry, and the plain-header query)
+/// and macOS adds two more (`sysctl`, `sw_vers`), so a per-invocation-only
+/// [`PROBE_TIMEOUT`] could total 25s in the worst case. [`probe`] instead
+/// wraps the whole gathering sequence in one `tokio::time::timeout` at
+/// this budget and returns a bare os/arch fingerprint (everything else
+/// defaulted) if it fires.
+const PROBE_TOTAL_BUDGET: Duration = Duration::from_secs(5);
 
 static CACHED: Mutex<Option<HardwareProbe>> = Mutex::new(None);
 
 /// Fingerprint this host's hardware. Never called automatically at daemon
 /// startup (v3 §10) — only on demand, by whichever later task needs to
-/// decide what to install/launch. Updates [`cached`]'s value.
+/// decide what to install/launch. Updates [`cached`]'s value. Bounded end
+/// to end by [`PROBE_TOTAL_BUDGET`], regardless of how many subprocesses
+/// or filesystem probes it runs internally.
 pub async fn probe() -> HardwareProbe {
     let os = std::env::consts::OS.to_string();
     let arch = std::env::consts::ARCH.to_string();
 
+    let result = match tokio::time::timeout(
+        PROBE_TOTAL_BUDGET,
+        probe_inner(os.clone(), arch.clone()),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                budget_secs = PROBE_TOTAL_BUDGET.as_secs(),
+                %os,
+                %arch,
+                "local::hardware::probe exceeded its total time budget; returning a bare os/arch fingerprint with everything else defaulted"
+            );
+            HardwareProbe {
+                os,
+                arch,
+                ..Default::default()
+            }
+        }
+    };
+
+    tracing::debug!(?result, "local::hardware::probe complete");
+
+    if let Ok(mut guard) = CACHED.lock() {
+        *guard = Some(result.clone());
+    }
+
+    result
+}
+
+/// The actual gathering sequence, factored out of [`probe`] so the latter
+/// can wrap it in one [`PROBE_TOTAL_BUDGET`]-wide timeout.
+async fn probe_inner(os: String, arch: String) -> HardwareProbe {
     let (nvidia_gpus, driver_cuda_version) = probe_nvidia().await;
     let has_physical_nvidia = !nvidia_gpus.is_empty();
     let cuda_visible_devices = std::env::var("CUDA_VISIBLE_DEVICES").ok();
     let has_usable_nvidia =
         has_physical_nvidia && !visible_devices_hide_all(cuda_visible_devices.as_deref());
 
-    let cuda_runtime_lines = probe_cuda_runtime_lines(&os);
-    let vulkan_available = probe_vulkan_available(&os);
+    // Both do synchronous filesystem globbing (up to eight `glob::glob`
+    // walks on Linux: 2 cudart majors + Vulkan loader + Vulkan ICD, each
+    // over `/usr/lib*`/`/lib*`/icd.d) — never call them directly on the
+    // async executor.
+    let cuda_runtime_lines = {
+        let os = os.clone();
+        tokio::task::spawn_blocking(move || probe_cuda_runtime_lines(&os))
+            .await
+            .unwrap_or_default()
+    };
+    let vulkan_available = {
+        let os = os.clone();
+        tokio::task::spawn_blocking(move || probe_vulkan_available(&os))
+            .await
+            .unwrap_or(false)
+    };
     let ram_bytes = probe_ram_bytes(&os).await;
     let macos_version = probe_macos_version(&os).await;
 
-    let result = HardwareProbe {
+    HardwareProbe {
         os,
         arch,
         nvidia_gpus,
@@ -102,13 +166,7 @@ pub async fn probe() -> HardwareProbe {
         vulkan_available,
         ram_bytes,
         macos_version,
-    };
-
-    if let Ok(mut guard) = CACHED.lock() {
-        *guard = Some(result.clone());
     }
-
-    result
 }
 
 /// The result of the most recent [`probe`] call, if any has run yet in this
@@ -119,32 +177,96 @@ pub fn cached() -> Option<HardwareProbe> {
 
 /// Runs `program args…`, capped at [`PROBE_TIMEOUT`]. `None` if the binary
 /// is missing, the process errors, times out, or exits non-zero — a probe
-/// failure is always "signal unavailable", never a panic.
+/// failure is always "signal unavailable", never a panic. `kill_on_drop`
+/// is set so a call cancelled by [`PROBE_TOTAL_BUDGET`]'s outer timeout
+/// (which drops this future mid-flight) does not leave the child process
+/// running in the background.
 async fn run_with_timeout(program: &str, args: &[&str]) -> Option<String> {
-    let output_fut = tokio::process::Command::new(program).args(args).output();
+    let output_fut = tokio::process::Command::new(program)
+        .args(args)
+        .kill_on_drop(true)
+        .output();
     match tokio::time::timeout(PROBE_TIMEOUT, output_fut).await {
         Ok(Ok(output)) if output.status.success() => {
             Some(String::from_utf8_lossy(&output.stdout).into_owned())
         }
-        _ => None,
+        Ok(Ok(output)) => {
+            tracing::debug!(
+                program,
+                ?args,
+                exit_code = output.status.code(),
+                "probe subprocess exited non-zero"
+            );
+            None
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(program, ?args, error = %e, "probe subprocess failed to spawn");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(
+                program,
+                ?args,
+                timeout_secs = PROBE_TIMEOUT.as_secs(),
+                "probe subprocess timed out"
+            );
+            None
+        }
     }
 }
 
-/// Runs both `nvidia-smi` invocations the probe needs: the queried CSV
-/// (GPU list) and the plain header (driver CUDA version).
+/// Runs the `nvidia-smi` invocations the probe needs: the queried CSV (GPU
+/// list, with a cap-less retry — see below) and the plain header (driver
+/// CUDA version).
+///
+/// An `nvidia-smi` old enough (~pre-11.x) to reject the `compute_cap`
+/// field exits non-zero on the first query, which would otherwise blank
+/// the whole GPU list and make `has_physical_nvidia` false even though a
+/// real card is present — silently defeating v3 §10's "physical but
+/// unusable" distinction before it can ever fire. If the first query comes
+/// back empty, retry without `compute_cap`; a GPU found this way just
+/// carries `compute_cap: None` (routes to [`CudaBucket::Portable`] in
+/// [`select_cuda_kind`]).
 async fn probe_nvidia() -> (Vec<GpuInfo>, Option<(u32, u32)>) {
-    let csv = run_with_timeout(
+    let mut gpus = run_with_timeout(
         "nvidia-smi",
         &[
             "--query-gpu=name,memory.total,compute_cap",
             "--format=csv,noheader,nounits",
         ],
     )
-    .await;
-    let gpus = csv.as_deref().map(parse_nvidia_smi_csv).unwrap_or_default();
+    .await
+    .as_deref()
+    .map(parse_nvidia_smi_csv)
+    .unwrap_or_default();
+
+    if gpus.is_empty() {
+        tracing::debug!(
+            "nvidia-smi --query-gpu=...,compute_cap returned nothing; retrying without compute_cap"
+        );
+        gpus = run_with_timeout(
+            "nvidia-smi",
+            &[
+                "--query-gpu=name,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+        )
+        .await
+        .as_deref()
+        .map(parse_nvidia_smi_csv)
+        .unwrap_or_default();
+    }
+    if gpus.is_empty() {
+        tracing::debug!("nvidia-smi unavailable, or reports no GPUs, on both queries");
+    }
 
     let plain = run_with_timeout("nvidia-smi", &[]).await;
     let driver_cuda_version = plain.as_deref().and_then(parse_driver_cuda_version);
+    if !gpus.is_empty() && driver_cuda_version.is_none() {
+        tracing::debug!(
+            "nvidia-smi listed GPU(s) but no driver CUDA version could be parsed from its plain header"
+        );
+    }
 
     (gpus, driver_cuda_version)
 }
@@ -162,10 +284,20 @@ fn probe_cuda_runtime_lines(os: &str) -> Vec<u32> {
         .collect()
 }
 
+/// v3 §10 specifies "loader + ICD" — a loader with no actual driver behind
+/// it cannot run anything. Linux checks both (loader file + at least one
+/// ICD manifest). Windows checks the loader only: a full check would read
+/// the Vulkan ICD registry key (`HKLM\SOFTWARE\Khronos\Vulkan\Drivers`),
+/// which needs a `windows-sys` feature beyond what this task's brief
+/// authorized (`Win32_System_SystemInformation` only) — left as a known
+/// gap (recorded for the controller). Either way a stale loader with no
+/// usable ICD still degrades safely at launch time via v3 §9's
+/// `BackendUnavailable` → next-tier path, so this is a diagnostic-accuracy
+/// gap, not a correctness one.
 fn probe_vulkan_available(os: &str) -> bool {
     match os {
         "windows" => windows_vulkan_available(),
-        "linux" => find_library("libvulkan.so.1"),
+        "linux" => find_library("libvulkan.so.1") && linux_vulkan_icd_present(),
         // macOS's selection never considers Vulkan (see `fallback_chain`) —
         // the build matrix has no macOS Vulkan archive.
         _ => false,
@@ -178,6 +310,31 @@ fn windows_vulkan_available() -> bool {
         .join("System32")
         .join("vulkan-1.dll")
         .exists()
+}
+
+/// Whether at least one Vulkan ICD manifest is discoverable via the
+/// standard Vulkan Loader search locations, or an explicit
+/// `VK_ICD_FILENAMES`/`VK_ADD_DRIVER_FILES` override is set. The loader
+/// (`libvulkan.so.1`) can be installed with no GPU driver behind it at
+/// all — checking for it alone would report `true` on a machine that
+/// cannot actually create a Vulkan device.
+fn linux_vulkan_icd_present() -> bool {
+    if std::env::var("VK_ICD_FILENAMES").is_ok() || std::env::var("VK_ADD_DRIVER_FILES").is_ok() {
+        return true;
+    }
+    for dir in [
+        "/usr/share/vulkan/icd.d",
+        "/etc/vulkan/icd.d",
+        "/usr/local/share/vulkan/icd.d",
+    ] {
+        let pattern = format!("{dir}/*.json");
+        if let Ok(mut paths) = glob::glob(&pattern) {
+            if paths.any(|p| p.is_ok()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Looks for `filename` under `/usr/lib*`, `/lib*`, or any directory named
@@ -267,8 +424,16 @@ async fn probe_macos_version(os: &str) -> Option<String> {
 
 /// Parses `nvidia-smi --query-gpu=name,memory.total,compute_cap
 /// --format=csv,noheader,nounits` output (one GPU per line, `memory.total`
-/// in MiB). Malformed lines are skipped rather than causing a panic or an
-/// `Err` — a partially-parsed GPU list is more useful than none.
+/// in MiB). Also accepts the 2-field `name,memory.total` shape (no
+/// `compute_cap` column, `compute_cap: None`) — [`probe_nvidia`] retries
+/// with that narrower query when a GPU is present but the fuller one comes
+/// back empty (an nvidia-smi old enough to reject `compute_cap` outright
+/// must not erase the fact that a physical NVIDIA card exists). Malformed
+/// lines are skipped rather than causing a panic or an `Err` — a
+/// partially-parsed GPU list is more useful than none. `memory.total *
+/// MIB` is `checked_mul`'d: a corrupted or hostile `nvidia-smi` reporting
+/// an absurd MiB count must not overflow `u64` (panic in debug, wraparound
+/// in release) — the line is skipped instead.
 pub fn parse_nvidia_smi_csv(csv: &str) -> Vec<GpuInfo> {
     csv.lines()
         .filter_map(|line| {
@@ -277,14 +442,17 @@ pub fn parse_nvidia_smi_csv(csv: &str) -> Vec<GpuInfo> {
                 return None;
             }
             let fields: Vec<&str> = line.split(',').map(str::trim).collect();
-            let [name, mem, cap] = fields.as_slice() else {
-                return None;
+            let (name, mem, cap) = match fields.as_slice() {
+                [name, mem, cap] => (*name, *mem, Some(*cap)),
+                [name, mem] => (*name, *mem, None),
+                _ => return None,
             };
             let vram_mib: u64 = mem.parse().ok()?;
+            let vram_bytes = vram_mib.checked_mul(crate::local::memory::MIB)?;
             Some(GpuInfo {
-                name: (*name).to_string(),
-                vram_bytes: vram_mib * crate::local::memory::MIB,
-                compute_cap: parse_compute_cap(cap),
+                name: name.to_string(),
+                vram_bytes,
+                compute_cap: cap.and_then(parse_compute_cap),
             })
         })
         .collect()
@@ -346,12 +514,15 @@ pub fn visible_devices_hide_all(env_value: Option<&str>) -> bool {
 }
 
 /// Parses `MemTotal:` out of `/proc/meminfo` content, returning bytes (the
-/// file reports KiB despite the `kB` label, per `man proc`).
+/// file reports KiB despite the `kB` label, per `man proc`). `* 1024` is
+/// `checked_mul`'d — `/proc/meminfo` is a kernel-controlled file in
+/// practice, but the parse still treats its number as untrusted external
+/// input rather than assume it can never overflow `u64`.
 pub fn parse_proc_meminfo(content: &str) -> Option<u64> {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
             let kib: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
-            return Some(kib * 1024);
+            return kib.checked_mul(1024);
         }
     }
     None
@@ -384,10 +555,51 @@ fn cuda_bucket(compute_cap: Option<(u32, u32)>) -> CudaBucket {
 /// against a real archive so far (task-2.2-brief.md's verified facts); the
 /// rest are filled in once Task 2.3 generates `release.rs` from every
 /// archive's own `BUILD_INFO.txt` and can supersede this table.
+///
+/// **Contract:** `None` here means "not yet measured", never "no cudart
+/// needed" — per v3 §4.3, every real Windows CUDA archive requires a
+/// paired cudart archive. Tasks 2.3/2.4 MUST treat a Windows
+/// `Backend::Cuda` [`InstallKind`] whose `cudart` is `None` as *unusable*
+/// (skip to the next tier), not as "nothing to pair".
 fn known_cudart_version(variant: &str) -> Option<&'static str> {
     match variant {
         "cuda13-older" => Some("13.3"),
         _ => None,
+    }
+}
+
+/// Whether the pinned engine release ships a CUDA archive for
+/// `(platform, variant)` — see `task-2.3-asset-names.md`'s 28 staged
+/// asset names (tag `b10909-mix-bea84f7`), which are the ground truth this
+/// table mirrors:
+/// - `linux-arm64` ships exactly one CUDA archive, `cuda13-portable` — no
+///   CUDA-12 line at all.
+/// - `linux-x64` and `windows-x64` each ship the full
+///   `cuda12-{legacy,older,newer,portable}` +
+///   `cuda13-{older,newer,portable}` set (seven variants each;
+///   `cuda12-portable` is real — controller ruling R45 — do not remove it).
+/// - `windows-arm64` and macOS ship no CUDA archive at all (`fallback_chain`
+///   never reaches [`select_cuda_kind`] for either).
+///
+/// A platform-blind selector could otherwise name a `(platform, variant)`
+/// pair with no matching download — a hard v3 §9 `DownloadFailed` stop at
+/// install time, not a safe `BackendUnavailable` degrade. This guard turns
+/// that into a `None` from [`select_cuda_kind`], which falls through to
+/// Vulkan/CPU instead (controller ruling R45).
+fn cuda_variant_exists_on(platform: &str, variant: &str) -> bool {
+    match platform {
+        "linux-arm64" => variant == "cuda13-portable",
+        "linux-x64" | "windows-x64" => matches!(
+            variant,
+            "cuda12-legacy"
+                | "cuda12-older"
+                | "cuda12-newer"
+                | "cuda12-portable"
+                | "cuda13-older"
+                | "cuda13-newer"
+                | "cuda13-portable"
+        ),
+        _ => false,
     }
 }
 
@@ -474,8 +686,23 @@ fn select_cuda_kind(p: &HardwareProbe) -> Option<InstallKind> {
         _ => return None,
     };
 
+    let platform = platform_string(p);
+    if !cuda_variant_exists_on(&platform, variant) {
+        // The compute-cap/driver-major math named a real variant string,
+        // but this platform has no such archive (e.g. `cuda12-portable` on
+        // `linux-arm64`, which ships only `cuda13-portable`). Fall through
+        // to Vulkan/CPU rather than send `fallback_chain`'s caller toward a
+        // download that does not exist.
+        tracing::debug!(
+            platform,
+            variant,
+            "computed CUDA variant has no archive on this platform; falling through"
+        );
+        return None;
+    }
+
     Some(InstallKind {
-        platform: platform_string(p),
+        platform,
         backend: Backend::Cuda,
         variant: Some(variant.to_string()),
         cudart: known_cudart_version(variant).map(str::to_string),
@@ -488,6 +715,16 @@ fn select_cuda_kind(p: &HardwareProbe) -> Option<InstallKind> {
 /// CUDA major, compute-capability bucket, the Linux cudart-presence
 /// requirement, and the macOS/Windows-arm64/hidden-NVIDIA platform
 /// overrides).
+///
+/// **macOS contract note (controller review, fix round 1):** the returned
+/// `InstallKind` always reports `backend: Metal` on macOS, even under an
+/// explicit `BackendPref::Cpu` — correct at *install* granularity (there is
+/// one macOS archive, "Metal 内含" its own CPU fallback in-process, so
+/// there is nothing else to fetch), but it means the explicit CPU
+/// preference is not visible in this chain's output. A consumer deriving
+/// launch flags (e.g. `n_gpu_layers`) must read the *original* `pref`
+/// passed in here, not `InstallKind.backend`, to honor an explicit
+/// `BackendPref::Cpu` on macOS.
 pub fn fallback_chain(p: &HardwareProbe, pref: BackendPref) -> Vec<InstallKind> {
     // Platform-locked backends: neither depends on hardware detection nor
     // is affected by `pref` — there is nothing else on these platforms to
@@ -500,10 +737,16 @@ pub fn fallback_chain(p: &HardwareProbe, pref: BackendPref) -> Vec<InstallKind> 
     }
 
     // An NVIDIA GPU physically present but made unusable (today, only by
-    // `CUDA_VISIBLE_DEVICES` hiding every device) is treated as an explicit
-    // "run CPU-only" signal and wins over everything else, including an
-    // explicit `pref` — Vulkan included.
-    if p.has_physical_nvidia && !p.has_usable_nvidia {
+    // `CUDA_VISIBLE_DEVICES` hiding every device) forces CPU-only — but
+    // ONLY for automatic selection (controller ruling R44). v3 §10's rule
+    // feeds §9's automatic 回退链, not an explicit user preference: §20/
+    // §21.4 expose `backend` as a user-facing `auto|cpu|vulkan|cuda`
+    // select whose whole purpose is overriding automatic selection, and
+    // `CUDA_VISIBLE_DEVICES` (the only unusability signal here) is a
+    // CUDA-runtime variable the Vulkan loader/ICD path never reads. An
+    // explicit `Vulkan`/`Cuda` pref still gets its normal validity check
+    // below; only `Auto` is short-circuited here.
+    if matches!(pref, BackendPref::Auto) && p.has_physical_nvidia && !p.has_usable_nvidia {
         return vec![cpu_kind(p)];
     }
 
@@ -567,6 +810,36 @@ mod tests {
         let gpus = parse_nvidia_smi_csv("not,even,close,to,valid\n\nTesla T4, 15360, 7.5");
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].name, "Tesla T4");
+    }
+
+    #[test]
+    fn parses_the_cap_less_fallback_csv_shape() {
+        // `probe_nvidia`'s retry query (`name,memory.total`, no
+        // `compute_cap`) for an nvidia-smi old enough to reject that field.
+        let gpus = parse_nvidia_smi_csv("Tesla T4, 15360");
+        assert_eq!(
+            gpus,
+            vec![GpuInfo {
+                name: "Tesla T4".to_string(),
+                vram_bytes: 15360 * crate::local::memory::MIB,
+                compute_cap: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn nvidia_smi_csv_rejects_a_vram_value_that_would_overflow_bytes() {
+        // 20,000,000,000,000 MiB * 1 MiB overflows u64 (checked_mul must
+        // catch it — the old unchecked `*` would panic in debug builds and
+        // silently wrap in release).
+        let gpus = parse_nvidia_smi_csv("Corrupted, 20000000000000, 7.5");
+        assert!(gpus.is_empty());
+    }
+
+    #[test]
+    fn parse_compute_cap_rejects_bracketed_not_available() {
+        // A real nvidia-smi quirk for an unsupported/disabled GPU.
+        assert_eq!(parse_compute_cap("[N/A]"), None);
     }
 
     // --- parse_driver_cuda_version ---------------------------------------
@@ -633,6 +906,13 @@ mod tests {
     #[test]
     fn parse_proc_meminfo_returns_none_without_memtotal() {
         assert_eq!(parse_proc_meminfo("MemFree: 1234 kB\n"), None);
+    }
+
+    #[test]
+    fn parse_proc_meminfo_rejects_a_value_that_would_overflow_bytes() {
+        // 20,000,000,000,000,000 KiB * 1024 overflows u64.
+        let content = "MemTotal:       20000000000000000 kB\n";
+        assert_eq!(parse_proc_meminfo(content), None);
     }
 
     // --- fallback_chain: brief step-1 scenarios (a)-(f) --------------------
@@ -823,12 +1103,19 @@ mod tests {
     }
 
     #[test]
-    fn e_hidden_nvidia_forces_cpu_even_under_an_explicit_vulkan_pref() {
+    fn e_hidden_nvidia_does_not_override_an_explicit_vulkan_pref() {
+        // Controller ruling R44 (fix round 1): the hidden-NVIDIA-forces-CPU
+        // rule governs automatic selection only. `CUDA_VISIBLE_DEVICES`
+        // hiding CUDA devices says nothing about the Vulkan loader/ICD
+        // path, and an explicit `backend=vulkan` preference (§20/§21.4)
+        // must not silently become a no-op.
         let mut p = windows_t4_probe();
         p.has_usable_nvidia = false;
         let chain = fallback_chain(&p, BackendPref::Vulkan);
-        assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].backend, Backend::Cpu);
+        assert_eq!(
+            chain.iter().map(|k| k.backend).collect::<Vec<_>>(),
+            vec![Backend::Vulkan, Backend::Cpu]
+        );
     }
 
     #[test]
@@ -890,6 +1177,205 @@ mod tests {
         );
     }
 
+    // --- coverage gaps from the review: cuda12-{older,newer}, cuda13-portable
+
+    #[test]
+    fn selects_cuda12_older_variant() {
+        let mut p = windows_t4_probe(); // compute cap 7.5 -> Older bucket
+        p.driver_cuda_version = Some((12, 5));
+        let chain = fallback_chain(&p, BackendPref::Auto);
+        assert_eq!(chain[0].variant.as_deref(), Some("cuda12-older"));
+    }
+
+    #[test]
+    fn selects_cuda12_newer_variant() {
+        let mut p = windows_t4_probe();
+        p.nvidia_gpus = vec![GpuInfo {
+            name: "NVIDIA GeForce RTX 5090".to_string(),
+            vram_bytes: 32 * crate::local::memory::GIB,
+            compute_cap: Some((12, 0)),
+        }];
+        p.driver_cuda_version = Some((12, 5));
+        let chain = fallback_chain(&p, BackendPref::Auto);
+        assert_eq!(chain[0].variant.as_deref(), Some("cuda12-newer"));
+    }
+
+    #[test]
+    fn selects_cuda13_portable_variant() {
+        let mut p = windows_t4_probe();
+        p.nvidia_gpus = vec![GpuInfo {
+            name: "hypothetical future card".to_string(),
+            vram_bytes: 32 * crate::local::memory::GIB,
+            compute_cap: Some((15, 0)), // outside every named bucket
+        }];
+        p.driver_cuda_version = Some((13, 0));
+        let chain = fallback_chain(&p, BackendPref::Auto);
+        assert_eq!(chain[0].variant.as_deref(), Some("cuda13-portable"));
+    }
+
+    // --- controller ruling R45: platform-aware CUDA variant validity ------
+
+    #[test]
+    fn linux_arm64_selects_its_one_shipped_cuda_variant() {
+        // linux-arm64 ships exactly one CUDA archive: cuda13-portable.
+        // Compute 8.7 (a real Jetson Orin cap) is not in any named bucket,
+        // so it lands in Portable already — the realistic case.
+        let p = HardwareProbe {
+            os: "linux".to_string(),
+            arch: "aarch64".to_string(),
+            nvidia_gpus: vec![GpuInfo {
+                name: "Jetson Orin".to_string(),
+                vram_bytes: 8 * crate::local::memory::GIB,
+                compute_cap: Some((8, 7)),
+            }],
+            has_physical_nvidia: true,
+            has_usable_nvidia: true,
+            driver_cuda_version: Some((13, 0)),
+            cuda_runtime_lines: vec![13],
+            vulkan_available: true,
+            ram_bytes: 16 * crate::local::memory::GIB,
+            macos_version: None,
+        };
+        let k = select_cuda_kind(&p).expect("cuda13-portable is the one arm64 archive");
+        assert_eq!(k.platform, "linux-arm64");
+        assert_eq!(k.variant.as_deref(), Some("cuda13-portable"));
+    }
+
+    #[test]
+    fn linux_arm64_falls_back_to_vulkan_when_the_bucket_has_no_arm64_archive() {
+        // A Pascal-class card (compute 6.1, "legacy" bucket) would resolve
+        // to `cuda12-legacy` on x64 — but linux-arm64 ships no CUDA-12 line
+        // at all, only `cuda13-portable`. Before the R45 platform guard,
+        // `select_cuda_kind` would have named `cuda12-legacy` on arm64
+        // anyway: a real §9 dead stop (DownloadFailed on a nonexistent
+        // archive), not a safe degrade.
+        let p = HardwareProbe {
+            os: "linux".to_string(),
+            arch: "aarch64".to_string(),
+            nvidia_gpus: vec![GpuInfo {
+                name: "old arm64 card".to_string(),
+                vram_bytes: 8 * crate::local::memory::GIB,
+                compute_cap: Some((6, 1)),
+            }],
+            has_physical_nvidia: true,
+            has_usable_nvidia: true,
+            driver_cuda_version: Some((12, 4)),
+            cuda_runtime_lines: vec![12],
+            vulkan_available: true,
+            ram_bytes: 16 * crate::local::memory::GIB,
+            macos_version: None,
+        };
+        assert_eq!(select_cuda_kind(&p), None);
+        let chain = fallback_chain(&p, BackendPref::Auto);
+        assert_eq!(chain[0].backend, Backend::Vulkan);
+    }
+
+    #[test]
+    fn cuda12_portable_is_still_selectable_on_linux_x64_and_windows_x64() {
+        // Controller ruling R45: cuda12-portable is a REAL shipped archive
+        // (verified against the 28 staged assets) and must not be removed.
+        // Compute 7.0 (V100) is outside every named bucket -> Portable.
+        for (os, platform) in [("linux", "linux-x64"), ("windows", "windows-x64")] {
+            let p = HardwareProbe {
+                os: os.to_string(),
+                arch: "x86_64".to_string(),
+                nvidia_gpus: vec![GpuInfo {
+                    name: "Tesla V100".to_string(),
+                    vram_bytes: 16 * crate::local::memory::GIB,
+                    compute_cap: Some((7, 0)),
+                }],
+                has_physical_nvidia: true,
+                has_usable_nvidia: true,
+                driver_cuda_version: Some((12, 4)),
+                cuda_runtime_lines: vec![12, 13],
+                vulkan_available: true,
+                ram_bytes: 16 * crate::local::memory::GIB,
+                macos_version: None,
+            };
+            let k = select_cuda_kind(&p).expect("cuda12-portable exists on this platform");
+            assert_eq!(k.platform, platform);
+            assert_eq!(k.variant.as_deref(), Some("cuda12-portable"));
+        }
+    }
+
+    #[test]
+    fn cuda_selection_never_names_an_archive_outside_the_staged_asset_list() {
+        // Ground truth: the 28 staged asset names for tag
+        // b10909-mix-bea84f7 (task-2.3-asset-names.md), written out
+        // independently of `cuda_variant_exists_on` so this is a real
+        // regression check on the production table, not a tautology.
+        fn valid_for(platform: &str, variant: &str) -> bool {
+            match platform {
+                "linux-arm64" => variant == "cuda13-portable",
+                "linux-x64" | "windows-x64" => matches!(
+                    variant,
+                    "cuda12-legacy"
+                        | "cuda12-older"
+                        | "cuda12-newer"
+                        | "cuda12-portable"
+                        | "cuda13-older"
+                        | "cuda13-newer"
+                        | "cuda13-portable"
+                ),
+                _ => false,
+            }
+        }
+
+        let caps = [
+            (6, 1),
+            (7, 5),
+            (8, 0),
+            (8, 6),
+            (8, 9),
+            (9, 0),
+            (10, 0),
+            (12, 0),
+            (8, 7), // Jetson Orin, outside every named bucket -> Portable
+            (7, 0), // V100, outside every named bucket -> Portable
+        ];
+        let platforms: [(&str, &str, &str, bool); 3] = [
+            ("linux", "x86_64", "linux-x64", true),
+            ("windows", "x86_64", "windows-x64", false),
+            ("linux", "aarch64", "linux-arm64", true),
+        ];
+
+        for (os, arch, platform_name, requires_cudart) in platforms {
+            for cap in caps {
+                for driver_major in [12u32, 13u32] {
+                    let cuda_runtime_lines = if requires_cudart {
+                        vec![12, 13]
+                    } else {
+                        vec![]
+                    };
+                    let p = HardwareProbe {
+                        os: os.to_string(),
+                        arch: arch.to_string(),
+                        nvidia_gpus: vec![GpuInfo {
+                            name: "test-gpu".to_string(),
+                            vram_bytes: 8 * crate::local::memory::GIB,
+                            compute_cap: Some(cap),
+                        }],
+                        has_physical_nvidia: true,
+                        has_usable_nvidia: true,
+                        driver_cuda_version: Some((driver_major, 0)),
+                        cuda_runtime_lines,
+                        vulkan_available: true,
+                        ram_bytes: 16 * crate::local::memory::GIB,
+                        macos_version: None,
+                    };
+                    if let Some(k) = select_cuda_kind(&p) {
+                        assert_eq!(k.platform, platform_name);
+                        let variant = k.variant.as_deref().unwrap();
+                        assert!(
+                            valid_for(platform_name, variant),
+                            "select_cuda_kind named a nonexistent archive: {platform_name} {variant} (cap {cap:?}, driver {driver_major})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     // --- explicit BackendPref overrides -------------------------------------
 
     #[test]
@@ -924,6 +1410,36 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(fallback_chain(&p, BackendPref::Cuda), vec![cpu_kind(&p)]);
+    }
+
+    #[test]
+    fn explicit_cuda_pref_selects_a_valid_kind_when_cuda_is_usable() {
+        // Coverage gap from the review: the `vec![k, cpu_kind(p)]` happy
+        // path at the `BackendPref::Cuda` arm was previously only
+        // exercised via the fall-to-CPU case above.
+        let p = windows_t4_probe();
+        let chain = fallback_chain(&p, BackendPref::Cuda);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].backend, Backend::Cuda);
+        assert_eq!(chain[0].variant.as_deref(), Some("cuda13-older"));
+        assert_eq!(chain[1].backend, Backend::Cpu);
+    }
+
+    #[test]
+    fn cached_reflects_the_last_value_written_to_the_shared_slot() {
+        // Exercises `cached()` without touching real hardware (previously
+        // only asserted inside the #[ignore]d live probe test).
+        let probe = HardwareProbe {
+            os: "test-os".to_string(),
+            arch: "test-arch".to_string(),
+            ram_bytes: 123,
+            ..Default::default()
+        };
+        {
+            let mut guard = CACHED.lock().expect("CACHED mutex poisoned");
+            *guard = Some(probe.clone());
+        }
+        assert_eq!(cached(), Some(probe));
     }
 
     // --- live probe (this machine) -------------------------------------------
