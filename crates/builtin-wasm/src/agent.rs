@@ -497,6 +497,25 @@ const AGENT_PROMPT: &str = include_str!("../prompts/agent.md");
 const SUBAGENT_BROWSER_PROMPT: &str = include_str!("../prompts/subagent_browser.md");
 const SUBAGENT_AGENT_PROMPT: &str = include_str!("../prompts/subagent_agent.md");
 
+// On-device base prompts. These are copied **verbatim** from the V0 direction
+// experiment's winning set (`local-vprompt2`): browser and agent measured
+// 1.00/1.00 on the clean case set, and the ship decision rests on those
+// numbers. They are measured artifacts, not prose to be improved — editing one
+// invalidates the measurement it was chosen for, silently and without any test
+// failing. `local_prompts_are_verbatim_copies_of_the_v0_winners` pins them.
+const LOCAL_CHAT_PROMPT: &str = include_str!("../prompts/local/chat.md");
+const LOCAL_BROWSER_PROMPT: &str = include_str!("../prompts/local/browser.md");
+const LOCAL_AGENT_PROMPT: &str = include_str!("../prompts/local/agent.md");
+
+/// Ceiling for a local-mode base prompt, in tokens by this crate's `bytes / 4`
+/// estimate.
+///
+/// 700 rather than a round 600: the measured browser winner is 619 tokens, and
+/// the budget exists to stop prompt bloat, not to force a re-write of an
+/// artifact whose score is the reason local mode ships at all. A future prompt
+/// that exceeds 700 is a signal to re-measure, not to raise this again.
+pub const LOCAL_PROMPT_TOKEN_BUDGET: usize = 700;
+
 // Computer use prompt layers
 const COMPUTER_USE_OVERVIEW: &str = include_str!("../prompts/computer_use_overview.md");
 const COMPUTER_USE_GUIDE: &str = include_str!("../prompts/computer_use_guide.md");
@@ -661,12 +680,24 @@ impl<H: HostFunctions> Agent<H> {
         // (design spec §4.2), then rendered once. Naming the parts is what lets
         // the event log say which section changed, and what gives P2 a stable
         // prefix boundary to cache on.
-        let mut sections: Vec<PromptSectionText> = match &input.custom_system_prompt {
+        let mut sections: Vec<PromptSectionText> = match (&input.custom_system_prompt, &input.local)
+        {
             // A custom prompt replaces the whole body — subagents use this.
             // One opaque section, honestly named: pretending to know its
-            // internal structure would make the log lie.
-            Some(custom) => vec![PromptSectionText::body("custom", custom.clone())],
-            None => {
+            // internal structure would make the log lie. It outranks local
+            // mode: a caller who supplied an exact prompt gets it.
+            (Some(custom), _) => vec![PromptSectionText::body("custom", custom.clone())],
+            // On-device: a short base prompt, the platform line, and
+            // USER.md. No skills catalog, no model list, no computer-use
+            // guides — those are what make a cloud prompt tens of thousands
+            // of tokens, which a local context cannot afford alongside the
+            // conversation and the tool schemas (v3 §13).
+            (None, Some(local)) => Self::build_local_prompt_sections(
+                mode,
+                input.os_platform.as_deref(),
+                local.user_doc.as_deref(),
+            ),
+            (None, None) => {
                 let skills = filter_skills(
                     self.host.skill_list().unwrap_or_default(),
                     input.skills_filter.as_deref(),
@@ -682,8 +713,13 @@ impl<H: HostFunctions> Agent<H> {
             }
         };
 
-        if let Some(soul) = &input.soul_context {
-            sections.push(PromptSectionText::body("soul", soul.clone()));
+        // The soul is five documents. An on-device context cannot afford it,
+        // and USER.md — the one part that is about the user rather than the
+        // assistant — is already carried as its own section above.
+        if input.local.is_none() {
+            if let Some(soul) = &input.soul_context {
+                sections.push(PromptSectionText::body("soul", soul.clone()));
+            }
         }
 
         // Prepended, not appended: an explicitly invoked skill outranks
@@ -787,6 +823,31 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         // exits (design spec §3.2).
         let turn = Self::derive_turn(input);
         self.host.record_turn_boundary(turn, true);
+
+        // An explicitly invoked skill can be larger than an on-device context
+        // can hold. Saying so in one sentence beats letting the engine silently
+        // truncate the instructions and then act on half of them.
+        //
+        // Checked inside the boundary, and the early return closes the boundary
+        // itself, so the pair still matches however this exits (§3.2).
+        if let (Some(local), Some(skill)) = (&input.local, &input.skill_context) {
+            let skill_tokens = skill.content.len() / 4;
+            let limit = (local.n_ctx / 4) as usize;
+            if skill_tokens > limit {
+                self.host.record_turn_boundary(turn, false);
+                return Ok(AgentOutput {
+                    text: format!(
+                        "This skill is too large for on-device mode ({skill_tokens} tokens, limit {limit})"
+                    ),
+                    tool_calls: Vec::new(),
+                    continue_loop: false,
+                    plan_proposal: None,
+                    artifact: None,
+                    loaded_tools: Vec::new(),
+                });
+            }
+        }
+
         let out = self.run_loop(input, &system_prompt, &tools);
         self.host.record_turn_boundary(turn, false);
         out
@@ -867,6 +928,77 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
     /// boundary between the stable head and the volatile tail is what P2's
     /// prefix caching keys on. `skills/catalog`, `models` and `soul` change
     /// often and therefore sit last.
+    /// The `platform` section.
+    ///
+    /// Shared by the cloud and local prompt builders deliberately: two copies of
+    /// this text would have to stay in sync with nothing to catch divergence.
+    fn platform_section(os: &str) -> PromptSectionText {
+        let shell_hint = match os {
+            "windows" => "Windows (PowerShell). Use PowerShell syntax for commands.",
+            "macos" => "macOS (zsh/bash). Use POSIX shell syntax for commands.",
+            _ => "Linux (bash). Use POSIX shell syntax for commands.",
+        };
+        PromptSectionText::body(
+            "platform",
+            format!(
+                "# System Environment
+
+Operating System: {}
+",
+                shell_hint
+            ),
+        )
+    }
+
+    /// The on-device base prompt for a mode.
+    fn local_base_prompt(mode: AgentMode) -> &'static str {
+        match mode {
+            AgentMode::Chat => LOCAL_CHAT_PROMPT,
+            AgentMode::Browser => LOCAL_BROWSER_PROMPT,
+            _ => LOCAL_AGENT_PROMPT,
+        }
+    }
+
+    /// Prompt sections for an on-device turn.
+    ///
+    /// Deliberately far smaller than [`Self::build_prompt_sections`]: no skills
+    /// catalog, no model list, no computer-use guides, no soul. Those are what
+    /// make a cloud system prompt tens of thousands of tokens, and a local
+    /// engine's context has to hold the conversation and the tool schemas as
+    /// well — v3 §13 is the reason local mode exists as a separate path at all.
+    fn build_local_prompt_sections(
+        mode: AgentMode,
+        os_platform: Option<&str>,
+        user_doc: Option<&str>,
+    ) -> Vec<PromptSectionText> {
+        let mut out = vec![PromptSectionText::body(
+            format!("base/local-{}", Self::mode_slug(mode)),
+            Self::local_base_prompt(mode),
+        )];
+
+        if let Some(os) = os_platform {
+            out.push(Self::platform_section(os));
+        }
+
+        // USER.md only. The daemon has already trimmed it to a local-sized
+        // excerpt; the rest of the five-document soul stays out of an
+        // on-device prompt entirely.
+        if let Some(doc) = user_doc.map(str::trim).filter(|d| !d.is_empty()) {
+            out.push(PromptSectionText::body(
+                "user",
+                format!(
+                    "# About the user
+
+{}
+",
+                    doc
+                ),
+            ));
+        }
+
+        out
+    }
+
     fn build_prompt_sections(
         mode: AgentMode,
         skills: &[SkillSummary],
@@ -880,21 +1012,7 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         )];
 
         if let Some(os) = os_platform {
-            let shell_hint = match os {
-                "windows" => "Windows (PowerShell). Use PowerShell syntax for commands.",
-                "macos" => "macOS (zsh/bash). Use POSIX shell syntax for commands.",
-                _ => "Linux (bash). Use POSIX shell syntax for commands.",
-            };
-            out.push(PromptSectionText::body(
-                "platform",
-                format!(
-                    "# System Environment
-
-Operating System: {}
-",
-                    shell_hint
-                ),
-            ));
+            out.push(Self::platform_section(os));
         }
 
         if computer_use.inject_overview {
@@ -6948,6 +7066,82 @@ mod tests {
         assert_eq!(joined, direct);
         assert!(joined.contains("# Available models"));
         assert!(joined.contains("Operating System: Windows"));
+    }
+
+    /// The on-device prompts are measured artifacts: browser and agent scored
+    /// 1.00/1.00 on the V0 clean set, and the decision to ship local mode with
+    /// tools rests on those numbers. Editing one invalidates the measurement it
+    /// was chosen for, silently and with nothing else to catch it.
+    ///
+    /// Byte-identity against the original `local-vprompt2` sources cannot be
+    /// asserted from here: they live in a staging directory outside the
+    /// workspace that will not exist on another machine, and comparing a
+    /// constant to the file it was `include_str!`'d from would assert nothing.
+    /// Pinning the sizes is the tripwire that works in-tree. Verified equal to
+    /// the sources by sha256 when copied (2026-09-17).
+    #[test]
+    fn local_prompts_keep_their_measured_size_and_fit_the_budget() {
+        for (name, prompt, bytes) in [
+            ("chat", LOCAL_CHAT_PROMPT, 2286usize),
+            ("browser", LOCAL_BROWSER_PROMPT, 2479),
+            ("agent", LOCAL_AGENT_PROMPT, 2315),
+        ] {
+            assert_eq!(
+                prompt.len(),
+                bytes,
+                "{name}.md changed size — it is a measured artifact, not prose to edit"
+            );
+            assert!(
+                prompt.len() / 4 <= LOCAL_PROMPT_TOKEN_BUDGET,
+                "{name}.md is {} tokens, over the {LOCAL_PROMPT_TOKEN_BUDGET} budget",
+                prompt.len() / 4
+            );
+        }
+    }
+
+    /// Asserting the exact id list is stronger than probing for absent strings:
+    /// it fails if anything at all is added, including sections nobody thought
+    /// to check for.
+    #[test]
+    fn local_prompt_sections_carry_only_base_platform_and_user() {
+        let sections = Agent::<MockHostFunctions>::build_local_prompt_sections(
+            AgentMode::Browser,
+            Some("windows"),
+            Some("  Prefers terse answers.  "),
+        );
+        let ids: Vec<&str> = sections.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["base/local-browser", "platform", "user"]);
+
+        let joined = Agent::<MockHostFunctions>::render_prompt_sections(&sections);
+        assert!(!joined.contains("# Available models"));
+        assert!(joined.contains("Operating System: Windows"));
+        assert!(joined.contains("# About the user"));
+        assert!(joined.contains("Prefers terse answers."));
+    }
+
+    #[test]
+    fn local_prompt_sections_pick_the_prompt_for_the_mode() {
+        for (mode, id) in [
+            (AgentMode::Chat, "base/local-chat"),
+            (AgentMode::Browser, "base/local-browser"),
+            (AgentMode::Agent, "base/local-agent"),
+        ] {
+            let sections =
+                Agent::<MockHostFunctions>::build_local_prompt_sections(mode, None, None);
+            let ids: Vec<&str> = sections.iter().map(|s| s.id.as_str()).collect();
+            assert_eq!(ids, vec![id]);
+        }
+    }
+
+    #[test]
+    fn local_prompt_sections_drop_a_blank_user_doc() {
+        let sections = Agent::<MockHostFunctions>::build_local_prompt_sections(
+            AgentMode::Chat,
+            None,
+            Some("   \n  "),
+        );
+        let ids: Vec<&str> = sections.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["base/local-chat"]);
     }
 
     /// A truncated result must tell the model where the rest went, or a long
