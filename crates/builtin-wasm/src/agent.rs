@@ -6412,10 +6412,6 @@ mod tests {
         }
     }
 
-    /// 没有听众、也没有 canvas 时,合成工具不该出现在请求里 ——
-    /// 它们在桌面聊天里**根本发不出声音**(唯一送达路径 `offer_part` 要 portal),
-    /// 却每次请求都要付约 4.4 KB 的 schema。
-    #[test]
     /// 没被点名时,这个工具不该出现在请求里。
     ///
     /// 它必须被点名才会捕获(见 spec),所以每轮都付它的 schema 是白付 —— 与
@@ -6523,6 +6519,10 @@ mod tests {
         ));
     }
 
+    /// 没有听众、也没有 canvas 时,合成工具不该出现在请求里 ——
+    /// 它们在桌面聊天里**根本发不出声音**(唯一送达路径 `offer_part` 要 portal),
+    /// 却每次请求都要付约 4.4 KB 的 schema。
+    #[test]
     fn speech_output_tools_are_not_offered_when_nothing_can_hear_them() {
         let mock = MockHostFunctions::new();
         let agent = Agent::new(mock);
