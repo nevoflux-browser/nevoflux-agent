@@ -274,6 +274,26 @@ pub struct LlmResponse {
     pub reasoning: Option<String>,
 }
 
+/// Local-mode fields carried on [`AgentInput`] when the turn is running
+/// against the on-device engine.
+///
+/// `Phase 3` (short prompts, deferred tool loading, a smaller context) reads
+/// these to behave differently than a cloud-model turn; a cloud turn never
+/// sets [`AgentInput::local`] at all, so absence — not an empty struct — is
+/// the "not local mode" signal.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LocalModeInput {
+    /// The context window this turn is running under: the running engine's
+    /// actual `n_ctx` when it is up, else the size it would launch with.
+    pub n_ctx: u32,
+    /// Names of tools already described to the model earlier this session,
+    /// so the prompt can skip re-describing them.
+    pub loaded_tools: Vec<String>,
+    /// USER.md content, truncated for a short local-mode prompt. `None`
+    /// when there is nothing to include.
+    pub user_doc: Option<String>,
+}
+
 /// Agent input from host.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentInput {
@@ -349,6 +369,10 @@ pub struct AgentInput {
     /// Host operating system (e.g., "windows", "linux", "macos").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os_platform: Option<String>,
+    /// Local-mode fields, set only when this turn is running against the
+    /// on-device engine. `None` for every cloud-model turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<LocalModeInput>,
 }
 
 /// Skill context for injection into system prompt.
@@ -387,6 +411,15 @@ pub struct AgentOutput {
     /// so the runner can send it to the sidebar for rendering in a canvas tab.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<Artifact>,
+    /// Tools loaded on demand during this turn, in local mode.
+    ///
+    /// Local mode starts with `tool_search` alone (or a small resident set in
+    /// chat mode) and loads the rest as the model asks for them. The daemon
+    /// persists this across turns of the same session so a later turn does not
+    /// have to re-discover tools the model already knows about. Empty — and
+    /// omitted from the wire — for every cloud-model turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loaded_tools: Vec<String>,
 }
 
 /// Skill summary (from skill_list).
@@ -813,6 +846,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
         assert_eq!(input.mode, AgentMode::Agent);
         assert_eq!(input.history.len(), 1);
@@ -838,6 +872,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
         assert!(input.custom_system_prompt.is_some());
         assert!(input
@@ -866,6 +901,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         assert!(json.contains("custom_system_prompt"));
@@ -889,6 +925,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
         let json2 = serde_json::to_string(&input_no_prompt).unwrap();
         assert!(!json2.contains("custom_system_prompt"));
@@ -902,6 +939,7 @@ mod tests {
             continue_loop: false,
             plan_proposal: None,
             artifact: None,
+            loaded_tools: vec![],
         };
         assert!(!output.continue_loop);
     }
@@ -1113,6 +1151,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         assert!(json.contains("local_files"));
@@ -1142,6 +1181,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         // Empty vec should not be serialized
@@ -1167,6 +1207,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
         assert_eq!(input.tab_id, Some(42));
 
@@ -1192,6 +1233,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
         let json2 = serde_json::to_string(&input_no_tab).unwrap();
         assert!(!json2.contains("tab_id"));
@@ -1235,6 +1277,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
         assert_eq!(input.tab_ids.len(), 3);
         assert_eq!(input.tab_ids[0].space, "Work");
@@ -1268,6 +1311,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
         let json2 = serde_json::to_string(&input_no_tabs).unwrap();
         assert!(!json2.contains("tab_ids"));

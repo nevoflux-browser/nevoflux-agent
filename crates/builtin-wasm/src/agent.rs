@@ -1765,6 +1765,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     continue_loop: false,
                     plan_proposal: Some(proposal),
                     artifact: None,
+                    loaded_tools: Vec::new(),
                 });
             }
 
@@ -1780,6 +1781,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     continue_loop: false,
                     plan_proposal: None,
                     artifact: Some(artifact),
+                    loaded_tools: Vec::new(),
                 });
             }
         }
@@ -1795,6 +1797,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             continue_loop: false,
             plan_proposal: None,
             artifact: None,
+            loaded_tools: Vec::new(),
         })
     }
 
@@ -6515,6 +6518,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         // Should run successfully with custom prompt
@@ -7400,6 +7404,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -7428,6 +7433,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -7456,6 +7462,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -7507,6 +7514,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -8192,6 +8200,7 @@ mod tests {
             soul_context: None,
             tools_config: None,
             os_platform: None,
+            local: None,
         };
 
         agent.run_loop(&input, "system", &tools).unwrap();
@@ -8523,6 +8532,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         // Should complete normally
@@ -8555,6 +8565,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         // Should exit early due to interrupt

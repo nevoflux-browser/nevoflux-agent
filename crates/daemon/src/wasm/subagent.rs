@@ -566,6 +566,7 @@ impl SubagentExecutor {
             soul_context: None,
             tools_config,
             os_platform: Some(std::env::consts::OS.to_string()),
+            local: None,
         };
 
         // Check for kill before running

@@ -6075,6 +6075,63 @@ pub(crate) fn is_clear_command(message: &str) -> bool {
 /// This function processes chat messages and streams the response back to the sidebar
 /// in real-time as the LLM generates output.
 #[allow(clippy::too_many_arguments)]
+/// Session-metadata key holding the tool names local mode has already loaded
+/// for this session.
+///
+/// Deferred tool loading (Task 3.3) starts a local turn with `tool_search`
+/// alone and loads the rest on demand; persisting the set here is what stops
+/// the next turn of the same conversation from re-discovering tools the model
+/// already knows about.
+const LOCAL_LOADED_TOOLS_KEY: &str = "local_loaded_tools";
+
+/// How much of USER.md a local-mode prompt carries, in **characters**.
+const LOCAL_USER_DOC_MAX_CHARS: usize = 500;
+
+/// Build the local-mode payload for one turn.
+///
+/// Pure — no session store, no running engine — so the truncation and parsing
+/// rules can be tested directly.
+///
+/// Two deliberate choices:
+/// - The cap is counted in `chars()`, not bytes. Taking a byte slice would
+///   panic on a multi-byte boundary, which this codebase has shipped before;
+///   counting characters cannot.
+/// - A malformed `local_loaded_tools` value degrades to an empty list rather
+///   than failing the turn. The list is a cache of what the model has already
+///   been shown; losing it costs one redundant `tool_search`, whereas refusing
+///   the turn costs the user their message.
+fn local_mode_input(
+    meta: Option<&std::collections::HashMap<String, serde_json::Value>>,
+    n_ctx: u32,
+    user_raw: &str,
+) -> nevoflux_builtin_wasm::LocalModeInput {
+    let loaded_tools = meta
+        .and_then(|m| m.get(LOCAL_LOADED_TOOLS_KEY))
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let trimmed = user_raw.trim();
+    let user_doc = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(LOCAL_USER_DOC_MAX_CHARS).collect())
+    };
+
+    nevoflux_builtin_wasm::LocalModeInput {
+        n_ctx,
+        loaded_tools,
+        user_doc,
+    }
+}
+
 async fn handle_chat_message_streaming(
     payload: &serde_json::Value,
     config: &Arc<AgentConfig>,
@@ -6735,6 +6792,11 @@ async fn handle_chat_message_streaming(
         effective_message
     };
 
+    // Resolved once and reused after the turn: `input` is moved into
+    // `spawn_blocking` below, so there is no way to ask it later whether this
+    // turn ran on-device.
+    let local_mode_active = config.llm.active_provider() == Some("local");
+
     let input = AgentInput {
         session_id: session_id.clone(),
         mode,
@@ -6772,6 +6834,41 @@ async fn handle_chat_message_streaming(
         // never touches mode/provider/model: those stay the user's call.
         tools_config: active_soul.as_deref().and_then(|s| s.tools_config.clone()),
         os_platform: Some(std::env::consts::OS.to_string()),
+        // On-device turns carry their own context budget, the tools already
+        // loaded this session, and a trimmed USER.md; a cloud turn carries
+        // `None`, which is what Phase 3 reads as "not local mode".
+        //
+        // There is no per-turn provider override to consult here: the override
+        // lives on `DaemonHostFunctions::with_llm_override`, whose only
+        // production caller is the subagent spawn path, not this one.
+        local: if local_mode_active {
+            let n_ctx = crate::local::endpoint::current()
+                .map(|ep| ep.n_ctx)
+                .unwrap_or_else(|| match config.llm.local.validated_ctx() {
+                    // A fixed size is what the engine would launch with.
+                    Ok(crate::local::config::CtxPref::Fixed(n)) => n,
+                    // `Auto` only resolves against hardware at launch (32K when
+                    // the model fits fully on GPU, else 16K) and no engine is
+                    // running to ask, so promise the floor. Under-stating the
+                    // budget costs a shorter prompt; over-stating it would let
+                    // the agent build a turn the engine cannot accept.
+                    _ => crate::local::config::CTX_FLOOR,
+                });
+            let user_raw = services
+                .knowledge_retriever
+                .as_ref()
+                .map(|r| r.soul_cache().user_raw.clone())
+                .unwrap_or_default();
+            let meta = session_manager
+                .get_session(&session_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|s| s.metadata);
+            Some(local_mode_input(meta.as_ref(), n_ctx, &user_raw))
+        } else {
+            None
+        },
     };
 
     // Create cancellation token for this streaming session
@@ -7189,6 +7286,42 @@ async fn handle_chat_message_streaming(
     // Handle agent result
     match agent_result {
         Ok(Ok(output)) => {
+            // Local mode loads tools on demand, so carry the set forward: it is
+            // what stops the next turn of this session from re-discovering
+            // tools the model has already been shown.
+            //
+            // Guarded on `local_mode_active` rather than on a non-empty list,
+            // because an empty list is meaningful here — a local turn that
+            // loaded nothing should still clear a stale stored set, and a cloud
+            // turn must not touch the key at all.
+            //
+            // `update_session_metadata` replaces the whole map, so this reads
+            // the existing metadata and merges; building a fresh map would
+            // silently drop every other key on the session.
+            if local_mode_active {
+                let stored = session_manager
+                    .get_session(&session_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.metadata);
+                let current = serde_json::json!(output.loaded_tools);
+                let unchanged = stored
+                    .as_ref()
+                    .and_then(|m| m.get(LOCAL_LOADED_TOOLS_KEY))
+                    .is_some_and(|prev| prev == &current);
+                if !unchanged {
+                    let mut merged = stored.unwrap_or_default();
+                    merged.insert(LOCAL_LOADED_TOOLS_KEY.to_string(), current);
+                    if let Err(e) = session_manager
+                        .update_session_metadata(&session_id, merged)
+                        .await
+                    {
+                        warn!("Failed to persist local loaded tools for {session_id}: {e}");
+                    }
+                }
+            }
+
             // Handle plan proposal if present
             if let Some(proposal) = &output.plan_proposal {
                 info!("Agent returned plan proposal for session {}", session_id);
@@ -7296,6 +7429,9 @@ async fn handle_chat_message_streaming(
                                 .as_deref()
                                 .and_then(|s| s.tools_config.clone()),
                             os_platform: Some(std::env::consts::OS.to_string()),
+                            // A re-run continues the same turn; local-mode state was
+                            // already resolved for the original input.
+                            local: None,
                         };
 
                         // Spawn stream forwarder for re-run
@@ -8486,6 +8622,7 @@ async fn handle_chat_message(
                 // and never touches mode/provider/model.
                 tools_config: active_soul.as_deref().and_then(|s| s.tools_config.clone()),
                 os_platform: Some(std::env::consts::OS.to_string()),
+                local: None,
             };
 
             // Run agent
@@ -14048,6 +14185,57 @@ mod soul_binding_tests {
 mod tests {
     use super::*;
     use nevoflux_protocol::PlanStep;
+
+    fn meta_with(value: serde_json::Value) -> std::collections::HashMap<String, serde_json::Value> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(LOCAL_LOADED_TOOLS_KEY.to_string(), value);
+        m
+    }
+
+    #[test]
+    fn local_mode_input_truncates_user_doc_at_a_char_boundary() {
+        // A multi-byte character straddling the cap is the case that panics if
+        // the cap is applied to bytes instead of characters.
+        let user_raw = "日".repeat(600);
+        let out = local_mode_input(None, 16384, &user_raw);
+        let doc = out.user_doc.expect("non-empty user doc");
+        assert_eq!(doc.chars().count(), LOCAL_USER_DOC_MAX_CHARS);
+        assert!(doc.starts_with('日'));
+        // Shorter-than-cap text is carried whole, and trimmed.
+        let short = local_mode_input(None, 16384, "  hello  ");
+        assert_eq!(short.user_doc.as_deref(), Some("hello"));
+        // Nothing worth carrying becomes `None`, not `Some("")`.
+        assert!(local_mode_input(None, 16384, "   \n ").user_doc.is_none());
+    }
+
+    #[test]
+    fn local_mode_input_parsing_tolerates_garbage() {
+        // Mixed array: keep the usable strings, drop the rest, rather than
+        // failing a turn over a cache of tool names.
+        let meta = meta_with(serde_json::json!(["read", 7, null, "  ", "grep", {"a": 1}]));
+        let out = local_mode_input(Some(&meta), 16384, "");
+        assert_eq!(out.loaded_tools, vec!["read".to_string(), "grep".to_string()]);
+
+        // Wrong type entirely, absent key, and absent metadata all degrade to
+        // an empty list.
+        let wrong = meta_with(serde_json::json!("not-an-array"));
+        assert!(local_mode_input(Some(&wrong), 16384, "")
+            .loaded_tools
+            .is_empty());
+        let other_key: std::collections::HashMap<String, serde_json::Value> =
+            [("unrelated".to_string(), serde_json::json!(["x"]))]
+                .into_iter()
+                .collect();
+        assert!(local_mode_input(Some(&other_key), 16384, "")
+            .loaded_tools
+            .is_empty());
+        assert!(local_mode_input(None, 16384, "").loaded_tools.is_empty());
+    }
+
+    #[test]
+    fn local_mode_input_carries_the_context_budget_verbatim() {
+        assert_eq!(local_mode_input(None, 32768, "").n_ctx, 32768);
+    }
 
     #[test]
     fn test_server_config_default() {

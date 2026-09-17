@@ -1576,6 +1576,7 @@ impl HostFunctions for MockHostFunctions {
             continue_loop: false,
             plan_proposal: None,
             artifact: None,
+            loaded_tools: vec![],
         })
     }
 
@@ -1586,6 +1587,7 @@ impl HostFunctions for MockHostFunctions {
             continue_loop: false,
             plan_proposal: None,
             artifact: None,
+            loaded_tools: vec![],
         })
     }
 
@@ -1596,6 +1598,7 @@ impl HostFunctions for MockHostFunctions {
             continue_loop: false,
             plan_proposal: None,
             artifact: None,
+            loaded_tools: vec![],
         })
     }
 
@@ -2151,6 +2154,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         let chat_output = mock.builtin_chat(&input).unwrap();
