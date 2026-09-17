@@ -2,9 +2,18 @@
 
 This directory pins one `unslothai/llama.cpp` fork release (the on-device
 `llama-server` build NevoFlux bundles) into
-[`crates/daemon/src/local/release.rs`](../../crates/daemon/src/local/release.rs),
+[`crates/daemon/src/local/release_generated.rs`](../../crates/daemon/src/local/release_generated.rs),
 and mirrors that release's assets to a GitHub repo NevoFlux controls, so an
 install never depends solely on the fork's own release staying up.
+
+Only the *data* is generated. The structs, the resolution logic
+(`mirror_sources`, `archive_for`) and the whole test module live in the
+ordinary, compiled
+[`crates/daemon/src/local/release.rs`](../../crates/daemon/src/local/release.rs),
+which `include!`s the generated file. They used to be emitted from a Python
+string in the generator, where no compiler, clippy, rustfmt or rust-analyzer
+could see them and where a test body could not be checked until it had been
+generated (ruling R51).
 
 ## The three pieces
 
@@ -46,12 +55,12 @@ build-metadata manifest (`llama-prebuilt-manifest.json`, uploaded to the
 mirror for byte-parity with the fork but not represented in `EngineRelease`
 — see ruling R43 below).
 
-### 2. Generate `release.rs`
+### 2. Generate `release_generated.rs`
 
 ```bash
 python scripts/engine-release/gen_release_rs.py \
     --staged <staging-dir>/staged.json \
-    --out crates/daemon/src/local/release.rs
+    --out crates/daemon/src/local/release_generated.rs
 ```
 
 Everything in the generated file is derived from `staged.json`'s own
@@ -65,7 +74,7 @@ line endings — never run a bare `cargo fmt`, which would rewrite unrelated
 files):
 
 ```bash
-rustfmt --edition 2021 crates/daemon/src/local/release.rs
+rustfmt --edition 2021 crates/daemon/src/local/release_generated.rs
 ```
 
 Then run its test module:
