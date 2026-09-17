@@ -32,6 +32,7 @@
 
 pub mod agent;
 pub mod host;
+pub mod local_mode;
 pub mod types;
 
 pub use agent::{Agent, AgentConfig, ASYNC_SAFE_TOOLS};
@@ -40,10 +41,9 @@ pub use nevoflux_protocol::LocalFileRef;
 pub use types::{
     AgentInput, AgentMode, AgentOutput, Attachment, BashResult, BashStatus, BrowserToolResult,
     GeneratedImage, GrepMatch, GrepResult, LlmChunk, LlmRequest, LlmResponse, LocalModeInput,
-    MemoryChunk, Message,
-    MessageRole, PromptSectionText, ReadResult, SkillContext, SkillSummary, SubagentInfo, TabInfo,
-    ToolCall,
-    ToolContext, ToolDefinition, ToolDenial, ToolGate, ToolResult, ToolSearchResult,
+    MemoryChunk, Message, MessageRole, PromptSectionText, ReadResult, SkillContext, SkillSummary,
+    SubagentInfo, TabInfo, ToolCall, ToolContext, ToolDefinition, ToolDenial, ToolGate, ToolResult,
+    ToolSearchResult,
 };
 
 /// Version of the builtin-wasm module.

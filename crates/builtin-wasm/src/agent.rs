@@ -488,6 +488,19 @@ pub struct Agent<H: HostFunctions> {
     current_keywords: RefCell<Vec<String>>,
     /// Skills that have been loaded in this session (prevent redundant re-loading).
     loaded_skills: RefCell<std::collections::HashSet<String>>,
+    /// On-device: everything this mode could load, searched by `tool_search`.
+    /// `None` for a cloud turn, which advertises its tools outright.
+    local_index: RefCell<Option<crate::local_mode::LocalToolIndex>>,
+    /// On-device: the tools loaded so far, oldest first. Seeded from the
+    /// previous turn's set, so the model does not re-discover what it just used.
+    local_loaded: RefCell<crate::local_mode::LoadedSet>,
+    /// On-device: definitions for loaded tools that are not in the index —
+    /// MCP and knowledge-base tools the host found. They have to be kept
+    /// because only the host can produce them again.
+    local_dynamic: RefCell<Vec<ToolDefinition>>,
+    /// On-device: set when `tool_search` changed the loaded set, so the loop
+    /// knows to rebuild the advertised tools before the next request.
+    local_tools_changed: Cell<bool>,
 }
 
 // Static base prompts, compiled into the binary
@@ -502,7 +515,9 @@ const SUBAGENT_AGENT_PROMPT: &str = include_str!("../prompts/subagent_agent.md")
 // 1.00/1.00 on the clean case set, and the ship decision rests on those
 // numbers. They are measured artifacts, not prose to be improved — editing one
 // invalidates the measurement it was chosen for, silently and without any test
-// failing. `local_prompts_are_verbatim_copies_of_the_v0_winners` pins them.
+// failing. `local_prompts_keep_their_measured_size_and_fit_the_budget` pins
+// their exact sizes — see that test for why byte-identity against the original
+// sources cannot be asserted from in-tree.
 const LOCAL_CHAT_PROMPT: &str = include_str!("../prompts/local/chat.md");
 const LOCAL_BROWSER_PROMPT: &str = include_str!("../prompts/local/browser.md");
 const LOCAL_AGENT_PROMPT: &str = include_str!("../prompts/local/agent.md");
@@ -648,6 +663,10 @@ impl<H: HostFunctions> Agent<H> {
             computer_use_triggered: Cell::new(false),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
+            local_index: RefCell::new(None),
+            local_loaded: RefCell::new(crate::local_mode::LoadedSet::default()),
+            local_dynamic: RefCell::new(Vec::new()),
+            local_tools_changed: Cell::new(false),
         }
     }
 
@@ -664,6 +683,10 @@ impl<H: HostFunctions> Agent<H> {
             computer_use_triggered: Cell::new(false),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
+            local_index: RefCell::new(None),
+            local_loaded: RefCell::new(crate::local_mode::LoadedSet::default()),
+            local_dynamic: RefCell::new(Vec::new()),
+            local_tools_changed: Cell::new(false),
         }
     }
 
@@ -789,34 +812,38 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         // Apply tool filtering based on tools_config
         tools = self.filter_tools(tools, &input.tools_config);
 
-        // When user attached specific tabs, update browser tool tab_id descriptions
-        // to guide the LLM toward the attached tabs instead of defaulting to current_tab.
-        if !input.tab_ids.is_empty() {
-            let attached: Vec<String> = input
-                .tab_ids
-                .iter()
-                .map(|t| format!("{} (\"{}\")", t.tab_id, t.tab_title))
-                .collect();
-            let hint = format!(
-                "Tab ID. The user attached tabs: {}. Unless the user explicitly asks for the current tab, use the attached tab's ID.",
-                attached.join(", ")
+        // On-device: the mode's tools become a searchable index instead of the
+        // advertised list, and the turn opens with `tool_search` plus whatever
+        // chat's resident set and earlier turns already loaded.
+        //
+        // The allowlist filter above still governs: the index is built from the
+        // tools that survived it, so nothing can be searched back into reach.
+        if let Some(local) = &input.local {
+            let skills = filter_skills(
+                self.host.skill_list().unwrap_or_default(),
+                input.skills_filter.as_deref(),
             );
-            for tool in &mut tools {
-                if matches!(
-                    tool.name.as_str(),
-                    "browser_get_markdown" | "browser_get_content" | "browser_screenshot"
-                ) {
-                    if let Some(props) = tool
-                        .input_schema
-                        .get_mut("properties")
-                        .and_then(|p| p.as_object_mut())
-                    {
-                        if let Some(tab_id_prop) = props.get_mut("tab_id") {
-                            tab_id_prop["description"] = serde_json::Value::String(hint.clone());
-                        }
-                    }
+            let index = crate::local_mode::LocalToolIndex::new(tools, skills);
+            let mut loaded = crate::local_mode::LoadedSet::default();
+            // Residents first, then what the last turn left: if the two together
+            // ever exceed the cap, the carried-over set is the half to lose.
+            for name in crate::local_mode::resident_tools_for(mode) {
+                if index.knows(name) {
+                    loaded.add(name);
                 }
             }
+            for name in &local.loaded_tools {
+                if index.knows(name) {
+                    loaded.add(name);
+                }
+            }
+            *self.local_index.borrow_mut() = Some(index);
+            *self.local_loaded.borrow_mut() = loaded;
+            self.local_dynamic.borrow_mut().clear();
+            self.local_tools_changed.set(false);
+            tools = self.local_active_tools(&input.tab_ids);
+        } else {
+            Self::apply_tab_hint(&mut tools, &input.tab_ids);
         }
 
         // Turn boundaries wrap the whole loop so they pair no matter how it
@@ -843,7 +870,7 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                     continue_loop: false,
                     plan_proposal: None,
                     artifact: None,
-                    loaded_tools: Vec::new(),
+                    loaded_tools: self.local_loaded_names(),
                 });
             }
         }
@@ -877,6 +904,175 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             AgentMode::Agent => self.get_agent_tools(),
             AgentMode::Code => self.get_agent_tools(),
         }
+    }
+
+    /// Point the browser tools at the tabs the user attached.
+    ///
+    /// Without this they default to the current tab, which is rarely what
+    /// someone means after attaching a tab explicitly. On-device this runs
+    /// again every time a tool is loaded mid-turn, since a tool that arrives
+    /// after the turn started would otherwise miss the hint.
+    fn apply_tab_hint(tools: &mut [ToolDefinition], tab_ids: &[TabInfo]) {
+        if tab_ids.is_empty() {
+            return;
+        }
+        let attached: Vec<String> = tab_ids
+            .iter()
+            .map(|t| format!("{} (\"{}\")", t.tab_id, t.tab_title))
+            .collect();
+        let hint = format!(
+            "Tab ID. The user attached tabs: {}. Unless the user explicitly asks for the current tab, use the attached tab's ID.",
+            attached.join(", ")
+        );
+        for tool in tools.iter_mut() {
+            if !matches!(
+                tool.name.as_str(),
+                "browser_get_markdown" | "browser_get_content" | "browser_screenshot"
+            ) {
+                continue;
+            }
+            if let Some(props) = tool
+                .input_schema
+                .get_mut("properties")
+                .and_then(|p| p.as_object_mut())
+            {
+                if let Some(tab_id_prop) = props.get_mut("tab_id") {
+                    tab_id_prop["description"] = serde_json::Value::String(hint.clone());
+                }
+            }
+        }
+    }
+
+    /// The tools an on-device turn advertises: the search entry point, plus
+    /// every tool loaded so far.
+    ///
+    /// Rebuilt rather than mutated because `tool_search` can evict at the cap,
+    /// and a stale entry would keep a tool callable that the model was told it
+    /// had lost.
+    fn local_active_tools(&self, tab_ids: &[TabInfo]) -> Vec<ToolDefinition> {
+        let mut tools = vec![crate::local_mode::local_tool_search_def()];
+        let loaded = self.local_loaded.borrow();
+        if let Some(index) = self.local_index.borrow().as_ref() {
+            tools.extend(index.tools_named(loaded.names()));
+        }
+        // Dynamic tools are not in the index, so they are resolved separately.
+        for name in loaded.names() {
+            if let Some(def) = self.local_dynamic.borrow().iter().find(|d| &d.name == name) {
+                tools.push(def.clone());
+            }
+        }
+        Self::apply_tab_hint(&mut tools, tab_ids);
+        tools
+    }
+
+    /// How many tools one keyword search may load.
+    ///
+    /// Listing more than it loads would invite the model to call something that
+    /// is not in the tool array; loading everything that matched would spend the
+    /// very context the search exists to protect.
+    const LOCAL_KEYWORD_LOAD_LIMIT: usize = 3;
+
+    /// The loaded set, for reporting back to the daemon.
+    ///
+    /// Empty on a cloud turn. On-device it must be reported even when this turn
+    /// loaded nothing new: the daemon persists whatever comes back, so an empty
+    /// list would drop what earlier turns had already loaded.
+    fn local_loaded_names(&self) -> Vec<String> {
+        if self.local_index.borrow().is_none() {
+            return Vec::new();
+        }
+        self.local_loaded.borrow().names().to_vec()
+    }
+
+    /// `tool_search` on-device.
+    ///
+    /// The cloud path returns a listing the model then calls through
+    /// `tool_call_dynamic`. Here the tools it finds are added to the real tool
+    /// array instead, and the model calls them by name on the next request.
+    fn local_tool_search(&self, query: &str, max_results: usize) -> HostResult<String> {
+        let mut lines: Vec<String> = Vec::new();
+
+        let index_ref = self.local_index.borrow();
+        let Some(index) = index_ref.as_ref() else {
+            return Ok(crate::local_mode::NO_MATCHES.to_string());
+        };
+
+        match index.resolve_query(query) {
+            crate::local_mode::SearchQuery::Select(names) => {
+                let (tools, skills, unknown) = index.select(&names);
+                for tool in &tools {
+                    if self.local_loaded.borrow_mut().add(&tool.name) {
+                        self.local_tools_changed.set(true);
+                    }
+                    lines.push(crate::local_mode::result_line_for_tool(tool));
+                }
+                for name in &skills {
+                    // A skill is instructions, not something callable: return
+                    // its text rather than adding it to the tool array.
+                    lines.push(crate::local_mode::result_line_for_skill(name));
+                    lines.push(self.host.skill_load(name)?);
+                    self.loaded_skills.borrow_mut().insert(name.clone());
+                }
+                for name in &unknown {
+                    // Naming what is missing beats silence — the model asked for
+                    // something specific and would otherwise retry the same name.
+                    lines.push(format!("{name}: not available on-device"));
+                }
+            }
+            crate::local_mode::SearchQuery::Keywords(keywords) => {
+                let mut hits = index.keyword_search(keywords, max_results);
+                if hits.len() < max_results {
+                    // Only the host can enumerate MCP and knowledge-base tools,
+                    // and it has already applied the user's denials.
+                    let room = max_results - hits.len();
+                    for found in self.host.tool_search(keywords, room)? {
+                        hits.push(crate::local_mode::SearchHit::Dynamic(found));
+                    }
+                }
+
+                let mut loaded_here = 0usize;
+                for hit in hits {
+                    if loaded_here >= Self::LOCAL_KEYWORD_LOAD_LIMIT {
+                        break;
+                    }
+                    match hit {
+                        crate::local_mode::SearchHit::Tool(tool) => {
+                            if self.local_loaded.borrow_mut().add(&tool.name) {
+                                self.local_tools_changed.set(true);
+                            }
+                            lines.push(crate::local_mode::result_line_for_tool(&tool));
+                            loaded_here += 1;
+                        }
+                        crate::local_mode::SearchHit::Dynamic(found) => {
+                            let def = crate::local_mode::tool_from_dynamic(&found);
+                            if self.local_loaded.borrow_mut().add(&def.name) {
+                                self.local_tools_changed.set(true);
+                            }
+                            let known = self
+                                .local_dynamic
+                                .borrow()
+                                .iter()
+                                .any(|d| d.name == def.name);
+                            if !known {
+                                self.local_dynamic.borrow_mut().push(def.clone());
+                            }
+                            lines.push(crate::local_mode::result_line_for_tool(&def));
+                            loaded_here += 1;
+                        }
+                        crate::local_mode::SearchHit::Skill(skill) => {
+                            lines.push(crate::local_mode::result_line_for_skill(&skill.name));
+                            lines.push(self.host.skill_load(&skill.name)?);
+                            self.loaded_skills.borrow_mut().insert(skill.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        if lines.is_empty() {
+            return Ok(crate::local_mode::NO_MATCHES.to_string());
+        }
+        Ok(lines.join("\n"))
     }
 
     /// Filter tools based on the tools_config.
@@ -1862,6 +2058,22 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 );
             }
 
+            // On-device: a `tool_search` this iteration changed what is loaded,
+            // so the next request has to advertise the new set. It goes through
+            // the same three gates as the initial list — a tool that arrived
+            // mid-turn is not exempt from them.
+            if self.local_tools_changed.replace(false) {
+                let refreshed = self.local_active_tools(&input.tab_ids);
+                active_tools = Self::gate_network_tools(
+                    &Self::gate_speech_tools(
+                        &Self::gate_canvas_tools(&refreshed, canvas_unlocked),
+                        canvas_unlocked || speech_useful,
+                    ),
+                    network_on,
+                    console_named,
+                );
+            }
+
             // Move tool calls into the accumulator (avoids a second clone)
             all_tool_calls.extend(tool_calls);
 
@@ -1883,7 +2095,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     continue_loop: false,
                     plan_proposal: Some(proposal),
                     artifact: None,
-                    loaded_tools: Vec::new(),
+                    loaded_tools: self.local_loaded_names(),
                 });
             }
 
@@ -1899,7 +2111,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     continue_loop: false,
                     plan_proposal: None,
                     artifact: Some(artifact),
-                    loaded_tools: Vec::new(),
+                    loaded_tools: self.local_loaded_names(),
                 });
             }
         }
@@ -1915,7 +2127,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             continue_loop: false,
             plan_proposal: None,
             artifact: None,
-            loaded_tools: Vec::new(),
+            loaded_tools: self.local_loaded_names(),
         })
     }
 
@@ -2471,8 +2683,14 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             "tool_search" => {
                 let query = tool_call.arguments["query"].as_str().unwrap_or("");
                 let max_results = tool_call.arguments["max_results"].as_u64().unwrap_or(5) as usize;
-                let results = self.host.tool_search(query, max_results)?;
-                serde_json::to_string_pretty(&results).unwrap_or_default()
+                // Bound the borrow before the call below takes its own.
+                let on_device = self.local_index.borrow().is_some();
+                if on_device {
+                    self.local_tool_search(query, max_results)?
+                } else {
+                    let results = self.host.tool_search(query, max_results)?;
+                    serde_json::to_string_pretty(&results).unwrap_or_default()
+                }
             }
             "tool_call_dynamic" => {
                 let tool_name = tool_call.arguments["tool_name"].as_str().unwrap_or("");
@@ -7131,6 +7349,254 @@ mod tests {
             let ids: Vec<&str> = sections.iter().map(|s| s.id.as_str()).collect();
             assert_eq!(ids, vec![id]);
         }
+    }
+
+    fn local_config() -> AgentConfig {
+        AgentConfig {
+            max_iterations: 5,
+            use_streaming: false,
+            suppress_streaming: false,
+            is_subagent: false,
+        }
+    }
+
+    fn local_input(mode: AgentMode, message: &str, carried: &[&str]) -> AgentInput {
+        AgentInput {
+            session_id: "t".into(),
+            mode,
+            user_message: message.into(),
+            history: vec![],
+            attachments: vec![],
+            local_files: vec![],
+            custom_system_prompt: None,
+            skills_filter: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
+            available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
+            tools_config: None,
+            os_platform: None,
+            local: Some(LocalModeInput {
+                n_ctx: 32768,
+                loaded_tools: carried.iter().map(|s| s.to_string()).collect(),
+                user_doc: None,
+            }),
+        }
+    }
+
+    fn says(text: &str) -> LlmResponse {
+        LlmResponse {
+            text: text.into(),
+            tool_calls: vec![],
+            reasoning: None,
+        }
+    }
+
+    fn searches(query: &str) -> LlmResponse {
+        LlmResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                call_id: Some("c1".into()),
+                name: "tool_search".into(),
+                arguments: serde_json::json!({ "query": query }),
+                signature: None,
+            }],
+            reasoning: None,
+        }
+    }
+
+    /// The whole point of deferred loading: a browser turn must not pay for
+    /// sixty tool schemas before the model has asked for anything.
+    #[test]
+    fn a_local_turn_opens_with_tool_search_alone() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("hello"));
+        let agent = Agent::with_config(mock, local_config());
+        agent
+            .run(&local_input(AgentMode::Browser, "read this page", &[]))
+            .unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert_eq!(captured[0], vec!["tool_search".to_string()]);
+    }
+
+    /// Chat is the measured exception — three residents, because searching for
+    /// them cost chat accuracy. Browser must not inherit them.
+    #[test]
+    fn chat_opens_with_its_residents_and_browser_does_not() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("hello"));
+        let agent = Agent::with_config(mock, local_config());
+        agent
+            .run(&local_input(AgentMode::Chat, "what is this", &[]))
+            .unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        for expected in [
+            "tool_search",
+            "web_search",
+            "memory_search",
+            "browser_get_markdown",
+        ] {
+            assert!(
+                captured[0].contains(&expected.to_string()),
+                "chat should open with {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_a_tool_puts_it_in_the_next_request_and_it_can_be_called() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(searches("select:browser_get_markdown"));
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c2".into(),
+                call_id: Some("c2".into()),
+                name: "browser_get_markdown".into(),
+                arguments: serde_json::json!({}),
+                signature: None,
+            }],
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+
+        let agent = Agent::with_config(mock, local_config());
+        let out = agent
+            .run(&local_input(AgentMode::Browser, "read this page", &[]))
+            .unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert_eq!(captured[0], vec!["tool_search".to_string()]);
+        assert!(
+            captured[1].contains(&"browser_get_markdown".to_string()),
+            "a loaded tool must reach the very next request"
+        );
+        assert!(out
+            .tool_calls
+            .iter()
+            .any(|c| c.name == "browser_get_markdown"));
+        assert!(out
+            .loaded_tools
+            .contains(&"browser_get_markdown".to_string()));
+    }
+
+    /// The daemon persists the loaded set between turns so the model does not
+    /// re-discover what it just used.
+    #[test]
+    fn a_carried_over_tool_is_loaded_before_the_first_request() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("hello"));
+        let agent = Agent::with_config(mock, local_config());
+        let out = agent
+            .run(&local_input(
+                AgentMode::Browser,
+                "search that again",
+                &["web_search"],
+            ))
+            .unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert!(captured[0].contains(&"web_search".to_string()));
+        assert!(out.loaded_tools.contains(&"web_search".to_string()));
+    }
+
+    /// Tools local mode never offers stay unreachable through search — saying
+    /// so beats letting the model call a name that will not be there.
+    #[test]
+    fn an_excluded_tool_cannot_be_selected() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(searches("select:switch_model"));
+        mock.add_llm_response(says("done"));
+
+        let agent = Agent::with_config(mock, local_config());
+        let out = agent
+            .run(&local_input(AgentMode::Browser, "use a better model", &[]))
+            .unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert_eq!(captured[1], vec!["tool_search".to_string()]);
+        assert!(out.loaded_tools.is_empty());
+    }
+
+    #[test]
+    fn selecting_a_skill_returns_instructions_without_adding_a_tool() {
+        let mock = MockHostFunctions::new();
+        mock.add_skill(SkillSummary {
+            name: "app-builder".into(),
+            description: "Build a small application".into(),
+            tags: vec![],
+        });
+        mock.add_llm_response(searches("select:skill/app-builder"));
+        mock.add_llm_response(says("done"));
+
+        let agent = Agent::with_config(mock, local_config());
+        let out = agent
+            .run(&local_input(AgentMode::Agent, "build me an app", &[]))
+            .unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert_eq!(
+            captured[1],
+            vec!["tool_search".to_string()],
+            "a skill is instructions, not something callable"
+        );
+        assert!(out.loaded_tools.is_empty());
+    }
+
+    /// MCP and knowledge-base tools only the host can enumerate must be
+    /// loadable too, or the knowledge base is unreachable on-device.
+    #[test]
+    fn a_keyword_search_loads_a_tool_only_the_host_knows() {
+        let mock = MockHostFunctions::new();
+        mock.tool_search_results
+            .borrow_mut()
+            .push(ToolSearchResult {
+                name: "brain_search".into(),
+                description: "Search the knowledge base".into(),
+                score: 1.0,
+                input_schema: serde_json::json!({"type": "object"}),
+                source: Some("mcp:brain".into()),
+            });
+        mock.add_llm_response(searches("brain"));
+        mock.add_llm_response(says("done"));
+
+        let agent = Agent::with_config(mock, local_config());
+        let out = agent
+            .run(&local_input(AgentMode::Chat, "查一下我的知识库", &[]))
+            .unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert!(
+            captured[1].contains(&"brain_search".to_string()),
+            "host-found tools must become callable, got {:?}",
+            captured[1]
+        );
+        assert!(out.loaded_tools.contains(&"brain_search".to_string()));
+    }
+
+    /// The allowlist governs the index, so nothing can be searched back into
+    /// reach that the filter already removed.
+    #[test]
+    fn an_allowlist_cannot_be_escaped_by_searching() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(searches("select:read"));
+        mock.add_llm_response(says("done"));
+
+        let agent = Agent::with_config(mock, local_config());
+        let mut input = local_input(AgentMode::Agent, "read that file", &[]);
+        input.tools_config = Some(nevoflux_protocol::subagent::ToolsConfig::Allow(vec![
+            "web_search".to_string(),
+        ]));
+        let out = agent.run(&input).unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert!(!captured[1].contains(&"read".to_string()));
+        assert!(out.loaded_tools.is_empty());
     }
 
     #[test]
