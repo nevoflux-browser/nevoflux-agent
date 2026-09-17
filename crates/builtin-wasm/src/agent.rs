@@ -1763,6 +1763,13 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             console_named,
         );
 
+        // On-device, tool-result budgets follow the context the engine was
+        // started with; a cloud turn keeps the fixed budget it always had.
+        let budget = match &input.local {
+            Some(local) => ResultBudget::for_local(local.n_ctx),
+            None => ResultBudget::CLOUD,
+        };
+
         let mut iterations = 0;
         let mut final_text = String::new();
         let mut all_tool_calls = Vec::new();
@@ -1805,7 +1812,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             // "make the sky bluer" is a follow-up that feeds the previous image
             // back in. Audio has no such turn; an image does, and taking it
             // away breaks editing silently.
-            shrink_aged_tool_results(&mut messages);
+            shrink_aged_tool_results_with(&mut messages, budget);
 
             // Use streaming or non-streaming LLM based on config
             let response = if self.config.use_streaming && !self.config.suppress_streaming {
@@ -1978,7 +1985,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 // it: the host writes the full text somewhere and the model is
                 // told where, so a long page or a big file is still reachable
                 // with `read` instead of being silently cut off.
-                let trimmed = truncate_tool_result_if_needed(&messages, &result.content);
+                let trimmed = truncate_tool_result_with(&messages, &result.content, budget);
                 let content = if trimmed.len() < result.content.len() {
                     match self
                         .host
@@ -6440,11 +6447,74 @@ fn calculate_messages_size(messages: &[Message]) -> usize {
 /// growth is still bounded — everything before it collapses to a fixed size.
 const RECENT_TOOL_RESULTS_KEPT_WHOLE: usize = 12;
 
-/// What an aged tool result is allowed to keep.
+/// How many bytes of tool results a turn may carry.
 ///
-/// Four kilobytes is a screenful: enough to see which file, which page, what
-/// the first rows said, and to decide whether it is worth fetching again.
-const AGED_TOOL_RESULT_BUDGET: usize = 4 * 1024;
+/// A cloud model gets a fixed, generous budget. On-device the same numbers are
+/// nonsense — a 32 KB single result does not fit a 16K context at all — so the
+/// local budget is derived from the context the engine was actually started
+/// with rather than hardcoded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResultBudget {
+    /// Gross size the whole message list may reach.
+    pub total: usize,
+    /// Held back for the model's own output, subtracted at the point of use.
+    pub reserved_output: usize,
+    /// A single result is never squeezed below this.
+    pub min_single: usize,
+    /// Nor allowed above it, however empty the conversation is.
+    pub max_single: usize,
+    /// What a result older than the recent window keeps.
+    ///
+    /// Four kilobytes is a screenful: enough to see which file, which page,
+    /// what the first rows said, and to decide whether it is worth fetching
+    /// again. On-device it is half that — a screenful is a larger share of a
+    /// 16K context than of a cloud one.
+    pub aged: usize,
+}
+
+impl ResultBudget {
+    /// The fixed budget every cloud turn has always used.
+    ///
+    /// `max_single` is the load-bearing one. Without a ceiling the budget is
+    /// "whatever is left", and at the start of a conversation that is 250 KB —
+    /// so the first tool call can put 250 KB into the history, nothing ever
+    /// takes it out, and every later request pays for it. That is not
+    /// theoretical: a base64 WAV costs 64 KB per second of speech, so a
+    /// four-second answer kept 250 KB of base64 — too big to be cheap and too
+    /// cut up to be usable — and a handful of spoken exchanges cost 2.8M
+    /// tokens. 32 KB is roughly eight thousand words, past what any single
+    /// result needs to be useful. A result that genuinely needs more should be
+    /// written somewhere and referenced, which is what the spill path is for.
+    pub const CLOUD: ResultBudget = ResultBudget {
+        total: 300 * 1024,
+        reserved_output: 50 * 1024,
+        min_single: 10 * 1024,
+        max_single: 32 * 1024,
+        aged: 4 * 1024,
+    };
+
+    /// Derive a budget from the engine's context size.
+    ///
+    /// Three bytes per token is the crude ratio this crate uses elsewhere; it
+    /// over-estimates bytes, which is the safe direction here.
+    ///
+    /// `total` is gross, exactly like [`ResultBudget::CLOUD`] —
+    /// `reserved_output` is subtracted where the budget is used. Subtracting it
+    /// here as well, as the plan's formula literally reads, would charge the
+    /// reservation twice and quietly cost every local result 12 KB.
+    pub fn for_local(n_ctx: u32) -> ResultBudget {
+        let bytes = n_ctx as usize * 3;
+        // A quarter of the context is as much as any one result may take.
+        let max_single = bytes / 4;
+        ResultBudget {
+            total: bytes,
+            reserved_output: 4096 * 3,
+            min_single: (4 * 1024).min(max_single),
+            max_single,
+            aged: 2 * 1024,
+        }
+    }
+}
 
 /// Shorten tool results that the conversation has moved past.
 ///
@@ -6465,6 +6535,10 @@ const AGED_TOOL_RESULT_BUDGET: usize = 4 * 1024;
 /// Idempotent: a result already under budget is left alone, so repeated calls
 /// across loop iterations converge instead of eating into it each time.
 fn shrink_aged_tool_results(messages: &mut [Message]) {
+    shrink_aged_tool_results_with(messages, ResultBudget::CLOUD);
+}
+
+fn shrink_aged_tool_results_with(messages: &mut [Message], budget: ResultBudget) {
     let results: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -6476,7 +6550,7 @@ fn shrink_aged_tool_results(messages: &mut [Message]) {
     }
     for &i in &results[..results.len() - RECENT_TOOL_RESULTS_KEPT_WHOLE] {
         let full = messages[i].content.len();
-        if full <= AGED_TOOL_RESULT_BUDGET {
+        if full <= budget.aged {
             continue;
         }
         // The note counts against the budget, so that what comes out is *under*
@@ -6487,50 +6561,27 @@ fn shrink_aged_tool_results(messages: &mut [Message]) {
             "...\n\n[Earlier tool result: {full} bytes, shortened. Ask again if \
              this turn still needs it.]"
         );
-        let head_budget = AGED_TOOL_RESULT_BUDGET.saturating_sub(note.len());
+        let head_budget = budget.aged.saturating_sub(note.len());
         let head = truncate_string_safe(&messages[i].content, head_budget).to_string();
         messages[i].content = head + &note;
     }
 }
 
 fn truncate_tool_result_if_needed(messages: &[Message], content: &str) -> String {
-    // Total message size limit (~75K tokens for most models)
-    const MAX_TOTAL_MESSAGE_SIZE: usize = 300 * 1024; // 300KB
-                                                      // Reserved space for LLM output
-    const RESERVED_OUTPUT_SIZE: usize = 50 * 1024; // 50KB
-                                                   // Minimum tool result size (don't truncate below this)
-    const MIN_TOOL_RESULT_SIZE: usize = 10 * 1024; // 10KB
+    truncate_tool_result_with(messages, content, ResultBudget::CLOUD)
+}
 
-    // Ceiling on any single result, however empty the conversation is.
-    //
-    // Without it the budget below is "whatever is left", and at the start of a
-    // conversation what is left is 250 KB. So the very first tool call can put
-    // 250 KB into the history, nothing ever takes it out again, and every later
-    // request in that conversation pays for it.
-    //
-    // That is not theoretical. A base64 WAV from a speech tool costs 64 KB per
-    // second of speech, so a four-second answer already passed the ceiling: the
-    // truncation below fired and kept 250 KB of base64 — the worst of both
-    // outcomes, too big to be cheap and too cut up to be usable. History then
-    // sat near 300 KB for the rest of the session (every later result squeezed
-    // down to MIN_TOOL_RESULT_SIZE), and a handful of spoken exchanges cost
-    // 2.8M tokens.
-    //
-    // 32 KB is roughly eight thousand words — past what any single result needs
-    // to be useful, and a tenth of the whole budget rather than three quarters
-    // of it. A result that genuinely needs more should be written somewhere and
-    // referenced, which is what the artifact and asset paths are for.
-    const MAX_SINGLE_TOOL_RESULT: usize = 32 * 1024;
-
+fn truncate_tool_result_with(messages: &[Message], content: &str, budget: ResultBudget) -> String {
     let current_size = calculate_messages_size(messages);
-    let available_space = MAX_TOTAL_MESSAGE_SIZE
+    let available_space = budget
+        .total
         .saturating_sub(current_size)
-        .saturating_sub(RESERVED_OUTPUT_SIZE);
+        .saturating_sub(budget.reserved_output);
 
     // Calculate max size for this tool result
     let max_result_size = available_space
-        .max(MIN_TOOL_RESULT_SIZE)
-        .min(MAX_SINGLE_TOOL_RESULT);
+        .max(budget.min_single)
+        .min(budget.max_single);
 
     if content.len() <= max_result_size {
         return content.to_string();
@@ -6590,6 +6641,59 @@ mod tests {
         let empty: Vec<Message> = Vec::new();
         let ordinary = "z".repeat(4 * 1024);
         assert_eq!(truncate_tool_result_if_needed(&empty, &ordinary), ordinary);
+    }
+
+    /// A quarter of the context, in the crate's three-bytes-per-token terms.
+    #[test]
+    fn a_local_budget_follows_the_context_size() {
+        let small = ResultBudget::for_local(16384);
+        assert_eq!(small.max_single, 12288);
+        assert_eq!(small.total, 49152);
+        assert_eq!(small.aged, 2 * 1024);
+        // The floor never rises above the ceiling, however small the context.
+        let tiny = ResultBudget::for_local(4096);
+        assert!(tiny.min_single <= tiny.max_single);
+
+        let big = ResultBudget::for_local(32768);
+        assert_eq!(big.max_single, 24576);
+    }
+
+    /// The point of the task: the same 40 KB result is cut to the local
+    /// ceiling on-device and to the cloud ceiling otherwise.
+    #[test]
+    fn one_result_is_cut_to_whichever_budget_is_in_force() {
+        let empty: Vec<Message> = vec![];
+        let huge = "x".repeat(40 * 1024);
+
+        let local = ResultBudget::for_local(16384);
+        let cut = truncate_tool_result_with(&empty, &huge, local);
+        assert!(
+            cut.len() <= local.max_single + 200,
+            "local result kept {} bytes, over its {} ceiling",
+            cut.len(),
+            local.max_single
+        );
+
+        // Unchanged for cloud: still the 32 KB ceiling it always had.
+        let cloud = truncate_tool_result_with(&empty, &huge, ResultBudget::CLOUD);
+        assert!(cloud.len() > local.max_single);
+        assert!(cloud.len() <= ResultBudget::CLOUD.max_single + 200);
+    }
+
+    /// An aged result keeps less on-device — 2 KB rather than 4 KB.
+    #[test]
+    fn aged_results_shrink_to_the_local_budget() {
+        let mut msgs: Vec<Message> = (0..RECENT_TOOL_RESULTS_KEPT_WHOLE + 1)
+            .map(|i| tool_result(&format!("t{i}"), 20 * 1024))
+            .collect();
+        shrink_aged_tool_results_with(&mut msgs, ResultBudget::for_local(16384));
+        assert!(
+            msgs[0].content.len() <= 2 * 1024,
+            "aged result kept {} bytes",
+            msgs[0].content.len()
+        );
+        // Everything inside the recent window is untouched.
+        assert_eq!(msgs[1].content.len(), 20 * 1024);
     }
 
     /// 短会话一个字都不该动。修剪是为长会话省钱,不是给每次对话降质。
