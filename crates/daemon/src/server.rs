@@ -6871,6 +6871,10 @@ async fn handle_chat_message_streaming(
         },
     };
 
+    // `input` is moved into the blocking task below, so the plan re-run — which
+    // builds a second AgentInput for the same turn — cannot ask it later.
+    let local_for_rerun = input.local.clone();
+
     // Create cancellation token for this streaming session
     let cancellation_token = tokio_util::sync::CancellationToken::new();
     {
@@ -7429,9 +7433,22 @@ async fn handle_chat_message_streaming(
                                 .as_deref()
                                 .and_then(|s| s.tools_config.clone()),
                             os_platform: Some(std::env::consts::OS.to_string()),
-                            // A re-run continues the same turn; local-mode state was
-                            // already resolved for the original input.
-                            local: None,
+                            // A re-run continues the same turn, so it keeps the
+                            // turn's local-mode state — carrying the tools the
+                            // turn has already loaded rather than the set it
+                            // started with. Passing `None` here would make the
+                            // re-run look like an ordinary cloud turn to Phase 3
+                            // (`local.is_none()` IS the "not local" signal), so a
+                            // local session that proposed a plan would silently
+                            // lose its context budget, its loaded tools and its
+                            // USER.md for the continuation.
+                            local: local_for_rerun.as_ref().map(|l| {
+                                nevoflux_builtin_wasm::LocalModeInput {
+                                    n_ctx: l.n_ctx,
+                                    loaded_tools: output.loaded_tools.clone(),
+                                    user_doc: l.user_doc.clone(),
+                                }
+                            }),
                         };
 
                         // Spawn stream forwarder for re-run

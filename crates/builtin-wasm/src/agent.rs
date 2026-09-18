@@ -826,7 +826,22 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 self.host.skill_list().unwrap_or_default(),
                 input.skills_filter.as_deref(),
             );
-            let index = crate::local_mode::LocalToolIndex::new(tools, skills);
+            // Anything the three gates can strip is left OUT of the index.
+            // Otherwise a search happily reports `browser_console_messages:
+            // loaded` and the network gate removes it from the very next
+            // request — the model is told it can call something that is not
+            // there, and the name still occupies one of the twelve slots for
+            // the rest of the session.
+            let searchable: Vec<ToolDefinition> = tools
+                .into_iter()
+                .filter(|t| {
+                    let n = t.name.as_str();
+                    !Self::CANVAS_OPERATE_TOOLS.contains(&n)
+                        && !Self::SPEECH_OUTPUT_TOOLS.contains(&n)
+                        && !Self::NAMED_ONLY_TOOLS.contains(&n)
+                })
+                .collect();
+            let index = crate::local_mode::LocalToolIndex::new(searchable, skills);
             let mut loaded = crate::local_mode::LoadedSet::default();
             // Carried-over first, residents LAST. `LoadedSet` evicts from the
             // front, and the residents are the measured lever — they lift chat
