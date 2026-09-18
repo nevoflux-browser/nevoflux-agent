@@ -6564,9 +6564,20 @@ impl ResultBudget {
     }
 }
 
+/// The CLOUD-budget spelling, for the tests written before `ResultBudget`
+/// existed.
+///
+/// `#[cfg(test)]` because every production call site now passes its budget
+/// explicitly. Ungated, this would be dead code compiled into the shipped
+/// binary and kept alive only by the tests that call it.
+#[cfg(test)]
+fn shrink_aged_tool_results(messages: &mut [Message]) {
+    shrink_aged_tool_results_with(messages, ResultBudget::CLOUD);
+}
+
 /// Shorten tool results that the conversation has moved past.
 ///
-/// Nothing here trimmed the history before this: [`truncate_tool_result_if_needed`]
+/// Nothing here trimmed the history before this: `truncate_tool_result_with`
 /// bounds each result **as it arrives** and never looks at it again, so a
 /// conversation only ever grew. Every request re-sent every byte of every
 /// result from every earlier turn, and a session with thirty-five requests paid
@@ -6582,10 +6593,6 @@ impl ResultBudget {
 ///
 /// Idempotent: a result already under budget is left alone, so repeated calls
 /// across loop iterations converge instead of eating into it each time.
-fn shrink_aged_tool_results(messages: &mut [Message]) {
-    shrink_aged_tool_results_with(messages, ResultBudget::CLOUD);
-}
-
 fn shrink_aged_tool_results_with(messages: &mut [Message], budget: ResultBudget) {
     let results: Vec<usize> = messages
         .iter()
@@ -6615,6 +6622,9 @@ fn shrink_aged_tool_results_with(messages: &mut [Message], budget: ResultBudget)
     }
 }
 
+/// The CLOUD-budget spelling, test-only for the same reason as
+/// [`shrink_aged_tool_results`].
+#[cfg(test)]
 fn truncate_tool_result_if_needed(messages: &[Message], content: &str) -> String {
     truncate_tool_result_with(messages, content, ResultBudget::CLOUD)
 }
