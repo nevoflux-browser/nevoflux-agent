@@ -7451,15 +7451,42 @@ mod tests {
     /// the sources by sha256 when copied (2026-09-17).
     #[test]
     fn local_prompts_keep_their_measured_size_and_fit_the_budget() {
-        for (name, prompt, bytes) in [
-            ("chat", LOCAL_CHAT_PROMPT, 2286usize),
-            ("browser", LOCAL_BROWSER_PROMPT, 2479),
-            ("agent", LOCAL_AGENT_PROMPT, 2315),
+        // FNV-1a over the bytes: no dependency, and it pins CONTENT rather
+        // than length. A length-only check waves through any equal-length
+        // edit — a word swap, a reordered bullet, a same-width typo fix —
+        // which is precisely the change that invalidates the measurement
+        // while looking harmless in review.
+        fn fnv1a64(bytes: &[u8]) -> u64 {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in bytes {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            h
+        }
+
+        for (name, prompt, bytes, digest) in [
+            (
+                "chat",
+                LOCAL_CHAT_PROMPT,
+                2286usize,
+                0x7d5b_58e8_5223_4a49u64,
+            ),
+            ("browser", LOCAL_BROWSER_PROMPT, 2479, 0x757e_3804_12a2_274c),
+            ("agent", LOCAL_AGENT_PROMPT, 2315, 0xff61_d173_3c79_04d4),
         ] {
             assert_eq!(
                 prompt.len(),
                 bytes,
                 "{name}.md changed size — it is a measured artifact, not prose to edit"
+            );
+            assert_eq!(
+                fnv1a64(prompt.as_bytes()),
+                digest,
+                "{name}.md changed content. Browser and agent scored 1.00/1.00 with \
+                 exactly this text, and the decision to ship local mode with tools \
+                 rests on that. If the edit is deliberate, re-run the V0 set and \
+                 update the digest with the new measurement."
             );
             assert!(
                 prompt.len() / 4 <= LOCAL_PROMPT_TOKEN_BUDGET,
