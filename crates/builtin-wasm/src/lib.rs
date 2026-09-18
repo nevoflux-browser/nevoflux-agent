@@ -32,6 +32,7 @@
 
 pub mod agent;
 pub mod host;
+pub mod local_mode;
 pub mod types;
 
 pub use agent::{Agent, AgentConfig, ASYNC_SAFE_TOOLS};
@@ -39,10 +40,10 @@ pub use host::{HostError, HostFunctions, HostResult};
 pub use nevoflux_protocol::LocalFileRef;
 pub use types::{
     AgentInput, AgentMode, AgentOutput, Attachment, BashResult, BashStatus, BrowserToolResult,
-    GeneratedImage, GrepMatch, GrepResult, LlmChunk, LlmRequest, LlmResponse, MemoryChunk, Message,
-    MessageRole, PromptSectionText, ReadResult, SkillContext, SkillSummary, SubagentInfo, TabInfo,
-    ToolCall,
-    ToolContext, ToolDefinition, ToolDenial, ToolGate, ToolResult, ToolSearchResult,
+    GeneratedImage, GrepMatch, GrepResult, LlmChunk, LlmRequest, LlmResponse, LocalModeInput,
+    MemoryChunk, Message, MessageRole, PromptSectionText, ReadResult, SkillContext, SkillSummary,
+    SubagentInfo, TabInfo, ToolCall, ToolContext, ToolDefinition, ToolDenial, ToolGate, ToolResult,
+    ToolSearchResult,
 };
 
 /// Version of the builtin-wasm module.
@@ -195,6 +196,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -231,6 +233,7 @@ mod tests {
                 tools_config: None,
                 skills_filter: None,
                 os_platform: None,
+                local: None,
             };
 
             let output = agent.run(&input);
@@ -260,6 +263,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -294,6 +298,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         let output = agent.run(&input);

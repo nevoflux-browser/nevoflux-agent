@@ -1136,6 +1136,10 @@ pub struct MockHostFunctions {
     pub active_packs: std::cell::RefCell<Vec<String>>,
     /// A prompt override in force, as (mode, body).
     pub prompt_override: std::cell::RefCell<Option<(String, String)>>,
+    /// Dynamic tools `tool_search` should report — MCP and knowledge-base
+    /// tools in real life. Local mode discovers tools through this call, so a
+    /// test cannot exercise that path while the mock always answers empty.
+    pub tool_search_results: std::cell::RefCell<Vec<ToolSearchResult>>,
 }
 
 #[cfg(test)]
@@ -1165,6 +1169,7 @@ impl MockHostFunctions {
             spills: std::cell::RefCell::new(vec![]),
             active_packs: std::cell::RefCell::new(vec![]),
             prompt_override: std::cell::RefCell::new(None),
+            tool_search_results: std::cell::RefCell::new(vec![]),
         }
     }
 
@@ -1471,8 +1476,11 @@ impl HostFunctions for MockHostFunctions {
         Ok(true) // Always granted in mock
     }
 
-    fn tool_search(&self, _query: &str, _max_results: usize) -> HostResult<Vec<ToolSearchResult>> {
-        Ok(vec![])
+    fn tool_search(&self, _query: &str, max_results: usize) -> HostResult<Vec<ToolSearchResult>> {
+        // The query is ignored on purpose: a mock that scored its own matches
+        // would be testing the mock. Tests state exactly what the host finds.
+        let results = self.tool_search_results.borrow();
+        Ok(results.iter().take(max_results).cloned().collect())
     }
 
     fn tool_call_dynamic(
@@ -1576,6 +1584,7 @@ impl HostFunctions for MockHostFunctions {
             continue_loop: false,
             plan_proposal: None,
             artifact: None,
+            loaded_tools: vec![],
         })
     }
 
@@ -1586,6 +1595,7 @@ impl HostFunctions for MockHostFunctions {
             continue_loop: false,
             plan_proposal: None,
             artifact: None,
+            loaded_tools: vec![],
         })
     }
 
@@ -1596,6 +1606,7 @@ impl HostFunctions for MockHostFunctions {
             continue_loop: false,
             plan_proposal: None,
             artifact: None,
+            loaded_tools: vec![],
         })
     }
 
@@ -2151,6 +2162,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         let chat_output = mock.builtin_chat(&input).unwrap();

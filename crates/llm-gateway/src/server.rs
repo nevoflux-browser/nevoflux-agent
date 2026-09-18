@@ -238,16 +238,94 @@ fn env_duration_secs(name: &str, default: Duration) -> Duration {
     }
 }
 
+/// A hot-swappable upstream routing update (Task 1.6). Replaces every
+/// field of [`crate::handlers::Upstream`] except the live `acp` client
+/// itself — [`GatewayHandle::set_upstream`] applies this atomically under
+/// one write-lock so no in-flight request can observe a torn mix of the
+/// old and new values.
+#[derive(Clone)]
+pub struct UpstreamUpdate {
+    pub base_url: String,
+    pub api_key: String,
+    pub model_override: String,
+    pub protocol: UpstreamProtocol,
+    /// ACP agent config to build an ACP client from **on demand**, if
+    /// `protocol == Acp` and no ACP client exists yet (fix round 1, item
+    /// 1). Ignored when an ACP client is already present — see
+    /// [`crate::handlers::Upstream::apply_update`] — so a hot swap away
+    /// from and back to ACP always reuses the same lazily-connected
+    /// client rather than rebuilding it (and losing a live subprocess).
+    pub acp_config: Option<AcpProviderConfig>,
+    /// When `true`, `/v1/chat/completions` short-circuits with an
+    /// immediate `503` (see [`crate::error::GatewayError::LocalEngineUnavailable`])
+    /// instead of dispatching on `protocol` at all — used while the
+    /// LocalOnly latch is on but no on-device engine is published yet
+    /// (fix round 1, item 5). Every other field is meaningless when this
+    /// is `true`.
+    pub unavailable: bool,
+}
+
+impl std::fmt::Debug for UpstreamUpdate {
+    /// Hand-written so `api_key` (and any secret riding `acp_config`'s
+    /// `env`) never lands in a log line via `{:?}` (fix round 1, item 7).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamUpdate")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .field("model_override", &self.model_override)
+            .field("protocol", &self.protocol)
+            .field(
+                "acp_config",
+                &self.acp_config.as_ref().map(|_| "<redacted>"),
+            )
+            .field("unavailable", &self.unavailable)
+            .finish()
+    }
+}
+
+/// A cheap, `Clone`-able handle onto a running gateway's hot-swappable
+/// upstream routing (Task 1.6), decoupled from [`GatewayHandle`]'s
+/// shutdown-owning fields (`join` / `shutdown`) so it can be stashed in a
+/// process-global and shared freely — e.g. by the daemon's config-change
+/// handlers (which don't hold a `&GatewayHandle`) and, later, the
+/// on-device engine supervisor (Task 2.9). Get one via
+/// [`GatewayHandle::control`].
+#[derive(Clone)]
+pub struct GatewayControl {
+    state: Arc<AppState>,
+}
+
+impl GatewayControl {
+    /// Atomically replace the upstream routing every future request will
+    /// see. In-flight requests that already snapshotted the old upstream
+    /// (see `handlers::chat_completions`) finish against it undisturbed.
+    pub async fn set_upstream(&self, up: UpstreamUpdate) {
+        self.state.upstream.write().await.apply_update(up);
+    }
+
+    /// The currently-active upstream routing.
+    pub async fn upstream_snapshot(&self) -> UpstreamUpdate {
+        self.state.upstream.read().await.snapshot()
+    }
+}
+
 /// Handle for a running gateway. Drop without calling [`Self::shutdown`]
 /// gives only best-effort teardown via the underlying task abort path.
 pub struct GatewayHandle {
     /// The address the listener was actually bound to. With
     /// `127.0.0.1:0` this is the OS-assigned port — read it back via
-    /// [`Self::bind_addr`] / [`Self::url`].
+    /// [`Self::bind_addr`] / [`Self::url`]. Never changed by
+    /// [`Self::set_upstream`].
     pub bind_addr: SocketAddr,
     /// Bearer token configured for this instance. Stored on the handle
     /// so the daemon can hand it to downstream consumers (gbrain in M3).
+    /// Never changed by [`Self::set_upstream`].
     pub bearer_token: String,
+    /// Shared app state, kept so [`Self::set_upstream`] /
+    /// [`Self::upstream_snapshot`] / [`Self::control`] can reach the
+    /// hot-swappable [`crate::handlers::Upstream`] without needing their
+    /// own separate handle type.
+    state: Arc<AppState>,
     join: JoinHandle<()>,
     shutdown: tokio::sync::oneshot::Sender<()>,
 }
@@ -269,6 +347,29 @@ impl GatewayHandle {
     /// Return the canonical `http://<host>:<port>` URL for this gateway.
     pub fn url(&self) -> String {
         format!("http://{}", self.bind_addr)
+    }
+
+    /// Atomically replace the upstream routing every future request will
+    /// see — the LocalOnly latch's hook for pointing this gateway at the
+    /// on-device engine (or a closed loopback) instead of the cloud, and
+    /// back again (Task 1.6). `bind_addr` / `bearer_token` are untouched.
+    pub async fn set_upstream(&self, up: UpstreamUpdate) {
+        self.state.upstream.write().await.apply_update(up);
+    }
+
+    /// The currently-active upstream routing.
+    pub async fn upstream_snapshot(&self) -> UpstreamUpdate {
+        self.state.upstream.read().await.snapshot()
+    }
+
+    /// A cheap `Clone`-able handle that can call [`Self::set_upstream`] /
+    /// [`Self::upstream_snapshot`] without holding this `GatewayHandle`
+    /// (which owns the non-`Clone` shutdown machinery) — see
+    /// [`GatewayControl`].
+    pub fn control(&self) -> GatewayControl {
+        GatewayControl {
+            state: self.state.clone(),
+        }
     }
 
     /// Signal the server to stop, then wait for the serve task to drain.
@@ -307,8 +408,8 @@ pub async fn serve(config: GatewayConfig) -> anyhow::Result<GatewayHandle> {
     // the same router via `tower::ServiceExt::oneshot` without binding a
     // TCP listener — see [`serve_test_router`].
     let state = Arc::new(AppState::new(config).await?);
-    let upstream_base_url_log = state.upstream_base_url.clone();
-    let app = handlers::build_router(state);
+    let upstream_base_url_log = state.upstream.read().await.base_url.clone();
+    let app = handlers::build_router(state.clone());
 
     // Bind first so callers can read back the OS-assigned port (if any)
     // and start health-checking immediately.
@@ -337,6 +438,7 @@ pub async fn serve(config: GatewayConfig) -> anyhow::Result<GatewayHandle> {
     Ok(GatewayHandle {
         bind_addr,
         bearer_token,
+        state,
         join,
         shutdown: shutdown_tx,
     })
@@ -375,9 +477,15 @@ mod tests {
         // A serve task that ignores the shutdown signal and never ends,
         // standing in for axum graceful-shutdown wedged on an open stream.
         let join = tokio::spawn(std::future::pending::<()>());
+        let state = Arc::new(
+            AppState::new(GatewayConfig::test_default())
+                .await
+                .expect("AppState::new for test"),
+        );
         let handle = GatewayHandle {
             bind_addr: "127.0.0.1:0".parse().expect("loopback addr"),
             bearer_token: "test-token".into(),
+            state,
             join,
             shutdown: shutdown_tx,
         };

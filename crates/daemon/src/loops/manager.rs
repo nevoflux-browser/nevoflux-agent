@@ -244,6 +244,23 @@ impl LoopManager {
                         .await;
                 }
 
+                // LocalOnly latch: an iteration would need to call an LLM
+                // off-device — refuse the fire cleanly (skipped + counted)
+                // rather than running it into `egress_guard`'s
+                // `PermissionDenied` mid-iteration.
+                if crate::local::latch::is_on() {
+                    let now = current_timestamp();
+                    let _ = LoopRepository::new(&executor_for_task.database())
+                        .increment_skipped(req.loop_id.as_ref(), now);
+                    let session_id = registry_for_task
+                        .with_mut(&req.loop_id, |rt| rt.session_id.clone())
+                        .unwrap_or_default();
+                    events_for_task
+                        .skipped(&session_id, &req.loop_id, &req.fire_reason, "local_mode")
+                        .await;
+                    continue;
+                }
+
                 // §8.2: drop if currently running.
                 let busy = registry_for_task
                     .with_mut(&req.loop_id, |rt| rt.current_iteration.is_some())
@@ -303,7 +320,7 @@ impl LoopManager {
                                     .with_mut(&req.loop_id, |rt| rt.session_id.clone())
                                     .unwrap_or_default();
                                 events_for_task
-                                    .skipped(&session_id, &req.loop_id, &req.fire_reason)
+                                    .skipped(&session_id, &req.loop_id, &req.fire_reason, "gate")
                                     .await;
                                 continue;
                             }
@@ -539,6 +556,13 @@ impl LoopManager {
 
     pub fn registry(&self) -> &LoopRegistry {
         &self.registry
+    }
+
+    /// Test seam: a sender into the dispatcher's fire channel, so tests can
+    /// drive a `LoopFireRequest` directly instead of waiting on a real timer.
+    #[cfg(test)]
+    pub(crate) fn fire_tx(&self) -> mpsc::Sender<LoopFireRequest> {
+        self.fire_tx.clone()
     }
 
     /// Handle to the armed-loop counter for the managed idle watchdog.
@@ -935,6 +959,28 @@ mod tests {
     use std::time::Duration;
 
     fn fresh() -> Storage {
+        // R35 root-cause fix: the dispatcher task spawned by `LoopManager::start`/
+        // `start_with_bus` below checks `crate::local::latch::is_on()` (see
+        // this file's own dispatch loop) before firing an iteration. In test
+        // builds `is_on()` prefers a thread-local override and only falls
+        // through to the REAL process-global latch when the calling thread
+        // never set one (see `local::latch`'s module docs, R26) — and
+        // `#[tokio::test]`'s current-thread flavor runs a spawned dispatcher
+        // on the SAME thread as the test that spawned it. None of this
+        // file's tests call `latch::set` themselves (except
+        // `fires_are_skipped_while_latched`, which explicitly wants the
+        // latched behavior), so their dispatcher's `is_on()` check used to
+        // silently read whatever the REAL global happened to be — safe only
+        // as long as nothing else in the binary ever touched it. Task 1.6's
+        // own latch tests do (deliberately, to exercise that behavior),
+        // running concurrently on other harness threads, which could flip
+        // an unrelated loop test's dispatcher into skip-and-count-as-latched
+        // mode mid-run, at random, depending on scheduling — the actual
+        // mechanism behind this file's own flaky failures once Task 1.6
+        // landed. Pinning the thread-local override to `false` here for
+        // every test makes each one immune to that, regardless of what any
+        // other concurrently-running test does to the real global.
+        crate::local::latch::set(false);
         let s = Storage::open_in_memory().unwrap();
         s.sessions()
             .create(CreateSessionParams::new().with_id("s1").with_title("t"))
@@ -1659,6 +1705,57 @@ mod tests {
             rec.skipped_triggers, 1,
             "gate skip must bump skipped_triggers"
         );
+    }
+
+    /// LocalOnly latch: while on-device mode is enforced, a fire must be
+    /// skipped (counted, event emitted) rather than run into an iteration
+    /// that would need to call an LLM off-device.
+    #[tokio::test]
+    async fn fires_are_skipped_while_latched() {
+        let _g = crate::local::latch::test_serial();
+        struct ResetLatch;
+        impl Drop for ResetLatch {
+            fn drop(&mut self) {
+                crate::local::latch::set(false);
+            }
+        }
+        let _reset = ResetLatch;
+
+        let storage = fresh();
+        let mgr = LoopManager::start(storage.database().clone());
+        let id = mgr
+            .create_loop(CreateLoopArgs {
+                session_id: "s1".into(),
+                trigger_expr_text: "time:5m".into(),
+                prompt_text: Some("p".into()),
+                wrapped_skill: None,
+                mode: nevoflux_builtin_wasm::AgentMode::Chat,
+                gate: None,
+                verify_check: None,
+            })
+            .await
+            .unwrap();
+
+        crate::local::latch::set(true);
+
+        mgr.fire_tx()
+            .send(LoopFireRequest {
+                loop_id: id.clone(),
+                fire_reason: "time".into(),
+                event_payload: None,
+            })
+            .await
+            .unwrap();
+
+        // Give the dispatcher a moment to process the fire.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let rec = storage.loops().get(id.as_ref()).unwrap().unwrap();
+        assert_eq!(
+            rec.iteration_count, 0,
+            "no iteration should run while latched"
+        );
+        assert_eq!(rec.skipped_triggers, 1, "the fire must be counted skipped");
     }
 
     /// W3 §gate dispatcher wiring: a gate whose decision is `run=true` must

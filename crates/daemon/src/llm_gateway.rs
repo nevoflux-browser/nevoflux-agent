@@ -11,18 +11,23 @@
 //!
 //! See `docs/plans/2026-05-24-knowledge-base-spike-plan.md` 附录 B.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{OnceLock, RwLock},
+    time::Duration,
+};
 
 use nevoflux_llm_gateway::{
-    serve as serve_gateway, AcpProviderConfig, GatewayConfig, GatewayHandle, UpstreamProtocol,
-    DEFAULT_ANTHROPIC_VERSION, DEFAULT_UPSTREAM_BASE, DEFAULT_UPSTREAM_CONNECT_TIMEOUT,
-    DEFAULT_UPSTREAM_REQUEST_TIMEOUT, DEFAULT_UPSTREAM_RETRY_MAX_WAIT,
-    DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT,
+    serve as serve_gateway, AcpProviderConfig, GatewayConfig, GatewayControl, GatewayHandle,
+    UpstreamProtocol, UpstreamUpdate, DEFAULT_ANTHROPIC_VERSION, DEFAULT_UPSTREAM_BASE,
+    DEFAULT_UPSTREAM_CONNECT_TIMEOUT, DEFAULT_UPSTREAM_REQUEST_TIMEOUT,
+    DEFAULT_UPSTREAM_RETRY_MAX_WAIT, DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT,
 };
 use rand::RngCore;
 use tracing::{info, warn};
 
 use crate::config::{AgentConfig, GatewayUpstreamConfig, LlmConfig};
+use crate::local::endpoint::LocalEndpoint;
 
 /// Clone-safe snapshot of a running gateway, suitable for storing in
 /// places that don't own the [`GatewayHandle`] itself (which holds the
@@ -61,7 +66,7 @@ pub type InitError = Box<dyn std::error::Error + Send + Sync>;
 /// the layered fallback (config → env → `[llm.<provider>]` → default)
 /// already applied.
 #[derive(Debug, Clone)]
-struct ResolvedUpstreamConfig {
+pub struct ResolvedUpstreamConfig {
     upstream_base_url: String,
     upstream_api_key: String,
     /// `None` = no remap (passthrough). `Some(name)` = rewrite incoming
@@ -84,6 +89,11 @@ struct ResolvedUpstreamConfig {
     /// (provider `claude-code`). Built from
     /// `nevoflux_llm::providers::acp::claude::build_config` with the MCP
     /// bridge disabled (the gateway's ACP session is headless + tool-less).
+    ///
+    /// Task 1.6: NOT carried into [`UpstreamUpdate`] — a hot swap never
+    /// reconstructs the gateway's `AcpUpstream`, only toggles `protocol`
+    /// between the boot-time cloud protocol and the on-device OpenAI
+    /// endpoint. See [`upstream_for_cloud`].
     acp_config: Option<AcpProviderConfig>,
 }
 
@@ -187,7 +197,7 @@ fn provider_canonical_base_url(provider: &str) -> &'static str {
 ///
 /// `upstream_api_key` additionally chains through `ANTHROPIC_API_KEY`
 /// as a final env fallback (preserved from M1 for backward compat).
-fn resolve_upstream_config(
+pub(crate) fn resolve_upstream_config(
     config: &GatewayUpstreamConfig,
     agent: &AgentConfig,
 ) -> ResolvedUpstreamConfig {
@@ -350,6 +360,131 @@ fn resolve_upstream_config(
     }
 }
 
+// =========================================================================
+// Task 1.6 — hot-swappable upstream, following the LocalOnly latch.
+// =========================================================================
+
+/// Process-global handle onto the running gateway's hot-swappable
+/// upstream (Task 1.6), published once at daemon boot
+/// ([`set_gateway_control`]). Exists so the free-function config-change
+/// handlers in `server.rs` (which don't hold a `&Server`, let alone a
+/// `&GatewayHandle`) and — later — the on-device engine supervisor (Task
+/// 2.9) can re-apply the latch's upstream without owning the gateway.
+static CURRENT_GATEWAY_CONTROL: OnceLock<GatewayControl> = OnceLock::new();
+
+/// Publish the gateway control handle. Best-effort like every other
+/// `CURRENT_*` global in this crate: a second call (a second daemon in the
+/// same process — tests, mostly) silently keeps the first value.
+pub(crate) fn set_gateway_control(control: GatewayControl) {
+    let _ = CURRENT_GATEWAY_CONTROL.set(control);
+}
+
+/// The published gateway control handle, if the gateway started.
+pub(crate) fn gateway_control() -> Option<GatewayControl> {
+    CURRENT_GATEWAY_CONTROL.get().cloned()
+}
+
+/// The most recently resolved cloud (non-local) upstream, refreshed on
+/// every [`crate::local::on_config_changed`] call — never only the
+/// boot-time snapshot, since the active cloud provider can change while
+/// the latch is on. [`apply_gateway_upstream_for_latch`]-equivalent
+/// callers that need to restore the cloud upstream (unlatching) read this
+/// instead of re-resolving from a config they don't have on hand.
+static CURRENT_CLOUD_UPSTREAM: RwLock<Option<ResolvedUpstreamConfig>> = RwLock::new(None);
+
+/// Cache the resolved cloud upstream for later unlatched restores.
+pub(crate) fn set_cloud_upstream(cloud: ResolvedUpstreamConfig) {
+    if let Ok(mut guard) = CURRENT_CLOUD_UPSTREAM.write() {
+        *guard = Some(cloud);
+    }
+}
+
+/// The most recently cached cloud upstream, if any has been resolved yet.
+pub(crate) fn cloud_upstream() -> Option<ResolvedUpstreamConfig> {
+    CURRENT_CLOUD_UPSTREAM.read().ok().and_then(|g| g.clone())
+}
+
+/// The [`UpstreamUpdate`] for the cloud (non-local) upstream — what the
+/// gateway should point at while the latch is off. Carries `acp_config`
+/// through so the gateway can build its ACP client on demand (fix round 1,
+/// item 1) if the cloud provider resolves to ACP but no ACP client exists
+/// yet — e.g. the gateway booted on a non-ACP upstream and the user
+/// switches the active provider to `claude-code` at runtime, no restart.
+pub(crate) fn upstream_for_cloud(cloud: &ResolvedUpstreamConfig) -> UpstreamUpdate {
+    UpstreamUpdate {
+        base_url: cloud.upstream_base_url.clone(),
+        api_key: cloud.upstream_api_key.clone(),
+        model_override: cloud.upstream_model_remap.clone().unwrap_or_default(),
+        protocol: cloud.upstream_protocol,
+        acp_config: cloud.acp_config.clone(),
+        unavailable: false,
+    }
+}
+
+/// The [`UpstreamUpdate`] for the on-device (local) upstream — what the
+/// gateway should point at while the latch is on. `local` is
+/// [`endpoint::current`]'s result: `None` means no engine is published
+/// (not started yet, or unloaded), in which case the update is marked
+/// `unavailable` so the gateway short-circuits `/v1/chat/completions`
+/// with an immediate `503` instead of attempting any network call (fix
+/// round 1, item 5 — the original design pointed this case at a closed
+/// loopback port, but that can hang if something else happens to be
+/// listening there).
+///
+/// `LocalEndpoint::base_url` is already the engine's own `/v1` prefix
+/// (e.g. `http://127.0.0.1:PORT/v1`), but the gateway's OpenAI passthrough
+/// handler builds its request URL as `{base_url}/v1/chat/completions`
+/// (see `nevoflux_llm_gateway::handlers::do_chat_completions_openai`) — so
+/// the trailing `/v1` is stripped here first, or the handler's own suffix
+/// would double it up and miss the engine's real route.
+pub(crate) fn upstream_for_local(local: Option<&LocalEndpoint>) -> UpstreamUpdate {
+    match local {
+        Some(ep) => {
+            let trimmed = ep.base_url.trim_end_matches('/');
+            let base_url = trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string();
+            UpstreamUpdate {
+                base_url,
+                api_key: ep.api_key.clone(),
+                model_override: ep.model_id.clone(),
+                protocol: UpstreamProtocol::OpenAi,
+                acp_config: None,
+                unavailable: false,
+            }
+        }
+        None => UpstreamUpdate {
+            base_url: String::new(),
+            api_key: String::new(),
+            model_override: String::new(),
+            protocol: UpstreamProtocol::OpenAi,
+            acp_config: None,
+            unavailable: true,
+        },
+    }
+}
+
+/// Apply the LocalOnly latch's state to a live gateway: point it at the
+/// on-device endpoint (or mark the upstream `unavailable`, if none is
+/// published yet) while latched, or restore `cloud` while not.
+///
+/// Pure glue over [`upstream_for_local`] / [`upstream_for_cloud`] +
+/// `GatewayHandle::set_upstream` — kept separate from those so callers
+/// that only have a [`GatewayControl`] (not a `&GatewayHandle`, e.g. the
+/// process-global path in `crate::local::sync`) can reuse the same
+/// translation without needing one.
+pub async fn apply_latch(
+    handle: &GatewayHandle,
+    latched: bool,
+    local: Option<&LocalEndpoint>,
+    cloud: &ResolvedUpstreamConfig,
+) {
+    let up = if latched {
+        upstream_for_local(local)
+    } else {
+        upstream_for_cloud(cloud)
+    };
+    handle.set_upstream(up).await;
+}
+
 /// Working directory for the gateway's headless ACP session. Reuses the
 /// daemon data dir's `workspace/` (same place `wasm::llm` uses for ACP).
 fn acp_work_dir() -> std::path::PathBuf {
@@ -502,7 +637,7 @@ fn generate_random_token() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
 
@@ -513,7 +648,14 @@ mod tests {
     /// var race each other and corrupt the result. Wrapping the
     /// mutating section in this mutex makes those tests serialize
     /// without pulling in `serial_test` as a new dev-dep.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    ///
+    /// `pub(crate)` (fix round 1, item 3): `crate::local::sync`'s tests
+    /// call `resolve_upstream_config` (via `on_config_changed`) too, and
+    /// must hold this same lock for the same reason — otherwise a
+    /// concurrently-running test here that sets e.g.
+    /// `NEVOFLUX_LLM_GATEWAY_UPSTREAM_BASE_URL` could leak into their
+    /// resolution.
+    pub(crate) static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// Env vars the resolver consults. Clear them all up-front in any
     /// test that wants a clean baseline.
@@ -529,7 +671,7 @@ mod tests {
         "ANTHROPIC_API_KEY",
     ];
 
-    fn clear_resolver_env() {
+    pub(crate) fn clear_resolver_env() {
         for var in RESOLVER_ENV_VARS {
             std::env::remove_var(var);
         }
@@ -904,5 +1046,209 @@ mod tests {
         assert!(agent.llm.provider.is_none());
         let resolved = resolve_upstream_config(&agent.knowledge_base.gateway, &agent);
         assert_eq!(resolved.upstream_protocol, UpstreamProtocol::Anthropic);
+    }
+
+    // ====================================================================
+    // Task 1.6 — hot-swappable upstream, following the LocalOnly latch.
+    //
+    // NOTE: these tests deliberately never call `set_gateway_control` /
+    // `set_cloud_upstream` — those touch process-globals (a `OnceLock` and
+    // a shared `RwLock`) that only `crate::local::sync`'s single
+    // integration test exercises, so two tests racing to be the "first
+    // setter" (or writing the global concurrently) can never happen. See
+    // that test's own comment.
+    // ====================================================================
+
+    fn test_resolved_cloud() -> ResolvedUpstreamConfig {
+        ResolvedUpstreamConfig {
+            upstream_base_url: "https://cloud.example".into(),
+            upstream_api_key: "cloud-key".into(),
+            upstream_model_remap: Some("cloud-model".into()),
+            anthropic_version: DEFAULT_ANTHROPIC_VERSION.to_string(),
+            request_timeout: DEFAULT_UPSTREAM_REQUEST_TIMEOUT,
+            connect_timeout: DEFAULT_UPSTREAM_CONNECT_TIMEOUT,
+            stream_idle_timeout: DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT,
+            retry_max_wait: DEFAULT_UPSTREAM_RETRY_MAX_WAIT,
+            advertised_models: vec!["cloud-model".into()],
+            upstream_protocol: UpstreamProtocol::Anthropic,
+            acp_config: None,
+        }
+    }
+
+    fn test_acp_provider_config() -> AcpProviderConfig {
+        AcpProviderConfig {
+            command: std::path::PathBuf::from("definitely-not-a-real-binary-xyz"),
+            args: vec![],
+            env: vec![],
+            env_remove: vec![],
+            work_dir: std::env::temp_dir(),
+            session_mode: "code".into(),
+            use_mcp_bridge: false,
+            inject_mcp_url: false,
+            gate_tool_calls: false,
+            config_options: vec![],
+        }
+    }
+
+    fn test_local_endpoint() -> crate::local::endpoint::LocalEndpoint {
+        crate::local::endpoint::LocalEndpoint {
+            base_url: "http://127.0.0.1:5555/v1".into(),
+            api_key: "local-secret".into(),
+            n_ctx: 8192,
+            model_id: "local-model".into(),
+            thinking_hybrid: false,
+        }
+    }
+
+    #[test]
+    fn upstream_for_cloud_carries_every_field() {
+        let cloud = test_resolved_cloud();
+        let up = upstream_for_cloud(&cloud);
+        assert_eq!(up.base_url, "https://cloud.example");
+        assert_eq!(up.api_key, "cloud-key");
+        assert_eq!(up.model_override, "cloud-model");
+        assert_eq!(up.protocol, UpstreamProtocol::Anthropic);
+        assert!(!up.unavailable);
+    }
+
+    #[test]
+    fn upstream_for_cloud_empty_remap_yields_empty_model_override() {
+        let mut cloud = test_resolved_cloud();
+        cloud.upstream_model_remap = None;
+        let up = upstream_for_cloud(&cloud);
+        assert_eq!(up.model_override, "");
+    }
+
+    /// Fix round 1, item 1: when the cloud provider resolves to ACP,
+    /// `upstream_for_cloud` must carry the `acp_config` through so the
+    /// gateway can build its ACP client on demand if one doesn't exist yet
+    /// (e.g. the gateway booted on a non-ACP upstream and the active
+    /// provider switches to `claude-code` at runtime).
+    #[test]
+    fn upstream_for_cloud_carries_acp_config_when_protocol_is_acp() {
+        let mut cloud = test_resolved_cloud();
+        cloud.upstream_protocol = UpstreamProtocol::Acp;
+        cloud.acp_config = Some(test_acp_provider_config());
+        let up = upstream_for_cloud(&cloud);
+        assert_eq!(up.protocol, UpstreamProtocol::Acp);
+        assert!(up.acp_config.is_some());
+    }
+
+    #[test]
+    fn upstream_for_local_none_is_marked_unavailable() {
+        // Fix round 1, item 5: no engine published yet must short-circuit
+        // at the gateway instead of pointing at a closed loopback port
+        // (which could hang if something else happens to be listening
+        // there).
+        let up = upstream_for_local(None);
+        assert!(up.unavailable);
+        assert!(up.base_url.is_empty());
+        assert!(up.api_key.is_empty());
+        assert!(up.model_override.is_empty());
+    }
+
+    #[test]
+    fn upstream_for_local_some_strips_trailing_v1_so_the_handler_suffix_lands_correctly() {
+        let ep = test_local_endpoint();
+        let up = upstream_for_local(Some(&ep));
+        // handlers::do_chat_completions_openai builds `{base_url}/v1/chat/completions`;
+        // ep.base_url is already `.../v1`, so the stored base_url must have
+        // that stripped or the request would hit `.../v1/v1/chat/completions`.
+        assert_eq!(up.base_url, "http://127.0.0.1:5555");
+        assert_eq!(up.api_key, "local-secret");
+        assert_eq!(up.model_override, "local-model");
+        assert_eq!(up.protocol, UpstreamProtocol::OpenAi);
+        assert!(!up.unavailable);
+    }
+
+    #[test]
+    fn upstream_for_local_tolerates_a_base_url_without_v1_or_trailing_slash() {
+        let mut ep = test_local_endpoint();
+        ep.base_url = "http://127.0.0.1:5555".into();
+        let up = upstream_for_local(Some(&ep));
+        assert_eq!(up.base_url, "http://127.0.0.1:5555");
+    }
+
+    fn test_gateway_config() -> GatewayConfig {
+        GatewayConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("loopback addr"),
+            bearer_token: "apply-latch-test-token".into(),
+            upstream_base_url: "https://boot.example".into(),
+            upstream_api_key: String::new(),
+            upstream_model_remap: None,
+            anthropic_version: DEFAULT_ANTHROPIC_VERSION.to_string(),
+            upstream_request_timeout: DEFAULT_UPSTREAM_REQUEST_TIMEOUT,
+            upstream_connect_timeout: DEFAULT_UPSTREAM_CONNECT_TIMEOUT,
+            upstream_stream_idle_timeout: DEFAULT_UPSTREAM_STREAM_IDLE_TIMEOUT,
+            upstream_retry_max_wait: DEFAULT_UPSTREAM_RETRY_MAX_WAIT,
+            advertised_models: vec![],
+            upstream_protocol: UpstreamProtocol::Anthropic,
+            acp_config: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_latch_off_restores_cloud_upstream() {
+        let handle = serve_gateway(test_gateway_config())
+            .await
+            .expect("gateway should start");
+        let cloud = test_resolved_cloud();
+        apply_latch(&handle, false, None, &cloud).await;
+        let snap = handle.upstream_snapshot().await;
+        assert_eq!(snap.base_url, cloud.upstream_base_url);
+        assert_eq!(snap.api_key, cloud.upstream_api_key);
+        assert_eq!(snap.model_override, "cloud-model");
+        assert_eq!(snap.protocol, UpstreamProtocol::Anthropic);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn apply_latch_on_no_endpoint_marks_upstream_unavailable() {
+        let handle = serve_gateway(test_gateway_config())
+            .await
+            .expect("gateway should start");
+        let cloud = test_resolved_cloud();
+        apply_latch(&handle, true, None, &cloud).await;
+        let snap = handle.upstream_snapshot().await;
+        assert!(snap.unavailable);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn apply_latch_on_with_endpoint_routes_to_the_engine() {
+        let handle = serve_gateway(test_gateway_config())
+            .await
+            .expect("gateway should start");
+        let cloud = test_resolved_cloud();
+        let ep = test_local_endpoint();
+        apply_latch(&handle, true, Some(&ep), &cloud).await;
+        let snap = handle.upstream_snapshot().await;
+        assert_eq!(snap.base_url, "http://127.0.0.1:5555");
+        assert_eq!(snap.api_key, "local-secret");
+        assert_eq!(snap.model_override, "local-model");
+        assert_eq!(snap.protocol, UpstreamProtocol::OpenAi);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn apply_latch_round_trips_cloud_local_cloud_preserves_cloud_fields() {
+        // Regression guard: toggling the latch on then off again must land
+        // back on the exact cloud `UpstreamUpdate` fields (base_url,
+        // api_key, model_override, protocol), not something derived from
+        // the local branch. (The ACP-client-identity round trip is a
+        // separate concern, covered at the llm-gateway crate level where
+        // `Upstream::apply_update`'s ACP-reuse logic actually lives — see
+        // `upstream_swap.rs`.)
+        let handle = serve_gateway(test_gateway_config())
+            .await
+            .expect("gateway should start");
+        let cloud = test_resolved_cloud();
+        apply_latch(&handle, false, None, &cloud).await;
+        apply_latch(&handle, true, None, &cloud).await;
+        apply_latch(&handle, false, None, &cloud).await;
+        let snap = handle.upstream_snapshot().await;
+        assert_eq!(snap.base_url, cloud.upstream_base_url);
+        assert_eq!(snap.protocol, UpstreamProtocol::Anthropic);
+        handle.shutdown().await;
     }
 }

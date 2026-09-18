@@ -180,8 +180,10 @@ impl ScheduleEvents {
             .await;
     }
 
-    /// `system:schedule:missed` (ephemeral).
-    pub async fn missed(&self, id: &str, name: &str, fire_was_at: i64) {
+    /// `system:schedule:missed` (ephemeral). `reason` is `None` for a normal
+    /// boot-recovery miss (daemon was down) and `Some("local_mode")` when a
+    /// due fire was refused because the LocalOnly latch is on.
+    pub async fn missed(&self, id: &str, name: &str, fire_was_at: i64, reason: Option<&str>) {
         let Some(bus) = &self.bus else {
             return;
         };
@@ -193,6 +195,7 @@ impl ScheduleEvents {
                     "schedule_id": id,
                     "name": name,
                     "fire_was_at": fire_was_at,
+                    "reason": reason,
                 }),
                 PublisherIdentity::Internal,
             ))
@@ -277,7 +280,7 @@ mod tests {
             .await;
         evts.run_end("sch-1", "nightly-digest", 1, "ok", 110, None, None)
             .await;
-        evts.missed("sch-1", "nightly-digest", 90).await;
+        evts.missed("sch-1", "nightly-digest", 90, None).await;
         evts.snapshot(json!({"active": 1, "running": 0, "failed_recent": 0, "next_fire_at": null}))
             .await;
     }
@@ -315,7 +318,8 @@ mod tests {
             Some(&"y".repeat(5000)),
         )
         .await;
-        evts.missed("sch-1", "nightly-digest", 90).await;
+        evts.missed("sch-1", "nightly-digest", 90, Some("local_mode"))
+            .await;
         evts.snapshot(json!({"active": 1, "running": 0, "failed_recent": 0, "next_fire_at": 42}))
             .await;
 
@@ -358,6 +362,7 @@ mod tests {
         assert_eq!(missed.topic, "system:schedule:missed");
         assert_eq!(missed.delivery, Delivery::Ephemeral);
         assert!(missed.payload["event_id"].is_string());
+        assert_eq!(missed.payload["reason"], json!("local_mode"));
 
         let snapshot = &received[5];
         assert_eq!(snapshot.topic, "system:schedule:snapshot");

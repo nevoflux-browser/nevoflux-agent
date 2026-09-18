@@ -41,6 +41,8 @@ pub enum ProviderType {
     OpenClaw,
     /// Antigravity CLI via antigravity-acp adapter (subprocess)
     Antigravity,
+    /// On-device inference engine (raw HTTP to a locally-launched server)
+    Local,
 }
 
 impl FromStr for ProviderType {
@@ -66,6 +68,7 @@ impl FromStr for ProviderType {
             "kimi-agent" | "kimi_agent" | "kimi" => Ok(ProviderType::KimiAgent),
             "openclaw" | "open_claw" | "open-claw" => Ok(ProviderType::OpenClaw),
             "antigravity" | "antigravity-cli" | "antigravity_cli" => Ok(ProviderType::Antigravity),
+            "local" | "on-device" | "ondevice" => Ok(ProviderType::Local),
             _ => Err(format!("Unknown provider: {}", s)),
         }
     }
@@ -145,6 +148,7 @@ pub fn default_model_for(provider: ProviderType) -> &'static str {
         ProviderType::KimiAgent => "kimi-latest",
         ProviderType::OpenClaw => "default",
         ProviderType::Antigravity => "default",
+        ProviderType::Local => "qwen3-4b-instruct-2507",
     }
 }
 
@@ -169,6 +173,7 @@ pub fn default_context_window_for(provider: ProviderType) -> u32 {
         ProviderType::KimiAgent => 128_000,
         ProviderType::OpenClaw => 200_000,
         ProviderType::Antigravity => 1_000_000,
+        ProviderType::Local => 16_384,
     }
 }
 
@@ -193,6 +198,7 @@ pub fn api_key_env_var(provider: ProviderType) -> &'static str {
         ProviderType::KimiAgent => "MOONSHOT_API_KEY",
         ProviderType::OpenClaw => "OPENCLAW_API_KEY",
         ProviderType::Antigravity => "GEMINI_API_KEY", // keyless; placeholder only
+        ProviderType::Local => "NEVOFLUX_LOCAL_API_KEY", // keyless; never read
     }
 }
 
@@ -396,6 +402,7 @@ mod tests {
             ProviderType::GeminiCli,
             ProviderType::KimiAgent,
             ProviderType::OpenClaw,
+            ProviderType::Local,
         ];
 
         for provider in providers {
@@ -428,6 +435,7 @@ mod tests {
             ProviderType::GeminiCli,
             ProviderType::KimiAgent,
             ProviderType::OpenClaw,
+            ProviderType::Local,
         ];
 
         for provider in providers {
@@ -530,6 +538,18 @@ mod tests {
         assert_eq!(
             ProviderType::from_str("open-claw").unwrap(),
             ProviderType::OpenClaw
+        );
+        assert_eq!(
+            ProviderType::from_str("local").unwrap(),
+            ProviderType::Local
+        );
+        assert_eq!(
+            ProviderType::from_str("on-device").unwrap(),
+            ProviderType::Local
+        );
+        assert_eq!(
+            ProviderType::from_str("ondevice").unwrap(),
+            ProviderType::Local
         );
     }
 

@@ -511,13 +511,17 @@ impl SubagentExecutor {
             host = host.with_sidebar_stream(tx);
         }
 
-        // Apply provider/model override if specified
+        // Apply provider/model override if specified (filtered through the
+        // LocalOnly latch — see `crate::agent_host::effective_override`).
         if let (Some(provider), Some(model)) = (provider_override, model_override) {
-            debug!(
-                "Subagent {}: applying provider/model override: provider={}, model={}",
-                id, provider, model
-            );
-            host = host.with_llm_override(provider, model);
+            if let Some((provider, model)) = crate::agent_host::effective_override(provider, model)
+            {
+                debug!(
+                    "Subagent {}: applying provider/model override: provider={}, model={}",
+                    id, provider, model
+                );
+                host = host.with_llm_override(provider, model);
+            }
         }
 
         // Create sandbox for agent-mode subagents
@@ -562,6 +566,7 @@ impl SubagentExecutor {
             soul_context: None,
             tools_config,
             os_platform: Some(std::env::consts::OS.to_string()),
+            local: None,
         };
 
         // Check for kill before running

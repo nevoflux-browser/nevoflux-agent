@@ -306,6 +306,21 @@ pub fn get_summarization_provider(
     config: &AgentConfig,
     model: &str,
 ) -> Result<(ProviderType, String)> {
+    // LocalOnly latch: summarization must never leave the device, so it
+    // always targets the on-device engine here — never `find_fallback_provider`
+    // (which would otherwise pick a cloud provider for an ACP active
+    // provider). The placeholder key is a sentinel; `execute_llm_chat`
+    // ignores it for `ProviderType::Local` and reads the real endpoint from
+    // `crate::local::endpoint`.
+    if crate::local::latch::is_on() {
+        return Ok((
+            ProviderType::Local,
+            crate::config::keyless_placeholder("local")
+                .expect("keyless_placeholder(\"local\") is always Some")
+                .to_string(),
+        ));
+    }
+
     // Use the active provider directly; only infer from model name as fallback.
     // Model names like "qwen/qwen3.6-plus:free" are OpenRouter IDs, not native
     // provider indicators — inferring from the prefix gives the wrong provider.
@@ -612,5 +627,27 @@ mod tests {
         assert!(result.is_ok());
         let (provider, _) = result.unwrap();
         assert!(matches!(provider, ProviderType::Anthropic));
+    }
+
+    /// While the LocalOnly latch is on, summarization must stay on-device
+    /// even when the active provider is ACP (which would normally trigger
+    /// `find_fallback_provider` and hand a cloud provider a full transcript).
+    #[test]
+    fn summarization_uses_local_and_never_falls_back_when_latched() {
+        let _g = crate::local::latch::test_serial();
+        struct ResetLatch;
+        impl Drop for ResetLatch {
+            fn drop(&mut self) {
+                crate::local::latch::set(false);
+            }
+        }
+        let _reset = ResetLatch;
+
+        crate::local::latch::set(true);
+        let mut config = AgentConfig::default();
+        config.llm.provider = Some("claude-code".into()); // ACP would normally fall back
+        config.llm.anthropic.api_key = Some("sk".into());
+        let r = get_summarization_provider(&config, "");
+        assert_eq!(r.unwrap().0, ProviderType::Local);
     }
 }

@@ -216,6 +216,7 @@ pub async fn execute_task_attempt(
         soul_context: None,
         tools_config: Some(nevoflux_protocol::subagent::ToolsConfig::Allow(allowlist)),
         os_platform: Some(std::env::consts::OS.to_string()),
+        local: None,
     };
 
     // `Agent::run` is synchronous (host fns block on the stashed runtime handle

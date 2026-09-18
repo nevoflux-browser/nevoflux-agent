@@ -8,6 +8,7 @@
 
 use crate::host::{HostFunctions, HostResult};
 use crate::types::*;
+use nevoflux_protocol::json_repair::INVALID_ARGUMENTS_KEY;
 use nevoflux_protocol::{Artifact, LocalFileRef, PlanProposal, PlanStep};
 use std::cell::{Cell, RefCell};
 
@@ -487,6 +488,19 @@ pub struct Agent<H: HostFunctions> {
     current_keywords: RefCell<Vec<String>>,
     /// Skills that have been loaded in this session (prevent redundant re-loading).
     loaded_skills: RefCell<std::collections::HashSet<String>>,
+    /// On-device: everything this mode could load, searched by `tool_search`.
+    /// `None` for a cloud turn, which advertises its tools outright.
+    local_index: RefCell<Option<crate::local_mode::LocalToolIndex>>,
+    /// On-device: the tools loaded so far, oldest first. Seeded from the
+    /// previous turn's set, so the model does not re-discover what it just used.
+    local_loaded: RefCell<crate::local_mode::LoadedSet>,
+    /// On-device: definitions for loaded tools that are not in the index —
+    /// MCP and knowledge-base tools the host found. They have to be kept
+    /// because only the host can produce them again.
+    local_dynamic: RefCell<Vec<ToolDefinition>>,
+    /// On-device: set when `tool_search` changed the loaded set, so the loop
+    /// knows to rebuild the advertised tools before the next request.
+    local_tools_changed: Cell<bool>,
 }
 
 // Static base prompts, compiled into the binary
@@ -495,6 +509,27 @@ const BROWSER_PROMPT: &str = include_str!("../prompts/browser.md");
 const AGENT_PROMPT: &str = include_str!("../prompts/agent.md");
 const SUBAGENT_BROWSER_PROMPT: &str = include_str!("../prompts/subagent_browser.md");
 const SUBAGENT_AGENT_PROMPT: &str = include_str!("../prompts/subagent_agent.md");
+
+// On-device base prompts. These are copied **verbatim** from the V0 direction
+// experiment's winning set (`local-vprompt2`): browser and agent measured
+// 1.00/1.00 on the clean case set, and the ship decision rests on those
+// numbers. They are measured artifacts, not prose to be improved — editing one
+// invalidates the measurement it was chosen for, silently and without any test
+// failing. `local_prompts_keep_their_measured_size_and_fit_the_budget` pins
+// their exact sizes — see that test for why byte-identity against the original
+// sources cannot be asserted from in-tree.
+const LOCAL_CHAT_PROMPT: &str = include_str!("../prompts/local/chat.md");
+const LOCAL_BROWSER_PROMPT: &str = include_str!("../prompts/local/browser.md");
+const LOCAL_AGENT_PROMPT: &str = include_str!("../prompts/local/agent.md");
+
+/// Ceiling for a local-mode base prompt, in tokens by this crate's `bytes / 4`
+/// estimate.
+///
+/// 700 rather than a round 600: the measured browser winner is 619 tokens, and
+/// the budget exists to stop prompt bloat, not to force a re-write of an
+/// artifact whose score is the reason local mode ships at all. A future prompt
+/// that exceeds 700 is a signal to re-measure, not to raise this again.
+pub const LOCAL_PROMPT_TOKEN_BUDGET: usize = 700;
 
 // Computer use prompt layers
 const COMPUTER_USE_OVERVIEW: &str = include_str!("../prompts/computer_use_overview.md");
@@ -628,6 +663,10 @@ impl<H: HostFunctions> Agent<H> {
             computer_use_triggered: Cell::new(false),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
+            local_index: RefCell::new(None),
+            local_loaded: RefCell::new(crate::local_mode::LoadedSet::default()),
+            local_dynamic: RefCell::new(Vec::new()),
+            local_tools_changed: Cell::new(false),
         }
     }
 
@@ -644,6 +683,10 @@ impl<H: HostFunctions> Agent<H> {
             computer_use_triggered: Cell::new(false),
             current_keywords: RefCell::new(Vec::new()),
             loaded_skills: RefCell::new(std::collections::HashSet::new()),
+            local_index: RefCell::new(None),
+            local_loaded: RefCell::new(crate::local_mode::LoadedSet::default()),
+            local_dynamic: RefCell::new(Vec::new()),
+            local_tools_changed: Cell::new(false),
         }
     }
 
@@ -660,12 +703,24 @@ impl<H: HostFunctions> Agent<H> {
         // (design spec §4.2), then rendered once. Naming the parts is what lets
         // the event log say which section changed, and what gives P2 a stable
         // prefix boundary to cache on.
-        let mut sections: Vec<PromptSectionText> = match &input.custom_system_prompt {
+        let mut sections: Vec<PromptSectionText> = match (&input.custom_system_prompt, &input.local)
+        {
             // A custom prompt replaces the whole body — subagents use this.
             // One opaque section, honestly named: pretending to know its
-            // internal structure would make the log lie.
-            Some(custom) => vec![PromptSectionText::body("custom", custom.clone())],
-            None => {
+            // internal structure would make the log lie. It outranks local
+            // mode: a caller who supplied an exact prompt gets it.
+            (Some(custom), _) => vec![PromptSectionText::body("custom", custom.clone())],
+            // On-device: a short base prompt, the platform line, and
+            // USER.md. No skills catalog, no model list, no computer-use
+            // guides — those are what make a cloud prompt tens of thousands
+            // of tokens, which a local context cannot afford alongside the
+            // conversation and the tool schemas (v3 §13).
+            (None, Some(local)) => Self::build_local_prompt_sections(
+                mode,
+                input.os_platform.as_deref(),
+                local.user_doc.as_deref(),
+            ),
+            (None, None) => {
                 let skills = filter_skills(
                     self.host.skill_list().unwrap_or_default(),
                     input.skills_filter.as_deref(),
@@ -681,8 +736,13 @@ impl<H: HostFunctions> Agent<H> {
             }
         };
 
-        if let Some(soul) = &input.soul_context {
-            sections.push(PromptSectionText::body("soul", soul.clone()));
+        // The soul is five documents. An on-device context cannot afford it,
+        // and USER.md — the one part that is about the user rather than the
+        // assistant — is already carried as its own section above.
+        if input.local.is_none() {
+            if let Some(soul) = &input.soul_context {
+                sections.push(PromptSectionText::body("soul", soul.clone()));
+            }
         }
 
         // Prepended, not appended: an explicitly invoked skill outranks
@@ -752,40 +812,91 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         // Apply tool filtering based on tools_config
         tools = self.filter_tools(tools, &input.tools_config);
 
-        // When user attached specific tabs, update browser tool tab_id descriptions
-        // to guide the LLM toward the attached tabs instead of defaulting to current_tab.
-        if !input.tab_ids.is_empty() {
-            let attached: Vec<String> = input
-                .tab_ids
-                .iter()
-                .map(|t| format!("{} (\"{}\")", t.tab_id, t.tab_title))
-                .collect();
-            let hint = format!(
-                "Tab ID. The user attached tabs: {}. Unless the user explicitly asks for the current tab, use the attached tab's ID.",
-                attached.join(", ")
+        // On-device: the mode's tools become a searchable index instead of the
+        // advertised list, and the turn opens with `tool_search` plus whatever
+        // chat's resident set and earlier turns already loaded.
+        //
+        // The allowlist filter above still governs: the index is built from the
+        // tools that survived it, so nothing can be searched back into reach.
+        // `.filter(|_| !tools.is_empty())`: a `ToolsConfig::None` caller asked
+        // for NO tools. Building an index anyway would hand it `tool_search`,
+        // a working entry point into everything the allowlist just removed.
+        if let Some(local) = input.local.as_ref().filter(|_| !tools.is_empty()) {
+            let skills = filter_skills(
+                self.host.skill_list().unwrap_or_default(),
+                input.skills_filter.as_deref(),
             );
-            for tool in &mut tools {
-                if matches!(
-                    tool.name.as_str(),
-                    "browser_get_markdown" | "browser_get_content" | "browser_screenshot"
-                ) {
-                    if let Some(props) = tool
-                        .input_schema
-                        .get_mut("properties")
-                        .and_then(|p| p.as_object_mut())
-                    {
-                        if let Some(tab_id_prop) = props.get_mut("tab_id") {
-                            tab_id_prop["description"] = serde_json::Value::String(hint.clone());
-                        }
-                    }
+            // Anything the three gates can strip is left OUT of the index.
+            // Otherwise a search happily reports `browser_console_messages:
+            // loaded` and the network gate removes it from the very next
+            // request — the model is told it can call something that is not
+            // there, and the name still occupies one of the twelve slots for
+            // the rest of the session.
+            let searchable: Vec<ToolDefinition> = tools
+                .into_iter()
+                .filter(|t| {
+                    let n = t.name.as_str();
+                    !Self::CANVAS_OPERATE_TOOLS.contains(&n)
+                        && !Self::SPEECH_OUTPUT_TOOLS.contains(&n)
+                        && !Self::NAMED_ONLY_TOOLS.contains(&n)
+                })
+                .collect();
+            let index = crate::local_mode::LocalToolIndex::new(searchable, skills);
+            let mut loaded = crate::local_mode::LoadedSet::default();
+            // Carried-over first, residents LAST. `LoadedSet` evicts from the
+            // front, and the residents are the measured lever — they lift chat
+            // from 0.55 to 0.68-0.73. Seeding them first meant that once a
+            // session had loaded twelve other tools, the residents were the
+            // first thing dropped and never came back, quietly undoing the
+            // very asymmetry they exist for.
+            for name in &local.loaded_tools {
+                if index.knows(name) {
+                    loaded.add(name);
                 }
             }
+            for name in crate::local_mode::resident_tools_for(mode) {
+                if index.knows(name) {
+                    loaded.add(name);
+                }
+            }
+            *self.local_index.borrow_mut() = Some(index);
+            *self.local_loaded.borrow_mut() = loaded;
+            self.local_dynamic.borrow_mut().clear();
+            self.local_tools_changed.set(false);
+            tools = self.local_active_tools(&input.tab_ids);
+        } else {
+            Self::apply_tab_hint(&mut tools, &input.tab_ids);
         }
 
         // Turn boundaries wrap the whole loop so they pair no matter how it
         // exits (design spec §3.2).
         let turn = Self::derive_turn(input);
         self.host.record_turn_boundary(turn, true);
+
+        // An explicitly invoked skill can be larger than an on-device context
+        // can hold. Saying so in one sentence beats letting the engine silently
+        // truncate the instructions and then act on half of them.
+        //
+        // Checked inside the boundary, and the early return closes the boundary
+        // itself, so the pair still matches however this exits (§3.2).
+        if let (Some(local), Some(skill)) = (&input.local, &input.skill_context) {
+            let skill_tokens = skill.content.len() / 4;
+            let limit = (local.n_ctx / 4) as usize;
+            if skill_tokens > limit {
+                self.host.record_turn_boundary(turn, false);
+                return Ok(AgentOutput {
+                    text: format!(
+                        "This skill is too large for on-device mode ({skill_tokens} tokens, limit {limit})"
+                    ),
+                    tool_calls: Vec::new(),
+                    continue_loop: false,
+                    plan_proposal: None,
+                    artifact: None,
+                    loaded_tools: self.local_loaded_names(),
+                });
+            }
+        }
+
         let out = self.run_loop(input, &system_prompt, &tools);
         self.host.record_turn_boundary(turn, false);
         out
@@ -815,6 +926,185 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
             AgentMode::Agent => self.get_agent_tools(),
             AgentMode::Code => self.get_agent_tools(),
         }
+    }
+
+    /// Point the browser tools at the tabs the user attached.
+    ///
+    /// Without this they default to the current tab, which is rarely what
+    /// someone means after attaching a tab explicitly. On-device this runs
+    /// again every time a tool is loaded mid-turn, since a tool that arrives
+    /// after the turn started would otherwise miss the hint.
+    fn apply_tab_hint(tools: &mut [ToolDefinition], tab_ids: &[TabInfo]) {
+        if tab_ids.is_empty() {
+            return;
+        }
+        let attached: Vec<String> = tab_ids
+            .iter()
+            .map(|t| format!("{} (\"{}\")", t.tab_id, t.tab_title))
+            .collect();
+        let hint = format!(
+            "Tab ID. The user attached tabs: {}. Unless the user explicitly asks for the current tab, use the attached tab's ID.",
+            attached.join(", ")
+        );
+        for tool in tools.iter_mut() {
+            if !matches!(
+                tool.name.as_str(),
+                "browser_get_markdown" | "browser_get_content" | "browser_screenshot"
+            ) {
+                continue;
+            }
+            if let Some(props) = tool
+                .input_schema
+                .get_mut("properties")
+                .and_then(|p| p.as_object_mut())
+            {
+                if let Some(tab_id_prop) = props.get_mut("tab_id") {
+                    tab_id_prop["description"] = serde_json::Value::String(hint.clone());
+                }
+            }
+        }
+    }
+
+    /// The tools an on-device turn advertises: the search entry point, plus
+    /// every tool loaded so far.
+    ///
+    /// Rebuilt rather than mutated because `tool_search` can evict at the cap,
+    /// and a stale entry would keep a tool callable that the model was told it
+    /// had lost.
+    fn local_active_tools(&self, tab_ids: &[TabInfo]) -> Vec<ToolDefinition> {
+        let mut tools = vec![crate::local_mode::local_tool_search_def()];
+        let loaded = self.local_loaded.borrow();
+        if let Some(index) = self.local_index.borrow().as_ref() {
+            tools.extend(index.tools_named(loaded.names()));
+        }
+        // Dynamic tools are not in the index, so they are resolved separately.
+        for name in loaded.names() {
+            if let Some(def) = self.local_dynamic.borrow().iter().find(|d| &d.name == name) {
+                tools.push(def.clone());
+            }
+        }
+        Self::apply_tab_hint(&mut tools, tab_ids);
+        tools
+    }
+
+    /// How many tools one keyword search may load.
+    ///
+    /// Listing more than it loads would invite the model to call something that
+    /// is not in the tool array; loading everything that matched would spend the
+    /// very context the search exists to protect.
+    const LOCAL_KEYWORD_LOAD_LIMIT: usize = 3;
+
+    /// The loaded set, for reporting back to the daemon.
+    ///
+    /// Empty on a cloud turn. On-device it must be reported even when this turn
+    /// loaded nothing new: the daemon persists whatever comes back, so an empty
+    /// list would drop what earlier turns had already loaded.
+    fn local_loaded_names(&self) -> Vec<String> {
+        if self.local_index.borrow().is_none() {
+            return Vec::new();
+        }
+        self.local_loaded.borrow().names().to_vec()
+    }
+
+    /// `tool_search` on-device.
+    ///
+    /// The cloud path returns a listing the model then calls through
+    /// `tool_call_dynamic`. Here the tools it finds are added to the real tool
+    /// array instead, and the model calls them by name on the next request.
+    fn local_tool_search(&self, query: &str, max_results: usize) -> HostResult<String> {
+        let mut lines: Vec<String> = Vec::new();
+
+        let index_ref = self.local_index.borrow();
+        let Some(index) = index_ref.as_ref() else {
+            return Ok(crate::local_mode::NO_MATCHES.to_string());
+        };
+
+        match index.resolve_query(query) {
+            crate::local_mode::SearchQuery::Select(names) => {
+                let (tools, skills, unknown) = index.select(&names);
+                for tool in &tools {
+                    if self.local_loaded.borrow_mut().add(&tool.name) {
+                        self.local_tools_changed.set(true);
+                    }
+                    lines.push(crate::local_mode::result_line_for_tool(tool));
+                }
+                for name in &skills {
+                    // A skill is instructions, not something callable: return
+                    // its text rather than adding it to the tool array. Only
+                    // the FIRST time, though — a whole SKILL.md re-inlined on
+                    // every repeat search would blow the very context budget
+                    // this module exists to protect.
+                    lines.push(crate::local_mode::result_line_for_skill(name));
+                    if self.loaded_skills.borrow_mut().insert(name.clone()) {
+                        lines.push(self.host.skill_load(name)?);
+                    }
+                }
+                for name in &unknown {
+                    // Naming what is missing beats silence — the model asked for
+                    // something specific and would otherwise retry the same name.
+                    lines.push(format!("{name}: not available on-device"));
+                }
+            }
+            crate::local_mode::SearchQuery::Keywords(keywords) => {
+                let mut hits = index.keyword_search(keywords, max_results);
+                if hits.len() < max_results {
+                    // Only the host can enumerate MCP and knowledge-base tools,
+                    // and it has already applied the user's denials.
+                    let room = max_results - hits.len();
+                    for found in self.host.tool_search(keywords, room)? {
+                        hits.push(crate::local_mode::SearchHit::Dynamic(found));
+                    }
+                }
+
+                let mut loaded_here = 0usize;
+                for hit in hits {
+                    if loaded_here >= Self::LOCAL_KEYWORD_LOAD_LIMIT {
+                        break;
+                    }
+                    match hit {
+                        crate::local_mode::SearchHit::Tool(tool) => {
+                            if self.local_loaded.borrow_mut().add(&tool.name) {
+                                self.local_tools_changed.set(true);
+                            }
+                            lines.push(crate::local_mode::result_line_for_tool(&tool));
+                            loaded_here += 1;
+                        }
+                        crate::local_mode::SearchHit::Dynamic(found) => {
+                            let def = crate::local_mode::tool_from_dynamic(&found);
+                            if self.local_loaded.borrow_mut().add(&def.name) {
+                                self.local_tools_changed.set(true);
+                            }
+                            let known = self
+                                .local_dynamic
+                                .borrow()
+                                .iter()
+                                .any(|d| d.name == def.name);
+                            if !known {
+                                self.local_dynamic.borrow_mut().push(def.clone());
+                            }
+                            lines.push(crate::local_mode::result_line_for_tool(&def));
+                            loaded_here += 1;
+                        }
+                        crate::local_mode::SearchHit::Skill(skill) => {
+                            lines.push(crate::local_mode::result_line_for_skill(&skill.name));
+                            if self.loaded_skills.borrow_mut().insert(skill.name.clone()) {
+                                lines.push(self.host.skill_load(&skill.name)?);
+                            }
+                            // Counts against the limit like any other hit: a
+                            // skill body is far larger than a tool schema, so
+                            // leaving it uncounted let one search inline as
+                            // many SKILL.md files as `max_results` allowed.
+                            loaded_here += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        if lines.is_empty() {
+            return Ok(crate::local_mode::NO_MATCHES.to_string());
+        }
+        Ok(lines.join("\n"))
     }
 
     /// Filter tools based on the tools_config.
@@ -866,6 +1156,77 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
     /// boundary between the stable head and the volatile tail is what P2's
     /// prefix caching keys on. `skills/catalog`, `models` and `soul` change
     /// often and therefore sit last.
+    /// The `platform` section.
+    ///
+    /// Shared by the cloud and local prompt builders deliberately: two copies of
+    /// this text would have to stay in sync with nothing to catch divergence.
+    fn platform_section(os: &str) -> PromptSectionText {
+        let shell_hint = match os {
+            "windows" => "Windows (PowerShell). Use PowerShell syntax for commands.",
+            "macos" => "macOS (zsh/bash). Use POSIX shell syntax for commands.",
+            _ => "Linux (bash). Use POSIX shell syntax for commands.",
+        };
+        PromptSectionText::body(
+            "platform",
+            format!(
+                "# System Environment
+
+Operating System: {}
+",
+                shell_hint
+            ),
+        )
+    }
+
+    /// The on-device base prompt for a mode.
+    fn local_base_prompt(mode: AgentMode) -> &'static str {
+        match mode {
+            AgentMode::Chat => LOCAL_CHAT_PROMPT,
+            AgentMode::Browser => LOCAL_BROWSER_PROMPT,
+            _ => LOCAL_AGENT_PROMPT,
+        }
+    }
+
+    /// Prompt sections for an on-device turn.
+    ///
+    /// Deliberately far smaller than [`Self::build_prompt_sections`]: no skills
+    /// catalog, no model list, no computer-use guides, no soul. Those are what
+    /// make a cloud system prompt tens of thousands of tokens, and a local
+    /// engine's context has to hold the conversation and the tool schemas as
+    /// well — v3 §13 is the reason local mode exists as a separate path at all.
+    fn build_local_prompt_sections(
+        mode: AgentMode,
+        os_platform: Option<&str>,
+        user_doc: Option<&str>,
+    ) -> Vec<PromptSectionText> {
+        let mut out = vec![PromptSectionText::body(
+            format!("base/local-{}", Self::mode_slug(mode)),
+            Self::local_base_prompt(mode),
+        )];
+
+        if let Some(os) = os_platform {
+            out.push(Self::platform_section(os));
+        }
+
+        // USER.md only. The daemon has already trimmed it to a local-sized
+        // excerpt; the rest of the five-document soul stays out of an
+        // on-device prompt entirely.
+        if let Some(doc) = user_doc.map(str::trim).filter(|d| !d.is_empty()) {
+            out.push(PromptSectionText::body(
+                "user",
+                format!(
+                    "# About the user
+
+{}
+",
+                    doc
+                ),
+            ));
+        }
+
+        out
+    }
+
     fn build_prompt_sections(
         mode: AgentMode,
         skills: &[SkillSummary],
@@ -879,21 +1240,7 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         )];
 
         if let Some(os) = os_platform {
-            let shell_hint = match os {
-                "windows" => "Windows (PowerShell). Use PowerShell syntax for commands.",
-                "macos" => "macOS (zsh/bash). Use POSIX shell syntax for commands.",
-                _ => "Linux (bash). Use POSIX shell syntax for commands.",
-            };
-            out.push(PromptSectionText::body(
-                "platform",
-                format!(
-                    "# System Environment
-
-Operating System: {}
-",
-                    shell_hint
-                ),
-            ));
+            out.push(Self::platform_section(os));
         }
 
         if computer_use.inject_overview {
@@ -1448,6 +1795,13 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             console_named,
         );
 
+        // On-device, tool-result budgets follow the context the engine was
+        // started with; a cloud turn keeps the fixed budget it always had.
+        let budget = match &input.local {
+            Some(local) => ResultBudget::for_local(local.n_ctx),
+            None => ResultBudget::CLOUD,
+        };
+
         let mut iterations = 0;
         let mut final_text = String::new();
         let mut all_tool_calls = Vec::new();
@@ -1490,7 +1844,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             // "make the sky bluer" is a follow-up that feeds the previous image
             // back in. Audio has no such turn; an image does, and taking it
             // away breaks editing silently.
-            shrink_aged_tool_results(&mut messages);
+            shrink_aged_tool_results_with(&mut messages, budget);
 
             // Use streaming or non-streaming LLM based on config
             let response = if self.config.use_streaming && !self.config.suppress_streaming {
@@ -1663,7 +2017,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                 // it: the host writes the full text somewhere and the model is
                 // told where, so a long page or a big file is still reachable
                 // with `read` instead of being silently cut off.
-                let trimmed = truncate_tool_result_if_needed(&messages, &result.content);
+                let trimmed = truncate_tool_result_with(&messages, &result.content, budget);
                 let content = if trimmed.len() < result.content.len() {
                     match self
                         .host
@@ -1741,6 +2095,29 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     network_on,
                     console_named,
                 );
+                // On-device that rebuild is wrong on its own: `tools` is the
+                // turn-START slice (search entry point plus residents), so it
+                // drops everything loaded so far this turn. Ask the refresh
+                // below to redo it from the loaded set instead.
+                if self.local_index.borrow().is_some() {
+                    self.local_tools_changed.set(true);
+                }
+            }
+
+            // On-device: a `tool_search` this iteration changed what is loaded,
+            // so the next request has to advertise the new set. It goes through
+            // the same three gates as the initial list — a tool that arrived
+            // mid-turn is not exempt from them.
+            if self.local_tools_changed.replace(false) {
+                let refreshed = self.local_active_tools(&input.tab_ids);
+                active_tools = Self::gate_network_tools(
+                    &Self::gate_speech_tools(
+                        &Self::gate_canvas_tools(&refreshed, canvas_unlocked),
+                        canvas_unlocked || speech_useful,
+                    ),
+                    network_on,
+                    console_named,
+                );
             }
 
             // Move tool calls into the accumulator (avoids a second clone)
@@ -1764,6 +2141,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     continue_loop: false,
                     plan_proposal: Some(proposal),
                     artifact: None,
+                    loaded_tools: self.local_loaded_names(),
                 });
             }
 
@@ -1779,6 +2157,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     continue_loop: false,
                     plan_proposal: None,
                     artifact: Some(artifact),
+                    loaded_tools: self.local_loaded_names(),
                 });
             }
         }
@@ -1794,6 +2173,7 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             continue_loop: false,
             plan_proposal: None,
             artifact: None,
+            loaded_tools: self.local_loaded_names(),
         })
     }
 
@@ -2013,6 +2393,34 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
     /// Execute a single tool call.
     fn execute_tool(&self, tool_call: &ToolCall) -> HostResult<ToolResult> {
         let normalized_name = Self::normalize_tool_name(&tool_call.name);
+
+        // Arguments that couldn't be parsed as JSON were wrapped by the LLM
+        // client into `{INVALID_ARGUMENTS_KEY: <raw text>}` instead of being
+        // silently defaulted to `{}` (which would let the tool run with
+        // wrong/no arguments). Refuse to run it at all and report why.
+        // Trigger on the key's mere presence, not just a string value — a
+        // future producer of this marker shouldn't be able to sneak past
+        // the check by putting a non-string under the key.
+        if let Some(marker) = tool_call.arguments.get(INVALID_ARGUMENTS_KEY) {
+            let raw = marker
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| marker.to_string());
+            let truncated: String = raw.chars().take(300).collect();
+            let tool_call_id = tool_call
+                .call_id
+                .clone()
+                .unwrap_or_else(|| tool_call.id.clone());
+            return Ok(ToolResult {
+                tool_call_id,
+                content: format!(
+                    "Error: the arguments for `{}` were not valid JSON, so the tool did not run. Received: {}",
+                    tool_call.name, truncated
+                ),
+                success: false,
+            });
+        }
+
         let content = match normalized_name {
             "think" => {
                 // Think tool: no side effects, just returns acknowledgment.
@@ -2321,8 +2729,14 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             "tool_search" => {
                 let query = tool_call.arguments["query"].as_str().unwrap_or("");
                 let max_results = tool_call.arguments["max_results"].as_u64().unwrap_or(5) as usize;
-                let results = self.host.tool_search(query, max_results)?;
-                serde_json::to_string_pretty(&results).unwrap_or_default()
+                // Bound the borrow before the call below takes its own.
+                let on_device = self.local_index.borrow().is_some();
+                if on_device {
+                    self.local_tool_search(query, max_results)?
+                } else {
+                    let results = self.host.tool_search(query, max_results)?;
+                    serde_json::to_string_pretty(&results).unwrap_or_default()
+                }
             }
             "tool_call_dynamic" => {
                 let tool_name = tool_call.arguments["tool_name"].as_str().unwrap_or("");
@@ -3023,6 +3437,15 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             // Recorded flows — daemon-orchestrated via tool_call_dynamic,
             // same dispatch pattern as the recording tools above.
             "run_flow" | "list_flows" | "report_flow_repair" => self
+                .host
+                .tool_call_dynamic(&tool_call.name, &tool_call.arguments)?,
+            // On-device, a tool discovered through the host (MCP, knowledge
+            // base) is advertised under its OWN name rather than behind
+            // `tool_call_dynamic`, so the model's call arrives here with no
+            // builtin arm to match. Route it back to the host instead of
+            // answering "Unknown tool" — without this, a searched-for
+            // `brain_*` tool is loadable, advertised, and uncallable.
+            name if self.local_dynamic.borrow().iter().any(|d| d.name == name) => self
                 .host
                 .tool_call_dynamic(&tool_call.name, &tool_call.arguments)?,
             _ => {
@@ -6072,15 +6495,89 @@ fn calculate_messages_size(messages: &[Message]) -> usize {
 /// growth is still bounded — everything before it collapses to a fixed size.
 const RECENT_TOOL_RESULTS_KEPT_WHOLE: usize = 12;
 
-/// What an aged tool result is allowed to keep.
+/// How many bytes of tool results a turn may carry.
 ///
-/// Four kilobytes is a screenful: enough to see which file, which page, what
-/// the first rows said, and to decide whether it is worth fetching again.
-const AGED_TOOL_RESULT_BUDGET: usize = 4 * 1024;
+/// A cloud model gets a fixed, generous budget. On-device the same numbers are
+/// nonsense — a 32 KB single result does not fit a 16K context at all — so the
+/// local budget is derived from the context the engine was actually started
+/// with rather than hardcoded.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResultBudget {
+    /// Gross size the whole message list may reach.
+    pub total: usize,
+    /// Held back for the model's own output, subtracted at the point of use.
+    pub reserved_output: usize,
+    /// A single result is never squeezed below this.
+    pub min_single: usize,
+    /// Nor allowed above it, however empty the conversation is.
+    pub max_single: usize,
+    /// What a result older than the recent window keeps.
+    ///
+    /// Four kilobytes is a screenful: enough to see which file, which page,
+    /// what the first rows said, and to decide whether it is worth fetching
+    /// again. On-device it is half that — a screenful is a larger share of a
+    /// 16K context than of a cloud one.
+    pub aged: usize,
+}
+
+impl ResultBudget {
+    /// The fixed budget every cloud turn has always used.
+    ///
+    /// `max_single` is the load-bearing one. Without a ceiling the budget is
+    /// "whatever is left", and at the start of a conversation that is 250 KB —
+    /// so the first tool call can put 250 KB into the history, nothing ever
+    /// takes it out, and every later request pays for it. That is not
+    /// theoretical: a base64 WAV costs 64 KB per second of speech, so a
+    /// four-second answer kept 250 KB of base64 — too big to be cheap and too
+    /// cut up to be usable — and a handful of spoken exchanges cost 2.8M
+    /// tokens. 32 KB is roughly eight thousand words, past what any single
+    /// result needs to be useful. A result that genuinely needs more should be
+    /// written somewhere and referenced, which is what the spill path is for.
+    pub const CLOUD: ResultBudget = ResultBudget {
+        total: 300 * 1024,
+        reserved_output: 50 * 1024,
+        min_single: 10 * 1024,
+        max_single: 32 * 1024,
+        aged: 4 * 1024,
+    };
+
+    /// Derive a budget from the engine's context size.
+    ///
+    /// Three bytes per token is the crude ratio this crate uses elsewhere; it
+    /// over-estimates bytes, which is the safe direction here.
+    ///
+    /// `total` is gross, exactly like [`ResultBudget::CLOUD`] —
+    /// `reserved_output` is subtracted where the budget is used. Subtracting it
+    /// here as well, as the plan's formula literally reads, would charge the
+    /// reservation twice and quietly cost every local result 12 KB.
+    pub fn for_local(n_ctx: u32) -> ResultBudget {
+        let bytes = n_ctx as usize * 3;
+        // A quarter of the context is as much as any one result may take.
+        let max_single = bytes / 4;
+        ResultBudget {
+            total: bytes,
+            reserved_output: 4096 * 3,
+            min_single: (4 * 1024).min(max_single),
+            max_single,
+            aged: 2 * 1024,
+        }
+    }
+}
+
+/// The CLOUD-budget spelling, for the tests written before `ResultBudget`
+/// existed.
+///
+/// `#[cfg(test)]` because every production call site now passes its budget
+/// explicitly. Ungated, this would be dead code compiled into the shipped
+/// binary and kept alive only by the tests that call it.
+#[cfg(test)]
+fn shrink_aged_tool_results(messages: &mut [Message]) {
+    shrink_aged_tool_results_with(messages, ResultBudget::CLOUD);
+}
 
 /// Shorten tool results that the conversation has moved past.
 ///
-/// Nothing here trimmed the history before this: [`truncate_tool_result_if_needed`]
+/// Nothing here trimmed the history before this: `truncate_tool_result_with`
 /// bounds each result **as it arrives** and never looks at it again, so a
 /// conversation only ever grew. Every request re-sent every byte of every
 /// result from every earlier turn, and a session with thirty-five requests paid
@@ -6096,7 +6593,7 @@ const AGED_TOOL_RESULT_BUDGET: usize = 4 * 1024;
 ///
 /// Idempotent: a result already under budget is left alone, so repeated calls
 /// across loop iterations converge instead of eating into it each time.
-fn shrink_aged_tool_results(messages: &mut [Message]) {
+fn shrink_aged_tool_results_with(messages: &mut [Message], budget: ResultBudget) {
     let results: Vec<usize> = messages
         .iter()
         .enumerate()
@@ -6108,7 +6605,7 @@ fn shrink_aged_tool_results(messages: &mut [Message]) {
     }
     for &i in &results[..results.len() - RECENT_TOOL_RESULTS_KEPT_WHOLE] {
         let full = messages[i].content.len();
-        if full <= AGED_TOOL_RESULT_BUDGET {
+        if full <= budget.aged {
             continue;
         }
         // The note counts against the budget, so that what comes out is *under*
@@ -6119,50 +6616,30 @@ fn shrink_aged_tool_results(messages: &mut [Message]) {
             "...\n\n[Earlier tool result: {full} bytes, shortened. Ask again if \
              this turn still needs it.]"
         );
-        let head_budget = AGED_TOOL_RESULT_BUDGET.saturating_sub(note.len());
+        let head_budget = budget.aged.saturating_sub(note.len());
         let head = truncate_string_safe(&messages[i].content, head_budget).to_string();
         messages[i].content = head + &note;
     }
 }
 
+/// The CLOUD-budget spelling, test-only for the same reason as
+/// [`shrink_aged_tool_results`].
+#[cfg(test)]
 fn truncate_tool_result_if_needed(messages: &[Message], content: &str) -> String {
-    // Total message size limit (~75K tokens for most models)
-    const MAX_TOTAL_MESSAGE_SIZE: usize = 300 * 1024; // 300KB
-                                                      // Reserved space for LLM output
-    const RESERVED_OUTPUT_SIZE: usize = 50 * 1024; // 50KB
-                                                   // Minimum tool result size (don't truncate below this)
-    const MIN_TOOL_RESULT_SIZE: usize = 10 * 1024; // 10KB
+    truncate_tool_result_with(messages, content, ResultBudget::CLOUD)
+}
 
-    // Ceiling on any single result, however empty the conversation is.
-    //
-    // Without it the budget below is "whatever is left", and at the start of a
-    // conversation what is left is 250 KB. So the very first tool call can put
-    // 250 KB into the history, nothing ever takes it out again, and every later
-    // request in that conversation pays for it.
-    //
-    // That is not theoretical. A base64 WAV from a speech tool costs 64 KB per
-    // second of speech, so a four-second answer already passed the ceiling: the
-    // truncation below fired and kept 250 KB of base64 — the worst of both
-    // outcomes, too big to be cheap and too cut up to be usable. History then
-    // sat near 300 KB for the rest of the session (every later result squeezed
-    // down to MIN_TOOL_RESULT_SIZE), and a handful of spoken exchanges cost
-    // 2.8M tokens.
-    //
-    // 32 KB is roughly eight thousand words — past what any single result needs
-    // to be useful, and a tenth of the whole budget rather than three quarters
-    // of it. A result that genuinely needs more should be written somewhere and
-    // referenced, which is what the artifact and asset paths are for.
-    const MAX_SINGLE_TOOL_RESULT: usize = 32 * 1024;
-
+fn truncate_tool_result_with(messages: &[Message], content: &str, budget: ResultBudget) -> String {
     let current_size = calculate_messages_size(messages);
-    let available_space = MAX_TOTAL_MESSAGE_SIZE
+    let available_space = budget
+        .total
         .saturating_sub(current_size)
-        .saturating_sub(RESERVED_OUTPUT_SIZE);
+        .saturating_sub(budget.reserved_output);
 
     // Calculate max size for this tool result
     let max_result_size = available_space
-        .max(MIN_TOOL_RESULT_SIZE)
-        .min(MAX_SINGLE_TOOL_RESULT);
+        .max(budget.min_single)
+        .min(budget.max_single);
 
     if content.len() <= max_result_size {
         return content.to_string();
@@ -6224,6 +6701,59 @@ mod tests {
         assert_eq!(truncate_tool_result_if_needed(&empty, &ordinary), ordinary);
     }
 
+    /// A quarter of the context, in the crate's three-bytes-per-token terms.
+    #[test]
+    fn a_local_budget_follows_the_context_size() {
+        let small = ResultBudget::for_local(16384);
+        assert_eq!(small.max_single, 12288);
+        assert_eq!(small.total, 49152);
+        assert_eq!(small.aged, 2 * 1024);
+        // The floor never rises above the ceiling, however small the context.
+        let tiny = ResultBudget::for_local(4096);
+        assert!(tiny.min_single <= tiny.max_single);
+
+        let big = ResultBudget::for_local(32768);
+        assert_eq!(big.max_single, 24576);
+    }
+
+    /// The point of the task: the same 40 KB result is cut to the local
+    /// ceiling on-device and to the cloud ceiling otherwise.
+    #[test]
+    fn one_result_is_cut_to_whichever_budget_is_in_force() {
+        let empty: Vec<Message> = vec![];
+        let huge = "x".repeat(40 * 1024);
+
+        let local = ResultBudget::for_local(16384);
+        let cut = truncate_tool_result_with(&empty, &huge, local);
+        assert!(
+            cut.len() <= local.max_single + 200,
+            "local result kept {} bytes, over its {} ceiling",
+            cut.len(),
+            local.max_single
+        );
+
+        // Unchanged for cloud: still the 32 KB ceiling it always had.
+        let cloud = truncate_tool_result_with(&empty, &huge, ResultBudget::CLOUD);
+        assert!(cloud.len() > local.max_single);
+        assert!(cloud.len() <= ResultBudget::CLOUD.max_single + 200);
+    }
+
+    /// An aged result keeps less on-device — 2 KB rather than 4 KB.
+    #[test]
+    fn aged_results_shrink_to_the_local_budget() {
+        let mut msgs: Vec<Message> = (0..RECENT_TOOL_RESULTS_KEPT_WHOLE + 1)
+            .map(|i| tool_result(&format!("t{i}"), 20 * 1024))
+            .collect();
+        shrink_aged_tool_results_with(&mut msgs, ResultBudget::for_local(16384));
+        assert!(
+            msgs[0].content.len() <= 2 * 1024,
+            "aged result kept {} bytes",
+            msgs[0].content.len()
+        );
+        // Everything inside the recent window is untouched.
+        assert_eq!(msgs[1].content.len(), 20 * 1024);
+    }
+
     /// 短会话一个字都不该动。修剪是为长会话省钱,不是给每次对话降质。
     #[test]
     fn a_short_conversation_keeps_every_tool_result_whole() {
@@ -6262,10 +6792,6 @@ mod tests {
         }
     }
 
-    /// 没有听众、也没有 canvas 时,合成工具不该出现在请求里 ——
-    /// 它们在桌面聊天里**根本发不出声音**(唯一送达路径 `offer_part` 要 portal),
-    /// 却每次请求都要付约 4.4 KB 的 schema。
-    #[test]
     /// 没被点名时,这个工具不该出现在请求里。
     ///
     /// 它必须被点名才会捕获(见 spec),所以每轮都付它的 schema 是白付 —— 与
@@ -6373,6 +6899,10 @@ mod tests {
         ));
     }
 
+    /// 没有听众、也没有 canvas 时,合成工具不该出现在请求里 ——
+    /// 它们在桌面聊天里**根本发不出声音**(唯一送达路径 `offer_part` 要 portal),
+    /// 却每次请求都要付约 4.4 KB 的 schema。
+    #[test]
     fn speech_output_tools_are_not_offered_when_nothing_can_hear_them() {
         let mock = MockHostFunctions::new();
         let agent = Agent::new(mock);
@@ -6486,6 +7016,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         // Should run successfully with custom prompt
@@ -6915,6 +7446,478 @@ mod tests {
         assert_eq!(joined, direct);
         assert!(joined.contains("# Available models"));
         assert!(joined.contains("Operating System: Windows"));
+    }
+
+    /// The on-device prompts are measured artifacts: browser and agent scored
+    /// 1.00/1.00 on the V0 clean set, and the decision to ship local mode with
+    /// tools rests on those numbers. Editing one invalidates the measurement it
+    /// was chosen for, silently and with nothing else to catch it.
+    ///
+    /// Byte-identity against the original `local-vprompt2` sources cannot be
+    /// asserted from here: they live in a staging directory outside the
+    /// workspace that will not exist on another machine, and comparing a
+    /// constant to the file it was `include_str!`'d from would assert nothing.
+    /// Pinning the sizes is the tripwire that works in-tree. Verified equal to
+    /// the sources by sha256 when copied (2026-09-17).
+    #[test]
+    fn local_prompts_keep_their_measured_size_and_fit_the_budget() {
+        // FNV-1a over the bytes: no dependency, and it pins CONTENT rather
+        // than length. A length-only check waves through any equal-length
+        // edit — a word swap, a reordered bullet, a same-width typo fix —
+        // which is precisely the change that invalidates the measurement
+        // while looking harmless in review.
+        fn fnv1a64(bytes: &[u8]) -> u64 {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in bytes {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            h
+        }
+
+        for (name, prompt, bytes, digest) in [
+            (
+                "chat",
+                LOCAL_CHAT_PROMPT,
+                2286usize,
+                0x7d5b_58e8_5223_4a49u64,
+            ),
+            ("browser", LOCAL_BROWSER_PROMPT, 2479, 0x757e_3804_12a2_274c),
+            ("agent", LOCAL_AGENT_PROMPT, 2315, 0xff61_d173_3c79_04d4),
+        ] {
+            assert_eq!(
+                prompt.len(),
+                bytes,
+                "{name}.md changed size — it is a measured artifact, not prose to edit"
+            );
+            assert_eq!(
+                fnv1a64(prompt.as_bytes()),
+                digest,
+                "{name}.md changed content. Browser and agent scored 1.00/1.00 with \
+                 exactly this text, and the decision to ship local mode with tools \
+                 rests on that. If the edit is deliberate, re-run the V0 set and \
+                 update the digest with the new measurement."
+            );
+            assert!(
+                prompt.len() / 4 <= LOCAL_PROMPT_TOKEN_BUDGET,
+                "{name}.md is {} tokens, over the {LOCAL_PROMPT_TOKEN_BUDGET} budget",
+                prompt.len() / 4
+            );
+        }
+    }
+
+    /// Asserting the exact id list is stronger than probing for absent strings:
+    /// it fails if anything at all is added, including sections nobody thought
+    /// to check for.
+    #[test]
+    fn local_prompt_sections_carry_only_base_platform_and_user() {
+        let sections = Agent::<MockHostFunctions>::build_local_prompt_sections(
+            AgentMode::Browser,
+            Some("windows"),
+            Some("  Prefers terse answers.  "),
+        );
+        let ids: Vec<&str> = sections.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["base/local-browser", "platform", "user"]);
+
+        let joined = Agent::<MockHostFunctions>::render_prompt_sections(&sections);
+        assert!(!joined.contains("# Available models"));
+        assert!(joined.contains("Operating System: Windows"));
+        assert!(joined.contains("# About the user"));
+        assert!(joined.contains("Prefers terse answers."));
+    }
+
+    #[test]
+    fn local_prompt_sections_pick_the_prompt_for_the_mode() {
+        for (mode, id) in [
+            (AgentMode::Chat, "base/local-chat"),
+            (AgentMode::Browser, "base/local-browser"),
+            (AgentMode::Agent, "base/local-agent"),
+        ] {
+            let sections =
+                Agent::<MockHostFunctions>::build_local_prompt_sections(mode, None, None);
+            let ids: Vec<&str> = sections.iter().map(|s| s.id.as_str()).collect();
+            assert_eq!(ids, vec![id]);
+        }
+    }
+
+    fn local_config() -> AgentConfig {
+        AgentConfig {
+            max_iterations: 5,
+            use_streaming: false,
+            suppress_streaming: false,
+            is_subagent: false,
+        }
+    }
+
+    fn local_input(mode: AgentMode, message: &str, carried: &[&str]) -> AgentInput {
+        AgentInput {
+            session_id: "t".into(),
+            mode,
+            user_message: message.into(),
+            history: vec![],
+            attachments: vec![],
+            local_files: vec![],
+            custom_system_prompt: None,
+            skills_filter: None,
+            tab_id: None,
+            tab_ids: vec![],
+            skill_context: None,
+            available_models: vec![],
+            mcp_servers: vec![],
+            soul_context: None,
+            tools_config: None,
+            os_platform: None,
+            local: Some(LocalModeInput {
+                n_ctx: 32768,
+                loaded_tools: carried.iter().map(|s| s.to_string()).collect(),
+                user_doc: None,
+            }),
+        }
+    }
+
+    fn says(text: &str) -> LlmResponse {
+        LlmResponse {
+            text: text.into(),
+            tool_calls: vec![],
+            reasoning: None,
+        }
+    }
+
+    fn searches(query: &str) -> LlmResponse {
+        LlmResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c1".into(),
+                call_id: Some("c1".into()),
+                name: "tool_search".into(),
+                arguments: serde_json::json!({ "query": query }),
+                signature: None,
+            }],
+            reasoning: None,
+        }
+    }
+
+    /// The whole point of deferred loading: a browser turn must not pay for
+    /// sixty tool schemas before the model has asked for anything.
+    #[test]
+    fn a_local_turn_opens_with_tool_search_alone() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("hello"));
+        let agent = Agent::with_config(mock, local_config());
+        agent
+            .run(&local_input(AgentMode::Browser, "read this page", &[]))
+            .unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert_eq!(captured[0], vec!["tool_search".to_string()]);
+    }
+
+    /// Chat is the measured exception — three residents, because searching for
+    /// them cost chat accuracy. Browser must not inherit them.
+    #[test]
+    fn chat_opens_with_its_residents_and_browser_does_not() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("hello"));
+        let agent = Agent::with_config(mock, local_config());
+        agent
+            .run(&local_input(AgentMode::Chat, "what is this", &[]))
+            .unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        for expected in [
+            "tool_search",
+            "web_search",
+            "memory_search",
+            "browser_get_markdown",
+        ] {
+            assert!(
+                captured[0].contains(&expected.to_string()),
+                "chat should open with {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_a_tool_puts_it_in_the_next_request_and_it_can_be_called() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(searches("select:browser_get_markdown"));
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c2".into(),
+                call_id: Some("c2".into()),
+                name: "browser_get_markdown".into(),
+                arguments: serde_json::json!({}),
+                signature: None,
+            }],
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+
+        let agent = Agent::with_config(mock, local_config());
+        let out = agent
+            .run(&local_input(AgentMode::Browser, "read this page", &[]))
+            .unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert_eq!(captured[0], vec!["tool_search".to_string()]);
+        assert!(
+            captured[1].contains(&"browser_get_markdown".to_string()),
+            "a loaded tool must reach the very next request"
+        );
+        assert!(out
+            .tool_calls
+            .iter()
+            .any(|c| c.name == "browser_get_markdown"));
+        assert!(out
+            .loaded_tools
+            .contains(&"browser_get_markdown".to_string()));
+    }
+
+    /// The daemon persists the loaded set between turns so the model does not
+    /// re-discover what it just used.
+    #[test]
+    fn a_carried_over_tool_is_loaded_before_the_first_request() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("hello"));
+        let agent = Agent::with_config(mock, local_config());
+        let out = agent
+            .run(&local_input(
+                AgentMode::Browser,
+                "search that again",
+                &["web_search"],
+            ))
+            .unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert!(captured[0].contains(&"web_search".to_string()));
+        assert!(out.loaded_tools.contains(&"web_search".to_string()));
+    }
+
+    /// Tools local mode never offers stay unreachable through search — saying
+    /// so beats letting the model call a name that will not be there.
+    #[test]
+    fn an_excluded_tool_cannot_be_selected() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(searches("select:switch_model"));
+        mock.add_llm_response(says("done"));
+
+        let agent = Agent::with_config(mock, local_config());
+        let out = agent
+            .run(&local_input(AgentMode::Browser, "use a better model", &[]))
+            .unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert_eq!(captured[1], vec!["tool_search".to_string()]);
+        assert!(out.loaded_tools.is_empty());
+    }
+
+    #[test]
+    fn selecting_a_skill_returns_instructions_without_adding_a_tool() {
+        let mock = MockHostFunctions::new();
+        mock.add_skill(SkillSummary {
+            name: "app-builder".into(),
+            description: "Build a small application".into(),
+            tags: vec![],
+        });
+        mock.add_llm_response(searches("select:skill/app-builder"));
+        mock.add_llm_response(says("done"));
+
+        let agent = Agent::with_config(mock, local_config());
+        let out = agent
+            .run(&local_input(AgentMode::Agent, "build me an app", &[]))
+            .unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert_eq!(
+            captured[1],
+            vec!["tool_search".to_string()],
+            "a skill is instructions, not something callable"
+        );
+        assert!(out.loaded_tools.is_empty());
+    }
+
+    /// MCP and knowledge-base tools only the host can enumerate must be
+    /// loadable too, or the knowledge base is unreachable on-device.
+    #[test]
+    fn a_keyword_search_loads_a_tool_only_the_host_knows() {
+        let mock = MockHostFunctions::new();
+        mock.tool_search_results
+            .borrow_mut()
+            .push(ToolSearchResult {
+                name: "brain_search".into(),
+                description: "Search the knowledge base".into(),
+                score: 1.0,
+                input_schema: serde_json::json!({"type": "object"}),
+                source: Some("mcp:brain".into()),
+            });
+        mock.add_llm_response(searches("brain"));
+        mock.add_llm_response(says("done"));
+
+        let agent = Agent::with_config(mock, local_config());
+        let out = agent
+            .run(&local_input(AgentMode::Chat, "查一下我的知识库", &[]))
+            .unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert!(
+            captured[1].contains(&"brain_search".to_string()),
+            "host-found tools must become callable, got {:?}",
+            captured[1]
+        );
+        assert!(out.loaded_tools.contains(&"brain_search".to_string()));
+    }
+
+    /// The oversized-skill rejection, and the property its placement exists
+    /// for: the early return sits INSIDE the turn boundary, so a missing close
+    /// would leave the event log with a turn that never ends.
+    #[test]
+    fn an_oversized_skill_is_refused_and_still_closes_its_turn() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("should never be reached"));
+        let agent = Agent::with_config(mock, local_config());
+
+        let mut input = local_input(AgentMode::Agent, "run that skill", &[]);
+        // 16384 ctx => a 4096-token ceiling; 40 KB of content is ~10240.
+        input.local.as_mut().unwrap().n_ctx = 16384;
+        input.skill_context = Some(SkillContext {
+            name: "huge".into(),
+            base_path: String::new(),
+            content: "x".repeat(40 * 1024),
+            available_files: vec![],
+        });
+
+        let out = agent.run(&input).unwrap();
+        assert!(
+            out.text.contains("too large for on-device mode"),
+            "expected a refusal, got: {}",
+            out.text
+        );
+        assert!(!out.continue_loop);
+
+        let events = agent.host.recorded_events.borrow();
+        let starts = events
+            .iter()
+            .filter(|e| e.starts_with("turn/start"))
+            .count();
+        let ends = events.iter().filter(|e| e.starts_with("turn/end")).count();
+        assert_eq!(starts, 1, "one turn should have opened: {events:?}");
+        assert_eq!(ends, 1, "and it must close on the early return: {events:?}");
+    }
+
+    /// Regression for the Task 3.3 review, Critical 1: a host-found tool was
+    /// advertised under its own name but had no arm in `execute_tool`, so
+    /// calling it answered "Unknown tool". The older test asserted only that
+    /// the name reached the next request — it passed while the feature was
+    /// dead. This one calls the thing.
+    #[test]
+    fn a_host_found_tool_is_actually_callable_once_loaded() {
+        let mock = MockHostFunctions::new();
+        mock.tool_search_results
+            .borrow_mut()
+            .push(ToolSearchResult {
+                name: "brain_search".into(),
+                description: "Search the knowledge base".into(),
+                score: 1.0,
+                input_schema: serde_json::json!({"type": "object"}),
+                source: Some("mcp:brain".into()),
+            });
+        mock.add_llm_response(searches("brain"));
+        mock.add_llm_response(says("done"));
+
+        let agent = Agent::with_config(mock, local_config());
+        agent
+            .run(&local_input(AgentMode::Chat, "查一下知识库", &[]))
+            .unwrap();
+
+        let call = ToolCall {
+            id: "c9".into(),
+            call_id: Some("c9".into()),
+            name: "brain_search".into(),
+            arguments: serde_json::json!({}),
+            signature: None,
+        };
+        let result = agent.execute_tool(&call).unwrap();
+        assert!(
+            result
+                .content
+                .contains("Mock result for tool: brain_search"),
+            "a loaded host tool must reach the host, got: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("Unknown tool"),
+            "advertised but undispatchable"
+        );
+    }
+
+    /// Regression for the Task 3.3 review, Critical 2: the canvas-unlock
+    /// branch rebuilt the advertised list from the TURN-START slice, which
+    /// on-device is only the search entry point plus residents — so every
+    /// tool loaded earlier in the same turn silently vanished.
+    #[test]
+    fn a_tool_loaded_this_turn_survives_a_canvas_unlock() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(searches("select:web_search"));
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c2".into(),
+                call_id: Some("c2".into()),
+                name: "canvas_create_composition".into(),
+                arguments: serde_json::json!({
+                    "title": "v", "width": 1920, "height": 1080,
+                    "duration_sec": 5, "fps": 30
+                }),
+                signature: None,
+            }],
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+
+        let agent = Agent::with_config(mock, local_config());
+        agent
+            .run(&local_input(AgentMode::Chat, "做一个合成", &[]))
+            .unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert!(captured.len() >= 3, "expected three requests: {captured:?}");
+        assert!(
+            captured[2].contains(&"web_search".to_string()),
+            "the tool loaded in iteration 1 was dropped by the canvas unlock: {:?}",
+            captured[2]
+        );
+    }
+
+    /// The allowlist governs the index, so nothing can be searched back into
+    /// reach that the filter already removed.
+    #[test]
+    fn an_allowlist_cannot_be_escaped_by_searching() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(searches("select:read"));
+        mock.add_llm_response(says("done"));
+
+        let agent = Agent::with_config(mock, local_config());
+        let mut input = local_input(AgentMode::Agent, "read that file", &[]);
+        input.tools_config = Some(nevoflux_protocol::subagent::ToolsConfig::Allow(vec![
+            "web_search".to_string(),
+        ]));
+        let out = agent.run(&input).unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert!(!captured[1].contains(&"read".to_string()));
+        assert!(out.loaded_tools.is_empty());
+    }
+
+    #[test]
+    fn local_prompt_sections_drop_a_blank_user_doc() {
+        let sections = Agent::<MockHostFunctions>::build_local_prompt_sections(
+            AgentMode::Chat,
+            None,
+            Some("   \n  "),
+        );
+        let ids: Vec<&str> = sections.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["base/local-chat"]);
     }
 
     /// A truncated result must tell the model where the rest went, or a long
@@ -7371,6 +8374,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -7399,6 +8403,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -7427,6 +8432,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -7478,6 +8484,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         let output = agent.run(&input).unwrap();
@@ -7829,6 +8836,37 @@ mod tests {
         assert!(mouse_move.description.contains("without clicking"));
     }
 
+    /// Writes each mode's tool schemas as JSON for offline model evaluation.
+    /// Run with `NEVOFLUX_DUMP_TOOLS_DIR=<dir> cargo test -p nevoflux-builtin-wasm --lib dump_tool_schemas -- --ignored`.
+    #[test]
+    #[ignore]
+    fn dump_tool_schemas() {
+        let Ok(dir) = std::env::var("NEVOFLUX_DUMP_TOOLS_DIR") else {
+            return;
+        };
+        let agent = Agent::new(MockHostFunctions::new());
+        std::fs::create_dir_all(&dir).unwrap();
+        for (slug, mode) in [
+            ("chat", AgentMode::Chat),
+            ("browser", AgentMode::Browser),
+            ("agent", AgentMode::Agent),
+        ] {
+            let tools: Vec<serde_json::Value> = agent
+                .get_tools_for_mode(mode)
+                .into_iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.input_schema,
+                    })
+                })
+                .collect();
+            let path = std::path::Path::new(&dir).join(format!("{slug}.json"));
+            std::fs::write(path, serde_json::to_string_pretty(&tools).unwrap()).unwrap();
+        }
+    }
+
     #[test]
     fn chat_mode_exposes_tool_search() {
         let mock = MockHostFunctions::new();
@@ -7934,6 +8972,21 @@ mod tests {
 
         let result = agent.execute_tool(&tool_call).unwrap();
         assert!(result.content.contains("Unknown tool"));
+    }
+
+    #[test]
+    fn invalid_arguments_marker_is_reported_not_executed() {
+        let agent = Agent::new(MockHostFunctions::new());
+        let call = ToolCall {
+            id: "c".into(),
+            call_id: None,
+            name: "read".into(),
+            arguments: serde_json::json!({ nevoflux_protocol::json_repair::INVALID_ARGUMENTS_KEY: "{oops" }),
+            signature: None,
+        };
+        let r = agent.execute_tool(&call).unwrap();
+        assert!(r.content.contains("not valid JSON"));
+        assert_eq!(agent.host.tool_read_calls.get(), 0);
     }
 
     #[test]
@@ -8117,6 +9170,7 @@ mod tests {
             soul_context: None,
             tools_config: None,
             os_platform: None,
+            local: None,
         };
 
         agent.run_loop(&input, "system", &tools).unwrap();
@@ -8448,6 +9502,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         // Should complete normally
@@ -8480,6 +9535,7 @@ mod tests {
             tools_config: None,
             skills_filter: None,
             os_platform: None,
+            local: None,
         };
 
         // Should exit early due to interrupt

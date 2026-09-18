@@ -4901,6 +4901,7 @@ dependencies = [
  "dirs 5.0.1",
  "ffmpeg-sidecar",
  "flate2",
+ "fs2",
  "futures",
  "glob",
  "grep-matcher",
@@ -4911,6 +4912,7 @@ dependencies = [
  "http-body-util",
  "ignore",
  "image",
+ "libc",
  "monty",
  "monty-types",
  "nevoflux-a2a",
@@ -4965,7 +4967,9 @@ dependencies = [
  "wasmtime-wasi",
  "wat",
  "which 7.0.3",
+ "windows-sys 0.59.0",
  "zeroize",
+ "zip 2.4.2",
  "zstd",
 ]
 

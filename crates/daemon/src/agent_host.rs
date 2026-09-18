@@ -167,6 +167,28 @@ fn estimate_tokens_from_chars(prompt_chars: usize, streamed_chars: usize) -> u64
     ((prompt_chars + streamed_chars) / 4) as u64
 }
 
+/// Filter a subagent provider/model override through the LocalOnly latch.
+///
+/// While the latch is on, an override naming anything but the on-device
+/// engine is dropped (logged, not silently ignored) rather than applied —
+/// otherwise a subagent could carry conversation content off-device via an
+/// explicit override argument even though the parent session cannot. Every
+/// call site that turns a caller-supplied `(provider_override,
+/// model_override)` pair into a [`DaemonHostFunctions::with_llm_override`]
+/// call routes through here first.
+pub(crate) fn effective_override(provider: String, model: String) -> Option<(String, String)> {
+    if crate::local::latch::is_on()
+        && provider.parse::<ProviderType>().ok() != Some(ProviderType::Local)
+    {
+        tracing::warn!(
+            provider = %provider,
+            "On-device mode is on: dropping non-local subagent model override"
+        );
+        return None;
+    }
+    Some((provider, model))
+}
+
 /// A streaming chunk to send to the sidebar.
 #[derive(Debug, Clone)]
 pub struct SidebarStreamChunk {
@@ -440,8 +462,12 @@ impl DaemonHostFunctions {
     /// Set provider/model override for this host instance.
     ///
     /// Unlike `set_model_override` (which validates API key), this method
-    /// sets the override unconditionally. Use when creating subagent hosts
-    /// where the parent has already validated the configuration.
+    /// sets the override unconditionally — it does NOT consult the LocalOnly
+    /// latch itself. Every call site that turns a caller-supplied
+    /// `(provider_override, model_override)` pair into a call here MUST
+    /// filter it through [`effective_override`] first, so a subagent spawn
+    /// can never carry conversation content off-device via an explicit
+    /// override argument while latched.
     pub fn with_llm_override(self, provider: impl Into<String>, model: impl Into<String>) -> Self {
         *self.model_override_provider.lock().unwrap() = Some(provider.into());
         *self.model_override_model.lock().unwrap() = Some(model.into());
@@ -5978,7 +6004,7 @@ impl HostFunctions for DaemonHostFunctions {
 
     fn set_model_override(&self, provider: &str, model: &str) -> HostResult<()> {
         // Validate provider name
-        let _provider_type = self
+        let provider_type = self
             .config
             .llm
             .resolve_wire(provider)
@@ -5986,6 +6012,18 @@ impl HostFunctions for DaemonHostFunctions {
                 code: 10,
                 message: format!("Invalid provider: {}", provider),
             })?;
+
+        // LocalOnly latch: refuse switching to anything but the on-device
+        // engine while conversation content must stay on the device.
+        if crate::local::latch::is_on() && provider_type != ProviderType::Local {
+            return Err(HostError {
+                code: 403,
+                message: format!(
+                    "On-device mode is on: cannot switch the model to '{provider}'. \
+                     Turn off on-device mode first."
+                ),
+            });
+        }
 
         // Validate API key exists for this provider
         self.get_api_key_for_provider(provider)?;
@@ -8173,10 +8211,13 @@ impl DaemonHostFunctions {
                     host = host.with_sidebar_stream(tx);
                 }
 
-                // Apply provider/model override if specified
+                // Apply provider/model override if specified (filtered
+                // through the LocalOnly latch — see `effective_override`).
                 if let (Some(provider), Some(model)) = (provider_override, model_override) {
-                    debug!("Legacy subagent {}: applying provider/model override: provider={}, model={}", id, provider, model);
-                    host = host.with_llm_override(provider, model);
+                    if let Some((provider, model)) = effective_override(provider, model) {
+                        debug!("Legacy subagent {}: applying provider/model override: provider={}, model={}", id, provider, model);
+                        host = host.with_llm_override(provider, model);
+                    }
                 }
 
                 // Create agent input with custom prompt for sub-agent
@@ -8202,6 +8243,7 @@ impl DaemonHostFunctions {
                     soul_context: None,
                     tools_config,
                     os_platform: Some(std::env::consts::OS.to_string()),
+                    local: None,
                 };
 
                 // Run the appropriate builtin mode
@@ -8809,8 +8851,23 @@ message = "not here"
     fn get_api_key_for_provider_covers_every_builtin() {
         // The old hand-written match listed only seven providers, so the rest
         // silently fell through to the environment.
+        //
+        // R42 (ratified as R50, controller review round 2): "local" is
+        // builtin (Task 1.1) but runs on-device and needs no API key at
+        // all, so it is exempt from the "every builtin has a key" invariant
+        // this test otherwise checks -- it deliberately has no
+        // `ProviderConfig` slot (see `LlmConfig::provider_config`'s own
+        // comment: it's a `LocalConfig`, not a `ProviderConfig`, so
+        // `provider_config_mut("local")` is `None` by design, not a bug).
+        // `get_api_key_for_provider` resolves it through
+        // `keyless_placeholder` instead, so it's set up and asserted
+        // separately from the config-backed builtins below -- this is a
+        // deliberate carve-out with a reason, not a silenced failure.
         let mut cfg = AgentConfig::default();
         for id in crate::config::BUILTIN_PROVIDER_IDS {
+            if *id == "local" {
+                continue;
+            }
             cfg.llm
                 .provider_config_mut(id)
                 .unwrap_or_else(|| panic!("no config slot for builtin {id}"))
@@ -8819,6 +8876,14 @@ message = "not here"
         let rt = tokio::runtime::Runtime::new().unwrap();
         let host = DaemonHostFunctions::new(Arc::new(cfg), rt.handle().clone());
         for id in crate::config::BUILTIN_PROVIDER_IDS {
+            if *id == "local" {
+                assert_eq!(
+                    host.get_api_key_for_provider(id).unwrap(),
+                    "local-engine",
+                    "\"local\" has no config slot; it must resolve via keyless_placeholder"
+                );
+                continue;
+            }
             assert_eq!(
                 host.get_api_key_for_provider(id).unwrap(),
                 format!("key-{id}"),
@@ -8834,6 +8899,70 @@ message = "not here"
             .expect("custom provider is a valid override target");
         host.set_model_override("not-a-provider", "x")
             .expect_err("unknown provider is still rejected");
+    }
+
+    /// LocalOnly latch: switching the model to a cloud provider must be
+    /// refused while on-device mode is enforced, even when the provider is
+    /// otherwise valid and its key configured.
+    #[test]
+    fn switch_model_to_cloud_is_refused_when_latched() {
+        let _g = crate::local::latch::test_serial();
+        struct ResetLatch;
+        impl Drop for ResetLatch {
+            fn drop(&mut self) {
+                crate::local::latch::set(false);
+            }
+        }
+        let _reset = ResetLatch;
+
+        let mut cfg = AgentConfig::default();
+        cfg.llm.anthropic.api_key = Some("sk-ant-test".to_string());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let host = DaemonHostFunctions::new(Arc::new(cfg), rt.handle().clone());
+
+        crate::local::latch::set(true);
+        let err = host
+            .set_model_override("anthropic", "claude-sonnet-4-5")
+            .expect_err("cloud switch must be refused while latched");
+        assert!(
+            err.message.contains("On-device mode"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    /// Pure-function coverage of the helper every subagent-override call site
+    /// routes through: latched drops a non-local override (with a warn!,
+    /// exercised for effect only — not asserted here), unlatched and a local
+    /// override both pass through unchanged.
+    #[test]
+    fn effective_override_drops_non_local_only_while_latched() {
+        let _g = crate::local::latch::test_serial();
+        struct ResetLatch;
+        impl Drop for ResetLatch {
+            fn drop(&mut self) {
+                crate::local::latch::set(false);
+            }
+        }
+        let _reset = ResetLatch;
+
+        assert_eq!(
+            effective_override("anthropic".into(), "claude".into()),
+            Some(("anthropic".to_string(), "claude".to_string())),
+            "not latched: passes through"
+        );
+
+        crate::local::latch::set(true);
+        assert_eq!(
+            effective_override("local".into(), "qwen3".into()),
+            Some(("local".to_string(), "qwen3".to_string())),
+            "local override passes through even while latched"
+        );
+        assert_eq!(
+            effective_override("anthropic".into(), "claude".into()),
+            None,
+            "non-local override dropped while latched"
+        );
     }
 
     /// Setup host with an empty skills registry (no default directories).

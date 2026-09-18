@@ -43,15 +43,90 @@ use crate::translate::{
     OpenAIChatRequest, StreamTranslator,
 };
 
+/// Mutable upstream routing state, hot-swappable at runtime (Task 1.6).
+///
+/// Grouping these fields behind one `RwLock` (see [`AppState::upstream`])
+/// lets [`crate::server::GatewayHandle::set_upstream`] replace all of
+/// them atomically — a request that reads the snapshot before a swap
+/// never sees a mix of the old `base_url` with the new `api_key`, say.
+/// Every handler that needs upstream routing reads exactly one snapshot
+/// clone at the top of the request (see `chat_completions` / `models`)
+/// rather than re-reading the lock field-by-field.
+#[derive(Clone)]
+pub(crate) struct Upstream {
+    pub(crate) base_url: String,
+    pub(crate) api_key: String,
+    /// If non-empty, overrides the `model` field of every incoming
+    /// chat-completions request before hitting upstream. See 附录 B 决策 #25.
+    pub(crate) model_override: String,
+    /// Protocol the upstream LLM endpoint speaks (M4-2.6). Dispatched on
+    /// inside `chat_completions` to pick between the Anthropic translator
+    /// path and the OpenAI passthrough path.
+    pub(crate) protocol: UpstreamProtocol,
+    /// Lazy ACP holder, present only when the gateway was booted with an
+    /// `acp_config` (i.e. `protocol == Acp` at [`AppState::new`] time).
+    /// The outer `Mutex` serializes the lazy connect so the subprocess is
+    /// spawned exactly once across concurrent first-requests.
+    ///
+    /// Left alone by [`Upstream::apply_update`] whenever it already holds
+    /// a client — a hot swap away from and back to `Acp` reuses the same
+    /// lazily-connected `AcpUpstream` instead of rebuilding it (and
+    /// losing a live subprocess): unreachable while `protocol != Acp`,
+    /// ready to lazily connect again the moment `protocol` swaps back.
+    /// Only built fresh when it's currently `None` and an update both
+    /// targets `Acp` and carries an `acp_config` to build from — see
+    /// `apply_update` (fix round 1, item 1: this used to be entirely
+    /// fixed at [`AppState::new`] time, so a runtime switch to an ACP
+    /// provider that wasn't active at boot always 500'd).
+    pub(crate) acp: Option<Arc<tokio::sync::Mutex<AcpUpstream>>>,
+    /// See [`crate::server::UpstreamUpdate::unavailable`].
+    pub(crate) unavailable: bool,
+}
+
+impl Upstream {
+    /// Apply a [`crate::server::UpstreamUpdate`] in place.
+    pub(crate) fn apply_update(&mut self, up: crate::server::UpstreamUpdate) {
+        self.base_url = up.base_url;
+        self.api_key = up.api_key;
+        self.model_override = up.model_override;
+        self.protocol = up.protocol;
+        self.unavailable = up.unavailable;
+        // Build the ACP client on demand (fix round 1, item 1) — only
+        // when switching TO Acp and none exists yet. If one already
+        // exists, it's reused regardless of `up.acp_config` (see the
+        // `acp` field's doc comment) so a round trip away from and back
+        // to Acp never loses a live subprocess.
+        if self.protocol == UpstreamProtocol::Acp && self.acp.is_none() {
+            if let Some(cfg) = up.acp_config {
+                self.acp = Some(Arc::new(tokio::sync::Mutex::new(AcpUpstream::new(cfg))));
+            }
+        }
+    }
+
+    /// Snapshot the swappable fields into a [`crate::server::UpstreamUpdate`].
+    /// `acp_config` is always `None` here — it's a write-only hint for
+    /// [`Self::apply_update`], not part of the observable current state
+    /// (and echoing an `AcpProviderConfig`, whose `env` may carry
+    /// secrets, back out through a snapshot would be an easy way to leak
+    /// one).
+    pub(crate) fn snapshot(&self) -> crate::server::UpstreamUpdate {
+        crate::server::UpstreamUpdate {
+            base_url: self.base_url.clone(),
+            api_key: self.api_key.clone(),
+            model_override: self.model_override.clone(),
+            protocol: self.protocol,
+            acp_config: None,
+            unavailable: self.unavailable,
+        }
+    }
+}
+
 /// Shared application state.
 pub(crate) struct AppState {
     pub(crate) bearer_token: String,
     pub(crate) chat_request_count: AtomicU64,
-    pub(crate) upstream_base_url: String,
-    pub(crate) upstream_api_key: String,
-    /// If non-empty, overrides the `model` field of every incoming
-    /// chat-completions request before hitting upstream. See 附录 B 决策 #25.
-    pub(crate) upstream_model_override: String,
+    /// Hot-swappable upstream routing (Task 1.6) — see [`Upstream`].
+    pub(crate) upstream: tokio::sync::RwLock<Upstream>,
     pub(crate) anthropic_version: String,
     /// Client used for non-stream upstream calls. Has both
     /// `connect_timeout` and `timeout()` set so a stuck request fails
@@ -62,6 +137,16 @@ pub(crate) struct AppState {
     /// whole stream lifetime, so per-chunk idle timeout is enforced via
     /// `tokio::time::timeout` inside the SSE handler instead.
     pub(crate) stream_http: reqwest::Client,
+    /// Same shape as [`Self::nonstream_http`] but built with `.no_proxy()`
+    /// — used whenever the *current* upstream's `base_url` is loopback
+    /// (see [`is_loopback_url`] / [`pick_client`]), so a system
+    /// `HTTP_PROXY`/`ALL_PROXY` can never see prompt content bound for the
+    /// on-device engine (R30, fix round 1 item 4). `reqwest` otherwise
+    /// honors those env vars for every request regardless of host.
+    pub(crate) nonstream_http_no_proxy: reqwest::Client,
+    /// No-proxy sibling of [`Self::stream_http`] — see
+    /// [`Self::nonstream_http_no_proxy`].
+    pub(crate) stream_http_no_proxy: reqwest::Client,
     /// Per-chunk idle budget for streaming responses (M2-3).
     pub(crate) upstream_stream_idle_timeout: Duration,
     /// Maximum `Retry-After` we'll sleep on a 429 retry before giving up.
@@ -75,18 +160,10 @@ pub(crate) struct AppState {
     pub(crate) embedder: OnceCell<Arc<FastEmbedProvider>>,
     /// Models advertised by `GET /v1/models` (M2-1). The handler falls
     /// back to a single-entry list synthesized from
-    /// `upstream_model_override` (or the sentinel `"default"`) when this
-    /// is empty, so naive clients calling list-models on a freshly-booted
-    /// gateway always get a valid response.
+    /// [`Upstream::model_override`] (or the sentinel `"default"`) when
+    /// this is empty, so naive clients calling list-models on a
+    /// freshly-booted gateway always get a valid response.
     pub(crate) advertised_models: Vec<String>,
-    /// Protocol the upstream LLM endpoint speaks (M4-2.6). Dispatched on
-    /// inside `chat_completions` to pick between the Anthropic translator
-    /// path and the OpenAI passthrough path.
-    pub(crate) upstream_protocol: UpstreamProtocol,
-    /// Lazy ACP holder, present only when `upstream_protocol == Acp`.
-    /// The outer `Mutex` serializes the lazy connect so the subprocess
-    /// is spawned exactly once across concurrent first-requests.
-    pub(crate) acp: Option<Arc<tokio::sync::Mutex<AcpUpstream>>>,
 }
 
 impl AppState {
@@ -113,28 +190,48 @@ impl AppState {
         let stream_http = reqwest::Client::builder()
             .connect_timeout(config.upstream_connect_timeout)
             .build()?;
+        // R30: identical timeout shapes, but with system-proxy honoring
+        // disabled outright — used instead of the two clients above
+        // whenever the current upstream is loopback (see `pick_client`).
+        let nonstream_http_no_proxy = apply_local_http_policy(
+            reqwest::Client::builder()
+                .connect_timeout(config.upstream_connect_timeout)
+                .timeout(config.upstream_request_timeout),
+        )
+        .build()?;
+        let stream_http_no_proxy = apply_local_http_policy(
+            reqwest::Client::builder().connect_timeout(config.upstream_connect_timeout),
+        )
+        .build()?;
 
         let acp = config
             .acp_config
             .clone()
             .map(|cfg| Arc::new(tokio::sync::Mutex::new(AcpUpstream::new(cfg))));
 
+        let upstream = Upstream {
+            base_url: config.upstream_base_url,
+            api_key: config.upstream_api_key,
+            model_override: config.upstream_model_remap.unwrap_or_default(),
+            protocol: config.upstream_protocol,
+            acp,
+            unavailable: false,
+        };
+
         Ok(Self {
             bearer_token: config.bearer_token,
             chat_request_count: AtomicU64::new(0),
-            upstream_base_url: config.upstream_base_url,
-            upstream_api_key: config.upstream_api_key,
-            upstream_model_override: config.upstream_model_remap.unwrap_or_default(),
+            upstream: tokio::sync::RwLock::new(upstream),
             anthropic_version: config.anthropic_version,
             nonstream_http,
             stream_http,
+            nonstream_http_no_proxy,
+            stream_http_no_proxy,
             upstream_stream_idle_timeout: config.upstream_stream_idle_timeout,
             upstream_retry_max_wait: config.upstream_retry_max_wait,
             #[cfg(feature = "embedding")]
             embedder: OnceCell::new(),
             advertised_models: config.advertised_models,
-            upstream_protocol: config.upstream_protocol,
-            acp,
         })
     }
 
@@ -372,6 +469,72 @@ pub(crate) async fn embeddings() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// Apply the local-engine HTTP policy to a builder: unconditionally
+/// strips any proxy configuration — whether inherited from
+/// `HTTP_PROXY`/`ALL_PROXY` or set explicitly via `.proxy(...)` earlier
+/// on the same builder — on top of whatever timeouts the caller already
+/// configured. Used to build [`AppState`]'s `*_no_proxy` client pair
+/// (fix round 1 follow-up item B / R33; mirrors
+/// `crate::wasm::local_llm::apply_local_http_policy` in the daemon
+/// crate, which this crate can't depend on).
+///
+/// Factored out specifically so it's testable without mutating the
+/// process's real `HTTP_PROXY` env var (which would race any other test
+/// in the crate building a plain client concurrently): start from a
+/// builder with an *explicit* proxy set, run it through here, and
+/// confirm a real request still reaches its target directly — see
+/// `apply_local_http_policy_clears_an_explicit_proxy` in this module's
+/// tests.
+pub(crate) fn apply_local_http_policy(b: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    b.no_proxy()
+}
+
+/// Whether `url`'s host is loopback: `127.0.0.0/8`, `[::1]`, or
+/// `localhost`. Mirrors `crate::local::latch::is_loopback_url` in the
+/// daemon crate (this crate can't depend on the daemon, so the same small
+/// check is duplicated here — see [`pick_client`]).
+///
+/// An unparseable URL or missing host is treated as NOT loopback — the
+/// conservative answer, since it falls through to the proxy-honoring
+/// client, i.e. whatever a normal cloud request would get.
+pub(crate) fn is_loopback_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // `Url::host_str` brackets an IPv6 literal (e.g. "[::1]"); strip that
+    // before handing it to `IpAddr::parse`, which doesn't accept brackets.
+    let candidate = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    candidate
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Pick the right one of [`AppState`]'s four reqwest clients for this
+/// request: proxy-honoring vs. no-proxy is driven by whether `base_url`
+/// (the upstream this specific request is going to) is loopback (R30);
+/// stream vs. non-stream is the existing M2-3 split.
+pub(crate) fn pick_client<'a>(
+    state: &'a AppState,
+    base_url: &str,
+    stream: bool,
+) -> &'a reqwest::Client {
+    match (is_loopback_url(base_url), stream) {
+        (true, true) => &state.stream_http_no_proxy,
+        (true, false) => &state.nonstream_http_no_proxy,
+        (false, true) => &state.stream_http,
+        (false, false) => &state.nonstream_http,
+    }
+}
+
 // =========================================================================
 // /v1/chat/completions
 // =========================================================================
@@ -383,18 +546,33 @@ pub(crate) async fn chat_completions(
     let req_idx = state.chat_request_count.fetch_add(1, Ordering::Relaxed) + 1;
     let stream = req.stream.unwrap_or(false);
 
+    // Task 1.6: snapshot the hot-swappable upstream once per request, so a
+    // concurrent `set_upstream` mid-flight can't hand this request a mix
+    // of the old and new routing fields.
+    let up = state.upstream.read().await.clone();
+
+    // Fix round 1, item 5: latched with no on-device engine published yet
+    // — fail fast and locally instead of attempting any network call.
+    if up.unavailable {
+        tracing::warn!(
+            req_idx,
+            "chat_completions rejected: on-device engine is not running"
+        );
+        return error_to_response(&GatewayError::LocalEngineUnavailable);
+    }
+
     // M4-2.6: dispatch on the upstream protocol. The Anthropic path is
     // the existing M2 translator; the OpenAI path is a thin passthrough
     // that swaps auth + applies the optional model remap and reuses the
     // same M2-3 retry/timeout/error-classification helpers.
-    let result = match state.upstream_protocol {
+    let result = match up.protocol {
         UpstreamProtocol::Anthropic => {
-            do_chat_completions_anthropic(state.clone(), req, req_idx, stream).await
+            do_chat_completions_anthropic(state.clone(), up, req, req_idx, stream).await
         }
         UpstreamProtocol::OpenAi => {
-            do_chat_completions_openai(state.clone(), req, req_idx, stream).await
+            do_chat_completions_openai(state.clone(), up, req, req_idx, stream).await
         }
-        UpstreamProtocol::Acp => match state.acp.clone() {
+        UpstreamProtocol::Acp => match up.acp {
             Some(acp) => acp_upstream::do_chat_completions_acp(acp, req, req_idx, stream).await,
             None => Err(GatewayError::Internal {
                 detail: "upstream_protocol=Acp but no acp_config was supplied to the gateway"
@@ -427,6 +605,7 @@ pub(crate) async fn chat_completions(
 /// upstream via [`post_upstream`], then translates the response back.
 async fn do_chat_completions_anthropic(
     state: Arc<AppState>,
+    up: Upstream,
     req: OpenAIChatRequest,
     req_idx: u64,
     stream: bool,
@@ -440,17 +619,17 @@ async fn do_chat_completions_anthropic(
     // Model remap (附录 B 决策 #25): some upstreams accept only a single
     // model name. The gateway is the abstraction layer where that mapping
     // happens. Driven by env var; empty = passthrough.
-    if !state.upstream_model_override.is_empty() && anthr.model != state.upstream_model_override {
+    if !up.model_override.is_empty() && anthr.model != up.model_override {
         tracing::debug!(
             req_idx,
             "remapping model {} -> {}",
             anthr.model,
-            state.upstream_model_override
+            up.model_override
         );
-        anthr.model = state.upstream_model_override.clone();
+        anthr.model = up.model_override.clone();
     }
 
-    let url = format!("{}/v1/messages", state.upstream_base_url);
+    let url = format!("{}/v1/messages", up.base_url);
     tracing::info!(
         req_idx,
         stream,
@@ -467,15 +646,12 @@ async fn do_chat_completions_anthropic(
     })?;
 
     // Pick the right reqwest client: streaming needs no total-request
-    // timeout (we enforce a per-chunk idle timeout manually instead).
-    let client = if stream {
-        &state.stream_http
-    } else {
-        &state.nonstream_http
-    };
+    // timeout (we enforce a per-chunk idle timeout manually instead), and
+    // a loopback upstream must bypass any system proxy (R30).
+    let client = pick_client(&state, &up.base_url, stream);
 
     let mut anthropic_headers = reqwest::header::HeaderMap::new();
-    if let Ok(hv) = reqwest::header::HeaderValue::from_str(&state.upstream_api_key) {
+    if let Ok(hv) = reqwest::header::HeaderValue::from_str(&up.api_key) {
         anthropic_headers.insert("x-api-key", hv);
     }
     if let Ok(hv) = reqwest::header::HeaderValue::from_str(&state.anthropic_version) {
@@ -527,14 +703,15 @@ async fn do_chat_completions_anthropic(
 /// Inner chat-completions implementation for the OpenAI passthrough
 /// path (M4-2.6). Forwards the client request unchanged except for:
 ///
-/// - applying [`AppState::upstream_model_override`] to the `model` field;
-/// - swapping auth to `Authorization: Bearer <upstream_api_key>`;
+/// - applying [`Upstream::model_override`] to the `model` field;
+/// - swapping auth to `Authorization: Bearer <api_key>`;
 /// - reusing M2-3's [`post_upstream`] for 429-retry + timeout + error
 ///   classification;
 /// - re-emitting the upstream SSE stream verbatim (with per-chunk idle
 ///   timeout) instead of running the Anthropic translator.
 async fn do_chat_completions_openai(
     state: Arc<AppState>,
+    up: Upstream,
     mut req: OpenAIChatRequest,
     req_idx: u64,
     stream: bool,
@@ -543,20 +720,17 @@ async fn do_chat_completions_openai(
 
     // Model remap — same semantics as the Anthropic path, just applied
     // directly to the OpenAI request body before we forward it.
-    if !state.upstream_model_override.is_empty() && req.model != state.upstream_model_override {
+    if !up.model_override.is_empty() && req.model != up.model_override {
         tracing::debug!(
             req_idx,
             "remapping model {} -> {}",
             req.model,
-            state.upstream_model_override
+            up.model_override
         );
-        req.model = state.upstream_model_override.clone();
+        req.model = up.model_override.clone();
     }
 
-    let url = format!(
-        "{}/v1/chat/completions",
-        state.upstream_base_url.trim_end_matches('/')
-    );
+    let url = format!("{}/v1/chat/completions", up.base_url.trim_end_matches('/'));
     tracing::info!(
         req_idx,
         stream,
@@ -571,16 +745,11 @@ async fn do_chat_completions_openai(
         detail: format!("upstream body encode failed: {e}"),
     })?;
 
-    let client = if stream {
-        &state.stream_http
-    } else {
-        &state.nonstream_http
-    };
+    // R30: a loopback upstream must bypass any system proxy.
+    let client = pick_client(&state, &up.base_url, stream);
 
     let mut openai_headers = reqwest::header::HeaderMap::new();
-    if let Ok(hv) =
-        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", state.upstream_api_key))
-    {
+    if let Ok(hv) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", up.api_key)) {
         openai_headers.insert(reqwest::header::AUTHORIZATION, hv);
     }
     openai_headers.insert(
@@ -1102,7 +1271,7 @@ pub(crate) struct ModelEntry {
 ///
 /// Returns the list configured via [`AppState::advertised_models`]. If
 /// empty, returns a single entry derived from
-/// [`AppState::upstream_model_override`] (if set), otherwise a sentinel
+/// [`Upstream::model_override`] (if set), otherwise a sentinel
 /// `"default"` placeholder so naive clients calling list-models on a
 /// freshly-booted gateway always get a valid response.
 ///
@@ -1114,10 +1283,13 @@ pub(crate) async fn models(State(state): State<Arc<AppState>>) -> Json<ModelsLis
     /// clients caching by `(id, created)` see the same value.
     const EPOCH: u64 = 1_729_600_000;
 
+    // Task 1.6: snapshot the hot-swappable upstream so this reflects the
+    // currently-active model_override, not a boot-time copy.
+    let model_override = state.upstream.read().await.model_override.clone();
     let models: Vec<String> = if !state.advertised_models.is_empty() {
         state.advertised_models.clone()
-    } else if !state.upstream_model_override.is_empty() {
-        vec![state.upstream_model_override.clone()]
+    } else if !model_override.is_empty() {
+        vec![model_override]
     } else {
         vec!["default".to_string()]
     };
@@ -1137,4 +1309,92 @@ pub(crate) async fn models(State(state): State<Arc<AppState>>) -> Json<ModelsLis
         object: "list",
         data,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_loopback_url_recognizes_127_range_localhost_and_ipv6_loopback() {
+        assert!(is_loopback_url("http://127.0.0.1:8080/v1"));
+        assert!(is_loopback_url("http://127.5.5.5/v1"));
+        assert!(is_loopback_url("http://localhost:11434/v1"));
+        assert!(is_loopback_url("http://LOCALHOST/v1"));
+        assert!(is_loopback_url("http://[::1]:8080/v1"));
+    }
+
+    #[test]
+    fn is_loopback_url_rejects_external_hosts_and_lookalikes() {
+        assert!(!is_loopback_url("https://api.anthropic.com/v1"));
+        assert!(!is_loopback_url("https://api.openai.com"));
+        // DNS-rebinding-style lookalike: a hostname that merely CONTAINS
+        // "127.0.0.1" is not itself loopback.
+        assert!(!is_loopback_url("http://127.0.0.1.evil.com/v1"));
+        assert!(!is_loopback_url("not a url at all"));
+    }
+
+    /// Structural proof that `pick_client`'s branch selection is driven by
+    /// `is_loopback_url` and the `stream` flag: check which of
+    /// `AppState`'s four client fields comes back, by pointer identity,
+    /// for all four (loopback × stream) combinations.
+    #[tokio::test]
+    async fn pick_client_selects_the_no_proxy_pair_only_for_loopback_urls() {
+        let state = AppState::new(GatewayConfig::test_default())
+            .await
+            .expect("AppState::new for test");
+
+        let loopback_stream = pick_client(&state, "http://127.0.0.1:9999/v1", true);
+        assert!(std::ptr::eq(loopback_stream, &state.stream_http_no_proxy));
+
+        let loopback_nonstream = pick_client(&state, "http://localhost:9999/v1", false);
+        assert!(std::ptr::eq(
+            loopback_nonstream,
+            &state.nonstream_http_no_proxy
+        ));
+
+        let cloud_stream = pick_client(&state, "https://api.anthropic.com", true);
+        assert!(std::ptr::eq(cloud_stream, &state.stream_http));
+
+        let cloud_nonstream = pick_client(&state, "https://api.anthropic.com", false);
+        assert!(std::ptr::eq(cloud_nonstream, &state.nonstream_http));
+    }
+
+    /// Fix round 1 follow-up item B (R33): `apply_local_http_policy` must
+    /// clear even an *explicit* proxy set on the builder, not just avoid
+    /// reading proxy env vars. Deterministic — no env mutation, so it
+    /// can't race any other test in the crate building a plain client
+    /// concurrently: start from a builder explicitly proxying everything
+    /// through `127.0.0.1:9` (nothing listens there — the "discard"
+    /// port), run it through `apply_local_http_policy`, and confirm the
+    /// built client still reaches a real local server directly. If the
+    /// policy failed to clear the proxy, the request would instead try
+    /// to speak HTTP-proxy protocol to `:9` and fail.
+    #[tokio::test]
+    async fn apply_local_http_policy_clears_an_explicit_proxy() {
+        use axum::{routing::get, Router};
+
+        let app = Router::new().route("/", get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake target");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("fake target serve");
+        });
+
+        let builder = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").expect("valid proxy url"));
+        let client = apply_local_http_policy(builder)
+            .build()
+            .expect("client should build");
+
+        let resp = client.get(format!("http://{addr}/")).send().await;
+        assert!(
+            resp.is_ok(),
+            "apply_local_http_policy must clear the explicit proxy so the request reaches \
+             the target directly; got {:?}",
+            resp.err()
+        );
+    }
 }

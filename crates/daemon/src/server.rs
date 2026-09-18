@@ -450,6 +450,14 @@ impl Server {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(()).await;
         }
+        // The on-device engine goes down first, before anything else gets a
+        // chance to wedge this path: it is a separate process holding
+        // several GB of VRAM and a machine-wide lock file, and on Windows
+        // the only other thing that would ever reap it is the daemon's
+        // kill-on-close Job Object — which fires at process exit, after the
+        // watchdog's force-exit, i.e. too late for a clean stop. A no-op
+        // when no engine is running.
+        crate::local::engine::supervisor().stop().await;
         // Brain goes down before the gateway: gbrain talks TO the
         // gateway, not the other way around, so we want gbrain to stop
         // making upstream calls before we tear down the listener.
@@ -881,6 +889,26 @@ pub async fn start_server(
         Some(boot) => (Some(boot.handle), Some(boot.snapshot)),
         None => (None, None),
     };
+    // Task 1.6: publish a cheap, `Clone`-able control handle onto the
+    // gateway's hot-swappable upstream so the LocalOnly latch's
+    // config-change hook (`crate::local::on_config_changed`, called from
+    // the free-function `config.llm.*` handlers below — they don't hold a
+    // `&Server`) can re-point the gateway without owning it.
+    if let Some(handle) = gateway_handle.as_ref() {
+        crate::llm_gateway::set_gateway_control(handle.control());
+    }
+    // Fix round 1, item 6: run the latch's config-change hook RIGHT HERE
+    // — as soon as the gateway control handle exists, before gbrain (or
+    // anything else) gets a chance to spawn and start sending real chat
+    // traffic through the gateway. `CURRENT_DB` / `CURRENT_EVENT_BUS`
+    // aren't published yet at this point in boot, so this call's "publish
+    // the paused-work counts" step is a no-op (gracefully degrading, per
+    // the module docs) — that's fine: what matters here is that a daemon
+    // that boots already latched (on-device provider active + enabled)
+    // never serves a single request against the cloud first. Uses the
+    // plain (not-yet-`SharedAgentConfig`-wrapped) `agent_config` in scope,
+    // since that wrapping only happens further down.
+    crate::local::on_config_changed(&agent_config).await;
 
     // Boot the gbrain integration (M3-3) OFF the critical boot path.
     //
@@ -1012,6 +1040,32 @@ pub async fn start_server(
     if let Some(snap) = gateway_snapshot.as_ref() {
         let _ = crate::kb_wizard::CURRENT_GATEWAY_SNAPSHOT.set(snap.clone());
     }
+    // Task 1.6: the DB handle `crate::local::on_config_changed` queries for
+    // the paused loop/schedule/goal counts it broadcasts on a latch
+    // transition. The boot-time call to `on_config_changed` itself already
+    // ran earlier (fix round 1, item 6 — right after the gateway control
+    // handle was published, before gbrain spawned), so this only affects
+    // the LATER calls from the four `config.llm.*` handlers below.
+    let _ = crate::local::sync::CURRENT_DB.set(db.clone());
+    // R32: now that the event bus + DB both exist, publish the CURRENT
+    // latch state unconditionally — not gated on a transition, unlike
+    // `on_config_changed`'s own publish — so a daemon that boots already
+    // latched still gives a sticky event to any subscriber (e.g. the
+    // sidebar's on-device indicator, v3 I3) that connects after boot. The
+    // earlier boot-time `on_config_changed` call already applied the
+    // gateway upstream; this only handles the broadcast.
+    crate::local::publish_current_latch_state().await;
+
+    // Task 2.9: register the engine supervisor's cold-start hook (the one
+    // `local::endpoint::ensure` falls back to) and start its idle-unload
+    // timer. Deliberately probes nothing and spawns nothing: the whole
+    // on-device pipeline is demand-driven, so a daemon whose user never
+    // touches local inference pays nothing for this call. Takes no path —
+    // `engine.lock`, `engine.pid` and the installs themselves all live under
+    // the shared engine cache root (v3 §6), NOT this daemon's data
+    // directory, which is what makes "one engine per machine" hold even
+    // across daemons configured with different data directories.
+    crate::local::engine::init();
 
     // Initialize MCP manager (empty) and tool search index.
     // Actual connections happen in a background task so the daemon starts fast.
@@ -1617,7 +1671,10 @@ pub async fn start_server(
                         let cons_config = agent_config_clone.read().unwrap().clone();
                         let cons_db = std::sync::Arc::new(shared_storage_clone.database().clone());
                         let cons_category = category.clone();
-                        tokio::spawn(async move {
+                        // Background (P1, Task 2.7): consolidation must
+                        // never contend with interactive chat for the local
+                        // engine's admission budget ahead of it.
+                        tokio::spawn(crate::local::admission::background(async move {
                             match crate::learning::consolidator::consolidate_category(
                                 cons_config,
                                 cons_db,
@@ -1639,7 +1696,7 @@ pub async fn start_server(
                                     );
                                 }
                             }
-                        });
+                        }));
                     }
                 }
             }
@@ -6013,6 +6070,63 @@ pub(crate) fn is_clear_command(message: &str) -> bool {
     rest[..name_end].eq_ignore_ascii_case("clear")
 }
 
+/// Session-metadata key holding the tool names local mode has already loaded
+/// for this session.
+///
+/// Deferred tool loading (Task 3.3) starts a local turn with `tool_search`
+/// alone and loads the rest on demand; persisting the set here is what stops
+/// the next turn of the same conversation from re-discovering tools the model
+/// already knows about.
+const LOCAL_LOADED_TOOLS_KEY: &str = "local_loaded_tools";
+
+/// How much of USER.md a local-mode prompt carries, in **characters**.
+const LOCAL_USER_DOC_MAX_CHARS: usize = 500;
+
+/// Build the local-mode payload for one turn.
+///
+/// Pure — no session store, no running engine — so the truncation and parsing
+/// rules can be tested directly.
+///
+/// Two deliberate choices:
+/// - The cap is counted in `chars()`, not bytes. Taking a byte slice would
+///   panic on a multi-byte boundary, which this codebase has shipped before;
+///   counting characters cannot.
+/// - A malformed `local_loaded_tools` value degrades to an empty list rather
+///   than failing the turn. The list is a cache of what the model has already
+///   been shown; losing it costs one redundant `tool_search`, whereas refusing
+///   the turn costs the user their message.
+fn local_mode_input(
+    meta: Option<&std::collections::HashMap<String, serde_json::Value>>,
+    n_ctx: u32,
+    user_raw: &str,
+) -> nevoflux_builtin_wasm::LocalModeInput {
+    let loaded_tools = meta
+        .and_then(|m| m.get(LOCAL_LOADED_TOOLS_KEY))
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let trimmed = user_raw.trim();
+    let user_doc = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(LOCAL_USER_DOC_MAX_CHARS).collect())
+    };
+
+    nevoflux_builtin_wasm::LocalModeInput {
+        n_ctx,
+        loaded_tools,
+        user_doc,
+    }
+}
+
 /// Handle chat channel messages with streaming support.
 ///
 /// This function processes chat messages and streams the response back to the sidebar
@@ -6678,6 +6792,11 @@ async fn handle_chat_message_streaming(
         effective_message
     };
 
+    // Resolved once and reused after the turn: `input` is moved into
+    // `spawn_blocking` below, so there is no way to ask it later whether this
+    // turn ran on-device.
+    let local_mode_active = config.llm.active_provider() == Some("local");
+
     let input = AgentInput {
         session_id: session_id.clone(),
         mode,
@@ -6715,7 +6834,46 @@ async fn handle_chat_message_streaming(
         // never touches mode/provider/model: those stay the user's call.
         tools_config: active_soul.as_deref().and_then(|s| s.tools_config.clone()),
         os_platform: Some(std::env::consts::OS.to_string()),
+        // On-device turns carry their own context budget, the tools already
+        // loaded this session, and a trimmed USER.md; a cloud turn carries
+        // `None`, which is what Phase 3 reads as "not local mode".
+        //
+        // There is no per-turn provider override to consult here: the override
+        // lives on `DaemonHostFunctions::with_llm_override`, whose only
+        // production caller is the subagent spawn path, not this one.
+        local: if local_mode_active {
+            let n_ctx = crate::local::endpoint::current()
+                .map(|ep| ep.n_ctx)
+                .unwrap_or_else(|| match config.llm.local.validated_ctx() {
+                    // A fixed size is what the engine would launch with.
+                    Ok(crate::local::config::CtxPref::Fixed(n)) => n,
+                    // `Auto` only resolves against hardware at launch (32K when
+                    // the model fits fully on GPU, else 16K) and no engine is
+                    // running to ask, so promise the floor. Under-stating the
+                    // budget costs a shorter prompt; over-stating it would let
+                    // the agent build a turn the engine cannot accept.
+                    _ => crate::local::config::CTX_FLOOR,
+                });
+            let user_raw = services
+                .knowledge_retriever
+                .as_ref()
+                .map(|r| r.soul_cache().user_raw.clone())
+                .unwrap_or_default();
+            let meta = session_manager
+                .get_session(&session_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|s| s.metadata);
+            Some(local_mode_input(meta.as_ref(), n_ctx, &user_raw))
+        } else {
+            None
+        },
     };
+
+    // `input` is moved into the blocking task below, so the plan re-run — which
+    // builds a second AgentInput for the same turn — cannot ask it later.
+    let local_for_rerun = input.local.clone();
 
     // Create cancellation token for this streaming session
     let cancellation_token = tokio_util::sync::CancellationToken::new();
@@ -7132,6 +7290,42 @@ async fn handle_chat_message_streaming(
     // Handle agent result
     match agent_result {
         Ok(Ok(output)) => {
+            // Local mode loads tools on demand, so carry the set forward: it is
+            // what stops the next turn of this session from re-discovering
+            // tools the model has already been shown.
+            //
+            // Guarded on `local_mode_active` rather than on a non-empty list,
+            // because an empty list is meaningful here — a local turn that
+            // loaded nothing should still clear a stale stored set, and a cloud
+            // turn must not touch the key at all.
+            //
+            // `update_session_metadata` replaces the whole map, so this reads
+            // the existing metadata and merges; building a fresh map would
+            // silently drop every other key on the session.
+            if local_mode_active {
+                let stored = session_manager
+                    .get_session(&session_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.metadata);
+                let current = serde_json::json!(output.loaded_tools);
+                let unchanged = stored
+                    .as_ref()
+                    .and_then(|m| m.get(LOCAL_LOADED_TOOLS_KEY))
+                    .is_some_and(|prev| prev == &current);
+                if !unchanged {
+                    let mut merged = stored.unwrap_or_default();
+                    merged.insert(LOCAL_LOADED_TOOLS_KEY.to_string(), current);
+                    if let Err(e) = session_manager
+                        .update_session_metadata(&session_id, merged)
+                        .await
+                    {
+                        warn!("Failed to persist local loaded tools for {session_id}: {e}");
+                    }
+                }
+            }
+
             // Handle plan proposal if present
             if let Some(proposal) = &output.plan_proposal {
                 info!("Agent returned plan proposal for session {}", session_id);
@@ -7239,6 +7433,22 @@ async fn handle_chat_message_streaming(
                                 .as_deref()
                                 .and_then(|s| s.tools_config.clone()),
                             os_platform: Some(std::env::consts::OS.to_string()),
+                            // A re-run continues the same turn, so it keeps the
+                            // turn's local-mode state — carrying the tools the
+                            // turn has already loaded rather than the set it
+                            // started with. Passing `None` here would make the
+                            // re-run look like an ordinary cloud turn to Phase 3
+                            // (`local.is_none()` IS the "not local" signal), so a
+                            // local session that proposed a plan would silently
+                            // lose its context budget, its loaded tools and its
+                            // USER.md for the continuation.
+                            local: local_for_rerun.as_ref().map(|l| {
+                                nevoflux_builtin_wasm::LocalModeInput {
+                                    n_ctx: l.n_ctx,
+                                    loaded_tools: output.loaded_tools.clone(),
+                                    user_doc: l.user_doc.clone(),
+                                }
+                            }),
                         };
 
                         // Spawn stream forwarder for re-run
@@ -7673,7 +7883,10 @@ async fn handle_chat_message_streaming(
                         content: final_text.clone(),
                     });
                 }
-                tokio::spawn(async move {
+                // Background (P1, Task 2.7): session memory extraction must
+                // never contend with interactive chat for the local
+                // engine's admission budget ahead of it.
+                tokio::spawn(crate::local::admission::background(async move {
                     match crate::learning::session_extractor::extract_session_memories(
                         ext_config,
                         ext_db,
@@ -7697,7 +7910,7 @@ async fn handle_chat_message_streaming(
                         }
                         _ => {}
                     }
-                });
+                }));
             }
 
             // Save tool calls to session history
@@ -8426,6 +8639,7 @@ async fn handle_chat_message(
                 // and never touches mode/provider/model.
                 tools_config: active_soul.as_deref().and_then(|s| s.tools_config.clone()),
                 os_platform: Some(std::env::consts::OS.to_string()),
+                local: None,
             };
 
             // Run agent
@@ -8679,6 +8893,29 @@ async fn handle_chat_message(
                 "models.status" => crate::models::rpc::handle_status(&params).await,
                 "models.download" => crate::models::rpc::handle_download(&params).await,
                 "models.cancel" => crate::models::rpc::handle_cancel(&params).await,
+                // On-device (local) inference control surface (Task 2.10).
+                // `install`/`update_engine`/`repair_engine` return as soon
+                // as they've started; progress streams on
+                // `system:local:progress`, state on `system:local:state`.
+                "local.status" => crate::local::rpc::handle_status(&params, shared_config).await,
+                "local.probe" => crate::local::rpc::handle_probe(&params).await,
+                "local.models" => crate::local::rpc::handle_models(&params).await,
+                "local.plan" => crate::local::rpc::handle_plan(&params).await,
+                "local.install" => crate::local::rpc::handle_install(&params, shared_config).await,
+                "local.cancel" => crate::local::rpc::handle_cancel(&params).await,
+                "local.set_default" => {
+                    crate::local::rpc::handle_set_default(&params, shared_config).await
+                }
+                "local.update_engine" => {
+                    crate::local::rpc::handle_update_engine(&params, shared_config).await
+                }
+                "local.repair_engine" => {
+                    crate::local::rpc::handle_repair_engine(&params, shared_config).await
+                }
+                "local.retry_backend" => crate::local::rpc::handle_retry_backend(&params).await,
+                "local.set_config" => {
+                    crate::local::rpc::handle_set_config(&params, shared_config).await
+                }
                 "kb.wizard.status" => crate::kb_wizard::handle_status(&params).await,
                 "kb.wizard.install_bun" => crate::kb_wizard::handle_install_bun(&params).await,
                 "kb.wizard.install_gbrain" => {
@@ -11814,6 +12051,10 @@ struct ProviderMeta {
     provider_type: &'static str,
     /// Embedded icon bytes (WebP, 128x128)
     icon_bytes: &'static [u8],
+    /// Excluded from `config.llm.list`'s `providers` array, so it never
+    /// renders as a card in the settings UI's cloud-provider grid. Used for
+    /// entries (like "local") that have their own dedicated UI elsewhere.
+    hidden: bool,
 }
 
 /// Encode icon bytes as a base64 data URI (image/webp).
@@ -11829,102 +12070,129 @@ const PROVIDER_METAS: &[ProviderMeta] = &[
         display_name: "Anthropic",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/anthropic.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "openai",
         display_name: "OpenAI",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/openai.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "deepseek",
         display_name: "DeepSeek",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/deepseek.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "qwen",
         display_name: "Qwen",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/qwen.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "gemini",
         display_name: "Google Gemini",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/gemini.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "groq",
         display_name: "Groq",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/groq.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "openrouter",
         display_name: "OpenRouter",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/openrouter.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "mistral",
         display_name: "Mistral",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/mistral.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "xai",
         display_name: "XAI (Grok)",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/xai.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "cohere",
         display_name: "Cohere",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/cohere.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "perplexity",
         display_name: "Perplexity",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/perplexity.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "together",
         display_name: "Together AI",
         provider_type: "service",
         icon_bytes: include_bytes!("../../../assets/icons/providers/together.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "ollama",
         display_name: "Ollama",
         provider_type: "local",
         icon_bytes: include_bytes!("../../../assets/icons/providers/ollama.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "claude-code",
         display_name: "Claude Code",
         provider_type: "cli",
         icon_bytes: include_bytes!("../../../assets/icons/providers/anthropic.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "antigravity",
         display_name: "Antigravity",
         provider_type: "cli",
         icon_bytes: include_bytes!("../../../assets/icons/providers/antigravity.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "kimi-agent",
         display_name: "Kimi Agent",
         provider_type: "cli",
         icon_bytes: include_bytes!("../../../assets/icons/providers/kimi.webp"),
+        hidden: false,
     },
     ProviderMeta {
         id: "openclaw",
         display_name: "OpenClaw",
         provider_type: "agent",
         icon_bytes: include_bytes!("../../../assets/icons/providers/openclaw.webp"),
+        hidden: false,
+    },
+    ProviderMeta {
+        id: "local",
+        display_name: "On-device",
+        provider_type: "local",
+        // Never rendered — `hidden: true` filters this out of the settings
+        // UI's cloud-provider grid before `icon_data_uri` would run on it.
+        // It gets its own dedicated on-device inference UI in a later task.
+        icon_bytes: &[],
+        hidden: true,
     },
 ];
 
@@ -11947,6 +12215,7 @@ async fn handle_config_llm_list(params: &serde_json::Value) -> serde_json::Value
 
     let mut providers: Vec<serde_json::Value> = PROVIDER_METAS
         .iter()
+        .filter(|meta| !meta.hidden)
         .map(|meta| {
             let provider_config = config.llm.provider_config(meta.id);
             let configured = config.llm.is_provider_configured(meta.id);
@@ -12234,6 +12503,13 @@ async fn handle_config_llm_set(
             let is_active = config.llm.provider.as_deref() == Some(provider_id);
             // Update the in-memory runtime config so changes take effect immediately
             *shared_config.write().unwrap() = Arc::new(config);
+            // Task 1.6: re-derive the LocalOnly latch from the new config,
+            // re-point the gateway's upstream accordingly, and broadcast
+            // `system:local:latch_changed` if the latch actually flipped.
+            {
+                let cfg_snapshot = shared_config.read().unwrap().clone();
+                crate::local::on_config_changed(&cfg_snapshot).await;
+            }
             // ACP providers bake their config (model via env/args) into the
             // subprocess at spawn. Drop the cached instance so the next chat
             // respawns with the just-saved settings — generic on purpose:
@@ -12464,6 +12740,10 @@ async fn handle_config_llm_custom_create(
         Ok(()) => {
             let active = config.llm.provider.as_deref() == Some(wire_id.as_str());
             *shared_config.write().unwrap() = Arc::new(config);
+            {
+                let cfg_snapshot = shared_config.read().unwrap().clone();
+                crate::local::on_config_changed(&cfg_snapshot).await;
+            }
             info!("config.llm.custom.create: created {wire_id} (active={active})");
             custom_response(
                 request_id,
@@ -12551,6 +12831,10 @@ async fn handle_config_llm_custom_update(
         Ok(()) => {
             let active = config.llm.provider.as_deref() == Some(wire_id.as_str());
             *shared_config.write().unwrap() = Arc::new(config);
+            {
+                let cfg_snapshot = shared_config.read().unwrap().clone();
+                crate::local::on_config_changed(&cfg_snapshot).await;
+            }
             info!("config.llm.custom.update: updated {wire_id} (active={active})");
             custom_response(
                 request_id,
@@ -12637,6 +12921,10 @@ async fn handle_config_llm_custom_delete(
     match config.save() {
         Ok(()) => {
             *shared_config.write().unwrap() = Arc::new(config);
+            {
+                let cfg_snapshot = shared_config.read().unwrap().clone();
+                crate::local::on_config_changed(&cfg_snapshot).await;
+            }
             info!(
                 "config.llm.custom.delete: removed {wire_id} (was_active={was_active}, fell_back_to={fell_back_to:?})"
             );
@@ -13915,6 +14203,60 @@ mod tests {
     use super::*;
     use nevoflux_protocol::PlanStep;
 
+    fn meta_with(value: serde_json::Value) -> std::collections::HashMap<String, serde_json::Value> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(LOCAL_LOADED_TOOLS_KEY.to_string(), value);
+        m
+    }
+
+    #[test]
+    fn local_mode_input_truncates_user_doc_at_a_char_boundary() {
+        // A multi-byte character straddling the cap is the case that panics if
+        // the cap is applied to bytes instead of characters.
+        let user_raw = "日".repeat(600);
+        let out = local_mode_input(None, 16384, &user_raw);
+        let doc = out.user_doc.expect("non-empty user doc");
+        assert_eq!(doc.chars().count(), LOCAL_USER_DOC_MAX_CHARS);
+        assert!(doc.starts_with('日'));
+        // Shorter-than-cap text is carried whole, and trimmed.
+        let short = local_mode_input(None, 16384, "  hello  ");
+        assert_eq!(short.user_doc.as_deref(), Some("hello"));
+        // Nothing worth carrying becomes `None`, not `Some("")`.
+        assert!(local_mode_input(None, 16384, "   \n ").user_doc.is_none());
+    }
+
+    #[test]
+    fn local_mode_input_parsing_tolerates_garbage() {
+        // Mixed array: keep the usable strings, drop the rest, rather than
+        // failing a turn over a cache of tool names.
+        let meta = meta_with(serde_json::json!(["read", 7, null, "  ", "grep", {"a": 1}]));
+        let out = local_mode_input(Some(&meta), 16384, "");
+        assert_eq!(
+            out.loaded_tools,
+            vec!["read".to_string(), "grep".to_string()]
+        );
+
+        // Wrong type entirely, absent key, and absent metadata all degrade to
+        // an empty list.
+        let wrong = meta_with(serde_json::json!("not-an-array"));
+        assert!(local_mode_input(Some(&wrong), 16384, "")
+            .loaded_tools
+            .is_empty());
+        let other_key: std::collections::HashMap<String, serde_json::Value> =
+            [("unrelated".to_string(), serde_json::json!(["x"]))]
+                .into_iter()
+                .collect();
+        assert!(local_mode_input(Some(&other_key), 16384, "")
+            .loaded_tools
+            .is_empty());
+        assert!(local_mode_input(None, 16384, "").loaded_tools.is_empty());
+    }
+
+    #[test]
+    fn local_mode_input_carries_the_context_budget_verbatim() {
+        assert_eq!(local_mode_input(None, 32768, "").n_ctx, 32768);
+    }
+
     #[test]
     fn test_server_config_default() {
         let config = ServerConfig::default();
@@ -14635,6 +14977,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_server_start_and_shutdown() {
+        // Fix round 1, item 3 / R35: `start_server` boots the in-process
+        // llm-gateway and runs `crate::local::on_config_changed` on it
+        // (Task 1.6), which touches the REAL global LocalOnly latch via
+        // `latch::refresh_from_config` (always writes the real global
+        // even in test builds — see `local::latch`'s module docs) as a
+        // boot side effect. Other tests (`local::sync`'s) assert on
+        // specific real-global values across their own multi-step async
+        // bodies, so this test's boot-time write needs to be excluded
+        // from THEIR critical sections too, for the whole duration of
+        // `start_server(...).await` (not just the moment of the write,
+        // buried inside that call where this test has no separate hook
+        // to scope a lock around). `test_serial_async()` — a tokio mutex,
+        // not `test_serial()`'s std one — is safe to hold for that whole
+        // span: a contended lock yields the task back to the scheduler
+        // instead of blocking the OS thread, so it can't starve unrelated
+        // timing-sensitive tests the way holding a std mutex here would.
+        let _latch_guard = crate::local::latch::test_serial_async().await;
+
         // Inject an isolated agent config instead of loading the developer's
         // real config.toml: a real config may enable gbrain (whose spawn
         // contends on the shared ~/.gbrain PGLite lock with any live daemon

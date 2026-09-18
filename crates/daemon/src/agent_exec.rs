@@ -297,6 +297,7 @@ pub async fn run_agent_once(
         soul_context: None,
         tools_config: Some(nevoflux_protocol::subagent::ToolsConfig::Allow(allowlist)),
         os_platform: Some(std::env::consts::OS.to_string()),
+        local: None,
     };
 
     // `Agent::run` is synchronous; the host functions block on the runtime

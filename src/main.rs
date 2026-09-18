@@ -1029,11 +1029,42 @@ async fn run_daemon(
         });
     }
 
-    // Wait for a shutdown signal: Ctrl+C, or the server terminating on its
-    // own (managed-mode idle timeout). Waiting only on Ctrl+C left idle
-    // managed daemons alive forever: the idle check stopped the accept loop
-    // but nothing ever ended the process, so each browser session leaked an
-    // orphan daemon holding a port from the 19501-19600 range.
+    // On Unix, also listen for SIGTERM — without an explicit handler its
+    // default disposition kills the process immediately, skipping this
+    // whole graceful path (log-shutdown, server.shutdown(), lock-file
+    // cleanup) entirely. That matters beyond just "clean logs": it is also
+    // how a process manager (systemd, Docker, an orchestrator) normally
+    // asks a daemon to stop, so without this, `docker stop`/`systemctl
+    // stop` would bypass shutdown the same way an unhandled kill would.
+    // Registered once and kept alive across both shutdown selects below (it
+    // is `recv()`d again at the second one) so a second SIGTERM is treated
+    // the same as a second Ctrl+C, instead of being silently coalesced with
+    // nothing left polling for it.
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    // Wait for a shutdown signal: Ctrl+C, SIGTERM (Unix), or the server
+    // terminating on its own (managed-mode idle timeout). Waiting only on
+    // Ctrl+C left idle managed daemons alive forever: the idle check
+    // stopped the accept loop but nothing ever ended the process, so each
+    // browser session leaked an orphan daemon holding a port from the
+    // 19501-19600 range.
+    //
+    // `tokio::select!`'s branches don't support `#[cfg(...)]` on individual
+    // arms (it's a plain macro_rules!, not attribute-aware), so the SIGTERM
+    // arm means two full copies of this select, one per platform, rather
+    // than one select with a conditional arm.
+    #[cfg(unix)]
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        _ = server.wait_terminated() => {
+            tracing::info!("server terminated on its own (idle timeout); exiting");
+        }
+        _ = sigterm.recv() => {
+            tracing::info!("SIGTERM received; shutting down");
+        }
+    }
+    #[cfg(not(unix))]
     tokio::select! {
         result = tokio::signal::ctrl_c() => result?,
         _ = server.wait_terminated() => {
@@ -1057,6 +1088,27 @@ async fn run_daemon(
     // here is what makes a *second* Ctrl+C effective.)
     let graceful = server.shutdown();
     tokio::pin!(graceful);
+    // Same two-copies-per-platform reasoning as the first shutdown select
+    // above. The SIGTERM arm reuses `sigterm` (rather than registering a
+    // fresh signal stream) deliberately: once a Unix signal handler is
+    // installed for a kind, the OS default disposition stays overridden for
+    // the process's life, so a second SIGTERM with nobody `recv()`-ing it
+    // would just be silently coalesced rather than terminate us — the same
+    // "signal now goes nowhere" trap the comment above (about `ctrl_c()`
+    // resolving once per await) is already guarding against for Ctrl+C.
+    #[cfg(unix)]
+    tokio::select! {
+        _ = &mut graceful => {
+            tracing::info!("graceful shutdown complete");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::warn!("second Ctrl+C received during shutdown; forcing exit");
+        }
+        _ = sigterm.recv() => {
+            tracing::warn!("second SIGTERM received during shutdown; forcing exit");
+        }
+    }
+    #[cfg(not(unix))]
     tokio::select! {
         _ = &mut graceful => {
             tracing::info!("graceful shutdown complete");
@@ -1629,8 +1681,24 @@ async fn handle_account_command(action: AccountAction) -> Result<(), Box<dyn std
     }
 }
 
+/// Plain sync entry point, checked *before* any tokio runtime exists.
+///
+/// `--engine-guard` (see `nevoflux_daemon::local::guard`) is a separate,
+/// tiny watchdog subprocess, not a normal CLI invocation — it never
+/// returns. It must not carry a tokio runtime (worker threads it has no use
+/// for, alive for the engine's whole lifetime), so this check has to happen
+/// ahead of `#[tokio::main]`, which builds its runtime before an
+/// `async fn main()`'s body ever runs. The ordinary CLI path falls through
+/// to `async_main`, where `#[tokio::main]` is applied instead.
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--engine-guard") {
+        nevoflux_daemon::local::guard::run(std::env::args().skip(2).collect())
+    }
+    async_main()
+}
+
 #[tokio::main]
-async fn main() {
+async fn async_main() {
     let cli = Cli::parse();
 
     // Handle subcommands first (they don't require async)

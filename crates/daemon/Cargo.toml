@@ -230,6 +230,16 @@ zstd = "0.13"
 # Pack GitHub install — gunzip GitHub codeload tarballs (tempfile already a dep).
 flate2 = "1"
 
+# Local-inference engine installer (`local::install`): extracting the
+# prebuilt llama-server archives. Pinned to the SAME spec as
+# `crates/tts/Cargo.toml`'s existing `zip` dependency so both crates unify
+# on one resolved version (2.4.2) instead of adding a second `zip` major
+# (the lockfile also carries an unrelated 8.x from another dependency).
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Free-disk-space check before downloading engine archives (`local::install`).
+fs2 = "0.4"
+
 # Native file dialog
 rfd = "0.15"
 
@@ -256,6 +266,29 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }
+
+# Tests only, and only on Unix: `local_e2e` asserts the engine-guard pipe is
+# CLOEXEC, which v3 §16.2 mandates as an assertion rather than a defaulted
+# property. `nix` is already here but its `fcntl` module needs the `fs`
+# feature this crate does not enable, and libc is already in the lockfile
+# transitively, so this adds nothing to the build graph.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+# Windows RAM total for the local-inference hardware probe
+# (`crate::local::hardware`). Version pinned to match the root binary's own
+# `[target.'cfg(windows)'.dependencies]` entry so both unify to one
+# resolved version instead of pulling two.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_SystemInformation",
+    # `local::engine`'s three-way `engine.pid` identity check (v3 §16.2):
+    # process creation time via `GetProcessTimes` and the full image path via
+    # `QueryFullProcessImageNameW`, so a recycled pid can never be mistaken
+    # for the engine this daemon spawned and killed in its place.
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

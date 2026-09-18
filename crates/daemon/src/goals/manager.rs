@@ -51,6 +51,13 @@ const PROGRESS_ANCHOR_K: usize = 5;
 /// Per-message clamp (bytes) for a tool result folded into the evaluator
 /// transcript, so one giant output can't evict all other context.
 const TOOL_RESULT_MAX_BYTES: usize = 2048;
+/// `last_reason` stamped on a check-less goal while the LocalOnly latch is
+/// on (R14): there is no model-judged evaluator route on-device, so the
+/// goal is paused rather than evaluated or expired.
+const LATCH_PAUSED_REASON: &str = "paused: on-device mode";
+/// `Verdict.reason` used for a checked goal while latched, in place of an
+/// actual model call (never made — see [`GoalManager::after_turn`]).
+const LATCH_AWAITING_CHECK_REASON: &str = "awaiting programmatic check";
 
 /// The pure post-turn decision, computed from the turn count *after* the
 /// increment and whether the evaluator judged the condition met.
@@ -294,6 +301,35 @@ impl GoalManager {
             .check_json
             .as_deref()
             .and_then(|s| serde_json::from_str::<crate::goals::check::GoalCheck>(s).ok());
+        let latched = crate::local::latch::is_on();
+
+        // (2a) LocalOnly latch, check-less goal (R14): there is no
+        // model-judged evaluator route on-device, so the goal is simply
+        // paused — not evaluated, not counted as a turn, never expired by
+        // budget exhaustion while paused. `last_reason` is persisted (and
+        // `state_changed` emitted) only when it actually changes, so a
+        // session sitting paused across many turns doesn't spam identical
+        // events or writes.
+        if latched && check.is_none() {
+            if rec.last_reason.as_deref() != Some(LATCH_PAUSED_REASON) {
+                let now = current_timestamp();
+                if let Err(e) = repo.set_last_reason(&rec.id, LATCH_PAUSED_REASON, now) {
+                    tracing::warn!(goal_id = %rec.id, error = %e, "goal after_turn: set_last_reason failed");
+                }
+                self.events
+                    .state_changed(
+                        session_id,
+                        &rec.id,
+                        rec.status.as_str(),
+                        &rec.condition,
+                        rec.turns_used,
+                        rec.max_turns,
+                        Some(LATCH_PAUSED_REASON),
+                    )
+                    .await;
+            }
+            return None;
+        }
 
         // (2b) Programmatic check short-circuit (spec §4.3 route A): a machine
         // check that holds against recent tool results achieves the goal with
@@ -322,43 +358,59 @@ impl GoalManager {
         // continues (met=false) instead of fail-safe stopping — the check is
         // its completion criterion, so keep working until it matches or the
         // budget is exhausted.
-        let verdict = match resolve_evaluator_for_goal(
-            &self.config,
-            rec.evaluator_provider.as_deref(),
-            rec.evaluator_model.as_deref(),
-        ) {
-            Ok(choice) => {
-                let transcript = self.load_transcript(session_id);
-                // ACP evaluator (route B) goes through the one-shot ACP adapter;
-                // direct-API evaluators through the standard path.
-                let result = evaluate_with_choice(&choice, &rec.condition, &transcript).await;
-                match result {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // A model error with a check present is not fatal — the
-                        // check is the real completion criterion, so keep working
-                        // rather than fail-safe stopping.
-                        if check.is_some() {
-                            Verdict {
-                                met: false,
-                                reason: "awaiting programmatic check".to_string(),
-                                tokens_used: 0,
+        //
+        // R14: while latched, the evaluator is NEVER called — not even when
+        // the goal's stored `evaluator_provider` predates the latch turning
+        // on and would otherwise resolve successfully (e.g. a leftover
+        // "anthropic" evaluator on a goal set before on-device mode was
+        // enabled). By this point `check` is always `Some` — a check-less
+        // goal already returned at (2a) — so this mirrors the check-present
+        // fail-safe branches below without making the network call.
+        let verdict = if latched {
+            Verdict {
+                met: false,
+                reason: LATCH_AWAITING_CHECK_REASON.to_string(),
+                tokens_used: 0,
+            }
+        } else {
+            match resolve_evaluator_for_goal(
+                &self.config,
+                rec.evaluator_provider.as_deref(),
+                rec.evaluator_model.as_deref(),
+            ) {
+                Ok(choice) => {
+                    let transcript = self.load_transcript(session_id);
+                    // ACP evaluator (route B) goes through the one-shot ACP adapter;
+                    // direct-API evaluators through the standard path.
+                    let result = evaluate_with_choice(&choice, &rec.condition, &transcript).await;
+                    match result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // A model error with a check present is not fatal — the
+                            // check is the real completion criterion, so keep working
+                            // rather than fail-safe stopping.
+                            if check.is_some() {
+                                Verdict {
+                                    met: false,
+                                    reason: LATCH_AWAITING_CHECK_REASON.to_string(),
+                                    tokens_used: 0,
+                                }
+                            } else {
+                                return self.record_evaluator_error(&repo, &rec, &e).await;
                             }
-                        } else {
-                            return self.record_evaluator_error(&repo, &rec, &e).await;
                         }
                     }
                 }
-            }
-            Err(e) => {
-                if check.is_some() {
-                    Verdict {
-                        met: false,
-                        reason: "awaiting programmatic check".to_string(),
-                        tokens_used: 0,
+                Err(e) => {
+                    if check.is_some() {
+                        Verdict {
+                            met: false,
+                            reason: LATCH_AWAITING_CHECK_REASON.to_string(),
+                            tokens_used: 0,
+                        }
+                    } else {
+                        return self.record_evaluator_error(&repo, &rec, &e).await;
                     }
-                } else {
-                    return self.record_evaluator_error(&repo, &rec, &e).await;
                 }
             }
         };
@@ -1010,5 +1062,53 @@ mod tests {
                 .turns_used,
             2
         );
+    }
+
+    /// R14: while the LocalOnly latch is on, a check-less goal is paused —
+    /// never evaluated by a model (which would leave the device) and never
+    /// counted as a turn — rather than fail-safe stopping or expiring.
+    #[tokio::test]
+    async fn check_less_goal_is_not_evaluated_or_counted_when_latched() {
+        let _g = crate::local::latch::test_serial();
+        struct ResetLatch;
+        impl Drop for ResetLatch {
+            fn drop(&mut self) {
+                crate::local::latch::set(false);
+            }
+        }
+        let _reset = ResetLatch;
+
+        let db = Database::open_in_memory().unwrap();
+        seed_session(&db, "sess-1");
+        // Create the goal BEFORE latching: a resolvable (anthropic) evaluator
+        // config, no check — exactly the shape that would normally either
+        // evaluate or fail-safe/expire.
+        let mgr = GoalManager::new(db.clone(), None, config_anthropic());
+        mgr.set("sess-1", "the PR is merged", None, None, Some(1))
+            .await
+            .unwrap();
+
+        crate::local::latch::set(true);
+
+        let out = mgr.after_turn("sess-1").await;
+        assert!(out.is_none(), "a paused goal never yields a continuation");
+
+        let rec = GoalRepository::new(&db)
+            .get_active("sess-1")
+            .unwrap()
+            .expect("goal still active");
+        assert_eq!(rec.turns_used, 0, "paused turns must not be counted");
+        assert_eq!(rec.status, GoalStatus::Active, "never expired while paused");
+        assert_eq!(rec.last_reason.as_deref(), Some("paused: on-device mode"));
+
+        // A second turn while still latched and still unchanged must not
+        // spam a duplicate DB write / event (still idempotent: same result).
+        assert!(mgr.after_turn("sess-1").await.is_none());
+        let rec2 = GoalRepository::new(&db)
+            .get_active("sess-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec2.turns_used, 0);
+        assert_eq!(rec2.last_reason.as_deref(), Some("paused: on-device mode"));
     }
 }
