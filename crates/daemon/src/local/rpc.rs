@@ -1289,6 +1289,69 @@ async fn set_config_with(
             }
         }
     }
+    // Model and quant, validated against the catalog. Without these the
+    // settings page's model picker wrote into a void: the RPC answered
+    // success, echoed the unchanged config, and the select snapped back with
+    // no error anywhere (review of Task 4.2, Critical 3).
+    if let Some(v) = params.get("model") {
+        let Some(name) = v.as_str() else {
+            return err_response(
+                &id,
+                "local.set_config",
+                "unknown_model",
+                "expected a string",
+            );
+        };
+        let Some(model) = catalog::model(name) else {
+            return err_response(
+                &id,
+                "local.set_config",
+                "unknown_model",
+                format!("unknown model id {name:?}"),
+            );
+        };
+        // The quant must be valid FOR THE NEW MODEL. Checking them
+        // independently would let a quant that exists on the old model
+        // through, and the engine would then look for a file that is not
+        // in the catalog at all.
+        let quant_bits = match params.get("quant").and_then(|q| q.as_str()) {
+            Some(q) => q.to_string(),
+            None => config.llm.local.quant.clone(),
+        };
+        if catalog::quant(model, &quant_bits).is_none() {
+            return err_response(
+                &id,
+                "local.set_config",
+                "unknown_quant",
+                format!("{name} has no {quant_bits:?} quantization"),
+            );
+        }
+        config.llm.local.model = name.to_string();
+        config.llm.local.quant = quant_bits;
+    } else if let Some(v) = params.get("quant") {
+        let Some(bits) = v.as_str() else {
+            return err_response(
+                &id,
+                "local.set_config",
+                "unknown_quant",
+                "expected a string",
+            );
+        };
+        let current = config.llm.local.model.clone();
+        match catalog::model(&current) {
+            Some(m) if catalog::quant(m, bits).is_some() => {
+                config.llm.local.quant = bits.to_string()
+            }
+            _ => {
+                return err_response(
+                    &id,
+                    "local.set_config",
+                    "unknown_quant",
+                    format!("{current} has no {bits:?} quantization"),
+                )
+            }
+        }
+    }
 
     if let Err(msg) = config.llm.local.validated_ctx() {
         return err_response(&id, "local.set_config", "bad_ctx", msg);

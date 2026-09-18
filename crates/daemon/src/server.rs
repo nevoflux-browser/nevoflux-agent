@@ -6070,11 +6070,6 @@ pub(crate) fn is_clear_command(message: &str) -> bool {
     rest[..name_end].eq_ignore_ascii_case("clear")
 }
 
-/// Handle chat channel messages with streaming support.
-///
-/// This function processes chat messages and streams the response back to the sidebar
-/// in real-time as the LLM generates output.
-#[allow(clippy::too_many_arguments)]
 /// Session-metadata key holding the tool names local mode has already loaded
 /// for this session.
 ///
@@ -6132,6 +6127,11 @@ fn local_mode_input(
     }
 }
 
+/// Handle chat channel messages with streaming support.
+///
+/// This function processes chat messages and streams the response back to the sidebar
+/// in real-time as the LLM generates output.
+#[allow(clippy::too_many_arguments)]
 async fn handle_chat_message_streaming(
     payload: &serde_json::Value,
     config: &Arc<AgentConfig>,
@@ -14214,7 +14214,10 @@ mod tests {
         // failing a turn over a cache of tool names.
         let meta = meta_with(serde_json::json!(["read", 7, null, "  ", "grep", {"a": 1}]));
         let out = local_mode_input(Some(&meta), 16384, "");
-        assert_eq!(out.loaded_tools, vec!["read".to_string(), "grep".to_string()]);
+        assert_eq!(
+            out.loaded_tools,
+            vec!["read".to_string(), "grep".to_string()]
+        );
 
         // Wrong type entirely, absent key, and absent metadata all degrade to
         // an empty list.

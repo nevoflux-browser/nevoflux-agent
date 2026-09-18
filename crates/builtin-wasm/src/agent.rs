@@ -818,21 +818,28 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
         //
         // The allowlist filter above still governs: the index is built from the
         // tools that survived it, so nothing can be searched back into reach.
-        if let Some(local) = &input.local {
+        // `.filter(|_| !tools.is_empty())`: a `ToolsConfig::None` caller asked
+        // for NO tools. Building an index anyway would hand it `tool_search`,
+        // a working entry point into everything the allowlist just removed.
+        if let Some(local) = input.local.as_ref().filter(|_| !tools.is_empty()) {
             let skills = filter_skills(
                 self.host.skill_list().unwrap_or_default(),
                 input.skills_filter.as_deref(),
             );
             let index = crate::local_mode::LocalToolIndex::new(tools, skills);
             let mut loaded = crate::local_mode::LoadedSet::default();
-            // Residents first, then what the last turn left: if the two together
-            // ever exceed the cap, the carried-over set is the half to lose.
-            for name in crate::local_mode::resident_tools_for(mode) {
+            // Carried-over first, residents LAST. `LoadedSet` evicts from the
+            // front, and the residents are the measured lever — they lift chat
+            // from 0.55 to 0.68-0.73. Seeding them first meant that once a
+            // session had loaded twelve other tools, the residents were the
+            // first thing dropped and never came back, quietly undoing the
+            // very asymmetry they exist for.
+            for name in &local.loaded_tools {
                 if index.knows(name) {
                     loaded.add(name);
                 }
             }
-            for name in &local.loaded_tools {
+            for name in crate::local_mode::resident_tools_for(mode) {
                 if index.knows(name) {
                     loaded.add(name);
                 }
@@ -1008,10 +1015,14 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                 }
                 for name in &skills {
                     // A skill is instructions, not something callable: return
-                    // its text rather than adding it to the tool array.
+                    // its text rather than adding it to the tool array. Only
+                    // the FIRST time, though — a whole SKILL.md re-inlined on
+                    // every repeat search would blow the very context budget
+                    // this module exists to protect.
                     lines.push(crate::local_mode::result_line_for_skill(name));
-                    lines.push(self.host.skill_load(name)?);
-                    self.loaded_skills.borrow_mut().insert(name.clone());
+                    if self.loaded_skills.borrow_mut().insert(name.clone()) {
+                        lines.push(self.host.skill_load(name)?);
+                    }
                 }
                 for name in &unknown {
                     // Naming what is missing beats silence — the model asked for
@@ -1061,8 +1072,14 @@ The user EXPLICITLY invoked the "{}" skill by name — you are running that skil
                         }
                         crate::local_mode::SearchHit::Skill(skill) => {
                             lines.push(crate::local_mode::result_line_for_skill(&skill.name));
-                            lines.push(self.host.skill_load(&skill.name)?);
-                            self.loaded_skills.borrow_mut().insert(skill.name.clone());
+                            if self.loaded_skills.borrow_mut().insert(skill.name.clone()) {
+                                lines.push(self.host.skill_load(&skill.name)?);
+                            }
+                            // Counts against the limit like any other hit: a
+                            // skill body is far larger than a tool schema, so
+                            // leaving it uncounted let one search inline as
+                            // many SKILL.md files as `max_results` allowed.
+                            loaded_here += 1;
                         }
                     }
                 }
@@ -2063,6 +2080,13 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
                     network_on,
                     console_named,
                 );
+                // On-device that rebuild is wrong on its own: `tools` is the
+                // turn-START slice (search entry point plus residents), so it
+                // drops everything loaded so far this turn. Ask the refresh
+                // below to redo it from the loaded set instead.
+                if self.local_index.borrow().is_some() {
+                    self.local_tools_changed.set(true);
+                }
             }
 
             // On-device: a `tool_search` this iteration changed what is loaded,
@@ -3398,6 +3422,15 @@ Users can also invoke skills explicitly with `/skill_name`. If the user's messag
             // Recorded flows — daemon-orchestrated via tool_call_dynamic,
             // same dispatch pattern as the recording tools above.
             "run_flow" | "list_flows" | "report_flow_repair" => self
+                .host
+                .tool_call_dynamic(&tool_call.name, &tool_call.arguments)?,
+            // On-device, a tool discovered through the host (MCP, knowledge
+            // base) is advertised under its OWN name rather than behind
+            // `tool_call_dynamic`, so the model's call arrives here with no
+            // builtin arm to match. Route it back to the host instead of
+            // answering "Unknown tool" — without this, a searched-for
+            // `brain_*` tool is loadable, advertised, and uncallable.
+            name if self.local_dynamic.borrow().iter().any(|d| d.name == name) => self
                 .host
                 .tool_call_dynamic(&tool_call.name, &tool_call.arguments)?,
             _ => {
@@ -7681,6 +7714,127 @@ mod tests {
             captured[1]
         );
         assert!(out.loaded_tools.contains(&"brain_search".to_string()));
+    }
+
+    /// The oversized-skill rejection, and the property its placement exists
+    /// for: the early return sits INSIDE the turn boundary, so a missing close
+    /// would leave the event log with a turn that never ends.
+    #[test]
+    fn an_oversized_skill_is_refused_and_still_closes_its_turn() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(says("should never be reached"));
+        let agent = Agent::with_config(mock, local_config());
+
+        let mut input = local_input(AgentMode::Agent, "run that skill", &[]);
+        // 16384 ctx => a 4096-token ceiling; 40 KB of content is ~10240.
+        input.local.as_mut().unwrap().n_ctx = 16384;
+        input.skill_context = Some(SkillContext {
+            name: "huge".into(),
+            base_path: String::new(),
+            content: "x".repeat(40 * 1024),
+            available_files: vec![],
+        });
+
+        let out = agent.run(&input).unwrap();
+        assert!(
+            out.text.contains("too large for on-device mode"),
+            "expected a refusal, got: {}",
+            out.text
+        );
+        assert!(!out.continue_loop);
+
+        let events = agent.host.recorded_events.borrow();
+        let starts = events
+            .iter()
+            .filter(|e| e.starts_with("turn/start"))
+            .count();
+        let ends = events.iter().filter(|e| e.starts_with("turn/end")).count();
+        assert_eq!(starts, 1, "one turn should have opened: {events:?}");
+        assert_eq!(ends, 1, "and it must close on the early return: {events:?}");
+    }
+
+    /// Regression for the Task 3.3 review, Critical 1: a host-found tool was
+    /// advertised under its own name but had no arm in `execute_tool`, so
+    /// calling it answered "Unknown tool". The older test asserted only that
+    /// the name reached the next request — it passed while the feature was
+    /// dead. This one calls the thing.
+    #[test]
+    fn a_host_found_tool_is_actually_callable_once_loaded() {
+        let mock = MockHostFunctions::new();
+        mock.tool_search_results
+            .borrow_mut()
+            .push(ToolSearchResult {
+                name: "brain_search".into(),
+                description: "Search the knowledge base".into(),
+                score: 1.0,
+                input_schema: serde_json::json!({"type": "object"}),
+                source: Some("mcp:brain".into()),
+            });
+        mock.add_llm_response(searches("brain"));
+        mock.add_llm_response(says("done"));
+
+        let agent = Agent::with_config(mock, local_config());
+        agent
+            .run(&local_input(AgentMode::Chat, "查一下知识库", &[]))
+            .unwrap();
+
+        let call = ToolCall {
+            id: "c9".into(),
+            call_id: Some("c9".into()),
+            name: "brain_search".into(),
+            arguments: serde_json::json!({}),
+            signature: None,
+        };
+        let result = agent.execute_tool(&call).unwrap();
+        assert!(
+            result
+                .content
+                .contains("Mock result for tool: brain_search"),
+            "a loaded host tool must reach the host, got: {}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("Unknown tool"),
+            "advertised but undispatchable"
+        );
+    }
+
+    /// Regression for the Task 3.3 review, Critical 2: the canvas-unlock
+    /// branch rebuilt the advertised list from the TURN-START slice, which
+    /// on-device is only the search entry point plus residents — so every
+    /// tool loaded earlier in the same turn silently vanished.
+    #[test]
+    fn a_tool_loaded_this_turn_survives_a_canvas_unlock() {
+        let mock = MockHostFunctions::new();
+        mock.add_llm_response(searches("select:web_search"));
+        mock.add_llm_response(LlmResponse {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: "c2".into(),
+                call_id: Some("c2".into()),
+                name: "canvas_create_composition".into(),
+                arguments: serde_json::json!({
+                    "title": "v", "width": 1920, "height": 1080,
+                    "duration_sec": 5, "fps": 30
+                }),
+                signature: None,
+            }],
+            reasoning: None,
+        });
+        mock.add_llm_response(says("done"));
+
+        let agent = Agent::with_config(mock, local_config());
+        agent
+            .run(&local_input(AgentMode::Chat, "做一个合成", &[]))
+            .unwrap();
+
+        let captured = agent.host.captured_tool_names.borrow();
+        assert!(captured.len() >= 3, "expected three requests: {captured:?}");
+        assert!(
+            captured[2].contains(&"web_search".to_string()),
+            "the tool loaded in iteration 1 was dropped by the canvas unlock: {:?}",
+            captured[2]
+        );
     }
 
     /// The allowlist governs the index, so nothing can be searched back into

@@ -4912,6 +4912,7 @@ dependencies = [
  "http-body-util",
  "ignore",
  "image",
+ "libc",
  "monty",
  "monty-types",
  "nevoflux-a2a",

@@ -264,7 +264,11 @@ async fn on_device_answers_and_the_network_is_refused() {
 /// passes whether or not the guard exists. The guard only matters when the
 /// daemon dies *without* running `stop()` — which is exactly the path nothing
 /// has ever driven.
-#[cfg(unix)]
+// `target_os = "linux"`, not `unix`: the check below reads `/proc/<pid>/cmdline`,
+// which macOS does not have. Under a bare `cfg(unix)` this would compile there,
+// read nothing, and fail with "no --engine-guard child was spawned" — reporting
+// a missing guard on a machine where the guard is fine.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "downloads an engine and a model, then kills processes"]
 #[serial]
@@ -304,6 +308,11 @@ async fn the_engine_is_a_child_of_the_guard_and_dies_with_the_daemon() {
                 !grandchildren.stdout.is_empty(),
                 "the guard has no child; llama-server should be under it"
             );
+            // The guard is spawned as `nevoflux-agent --engine-guard --
+            // <...>/llama-server <args>`, so its OWN cmdline necessarily
+            // contains that name. Checking it below would fail on exactly the
+            // arrangement this test is here to confirm.
+            continue;
         }
         assert!(
             !cmd.contains("llama-server"),
