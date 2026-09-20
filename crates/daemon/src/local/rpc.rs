@@ -1572,7 +1572,13 @@ mod tests {
         // with no `models_dir` to check on disk -- `model` reports it as
         // "missing", not `null` (that only happens for an unknown
         // model/quant id in config, exercised separately below).
-        assert_eq!(v["model"]["id"], "qwen3-4b-instruct-2507");
+        // Against `cfg.model`, not a hardcoded id: what this test is about is
+        // that status reports the CONFIGURED model and resolves it, whichever
+        // one that is. The default's identity is pinned once, in
+        // `local::config`'s `defaults_match_design`; repeating it here only
+        // made this test fail when the default moved to 8B (R40), which is a
+        // deliberate product change and not a regression in `status_with`.
+        assert_eq!(v["model"]["id"], cfg.model);
         assert_eq!(v["model"]["state"], "missing");
         assert_eq!(v["model"]["have"], 0);
 

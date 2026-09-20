@@ -116,7 +116,14 @@ impl Default for LocalConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            model: "qwen3-4b-instruct-2507".to_string(),
+            // 8B, not 4B: the V0 direction experiment measured 4B at 0.35-0.51
+            // selection accuracy in EVERY configuration tried, against 0.78 for
+            // 8B (browser/agent 0.89-1.00). Shipping 4B as the default would
+            // hand a user on defaults the exact configuration the experiment
+            // rejected. 4B and 1.7B stay in the catalog as smaller-machine
+            // fallbacks; the hardware floor rises to ~6.2 GB VRAM @16K.
+            // v3 §12, ruling R40.
+            model: "qwen3-8b".to_string(),
             quant: "Q4_K_M".to_string(),
             backend: BackendPref::Auto,
             gpu_layers: -1,
@@ -158,6 +165,22 @@ mod tests {
         assert_eq!(c.kv_cache_type, KvCacheType::Q8_0);
         assert_eq!(c.parallel, 2);
         assert_eq!(c.idle_unload_secs, 300);
+
+        // The default MODEL was the one field this test did not check, and it
+        // is the one the experiment changed — so the ruling that moved it to
+        // 8B went unimplemented for two phases without anything failing. A
+        // test named for matching the design has to check the part of the
+        // design that moved (v3 §12, R40).
+        assert_eq!(c.model, "qwen3-8b");
+        assert_eq!(c.quant, "Q4_K_M");
+
+        // And the default must actually exist in the catalog, or the first
+        // install resolves nothing.
+        let m = crate::local::catalog::model(&c.model).expect("default model is in the catalog");
+        assert!(
+            crate::local::catalog::quant(m, &c.quant).is_some(),
+            "default quant is offered for the default model"
+        );
     }
 
     #[test]
