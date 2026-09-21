@@ -188,8 +188,11 @@ fn status_with(
     root: &Path,
     models_dir: Option<&Path>,
 ) -> serde_json::Value {
-    let engine_json = probe
-        .and_then(|p| installed_engine(root, &hardware::fallback_chain(p, cfg.backend)))
+    let installed =
+        probe.and_then(|p| installed_engine(root, &hardware::fallback_chain(p, cfg.backend)));
+    let installed_backend = installed.as_ref().map(|(kind, _)| kind.backend);
+
+    let engine_json = installed
         .map(|(kind, m)| {
             let bytes: u64 = m.files.iter().map(|f| f.size).sum();
             let update = match marker::tag_status(&m.tag) {
@@ -206,12 +209,14 @@ fn status_with(
         })
         .unwrap_or(serde_json::Value::Null);
 
+    let mut model_present = false;
     let model_json = catalog::model(&cfg.model)
         .and_then(|m| catalog::quant(m, &cfg.quant).map(|q| (m, q)))
         .map(|(m, q)| {
             let (state, have) = models_dir
                 .map(|d| model_file_state(d, q))
                 .unwrap_or(("missing", 0));
+            model_present = state == "present";
             serde_json::json!({
                 "id": m.id,
                 "quant": q.bits,
@@ -222,8 +227,31 @@ fn status_with(
         })
         .unwrap_or(serde_json::Value::Null);
 
+    // `engine::init` deliberately probes, installs and spawns nothing at boot
+    // (v3 §10: the pipeline is demand-driven, so a daemon whose user never
+    // touches local inference pays nothing for it). The supervisor therefore
+    // sits at `Idle` after every restart — including on a machine that has an
+    // engine installed, a model downloaded and `enabled = true`.
+    //
+    // Reporting that verbatim makes the settings page say "Not set up" about
+    // something that is fully set up, and there is no way back from it: the
+    // card only offers to make on-device the default once it is running, and
+    // it only runs once it is the default. `Stopped` is the state that already
+    // means exactly this ("installed, not currently resident, cold-starts on
+    // demand"), so say that instead.
+    //
+    // Costs nothing extra: both disk checks it reads were already done above
+    // for `engine`/`model`, and this still only runs when someone asks for
+    // status.
+    let state = match (supervisor.state(), installed_backend) {
+        (crate::local::state::LocalState::Idle, Some(backend)) if cfg.enabled && model_present => {
+            crate::local::state::LocalState::Stopped { backend }
+        }
+        (s, _) => s,
+    };
+
     serde_json::json!({
-        "state": supervisor.state(),
+        "state": state,
         "latched": latch::is_on(),
         "config": cfg,
         "engine": engine_json,
@@ -1679,6 +1707,92 @@ mod tests {
         assert_eq!(v["model"]["state"], "partial");
         assert_eq!(v["model"]["have"], 4096);
         assert_eq!(v["model"]["bytes"], quant.bytes);
+
+        // An engine on disk is NOT enough to call this stopped-and-ready-to-go:
+        // the model is only half here, so a cold start would fail. `Idle` is
+        // right, and it is what puts the user back on the Set-up path that
+        // finishes the download.
+        assert_eq!(v["state"]["state"], "idle");
+    }
+
+    /// Engine installed, model fully present, `enabled = true` — and the
+    /// supervisor freshly constructed, exactly as it is after every daemon
+    /// restart (`engine::init` probes and spawns nothing at boot, v3 §10).
+    ///
+    /// Reporting the raw `Idle` here made the settings page say "Not set up"
+    /// about a complete installation, with no way back: the card only offers
+    /// to make on-device the default once it is running, and it only runs once
+    /// it is the default.
+    #[test]
+    fn status_with_calls_a_complete_install_stopped_rather_than_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine_root = dir.path().join("engine");
+        let probe = cpu_only_probe();
+        let cfg = LocalConfig {
+            backend: BackendPref::Cpu,
+            enabled: true,
+            ..LocalConfig::default()
+        };
+
+        let chain = hardware::fallback_chain(&probe, cfg.backend);
+        let kind = chain.first().expect("cpu chain is never empty").clone();
+        let install_dir = install::install_dir(&engine_root, ENGINE_PINNED.tag, &kind);
+        std::fs::create_dir_all(&install_dir).unwrap();
+        marker::write_marker(
+            &install_dir,
+            &marker::Marker {
+                tag: ENGINE_PINNED.tag.to_string(),
+                kind: kind_label(&kind),
+                archive_sha256: vec![],
+                files: vec![marker::FileEntry {
+                    path: "llama-server".to_string(),
+                    size: 12345,
+                    sha256: "a".repeat(64),
+                }],
+                installed_at: 0,
+                last_used_at: 0,
+                bad: None,
+            },
+        )
+        .unwrap();
+
+        // `set_len` rather than writing the bytes: `model_file_state` only
+        // compares the length, and the real quant is multiple gigabytes.
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let model = catalog::model(&cfg.model).unwrap();
+        let quant = catalog::quant(model, &cfg.quant).unwrap();
+        let f = std::fs::File::create(models_dir.join(quant.file)).unwrap();
+        f.set_len(quant.bytes).unwrap();
+        drop(f);
+
+        let supervisor = EngineSupervisor::new(engine_root.clone());
+        let v = status_with(
+            &cfg,
+            &supervisor,
+            Some(&probe),
+            &engine_root,
+            Some(&models_dir),
+        );
+
+        assert_eq!(v["model"]["state"], "present");
+        assert_eq!(v["state"]["state"], "stopped");
+        assert_eq!(v["state"]["backend"], "cpu");
+
+        // With on-device switched off, a complete install is still not
+        // something to report as running-capable.
+        let disabled = LocalConfig {
+            enabled: false,
+            ..cfg.clone()
+        };
+        let v2 = status_with(
+            &disabled,
+            &supervisor,
+            Some(&probe),
+            &engine_root,
+            Some(&models_dir),
+        );
+        assert_eq!(v2["state"]["state"], "idle");
     }
 
     #[test]
