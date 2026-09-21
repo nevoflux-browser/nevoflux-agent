@@ -1207,6 +1207,13 @@ fn launch_relevant_changed(before: &LocalConfig, after: &LocalConfig) -> bool {
     before.ctx_size != after.ctx_size
         || before.backend != after.backend
         || before.parallel != after.parallel
+        // The weights are chosen when the process is launched and never
+        // reloaded in place, so a model or quant change that does not stop the
+        // engine leaves the OLD model answering while the settings page says
+        // the new one is selected. That is worse than a slow reload: it is a
+        // lie the user has no way to see.
+        || before.model != after.model
+        || before.quant != after.quant
 }
 
 async fn set_config_with(
@@ -2005,6 +2012,18 @@ mod tests {
         let mut backend_changed = before.clone();
         backend_changed.backend = BackendPref::Cuda;
         assert!(launch_relevant_changed(&before, &backend_changed));
+
+        // Model and quant are launch-relevant: the weights are chosen when the
+        // process starts and never swapped in place. Leaving them out meant a
+        // model switch saved the config, skipped the reload, and left the old
+        // model answering while the UI showed the new one selected.
+        let mut model_changed = before.clone();
+        model_changed.model = "qwen3-1.7b".to_string();
+        assert!(launch_relevant_changed(&before, &model_changed));
+
+        let mut quant_changed = before.clone();
+        quant_changed.quant = "Q8_0".to_string();
+        assert!(launch_relevant_changed(&before, &quant_changed));
 
         assert!(!launch_relevant_changed(&before, &before.clone()));
     }
