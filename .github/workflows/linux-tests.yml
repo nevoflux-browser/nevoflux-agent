@@ -1,0 +1,82 @@
+name: Linux tests
+
+# Why this exists
+# ---------------
+# `release.yml` builds the daemon for four Unix targets, so production
+# `#[cfg(unix)]` code does get compiled — but only when a release tag is
+# pushed, and only with `cargo build`. `cargo build` does not compile tests,
+# so every `#[cfg(unix)]` **test** in this repo had never been compiled
+# anywhere, let alone run: the engine guard's SIGTERM path, the integrity
+# check's symlink rejection, the installer's tar exec-bit, and the on-device
+# end-to-end test.
+#
+# That is not a hypothetical gap. A review found `libc::fcntl` used in
+# `tests/local_e2e.rs` while `libc` was not a dependency of this crate — a
+# hard "use of undeclared crate" that would have failed the whole test binary
+# on Linux, taking the other tests in the file with it, and that no Windows
+# machine and no release build could ever have surfaced.
+#
+# So this job does two things, and the order matters: it COMPILES every test
+# target first (which is where that class of defect lives), then RUNS the unit
+# tests (which is where behaviour lives).
+#
+# What it deliberately does not cover: macOS (`cfg(unix)` includes it, and some
+# paths here are `cfg(target_os = "linux")` because they read /proc), and the
+# orphan-prevention mechanism end to end — that needs a live engine process and
+# a SIGKILL, which is `#[ignore]`d because it wants a multi-gigabyte model.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same branch makes the older run pointless.
+concurrency:
+  group: linux-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  daemon:
+    name: daemon (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # X11/Wayland headers: the input and screenshot paths link against them
+      # on Linux. Same set `release.yml` installs for its x86_64 Linux build.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxrandr-dev libxtst-dev libwayland-dev
+
+      # Read the pinned channel rather than hardcoding it, so this cannot drift
+      # away from rust-toolchain.toml.
+      - name: Resolve toolchain
+        id: toolchain
+        run: |
+          CHANNEL=$(grep -m1 '^channel' rust-toolchain.toml | cut -d'"' -f2)
+          echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
+          echo "Toolchain from rust-toolchain.toml: ${CHANNEL}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-tests
+
+      # FIRST: compile every test target, including the integration tests under
+      # `tests/`, which `--lib` would skip. This is the step that catches the
+      # "cfg(unix) code has never been type-checked" class — an undeclared
+      # crate, a renamed API, a wrong type behind a cfg the dev machine strips.
+      - name: Compile all test targets
+        run: cargo test -p nevoflux-daemon --tests --no-run
+
+      # THEN: run the unit tests. Kept to `--lib` on purpose — the integration
+      # tests here are `#[ignore]`d because they download multi-gigabyte models
+      # and want a GPU, so compiling them is the whole value CI can extract.
+      - name: Run unit tests
+        run: cargo test -p nevoflux-daemon --lib
