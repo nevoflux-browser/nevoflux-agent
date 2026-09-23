@@ -83,6 +83,7 @@ pub mod speech;
 pub mod tool_pipeline;
 pub mod trace;
 pub mod tts;
+pub mod turn_stats;
 pub mod validation;
 pub mod wasm;
 
