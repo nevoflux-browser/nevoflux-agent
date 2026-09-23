@@ -6188,6 +6188,23 @@ impl HostFunctions for DaemonHostFunctions {
             return Ok(());
         }
 
+        // Settle any LLM call still open for accounting before the terminal
+        // frame goes out: the guest may call `stream_end` before it closes
+        // its last stream, and the frame carries the reply's usage, so an
+        // unsettled call would be missing from the numbers the user sees.
+        // Settling removes the entry, so the later `llm_stream_close` is a
+        // no-op and nothing is counted twice.
+        if let Some(stats) = &self.turn_stats {
+            let pending: Vec<StreamStatsData> = self
+                .stream_stats_data
+                .lock()
+                .map(|mut map| map.drain().map(|(_, data)| data).collect())
+                .unwrap_or_default();
+            for data in pending {
+                stats.record(stream_stats_to_call(data, self.is_subagent));
+            }
+        }
+
         if let Some(tx) = &self.sidebar_stream_tx {
             let chunk = SidebarStreamChunk {
                 text: String::new(),
@@ -8891,6 +8908,80 @@ mod tests {
         assert!(call.external_agent, "claude-code runs its own agent loop");
         assert!(call.is_subagent);
         assert_eq!(call.estimated_output, 0);
+    }
+
+    /// A stream the guest opened for accounting but has not closed yet.
+    fn pending_stream_stats() -> super::StreamStatsData {
+        let start = std::time::Instant::now();
+        super::StreamStatsData {
+            requested_at: start,
+            first_chunk_at: Some(start),
+            last_chunk_at: Some(start + std::time::Duration::from_millis(900)),
+            estimated_input: 100,
+            output_chars: "hello there".to_string(),
+            reported: Some(crate::wasm::llm::LlmUsage {
+                prompt_tokens: 90,
+                completion_tokens: 4,
+                total_tokens: 94,
+            }),
+            provider: "anthropic".into(),
+            model: "m".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_end_settles_calls_the_guest_left_open() {
+        // The terminal frame carries the reply's usage, and the guest may call
+        // stream_end before closing its last stream. If that call were still
+        // unsettled the frame would report nothing.
+        use nevoflux_builtin_wasm::HostFunctions;
+
+        let stats = crate::turn_stats::TurnStats::new();
+        let host = super::DaemonHostFunctions::new(
+            std::sync::Arc::new(crate::config::AgentConfig::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .with_turn_stats(stats.clone());
+        host.stream_stats_data
+            .lock()
+            .unwrap()
+            .insert(7, pending_stream_stats());
+
+        assert!(
+            stats.snapshot().is_none(),
+            "nothing is settled before stream_end"
+        );
+        host.stream_end().unwrap();
+
+        let snapshot = stats.snapshot().expect("stream_end settled the open call");
+        assert_eq!(snapshot.main.calls, 1);
+        assert_eq!(snapshot.main.input, 90);
+        assert_eq!(snapshot.main.output, 4);
+    }
+
+    #[tokio::test]
+    async fn a_settled_call_is_not_counted_twice_when_close_follows() {
+        use nevoflux_builtin_wasm::HostFunctions;
+
+        let stats = crate::turn_stats::TurnStats::new();
+        let host = super::DaemonHostFunctions::new(
+            std::sync::Arc::new(crate::config::AgentConfig::default()),
+            tokio::runtime::Handle::current(),
+        )
+        .with_turn_stats(stats.clone());
+        host.stream_stats_data
+            .lock()
+            .unwrap()
+            .insert(7, pending_stream_stats());
+
+        host.stream_end().unwrap();
+        host.llm_stream_close(7).unwrap();
+
+        assert_eq!(
+            stats.snapshot().expect("one call recorded").main.calls,
+            1,
+            "settling removes the entry, so close is a no-op"
+        );
     }
 
     fn host_with_prompt_held_by(pack: &str) -> super::DaemonHostFunctions {

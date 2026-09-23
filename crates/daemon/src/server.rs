@@ -5843,6 +5843,12 @@ pub const CONTAINER_METADATA_KEY: &str = "container";
 /// the reply was cancelled) the field is left off entirely and the sidebar
 /// shows no stats rather than zeros.
 fn attach_usage(payload: &mut serde_json::Value, usage: Option<&nevoflux_protocol::TurnUsage>) {
+    info!(
+        has_usage = usage.is_some(),
+        main_calls = usage.map(|u| u.main.calls).unwrap_or(0),
+        sub_calls = usage.and_then(|u| u.subagent.as_ref()).map(|s| s.calls).unwrap_or(0),
+        "terminal frame: per-reply usage snapshot"
+    );
     let Some(usage) = usage else { return };
     let Some(p) = payload.get_mut("payload") else {
         return;
