@@ -8039,6 +8039,10 @@ async fn handle_chat_message_streaming(
                 final_payload["payload"]["session_title"] = serde_json::Value::String(title);
             }
 
+            // This frame is terminal too, and it is the later of the two: the
+            // run has returned, so its snapshot is the complete one.
+            attach_usage(&mut final_payload, turn_stats.snapshot().as_ref());
+
             let response =
                 DaemonEnvelope::new(&proxy_id, channel, final_payload).with_request_id(&request_id);
             info!(
